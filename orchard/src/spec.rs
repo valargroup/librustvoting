@@ -240,6 +240,24 @@ pub(crate) fn prf_nf(nk: pallas::Base, rho: pallas::Base) -> pallas::Base {
         .hash([nk, rho])
 }
 
+/// Rho binding hash for the delegation circuit (condition 3).
+///
+/// `rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)`
+///
+/// Binds the signed note's rho to the exact notes being delegated, the governance
+/// commitment, and the round, making the keystone signature non-replayable and scoped.
+pub(crate) fn rho_binding_hash(
+    cmx_1: pallas::Base,
+    cmx_2: pallas::Base,
+    cmx_3: pallas::Base,
+    cmx_4: pallas::Base,
+    gov_comm: pallas::Base,
+    vote_round_id: pallas::Base,
+) -> pallas::Base {
+    poseidon::Hash::<_, poseidon::P128Pow5T3, poseidon::ConstantLength<6>, 3, 2>::init()
+        .hash([cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id])
+}
+
 /// Defined in [Zcash Protocol Spec § 5.4.5.5: Orchard Key Agreement][concreteorchardkeyagreement].
 ///
 /// [concreteorchardkeyagreement]: https://zips.z.cash/protocol/nu5.pdf#concreteorchardkeyagreement

@@ -49,7 +49,12 @@ use halo2_gadgets::{
         chip::{EccChip, EccConfig},
         FixedPoint, NonIdentityPoint, Point, ScalarFixed, ScalarVar,
     },
-    poseidon::{primitives as poseidon, Pow5Chip as PoseidonChip, Pow5Config as PoseidonConfig},
+    poseidon::{
+        primitives::{self as poseidon, ConstantLength},
+        Hash as PoseidonHash,
+        Pow5Chip as PoseidonChip,
+        Pow5Config as PoseidonConfig,
+    },
     sinsemilla::chip::{SinsemillaChip, SinsemillaConfig},
     utilities::lookup_range_check::LookupRangeCheckConfig,
 };
@@ -60,6 +65,10 @@ const NF_SIGNED: usize = 0;
 const RK_X: usize = 1;
 /// Public input offset for rk (y-coordinate).
 const RK_Y: usize = 2;
+/// Public input offset for the governance commitment.
+const GOV_COMM: usize = 3;
+/// Public input offset for the vote round identifier.
+const VOTE_ROUND_ID: usize = 4;
 
 /// Size of the delegation circuit (2^K rows).
 ///
@@ -157,6 +166,13 @@ pub struct Circuit {
     rcm_signed: Value<NoteCommitTrapdoor>,
     g_d_signed: Value<NonIdentityPallasPoint>,
     pk_d_signed: Value<DiversifiedTransmissionKey>,
+    // Rho binding witnesses (condition 3).
+    cmx_1: Value<pallas::Base>,
+    cmx_2: Value<pallas::Base>,
+    cmx_3: Value<pallas::Base>,
+    cmx_4: Value<pallas::Base>,
+    gov_comm: Value<pallas::Base>,
+    vote_round_id: Value<pallas::Base>,
 }
 
 impl Circuit {
@@ -177,7 +193,32 @@ impl Circuit {
             rcm_signed: Value::known(rcm_signed),
             g_d_signed: Value::known(sender_address.g_d()),
             pk_d_signed: Value::known(*sender_address.pk_d()),
+            ..Default::default()
         }
+    }
+
+    /// Sets the rho-binding witness fields (condition 3).
+    ///
+    /// The rho of the signed note must equal
+    /// `Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)`,
+    /// binding the keystone signature to the exact notes being delegated,
+    /// the governance commitment, and the round.
+    pub fn with_rho_binding(
+        mut self,
+        cmx_1: pallas::Base,
+        cmx_2: pallas::Base,
+        cmx_3: pallas::Base,
+        cmx_4: pallas::Base,
+        gov_comm: pallas::Base,
+        vote_round_id: pallas::Base,
+    ) -> Self {
+        self.cmx_1 = Value::known(cmx_1);
+        self.cmx_2 = Value::known(cmx_2);
+        self.cmx_3 = Value::known(cmx_3);
+        self.cmx_4 = Value::known(cmx_4);
+        self.gov_comm = Value::known(gov_comm);
+        self.vote_round_id = Value::known(vote_round_id);
+        self
     }
 }
 
@@ -498,7 +539,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 g_d_signed.inner(),
                 pk_d_signed.inner(),
                 v_signed,
-                rho_signed,
+                rho_signed.clone(),
                 psi_signed,
                 rcm_signed,
             )?;
@@ -507,6 +548,50 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             derived_cm_signed.constrain_equal(
                 layouter.namespace(|| "cm_signed integrity"),
                 &cm_signed,
+            )?;
+        }
+
+        // Rho binding.
+        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+        // Binds the signed note to the exact notes being delegated, the governance
+        // commitment, and the round, making the keystone signature non-replayable.
+        {
+            let cmx_1 = assign_free_advice(
+                layouter.namespace(|| "witness cmx_1"), config.advices[0], self.cmx_1)?;
+            let cmx_2 = assign_free_advice(
+                layouter.namespace(|| "witness cmx_2"), config.advices[0], self.cmx_2)?;
+            let cmx_3 = assign_free_advice(
+                layouter.namespace(|| "witness cmx_3"), config.advices[0], self.cmx_3)?;
+            let cmx_4 = assign_free_advice(
+                layouter.namespace(|| "witness cmx_4"), config.advices[0], self.cmx_4)?;
+            let gov_comm = assign_free_advice(
+                layouter.namespace(|| "witness gov_comm"), config.advices[0], self.gov_comm)?;
+            let vote_round_id = assign_free_advice(
+                layouter.namespace(|| "witness vote_round_id"), config.advices[0], self.vote_round_id)?;
+
+            // Bind gov_comm and vote_round_id to the public inputs.
+            layouter.constrain_instance(gov_comm.cell(), config.primary, GOV_COMM)?;
+            layouter.constrain_instance(vote_round_id.cell(), config.primary, VOTE_ROUND_ID)?;
+
+            // Poseidon hash over 6 inputs using ConstantLength<6>.
+            let derived_rho = {
+                let poseidon_message = [cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id];
+                let poseidon_hasher = PoseidonHash::<
+                    pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<6>, 3, 2,
+                >::init(
+                    config.poseidon_chip(),
+                    layouter.namespace(|| "rho binding Poseidon init"),
+                )?;
+                poseidon_hasher.hash(
+                    layouter.namespace(|| "Poseidon(cmx_1..4, gov_comm, vote_round_id)"),
+                    poseidon_message,
+                )?
+            };
+
+            // Constrain: derived_rho == rho_signed.
+            layouter.assign_region(
+                || "rho binding equality",
+                |mut region| region.constrain_equal(derived_rho.cell(), rho_signed.cell()),
             )?;
         }
 
@@ -521,12 +606,26 @@ pub struct Instance {
     pub nf_signed: Nullifier,
     /// The randomized spend validating key, used for signature verification out-of-circuit.
     pub rk: VerificationKey<SpendAuth>,
+    /// The governance commitment (public input for rho binding, condition 3).
+    pub gov_comm: pallas::Base,
+    /// The vote round identifier (public input for rho binding, condition 3).
+    pub vote_round_id: pallas::Base,
 }
 
 impl Instance {
     /// Constructs an [`Instance`] from its constituent parts.
-    pub fn from_parts(nf_signed: Nullifier, rk: VerificationKey<SpendAuth>) -> Self {
-        Instance { nf_signed, rk }
+    pub fn from_parts(
+        nf_signed: Nullifier,
+        rk: VerificationKey<SpendAuth>,
+        gov_comm: pallas::Base,
+        vote_round_id: pallas::Base,
+    ) -> Self {
+        Instance {
+            nf_signed,
+            rk,
+            gov_comm,
+            vote_round_id,
+        }
     }
 
     /// Returns the public inputs as a vector of field elements for halo2.
@@ -537,7 +636,13 @@ impl Instance {
             .coordinates()
             .unwrap();
 
-        vec![self.nf_signed.0, *rk.x(), *rk.y()]
+        vec![
+            self.nf_signed.0,
+            *rk.x(),
+            *rk.y(),
+            self.gov_comm,
+            self.vote_round_id,
+        ]
     }
 }
 
@@ -546,36 +651,93 @@ mod tests {
     use super::*;
     use crate::{
         keys::{FullViewingKey, Scope, SpendValidatingKey, SpendingKey},
-        note::Note,
+        note::{commitment::ExtractedNoteCommitment, Note},
+        spec::rho_binding_hash,
     };
     use ff::Field;
     use halo2_proofs::{dev::MockProver, plonk::Circuit as Halo2Circuit};
     use rand::rngs::OsRng;
 
-    /// Helper: create a dummy note and its corresponding circuit + expected public inputs.
-    fn make_test_note() -> (Circuit, Nullifier, VerificationKey<SpendAuth>) {
+    /// Return value from [`make_test_note`] bundling all test artefacts.
+    struct TestNote {
+        circuit: Circuit,
+        nf: Nullifier,
+        rk: VerificationKey<SpendAuth>,
+        gov_comm: pallas::Base,
+        vote_round_id: pallas::Base,
+        cmx_1: pallas::Base,
+        cmx_2: pallas::Base,
+        cmx_3: pallas::Base,
+        cmx_4: pallas::Base,
+    }
+
+    /// Helper: create a dummy note whose rho is derived from the rho-binding hash,
+    /// along with the circuit, public inputs, and all intermediate values.
+    fn make_test_note() -> TestNote {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
+
+        // Create 4 dummy notes and extract cmx_i = ExtractP(cm_i).
+        let (_, _, note1) = Note::dummy(&mut rng, None);
+        let (_, _, note2) = Note::dummy(&mut rng, None);
+        let (_, _, note3) = Note::dummy(&mut rng, None);
+        let (_, _, note4) = Note::dummy(&mut rng, None);
+        let cmx_1 = ExtractedNoteCommitment::from(note1.commitment()).inner();
+        let cmx_2 = ExtractedNoteCommitment::from(note2.commitment()).inner();
+        let cmx_3 = ExtractedNoteCommitment::from(note3.commitment()).inner();
+        let cmx_4 = ExtractedNoteCommitment::from(note4.commitment()).inner();
+
+        // Random governance commitment and vote round id.
+        let gov_comm = pallas::Base::random(&mut rng);
+        let vote_round_id = pallas::Base::random(&mut rng);
+
+        // Derive rho from the binding hash.
+        let rho = rho_binding_hash(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id);
+
+        // Create the signed note with this rho.
+        let sk = SpendingKey::random(&mut rng);
+        let fvk: FullViewingKey = (&sk).into();
+        // Re-derive with the correct FVK so nullifier/address integrity hold.
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let note = Note::new(recipient, NoteValue::zero(), Nullifier(rho), &mut rng);
 
         let nf = note.nullifier(&fvk);
         let ak: SpendValidatingKey = fvk.clone().into();
         let alpha = pallas::Scalar::random(&mut rng);
         let rk = ak.randomize(&alpha);
-        let circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        let circuit = Circuit::from_note_unchecked(&fvk, &note, alpha)
+            .with_rho_binding(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id);
 
-        (circuit, nf, rk)
+        TestNote { circuit, nf, rk, gov_comm, vote_round_id, cmx_1, cmx_2, cmx_3, cmx_4 }
+    }
+
+    /// Helper to build an Instance from a TestNote.
+    fn make_instance(t: &TestNote) -> Instance {
+        Instance::from_parts(t.nf, t.rk.clone(), t.gov_comm, t.vote_round_id)
+    }
+
+    /// Helper to build an Instance from manually constructed test data.
+    /// Used by tests that bypass make_test_note() and need dummy rho-binding public inputs.
+    fn make_instance_manual(
+        nf: Nullifier,
+        rk: VerificationKey<SpendAuth>,
+    ) -> Instance {
+        // These tests don't exercise rho binding, so use dummy zero values.
+        // The circuit will still fail at the rho binding check since no
+        // rho binding witnesses are set, but the test is targeting a different
+        // constraint — the first failing constraint is what the test checks.
+        Instance::from_parts(nf, rk, pallas::Base::zero(), pallas::Base::zero())
     }
 
     #[test]
     fn nullifier_integrity_happy_path() {
-        let (circuit, nf, rk) = make_test_note();
+        let t = make_test_note();
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
 
         let prover = MockProver::run(
             K,
-            &circuit,
+            &t.circuit,
             vec![public_inputs],
         )
         .unwrap();
@@ -587,26 +749,22 @@ mod tests {
     fn nullifier_integrity_wrong_key() {
         let mut rng = OsRng;
 
-        // Create note with one key
-        let (_sk1, fvk1, note) = Note::dummy(&mut rng, None);
-        let alpha = pallas::Scalar::random(&mut rng);
-        let circuit = Circuit::from_note_unchecked(&fvk1, &note, alpha);
+        // Use make_test_note for a valid circuit, then supply wrong nf.
+        let t = make_test_note();
 
-        // Derive the correct rk from fvk1 (so spend authority passes)
-        let ak1: SpendValidatingKey = fvk1.clone().into();
-        let rk = ak1.randomize(&alpha);
-
-        // But derive the expected nullifier with a different key
+        // Derive the expected nullifier with a different key.
         let sk2 = SpendingKey::random(&mut rng);
         let fvk2: FullViewingKey = (&sk2).into();
-        let wrong_nf = note.nullifier(&fvk2);
+        // We need a note to derive a wrong nf. Create a dummy one and derive nf with fvk2.
+        let (_, _, dummy_note) = Note::dummy(&mut rng, None);
+        let wrong_nf = dummy_note.nullifier(&fvk2);
 
-        let instance = Instance::from_parts(wrong_nf, rk);
+        let instance = Instance::from_parts(wrong_nf, t.rk, t.gov_comm, t.vote_round_id);
         let public_inputs = instance.to_halo2_instance();
 
         let prover = MockProver::run(
             K,
-            &circuit,
+            &t.circuit,
             vec![public_inputs],
         )
         .unwrap();
@@ -618,14 +776,14 @@ mod tests {
     #[test]
     fn nullifier_integrity_dummy_note() {
         // A dummy note (value = 0) should work identically.
-        let (circuit, nf, rk) = make_test_note();
+        let t = make_test_note();
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
 
         let prover = MockProver::run(
             K,
-            &circuit,
+            &t.circuit,
             vec![public_inputs],
         )
         .unwrap();
@@ -636,25 +794,22 @@ mod tests {
     #[test]
     fn spend_authority_wrong_rk() {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
+        let t = make_test_note();
 
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
+        // Compute rk with a different alpha
+        let ak: SpendValidatingKey = {
+            let sk = SpendingKey::random(&mut rng);
+            let fvk: FullViewingKey = (&sk).into();
+            fvk.into()
+        };
+        let wrong_rk = ak.randomize(&pallas::Scalar::random(&mut rng));
 
-        // Build the circuit with one alpha
-        let alpha_circuit = pallas::Scalar::random(&mut rng);
-        let circuit = Circuit::from_note_unchecked(&fvk, &note, alpha_circuit);
-
-        // But compute rk with a different alpha
-        let alpha_wrong = pallas::Scalar::random(&mut rng);
-        let wrong_rk = ak.randomize(&alpha_wrong);
-
-        let instance = Instance::from_parts(nf, wrong_rk);
+        let instance = Instance::from_parts(t.nf, wrong_rk, t.gov_comm, t.vote_round_id);
         let public_inputs = instance.to_halo2_instance();
 
         let prover = MockProver::run(
             K,
-            &circuit,
+            &t.circuit,
             vec![public_inputs],
         )
         .unwrap();
@@ -665,31 +820,27 @@ mod tests {
 
     #[test]
     fn address_integrity_happy_path() {
-        let (circuit, nf, rk) = make_test_note();
+        let t = make_test_note();
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
 
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
     }
 
     #[test]
     fn address_integrity_wrong_rivk() {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let mut circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
         // Replace rivk with a different key's rivk
         let sk2 = SpendingKey::random(&mut rng);
         let fvk2: FullViewingKey = (&sk2).into();
         circuit.rivk = Value::known(fvk2.rivk(Scope::External));
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -698,12 +849,8 @@ mod tests {
     #[test]
     fn address_integrity_wrong_pk_d() {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let mut circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
         // Replace pk_d with a different key's pk_d
         let sk2 = SpendingKey::random(&mut rng);
@@ -711,7 +858,7 @@ mod tests {
         let other_address = fvk2.address_at(0u32, Scope::External);
         circuit.pk_d_signed = Value::known(*other_address.pk_d());
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -719,22 +866,18 @@ mod tests {
 
     #[test]
     fn note_commit_integrity_happy_path() {
-        let (circuit, nf, rk) = make_test_note();
-        let instance = Instance::from_parts(nf, rk);
+        let t = make_test_note();
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
     }
 
     #[test]
     fn note_commit_integrity_wrong_rcm() {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let mut circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
         // Replace rcm_signed with a different note's rcm (wrong trapdoor)
         let (_sk2, _fvk2, note2) = Note::dummy(&mut rng, None);
@@ -742,7 +885,7 @@ mod tests {
         let wrong_rcm = note2.rseed().rcm(&rho2);
         circuit.rcm_signed = Value::known(wrong_rcm);
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -751,18 +894,13 @@ mod tests {
     #[test]
     fn note_commit_integrity_wrong_cm() {
         let mut rng = OsRng;
-        let (_sk1, fvk1, note1) = Note::dummy(&mut rng, None);
-        let (_sk2, _fvk2, note2) = Note::dummy(&mut rng, None);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
-        // Build circuit from note1 but use note2's commitment
-        let nf = note1.nullifier(&fvk1);
-        let ak: SpendValidatingKey = fvk1.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let mut circuit = Circuit::from_note_unchecked(&fvk1, &note1, alpha);
+        let (_sk2, _fvk2, note2) = Note::dummy(&mut rng, None);
         circuit.cm_signed = Value::known(note2.commitment());
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -777,17 +915,13 @@ mod tests {
     #[test]
     fn wrong_rho_signed_witness() {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let mut circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
-        // Tamper rho_signed — feeds into both nullifier derivation and note commitment.
+        // Tamper rho_signed — feeds into nullifier derivation, note commitment, AND rho binding.
         circuit.rho_signed = Value::known(pallas::Base::random(&mut rng));
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -796,17 +930,13 @@ mod tests {
     #[test]
     fn wrong_psi_signed_witness() {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let mut circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
         // Tamper psi_signed — feeds into both nullifier derivation and note commitment.
         circuit.psi_signed = Value::known(pallas::Base::random(&mut rng));
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -815,22 +945,16 @@ mod tests {
     #[test]
     fn wrong_g_d_signed_witness() {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let mut circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
         // Replace g_d_signed with a different key's diversified generator.
-        // g_d feeds into both address integrity ([ivk] * g_d = pk_d) and
-        // note commitment (NoteCommit includes repr(g_d)).
         let sk2 = SpendingKey::random(&mut rng);
         let fvk2: FullViewingKey = (&sk2).into();
         let other_address = fvk2.address_at(0u32, Scope::External);
         circuit.g_d_signed = Value::known(other_address.g_d());
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -839,21 +963,15 @@ mod tests {
     #[test]
     fn wrong_ak_witness() {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let mut circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
         // Replace ak with a different key's ak.
-        // ak feeds into both spend authority (rk = [alpha]*G + ak) and
-        // address integrity (ivk = CommitIvk(ExtractP(ak), nk, rivk)).
         let sk2 = SpendingKey::random(&mut rng);
         let fvk2: FullViewingKey = (&sk2).into();
         circuit.ak = Value::known(fvk2.clone().into());
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -862,22 +980,15 @@ mod tests {
     #[test]
     fn wrong_nk_witness() {
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let mut circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
         // Replace nk with a different key's nk.
-        // nk feeds into both nullifier derivation and CommitIvk for address integrity.
-        // This is the "attacker knows the correct public inputs but tries to prove with wrong nk"
-        // scenario — more realistic than nullifier_integrity_wrong_key which tampers the public input.
         let sk2 = SpendingKey::random(&mut rng);
         let fvk2: FullViewingKey = (&sk2).into();
         circuit.nk = Value::known(*fvk2.nk());
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -892,21 +1003,9 @@ mod tests {
 
     #[test]
     fn cross_constraint_ak_binds_spend_authority_and_address_integrity() {
-        // If ak were not shared, an attacker could satisfy spend authority with ak1
-        // (matching rk) and address integrity with ak2 (matching ivk/pk_d).
-        // With shared ak, both constraints must agree — so wrong ak must fail BOTH.
-        //
-        // We construct a scenario where ak2 would satisfy address integrity
-        // (by using fvk2's rivk, g_d, pk_d) but the rk public input was derived
-        // from ak1. The circuit should still fail because it uses a single ak cell.
         let mut rng = OsRng;
-        let (_sk1, fvk1, note1) = Note::dummy(&mut rng, None);
-        let nf = note1.nullifier(&fvk1);
-        let ak1: SpendValidatingKey = fvk1.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak1.randomize(&alpha); // rk derived from ak1
-
-        let mut circuit = Circuit::from_note_unchecked(&fvk1, &note1, alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
         // Swap in ak from a different key — breaks spend authority
         // even if we also swap rivk/g_d/pk_d to make address integrity
@@ -919,7 +1018,7 @@ mod tests {
         circuit.g_d_signed = Value::known(addr2.g_d());
         circuit.pk_d_signed = Value::known(*addr2.pk_d());
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -927,31 +1026,21 @@ mod tests {
 
     #[test]
     fn cross_constraint_rho_binds_nullifier_and_note_commit() {
-        // rho is used in both DeriveNullifier and NoteCommit. If they could
-        // diverge, an attacker could use rho1 for nullifier (matching nf) and
-        // rho2 for NoteCommit (matching cm). Verify the shared binding rejects this.
         let mut rng = OsRng;
-        let (_sk, fvk, note) = Note::dummy(&mut rng, None);
-        let nf = note.nullifier(&fvk);
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
 
         // Build a second note to get a different rho/commitment pair
         let (_sk2, _fvk2, note2) = Note::dummy(&mut rng, None);
 
-        // Construct circuit from note1 but inject note2's rho and cm.
-        // If rho were split, the prover could route note2's rho to NoteCommit
-        // and note1's rho to DeriveNullifier. Shared cell prevents this.
-        let mut circuit = Circuit::from_note_unchecked(&fvk, &note, alpha);
+        // Inject note2's rho and cm into the circuit.
         let rho2 = note2.rho();
         circuit.rho_signed = Value::known(rho2.0);
         circuit.psi_signed = Value::known(note2.rseed().psi(&rho2));
         circuit.rcm_signed = Value::known(note2.rseed().rcm(&rho2));
         circuit.cm_signed = Value::known(note2.commitment());
-        // g_d and pk_d still from note1's address — NoteCommit will mismatch.
 
-        let instance = Instance::from_parts(nf, rk);
+        let instance = make_instance(&t);
         let public_inputs = instance.to_halo2_instance();
         let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
@@ -963,16 +1052,14 @@ mod tests {
 
     #[test]
     fn multiple_independent_notes_verify() {
-        // Two independent notes should each produce valid proofs.
-        // Verifies that the circuit is properly parameterised and stateless.
-        let (circuit1, nf1, rk1) = make_test_note();
-        let (circuit2, nf2, rk2) = make_test_note();
+        let t1 = make_test_note();
+        let t2 = make_test_note();
 
-        let pi1 = Instance::from_parts(nf1, rk1).to_halo2_instance();
-        let pi2 = Instance::from_parts(nf2, rk2).to_halo2_instance();
+        let pi1 = make_instance(&t1).to_halo2_instance();
+        let pi2 = make_instance(&t2).to_halo2_instance();
 
-        let prover1 = MockProver::run(K, &circuit1, vec![pi1]).unwrap();
-        let prover2 = MockProver::run(K, &circuit2, vec![pi2]).unwrap();
+        let prover1 = MockProver::run(K, &t1.circuit, vec![pi1]).unwrap();
+        let prover2 = MockProver::run(K, &t2.circuit, vec![pi2]).unwrap();
 
         assert_eq!(prover1.verify(), Ok(()));
         assert_eq!(prover2.verify(), Ok(()));
@@ -980,55 +1067,107 @@ mod tests {
 
     #[test]
     fn swapped_public_inputs_fail() {
-        // Swapping the public inputs between two valid circuits should fail.
-        // Guards against confused-deputy scenarios.
-        let (circuit1, nf1, rk1) = make_test_note();
-        let (_circuit2, nf2, rk2) = make_test_note();
+        let t1 = make_test_note();
+        let t2 = make_test_note();
 
-        // Feed circuit1 the public inputs of circuit2
-        let wrong_pi = Instance::from_parts(nf2, rk2).to_halo2_instance();
-        let prover = MockProver::run(K, &circuit1, vec![wrong_pi]).unwrap();
+        // Feed t1's circuit the public inputs of t2
+        let wrong_pi = make_instance(&t2).to_halo2_instance();
+        let prover = MockProver::run(K, &t1.circuit, vec![wrong_pi]).unwrap();
         assert!(prover.verify().is_err());
 
         // And vice versa
-        let wrong_pi = Instance::from_parts(nf1, rk1).to_halo2_instance();
-        let prover = MockProver::run(K, &_circuit2, vec![wrong_pi]).unwrap();
+        let wrong_pi = make_instance(&t1).to_halo2_instance();
+        let prover = MockProver::run(K, &t2.circuit, vec![wrong_pi]).unwrap();
         assert!(prover.verify().is_err());
     }
 
     #[test]
     fn instance_to_halo2_roundtrip() {
-        // Verify that to_halo2_instance produces the expected three-element vector
-        // [nf, rk.x, rk.y] and that the values are consistent with the inputs.
-        let (_, nf, rk) = make_test_note();
-        let instance = Instance::from_parts(nf, rk.clone());
+        let t = make_test_note();
+        let instance = make_instance(&t);
         let pi = instance.to_halo2_instance();
 
-        assert_eq!(pi.len(), 3, "Expected exactly 3 public inputs (nf, rk.x, rk.y)");
-        assert_eq!(pi[NF_SIGNED], nf.0, "First element must be nf");
+        assert_eq!(pi.len(), 5, "Expected exactly 5 public inputs (nf, rk.x, rk.y, gov_comm, vote_round_id)");
+        assert_eq!(pi[NF_SIGNED], t.nf.0, "First element must be nf");
 
         // Reconstruct rk coordinates independently and compare.
-        let rk_point = pallas::Point::from_bytes(&rk.into())
+        let rk_point = pallas::Point::from_bytes(&t.rk.into())
             .unwrap()
             .to_affine()
             .coordinates()
             .unwrap();
         assert_eq!(pi[RK_X], *rk_point.x(), "Second element must be rk.x");
         assert_eq!(pi[RK_Y], *rk_point.y(), "Third element must be rk.y");
+        assert_eq!(pi[GOV_COMM], t.gov_comm, "Fourth element must be gov_comm");
+        assert_eq!(pi[VOTE_ROUND_ID], t.vote_round_id, "Fifth element must be vote_round_id");
     }
 
     #[test]
     fn default_circuit_is_consistent_with_without_witnesses() {
-        // Verify that without_witnesses() returns a default circuit,
-        // and that the default circuit can be used for keygen (configure + FloorPlanner)
-        // without panicking. halo2 relies on this for keygen_vk / keygen_pk.
-        let (circuit, _, _) = make_test_note();
-        let empty = Halo2Circuit::without_witnesses(&circuit);
+        let t = make_test_note();
+        let empty = Halo2Circuit::without_witnesses(&t.circuit);
 
-        // The default circuit should be able to produce verification keys.
-        // This is the same codepath halo2 uses during keygen.
         let params = halo2_proofs::poly::commitment::Params::<vesta::Affine>::new(K);
         let vk = halo2_proofs::plonk::keygen_vk(&params, &empty);
         assert!(vk.is_ok(), "keygen_vk must succeed on without_witnesses circuit");
+    }
+
+    // ================================================================
+    // Rho binding tests (condition 3).
+    // ================================================================
+
+    #[test]
+    fn rho_binding_happy_path() {
+        let t = make_test_note();
+        let instance = make_instance(&t);
+        let public_inputs = instance.to_halo2_instance();
+
+        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
+        assert_eq!(prover.verify(), Ok(()));
+    }
+
+    #[test]
+    fn rho_binding_wrong_cmx() {
+        let mut rng = OsRng;
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
+
+        // Tamper with cmx_1 in the witness. The Poseidon hash will produce
+        // a different value than rho_signed, so the equality constraint fails.
+        circuit.cmx_1 = Value::known(pallas::Base::random(&mut rng));
+
+        let instance = make_instance(&t);
+        let public_inputs = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn rho_binding_wrong_gov_comm_public_input() {
+        let mut rng = OsRng;
+        let t = make_test_note();
+
+        // Supply a different gov_comm in the public instance while the circuit
+        // witness has the correct gov_comm. The constrain_instance on gov_comm will fail.
+        let wrong_gov_comm = pallas::Base::random(&mut rng);
+        let instance = Instance::from_parts(t.nf, t.rk, wrong_gov_comm, t.vote_round_id);
+        let public_inputs = instance.to_halo2_instance();
+
+        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn rho_binding_wrong_vote_round_id() {
+        let mut rng = OsRng;
+        let t = make_test_note();
+
+        // Supply a different vote_round_id in the public instance.
+        let wrong_vote_round_id = pallas::Base::random(&mut rng);
+        let instance = Instance::from_parts(t.nf, t.rk, t.gov_comm, wrong_vote_round_id);
+        let public_inputs = instance.to_halo2_instance();
+
+        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
+        assert!(prover.verify().is_err());
     }
 }

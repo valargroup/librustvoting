@@ -5,6 +5,9 @@
 - Public
    * **nf_signed**: a unique, deterministic identifier derived from a note's secret components that publicly marks the note as spent.
    * **rk**: the randomized public key for spend authorization. Derived per-transaction, publicly exposed, unlinkable, paired with `rsk` - the private key
+   * **gov_comm**: the governance commitment — a Pallas base field element identifying the governance context (e.g., a particular DAO or proposal framework). Scopes the delegation proof to a specific governance domain, preventing cross-governance replay.
+   * **vote_round_id**: the vote round identifier — a Pallas base field element identifying the specific voting round or epoch. Prevents cross-round replay: a keystone signature for round N cannot be reused in round N+1.
+
 - Private
    * **ρ** "rho": The nullifier of the note that was spent to create the signed note
    * **ψ** ("psi"): A pseudorandom field element derived from the note's random seed `rseed` and its nullifier domain separator rho
@@ -16,6 +19,7 @@
    * **rcm_signed**: the note commitment trapdoor (randomness). A scalar derived from `rseed` and `rho` that blinds the commitment.
    * **g_d_signed**: the diversified generator from the note recipient's address
    * **pk_d_signed**: the diversified transmission key from the note recipient's address
+   * **cmx_1, cmx_2, cmx_3, cmx_4**: the extracted note commitments (`ExtractP(cm_i)`) of the four notes being delegated. Each is a Pallas base field element (x-coordinate of the commitment point). Hashed together with `gov_comm` and `vote_round_id` to produce `rho_signed` in condition 3. Currently free witnesses; a future condition (condition 10) will derive them in-circuit.
 
 ## 1. Signed Note Commitment Integrity
 
@@ -91,7 +95,26 @@ DeriveNullifier_nk(ρ, ψ, cm) = ExtractP(
 - **Why not expose nf_old publicly?**
    * In standard Orchard, the nullifier is published to prevent double-spending. In this delegation circuit, nf_old is not directly exposed as a public input. Instead, it is checked against the exclusion interval and a domain nullifier is published instead. The standard nullifier stays hidden.
 
-## 3. Spend Authority
+## 3. Rho Binding
+
+Purpose: the signed note's rho is bound to the exact notes being delegated, the governance commitment, and the round. This is what makes the keystone signature non-replayable and scoped.
+
+```
+rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+```
+
+Where
+- **cmx_1, cmx_2, cmx_3, cmx_4**: The extracted note commitments (`ExtractP(cm_i)`) of the four notes being delegated. Each `cmx_i` is a Pallas base field element — the x-coordinate of the corresponding note's commitment point. By hashing all four commitments into rho, the keystone signature is bound to the exact set of notes the delegator chose. Tampering with any single commitment changes the hash and invalidates the proof. Currently witnessed as free private inputs; a future condition (condition 10) will derive them in-circuit from the actual note data.
+- **gov_comm**: The governance commitment — a Pallas base field element identifying the governance context.
+- **vote_round_id**: The vote round identifier — a Pallas base field element identifying the specific voting round or epoch.
+
+**Function:** `Poseidon` with `ConstantLength<6>`
+
+Uses the same `Pow5Chip` / `P128Pow5T3` construction as the nullifier derivation, but with 6 inputs instead of 2. With rate 2, the sponge absorbs 2 elements per permutation round (3 absorption rounds for 6 inputs). The domain separator includes the input length, providing proper cryptographic separation from other Poseidon uses in the circuit.
+
+**Constraint:** The circuit computes `derived_rho = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)` and enforces strict equality `derived_rho == rho_signed`. Since `rho_signed` is the same value used in both note commitment integrity (condition 1) and nullifier integrity (condition 2), this creates a three-way binding: the nullifier, the note commitment, and the delegation scope are all tied to the same rho.
+
+## 4. Spend Authority
 
 Purpose: proves spending authority while preserving unlinkability. Links to the Keystone spend-auth signature out-of-circuit.
 - Only the holder of `ask` can produce `rsk = ask + alpha` and sign under `rk`, proving they are authorized to spend the note.
@@ -109,7 +132,7 @@ Where:
 
 Spend Authority: i.e. `rk = ak + [alpha] * G` — the public `rk` is a valid rerandomization of `ak`. Links to the Keystone signature verified out-of-circuit.
 
-## 4. Diversified Address Integrity
+## 5. Diversified Address Integrity
 
 Purpose: proves the signed note's address belongs to the same key material `(ak, nk)`. This is where `ivk` is established — it will be reused for every real note ownership check.
 
