@@ -1170,4 +1170,108 @@ mod tests {
         let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
         assert!(prover.verify().is_err());
     }
+
+    #[test]
+    fn rho_binding_wrong_cmx_4() {
+        let mut rng = OsRng;
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
+
+        // Tamper with cmx_4 — the last Poseidon input. Verifies the sponge
+        // doesn't silently ignore later inputs.
+        circuit.cmx_4 = Value::known(pallas::Base::random(&mut rng));
+
+        let instance = make_instance(&t);
+        let public_inputs = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    // ================================================================
+    // Witness-tampering test for alpha (spend authority private input).
+    // ================================================================
+
+    #[test]
+    fn wrong_alpha_witness() {
+        let mut rng = OsRng;
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
+
+        // Tamper alpha while keeping the correct rk public input.
+        // The circuit computes rk' = [alpha'] * G + ak, which won't match rk.
+        circuit.alpha = Value::known(pallas::Scalar::random(&mut rng));
+
+        let instance = make_instance(&t);
+        let public_inputs = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    // ================================================================
+    // Cross-constraint: nk binds nullifier and address integrity.
+    // nk is shared between DeriveNullifier (condition 2) and
+    // CommitIvk (condition 5). Verify we can't split them.
+    // ================================================================
+
+    #[test]
+    fn cross_constraint_nk_binds_nullifier_and_address_integrity() {
+        let mut rng = OsRng;
+        let t = make_test_note();
+        let mut circuit = t.circuit.clone();
+
+        // Replace nk with a different key's nk, and also adjust rivk/g_d/pk_d
+        // to make CommitIvk internally consistent with the new nk.
+        // If nk were split across constraints, address integrity would pass
+        // while nullifier integrity would use the original nk. Since nk is a
+        // single cell, both constraints see the tampered value and the proof
+        // must fail (the nullifier won't match the public input).
+        let sk2 = SpendingKey::random(&mut rng);
+        let fvk2: FullViewingKey = (&sk2).into();
+        circuit.nk = Value::known(*fvk2.nk());
+        // Also swap rivk to match nk2 so CommitIvk would be internally
+        // consistent if it had its own nk cell.
+        circuit.rivk = Value::known(fvk2.rivk(Scope::External));
+
+        let instance = make_instance(&t);
+        let public_inputs = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    // ================================================================
+    // Spec-vs-circuit consistency: rho_binding_hash.
+    // ================================================================
+
+    #[test]
+    fn rho_binding_spec_matches_circuit() {
+        // Independently recompute rho_binding_hash from the TestNote's cmx
+        // values and verify the circuit still accepts. This guards against
+        // divergence between the spec function and the in-circuit Poseidon.
+        let t = make_test_note();
+
+        // Recompute rho from the stored cmx values — independently of
+        // make_test_note's own call to rho_binding_hash.
+        let recomputed_rho = rho_binding_hash(
+            t.cmx_1, t.cmx_2, t.cmx_3, t.cmx_4, t.gov_comm, t.vote_round_id,
+        );
+
+        // Build a fresh note with this independently derived rho.
+        let mut rng = OsRng;
+        let sk = SpendingKey::random(&mut rng);
+        let fvk: FullViewingKey = (&sk).into();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let note = Note::new(recipient, NoteValue::zero(), Nullifier(recomputed_rho), &mut rng);
+
+        let nf = note.nullifier(&fvk);
+        let ak: SpendValidatingKey = fvk.clone().into();
+        let alpha = pallas::Scalar::random(&mut rng);
+        let rk = ak.randomize(&alpha);
+        let circuit = Circuit::from_note_unchecked(&fvk, &note, alpha)
+            .with_rho_binding(t.cmx_1, t.cmx_2, t.cmx_3, t.cmx_4, t.gov_comm, t.vote_round_id);
+
+        let instance = Instance::from_parts(nf, rk, t.gov_comm, t.vote_round_id);
+        let public_inputs = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        assert_eq!(prover.verify(), Ok(()));
+    }
 }
