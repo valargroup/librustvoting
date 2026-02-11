@@ -7,86 +7,160 @@ struct ProposalDetailView: View {
     let store: StoreOf<Voting>
     let proposal: Proposal
 
+    private let impactFeedback = UIImpactFeedbackGenerator(style: .light)
+
     var body: some View {
         WithPerceptionTracking {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    // Header
-                    VStack(alignment: .leading, spacing: 8) {
-                        if let zip = proposal.zipNumber {
-                            ZIPBadge(zipNumber: zip)
+            VStack(spacing: 0) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        // Header
+                        VStack(alignment: .leading, spacing: 8) {
+                            if let zip = proposal.zipNumber {
+                                ZIPBadge(zipNumber: zip)
+                            }
+
+                            Text(proposal.title)
+                                .zFont(.semiBold, size: 22, style: Design.Text.primary)
+
+                            Text(proposal.description)
+                                .zFont(.regular, size: 15, style: Design.Text.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        Text(proposal.title)
-                            .zFont(.semiBold, size: 22, style: Design.Text.primary)
-
-                        Text(proposal.description)
-                            .zFont(.regular, size: 15, style: Design.Text.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    // Forum link
-                    if let url = proposal.forumURL {
-                        Link(destination: url) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "bubble.left.and.text.bubble.right")
-                                    .font(.caption)
-                                Text("View Forum Discussion")
-                                    .zFont(.medium, size: 14, style: Design.Text.link)
+                        // Forum link
+                        if let url = proposal.forumURL {
+                            Link(destination: url) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "bubble.left.and.text.bubble.right")
+                                        .font(.caption)
+                                    Text("View Forum Discussion")
+                                        .zFont(.medium, size: 14, style: Design.Text.link)
+                                }
                             }
                         }
+
+                        Spacer().frame(height: 8)
+
+                        // Vote buttons
+                        VStack(spacing: 12) {
+                            let currentVote = store.votes[proposal.id]
+
+                            voteButton(
+                                title: "Support",
+                                icon: "hand.thumbsup.fill",
+                                color: .green,
+                                isSelected: currentVote == .support
+                            ) {
+                                store.send(.castVote(proposalId: proposal.id, choice: .support))
+                            }
+
+                            voteButton(
+                                title: "Oppose",
+                                icon: "hand.thumbsdown.fill",
+                                color: .red,
+                                isSelected: currentVote == .oppose
+                            ) {
+                                store.send(.castVote(proposalId: proposal.id, choice: .oppose))
+                            }
+
+                            voteButton(
+                                title: "Skip",
+                                icon: "forward.fill",
+                                color: .gray,
+                                isSelected: currentVote == .skip
+                            ) {
+                                store.send(.castVote(proposalId: proposal.id, choice: .skip))
+                            }
+                        }
+
+                        Spacer()
                     }
-
-                    Spacer().frame(height: 8)
-
-                    // Vote buttons
-                    VStack(spacing: 12) {
-                        let currentVote = store.votes[proposal.id]
-
-                        voteButton(
-                            title: "Support",
-                            icon: "hand.thumbsup.fill",
-                            color: .green,
-                            isSelected: currentVote == .support
-                        ) {
-                            store.send(.castVote(proposalId: proposal.id, choice: .support))
-                        }
-
-                        voteButton(
-                            title: "Oppose",
-                            icon: "hand.thumbsdown.fill",
-                            color: .red,
-                            isSelected: currentVote == .oppose
-                        ) {
-                            store.send(.castVote(proposalId: proposal.id, choice: .oppose))
-                        }
-
-                        voteButton(
-                            title: "Skip",
-                            icon: "forward.fill",
-                            color: .gray,
-                            isSelected: currentVote == .skip
-                        ) {
-                            store.send(.castVote(proposalId: proposal.id, choice: .skip))
-                        }
-                    }
-
-                    Spacer()
+                    .padding(.horizontal, 24)
+                    .padding(.top, 16)
                 }
-                .padding(.horizontal, 24)
-                .padding(.top, 16)
+
+                // Bottom prev/next navigation
+                proposalNavigationBar()
             }
-            .navigationTitle("Proposal")
+            .navigationTitle(positionLabel)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
                         store.send(.backToList)
                     } label: {
-                        Image(systemName: "chevron.left")
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.left")
+                            Text("List")
+                                .font(.system(size: 16))
+                        }
                     }
                 }
             }
+        }
+    }
+
+    private var positionLabel: String {
+        if let index = store.detailProposalIndex {
+            return "\(index + 1) of \(store.totalProposals)"
+        }
+        return "Proposal"
+    }
+
+    @ViewBuilder
+    private func proposalNavigationBar() -> some View {
+        let index = store.detailProposalIndex
+        let hasPrev = (index ?? 0) > 0
+        let hasNext = (index ?? 0) < store.totalProposals - 1
+
+        VStack(spacing: 0) {
+            Divider()
+
+            HStack {
+                Button {
+                    store.send(.previousProposalDetail)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left")
+                        Text("Prev")
+                    }
+                    .font(.system(size: 14, weight: .medium))
+                    .frame(minWidth: 44, minHeight: 44)
+                }
+                .disabled(!hasPrev)
+                .opacity(hasPrev ? 1 : 0.3)
+                .accessibilityLabel("Previous proposal")
+
+                Spacer()
+
+                Button {
+                    store.send(.backToList)
+                } label: {
+                    Image(systemName: "list.bullet")
+                        .font(.system(size: 16))
+                        .frame(minWidth: 44, minHeight: 44)
+                }
+                .accessibilityLabel("Back to proposal list")
+
+                Spacer()
+
+                Button {
+                    store.send(.nextProposalDetail)
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("Next")
+                        Image(systemName: "chevron.right")
+                    }
+                    .font(.system(size: 14, weight: .medium))
+                    .frame(minWidth: 44, minHeight: 44)
+                }
+                .disabled(!hasNext)
+                .opacity(hasNext ? 1 : 0.3)
+                .accessibilityLabel("Next proposal")
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
         }
     }
 
@@ -98,7 +172,10 @@ struct ProposalDetailView: View {
         isSelected: Bool,
         action: @escaping () -> Void
     ) -> some View {
-        Button(action: action) {
+        Button {
+            impactFeedback.impactOccurred()
+            action()
+        } label: {
             HStack {
                 Image(systemName: icon)
                 Text(title)

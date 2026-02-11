@@ -21,6 +21,9 @@ public struct Voting {
         public var votingWeight: UInt64
         public var isKeystoneUser: Bool
 
+        // Which proposal the bottom bar targets (radio selection on list)
+        public var selectedProposalId: String?
+
         // ZKP #1 (delegation) — runs in background
         public var delegationProofStatus: ProofStatus = .notStarted
 
@@ -60,9 +63,21 @@ public struct Voting {
             votingRound.proposals.first { votes[$0.id] == nil }?.id
         }
 
+        public var activeProposalId: String? {
+            selectedProposalId ?? nextUnvotedProposalId
+        }
+
         public var selectedProposal: Proposal? {
             if case .proposalDetail(let id) = currentScreen {
                 return votingRound.proposals.first { $0.id == id }
+            }
+            return nil
+        }
+
+        // Index of the proposal currently shown in detail
+        public var detailProposalIndex: Int? {
+            if case .proposalDetail(let id) = currentScreen {
+                return votingRound.proposals.firstIndex { $0.id == id }
             }
             return nil
         }
@@ -97,11 +112,15 @@ public struct Voting {
         case delegationProofFailed(String)
 
         // Proposal list
-        case proposalTapped(String)
+        case proposalTapped(String)       // open detail
+        case bottomBarNext
+        case bottomBarPrevious
 
         // Proposal detail
         case castVote(proposalId: String, choice: VoteChoice)
         case backToList
+        case nextProposalDetail
+        case previousProposalDetail
 
         // Vote review
         case reviewVotesTapped
@@ -160,7 +179,6 @@ public struct Voting {
             case .startDelegationProof:
                 state.delegationProofStatus = .generating(progress: 0)
                 return .run { send in
-                    // Simulate ZKP generation over ~4 seconds
                     for step in 1...8 {
                         try await Task.sleep(for: .milliseconds(500))
                         await send(.delegationProofProgress(Double(step) / 8.0))
@@ -182,7 +200,26 @@ public struct Voting {
 
             // MARK: - Proposal List
 
+            case .bottomBarNext:
+                let proposals = state.votingRound.proposals
+                if let currentId = state.activeProposalId,
+                   let idx = proposals.firstIndex(where: { $0.id == currentId }),
+                   idx + 1 < proposals.count {
+                    state.selectedProposalId = proposals[idx + 1].id
+                }
+                return .none
+
+            case .bottomBarPrevious:
+                let proposals = state.votingRound.proposals
+                if let currentId = state.activeProposalId,
+                   let idx = proposals.firstIndex(where: { $0.id == currentId }),
+                   idx > 0 {
+                    state.selectedProposalId = proposals[idx - 1].id
+                }
+                return .none
+
             case .proposalTapped(let id):
+                state.selectedProposalId = id
                 state.screenStack.append(.proposalDetail(id: id))
                 return .none
 
@@ -190,11 +227,51 @@ public struct Voting {
 
             case .castVote(let proposalId, let choice):
                 state.votes[proposalId] = choice
+
+                if case .proposalDetail = state.currentScreen {
+                    // Detail view: auto-advance to next unvoted
+                    if let nextId = nextUnvotedId(after: proposalId, in: state) {
+                        state.selectedProposalId = nextId
+                        state.screenStack.removeLast()
+                        state.screenStack.append(.proposalDetail(id: nextId))
+                    } else {
+                        // All voted, go back to list
+                        state.selectedProposalId = nil
+                        state.screenStack.removeLast()
+                    }
+                } else {
+                    // List view: auto-advance bottom bar to next unvoted
+                    if let nextId = nextUnvotedId(after: proposalId, in: state) {
+                        state.selectedProposalId = nextId
+                    } else {
+                        // All voted — clear selection to show review
+                        state.selectedProposalId = nil
+                    }
+                }
                 return .none
 
             case .backToList:
                 if case .proposalDetail = state.currentScreen {
                     state.screenStack.removeLast()
+                }
+                return .none
+
+            case .nextProposalDetail:
+                if let index = state.detailProposalIndex,
+                   index + 1 < state.votingRound.proposals.count {
+                    let nextId = state.votingRound.proposals[index + 1].id
+                    state.selectedProposalId = nextId
+                    state.screenStack.removeLast()
+                    state.screenStack.append(.proposalDetail(id: nextId))
+                }
+                return .none
+
+            case .previousProposalDetail:
+                if let index = state.detailProposalIndex, index > 0 {
+                    let prevId = state.votingRound.proposals[index - 1].id
+                    state.selectedProposalId = prevId
+                    state.screenStack.removeLast()
+                    state.screenStack.append(.proposalDetail(id: prevId))
                 }
                 return .none
 
@@ -214,7 +291,6 @@ public struct Voting {
                 return .run { [total = state.totalProposals] send in
                     for index in 0..<total {
                         await send(.submissionProgress(index, total))
-                        // Simulate per-proposal ZKP + submission
                         try await Task.sleep(for: .milliseconds(400))
                     }
                     try await Task.sleep(for: .milliseconds(300))
@@ -243,5 +319,15 @@ public struct Voting {
                 return .send(.dismissFlow)
             }
         }
+    }
+
+    // Find the next unvoted proposal after the given one (wrapping around)
+    private func nextUnvotedId(after proposalId: String, in state: State) -> String? {
+        let proposals = state.votingRound.proposals
+        guard let currentIndex = proposals.firstIndex(where: { $0.id == proposalId }) else { return nil }
+
+        // Look forward first, then wrap
+        return proposals[(currentIndex + 1)...].first { state.votes[$0.id] == nil }?.id
+            ?? proposals[..<currentIndex].first { state.votes[$0.id] == nil }?.id
     }
 }

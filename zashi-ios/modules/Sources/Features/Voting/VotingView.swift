@@ -11,9 +11,7 @@ public struct VotingView: View {
     public var body: some View {
         WithPerceptionTracking {
             screenView(for: store.currentScreen)
-                .id(store.screenStack.count)
-                .transition(.move(edge: .trailing))
-                .animation(.easeInOut(duration: 0.25), value: store.screenStack.count)
+                .animation(.easeInOut(duration: 0.25), value: store.selectedProposal?.id)
         }
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(true)
@@ -31,6 +29,8 @@ public struct VotingView: View {
         case .proposalDetail:
             if let proposal = store.selectedProposal {
                 ProposalDetailView(store: store, proposal: proposal)
+                    .id(proposal.id)
+                    .transition(.opacity)
             }
         case .voteReview:
             VoteReviewView(store: store)
