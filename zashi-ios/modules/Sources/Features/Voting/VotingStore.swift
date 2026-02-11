@@ -56,6 +56,10 @@ public struct Voting {
             allVoted && isDelegationReady
         }
 
+        public var nextUnvotedProposalId: String? {
+            votingRound.proposals.first { votes[$0.id] == nil }?.id
+        }
+
         public var selectedProposal: Proposal? {
             if case .proposalDetail(let id) = currentScreen {
                 return votingRound.proposals.first { $0.id == id }
