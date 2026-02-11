@@ -42,6 +42,14 @@ version = "0.10.2"
 #rev = "e2fe0b8d386fad99e00d6135c5caf3cc04045646"
 features = [ "transparent-inputs" ]
 
+[[bin]]
+name = "ingest-nfs"
+path = "src/bin/ingest_nfs.rs"
+
+[[bin]]
+name = "test-non-inclusion"
+path = "src/bin/test_non_inclusion.rs"
+
 [patch.crates-io]
 #orchard = { path = "../../../ywallet/orchard" }
 orchard = {git = "https://github.com/hhanh00/orchard.git", rev="768c365"}
