@@ -1,1 +1,4 @@
 zallyd
+
+# Rust build artifacts
+circuits/target/

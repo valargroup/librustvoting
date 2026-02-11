@@ -1,7 +1,7 @@
 BINARY = zallyd
 HOME_DIR = $(HOME)/.zallyd
 
-.PHONY: install init start clean build fmt lint test test-unit test-integration
+.PHONY: install init start clean build fmt lint test test-unit test-integration circuits fixtures test-halo2
 
 ## install: Build and install the zallyd binary to $GOPATH/bin
 install:
@@ -40,5 +40,25 @@ test-unit:
 test-integration:
 	go test -count=1 -race -timeout 5m ./app/...
 
-## test: Run all tests
+## test: Run all tests (Go only, no Rust dependency)
 test: test-unit test-integration
+
+# ---------------------------------------------------------------------------
+# Halo2 / Rust circuit targets
+# ---------------------------------------------------------------------------
+
+## circuits: Build the Rust static library (requires cargo)
+circuits:
+	cargo build --release --manifest-path circuits/Cargo.toml
+
+## circuits-test: Run Rust circuit unit tests
+circuits-test:
+	cargo test --release --manifest-path circuits/Cargo.toml
+
+## fixtures: Regenerate proof fixture files in crypto/zkp/testdata/ (requires circuits build)
+fixtures: circuits
+	cargo test --release --manifest-path circuits/Cargo.toml -- generate_fixtures --ignored --nocapture
+
+## test-halo2: Run Go tests that use real Halo2 verification via CGo (requires circuits)
+test-halo2: circuits
+	go test -tags halo2 -count=1 -v ./crypto/zkp/halo2/...

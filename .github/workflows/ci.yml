@@ -48,3 +48,29 @@ jobs:
           go-version: "1.23"
       - name: Run integration tests
         run: make test-integration
+
+  test-halo2:
+    name: Halo2 ZKP Verification Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: circuits/target
+          key: ${{ runner.os }}-circuits-${{ hashFiles('circuits/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-circuits-
+      - name: Build Rust circuits library
+        run: make circuits
+      - name: Run Rust circuit tests
+        run: make circuits-test
+      - name: Run Go Halo2 verification tests
+        run: make test-halo2
