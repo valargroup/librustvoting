@@ -138,6 +138,13 @@ struct ProposalListView: View {
         let isNext = store.nextUnvotedProposalId == proposal.id
 
         VStack(alignment: .leading, spacing: 10) {
+            if isNext {
+                Text("UP NEXT")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(Design.Surfaces.brandPrimary.color(colorScheme))
+                    .padding(.bottom, -4)
+            }
+
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
                     if let zip = proposal.zipNumber {
@@ -168,13 +175,17 @@ struct ProposalListView: View {
                 .lineLimit(2)
         }
         .padding(16)
-        .background(Design.Surfaces.bgPrimary.color(colorScheme))
+        .background(
+            isNext
+                ? Design.Surfaces.brandPrimary.color(colorScheme).opacity(0.04)
+                : Design.Surfaces.bgPrimary.color(colorScheme)
+        )
         .clipShape(RoundedRectangle(cornerRadius: 16))
         .overlay(
             RoundedRectangle(cornerRadius: 16)
                 .stroke(
                     isNext
-                        ? Design.Surfaces.brandPrimary.color(colorScheme).opacity(0.5)
+                        ? Design.Surfaces.brandPrimary.color(colorScheme)
                         : vote != nil
                             ? voteColor(vote).opacity(0.3)
                             : Design.Surfaces.strokeSecondary.color(colorScheme),
@@ -183,6 +194,7 @@ struct ProposalListView: View {
         )
         .shadow(color: .black.opacity(0.04), radius: 2, x: 0, y: 1)
         .animation(.easeInOut(duration: 0.2), value: vote)
+        .animation(.easeInOut(duration: 0.2), value: isNext)
     }
 
     // MARK: - Components
