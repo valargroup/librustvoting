@@ -90,7 +90,7 @@ jobs:
         with:
           node-version: "20"
       - name: Build and install zallyd
-        run: make install
+        run: make install-ffi
       - name: Initialize chain
         run: bash scripts/init.sh
       - name: Enable REST API server
