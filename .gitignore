@@ -2,3 +2,6 @@ zallyd
 
 # Rust build artifacts
 circuits/target/
+
+# Node
+node_modules/

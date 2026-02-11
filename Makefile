@@ -1,7 +1,7 @@
 BINARY = zallyd
 HOME_DIR = $(HOME)/.zallyd
 
-.PHONY: install init start clean build fmt lint test test-unit test-integration test-api circuits fixtures test-halo2 test-halo2-ante test-redpallas test-redpallas-ante test-all-ffi
+.PHONY: install init start clean build fmt lint test test-unit test-integration test-api fixtures-ts circuits fixtures test-halo2 test-halo2-ante test-redpallas test-redpallas-ante test-all-ffi
 
 ## install: Build and install the zallyd binary to $GOPATH/bin
 install:
@@ -46,6 +46,12 @@ test: test-unit test-integration
 ## test-api: TypeScript API tests against a running chain (requires: make start)
 test-api:
 	cd tests/api && npm test
+
+## fixtures-ts: Copy Halo2 proof fixtures into TS test directory (requires: make fixtures)
+fixtures-ts: fixtures
+	mkdir -p tests/api/fixtures
+	cp crypto/zkp/testdata/toy_valid_proof.bin tests/api/fixtures/
+	cp crypto/zkp/testdata/toy_valid_input.bin tests/api/fixtures/
 
 # ---------------------------------------------------------------------------
 # Rust circuit / FFI targets

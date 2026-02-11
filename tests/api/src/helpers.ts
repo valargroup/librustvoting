@@ -1,0 +1,272 @@
+/**
+ * Shared helpers for Zally API tests.
+ *
+ * - BASE_URL: the Cosmos SDK API server (default http://localhost:1318)
+ * - deriveRoundId: replicates the on-chain Blake2b-256 round ID derivation
+ * - makeSetupRoundPayload / makeDelegationPayload: build valid JSON bodies
+ * - getRealProofFixtures: loads real Halo2 toy proof + public input from disk
+ */
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { blake2b } from "@noble/hashes/blake2b";
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+export const BASE_URL = process.env.ZALLY_API_URL ?? "http://localhost:1318";
+
+// ---------------------------------------------------------------------------
+// Byte encoding helpers
+// ---------------------------------------------------------------------------
+
+/** Create a Uint8Array of `len` bytes all set to `fill`. */
+export function repeatByte(fill: number, len: number): Uint8Array {
+  return new Uint8Array(len).fill(fill);
+}
+
+/** Encode a Uint8Array to standard base64 (Go's encoding/json default). */
+export function toBase64(bytes: Uint8Array): string {
+  // Node 18+ Buffer is available
+  return Buffer.from(bytes).toString("base64");
+}
+
+/** Decode a hex string to Uint8Array. */
+export function fromHex(hex: string): Uint8Array {
+  return Buffer.from(hex, "hex");
+}
+
+/** Encode a Uint8Array to hex string. */
+export function toHex(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString("hex");
+}
+
+// ---------------------------------------------------------------------------
+// Proof fixture loading
+// ---------------------------------------------------------------------------
+
+const FIXTURES_DIR = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "fixtures",
+);
+
+/** Read a binary fixture file from tests/api/fixtures/. */
+export function loadFixture(name: string): Uint8Array {
+  return new Uint8Array(readFileSync(path.join(FIXTURES_DIR, name)));
+}
+
+// Lazy-loaded real Halo2 proof + public input (toy circuit: 7 * a^2 * b^2 = c).
+let _realProof: Uint8Array | null = null;
+let _realInput: Uint8Array | null = null;
+let _fixturesAvailable: boolean | null = null;
+
+/**
+ * Load the real Halo2 toy proof fixtures from disk.
+ * Returns { proof, publicInput } if the fixture files exist, or null if they
+ * are missing (e.g. `make fixtures` has not been run).
+ *
+ * The publicInput is the 32-byte LE Pallas Fp encoding of c=252 (a=2, b=3).
+ * It is used as the `rk` field in MsgRegisterDelegation, since the toy
+ * circuit's VerifyDelegation uses inputs.Rk as the public input.
+ */
+export function getRealProofFixtures(): {
+  proof: Uint8Array;
+  publicInput: Uint8Array;
+} | null {
+  if (_fixturesAvailable === false) return null;
+  if (_realProof && _realInput) {
+    return { proof: _realProof, publicInput: _realInput };
+  }
+  try {
+    _realProof = loadFixture("toy_valid_proof.bin");
+    _realInput = loadFixture("toy_valid_input.bin");
+    _fixturesAvailable = true;
+    return { proof: _realProof, publicInput: _realInput };
+  } catch {
+    _fixturesAvailable = false;
+    console.warn(
+      "[zally-api-tests] Halo2 fixture files not found in tests/api/fixtures/. " +
+        "Falling back to mock proof data. Run `make fixtures-ts` to generate real fixtures.",
+    );
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Round ID derivation (mirrors deriveRoundID in keeper/msg_server.go)
+// ---------------------------------------------------------------------------
+
+/** Write a uint64 as 8 bytes big-endian into a Uint8Array. */
+function uint64BE(value: number): Uint8Array {
+  const buf = new Uint8Array(8);
+  const view = new DataView(buf.buffer);
+  // DataView setBigUint64 handles full 64-bit range
+  view.setBigUint64(0, BigInt(value), false); // big-endian
+  return buf;
+}
+
+export interface SetupRoundFields {
+  snapshot_height: number;
+  snapshot_blockhash: Uint8Array;
+  proposals_hash: Uint8Array;
+  vote_end_time: number;
+  nullifier_imt_root: Uint8Array;
+  nc_root: Uint8Array;
+}
+
+/**
+ * Derive the vote_round_id exactly as the chain does:
+ *   Blake2b-256(snapshot_height || snapshot_blockhash || proposals_hash ||
+ *               vote_end_time || nullifier_imt_root || nc_root)
+ */
+export function deriveRoundId(fields: SetupRoundFields): Uint8Array {
+  const parts: Uint8Array[] = [
+    uint64BE(fields.snapshot_height),
+    fields.snapshot_blockhash,
+    fields.proposals_hash,
+    uint64BE(fields.vote_end_time),
+    fields.nullifier_imt_root,
+    fields.nc_root,
+  ];
+  const total = parts.reduce((s, p) => s + p.length, 0);
+  const data = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    data.set(p, offset);
+    offset += p.length;
+  }
+  return blake2b(data, { dkLen: 32 });
+}
+
+// ---------------------------------------------------------------------------
+// Payload builders
+// ---------------------------------------------------------------------------
+
+// Auto-incrementing counter seeded from timestamp to ensure uniqueness
+// across test runs (chain state persists).
+let roundCounter = Math.floor(Date.now() / 1000) % 1_000_000;
+
+/**
+ * Build a valid MsgSetupVoteRound JSON body.
+ * Returns both the JSON-ready object (with base64 byte fields) and the raw
+ * fields needed for deriveRoundId.
+ *
+ * Each call produces a unique round ID by incrementing snapshot_height.
+ */
+export function makeSetupRoundPayload() {
+  const snapshotBlockhash = repeatByte(0xaa, 32);
+  const proposalsHash = repeatByte(0xbb, 32);
+  const nullifierImtRoot = repeatByte(0xcc, 32);
+  const ncRoot = repeatByte(0xdd, 32);
+  const snapshotHeight = 1000 + roundCounter++;
+  const voteEndTime = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
+
+  const fields: SetupRoundFields = {
+    snapshot_height: snapshotHeight,
+    snapshot_blockhash: snapshotBlockhash,
+    proposals_hash: proposalsHash,
+    vote_end_time: voteEndTime,
+    nullifier_imt_root: nullifierImtRoot,
+    nc_root: ncRoot,
+  };
+
+  const body = {
+    creator: "zvote1admin",
+    snapshot_height: snapshotHeight,
+    snapshot_blockhash: toBase64(snapshotBlockhash),
+    proposals_hash: toBase64(proposalsHash),
+    vote_end_time: voteEndTime,
+    nullifier_imt_root: toBase64(nullifierImtRoot),
+    nc_root: toBase64(ncRoot),
+  };
+
+  return { body, fields, roundId: deriveRoundId(fields) };
+}
+
+// Auto-incrementing nullifier counter to avoid collisions with spent nullifiers
+// from previous test runs (chain state persists).
+let nullifierCounter = Math.floor(Date.now() / 1000) % 1_000_000;
+
+/** Create a unique 32-byte nullifier by writing a counter value into it. */
+function makeUniqueNullifier(): Uint8Array {
+  const nf = new Uint8Array(32);
+  const view = new DataView(nf.buffer);
+  view.setUint32(0, nullifierCounter++, false);
+  // Fill remaining bytes with a pattern to satisfy non-empty checks
+  for (let i = 4; i < 32; i++) nf[i] = 0xab;
+  return nf;
+}
+
+/**
+ * Build a valid MsgRegisterDelegation JSON body.
+ *
+ * When real Halo2 fixture files are available (tests/api/fixtures/), uses the
+ * actual proof bytes and sets `rk` to the real 32-byte public input. Otherwise
+ * falls back to mock data that passes the MockVerifier.
+ *
+ * Every call produces unique nullifiers (using an auto-incrementing counter)
+ * so delegations never collide even across test runs.
+ *
+ * @param roundId - The vote_round_id (raw bytes) to target.
+ */
+export function makeDelegationPayload(roundId: Uint8Array) {
+  const nf1 = makeUniqueNullifier();
+  const nf2 = makeUniqueNullifier();
+  const cmx = makeUniqueNullifier(); // unique cmx_new
+  const govComm = makeUniqueNullifier(); // unique gov_comm
+
+  // Use real Halo2 proof + public input when fixture files are present.
+  const fixtures = getRealProofFixtures();
+  const rk = fixtures ? fixtures.publicInput : repeatByte(0x01, 32);
+  const proof = fixtures
+    ? fixtures.proof
+    : Buffer.from("mock-delegation-proof");
+
+  return {
+    rk: toBase64(rk),
+    spend_auth_sig: toBase64(repeatByte(0x02, 64)),
+    signed_note_nullifier: toBase64(repeatByte(0x03, 32)),
+    cmx_new: toBase64(cmx),
+    enc_memo: toBase64(repeatByte(0x05, 64)),
+    gov_comm: toBase64(govComm),
+    gov_nullifiers: [toBase64(nf1), toBase64(nf2)],
+    proof: toBase64(proof),
+    vote_round_id: toBase64(roundId),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+/** POST JSON to a /zally/v1/* endpoint and return the parsed response. */
+export async function postJSON(path: string, body: unknown) {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json();
+  return { status: res.status, json };
+}
+
+/** GET a /zally/v1/* endpoint and return the parsed response. */
+export async function getJSON(path: string) {
+  const res = await fetch(`${BASE_URL}${path}`);
+  const json = await res.json();
+  return { status: res.status, json };
+}
+
+// ---------------------------------------------------------------------------
+// Wait helper -- give CometBFT time to include the tx in a block
+// ---------------------------------------------------------------------------
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Default block time wait (slightly over one block period). */
+export const BLOCK_WAIT_MS = 6000;
