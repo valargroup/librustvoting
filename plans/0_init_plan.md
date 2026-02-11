@@ -27,7 +27,7 @@ todos:
     content: "Phase 5: Implement gRPC query handlers (commitment tree at height, latest tree, vote round, proposal tally)"
     status: done
   - id: tests
-    content: "Phase 6: Unit tests for keeper, integration test for JSON tx submission, recheck behavior test"
+    content: "Phase 6: Integration tests (in-process ABCI pipeline), testutil/ package, Makefile targets, CI separation"
     status: pending
   - id: review-strip-staking
     content: "Review: Can we remove staking + distribution modules? Vote chain doesn't need validator economics. Would require rewriting init to set CometBFT genesis validators directly (no gentx), providing a staking shim for genutil or removing genutil, and accepting a static validator set. Revisit after Phase 5 when the custom ABCI tx pipeline is in place."

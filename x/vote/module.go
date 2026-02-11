@@ -11,11 +11,15 @@ import (
 	"cosmossdk.io/core/store"
 	"cosmossdk.io/depinject"
 	"cosmossdk.io/log"
+	"cosmossdk.io/x/tx/signing"
 
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/codec"
+	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/types/module"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/z-cale/zally/x/vote/keeper"
 	modulev1 "github.com/z-cale/zally/x/vote/module/v1"
@@ -37,8 +41,59 @@ var (
 func init() {
 	appmodule.Register(
 		&modulev1.Module{},
-		appmodule.Provide(ProvideModule),
+		appmodule.Provide(
+			ProvideModule,
+			ProvideSetupRoundSigner,
+			ProvideDelegationSigner,
+			ProvideVoteCommitmentSigner,
+			ProvideRevealShareSigner,
+		),
 	)
+}
+
+// ---------------------------------------------------------------------------
+// Custom signers for vote messages
+// ---------------------------------------------------------------------------
+//
+// Vote transactions bypass the Cosmos SDK Tx envelope and use ZKP/RedPallas
+// authentication instead of standard Cosmos signatures. The SDK's
+// InterfaceRegistry requires every Msg service message to have either a
+// cosmos.msg.v1.signer protobuf option or a custom GetSigners function.
+//
+// We satisfy this by providing no-op signers via depinject. Each function
+// returns a signing.CustomGetSigner (a ManyPerContainerType), which the
+// runtime collects into []signing.CustomGetSigner for ProvideInterfaceRegistry.
+
+// noopSignerFn is a GetSignersFunc that returns nil — vote messages have no
+// standard Cosmos signers.
+func noopSignerFn(proto.Message) ([][]byte, error) { return nil, nil }
+
+func ProvideSetupRoundSigner() signing.CustomGetSigner {
+	return signing.CustomGetSigner{
+		MsgType: protoreflect.FullName("zvote.v1.MsgSetupVoteRound"),
+		Fn:      noopSignerFn,
+	}
+}
+
+func ProvideDelegationSigner() signing.CustomGetSigner {
+	return signing.CustomGetSigner{
+		MsgType: protoreflect.FullName("zvote.v1.MsgRegisterDelegation"),
+		Fn:      noopSignerFn,
+	}
+}
+
+func ProvideVoteCommitmentSigner() signing.CustomGetSigner {
+	return signing.CustomGetSigner{
+		MsgType: protoreflect.FullName("zvote.v1.MsgCreateVoteCommitment"),
+		Fn:      noopSignerFn,
+	}
+}
+
+func ProvideRevealShareSigner() signing.CustomGetSigner {
+	return signing.CustomGetSigner{
+		MsgType: protoreflect.FullName("zvote.v1.MsgRevealVoteShare"),
+		Fn:      noopSignerFn,
+	}
 }
 
 // ModuleInputs defines the inputs needed to create the vote module.
@@ -99,6 +154,12 @@ func (AppModule) IsAppModule() {}
 // Name returns the module name.
 func (AppModule) Name() string {
 	return types.ModuleName
+}
+
+// RegisterInterfaces registers the vote module's message types with the
+// InterfaceRegistry, required for MsgServiceRouter to accept vote messages.
+func (AppModule) RegisterInterfaces(registry codectypes.InterfaceRegistry) {
+	types.RegisterInterfaces(registry)
 }
 
 // RegisterServices registers the module's gRPC services with the app.

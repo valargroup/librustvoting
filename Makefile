@@ -1,7 +1,7 @@
 BINARY = zallyd
 HOME_DIR = $(HOME)/.zallyd
 
-.PHONY: install init start clean build fmt lint test
+.PHONY: install init start clean build fmt lint test test-unit test-integration
 
 ## install: Build and install the zallyd binary to $GOPATH/bin
 install:
@@ -32,6 +32,13 @@ fmt:
 lint:
 	go vet ./...
 
-## test: Run tests
-test:
-	go test ./...
+## test-unit: Keeper, validation, codec, module unit tests (fast, parallel)
+test-unit:
+	go test -count=1 -race -parallel=4 ./x/vote/... ./api/...
+
+## test-integration: Full ABCI pipeline integration tests (in-process chain)
+test-integration:
+	go test -count=1 -race -timeout 5m ./app/...
+
+## test: Run all tests
+test: test-unit test-integration
