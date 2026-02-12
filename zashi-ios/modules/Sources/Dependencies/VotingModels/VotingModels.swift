@@ -84,6 +84,59 @@ public struct VotingRoundParams: Equatable, Sendable {
     }
 }
 
+// MARK: - Round State (from Rust storage)
+
+public enum RoundPhaseInfo: Equatable, Sendable {
+    case initialized
+    case hotkeyGenerated
+    case delegationConstructed
+    case witnessBuilt
+    case delegationProved
+    case voteReady
+}
+
+public struct RoundStateInfo: Equatable, Sendable {
+    public let roundId: String
+    public let phase: RoundPhaseInfo
+    public let snapshotHeight: UInt64
+    public let hotkeyAddress: String?
+    public let delegatedWeight: UInt64?
+    public let proofGenerated: Bool
+    public let votesCast: [String]
+
+    public init(
+        roundId: String,
+        phase: RoundPhaseInfo,
+        snapshotHeight: UInt64,
+        hotkeyAddress: String?,
+        delegatedWeight: UInt64?,
+        proofGenerated: Bool,
+        votesCast: [String]
+    ) {
+        self.roundId = roundId
+        self.phase = phase
+        self.snapshotHeight = snapshotHeight
+        self.hotkeyAddress = hotkeyAddress
+        self.delegatedWeight = delegatedWeight
+        self.proofGenerated = proofGenerated
+        self.votesCast = votesCast
+    }
+}
+
+public struct RoundSummaryInfo: Equatable, Sendable {
+    public let roundId: String
+    public let phase: RoundPhaseInfo
+    public let snapshotHeight: UInt64
+    public let createdAt: UInt64
+
+    public init(roundId: String, phase: RoundPhaseInfo, snapshotHeight: UInt64, createdAt: UInt64) {
+        self.roundId = roundId
+        self.phase = phase
+        self.snapshotHeight = snapshotHeight
+        self.createdAt = createdAt
+    }
+}
+
 // MARK: - Hotkey
 
 public struct VotingHotkey: Equatable, Sendable {

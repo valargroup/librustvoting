@@ -3,18 +3,82 @@ import Foundation
 import VotingModels
 import ZcashVotingFFI
 
+// MARK: - StreamProgressReporter
+
+/// Bridges UniFFI ProofProgressReporter callback → AsyncThrowingStream<ProofEvent>.
+private final class StreamProgressReporter: ZcashVotingFFI.ProofProgressReporter {
+    let continuation: AsyncThrowingStream<ProofEvent, Error>.Continuation
+
+    init(_ continuation: AsyncThrowingStream<ProofEvent, Error>.Continuation) {
+        self.continuation = continuation
+    }
+
+    func onProgress(progress: Double) {
+        continuation.yield(.progress(progress))
+    }
+}
+
+// MARK: - Live key
+
 extension VotingCryptoClient: DependencyKey {
     public static var liveValue: Self {
-        Self(
-            generateHotkey: {
-                let hotkey = try ZcashVotingFFI.generateHotkey()
+        // The database is created lazily via openDatabase()
+        let dbActor = DatabaseActor()
+
+        return Self(
+            openDatabase: { path in
+                try await dbActor.open(path: path)
+            },
+            initRound: { params, sessionJson in
+                let db = try await dbActor.database()
+                let ffiParams = ZcashVotingFFI.VotingRoundParams(
+                    voteRoundId: params.voteRoundId.hexString,
+                    snapshotHeight: params.snapshotHeight,
+                    eaPk: params.eaPK,
+                    ncRoot: params.ncRoot,
+                    nullifierImtRoot: params.nullifierIMTRoot
+                )
+                try db.initRound(params: ffiParams, sessionJson: sessionJson)
+            },
+            getRoundState: { roundId in
+                let db = try await dbActor.database()
+                let state = try db.getRoundState(roundId: roundId)
+                return RoundStateInfo(
+                    roundId: state.roundId,
+                    phase: state.phase.toModel(),
+                    snapshotHeight: state.snapshotHeight,
+                    hotkeyAddress: state.hotkeyAddress,
+                    delegatedWeight: state.delegatedWeight,
+                    proofGenerated: state.proofGenerated,
+                    votesCast: state.votesCast
+                )
+            },
+            listRounds: {
+                let db = try await dbActor.database()
+                return try db.listRounds().map {
+                    RoundSummaryInfo(
+                        roundId: $0.roundId,
+                        phase: $0.phase.toModel(),
+                        snapshotHeight: $0.snapshotHeight,
+                        createdAt: $0.createdAt
+                    )
+                }
+            },
+            clearRound: { roundId in
+                let db = try await dbActor.database()
+                try db.clearRound(roundId: roundId)
+            },
+            generateHotkey: { roundId in
+                let db = try await dbActor.database()
+                let hotkey = try db.generateHotkey(roundId: roundId)
                 return VotingHotkey(
                     secretKey: hotkey.secretKey,
                     publicKey: hotkey.publicKey,
                     address: hotkey.address
                 )
             },
-            constructDelegationAction: { hotkey, notes, params in
+            constructDelegationAction: { roundId, hotkey, notes in
+                let db = try await dbActor.database()
                 let ffiHotkey = ZcashVotingFFI.VotingHotkey(
                     secretKey: hotkey.secretKey,
                     publicKey: hotkey.publicKey,
@@ -28,17 +92,10 @@ extension VotingCryptoClient: DependencyKey {
                         position: $0.position
                     )
                 }
-                let ffiParams = ZcashVotingFFI.VotingRoundParams(
-                    voteRoundId: params.voteRoundId.hexString,
-                    snapshotHeight: params.snapshotHeight,
-                    eaPk: params.eaPK,
-                    ncRoot: params.ncRoot,
-                    nullifierImtRoot: params.nullifierIMTRoot
-                )
-                let result = try ZcashVotingFFI.constructDelegationAction(
+                let result = try db.constructDelegationAction(
+                    roundId: roundId,
                     hotkey: ffiHotkey,
-                    notes: ffiNotes,
-                    params: ffiParams
+                    notes: ffiNotes
                 )
                 return DelegationAction(
                     actionBytes: result.actionBytes,
@@ -46,27 +103,34 @@ extension VotingCryptoClient: DependencyKey {
                     sighash: result.sighash
                 )
             },
-            buildDelegationWitness: { action, inclusionProofs, exclusionProofs in
+            storeTreeState: { roundId, treeState in
+                let db = try await dbActor.database()
+                try db.storeTreeState(roundId: roundId, treeStateBytes: treeState)
+            },
+            buildDelegationWitness: { roundId, action, inclusionProofs, exclusionProofs in
+                let db = try await dbActor.database()
                 let ffiAction = ZcashVotingFFI.DelegationAction(
                     actionBytes: action.actionBytes,
                     rk: action.rk,
                     sighash: action.sighash
                 )
-                return try ZcashVotingFFI.buildDelegationWitness(
+                return try db.buildDelegationWitness(
+                    roundId: roundId,
                     action: ffiAction,
                     inclusionProofs: inclusionProofs,
                     exclusionProofs: exclusionProofs
                 )
             },
-            generateDelegationProof: { witness in
+            generateDelegationProof: { roundId in
                 AsyncThrowingStream { continuation in
-                    Task {
+                    Task.detached {
                         do {
-                            for step in 1...7 {
-                                try await Task.sleep(for: .milliseconds(500))
-                                continuation.yield(.progress(Double(step) / 8.0))
-                            }
-                            let result = try ZcashVotingFFI.generateDelegationProof(witness: witness)
+                            let db = try await dbActor.database()
+                            let reporter = StreamProgressReporter(continuation)
+                            let result = try db.generateDelegationProof(
+                                roundId: roundId,
+                                progress: reporter
+                            )
                             guard result.success else {
                                 continuation.finish(throwing: VotingCryptoError.proofFailed(
                                     result.error ?? "unknown"
@@ -84,8 +148,9 @@ extension VotingCryptoClient: DependencyKey {
             decomposeWeight: { weight in
                 ZcashVotingFFI.decomposeWeight(weight: weight)
             },
-            encryptShares: { shares, eaPK in
-                let ffiShares = try ZcashVotingFFI.encryptShares(shares: shares, eaPk: eaPK)
+            encryptShares: { roundId, shares in
+                let db = try await dbActor.database()
+                let ffiShares = try db.encryptShares(roundId: roundId, shares: shares)
                 return ffiShares.map {
                     EncryptedShare(
                         c1: $0.c1,
@@ -95,14 +160,12 @@ extension VotingCryptoClient: DependencyKey {
                     )
                 }
             },
-            buildVoteCommitment: { proposalId, choice, encShares, vanWitness in
+            buildVoteCommitment: { roundId, proposalId, choice, encShares, vanWitness in
                 AsyncThrowingStream { continuation in
-                    Task {
+                    Task.detached {
                         do {
-                            for step in 1...3 {
-                                try await Task.sleep(for: .milliseconds(100))
-                                continuation.yield(.progress(Double(step) / 4.0))
-                            }
+                            let db = try await dbActor.database()
+                            let reporter = StreamProgressReporter(continuation)
                             let ffiShares = encShares.map {
                                 ZcashVotingFFI.EncryptedShare(
                                     c1: $0.c1,
@@ -111,11 +174,13 @@ extension VotingCryptoClient: DependencyKey {
                                     plaintextValue: $0.plaintextValue
                                 )
                             }
-                            let result = try ZcashVotingFFI.buildVoteCommitment(
-                                proposalId: String(proposalId),
+                            let result = try db.buildVoteCommitment(
+                                roundId: roundId,
+                                proposalId: proposalId,
                                 choice: choice.ffiValue,
                                 encShares: ffiShares,
-                                vanWitness: vanWitness
+                                vanWitness: vanWitness,
+                                progress: reporter
                             )
                             let bundle = VoteCommitmentBundle(
                                 vanNullifier: result.vanNullifier,
@@ -135,6 +200,7 @@ extension VotingCryptoClient: DependencyKey {
                 }
             },
             buildSharePayloads: { encShares, commitment in
+                let db = try await dbActor.database()
                 let ffiShares = encShares.map {
                     ZcashVotingFFI.EncryptedShare(
                         c1: $0.c1,
@@ -150,7 +216,7 @@ extension VotingCryptoClient: DependencyKey {
                     proposalId: String(commitment.proposalId),
                     proof: commitment.proof
                 )
-                let ffiPayloads = try ZcashVotingFFI.buildSharePayloads(
+                let ffiPayloads = try db.buildSharePayloads(
                     encShares: ffiShares,
                     commitment: ffiCommitment
                 )
@@ -169,8 +235,30 @@ extension VotingCryptoClient: DependencyKey {
                         treePosition: $0.treePosition
                     )
                 }
+            },
+            markVoteSubmitted: { roundId, proposalId in
+                let db = try await dbActor.database()
+                try db.markVoteSubmitted(roundId: roundId, proposalId: proposalId)
             }
         )
+    }
+}
+
+// MARK: - DatabaseActor
+
+/// Thread-safe holder for the VotingDatabase instance.
+private actor DatabaseActor {
+    private var db: ZcashVotingFFI.VotingDatabase?
+
+    func open(path: String) throws {
+        db = try ZcashVotingFFI.VotingDatabase.open(path: path)
+    }
+
+    func database() throws -> ZcashVotingFFI.VotingDatabase {
+        guard let db else {
+            throw VotingCryptoError.databaseNotOpen
+        }
+        return db
     }
 }
 
@@ -178,6 +266,7 @@ extension VotingCryptoClient: DependencyKey {
 
 enum VotingCryptoError: Error {
     case proofFailed(String)
+    case databaseNotOpen
 }
 
 private extension VoteChoice {
@@ -193,5 +282,18 @@ private extension VoteChoice {
 private extension Data {
     var hexString: String {
         map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private extension ZcashVotingFFI.RoundPhase {
+    func toModel() -> RoundPhaseInfo {
+        switch self {
+        case .initialized: return .initialized
+        case .hotkeyGenerated: return .hotkeyGenerated
+        case .delegationConstructed: return .delegationConstructed
+        case .witnessBuilt: return .witnessBuilt
+        case .delegationProved: return .delegationProved
+        case .voteReady: return .voteReady
+        }
     }
 }

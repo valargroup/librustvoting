@@ -3,13 +3,11 @@ import ComposableArchitecture
 import VotingAPIClient
 import VotingCryptoClient
 import VotingModels
-import VotingStorageClient
 
 @Reducer
 public struct Voting {
     @Dependency(\.votingAPI) var votingAPI
     @Dependency(\.votingCrypto) var votingCrypto
-    @Dependency(\.votingStorage) var votingStorage
     @ObservableState
     public struct State: Equatable {
         public enum Screen: Equatable {
@@ -29,6 +27,7 @@ public struct Voting {
         public var votes: [UInt32: VoteChoice] = [:]
         public var votingWeight: UInt64
         public var isKeystoneUser: Bool
+        public var roundId: String
 
         public var selectedProposalId: UInt32?
 
@@ -95,11 +94,13 @@ public struct Voting {
         public init(
             votingRound: VotingRound = MockVotingService.votingRound,
             votingWeight: UInt64 = MockVotingService.votingWeight,
-            isKeystoneUser: Bool = false
+            isKeystoneUser: Bool = false,
+            roundId: String = "mock-round-1"
         ) {
             self.votingRound = votingRound
             self.votingWeight = votingWeight
             self.isKeystoneUser = isKeystoneUser
+            self.roundId = roundId
         }
     }
 
@@ -163,11 +164,9 @@ public struct Voting {
 
             case .startDelegationProof:
                 state.delegationProofStatus = .generating(progress: 0)
+                let roundId = state.roundId
                 return .run { [votingCrypto] send in
-                    // In the full flow: constructDelegationAction → fetch proofs → buildDelegationWitness → generateDelegationProof
-                    // For now the witness is a placeholder; the stub streams progress over ~4s
-                    let witness = Data(repeating: 0xDD, count: 512)
-                    for try await event in votingCrypto.generateDelegationProof(witness) {
+                    for try await event in votingCrypto.generateDelegationProof(roundId) {
                         switch event {
                         case .progress(let p):
                             await send(.delegationProofProgress(p))
@@ -217,6 +216,7 @@ public struct Voting {
 
                 let proposalId = pending.proposalId
                 let choice = pending.choice
+                let roundId = state.roundId
                 let nextId = nextUnvotedId(after: proposalId, in: state)
 
                 return .merge(
@@ -230,7 +230,7 @@ public struct Voting {
                             plaintextValue: 1
                         )]
                         var proofData = Data()
-                        for try await event in votingCrypto.buildVoteCommitment(proposalId, choice, mockShares, mockWitness) {
+                        for try await event in votingCrypto.buildVoteCommitment(roundId, proposalId, choice, mockShares, mockWitness) {
                             if case .completed(let proof) = event {
                                 proofData = proof
                             }
