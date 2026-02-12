@@ -258,10 +258,12 @@ public struct Voting {
 
                 return .merge(
                     // Submit this vote to chain in background
-                    .run { [votingAPI, votingCrypto] _ in
+                    .run { [votingAPI, votingCrypto] send in
                         // Decompose weight into binary shares, encrypt under EA public key
                         let shares = votingCrypto.decomposeWeight(votingWeight)
+                        print("[Voting] decomposeWeight(\(votingWeight)) → \(shares.count) shares")
                         let encShares = try await votingCrypto.encryptShares(roundId, shares)
+
                         let vanWitness = Data(repeating: 0xDD, count: 64) // mock VAN witness
 
                         // Build vote commitment + ZKP #2 (stored in DB)
@@ -288,6 +290,8 @@ public struct Voting {
 
                         // Mark vote submitted in DB
                         try await votingCrypto.markVoteSubmitted(roundId, proposalId)
+                    } catch: { error, _ in
+                        print("[Voting] vote submission failed: \(error)")
                     },
                     // Advance UI after brief pause
                     .run { send in

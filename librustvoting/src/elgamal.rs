@@ -2,6 +2,7 @@ use crate::types::{validate_32_bytes, EncryptedShare, VotingError};
 
 /// Encrypt each share under ea_pk using additively homomorphic El Gamal.
 /// STUB: returns mock ciphertext pairs.
+/// Protocol requires exactly 4 shares (§3.3.1).
 pub fn encrypt_shares(shares: &[u64], ea_pk: &[u8]) -> Result<Vec<EncryptedShare>, VotingError> {
     validate_32_bytes(ea_pk, "ea_pk")?;
 
@@ -11,13 +12,14 @@ pub fn encrypt_shares(shares: &[u64], ea_pk: &[u8]) -> Result<Vec<EncryptedShare
         });
     }
 
+    if shares.len() > 4 {
+        return Err(VotingError::InvalidInput {
+            message: format!("at most 4 shares supported, got {}", shares.len()),
+        });
+    }
+
     let mut encrypted = Vec::with_capacity(shares.len());
     for (i, &value) in shares.iter().enumerate() {
-        if i > 3 {
-            return Err(VotingError::InvalidInput {
-                message: format!("at most 4 shares supported, got {}", shares.len()),
-            });
-        }
         encrypted.push(EncryptedShare {
             c1: vec![0xC1; 32],
             c2: vec![0xC2; 32],
@@ -43,6 +45,13 @@ mod tests {
         assert_eq!(result[0].plaintext_value, 1);
         assert_eq!(result[2].share_index, 2);
         assert_eq!(result[2].plaintext_value, 8);
+    }
+
+    #[test]
+    fn test_encrypt_shares_rejects_more_than_4() {
+        let shares = vec![1, 2, 4, 8, 16];
+        let ea_pk = vec![0xEA; 32];
+        assert!(encrypt_shares(&shares, &ea_pk).is_err());
     }
 
     #[test]
