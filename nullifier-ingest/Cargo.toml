@@ -1,9 +1,0 @@
-[workspace]
-members = ["zcash-vote", "nullifier-tree"]
-resolver = "2"
-
-[patch.crates-io]
-#orchard = { path = "../../../ywallet/orchard" }
-orchard = {git = "https://github.com/hhanh00/orchard.git", rev="768c365"}
-halo2_gadgets  = { git = "https://github.com/zcash/halo2.git", rev = "642924d614305d882cc122739c59144109f4bd3f" }
-halo2_proofs = { git = "https://github.com/zcash/halo2.git", rev = "642924d614305d882cc122739c59144109f4bd3f" }
