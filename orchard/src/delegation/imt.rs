@@ -13,8 +13,8 @@ use pasta_curves::pallas;
 use std::sync::LazyLock;
 
 /// Depth of the nullifier Indexed Merkle Tree Merkle path (Poseidon2-based).
-/// Total Poseidon2 calls per proof = 1 (leaf hash) + 31 (path) = 32.
-pub const IMT_DEPTH: usize = 31;
+/// Total Poseidon2 calls per proof = 1 (leaf hash) + 29 (path) = 30.
+pub const IMT_DEPTH: usize = 29;
 
 /// Domain tag for governance authorization nullifier (per spec §1.3.2, condition 14).
 ///
@@ -59,7 +59,7 @@ pub(crate) fn gov_null_hash(
 ///
 /// Each leaf stores an explicit (low, high) pair defining an interval.
 /// The leaf hash is `Poseidon2(low, high)`, followed by a standard
-/// 31-level Merkle path to the root.
+/// 29-level Merkle path to the root.
 #[derive(Clone, Debug)]
 pub struct ImtProofData {
     /// The Merkle root of the IMT.
@@ -70,7 +70,7 @@ pub struct ImtProofData {
     pub high: pallas::Base,
     /// Position of the leaf in the tree.
     pub leaf_pos: u32,
-    /// Sibling hashes along the 31-level Merkle path (pure siblings).
+    /// Sibling hashes along the 29-level Merkle path (pure siblings).
     pub path: [pallas::Base; IMT_DEPTH],
 }
 
@@ -198,7 +198,7 @@ impl ImtProvider for SpacedLeafImtProvider {
 
         let empty = empty_imt_hashes();
 
-        // Build Merkle path (31 pure siblings).
+        // Build Merkle path (29 pure siblings).
         let mut path = [pallas::Base::zero(); IMT_DEPTH];
 
         // Levels 0..4: siblings from the 32-leaf subtree.
@@ -209,7 +209,7 @@ impl ImtProvider for SpacedLeafImtProvider {
             idx >>= 1;
         }
 
-        // Levels 5..30: empty subtree hashes (all leaves beyond position 31 are empty).
+        // Levels 5..28: empty subtree hashes (all leaves beyond position 31 are empty).
         for l in 5..IMT_DEPTH {
             path[l] = empty[l];
         }

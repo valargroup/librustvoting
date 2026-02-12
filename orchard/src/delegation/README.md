@@ -49,7 +49,7 @@ A single circuit proving all 16 conditions of the delegation ZKP at K=16 (65,536
    * **imt_low**: the interval start (low bound of the bracketing leaf).
    * **imt_high**: the interval end (high bound of the bracketing leaf).
    * **imt_leaf_pos**: position of the leaf in the IMT.
-   * **imt_path**: Poseidon2-based IMT Merkle authentication path (31 pure siblings).
+   * **imt_path**: Poseidon2-based IMT Merkle authentication path (29 pure siblings).
 
 - Private (governance — condition 7)
    * **gov_comm_rand**: a random blinding factor for the governance commitment.
@@ -299,7 +299,7 @@ Purpose: prove the note's nullifier has NOT been spent, using a Poseidon2-based 
 
 1. **Leaf hash**: `leaf_hash = Poseidon2(low, high)` — authenticates both interval bounds via the Merkle root.
 
-2. **Merkle path** (31 levels, starting from `leaf_hash`): At each level, a `q_imt_swap` gate conditionally swaps `(current, sibling)` into `(left, right)` based on the position bit, then `Poseidon2(left, right)` computes the parent. The swap gate constrains:
+2. **Merkle path** (29 levels, starting from `leaf_hash`): At each level, a `q_imt_swap` gate conditionally swaps `(current, sibling)` into `(left, right)` based on the position bit, then `Poseidon2(left, right)` computes the parent. The swap gate constrains:
    - `left = current + pos_bit * (sibling - current)`
    - `left + right = current + sibling`
    - `bool_check(pos_bit)`

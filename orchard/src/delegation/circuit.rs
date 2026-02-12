@@ -186,7 +186,7 @@ pub struct Config {
     // real notes' Merkle root matches nc_root, IMT root matches nf_imt_root.
     q_per_note: Selector,
     // IMT conditional swap gate selector (condition 13).
-    // At each of the 31 IMT Merkle levels, swaps (current, sibling) into (left, right)
+    // At each of the 29 IMT Merkle levels, swaps (current, sibling) into (left, right)
     // based on the position bit before Poseidon hashing.
     q_imt_swap: Selector,
     // Interval check gate selector (condition 13).
@@ -1652,7 +1652,7 @@ fn synthesize_note_slot(
     //
     // The proof has three parts:
     //   1. Leaf hash: Poseidon2(low, high)
-    //   2. Merkle path: 31 levels from the leaf hash to the root.
+    //   2. Merkle path: 29 levels from the leaf hash to the root.
     //   3. Interval check: low <= real_nf <= high, proved by
     //      range-checking x and x_shifted to [0, 2^250).
     //
@@ -1679,7 +1679,7 @@ fn synthesize_note_slot(
         )?
     };
 
-    // Poseidon2 Merkle path from leaf_hash, 31 levels.
+    // Poseidon2 Merkle path from leaf_hash, 29 levels.
     // At each level, q_imt_swap orders (current, sibling) by position bit,
     // then Poseidon2(left, right) computes the parent.
     let mut current = leaf_hash;
