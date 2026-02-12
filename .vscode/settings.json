@@ -1,5 +1,8 @@
 {
     "gopls": {
         "build.buildFlags": ["-tags=halo2"]
-    }
+    },
+    "rust-analyzer.linkedProjects": [
+        "nullifier-ingest/Cargo.toml"
+    ]
 }

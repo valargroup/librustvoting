@@ -1,10 +1,12 @@
-# Root Makefile — delegates to sdk/
-SDK_DIR = sdk
+# Root Makefile
+SDK_DIR     = sdk
+INGEST_DIR  = nullifier-ingest
 
 .PHONY: install install-ffi init init-ffi start clean build fmt lint \
 	test test-unit test-integration test-api \
 	fixtures-ts circuits circuits-test fixtures \
-	test-halo2 test-halo2-ante test-redpallas test-redpallas-ante test-all-ffi
+	test-halo2 test-halo2-ante test-redpallas test-redpallas-ante test-all-ffi \
+	ingest ingest-status ingest-test ingest-proof ingest-clean
 
 install:
 	$(MAKE) -C $(SDK_DIR) install
@@ -71,3 +73,20 @@ test-redpallas-ante:
 
 test-all-ffi:
 	$(MAKE) -C $(SDK_DIR) test-all-ffi
+
+# ── Nullifier Ingestion ──────────────────────────────────────────────
+
+ingest: ## Ingest Orchard nullifiers from chain into SQLite
+	$(MAKE) -C $(INGEST_DIR) ingest
+
+ingest-status: ## Show nullifier count, last synced height, DB size
+	$(MAKE) -C $(INGEST_DIR) status
+
+ingest-test: ## Run nullifier-tree unit tests
+	$(MAKE) -C $(INGEST_DIR) test
+
+ingest-proof: ## Run exclusion proof verification against ingested data
+	$(MAKE) -C $(INGEST_DIR) test-proof
+
+ingest-clean: ## Remove nullifier build artifacts and database
+	$(MAKE) -C $(INGEST_DIR) clean

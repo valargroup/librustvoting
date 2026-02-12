@@ -1,6 +1,6 @@
 [package]
 name = "nullifier-tree"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -16,8 +16,11 @@ r2d2 = "0.8"
 pasta_curves = "0.5"
 ff = "0.13"
 incrementalmerkletree = "0.3.1"
-http = "0.2.12"
-dotenv = "0.15.0"
+
+[patch.crates-io]
+orchard = { git = "https://github.com/hhanh00/orchard.git", rev = "768c365" }
+halo2_gadgets = { git = "https://github.com/zcash/halo2.git", rev = "642924d614305d882cc122739c59144109f4bd3f" }
+halo2_proofs = { git = "https://github.com/zcash/halo2.git", rev = "642924d614305d882cc122739c59144109f4bd3f" }
 
 [[bin]]
 name = "ingest-nfs"
