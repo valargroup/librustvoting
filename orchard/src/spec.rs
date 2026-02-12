@@ -269,7 +269,7 @@ pub(crate) const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
 ///
 /// ```text
 /// gov_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id,
-///                     gov_comm_rand, MAX_PROPOSAL_AUTHORITY)
+///                     MAX_PROPOSAL_AUTHORITY, gov_comm_rand)
 /// ```
 ///
 /// Binds the governance commitment to the output note's voting hotkey address,
@@ -285,7 +285,7 @@ pub(crate) const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
 /// synthesis issue (the Pow5Chip's partial-round layout fails during real
 /// proving with odd-length inputs at rate 2).
 ///
-/// `MAX_PROPOSAL_AUTHORITY` occupies the 6th slot as a fixed constant.  It is
+/// `MAX_PROPOSAL_AUTHORITY` occupies the 5th slot as a fixed constant.  It is
 /// baked into the delegation circuit's verification key via
 /// `assign_advice_from_constant`, so a malicious prover cannot substitute a
 /// different authority value.
@@ -302,8 +302,8 @@ pub(crate) fn gov_commitment_hash(
             pk_d_new_x,
             v_total,
             vote_round_id,
-            gov_comm_rand,
             pallas::Base::from(MAX_PROPOSAL_AUTHORITY),
+            gov_comm_rand,
         ])
 }
 

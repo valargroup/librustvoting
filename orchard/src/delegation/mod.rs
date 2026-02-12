@@ -1,10 +1,12 @@
 //! Delegation ZKP circuit.
 //!
-//! Proves nullifier integrity for a single note, following the 1-circuit-per-note
-//! pattern from the vote module. For multiple notes (up to 4), the builder layer
-//! creates multiple independent proofs and binds them externally.
+//! A single circuit proving all 16 conditions of the delegation ZKP,
+//! including 4 per-note slots and gov null pairwise distinctness.
+//! The builder layer creates padded notes for unused slots and
+//! produces a single proof.
 
+pub mod builder;
 pub mod circuit;
-pub mod per_note_circuit;
+pub mod imt;
 
 pub use circuit::{Circuit, Instance};

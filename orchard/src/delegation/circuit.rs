@@ -1,23 +1,30 @@
 //! The Delegation circuit implementation.
 //!
-//! Proves nullifier integrity, spend authority, and diversified address integrity
-//! for a single note:
-//! - Given private witness data `(nk, rho_signed, psi_signed, cm_signed)`, derives
-//!   `nf_signed` in-circuit and constrains it to match the public input.
-//! - Given private witness data `(ak, alpha)`, derives `rk = [alpha] * SpendAuthG + ak`
-//!   and constrains it to match the public input. This links the ZKP to the
-//!   keystone signature verified out-of-circuit.
-//! - Given private witness data `(ak, nk, rivk, g_d_signed, pk_d_signed)`, derives
-//!   `ivk = CommitIvk_rivk(ExtractP(ak), nk)` and constrains `pk_d_signed = [ivk] * g_d_signed`.
-//!   This proves the note's address belongs to the same key material.
+//! A single circuit proving all 16 conditions of the delegation ZKP:
 //!
-//! Follows the 1-circuit-per-note pattern from the vote module. For multiple
-//! notes, the builder layer creates multiple independent proofs.
+//! - **Condition 1**: Signed note commitment integrity.
+//! - **Condition 2**: Nullifier integrity.
+//! - **Condition 3**: Rho binding — keystone rho = Poseidon(cmx_1..4, gov_comm, vote_round_id).
+//! - **Condition 4**: Spend authority.
+//! - **Condition 5**: CommitIvk & diversified address integrity.
+//! - **Condition 6**: Output note commitment integrity.
+//! - **Condition 7**: Governance commitment integrity.
+//! - **Condition 8**: Minimum voting weight.
+//! - **Condition 9** (×4): Note commitment integrity.
+//! - **Condition 10** (×4): Merkle path validity.
+//! - **Condition 11** (×4): Diversified address integrity.
+//! - **Condition 12** (×4): Private nullifier derivation.
+//! - **Condition 13** (×4): IMT non-membership.
+//! - **Condition 14** (×4): Governance nullifier publication.
+//! - **Condition 15** (×4): Padded-note zero-value enforcement.
+//! - **Condition 16**: Gov null pairwise distinctness.
 
+use ff::Field;
 use group::{Curve, GroupEncoding};
 use halo2_proofs::{
-    circuit::{floor_planner, Layouter, Value},
-    plonk::{self, Advice, Column, Instance as InstanceColumn},
+    circuit::{floor_planner, AssignedCell, Layouter, Value},
+    plonk::{self, Advice, Column, Constraints, Expression, Instance as InstanceColumn, Selector},
+    poly::Rotation,
 };
 use pasta_curves::{arithmetic::CurveAffine, pallas, vesta};
 
@@ -26,12 +33,14 @@ use crate::{
         commit_ivk::{CommitIvkChip, CommitIvkConfig},
         gadget::{
             add_chip::{AddChip, AddConfig},
-            assign_free_advice, commit_ivk, derive_nullifier, note_commit,
-            AddInstruction,
+            assign_free_advice, commit_ivk, derive_nullifier, note_commit, AddInstruction,
         },
         note_commit::{NoteCommitChip, NoteCommitConfig},
     },
-    constants::{OrchardCommitDomains, OrchardFixedBases, OrchardFixedBasesFull, OrchardHashDomains},
+    constants::{
+        OrchardCommitDomains, OrchardFixedBases, OrchardFixedBasesFull, OrchardHashDomains,
+        MERKLE_DEPTH_ORCHARD,
+    },
     keys::{
         CommitIvkRandomness, DiversifiedTransmissionKey, FullViewingKey, NullifierDerivingKey,
         Scope, SpendValidatingKey,
@@ -43,6 +52,7 @@ use crate::{
     },
     primitives::redpallas::{SpendAuth, VerificationKey},
     spec::NonIdentityPallasPoint,
+    tree::MerkleHashOrchard,
     value::NoteValue,
 };
 use halo2_gadgets::{
@@ -52,13 +62,23 @@ use halo2_gadgets::{
     },
     poseidon::{
         primitives::{self as poseidon, ConstantLength},
-        Hash as PoseidonHash,
-        Pow5Chip as PoseidonChip,
-        Pow5Config as PoseidonConfig,
+        Hash as PoseidonHash, Pow5Chip as PoseidonChip, Pow5Config as PoseidonConfig,
     },
-    sinsemilla::chip::{SinsemillaChip, SinsemillaConfig},
-    utilities::lookup_range_check::LookupRangeCheckConfig,
+    sinsemilla::{
+        chip::{SinsemillaChip, SinsemillaConfig},
+        merkle::{
+            chip::{MerkleChip, MerkleConfig},
+            MerklePath as GadgetMerklePath,
+        },
+    },
+    utilities::{bool_check, lookup_range_check::LookupRangeCheckConfig},
 };
+
+use super::imt::IMT_DEPTH;
+
+// ================================================================
+// Public input offsets (12 field elements).
+// ================================================================
 
 /// Public input offset for the derived nullifier.
 const NF_SIGNED: usize = 0;
@@ -72,6 +92,18 @@ const CMX_NEW: usize = 3;
 const GOV_COMM: usize = 4;
 /// Public input offset for the vote round identifier.
 const VOTE_ROUND_ID: usize = 5;
+/// Public input offset for the note commitment tree root.
+const NC_ROOT: usize = 6;
+/// Public input offset for the nullifier IMT root.
+const NF_IMT_ROOT: usize = 7;
+/// Public input offsets for per-note governance nullifiers (derived from real notes).
+const GOV_NULL_1: usize = 8;
+const GOV_NULL_2: usize = 9;
+const GOV_NULL_3: usize = 10;
+const GOV_NULL_4: usize = 11;
+
+/// Gov null offsets indexed by note slot.
+const GOV_NULL_OFFSETS: [usize; 4] = [GOV_NULL_1, GOV_NULL_2, GOV_NULL_3, GOV_NULL_4];
 
 /// Maximum proposal authority — the default for a fresh delegation.
 ///
@@ -84,23 +116,9 @@ const VOTE_ROUND_ID: usize = 5;
 /// cannot substitute a different authority value.
 pub(crate) const MAX_PROPOSAL_AUTHORITY: u64 = 65535; // 2^16 - 1
 
-/// Size of the delegation circuit (2^K rows).
-///
-/// K=12 (4096 rows) fits all current conditions. Future additions (Merkle path,
-/// SMT non-membership, governance nullifiers) may require increasing to K=13.
-///
-/// Row budget breakdown:
-/// - Sinsemilla lookup table: ~1024 rows (loaded once, shared)
-/// - NoteCommit × 2 (Sinsemilla hash + decomposition/canonicity + rcm scalar mul): ~2000-2300 rows
-/// - Nullifier derivation (Poseidon + ECC): ~400 rows
-/// - Spend authority (fixed-base scalar mul + point add): ~260 rows
-/// - CommitIvk (Sinsemilla short commit + decomposition): ~200 rows
-/// - Address integrity (variable-base scalar mul): ~260 rows
-/// - Rho binding Poseidon (6 inputs): ~350 rows
-/// - Gov commitment Poseidon (6 inputs, zero-padded): ~350 rows
-/// - v_total summation (3 AddChip ops): ~9 rows
-/// - Min weight range check (7 words × 10 bits): ~70 rows
-const K: u32 = 12;
+// ================================================================
+// Config
+// ================================================================
 
 /// Configuration for the Delegation circuit.
 #[derive(Clone, Debug)]
@@ -126,11 +144,13 @@ pub struct Config {
     // Sinsemilla config 1 — used for loading the lookup table that
     // LookupRangeCheckConfig (and thus EccChip) depends on, for CommitIvk,
     // and for the signed note's NoteCommit. Uses advices[..5].
-    sinsemilla_config_1: SinsemillaConfig<OrchardHashDomains, OrchardCommitDomains, OrchardFixedBases>,
+    sinsemilla_config_1:
+        SinsemillaConfig<OrchardHashDomains, OrchardCommitDomains, OrchardFixedBases>,
     // Sinsemilla config 2 — a second instance for the output note's NoteCommit.
     // Uses advices[5..] so the two Sinsemilla chips can lay out side-by-side.
     // Two are needed for each NoteCommit. If these were reused, gates would conflict.
-    sinsemilla_config_2: SinsemillaConfig<OrchardHashDomains, OrchardCommitDomains, OrchardFixedBases>,
+    sinsemilla_config_2:
+        SinsemillaConfig<OrchardHashDomains, OrchardCommitDomains, OrchardFixedBases>,
     // Configuration to handle decomposition and canonicity checking for CommitIvk.
     commit_ivk_config: CommitIvkConfig,
     // Configuration for decomposition and canonicity checking for the signed note's NoteCommit.
@@ -141,6 +161,29 @@ pub struct Config {
     // Used in condition 8 (minimum voting weight) to verify that
     // v_total - MIN_WEIGHT fits in 70 bits (non-negative).
     range_check: LookupRangeCheckConfig<pallas::Base, 10>,
+    // Merkle config 1 — Sinsemilla-based Merkle path verification for condition 10.
+    // Paired with sinsemilla_config_1. Uses advices[..5].
+    merkle_config_1: MerkleConfig<OrchardHashDomains, OrchardCommitDomains, OrchardFixedBases>,
+    // Merkle config 2 — second Merkle chip for condition 10, paired with sinsemilla_config_2.
+    // Uses advices[5..]. Two configs are required because MerkleChip alternates between
+    // them at each tree level (even levels use config 1, odd levels use config 2).
+    merkle_config_2: MerkleConfig<OrchardHashDomains, OrchardCommitDomains, OrchardFixedBases>,
+    // Per-note custom gate selector (conditions 10, 13, 15).
+    // Enforces: is_note_real is boolean, padded notes have v=0,
+    // real notes' Merkle root matches nc_root, and IMT root matches nf_imt_root.
+    q_per_note: Selector,
+    // IMT conditional swap gate selector (condition 13).
+    // At each of the 32 IMT Merkle levels, swaps (current, sibling) into (left, right)
+    // based on the position bit before Poseidon hashing.
+    q_imt_swap: Selector,
+    // IMT non-membership range check gate selector (condition 13).
+    // Proves low_nf < real_nf < next_nf (or low_nf < real_nf for the max leaf)
+    // by constraining diff values that are then range-checked to [0, 2^250).
+    q_imt_nonmember: Selector,
+    // Gov null pairwise distinctness gate selector (condition 16).
+    // For each of the 6 pairs (i,j), constrains (gov_null_i - gov_null_j) * inv = 1,
+    // which is unsatisfiable when two gov nullifiers are equal.
+    q_gov_null_distinct: Selector,
 }
 
 impl Config {
@@ -184,20 +227,56 @@ impl Config {
         NoteCommitChip::construct(self.new_note_commit_config.clone())
     }
 
+    fn merkle_chip_1(
+        &self,
+    ) -> MerkleChip<OrchardHashDomains, OrchardCommitDomains, OrchardFixedBases> {
+        MerkleChip::construct(self.merkle_config_1.clone())
+    }
+
+    fn merkle_chip_2(
+        &self,
+    ) -> MerkleChip<OrchardHashDomains, OrchardCommitDomains, OrchardFixedBases> {
+        MerkleChip::construct(self.merkle_config_2.clone())
+    }
+
     fn range_check_config(&self) -> LookupRangeCheckConfig<pallas::Base, 10> {
         self.range_check
     }
 }
 
+// ================================================================
+// NoteSlotWitness
+// ================================================================
+
+/// Private witness data for a single note slot (conditions 9–15).
+#[derive(Clone, Debug, Default)]
+pub struct NoteSlotWitness {
+    pub(crate) g_d: Value<NonIdentityPallasPoint>,
+    pub(crate) pk_d: Value<NonIdentityPallasPoint>,
+    pub(crate) v: Value<NoteValue>,
+    pub(crate) rho: Value<pallas::Base>,
+    pub(crate) psi: Value<pallas::Base>,
+    pub(crate) rcm: Value<NoteCommitTrapdoor>,
+    pub(crate) cm: Value<NoteCommitment>,
+    pub(crate) path: Value<[MerkleHashOrchard; MERKLE_DEPTH_ORCHARD]>,
+    pub(crate) pos: Value<u32>,
+    pub(crate) is_note_real: Value<bool>,
+    pub(crate) imt_low_nf: Value<pallas::Base>,
+    pub(crate) imt_next_nf: Value<pallas::Base>,
+    pub(crate) imt_leaf_pos: Value<u32>,
+    pub(crate) imt_path: Value<[pallas::Base; IMT_DEPTH]>,
+}
+
+// ================================================================
+// Circuit
+// ================================================================
+
 /// The Delegation circuit.
 ///
-/// Proves nullifier integrity, spend authority, and diversified address integrity:
-/// - The prover knows `(nk, rho, psi, cm)` such that `nf_signed = DeriveNullifier(nk, rho, psi, cm)`.
-/// - The prover knows `(ak, alpha)` such that `rk = [alpha] * SpendAuthG + ak`.
-/// - The prover knows `(ak, nk, rivk, g_d_signed, pk_d_signed)` such that
-///   `pk_d_signed = [CommitIvk_rivk(ExtractP(ak), nk)] * g_d_signed`.
+/// Proves all 16 conditions of the delegation ZKP (see README for details).
 #[derive(Clone, Debug, Default)]
 pub struct Circuit {
+    // Signed note witnesses (conditions 1–5).
     nk: Value<NullifierDerivingKey>,
     rho_signed: Value<pallas::Base>,
     psi_signed: Value<pallas::Base>,
@@ -208,28 +287,18 @@ pub struct Circuit {
     rcm_signed: Value<NoteCommitTrapdoor>,
     g_d_signed: Value<NonIdentityPallasPoint>,
     pk_d_signed: Value<DiversifiedTransmissionKey>,
-    // Output note witnesses.
+    // Output note witnesses (condition 6).
     // These are free witnesses.
     g_d_new: Value<NonIdentityPallasPoint>,
     pk_d_new: Value<DiversifiedTransmissionKey>,
     psi_new: Value<pallas::Base>,
     rcm_new: Value<NoteCommitTrapdoor>,
-    // Rho binding witnesses.
-    cmx_1: Value<pallas::Base>,
-    cmx_2: Value<pallas::Base>,
-    cmx_3: Value<pallas::Base>,
-    cmx_4: Value<pallas::Base>,
-    gov_comm: Value<pallas::Base>,
-    vote_round_id: Value<pallas::Base>,
-    // Gov commitment integrity witnesses (condition 7).
-    // These are the note values for the 4 delegated notes.
-    // Free witnesses until condition 9 (Old Note Commitment Integrity) is implemented.
-    v_1: Value<pallas::Base>,
-    v_2: Value<pallas::Base>,
-    v_3: Value<pallas::Base>,
-    v_4: Value<pallas::Base>,
-    // The governance commitment randomness (blinding factor).
+    // Per-note slots (conditions 9–15).
+    notes: [NoteSlotWitness; 4],
+    // Gov commitment blinding factor (condition 7).
     gov_comm_rand: Value<pallas::Base>,
+    // Condition 8 (minimum voting weight) has no witnesses — it uses v_total
+    // derived in-circuit from per-note values plus the constant MIN_WEIGHT.
 }
 
 impl Circuit {
@@ -254,63 +323,7 @@ impl Circuit {
         }
     }
 
-    /// Sets the rho-binding witness fields (condition 3).
-    ///
-    /// The rho of the signed note must equal
-    /// `Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)`,
-    /// binding the keystone signature to the exact notes being delegated,
-    /// the governance commitment, and the round.
-    pub fn with_rho_binding(
-        mut self,
-        cmx_1: pallas::Base,
-        cmx_2: pallas::Base,
-        cmx_3: pallas::Base,
-        cmx_4: pallas::Base,
-        gov_comm: pallas::Base,
-        vote_round_id: pallas::Base,
-    ) -> Self {
-        self.cmx_1 = Value::known(cmx_1);
-        self.cmx_2 = Value::known(cmx_2);
-        self.cmx_3 = Value::known(cmx_3);
-        self.cmx_4 = Value::known(cmx_4);
-        self.gov_comm = Value::known(gov_comm);
-        self.vote_round_id = Value::known(vote_round_id);
-        self
-    }
-
-    /// Sets the governance commitment witness fields (conditions 7 and 8).
-    ///
-    /// The 4 note values `v_1..v_4` are the values of the delegated notes.
-    /// `gov_comm_rand` is the blinding factor for the governance commitment.
-    ///
-    /// The circuit computes `v_total = v_1 + v_2 + v_3 + v_4` and verifies:
-    /// - **Condition 7**: `gov_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand, MAX_PROPOSAL_AUTHORITY)`
-    /// - **Condition 8**: `v_total >= 12,500,000` zatoshi (0.125 ZEC)
-    pub fn with_gov_commitment_data(
-        mut self,
-        v_1: u64,
-        v_2: u64,
-        v_3: u64,
-        v_4: u64,
-        gov_comm_rand: pallas::Base,
-    ) -> Self {
-        self.v_1 = Value::known(pallas::Base::from(v_1));
-        self.v_2 = Value::known(pallas::Base::from(v_2));
-        self.v_3 = Value::known(pallas::Base::from(v_3));
-        self.v_4 = Value::known(pallas::Base::from(v_4));
-        self.gov_comm_rand = Value::known(gov_comm_rand);
-        self
-    }
-
-    /// Sets the output note witness fields.
-    ///
-    /// The output note's `rho` must equal `nf_signed` (the nullifier of the
-    /// signed note). The caller is responsible for creating the output note
-    /// with `rho = nf_signed`; this is validated by the in-circuit constraint
-    /// `rho_new = nf_signed.inner()`.
-    ///
-    /// The output address `(g_d_new, pk_d_new)` is NOT checked against `ivk`
-    /// in-circuit. The voting hotkey is instead bound transitively through `gov_comm`.
+    /// Sets the output note witness fields (condition 6).
     pub fn with_output_note(mut self, output_note: &Note) -> Self {
         let rho_new = output_note.rho();
         let psi_new = output_note.rseed().psi(&rho_new);
@@ -321,7 +334,23 @@ impl Circuit {
         self.rcm_new = Value::known(rcm_new);
         self
     }
+
+    /// Sets the four per-note slot witnesses (conditions 9–15).
+    pub fn with_notes(mut self, notes: [NoteSlotWitness; 4]) -> Self {
+        self.notes = notes;
+        self
+    }
+
+    /// Sets the governance commitment blinding factor (condition 7).
+    pub fn with_gov_comm_rand(mut self, gov_comm_rand: pallas::Base) -> Self {
+        self.gov_comm_rand = Value::known(gov_comm_rand);
+        self
+    }
 }
+
+// ================================================================
+// plonk::Circuit implementation
+// ================================================================
 
 impl plonk::Circuit<pallas::Base> for Circuit {
     type Config = Config;
@@ -346,8 +375,141 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             meta.advice_column(),
         ];
 
-        // Addition of two field elements.
-        // 7,8,6 are chosen to share columns with the Poseidon chip to minimize column usage.
+        // Per-note custom gates (conditions 10, 13, 15).
+        let q_per_note = meta.selector();
+        meta.create_gate("Per-note checks", |meta| {
+            let q_per_note = meta.query_selector(q_per_note);
+            let is_note_real = meta.query_advice(advices[0], Rotation::cur());
+            let v = meta.query_advice(advices[1], Rotation::cur());
+            let root = meta.query_advice(advices[2], Rotation::cur());
+            let anchor = meta.query_advice(advices[3], Rotation::cur());
+            let imt_root = meta.query_advice(advices[4], Rotation::cur());
+            let nf_imt_root = meta.query_advice(advices[5], Rotation::cur());
+
+            let one = Expression::Constant(pallas::Base::one());
+
+            Constraints::with_selector(
+                q_per_note,
+                [
+                    // Cond 15: padded notes must have v=0. Real notes pass trivially.
+                    (
+                        "(1 - is_note_real) * v = 0",
+                        (one.clone() - is_note_real.clone()) * v,
+                    ),
+                    // Prevent is_note_real from being an arbitrary field element.
+                    ("bool_check is_note_real", bool_check(is_note_real.clone())),
+                    // Cond 10: real notes' Merkle root must match the public nc_root.
+                    // Padded notes skip this (is_note_real=0 zeroes the expression).
+                    (
+                        "is_note_real * (root - anchor) = 0",
+                        is_note_real * (root - anchor),
+                    ),
+                    // Cond 13: IMT root from non-membership proof must match public
+                    // nf_imt_root. Not gated — padded notes check too (§1.3.5).
+                    ("imt_root = nf_imt_root", imt_root - nf_imt_root),
+                ],
+            )
+        });
+
+        // IMT conditional swap gate (condition 13).
+        // At each level of the Poseidon Merkle path, we need to place (current, sibling)
+        // into (left, right) based on the position bit. If pos_bit=0, current is the
+        // left child; if pos_bit=1, they swap.
+        let q_imt_swap = meta.selector();
+        meta.create_gate("IMT conditional swap", |meta| {
+            let q = meta.query_selector(q_imt_swap);
+            let pos_bit = meta.query_advice(advices[0], Rotation::cur());
+            let current = meta.query_advice(advices[1], Rotation::cur());
+            let sibling = meta.query_advice(advices[2], Rotation::cur());
+            let left = meta.query_advice(advices[3], Rotation::cur());
+            let right = meta.query_advice(advices[4], Rotation::cur());
+
+            Constraints::with_selector(
+                q,
+                [
+                    // left = current + pos_bit * (sibling - current)
+                    // i.e. left = current when pos_bit=0, left = sibling when pos_bit=1.
+                    (
+                        "swap left",
+                        left.clone()
+                            - current.clone()
+                            - pos_bit.clone() * (sibling.clone() - current.clone()),
+                    ),
+                    // left + right = current + sibling (conservation: no values lost).
+                    ("swap right", left + right - current - sibling),
+                    // pos_bit must be 0 or 1.
+                    ("bool_check pos_bit", bool_check(pos_bit)),
+                ],
+            )
+        });
+
+        // IMT non-membership gate (condition 13).
+        // Proves that real_nf is NOT in the IMT by showing it falls strictly between
+        // two adjacent leaves: low_nf < real_nf < next_nf (or low_nf < real_nf for
+        // the max leaf where next_nf = 0).
+        let q_imt_nonmember = meta.selector();
+        meta.create_gate("IMT non-membership", |meta| {
+            let q = meta.query_selector(q_imt_nonmember);
+            let low_nf = meta.query_advice(advices[0], Rotation::cur());
+            let next_nf = meta.query_advice(advices[1], Rotation::cur());
+            let real_nf = meta.query_advice(advices[2], Rotation::cur());
+            let is_max = meta.query_advice(advices[3], Rotation::cur());
+            let inv_nf = meta.query_advice(advices[0], Rotation::next());
+            let diff1 = meta.query_advice(advices[1], Rotation::next());
+            let diff2_mask = meta.query_advice(advices[2], Rotation::next());
+
+            let one = Expression::Constant(pallas::Base::one());
+
+            Constraints::with_selector(
+                q,
+                [
+                    // Detect max leaf: is_max = 1 iff next_nf = 0.
+                    // Uses the inverse trick: if next_nf != 0 then inv_nf = 1/next_nf
+                    // and is_max = 1 - 1 = 0. If next_nf = 0, is_max = 1 - 0 = 1.
+                    (
+                        "is_max = 1 - next_nf * inv_nf",
+                        is_max.clone() - (one.clone() - next_nf.clone() * inv_nf),
+                    ),
+                    // Force consistency: if is_max=1 then next_nf must be 0.
+                    ("next_nf * is_max = 0", next_nf.clone() * is_max.clone()),
+                    ("bool_check is_max", bool_check(is_max.clone())),
+                    // diff1 = real_nf - low_nf - 1 (must be >= 0, checked via range
+                    // check outside this gate). Proves low_nf < real_nf.
+                    (
+                        "diff1 = real_nf - low_nf - 1",
+                        diff1 - (real_nf.clone() - low_nf - one.clone()),
+                    ),
+                    // diff2_mask = (1 - is_max) * (next_nf - real_nf - 1).
+                    // If not max leaf: proves real_nf < next_nf (range-checked outside).
+                    // If max leaf: masked to 0 (no upper bound needed).
+                    (
+                        "diff2_mask = (1 - is_max) * (next_nf - real_nf - 1)",
+                        diff2_mask - (one.clone() - is_max) * (next_nf - real_nf - one),
+                    ),
+                ],
+            )
+        });
+
+        // Gov null pairwise distinctness gate (condition 16).
+        // Proves two gov nullifiers are different by witnessing inv = 1/(a - b).
+        // If a = b, no valid inv exists and the constraint fails.
+        // Applied to all 6 pairs: (0,1), (0,2), (0,3), (1,2), (1,3), (2,3).
+        let q_gov_null_distinct = meta.selector();
+        meta.create_gate("Gov null pairwise distinctness", |meta| {
+            let q = meta.query_selector(q_gov_null_distinct);
+            let a = meta.query_advice(advices[0], Rotation::cur());
+            let b = meta.query_advice(advices[1], Rotation::cur());
+            let inv = meta.query_advice(advices[2], Rotation::cur());
+
+            let one = Expression::Constant(pallas::Base::one());
+
+            Constraints::with_selector(
+                q,
+                // (a - b) * inv = 1 is satisfiable iff a != b.
+                [("(a - b) * inv = 1", (a.clone() - b.clone()) * inv - one)],
+            )
+        });
+
         let add_config = AddChip::configure(meta, advices[7], advices[8], advices[6]);
 
         // Fixed columns for the Sinsemilla generator lookup table.
@@ -400,29 +562,39 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             rc_b,
         );
 
-        // Sinsemilla config 1 — used for loading the lookup table that the range check
-        // (and thus ECC operations) depend on, for CommitIvk, and for the signed
-        // note's NoteCommit.
-        let sinsemilla_config_1 = SinsemillaChip::configure(
-            meta,
-            advices[..5].try_into().unwrap(),
-            advices[6],
-            lagrange_coeffs[0],
-            lookup,
-            range_check,
-        );
+        // Sinsemilla config 1 + Merkle config 1.
+        // Sinsemilla: loads the lookup table, used for CommitIvk, and the signed
+        // note's NoteCommit. Uses advices[..5].
+        // Merkle: used for even levels of the per-note Merkle path (condition 10).
+        let (sinsemilla_config_1, merkle_config_1) = {
+            let sinsemilla_config_1 = SinsemillaChip::configure(
+                meta,
+                advices[..5].try_into().unwrap(),
+                advices[6],
+                lagrange_coeffs[0],
+                lookup,
+                range_check,
+            );
+            let merkle_config_1 = MerkleChip::configure(meta, sinsemilla_config_1.clone());
+            (sinsemilla_config_1, merkle_config_1)
+        };
 
-        // Sinsemilla config 2 — a second instance for the output note's NoteCommit.
-        // Since the Sinsemilla config uses only 5 advice columns,
-        // we can fit two instances side-by-side.
-        let sinsemilla_config_2 = SinsemillaChip::configure(
-            meta,
-            advices[5..].try_into().unwrap(),
-            advices[7],
-            lagrange_coeffs[1],
-            lookup,
-            range_check,
-        );
+        // Sinsemilla config 2 + Merkle config 2.
+        // Sinsemilla: used for the output note's NoteCommit. Uses advices[5..],
+        // so the two Sinsemilla chips lay out side-by-side.
+        // Merkle: used for odd levels of the per-note Merkle path (condition 10).
+        let (sinsemilla_config_2, merkle_config_2) = {
+            let sinsemilla_config_2 = SinsemillaChip::configure(
+                meta,
+                advices[5..].try_into().unwrap(),
+                advices[7],
+                lagrange_coeffs[1],
+                lookup,
+                range_check,
+            );
+            let merkle_config_2 = MerkleChip::configure(meta, sinsemilla_config_2.clone());
+            (sinsemilla_config_2, merkle_config_2)
+        };
 
         // Configuration to handle decomposition and canonicity checking for CommitIvk.
         let commit_ivk_config = CommitIvkChip::configure(meta, advices);
@@ -447,6 +619,12 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             signed_note_commit_config,
             new_note_commit_config,
             range_check,
+            merkle_config_1,
+            merkle_config_2,
+            q_per_note,
+            q_imt_swap,
+            q_imt_nonmember,
+            q_gov_null_distinct,
         }
     }
 
@@ -535,9 +713,15 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             self.cm_signed.as_ref().map(|cm| cm.inner().to_affine()),
         )?;
 
+        // ---------------------------------------------------------------
+        // Condition 2: Nullifier integrity.
+        // nf_signed = DeriveNullifier_nk(rho_signed, psi_signed, cm_signed)
+        // ---------------------------------------------------------------
+
         // Nullifier integrity: derive nf_signed = DeriveNullifier(nk, rho_signed, psi_signed, cm_signed).
         let nf_signed = derive_nullifier(
-            layouter.namespace(|| "nf_signed = DeriveNullifier_nk(rho_signed, psi_signed, cm_signed)"),
+            layouter
+                .namespace(|| "nf_signed = DeriveNullifier_nk(rho_signed, psi_signed, cm_signed)"),
             config.poseidon_chip(),
             config.add_chip(),
             ecc_chip.clone(),
@@ -552,17 +736,19 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // as a public input from outside the circuit (supplied at NF_SIGNED of the public input)
         layouter.constrain_instance(nf_signed.inner().cell(), config.primary, NF_SIGNED)?;
 
+        // ---------------------------------------------------------------
+        // Condition 4: Spend authority.
+        // rk = [alpha] * SpendAuthG + ak_P
+        // ---------------------------------------------------------------
+
         // Spend authority
         // Proves that the public rk is a valid rerandomization of the prover's ak.
         // The out-of-circuit verifier checks that the keystone signature is valid under rk,
         // so this links the ZKP to the signature without revealing ak.
         {
             // Witness alpha (spend auth randomizer) as a full-width fixed scalar.
-            let alpha = ScalarFixed::new(
-                ecc_chip.clone(),
-                layouter.namespace(|| "alpha"),
-                self.alpha,
-            )?;
+            let alpha =
+                ScalarFixed::new(ecc_chip.clone(), layouter.namespace(|| "alpha"), self.alpha)?;
 
             // alpha_commitment = [alpha] SpendAuthG
             let (alpha_commitment, _) = {
@@ -581,6 +767,11 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             layouter.constrain_instance(rk.inner().y().cell(), config.primary, RK_Y)?;
         }
 
+        // ---------------------------------------------------------------
+        // Condition 5: CommitIvk → ivk (internal wire, not a public input).
+        // pk_d_signed = [ivk] * g_d_signed.
+        // ---------------------------------------------------------------
+
         // Diversified address integrity.
         // ivk = ⊥ or pk_d_signed = [ivk] * g_d_signed
         // where ivk = CommitIvk_rivk(ExtractP(ak_P), nk)
@@ -588,7 +779,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // The ⊥ case is handled internally by CommitDomain::short_commit:
         // incomplete addition allows ⊥ to occur, and synthesis detects
         // these edge cases and aborts proof creation.
-        let pk_d_signed = {
+        let ivk_cell = {
             let ivk = {
                 // ExtractP(ak_P) -- extract the x-coordinate from the curve point
                 let ak = ak_P.extract_p().inner().clone();
@@ -605,39 +796,53 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                     config.commit_ivk_chip(),
                     layouter.namespace(|| "CommitIvk"),
                     ak,
-                    nk,
+                    nk.clone(),
                     rivk,
                 )?
             };
 
+            // ivk is internal — NOT constrained to a public input.
+            let ivk_cell = ivk.inner().clone();
+
             // Convert ivk (an x-coordinate) to a variable-base scalar for EC multiplication.
-            let ivk = ScalarVar::from_base(
-                ecc_chip.clone(),
-                layouter.namespace(|| "ivk"),
-                ivk.inner(),
-            )?;
+            let ivk_scalar =
+                ScalarVar::from_base(ecc_chip.clone(), layouter.namespace(|| "ivk"), ivk.inner())?;
 
             // [ivk] g_d_signed - derive the expected pk_d
             let (derived_pk_d_signed, _ivk) =
-                g_d_signed.mul(layouter.namespace(|| "[ivk] g_d_signed"), ivk)?;
+                g_d_signed.mul(layouter.namespace(|| "[ivk] g_d_signed"), ivk_scalar)?;
 
             // Witness pk_d_signed and constrain it to equal the derived value.
             let pk_d_signed = NonIdentityPoint::new(
                 ecc_chip.clone(),
                 layouter.namespace(|| "witness pk_d_signed"),
-                self.pk_d_signed.map(|pk_d_signed| pk_d_signed.inner().to_affine()),
+                self.pk_d_signed
+                    .map(|pk_d_signed| pk_d_signed.inner().to_affine()),
             )?;
             derived_pk_d_signed
                 .constrain_equal(layouter.namespace(|| "pk_d_signed equality"), &pk_d_signed)?;
 
-            pk_d_signed
+            ivk_cell
         };
+
+        // ---------------------------------------------------------------
+        // Condition 1: Signed note commitment integrity.
+        // NoteCommit_rcm_signed(g_d_signed, pk_d_signed, 0, rho_signed, psi_signed) = cm_signed
+        // ---------------------------------------------------------------
 
         // signed note commitment integrity.
         // NoteCommit_rcm_signed(repr(g_d_signed), repr(pk_d_signed), 0,
         //                        rho_signed, psi_signed) = cm_signed
         // No null option: the signed note must have a valid commitment.
         {
+            // Re-witness pk_d_signed for NoteCommit (need inner() from the constrained point).
+            let pk_d_signed_for_nc = NonIdentityPoint::new(
+                ecc_chip.clone(),
+                layouter.namespace(|| "pk_d_signed for note_commit"),
+                self.pk_d_signed
+                    .map(|pk_d_signed| pk_d_signed.inner().to_affine()),
+            )?;
+
             let rcm_signed = ScalarFixed::new(
                 ecc_chip.clone(),
                 layouter.namespace(|| "rcm_signed"),
@@ -658,7 +863,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 config.ecc_chip(),
                 config.note_commit_chip_signed(),
                 g_d_signed.inner(),
-                pk_d_signed.inner(),
+                pk_d_signed_for_nc.inner(),
                 v_signed,
                 rho_signed.clone(),
                 psi_signed,
@@ -666,59 +871,227 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             )?;
 
             // Strict equality — no null/bottom option.
-            derived_cm_signed.constrain_equal(
-                layouter.namespace(|| "cm_signed integrity"),
-                &cm_signed,
-            )?;
+            derived_cm_signed
+                .constrain_equal(layouter.namespace(|| "cm_signed integrity"), &cm_signed)?;
         }
+
+        // ---------------------------------------------------------------
+        // Read shared public inputs from instance column.
+        // ---------------------------------------------------------------
 
         // Rho binding (condition 3).
         // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
         // Binds the signed note to the exact notes being delegated, the governance
         // commitment, and the round, making the keystone signature non-replayable.
         //
-        // Returns gov_comm_cell and vote_round_id_cell for reuse in condition 7.
-        let (gov_comm_cell, vote_round_id_cell) = {
-            let cmx_1 = assign_free_advice(
-                layouter.namespace(|| "witness cmx_1"), config.advices[0], self.cmx_1)?;
-            let cmx_2 = assign_free_advice(
-                layouter.namespace(|| "witness cmx_2"), config.advices[0], self.cmx_2)?;
-            let cmx_3 = assign_free_advice(
-                layouter.namespace(|| "witness cmx_3"), config.advices[0], self.cmx_3)?;
-            let cmx_4 = assign_free_advice(
-                layouter.namespace(|| "witness cmx_4"), config.advices[0], self.cmx_4)?;
-            let gov_comm = assign_free_advice(
-                layouter.namespace(|| "witness gov_comm"), config.advices[0], self.gov_comm)?;
-            let vote_round_id = assign_free_advice(
-                layouter.namespace(|| "witness vote_round_id"), config.advices[0], self.vote_round_id)?;
+        // Public inputs live in the instance column, but gates can only constrain
+        // advice cells. assign_advice_from_instance copies each public input into an
+        // advice cell with a copy constraint, so the prover cannot substitute a
+        // different value. The resulting cells are then passed into downstream gates.
 
-            // Bind gov_comm and vote_round_id to the public inputs.
-            layouter.constrain_instance(gov_comm.cell(), config.primary, GOV_COMM)?;
-            layouter.constrain_instance(vote_round_id.cell(), config.primary, VOTE_ROUND_ID)?;
+        // gov_comm: used in condition 3 (rho binding hash) and condition 7 (gov
+        // commitment integrity check).
+        let gov_comm_cell = layouter.assign_region(
+            || "copy gov_comm from instance",
+            |mut region| {
+                region.assign_advice_from_instance(
+                    || "gov_comm",
+                    config.primary,
+                    GOV_COMM,
+                    config.advices[0],
+                    0,
+                )
+            },
+        )?;
 
-            // Poseidon hash over 6 inputs using ConstantLength<6>.
-            let derived_rho = {
-                let poseidon_message = [cmx_1, cmx_2, cmx_3, cmx_4, gov_comm.clone(), vote_round_id.clone()];
-                let poseidon_hasher = PoseidonHash::<
-                    pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<6>, 3, 2,
-                >::init(
-                    config.poseidon_chip(),
-                    layouter.namespace(|| "rho binding Poseidon init"),
-                )?;
-                poseidon_hasher.hash(
-                    layouter.namespace(|| "Poseidon(cmx_1..4, gov_comm, vote_round_id)"),
-                    poseidon_message,
-                )?
-            };
+        // vote_round_id: used in condition 3 (rho binding hash) and condition 7
+        // (gov commitment integrity check).
+        let vote_round_id_cell = layouter.assign_region(
+            || "copy vote_round_id from instance",
+            |mut region| {
+                region.assign_advice_from_instance(
+                    || "vote_round_id",
+                    config.primary,
+                    VOTE_ROUND_ID,
+                    config.advices[0],
+                    0,
+                )
+            },
+        )?;
 
-            // Constrain: derived_rho == rho_signed.
+        // nc_root: the note commitment tree anchor. Each real note's Merkle root
+        // is checked against this in condition 10 (via q_per_note gate).
+        let nc_root_cell = layouter.assign_region(
+            || "copy nc_root from instance",
+            |mut region| {
+                region.assign_advice_from_instance(
+                    || "nc_root",
+                    config.primary,
+                    NC_ROOT,
+                    config.advices[0],
+                    0,
+                )
+            },
+        )?;
+
+        // nf_imt_root: the nullifier IMT root at snapshot height. Each note's IMT
+        // non-membership proof root is checked against this in condition 13
+        // (via q_per_note gate).
+        let nf_imt_root_cell = layouter.assign_region(
+            || "copy nf_imt_root from instance",
+            |mut region| {
+                region.assign_advice_from_instance(
+                    || "nf_imt_root",
+                    config.primary,
+                    NF_IMT_ROOT,
+                    config.advices[0],
+                    0,
+                )
+            },
+        )?;
+
+        // ---------------------------------------------------------------
+        // Conditions 9–15: prove ownership and unspentness of each delegated note.
+        // ---------------------------------------------------------------
+
+        // For each of the 4 note slots, synthesize_note_slot proves:
+        //   - I know the note's contents and it has a valid commitment (cond 9)
+        //   - The commitment exists in the mainchain note tree (cond 10)
+        //   - The note belongs to my key (cond 11)
+        //   - The note's nullifier is NOT in the spent-nullifier IMT (cond 12-13)
+        //   - A governance nullifier is correctly derived for this note (cond 14)
+        //   - Padded (unused) slots have zero value (cond 15)
+        //
+        // Returns three values per slot for use in the global conditions that follow:
+        //   cmx_i      — hashed into rho_signed (condition 3)
+        //   v_i        — summed into v_total (conditions 7 and 8)
+        //   gov_null_i — checked pairwise for distinctness (condition 16)
+
+        let mut cmx_cells = Vec::with_capacity(4);
+        let mut v_cells = Vec::with_capacity(4);
+        let mut gov_null_cells = Vec::with_capacity(4);
+
+        for i in 0..4 {
+            let (cmx_i, v_i, gov_null_i) = synthesize_note_slot(
+                &config,
+                &mut layouter,
+                ecc_chip.clone(),
+                &ivk_cell,
+                &nk,
+                &vote_round_id_cell,
+                &nc_root_cell,
+                &nf_imt_root_cell,
+                &self.notes[i],
+                i,
+                GOV_NULL_OFFSETS[i],
+            )?;
+            cmx_cells.push(cmx_i);
+            v_cells.push(v_i);
+            gov_null_cells.push(gov_null_i);
+        }
+
+        // ---------------------------------------------------------------
+        // Condition 16: Gov null pairwise distinctness.
+        // ---------------------------------------------------------------
+
+        // Prevents double-delegation: no two note slots may produce the same
+        // governance nullifier. We check all 6 pairs of the 4 gov nullifiers.
+        //
+        // For each pair (i, j), we place gov_null_i, gov_null_j, and a witness
+        // inv = 1/(gov_null_i - gov_null_j) into the same row. The gate constrains
+        // (a - b) * inv = 1, which is only satisfiable when a != b (no field
+        // element has a multiplicative inverse of zero).
+        {
+            const PAIRS: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+
+            layouter.assign_region(
+                || "gov null distinctness",
+                |mut region| {
+                    for (row, &(i, j)) in PAIRS.iter().enumerate() {
+                        config.q_gov_null_distinct.enable(&mut region, row)?;
+
+                        // Copy the two gov nullifiers from their note slots.
+                        gov_null_cells[i].copy_advice(
+                            || format!("gov_null_{i}"),
+                            &mut region,
+                            config.advices[0],
+                            row,
+                        )?;
+                        gov_null_cells[j].copy_advice(
+                            || format!("gov_null_{j}"),
+                            &mut region,
+                            config.advices[1],
+                            row,
+                        )?;
+
+                        // Witness the inverse of their difference.
+                        region.assign_advice(
+                            || format!("inv_{i}_{j}"),
+                            config.advices[2],
+                            row,
+                            || {
+                                gov_null_cells[i]
+                                    .value()
+                                    .copied()
+                                    .zip(gov_null_cells[j].value().copied())
+                                    .map(|(a, b)| (a - b).invert().unwrap_or(pallas::Base::zero()))
+                            },
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+
+        // ---------------------------------------------------------------
+        // Condition 3: Rho binding.
+        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+        // ---------------------------------------------------------------
+
+        // The keystone note's rho is deterministically derived from the 4 note
+        // commitments, the gov commitment, and the vote round. This binds the
+        // keystone signature to the exact set of notes being delegated — replaying
+        // the signature with different notes would produce a different rho, which
+        // would change the nullifier (cond 2) and break the proof.
+        {
+            // Hash the 6 inputs: 4 note commitment x-coords (from cond 9),
+            // gov_comm (public input), and vote_round_id (public input).
+            let poseidon_message = [
+                cmx_cells[0].clone(),
+                cmx_cells[1].clone(),
+                cmx_cells[2].clone(),
+                cmx_cells[3].clone(),
+                gov_comm_cell.clone(),
+                vote_round_id_cell.clone(),
+            ];
+            let poseidon_hasher = PoseidonHash::<
+                pallas::Base,
+                _,
+                poseidon::P128Pow5T3,
+                ConstantLength<6>,
+                3,
+                2,
+            >::init(
+                config.poseidon_chip(),
+                layouter.namespace(|| "rho binding Poseidon init"),
+            )?;
+            let derived_rho = poseidon_hasher.hash(
+                layouter.namespace(|| "Poseidon(cmx_1..4, gov_comm, vote_round_id)"),
+                poseidon_message,
+            )?;
+
+            // The derived rho must equal the rho_signed used in condition 1 (note
+            // commitment) and condition 2 (nullifier). This closes the binding.
             layouter.assign_region(
                 || "rho binding equality",
                 |mut region| region.constrain_equal(derived_rho.cell(), rho_signed.cell()),
             )?;
+        }
 
-            (gov_comm, vote_round_id)
-        };
+        // ---------------------------------------------------------------
+        // Condition 6: Output note commitment integrity.
+        // Returns (g_d_new_x, pk_d_new_x) for condition 7.
+        // ---------------------------------------------------------------
 
         // Output note commitment integrity (condition 6).
         //
@@ -794,13 +1167,22 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             layouter.constrain_instance(cmx.inner().cell(), config.primary, CMX_NEW)?;
 
             // Extract x-coordinates of the output address for condition 7.
-            (g_d_new.extract_p().inner().clone(), pk_d_new.extract_p().inner().clone())
+            (
+                g_d_new.extract_p().inner().clone(),
+                pk_d_new.extract_p().inner().clone(),
+            )
         };
+
+        // ---------------------------------------------------------------
+        // Condition 7: Gov commitment integrity.
+        // gov_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id,
+        //                     MAX_PROPOSAL_AUTHORITY, gov_comm_rand)
+        // ---------------------------------------------------------------
 
         // Gov commitment integrity (condition 7).
         //
         // gov_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id,
-        //                     gov_comm_rand, MAX_PROPOSAL_AUTHORITY)
+        //                     MAX_PROPOSAL_AUTHORITY, gov_comm_rand)
         //
         // Proves that the governance commitment (public input) is correctly derived
         // from the output note's voting hotkey address, the total voting weight,
@@ -814,26 +1196,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ConstantLength<5> synthesis issue with the Pow5Chip's partial-round
         // layout during real proving.
         let v_total = {
-            let v_1 = assign_free_advice(
-                layouter.namespace(|| "witness v_1"),
-                config.advices[0],
-                self.v_1,
-            )?;
-            let v_2 = assign_free_advice(
-                layouter.namespace(|| "witness v_2"),
-                config.advices[0],
-                self.v_2,
-            )?;
-            let v_3 = assign_free_advice(
-                layouter.namespace(|| "witness v_3"),
-                config.advices[0],
-                self.v_3,
-            )?;
-            let v_4 = assign_free_advice(
-                layouter.namespace(|| "witness v_4"),
-                config.advices[0],
-                self.v_4,
-            )?;
             let gov_comm_rand = assign_free_advice(
                 layouter.namespace(|| "witness gov_comm_rand"),
                 config.advices[0],
@@ -842,25 +1204,22 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
             // v_total = v_1 + v_2 + v_3 + v_4  (three AddChip additions)
             let add_chip = config.add_chip();
-            let sum_12 = add_chip.add(
-                layouter.namespace(|| "v_1 + v_2"),
-                &v_1,
-                &v_2,
-            )?;
+            let sum_12 =
+                add_chip.add(layouter.namespace(|| "v_1 + v_2"), &v_cells[0], &v_cells[1])?;
             let sum_123 = add_chip.add(
                 layouter.namespace(|| "(v_1 + v_2) + v_3"),
                 &sum_12,
-                &v_3,
+                &v_cells[2],
             )?;
             let v_total = add_chip.add(
                 layouter.namespace(|| "(v_1 + v_2 + v_3) + v_4"),
                 &sum_123,
-                &v_4,
+                &v_cells[3],
             )?;
 
             // MAX_PROPOSAL_AUTHORITY — constant-constrained so the value is
             // baked into the verification key and cannot be altered by a
-            // malicious prover.  This is the 6th Poseidon input; it occupies
+            // malicious prover.  This is the 5th Poseidon input; it occupies
             // the slot reserved for proposal authority in the spec.
             let max_proposal_authority = layouter.assign_region(
                 || "MAX_PROPOSAL_AUTHORITY constant",
@@ -875,24 +1234,31 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             )?;
 
             // Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id,
-            //          gov_comm_rand, MAX_PROPOSAL_AUTHORITY)
+            //          MAX_PROPOSAL_AUTHORITY, gov_comm_rand)
             let derived_gov_comm = {
                 let poseidon_message = [
                     g_d_new_x,
                     pk_d_new_x,
                     v_total.clone(),
                     vote_round_id_cell,
-                    gov_comm_rand,
                     max_proposal_authority,
+                    gov_comm_rand,
                 ];
                 let poseidon_hasher = PoseidonHash::<
-                    pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<6>, 3, 2,
+                    pallas::Base,
+                    _,
+                    poseidon::P128Pow5T3,
+                    ConstantLength<6>,
+                    3,
+                    2,
                 >::init(
                     config.poseidon_chip(),
                     layouter.namespace(|| "gov_comm Poseidon init"),
                 )?;
                 poseidon_hasher.hash(
-                    layouter.namespace(|| "Poseidon(g_d_new_x, pk_d_new_x, v_total, round, rand, authority)"),
+                    layouter.namespace(|| {
+                        "Poseidon(g_d_new_x, pk_d_new_x, v_total, round, authority, rand)"
+                    }),
                     poseidon_message,
                 )?
             };
@@ -905,6 +1271,11 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
             v_total
         };
+
+        // ---------------------------------------------------------------
+        // Condition 8: Minimum voting weight.
+        // v_total >= 12,500,000 zatoshi (0.125 ZEC)
+        // ---------------------------------------------------------------
 
         // Minimum voting weight (condition 8).
         //
@@ -971,19 +1342,588 @@ impl plonk::Circuit<pallas::Base> for Circuit {
     }
 }
 
-/// Public inputs to the Delegation circuit.
+// ================================================================
+// Per-note slot synthesis (conditions 9–15).
+// ================================================================
+
+/// Synthesize conditions 9–15 for a single note slot.
+///
+/// Returns `(cmx_cell, v_cell, gov_null_cell)` — the extracted commitment,
+/// value, and governance nullifier for use in the rho binding (condition 3),
+/// gov commitment (condition 7), and gov null distinctness (condition 16).
+#[allow(clippy::too_many_arguments, non_snake_case)]
+fn synthesize_note_slot(
+    config: &Config,
+    layouter: &mut impl Layouter<pallas::Base>,
+    ecc_chip: EccChip<OrchardFixedBases>,
+    ivk_cell: &AssignedCell<pallas::Base, pallas::Base>,
+    nk_cell: &AssignedCell<pallas::Base, pallas::Base>,
+    vote_round_id_cell: &AssignedCell<pallas::Base, pallas::Base>,
+    nc_root_cell: &AssignedCell<pallas::Base, pallas::Base>,
+    nf_imt_root_cell: &AssignedCell<pallas::Base, pallas::Base>,
+    note: &NoteSlotWitness,
+    slot: usize,
+    gov_null_offset: usize,
+) -> Result<
+    (
+        AssignedCell<pallas::Base, pallas::Base>,
+        AssignedCell<pallas::Base, pallas::Base>,
+        AssignedCell<pallas::Base, pallas::Base>,
+    ),
+    plonk::Error,
+> {
+    let s = slot; // shorthand for format strings
+
+    // ---------------------------------------------------------------
+    // Condition 9: Note commitment integrity.
+    // ---------------------------------------------------------------
+
+    // Proves the prover knows the note's plaintext (address, value, rho, psi)
+    // and that it hashes to the claimed commitment. This is the foundation —
+    // all other per-note conditions build on these witnessed values.
+
+    // Witness the note's address components as curve points.
+    let g_d = NonIdentityPoint::new(
+        ecc_chip.clone(),
+        layouter.namespace(|| format!("note {s} witness g_d")),
+        note.g_d.as_ref().map(|gd| gd.to_affine()),
+    )?;
+
+    let pk_d = NonIdentityPoint::new(
+        ecc_chip.clone(),
+        layouter.namespace(|| format!("note {s} witness pk_d")),
+        note.pk_d.as_ref().map(|pk| pk.to_affine()),
+    )?;
+
+    // Witness the note's value, rho, and psi as field elements.
+    let v = assign_free_advice(
+        layouter.namespace(|| format!("note {s} witness v")),
+        config.advices[0],
+        note.v,
+    )?;
+
+    let rho = assign_free_advice(
+        layouter.namespace(|| format!("note {s} witness rho")),
+        config.advices[0],
+        note.rho,
+    )?;
+
+    let psi = assign_free_advice(
+        layouter.namespace(|| format!("note {s} witness psi")),
+        config.advices[0],
+        note.psi,
+    )?;
+
+    // Witness rcm (commitment randomness) as a fixed-base scalar for ECC.
+    let rcm = ScalarFixed::new(
+        ecc_chip.clone(),
+        layouter.namespace(|| format!("note {s} rcm")),
+        note.rcm.as_ref().map(|rcm| rcm.inner()),
+    )?;
+
+    // Witness the claimed commitment as a curve point.
+    let cm = Point::new(
+        ecc_chip.clone(),
+        layouter.namespace(|| format!("note {s} witness cm")),
+        note.cm.as_ref().map(|cm| cm.inner().to_affine()),
+    )?;
+
+    // Recompute NoteCommit from the plaintext and constrain it equals the
+    // witnessed cm. If any input (g_d, pk_d, v, rho, psi, rcm) is wrong,
+    // the recomputed commitment won't match and the proof fails.
+    let derived_cm = note_commit(
+        layouter.namespace(|| format!("note {s} NoteCommit")),
+        config.sinsemilla_chip_1(),
+        config.ecc_chip(),
+        config.note_commit_chip_signed(),
+        g_d.inner(),
+        pk_d.inner(),
+        v.clone(),
+        rho.clone(),
+        psi.clone(),
+        rcm,
+    )?;
+
+    derived_cm.constrain_equal(layouter.namespace(|| format!("note {s} cm integrity")), &cm)?;
+
+    // cmx = ExtractP(cm) — returned to caller.
+    let cmx_cell = cm.extract_p().inner().clone();
+
+    // Witness v as pallas::Base for use in the gov commitment sum (condition 7).
+    // Constrain it equal to the NoteValue cell used in note_commit.
+    let v_base = assign_free_advice(
+        layouter.namespace(|| format!("note {s} witness v_base")),
+        config.advices[0],
+        note.v.map(|val| pallas::Base::from(val.inner())),
+    )?;
+    layouter.assign_region(
+        || format!("note {s} v = v_base"),
+        |mut region| region.constrain_equal(v.cell(), v_base.cell()),
+    )?;
+
+    // ---------------------------------------------------------------
+    // Condition 11: Diversified address integrity.
+    // pk_d = [ivk] * g_d
+    // ---------------------------------------------------------------
+
+    // Proves this note belongs to the prover's key. ivk (incoming viewing key)
+    // was derived from ak and nk in condition 5. If pk_d != [ivk] * g_d, the
+    // note was addressed to someone else and the prover can't claim it.
+
+    // Convert ivk from a base field element to a scalar for ECC multiplication.
+    let ivk_scalar = ScalarVar::from_base(
+        ecc_chip.clone(),
+        layouter.namespace(|| format!("note {s} ivk to scalar")),
+        ivk_cell,
+    )?;
+
+    // Compute [ivk] * g_d and check it matches the witnessed pk_d.
+    let (derived_pk_d, _ivk) = g_d.mul(
+        layouter.namespace(|| format!("note {s} [ivk] g_d")),
+        ivk_scalar,
+    )?;
+
+    // Constrain: derived_pk_d == pk_d.
+    derived_pk_d.constrain_equal(
+        layouter.namespace(|| format!("note {s} pk_d equality")),
+        &pk_d,
+    )?;
+
+    // ---------------------------------------------------------------
+    // Condition 12: Private nullifier derivation.
+    // real_nf = DeriveNullifier_nk(rho, psi, cm)
+    // ---------------------------------------------------------------
+
+    // Derives the note's real mainchain nullifier in-circuit. This is NOT
+    // published — it stays private. It's used for two things:
+    //   1. IMT non-membership (cond 13): proves the note is unspent
+    //   2. Gov nullifier derivation (cond 14): hashed into the public gov_null
+
+    let real_nf = derive_nullifier(
+        layouter.namespace(|| format!("note {s} real_nf = DeriveNullifier")),
+        config.poseidon_chip(),
+        config.add_chip(),
+        ecc_chip.clone(),
+        rho.clone(),
+        &psi,
+        &cm,
+        nk_cell.clone(),
+    )?;
+
+    // ---------------------------------------------------------------
+    // Condition 14: Governance nullifier integrity.
+    // gov_null = Poseidon(nk, Poseidon(domain_tag, Poseidon(vote_round_id, real_nf)))
+    // ---------------------------------------------------------------
+
+    // Derives a governance-domain nullifier published on the vote chain to prevent
+    // double-delegation. The three-layer Poseidon hash ensures:
+    //   - Scoped to this voting round (vote_round_id)
+    //   - Domain-separated from other nullifier uses ("governance authorization" tag)
+    //   - Keyed by nk, so it can't be linked to real_nf even when real_nf is later
+    //     revealed on mainchain
+    //
+    // The result is constrained to the public instance so the vote chain can
+    // track which notes have already been delegated this round.
+
+    // Domain tag = "governance authorization" as a field element. Assigned as a
+    // constant so it's baked into the verification key.
+    let domain_tag = layouter.assign_region(
+        || format!("note {s} gov_auth domain tag"),
+        |mut region| {
+            region.assign_advice_from_constant(
+                || "domain_tag",
+                config.advices[0],
+                0,
+                crate::delegation::imt::gov_auth_domain_tag(),
+            )
+        },
+    )?;
+
+    // Step 1: Poseidon(vote_round_id, real_nf) — scope to this round + note.
+    let intermediate = {
+        let poseidon_hasher =
+            PoseidonHash::<pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+                config.poseidon_chip(),
+                layouter.namespace(|| format!("note {s} gov_null step 1 init")),
+            )?;
+        poseidon_hasher.hash(
+            layouter.namespace(|| format!("note {s} Poseidon(vote_round_id, real_nf)")),
+            [vote_round_id_cell.clone(), real_nf.inner().clone()],
+        )?
+    };
+
+    // Step 2: Poseidon(domain_tag, intermediate) — domain separation.
+    let tagged = {
+        let poseidon_hasher =
+            PoseidonHash::<pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+                config.poseidon_chip(),
+                layouter.namespace(|| format!("note {s} gov_null step 2 init")),
+            )?;
+        poseidon_hasher.hash(
+            layouter.namespace(|| format!("note {s} Poseidon(domain_tag, intermediate)")),
+            [domain_tag, intermediate],
+        )?
+    };
+
+    // Step 3: Poseidon(nk, tagged) — key the result so it can't be reversed.
+    let gov_null = {
+        let poseidon_hasher =
+            PoseidonHash::<pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+                config.poseidon_chip(),
+                layouter.namespace(|| format!("note {s} gov_null step 3 init")),
+            )?;
+        poseidon_hasher.hash(
+            layouter.namespace(|| format!("note {s} Poseidon(nk, tagged)")),
+            [nk_cell.clone(), tagged],
+        )?
+    };
+
+    // Constrain gov_null to the public instance column so the vote chain sees it.
+    let gov_null_cell = gov_null.clone();
+    layouter.constrain_instance(gov_null.cell(), config.primary, gov_null_offset)?;
+
+    // ---------------------------------------------------------------
+    // Condition 10: Merkle path validity.
+    // ---------------------------------------------------------------
+
+    // Proves the note's commitment exists in the mainchain note commitment tree.
+    // Computes the Sinsemilla-based Merkle root from the leaf (cmx = ExtractP(cm))
+    // and the 32-level authentication path. The q_per_note gate then checks that
+    // the computed root equals the public nc_root (for real notes only).
+
+    let root = {
+        // Convert the witnessed Merkle path siblings to raw field elements.
+        let path = note
+            .path
+            .map(|typed_path| typed_path.map(|node| node.inner()));
+        let merkle_inputs = GadgetMerklePath::construct(
+            [config.merkle_chip_1(), config.merkle_chip_2()],
+            OrchardHashDomains::MerkleCrh,
+            note.pos,
+            path,
+        );
+        // The leaf is the x-coordinate of the note commitment.
+        let leaf = cm.extract_p().inner().clone();
+        merkle_inputs
+            .calculate_root(layouter.namespace(|| format!("note {s} Merkle path")), leaf)?
+    };
+
+    // ---------------------------------------------------------------
+    // Condition 13: IMT non-membership.
+    // ---------------------------------------------------------------
+
+    // Proves the note's real nullifier (from cond 12) has NOT been spent on
+    // mainchain. Uses an Indexed Merkle Tree (IMT) where each leaf stores
+    // (low_nf, next_nf) — a sorted linked list of all known nullifiers.
+    //
+    // The proof has three parts:
+    //   1. Merkle path: the bracketing leaf Poseidon(low_nf, next_nf) is in the
+    //      IMT at the claimed position, producing a root that matches nf_imt_root.
+    //   2. Non-membership gate: low_nf < real_nf < next_nf (or low_nf < real_nf
+    //      for the max leaf where next_nf = 0). This proves real_nf falls in a
+    //      gap between adjacent leaves, so it's not in the tree.
+    //   3. Range checks: diff1 and diff2_mask are range-checked to 250 bits,
+    //      which enforces the strict inequalities (a negative difference would
+    //      wrap around to a large field element outside the 250-bit range).
+    //
+    // TODO: The 250-bit range check assumes the IMT preprocessing produces
+    // bracket gaps smaller than 2^250. Decide whether to keep this assumption
+    // or replace with an assumption-free in-circuit comparator.
+    //
+    // TODO: IMT hashing currently uses Poseidon1 (P128Pow5T3). If the IMT
+    // moves to Poseidon2, we'll need a Poseidon2 Halo2 chip/gadget here.
+
+    // Witness the bracketing leaf's low and next nullifiers.
+    let low_nf = assign_free_advice(
+        layouter.namespace(|| format!("note {s} imt_low_nf")),
+        config.advices[0],
+        note.imt_low_nf,
+    )?;
+    let next_nf = assign_free_advice(
+        layouter.namespace(|| format!("note {s} imt_next_nf")),
+        config.advices[0],
+        note.imt_next_nf,
+    )?;
+
+    // Hash the leaf: Poseidon(low_nf, next_nf) is the leaf value in the IMT.
+    let leaf_hash = {
+        let poseidon_hasher =
+            PoseidonHash::<pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+                config.poseidon_chip(),
+                layouter.namespace(|| format!("note {s} IMT leaf hash init")),
+            )?;
+        poseidon_hasher.hash(
+            layouter.namespace(|| format!("note {s} Poseidon(low_nf, next_nf)")),
+            [low_nf.clone(), next_nf.clone()],
+        )?
+    };
+
+    // Part 1: Poseidon Merkle path — walk from the leaf to the root.
+    // At each level, use q_imt_swap to order (current, sibling) by position bit,
+    // then hash Poseidon(left, right) to get the parent.
+    let mut current = leaf_hash;
+    for i in 0..IMT_DEPTH {
+        let pos_bit = assign_free_advice(
+            layouter.namespace(|| format!("note {s} imt pos_bit {i}")),
+            config.advices[0],
+            note.imt_leaf_pos
+                .map(|p| pallas::Base::from(((p >> i) & 1) as u64)),
+        )?;
+
+        let sibling = assign_free_advice(
+            layouter.namespace(|| format!("note {s} imt sibling {i}")),
+            config.advices[0],
+            note.imt_path.map(|path| path[i]),
+        )?;
+
+        let (left, right) = layouter.assign_region(
+            || format!("note {s} imt swap level {i}"),
+            |mut region| {
+                config.q_imt_swap.enable(&mut region, 0)?;
+
+                let pos_bit_cell =
+                    pos_bit.copy_advice(|| "pos_bit", &mut region, config.advices[0], 0)?;
+                let current_cell =
+                    current.copy_advice(|| "current", &mut region, config.advices[1], 0)?;
+                let sibling_cell =
+                    sibling.copy_advice(|| "sibling", &mut region, config.advices[2], 0)?;
+
+                let left = region.assign_advice(
+                    || "left",
+                    config.advices[3],
+                    0,
+                    || {
+                        pos_bit_cell
+                            .value()
+                            .copied()
+                            .zip(current_cell.value().copied())
+                            .zip(sibling_cell.value().copied())
+                            .map(|((bit, cur), sib)| {
+                                if bit == pallas::Base::zero() {
+                                    cur
+                                } else {
+                                    sib
+                                }
+                            })
+                    },
+                )?;
+
+                let right = region.assign_advice(
+                    || "right",
+                    config.advices[4],
+                    0,
+                    || {
+                        current_cell
+                            .value()
+                            .copied()
+                            .zip(sibling_cell.value().copied())
+                            .zip(left.value().copied())
+                            .map(|((cur, sib), l)| cur + sib - l)
+                    },
+                )?;
+
+                Ok((left, right))
+            },
+        )?;
+
+        let parent = {
+            let poseidon_hasher = PoseidonHash::<
+                pallas::Base,
+                _,
+                poseidon::P128Pow5T3,
+                ConstantLength<2>,
+                3,
+                2,
+            >::init(
+                config.poseidon_chip(),
+                layouter.namespace(|| format!("note {s} IMT level {i} hash init")),
+            )?;
+            poseidon_hasher.hash(
+                layouter.namespace(|| format!("note {s} Poseidon(left, right) level {i}")),
+                [left, right],
+            )?
+        };
+        current = parent;
+    }
+    // The computed root is checked against the public nf_imt_root in the
+    // q_per_note gate below.
+    let imt_root = current;
+
+    // Part 2: Non-membership inequality gate.
+    // Assigns low_nf, next_nf, real_nf, and helper witnesses (is_max, inv_nf)
+    // into the q_imt_nonmember gate, which constrains:
+    //   diff1 = real_nf - low_nf - 1      (proves low_nf < real_nf)
+    //   diff2_mask = (1 - is_max) * (next_nf - real_nf - 1)
+    //                                      (proves real_nf < next_nf, unless max leaf)
+    let (diff1, diff2_mask) = layouter.assign_region(
+        || format!("note {s} imt non-membership"),
+        |mut region| {
+            config.q_imt_nonmember.enable(&mut region, 0)?;
+
+            low_nf.copy_advice(|| "low_nf", &mut region, config.advices[0], 0)?;
+            let next_nf_cell =
+                next_nf.copy_advice(|| "next_nf", &mut region, config.advices[1], 0)?;
+            let real_nf_cell =
+                real_nf
+                    .inner()
+                    .copy_advice(|| "real_nf", &mut region, config.advices[2], 0)?;
+
+            // is_max = 1 if this is the max leaf (next_nf = 0), else 0.
+            let is_max = region.assign_advice(
+                || "is_max",
+                config.advices[3],
+                0,
+                || {
+                    next_nf_cell.value().copied().map(|nf| {
+                        if nf == pallas::Base::zero() {
+                            pallas::Base::one()
+                        } else {
+                            pallas::Base::zero()
+                        }
+                    })
+                },
+            )?;
+
+            // inv_nf = 1/next_nf (or 0 if next_nf = 0). Used by the gate's
+            // inverse trick to derive is_max.
+            region.assign_advice(
+                || "inv_nf",
+                config.advices[0],
+                1,
+                || {
+                    next_nf_cell.value().copied().map(|nf| {
+                        if nf == pallas::Base::zero() {
+                            pallas::Base::zero()
+                        } else {
+                            nf.invert().unwrap()
+                        }
+                    })
+                },
+            )?;
+
+            // diff1 = real_nf - low_nf - 1. Must be non-negative (range-checked below).
+            let diff1 = region.assign_advice(
+                || "diff1",
+                config.advices[1],
+                1,
+                || {
+                    real_nf_cell
+                        .value()
+                        .copied()
+                        .zip(low_nf.value().copied())
+                        .map(|(rnf, lnf)| rnf - lnf - pallas::Base::one())
+                },
+            )?;
+
+            // diff2_mask = (1 - is_max) * (next_nf - real_nf - 1).
+            // Zero for max leaf; otherwise must be non-negative (range-checked below).
+            let diff2_mask = region.assign_advice(
+                || "diff2_mask",
+                config.advices[2],
+                1,
+                || {
+                    is_max
+                        .value()
+                        .copied()
+                        .zip(next_nf_cell.value().copied())
+                        .zip(real_nf_cell.value().copied())
+                        .map(|((im, nnf), rnf)| {
+                            (pallas::Base::one() - im) * (nnf - rnf - pallas::Base::one())
+                        })
+                },
+            )?;
+
+            Ok((diff1, diff2_mask))
+        },
+    )?;
+
+    // Part 3: Range checks enforce the inequalities.
+    // If diff1 or diff2_mask were negative (i.e. the inequality was violated),
+    // the field subtraction would wrap around to a value > 2^250, failing
+    // the range check. 25 limbs × 10 bits = 250-bit range.
+    config.ecc_config.lookup_config.copy_check(
+        layouter.namespace(|| format!("note {s} diff1 < 2^250")),
+        diff1,
+        25,
+        true,
+    )?;
+
+    config.ecc_config.lookup_config.copy_check(
+        layouter.namespace(|| format!("note {s} diff2_mask < 2^250")),
+        diff2_mask,
+        25,
+        true,
+    )?;
+
+    // ---------------------------------------------------------------
+    // Custom gate region: conditions 10 + 13 + 15.
+    // ---------------------------------------------------------------
+
+    // Activates the q_per_note gate, which ties together results from the
+    // preceding conditions into a single row of checks:
+    //   - Cond 15: padded notes (is_note_real=0) must have v=0
+    //   - Cond 10: real notes' Merkle root must match the public nc_root
+    //   - Cond 13: IMT root from non-membership proof must match public nf_imt_root
+    //
+    // All six values are copied from earlier regions via copy constraints,
+    // so the gate operates on the same cells that the upstream gadgets produced.
+
+    let is_note_real = assign_free_advice(
+        layouter.namespace(|| format!("note {s} witness is_note_real")),
+        config.advices[0],
+        note.is_note_real.map(|b| pallas::Base::from(b as u64)),
+    )?;
+
+    layouter.assign_region(
+        || format!("note {s} per-note checks"),
+        |mut region| {
+            config.q_per_note.enable(&mut region, 0)?;
+
+            is_note_real.copy_advice(|| "is_note_real", &mut region, config.advices[0], 0)?;
+            v.copy_advice(|| "v", &mut region, config.advices[1], 0)?;
+            root.copy_advice(|| "calculated root", &mut region, config.advices[2], 0)?;
+            nc_root_cell.copy_advice(|| "nc_root (anchor)", &mut region, config.advices[3], 0)?;
+            imt_root.copy_advice(|| "imt_root", &mut region, config.advices[4], 0)?;
+            nf_imt_root_cell.copy_advice(|| "nf_imt_root", &mut region, config.advices[5], 0)?;
+
+            Ok(())
+        },
+    )?;
+
+    // Return the three values needed by global conditions:
+    //   cmx_cell   → condition 3 (rho binding hash)
+    //   v_base     → conditions 7 & 8 (gov commitment, min weight)
+    //   gov_null   → condition 16 (pairwise distinctness)
+    Ok((cmx_cell, v_base, gov_null_cell))
+}
+
+// ================================================================
+// Instance
+// ================================================================
+
+/// Public inputs to the delegation circuit (12 field elements).
+///
+/// These are the values posted to the vote chain (§2.4) that both the prover
+/// and verifier agree on. The verifier checks the proof against these values
+/// without seeing any private witnesses.
 #[derive(Clone, Debug)]
 pub struct Instance {
-    /// The derived nullifier (temporary public input; will be replaced by gov_null).
+    /// The derived nullifier of the keystone note.
     pub nf_signed: Nullifier,
-    /// The randomized spend validating key, used for signature verification out-of-circuit.
+    /// The randomized spend validating key.
     pub rk: VerificationKey<SpendAuth>,
-    /// The extracted note commitment of the output note (condition 6).
+    /// The extracted commitment of the output note.
     pub cmx_new: pallas::Base,
-    /// The governance commitment (public input for rho binding, condition 3).
+    /// The governance commitment hash.
     pub gov_comm: pallas::Base,
-    /// The vote round identifier (public input for rho binding, condition 3).
+    /// The voting round identifier.
     pub vote_round_id: pallas::Base,
+    /// The note commitment tree root (shared anchor).
+    pub nc_root: pallas::Base,
+    /// The nullifier IMT root.
+    pub nf_imt_root: pallas::Base,
+    /// Per-note governance nullifiers (4 slots).
+    pub gov_null: [pallas::Base; 4],
 }
 
 impl Instance {
@@ -994,6 +1934,9 @@ impl Instance {
         cmx_new: pallas::Base,
         gov_comm: pallas::Base,
         vote_round_id: pallas::Base,
+        nc_root: pallas::Base,
+        nf_imt_root: pallas::Base,
+        gov_null: [pallas::Base; 4],
     ) -> Self {
         Instance {
             nf_signed,
@@ -1001,11 +1944,20 @@ impl Instance {
             cmx_new,
             gov_comm,
             vote_round_id,
+            nc_root,
+            nf_imt_root,
+            gov_null,
         }
     }
 
-    /// Returns the public inputs as a vector of field elements for halo2.
+    /// Serializes the public inputs into the flat field-element vector that
+    /// halo2's `MockProver::run`, `create_proof`, and `verify_proof` expect.
+    ///
+    /// The order must match the instance column offsets defined at the top of
+    /// this file (`NF_SIGNED`, `RK_X`, `RK_Y`, `CMX_NEW`, etc.).
     pub fn to_halo2_instance(&self) -> Vec<vesta::Scalar> {
+        // rk is stored as compressed bytes but the circuit constrains it as
+        // two field elements (x, y coordinates of the curve point).
         let rk = pallas::Point::from_bytes(&self.rk.clone().into())
             .unwrap()
             .to_affine()
@@ -1019,1209 +1971,511 @@ impl Instance {
             self.cmx_new,
             self.gov_comm,
             self.vote_round_id,
+            self.nc_root,
+            self.nf_imt_root,
+            self.gov_null[0],
+            self.gov_null[1],
+            self.gov_null[2],
+            self.gov_null[3],
         ]
     }
 }
+
+// ================================================================
+// Test-only
+// ================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        delegation::imt::{gov_null_hash, ImtProofData, ImtProvider, SpacedLeafImtProvider},
         keys::{FullViewingKey, Scope, SpendValidatingKey, SpendingKey},
         note::{commitment::ExtractedNoteCommitment, Note},
         spec::{gov_commitment_hash, rho_binding_hash},
+        tree::MerklePath as OrchardMerklePath,
     };
-    use pasta_curves::arithmetic::CurveAffine;
     use ff::Field;
-    use halo2_proofs::{
-        dev::MockProver,
-        plonk::{self as halo2_plonk, Circuit as Halo2Circuit, SingleVerifier},
-        poly::commitment::Params,
-        transcript::{Blake2bRead, Blake2bWrite},
-    };
+    use halo2_proofs::dev::MockProver;
+    use incrementalmerkletree::{Altitude, Hashable};
+    use pasta_curves::{arithmetic::CurveAffine, pallas};
     use rand::rngs::OsRng;
 
-    /// Return value from [`make_test_note`] bundling all test artefacts.
-    struct TestNote {
-        circuit: Circuit,
-        nf: Nullifier,
-        rk: VerificationKey<SpendAuth>,
-        /// The extracted commitment of the output note (condition 6 public input).
-        cmx_new: pallas::Base,
-        gov_comm: pallas::Base,
-        vote_round_id: pallas::Base,
-        cmx_1: pallas::Base,
-        cmx_2: pallas::Base,
-        cmx_3: pallas::Base,
-        cmx_4: pallas::Base,
-        /// The output note, kept for negative tests that need to tamper with it.
-        output_note: Note,
-        /// Note values for the 4 delegated notes (condition 7/8).
-        v_1: u64,
-        v_2: u64,
-        v_3: u64,
-        v_4: u64,
-        /// Gov commitment blinding factor (condition 7).
-        gov_comm_rand: pallas::Base,
-    }
-
-    /// Helper: create a dummy note whose rho is derived from the rho-binding hash,
-    /// along with the circuit, public inputs, and all intermediate values.
+    /// Size of the delegation circuit (2^K rows).
     ///
-    /// The flow is:
-    /// 1. Choose keys and output address
-    /// 2. Choose v_1..v_4, gov_comm_rand, vote_round_id
-    /// 3. Compute gov_comm = gov_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand)
-    /// 4. Choose cmx_1..4, compute rho = rho_binding_hash(cmx_1..4, gov_comm, vote_round_id)
-    /// 5. Create signed note with this rho
-    /// 6. Create output note with rho = nf_signed
-    /// 7. Build circuit with all builder methods
-    fn make_test_note() -> TestNote {
-        let mut rng = OsRng;
+    /// K=16 (65,536 rows) fits all conditions including 4 per-note slots.
+    /// Estimated usage: ~42,000 rows (main ~3,000 + shared tables ~2,000 + 4 × ~9,500 per-note).
+    const K: u32 = 16;
 
-        // Keys.
-        let sk = SpendingKey::random(&mut rng);
-        let fvk: FullViewingKey = (&sk).into();
-        let recipient = fvk.address_at(0u32, Scope::External);
-        let output_recipient = fvk.address_at(1u32, Scope::External);
+    /// Helper: build a NoteSlotWitness for a note with a Merkle path and IMT proof.
+    fn make_note_slot(
+        note: &Note,
+        merkle_path: &OrchardMerklePath,
+        imt: &ImtProofData,
+        is_real: bool,
+    ) -> NoteSlotWitness {
+        let rho = note.rho();
+        let psi = note.rseed().psi(&rho);
+        let rcm = note.rseed().rcm(&rho);
+        let cm = note.commitment();
+        let recipient = note.recipient();
 
-        // Note values — must sum to >= 12,500,000 (MIN_WEIGHT).
-        let v_1: u64 = 5_000_000;
-        let v_2: u64 = 5_000_000;
-        let v_3: u64 = 3_000_000;
-        let v_4: u64 = 500_000;
-        let v_total = pallas::Base::from(v_1 + v_2 + v_3 + v_4);
-
-        // Random blinding factor and vote round id.
-        let gov_comm_rand = pallas::Base::random(&mut rng);
-        let vote_round_id = pallas::Base::random(&mut rng);
-
-        // Extract x-coordinates of the output address for gov_commitment_hash.
-        let g_d_new_x = *output_recipient.g_d().to_affine().coordinates().unwrap().x();
-        let pk_d_new_x = *output_recipient.pk_d().inner().to_affine().coordinates().unwrap().x();
-
-        // Compute gov_comm from the voting hotkey address, weight, round, and randomness.
-        let gov_comm = gov_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand);
-
-        // Create 4 dummy notes and extract cmx_i = ExtractP(cm_i).
-        let (_, _, note1) = Note::dummy(&mut rng, None);
-        let (_, _, note2) = Note::dummy(&mut rng, None);
-        let (_, _, note3) = Note::dummy(&mut rng, None);
-        let (_, _, note4) = Note::dummy(&mut rng, None);
-        let cmx_1 = ExtractedNoteCommitment::from(note1.commitment()).inner();
-        let cmx_2 = ExtractedNoteCommitment::from(note2.commitment()).inner();
-        let cmx_3 = ExtractedNoteCommitment::from(note3.commitment()).inner();
-        let cmx_4 = ExtractedNoteCommitment::from(note4.commitment()).inner();
-
-        // Derive rho from the binding hash (includes gov_comm).
-        let rho = rho_binding_hash(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id);
-
-        // Create the signed note with this rho.
-        let note = Note::new(recipient, NoteValue::zero(), Nullifier(rho), &mut rng);
-        let nf = note.nullifier(&fvk);
-
-        // Create the output note with rho = nf_signed (condition 6 chain).
-        let output_note = Note::new(output_recipient, NoteValue::zero(), nf, &mut rng);
-        let cmx_new = ExtractedNoteCommitment::from(output_note.commitment()).inner();
-
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let circuit = Circuit::from_note_unchecked(&fvk, &note, alpha)
-            .with_rho_binding(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
-            .with_output_note(&output_note)
-            .with_gov_commitment_data(v_1, v_2, v_3, v_4, gov_comm_rand);
-
-        TestNote {
-            circuit, nf, rk, cmx_new, gov_comm, vote_round_id,
-            cmx_1, cmx_2, cmx_3, cmx_4, output_note,
-            v_1, v_2, v_3, v_4, gov_comm_rand,
+        NoteSlotWitness {
+            g_d: Value::known(recipient.g_d()),
+            pk_d: Value::known(
+                NonIdentityPallasPoint::from_bytes(&recipient.pk_d().to_bytes()).unwrap(),
+            ),
+            v: Value::known(note.value()),
+            rho: Value::known(rho.0),
+            psi: Value::known(psi),
+            rcm: Value::known(rcm),
+            cm: Value::known(cm),
+            path: Value::known(merkle_path.auth_path()),
+            pos: Value::known(merkle_path.position()),
+            is_note_real: Value::known(is_real),
+            imt_low_nf: Value::known(imt.low_nf),
+            imt_next_nf: Value::known(imt.next_nf),
+            imt_leaf_pos: Value::known(imt.leaf_pos),
+            imt_path: Value::known(imt.path),
         }
     }
 
-    /// Helper to build an Instance from a TestNote.
-    fn make_instance(t: &TestNote) -> Instance {
-        Instance::from_parts(t.nf, t.rk.clone(), t.cmx_new, t.gov_comm, t.vote_round_id)
+    /// Return value from `make_test_data` bundling all test artefacts.
+    struct TestData {
+        circuit: Circuit,
+        instance: Instance,
     }
 
-    /// Helper to build an Instance from manually constructed test data.
-    /// Used by tests that bypass make_test_note() and need dummy rho-binding public inputs.
-    fn make_instance_manual(
-        nf: Nullifier,
-        rk: VerificationKey<SpendAuth>,
-    ) -> Instance {
-        // These tests don't exercise rho binding or output note, so use dummy zero values.
-        // The circuit will still fail at the rho binding check since no
-        // rho binding witnesses are set, but the test is targeting a different
-        // constraint — the first failing constraint is what the test checks.
-        Instance::from_parts(nf, rk, pallas::Base::zero(), pallas::Base::zero(), pallas::Base::zero())
+    /// Build a valid merged circuit with 1 real note + 3 padded notes.
+    fn make_test_data() -> TestData {
+        let mut rng = OsRng;
+
+        let sk = SpendingKey::random(&mut rng);
+        let fvk: FullViewingKey = (&sk).into();
+        let output_recipient = fvk.address_at(1u32, Scope::External);
+
+        // Key material.
+        let nk_val = fvk.nk().inner();
+        let ak: SpendValidatingKey = fvk.clone().into();
+
+        let vote_round_id = pallas::Base::random(&mut rng);
+        let gov_comm_rand = pallas::Base::random(&mut rng);
+
+        // Shared IMT provider (consistent root for all notes).
+        let imt_provider = SpacedLeafImtProvider::new();
+        let nf_imt_root = imt_provider.root();
+
+        // Real note (slot 0) with value = 13,000,000.
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let note_value = NoteValue::from_raw(13_000_000);
+        let (_, _, dummy_parent) = Note::dummy(&mut rng, None);
+        let real_note = Note::new(
+            recipient,
+            note_value,
+            dummy_parent.nullifier(&fvk),
+            &mut rng,
+        );
+
+        // Build Merkle tree with real note at position 0.
+        let cmx_real = ExtractedNoteCommitment::from(real_note.commitment()).inner();
+        let empty_leaf = MerkleHashOrchard::empty_leaf();
+        let leaves = [
+            MerkleHashOrchard::from_base(cmx_real),
+            empty_leaf,
+            empty_leaf,
+            empty_leaf,
+        ];
+        let l1_0 = MerkleHashOrchard::combine(Altitude::from(0), &leaves[0], &leaves[1]);
+        let l1_1 = MerkleHashOrchard::combine(Altitude::from(0), &leaves[2], &leaves[3]);
+        let l2_0 = MerkleHashOrchard::combine(Altitude::from(1), &l1_0, &l1_1);
+
+        let mut current = l2_0;
+        for level in 2..MERKLE_DEPTH_ORCHARD {
+            let sibling = MerkleHashOrchard::empty_root(Altitude::from(level as u8));
+            current = MerkleHashOrchard::combine(Altitude::from(level as u8), &current, &sibling);
+        }
+        let nc_root = current.inner();
+
+        let mut auth_path_0 = [pallas::Base::zero(); MERKLE_DEPTH_ORCHARD];
+        auth_path_0[0] = leaves[1].inner();
+        auth_path_0[1] = l1_1.inner();
+        for level in 2..MERKLE_DEPTH_ORCHARD {
+            auth_path_0[level] = MerkleHashOrchard::empty_root(Altitude::from(level as u8)).inner();
+        }
+        let merkle_path_0 = OrchardMerklePath::new(0u32, auth_path_0);
+
+        // IMT proof for real note (from shared provider).
+        let real_nf = real_note.nullifier(&fvk);
+        let imt_0 = imt_provider.non_membership_proof(real_nf.0);
+        let gov_null_0 = gov_null_hash(nk_val, vote_round_id, real_nf.0);
+
+        let slot_0 = make_note_slot(&real_note, &merkle_path_0, &imt_0, true);
+
+        // Padded notes (slots 1-3): zero-value notes with addresses from the real ivk.
+        let mut note_slots = vec![slot_0];
+        let mut cmx_values = vec![cmx_real];
+        let mut gov_nulls = vec![gov_null_0];
+
+        let dummy_merkle_path =
+            OrchardMerklePath::new(0u32, [pallas::Base::zero(); MERKLE_DEPTH_ORCHARD]);
+
+        for i in 1..4u32 {
+            // Use fvk.address_at() so pk_d = [ivk] * g_d with the REAL ivk.
+            let pad_addr = fvk.address_at(100 + i, Scope::External);
+            let (_, _, dummy) = Note::dummy(&mut rng, None);
+            let pad_note = Note::new(pad_addr, NoteValue::zero(), dummy.nullifier(&fvk), &mut rng);
+
+            let pad_cmx = ExtractedNoteCommitment::from(pad_note.commitment()).inner();
+            let pad_nf = pad_note.nullifier(&fvk);
+            let pad_imt = imt_provider.non_membership_proof(pad_nf.0);
+            let pad_gov_null = gov_null_hash(nk_val, vote_round_id, pad_nf.0);
+
+            note_slots.push(make_note_slot(
+                &pad_note,
+                &dummy_merkle_path,
+                &pad_imt,
+                false,
+            ));
+            cmx_values.push(pad_cmx);
+            gov_nulls.push(pad_gov_null);
+        }
+
+        let notes: [NoteSlotWitness; 4] = note_slots.try_into().unwrap();
+
+        // Values: real note = 13M, padded = 0.
+        let v_total = pallas::Base::from(13_000_000u64);
+
+        // Compute gov_comm.
+        let g_d_new_x = *output_recipient
+            .g_d()
+            .to_affine()
+            .coordinates()
+            .unwrap()
+            .x();
+        let pk_d_new_x = *output_recipient
+            .pk_d()
+            .inner()
+            .to_affine()
+            .coordinates()
+            .unwrap()
+            .x();
+        let gov_comm =
+            gov_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand);
+
+        // Compute rho.
+        let rho = rho_binding_hash(
+            cmx_values[0],
+            cmx_values[1],
+            cmx_values[2],
+            cmx_values[3],
+            gov_comm,
+            vote_round_id,
+        );
+
+        // Create signed note with this rho.
+        let sender_address = fvk.address_at(0u32, Scope::External);
+        let signed_note = Note::new(sender_address, NoteValue::zero(), Nullifier(rho), &mut rng);
+        let nf_signed = signed_note.nullifier(&fvk);
+
+        // Create output note with rho = nf_signed.
+        let output_note = Note::new(output_recipient, NoteValue::zero(), nf_signed, &mut rng);
+        let cmx_new = ExtractedNoteCommitment::from(output_note.commitment()).inner();
+
+        let alpha = pallas::Scalar::random(&mut rng);
+        let rk = ak.randomize(&alpha);
+
+        let circuit = Circuit::from_note_unchecked(&fvk, &signed_note, alpha)
+            .with_output_note(&output_note)
+            .with_notes(notes)
+            .with_gov_comm_rand(gov_comm_rand);
+
+        let instance = Instance::from_parts(
+            nf_signed,
+            rk,
+            cmx_new,
+            gov_comm,
+            vote_round_id,
+            nc_root,
+            nf_imt_root,
+            [gov_nulls[0], gov_nulls[1], gov_nulls[2], gov_nulls[3]],
+        );
+
+        TestData { circuit, instance }
     }
 
     #[test]
-    fn nullifier_integrity_happy_path() {
-        let t = make_test_note();
+    fn happy_path() {
+        let t = make_test_data();
+        let pi = t.instance.to_halo2_instance();
 
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-
-        let prover = MockProver::run(
-            K,
-            &t.circuit,
-            vec![public_inputs],
-        )
-        .unwrap();
-
+        let prover = MockProver::run(K, &t.circuit, vec![pi]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
     }
 
     #[test]
-    fn nullifier_integrity_wrong_key() {
+    fn wrong_nf_fails() {
+        let t = make_test_data();
+        let mut instance = t.instance.clone();
+        instance.nf_signed = Nullifier(pallas::Base::random(&mut OsRng));
+
+        let pi = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &t.circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn wrong_rk_fails() {
         let mut rng = OsRng;
+        let t = make_test_data();
 
-        // Use make_test_note for a valid circuit, then supply wrong nf.
-        let t = make_test_note();
-
-        // Derive the expected nullifier with a different key.
         let sk2 = SpendingKey::random(&mut rng);
         let fvk2: FullViewingKey = (&sk2).into();
-        // We need a note to derive a wrong nf. Create a dummy one and derive nf with fvk2.
-        let (_, _, dummy_note) = Note::dummy(&mut rng, None);
-        let wrong_nf = dummy_note.nullifier(&fvk2);
+        let ak2: SpendValidatingKey = fvk2.into();
+        let wrong_rk = ak2.randomize(&pallas::Scalar::random(&mut rng));
 
-        let instance = Instance::from_parts(wrong_nf, t.rk, t.cmx_new, t.gov_comm, t.vote_round_id);
-        let public_inputs = instance.to_halo2_instance();
+        let mut instance = t.instance.clone();
+        instance.rk = wrong_rk;
 
-        let prover = MockProver::run(
-            K,
-            &t.circuit,
-            vec![public_inputs],
-        )
-        .unwrap();
-
-        // The proof should fail: the derived nullifier won't match the public input.
+        let pi = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &t.circuit, vec![pi]).unwrap();
         assert!(prover.verify().is_err());
     }
 
     #[test]
-    fn nullifier_integrity_dummy_note() {
-        // A dummy note (value = 0) should work identically.
-        let t = make_test_note();
+    fn wrong_gov_null_fails() {
+        let t = make_test_data();
+        let mut instance = t.instance.clone();
+        instance.gov_null[0] = pallas::Base::random(&mut OsRng);
 
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-
-        let prover = MockProver::run(
-            K,
-            &t.circuit,
-            vec![public_inputs],
-        )
-        .unwrap();
-
-        assert_eq!(prover.verify(), Ok(()));
-    }
-
-    #[test]
-    fn spend_authority_wrong_rk() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-
-        // Compute rk with a different alpha
-        let ak: SpendValidatingKey = {
-            let sk = SpendingKey::random(&mut rng);
-            let fvk: FullViewingKey = (&sk).into();
-            fvk.into()
-        };
-        let wrong_rk = ak.randomize(&pallas::Scalar::random(&mut rng));
-
-        let instance = Instance::from_parts(t.nf, wrong_rk, t.cmx_new, t.gov_comm, t.vote_round_id);
-        let public_inputs = instance.to_halo2_instance();
-
-        let prover = MockProver::run(
-            K,
-            &t.circuit,
-            vec![public_inputs],
-        )
-        .unwrap();
-
-        // The proof should fail: the derived rk won't match the public input.
+        let pi = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &t.circuit, vec![pi]).unwrap();
         assert!(prover.verify().is_err());
     }
 
     #[test]
-    fn address_integrity_happy_path() {
-        let t = make_test_note();
+    fn wrong_nc_root_fails() {
+        let t = make_test_data();
+        let mut instance = t.instance.clone();
+        instance.nc_root = pallas::Base::random(&mut OsRng);
 
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-
-        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
-        assert_eq!(prover.verify(), Ok(()));
-    }
-
-    #[test]
-    fn address_integrity_wrong_rivk() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Replace rivk with a different key's rivk
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        circuit.rivk = Value::known(fvk2.rivk(Scope::External));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        let pi = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &t.circuit, vec![pi]).unwrap();
         assert!(prover.verify().is_err());
     }
 
     #[test]
-    fn address_integrity_wrong_pk_d() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
+    fn wrong_imt_root_fails() {
+        let t = make_test_data();
+        let mut instance = t.instance.clone();
+        instance.nf_imt_root = pallas::Base::random(&mut OsRng);
 
-        // Replace pk_d with a different key's pk_d
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        let other_address = fvk2.address_at(0u32, Scope::External);
-        circuit.pk_d_signed = Value::known(*other_address.pk_d());
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        let pi = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &t.circuit, vec![pi]).unwrap();
         assert!(prover.verify().is_err());
     }
 
     #[test]
-    fn note_commit_integrity_happy_path() {
-        let t = make_test_note();
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
-        assert_eq!(prover.verify(), Ok(()));
-    }
+    fn wrong_gov_comm_fails() {
+        let t = make_test_data();
+        let mut instance = t.instance.clone();
+        instance.gov_comm = pallas::Base::random(&mut OsRng);
 
-    #[test]
-    fn note_commit_integrity_wrong_rcm() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Replace rcm_signed with a different note's rcm (wrong trapdoor)
-        let (_sk2, _fvk2, note2) = Note::dummy(&mut rng, None);
-        let rho2 = note2.rho();
-        let wrong_rcm = note2.rseed().rcm(&rho2);
-        circuit.rcm_signed = Value::known(wrong_rcm);
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
+        let pi = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &t.circuit, vec![pi]).unwrap();
         assert!(prover.verify().is_err());
     }
 
     #[test]
-    fn note_commit_integrity_wrong_cm() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
+    fn wrong_vote_round_id_fails() {
+        let t = make_test_data();
+        let mut instance = t.instance.clone();
+        instance.vote_round_id = pallas::Base::random(&mut OsRng);
 
-        let (_sk2, _fvk2, note2) = Note::dummy(&mut rng, None);
-        circuit.cm_signed = Value::known(note2.commitment());
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    // ================================================================
-    // Witness-tampering tests for previously uncovered private inputs.
-    // Each test modifies exactly ONE witness while keeping the correct
-    // public inputs, verifying that the circuit rejects the proof.
-    // ================================================================
-
-    #[test]
-    fn wrong_rho_signed_witness() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Tamper rho_signed — feeds into nullifier derivation, note commitment, AND rho binding.
-        circuit.rho_signed = Value::known(pallas::Base::random(&mut rng));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn wrong_psi_signed_witness() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Tamper psi_signed — feeds into both nullifier derivation and note commitment.
-        circuit.psi_signed = Value::known(pallas::Base::random(&mut rng));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn wrong_g_d_signed_witness() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Replace g_d_signed with a different key's diversified generator.
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        let other_address = fvk2.address_at(0u32, Scope::External);
-        circuit.g_d_signed = Value::known(other_address.g_d());
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn wrong_ak_witness() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Replace ak with a different key's ak.
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        circuit.ak = Value::known(fvk2.clone().into());
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn wrong_nk_witness() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Replace nk with a different key's nk.
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        circuit.nk = Value::known(*fvk2.nk());
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    // ================================================================
-    // Cross-constraint binding tests.
-    // Verify that shared witnesses (nk, ak, rho, g_d) are actually the
-    // SAME cell across constraints. An attacker who could "split" a
-    // shared witness would break soundness.
-    // ================================================================
-
-    #[test]
-    fn cross_constraint_ak_binds_spend_authority_and_address_integrity() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Swap in ak from a different key — breaks spend authority
-        // even if we also swap rivk/g_d/pk_d to make address integrity
-        // consistent with the new ak (the circuit only has one ak cell).
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        let addr2 = fvk2.address_at(0u32, Scope::External);
-        circuit.ak = Value::known(fvk2.clone().into());
-        circuit.rivk = Value::known(fvk2.rivk(Scope::External));
-        circuit.g_d_signed = Value::known(addr2.g_d());
-        circuit.pk_d_signed = Value::known(*addr2.pk_d());
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn cross_constraint_rho_binds_nullifier_and_note_commit() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Build a second note to get a different rho/commitment pair
-        let (_sk2, _fvk2, note2) = Note::dummy(&mut rng, None);
-
-        // Inject note2's rho and cm into the circuit.
-        let rho2 = note2.rho();
-        circuit.rho_signed = Value::known(rho2.0);
-        circuit.psi_signed = Value::known(note2.rseed().psi(&rho2));
-        circuit.rcm_signed = Value::known(note2.rseed().rcm(&rho2));
-        circuit.cm_signed = Value::known(note2.commitment());
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    // ================================================================
-    // Edge-case and structural tests.
-    // ================================================================
-
-    #[test]
-    fn multiple_independent_notes_verify() {
-        let t1 = make_test_note();
-        let t2 = make_test_note();
-
-        let pi1 = make_instance(&t1).to_halo2_instance();
-        let pi2 = make_instance(&t2).to_halo2_instance();
-
-        let prover1 = MockProver::run(K, &t1.circuit, vec![pi1]).unwrap();
-        let prover2 = MockProver::run(K, &t2.circuit, vec![pi2]).unwrap();
-
-        assert_eq!(prover1.verify(), Ok(()));
-        assert_eq!(prover2.verify(), Ok(()));
-    }
-
-    #[test]
-    fn swapped_public_inputs_fail() {
-        let t1 = make_test_note();
-        let t2 = make_test_note();
-
-        // Feed t1's circuit the public inputs of t2
-        let wrong_pi = make_instance(&t2).to_halo2_instance();
-        let prover = MockProver::run(K, &t1.circuit, vec![wrong_pi]).unwrap();
-        assert!(prover.verify().is_err());
-
-        // And vice versa
-        let wrong_pi = make_instance(&t1).to_halo2_instance();
-        let prover = MockProver::run(K, &t2.circuit, vec![wrong_pi]).unwrap();
+        let pi = instance.to_halo2_instance();
+        let prover = MockProver::run(K, &t.circuit, vec![pi]).unwrap();
         assert!(prover.verify().is_err());
     }
 
     #[test]
     fn instance_to_halo2_roundtrip() {
-        let t = make_test_note();
-        let instance = make_instance(&t);
-        let pi = instance.to_halo2_instance();
-
-        assert_eq!(pi.len(), 6, "Expected exactly 6 public inputs (nf, rk.x, rk.y, cmx_new, gov_comm, vote_round_id)");
-        assert_eq!(pi[NF_SIGNED], t.nf.0, "First element must be nf");
-
-        // Reconstruct rk coordinates independently and compare.
-        let rk_point = pallas::Point::from_bytes(&t.rk.into())
-            .unwrap()
-            .to_affine()
-            .coordinates()
-            .unwrap();
-        assert_eq!(pi[RK_X], *rk_point.x(), "Second element must be rk.x");
-        assert_eq!(pi[RK_Y], *rk_point.y(), "Third element must be rk.y");
-        assert_eq!(pi[CMX_NEW], t.cmx_new, "Fourth element must be cmx_new");
-        assert_eq!(pi[GOV_COMM], t.gov_comm, "Fifth element must be gov_comm");
-        assert_eq!(pi[VOTE_ROUND_ID], t.vote_round_id, "Sixth element must be vote_round_id");
+        let t = make_test_data();
+        let pi = t.instance.to_halo2_instance();
+        assert_eq!(pi.len(), 12, "Expected exactly 12 public inputs");
+        assert_eq!(pi[NF_SIGNED], t.instance.nf_signed.0);
+        assert_eq!(pi[CMX_NEW], t.instance.cmx_new);
+        assert_eq!(pi[GOV_COMM], t.instance.gov_comm);
+        assert_eq!(pi[NC_ROOT], t.instance.nc_root);
+        assert_eq!(pi[NF_IMT_ROOT], t.instance.nf_imt_root);
+        assert_eq!(pi[GOV_NULL_1], t.instance.gov_null[0]);
     }
 
     #[test]
-    fn default_circuit_is_consistent_with_without_witnesses() {
-        let t = make_test_note();
-        let empty = Halo2Circuit::without_witnesses(&t.circuit);
-
+    fn default_circuit_shape() {
+        let t = make_test_data();
+        let empty = plonk::Circuit::without_witnesses(&t.circuit);
         let params = halo2_proofs::poly::commitment::Params::<vesta::Affine>::new(K);
         let vk = halo2_proofs::plonk::keygen_vk(&params, &empty);
-        assert!(vk.is_ok(), "keygen_vk must succeed on without_witnesses circuit");
-    }
-
-    // ================================================================
-    // Rho binding tests (condition 3).
-    // ================================================================
-
-    #[test]
-    fn rho_binding_happy_path() {
-        let t = make_test_note();
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-
-        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
-        assert_eq!(prover.verify(), Ok(()));
-    }
-
-    #[test]
-    fn rho_binding_wrong_cmx() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Tamper with cmx_1 in the witness. The Poseidon hash will produce
-        // a different value than rho_signed, so the equality constraint fails.
-        circuit.cmx_1 = Value::known(pallas::Base::random(&mut rng));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn rho_binding_wrong_gov_comm_public_input() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-
-        // Supply a different gov_comm in the public instance while the circuit
-        // witness has the correct gov_comm. The constrain_instance on gov_comm will fail.
-        let wrong_gov_comm = pallas::Base::random(&mut rng);
-        let instance = Instance::from_parts(t.nf, t.rk, t.cmx_new, wrong_gov_comm, t.vote_round_id);
-        let public_inputs = instance.to_halo2_instance();
-
-        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn rho_binding_wrong_vote_round_id() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-
-        // Supply a different vote_round_id in the public instance.
-        let wrong_vote_round_id = pallas::Base::random(&mut rng);
-        let instance = Instance::from_parts(t.nf, t.rk, t.cmx_new, t.gov_comm, wrong_vote_round_id);
-        let public_inputs = instance.to_halo2_instance();
-
-        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn rho_binding_wrong_cmx_4() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Tamper with cmx_4 — the last Poseidon input. Verifies the sponge
-        // doesn't silently ignore later inputs.
-        circuit.cmx_4 = Value::known(pallas::Base::random(&mut rng));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    // ================================================================
-    // Witness-tampering test for alpha (spend authority private input).
-    // ================================================================
-
-    #[test]
-    fn wrong_alpha_witness() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Tamper alpha while keeping the correct rk public input.
-        // The circuit computes rk' = [alpha'] * G + ak, which won't match rk.
-        circuit.alpha = Value::known(pallas::Scalar::random(&mut rng));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    // ================================================================
-    // Cross-constraint: nk binds nullifier and address integrity.
-    // nk is shared between DeriveNullifier (condition 2) and
-    // CommitIvk (condition 5). Verify we can't split them.
-    // ================================================================
-
-    #[test]
-    fn cross_constraint_nk_binds_nullifier_and_address_integrity() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Replace nk with a different key's nk, and also adjust rivk/g_d/pk_d
-        // to make CommitIvk internally consistent with the new nk.
-        // If nk were split across constraints, address integrity would pass
-        // while nullifier integrity would use the original nk. Since nk is a
-        // single cell, both constraints see the tampered value and the proof
-        // must fail (the nullifier won't match the public input).
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        circuit.nk = Value::known(*fvk2.nk());
-        // Also swap rivk to match nk2 so CommitIvk would be internally
-        // consistent if it had its own nk cell.
-        circuit.rivk = Value::known(fvk2.rivk(Scope::External));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    // ================================================================
-    // Spec-vs-circuit consistency: rho_binding_hash.
-    // ================================================================
-
-    #[test]
-    fn rho_binding_spec_matches_circuit() {
-        // Independently recompute rho_binding_hash from the TestNote's cmx
-        // values and verify the circuit still accepts. This guards against
-        // divergence between the spec function and the in-circuit Poseidon.
-        let t = make_test_note();
-
-        // Recompute rho from the stored cmx values — independently of
-        // make_test_note's own call to rho_binding_hash.
-        let recomputed_rho = rho_binding_hash(
-            t.cmx_1, t.cmx_2, t.cmx_3, t.cmx_4, t.gov_comm, t.vote_round_id,
+        assert!(
+            vk.is_ok(),
+            "keygen_vk must succeed on without_witnesses circuit"
         );
+    }
 
-        // Build a fresh note with this independently derived rho.
+    /// Duplicate the same real note across slots 0 and 1 — the circuit must
+    /// reject this because gov_null_0 == gov_null_1.
+    #[test]
+    fn duplicate_note_slot_fails() {
         let mut rng = OsRng;
+
         let sk = SpendingKey::random(&mut rng);
         let fvk: FullViewingKey = (&sk).into();
-        let recipient = fvk.address_at(0u32, Scope::External);
-        let note = Note::new(recipient, NoteValue::zero(), Nullifier(recomputed_rho), &mut rng);
-
-        let nf = note.nullifier(&fvk);
-
-        // Create output note with rho = nf.
         let output_recipient = fvk.address_at(1u32, Scope::External);
-        let _output_note = Note::new(output_recipient, NoteValue::zero(), nf, &mut rng);
 
-        // Compute gov_comm from this output_recipient's address.
-        let g_d_new_x = *output_recipient.g_d().to_affine().coordinates().unwrap().x();
-        let pk_d_new_x = *output_recipient.pk_d().inner().to_affine().coordinates().unwrap().x();
-        let v_total = pallas::Base::from(t.v_1 + t.v_2 + t.v_3 + t.v_4);
-        let fresh_gov_comm_rand = pallas::Base::random(&mut rng);
-        let fresh_gov_comm = gov_commitment_hash(
-            g_d_new_x, pk_d_new_x, v_total, t.vote_round_id, fresh_gov_comm_rand,
-        );
-
-        // Recompute rho with the fresh gov_comm.
-        let recomputed_rho2 = rho_binding_hash(
-            t.cmx_1, t.cmx_2, t.cmx_3, t.cmx_4, fresh_gov_comm, t.vote_round_id,
-        );
-        let note2 = Note::new(recipient, NoteValue::zero(), Nullifier(recomputed_rho2), &mut rng);
-        let nf2 = note2.nullifier(&fvk);
-        let output_note2 = Note::new(output_recipient, NoteValue::zero(), nf2, &mut rng);
-        let cmx_new2 = ExtractedNoteCommitment::from(output_note2.commitment()).inner();
-
+        let nk_val = fvk.nk().inner();
         let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let circuit = Circuit::from_note_unchecked(&fvk, &note2, alpha)
-            .with_rho_binding(t.cmx_1, t.cmx_2, t.cmx_3, t.cmx_4, fresh_gov_comm, t.vote_round_id)
-            .with_output_note(&output_note2)
-            .with_gov_commitment_data(t.v_1, t.v_2, t.v_3, t.v_4, fresh_gov_comm_rand);
 
-        let instance = Instance::from_parts(nf2, rk, cmx_new2, fresh_gov_comm, t.vote_round_id);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert_eq!(prover.verify(), Ok(()));
-    }
+        let vote_round_id = pallas::Base::random(&mut rng);
+        let gov_comm_rand = pallas::Base::random(&mut rng);
 
-    // ================================================================
-    // Output note commitment integrity tests (condition 6).
-    // ================================================================
+        let imt_provider = SpacedLeafImtProvider::new();
+        let nf_imt_root = imt_provider.root();
 
-    #[test]
-    fn output_note_commit_happy_path() {
-        let t = make_test_note();
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
-        assert_eq!(prover.verify(), Ok(()));
-    }
-
-    #[test]
-    fn output_note_commit_wrong_rcm() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Replace rcm_new with wrong randomness. The recomputed commitment
-        // won't match cmx_new in the public input.
-        let (_, _, dummy) = Note::dummy(&mut rng, None);
-        let dummy_rho = dummy.rho();
-        circuit.rcm_new = Value::known(dummy.rseed().rcm(&dummy_rho));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn output_note_commit_wrong_cmx_public_input() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-
-        // Supply a different cmx_new in the public instance while the circuit
-        // witness is correct. The constrain_instance on cmx will fail.
-        let wrong_cmx = pallas::Base::random(&mut rng);
-        let instance = Instance::from_parts(t.nf, t.rk, wrong_cmx, t.gov_comm, t.vote_round_id);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn output_note_commit_wrong_psi() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Tamper psi_new. The recomputed commitment won't match.
-        circuit.psi_new = Value::known(pallas::Base::random(&mut rng));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn output_note_commit_wrong_g_d() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Replace g_d_new with a different address's diversified generator.
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        let other_address = fvk2.address_at(0u32, Scope::External);
-        circuit.g_d_new = Value::known(other_address.g_d());
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn output_note_commit_wrong_pk_d() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Replace pk_d_new with a different key's pk_d.
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        let other_address = fvk2.address_at(0u32, Scope::External);
-        circuit.pk_d_new = Value::known(*other_address.pk_d());
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn cross_constraint_rho_new_chained_from_nf_signed() {
-        // Verify that rho_new is actually the same cell as nf_signed.
-        // If the circuit allowed a different rho_new, an attacker could
-        // create output notes unrelated to the signed note's nullifier.
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Create a different output note with a DIFFERENT rho (not nf_signed).
-        // The commitment will be valid on its own, but the in-circuit
-        // rho_new = nf_signed constraint will reject it.
-        let sk2 = SpendingKey::random(&mut rng);
-        let fvk2: FullViewingKey = (&sk2).into();
-        let other_recipient = fvk2.address_at(0u32, Scope::External);
-        let (_, _, unrelated_note) = Note::dummy(&mut rng, None);
-        let wrong_rho_note = Note::new(
-            other_recipient,
-            NoteValue::zero(),
-            unrelated_note.nullifier(&fvk2), // rho != nf_signed
+        // Create one real note.
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let note_value = NoteValue::from_raw(13_000_000);
+        let (_, _, dummy_parent) = Note::dummy(&mut rng, None);
+        let real_note = Note::new(
+            recipient,
+            note_value,
+            dummy_parent.nullifier(&fvk),
             &mut rng,
         );
-        let wrong_cmx = ExtractedNoteCommitment::from(wrong_rho_note.commitment()).inner();
 
-        // Set the output note witnesses to the wrong-rho note.
-        circuit = circuit.with_output_note(&wrong_rho_note);
+        let cmx_real = ExtractedNoteCommitment::from(real_note.commitment()).inner();
+        let real_nf = real_note.nullifier(&fvk);
+        let imt_0 = imt_provider.non_membership_proof(real_nf.0);
+        let gov_null_real = gov_null_hash(nk_val, vote_round_id, real_nf.0);
 
-        // Use the wrong cmx as the public input to match the witness.
+        // Build Merkle tree with real note at position 0.
+        let empty_leaf = MerkleHashOrchard::empty_leaf();
+        let leaves = [
+            MerkleHashOrchard::from_base(cmx_real),
+            empty_leaf,
+            empty_leaf,
+            empty_leaf,
+        ];
+        let l1_0 = MerkleHashOrchard::combine(Altitude::from(0), &leaves[0], &leaves[1]);
+        let l1_1 = MerkleHashOrchard::combine(Altitude::from(0), &leaves[2], &leaves[3]);
+        let l2_0 = MerkleHashOrchard::combine(Altitude::from(1), &l1_0, &l1_1);
+
+        let mut current = l2_0;
+        for level in 2..MERKLE_DEPTH_ORCHARD {
+            let sibling = MerkleHashOrchard::empty_root(Altitude::from(level as u8));
+            current = MerkleHashOrchard::combine(Altitude::from(level as u8), &current, &sibling);
+        }
+        let nc_root = current.inner();
+
+        let mut auth_path_0 = [pallas::Base::zero(); MERKLE_DEPTH_ORCHARD];
+        auth_path_0[0] = leaves[1].inner();
+        auth_path_0[1] = l1_1.inner();
+        for level in 2..MERKLE_DEPTH_ORCHARD {
+            auth_path_0[level] = MerkleHashOrchard::empty_root(Altitude::from(level as u8)).inner();
+        }
+        let merkle_path_0 = OrchardMerklePath::new(0u32, auth_path_0);
+
+        let slot_real = make_note_slot(&real_note, &merkle_path_0, &imt_0, true);
+
+        // DUPLICATE: slot 1 uses the exact same note as slot 0.
+        let slot_dup = slot_real.clone();
+
+        // Padded notes for slots 2-3.
+        let dummy_merkle_path =
+            OrchardMerklePath::new(0u32, [pallas::Base::zero(); MERKLE_DEPTH_ORCHARD]);
+        let mut note_slots = vec![slot_real, slot_dup];
+        let mut cmx_values = vec![cmx_real, cmx_real];
+        let mut gov_nulls = vec![gov_null_real, gov_null_real];
+
+        for i in 2..4u32 {
+            let pad_addr = fvk.address_at(100 + i, Scope::External);
+            let (_, _, dummy) = Note::dummy(&mut rng, None);
+            let pad_note = Note::new(pad_addr, NoteValue::zero(), dummy.nullifier(&fvk), &mut rng);
+
+            let pad_cmx = ExtractedNoteCommitment::from(pad_note.commitment()).inner();
+            let pad_nf = pad_note.nullifier(&fvk);
+            let pad_imt = imt_provider.non_membership_proof(pad_nf.0);
+            let pad_gov_null = gov_null_hash(nk_val, vote_round_id, pad_nf.0);
+
+            note_slots.push(make_note_slot(
+                &pad_note,
+                &dummy_merkle_path,
+                &pad_imt,
+                false,
+            ));
+            cmx_values.push(pad_cmx);
+            gov_nulls.push(pad_gov_null);
+        }
+
+        let notes: [NoteSlotWitness; 4] = note_slots.try_into().unwrap();
+
+        // v_total counts the duplicate: 13M * 2 = 26M.
+        let v_total = pallas::Base::from(26_000_000u64);
+
+        let g_d_new_x = *output_recipient
+            .g_d()
+            .to_affine()
+            .coordinates()
+            .unwrap()
+            .x();
+        let pk_d_new_x = *output_recipient
+            .pk_d()
+            .inner()
+            .to_affine()
+            .coordinates()
+            .unwrap()
+            .x();
+        let gov_comm =
+            gov_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand);
+
+        let rho = rho_binding_hash(
+            cmx_values[0],
+            cmx_values[1],
+            cmx_values[2],
+            cmx_values[3],
+            gov_comm,
+            vote_round_id,
+        );
+
+        let sender_address = fvk.address_at(0u32, Scope::External);
+        let signed_note = Note::new(sender_address, NoteValue::zero(), Nullifier(rho), &mut rng);
+        let nf_signed = signed_note.nullifier(&fvk);
+
+        let output_note = Note::new(output_recipient, NoteValue::zero(), nf_signed, &mut rng);
+        let cmx_new = ExtractedNoteCommitment::from(output_note.commitment()).inner();
+
+        let alpha = pallas::Scalar::random(&mut rng);
+        let rk = ak.randomize(&alpha);
+
+        let circuit = Circuit::from_note_unchecked(&fvk, &signed_note, alpha)
+            .with_output_note(&output_note)
+            .with_notes(notes)
+            .with_gov_comm_rand(gov_comm_rand);
+
         let instance = Instance::from_parts(
-            t.nf, t.rk.clone(), wrong_cmx, t.gov_comm, t.vote_round_id,
-        );
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    // ================================================================
-    // Gov commitment integrity tests (condition 7).
-    // ================================================================
-    #[test]
-    fn gov_commitment_wrong_gov_comm_rand() {
-        let mut rng = OsRng;
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Tamper with gov_comm_rand. The derived gov_comm won't match the
-        // public input, so the equality constraint fails.
-        circuit.gov_comm_rand = Value::known(pallas::Base::random(&mut rng));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn gov_commitment_wrong_v_1() {
-        let t = make_test_note();
-        let mut circuit = t.circuit.clone();
-
-        // Tamper with v_1 — changes v_total and thus the derived gov_comm.
-        circuit.v_1 = Value::known(pallas::Base::from(999_999_999u64));
-
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    #[test]
-    fn gov_commitment_spec_matches_circuit() {
-        // Independently recompute gov_commitment_hash and verify the circuit accepts.
-        let t = make_test_note();
-
-        // Extract output address coordinates from the output note.
-        let output_addr = t.output_note.recipient();
-        let g_d_new_x = *output_addr.g_d().to_affine().coordinates().unwrap().x();
-        let pk_d_new_x = *output_addr.pk_d().inner().to_affine().coordinates().unwrap().x();
-        let v_total = pallas::Base::from(t.v_1 + t.v_2 + t.v_3 + t.v_4);
-
-        let recomputed = gov_commitment_hash(
-            g_d_new_x, pk_d_new_x, v_total, t.vote_round_id, t.gov_comm_rand,
-        );
-        assert_eq!(recomputed, t.gov_comm, "spec hash must match what make_test_note computed");
-
-        // The full circuit should also verify.
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
-        assert_eq!(prover.verify(), Ok(()));
-    }
-
-    // ================================================================
-    // MAX_PROPOSAL_AUTHORITY constant-constraint tests (conditions 7, H-1/H-2).
-    //
-    // These verify that the 6th Poseidon input in gov_comm is baked into the
-    // verification key via assign_advice_from_constant. A malicious prover
-    // cannot substitute a different value (e.g. 0 authority instead of 65535).
-    // ================================================================
-
-    #[test]
-    fn gov_commitment_uses_max_proposal_authority() {
-        // Verify that the out-of-circuit gov_commitment_hash produces a value
-        // consistent with the in-circuit Poseidon that uses MAX_PROPOSAL_AUTHORITY
-        // (not zero) as the 6th input.
-        use crate::delegation::circuit::MAX_PROPOSAL_AUTHORITY;
-
-        let t = make_test_note();
-
-        // Manually compute what the hash *would* be if zero were used instead.
-        let output_addr = t.output_note.recipient();
-        let g_d_new_x = *output_addr.g_d().to_affine().coordinates().unwrap().x();
-        let pk_d_new_x = *output_addr.pk_d().inner().to_affine().coordinates().unwrap().x();
-        let v_total = pallas::Base::from(t.v_1 + t.v_2 + t.v_3 + t.v_4);
-
-        let with_authority = gov_commitment_hash(
-            g_d_new_x, pk_d_new_x, v_total, t.vote_round_id, t.gov_comm_rand,
+            nf_signed,
+            rk,
+            cmx_new,
+            gov_comm,
+            vote_round_id,
+            nc_root,
+            nf_imt_root,
+            [gov_nulls[0], gov_nulls[1], gov_nulls[2], gov_nulls[3]],
         );
 
-        // Compute a hypothetical hash with zero in the 6th slot.
-        use halo2_gadgets::poseidon::primitives::{self as poseidon_prim, ConstantLength as CL};
-        let with_zero = poseidon_prim::Hash::<
-            _, poseidon_prim::P128Pow5T3, CL<6>, 3, 2,
-        >::init()
-            .hash([g_d_new_x, pk_d_new_x, v_total, t.vote_round_id, t.gov_comm_rand, pallas::Base::zero()]);
-
-        // They must differ — proves the spec function embeds 65535, not 0.
-        assert_ne!(with_authority, with_zero,
-            "gov_commitment_hash must use MAX_PROPOSAL_AUTHORITY ({}), not zero",
-            MAX_PROPOSAL_AUTHORITY,
-        );
-
-        // And the circuit must accept the authority-based commitment.
-        assert_eq!(with_authority, t.gov_comm);
-    }
-
-    #[test]
-    fn gov_commitment_wrong_proposal_authority_fails() {
-        // Build a valid circuit but supply a gov_comm computed with a different
-        // proposal authority (e.g. 0 instead of 65535).  The in-circuit
-        // constant-constrained MAX_PROPOSAL_AUTHORITY will produce a different
-        // Poseidon hash, so the gov_comm equality constraint must fail.
-        let mut rng = OsRng;
-        let sk = SpendingKey::random(&mut rng);
-        let fvk: FullViewingKey = (&sk).into();
-        let recipient = fvk.address_at(0u32, Scope::External);
-        let output_recipient = fvk.address_at(1u32, Scope::External);
-
-        let v_1: u64 = 5_000_000;
-        let v_2: u64 = 5_000_000;
-        let v_3: u64 = 3_000_000;
-        let v_4: u64 = 500_000;
-        let v_total = pallas::Base::from(v_1 + v_2 + v_3 + v_4);
-        let gov_comm_rand = pallas::Base::random(&mut rng);
-        let vote_round_id = pallas::Base::random(&mut rng);
-
-        let g_d_new_x = *output_recipient.g_d().to_affine().coordinates().unwrap().x();
-        let pk_d_new_x = *output_recipient.pk_d().inner().to_affine().coordinates().unwrap().x();
-
-        // Compute a WRONG gov_comm using 0 authority instead of 65535.
-        use halo2_gadgets::poseidon::primitives::{self as poseidon_prim, ConstantLength as CL};
-        let wrong_gov_comm = poseidon_prim::Hash::<
-            _, poseidon_prim::P128Pow5T3, CL<6>, 3, 2,
-        >::init()
-            .hash([g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand, pallas::Base::zero()]);
-
-        // Build the signed note with rho derived from wrong_gov_comm.
-        let (_, _, note1) = Note::dummy(&mut rng, None);
-        let (_, _, note2) = Note::dummy(&mut rng, None);
-        let (_, _, note3) = Note::dummy(&mut rng, None);
-        let (_, _, note4) = Note::dummy(&mut rng, None);
-        let cmx_1 = ExtractedNoteCommitment::from(note1.commitment()).inner();
-        let cmx_2 = ExtractedNoteCommitment::from(note2.commitment()).inner();
-        let cmx_3 = ExtractedNoteCommitment::from(note3.commitment()).inner();
-        let cmx_4 = ExtractedNoteCommitment::from(note4.commitment()).inner();
-
-        let rho = rho_binding_hash(cmx_1, cmx_2, cmx_3, cmx_4, wrong_gov_comm, vote_round_id);
-        let note = Note::new(recipient, NoteValue::zero(), Nullifier(rho), &mut rng);
-        let nf = note.nullifier(&fvk);
-        let output_note = Note::new(output_recipient, NoteValue::zero(), nf, &mut rng);
-        let cmx_new = ExtractedNoteCommitment::from(output_note.commitment()).inner();
-
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-
-        // Build circuit — its internal Poseidon uses MAX_PROPOSAL_AUTHORITY (65535).
-        // The witness gov_comm field is wrong_gov_comm (computed with 0).
-        let circuit = Circuit::from_note_unchecked(&fvk, &note, alpha)
-            .with_rho_binding(cmx_1, cmx_2, cmx_3, cmx_4, wrong_gov_comm, vote_round_id)
-            .with_output_note(&output_note)
-            .with_gov_commitment_data(v_1, v_2, v_3, v_4, gov_comm_rand);
-
-        // Supply wrong_gov_comm as the public input so rho binding passes.
-        // But the in-circuit Poseidon with MAX_PROPOSAL_AUTHORITY will derive
-        // a DIFFERENT gov_comm, failing the equality constraint.
-        let instance = Instance::from_parts(nf, rk, cmx_new, wrong_gov_comm, vote_round_id);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err(),
-            "Circuit must reject gov_comm computed with wrong proposal authority");
-    }
-
-    // ================================================================
-    // Minimum voting weight tests (condition 8).
-    // ================================================================
-
-    #[test]
-    fn min_weight_happy_path() {
-        // make_test_note uses v_total = 13,500,000 >= 12,500,000.
-        let t = make_test_note();
-        let instance = make_instance(&t);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &t.circuit, vec![public_inputs]).unwrap();
-        assert_eq!(prover.verify(), Ok(()));
-    }
-
-    #[test]
-    fn min_weight_exactly_at_threshold() {
-        // Build a circuit where v_total == 12,500,000 exactly (diff = 0).
-        let mut rng = OsRng;
-        let sk = SpendingKey::random(&mut rng);
-        let fvk: FullViewingKey = (&sk).into();
-        let recipient = fvk.address_at(0u32, Scope::External);
-        let output_recipient = fvk.address_at(1u32, Scope::External);
-
-        let v_1: u64 = 12_500_000;
-        let v_2: u64 = 0;
-        let v_3: u64 = 0;
-        let v_4: u64 = 0;
-        let v_total = pallas::Base::from(v_1 + v_2 + v_3 + v_4);
-
-        let gov_comm_rand = pallas::Base::random(&mut rng);
-        let vote_round_id = pallas::Base::random(&mut rng);
-
-        let g_d_new_x = *output_recipient.g_d().to_affine().coordinates().unwrap().x();
-        let pk_d_new_x = *output_recipient.pk_d().inner().to_affine().coordinates().unwrap().x();
-        let gov_comm = gov_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand);
-
-        let (_, _, note1) = Note::dummy(&mut rng, None);
-        let (_, _, note2) = Note::dummy(&mut rng, None);
-        let (_, _, note3) = Note::dummy(&mut rng, None);
-        let (_, _, note4) = Note::dummy(&mut rng, None);
-        let cmx_1 = ExtractedNoteCommitment::from(note1.commitment()).inner();
-        let cmx_2 = ExtractedNoteCommitment::from(note2.commitment()).inner();
-        let cmx_3 = ExtractedNoteCommitment::from(note3.commitment()).inner();
-        let cmx_4 = ExtractedNoteCommitment::from(note4.commitment()).inner();
-
-        let rho = rho_binding_hash(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id);
-        let note = Note::new(recipient, NoteValue::zero(), Nullifier(rho), &mut rng);
-        let nf = note.nullifier(&fvk);
-        let output_note = Note::new(output_recipient, NoteValue::zero(), nf, &mut rng);
-        let cmx_new = ExtractedNoteCommitment::from(output_note.commitment()).inner();
-
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let circuit = Circuit::from_note_unchecked(&fvk, &note, alpha)
-            .with_rho_binding(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
-            .with_output_note(&output_note)
-            .with_gov_commitment_data(v_1, v_2, v_3, v_4, gov_comm_rand);
-
-        let instance = Instance::from_parts(nf, rk, cmx_new, gov_comm, vote_round_id);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert_eq!(prover.verify(), Ok(()));
-    }
-
-    #[test]
-    fn min_weight_below_threshold_fails() {
-        // Build a circuit where v_total < 12,500,000 (insufficient weight).
-        //
-        // Soundness note: MIN_WEIGHT is assigned via assign_advice_from_constant,
-        // which binds it to the fixed column in the verification key. A malicious
-        // prover cannot substitute min_weight = 0 to bypass this check — the
-        // constant constraint would fail verification.
-        let mut rng = OsRng;
-        let sk = SpendingKey::random(&mut rng);
-        let fvk: FullViewingKey = (&sk).into();
-        let recipient = fvk.address_at(0u32, Scope::External);
-        let output_recipient = fvk.address_at(1u32, Scope::External);
-
-        // v_total = 12,499,999 — one zatoshi below threshold.
-        let v_1: u64 = 12_499_999;
-        let v_2: u64 = 0;
-        let v_3: u64 = 0;
-        let v_4: u64 = 0;
-        let v_total = pallas::Base::from(v_1 + v_2 + v_3 + v_4);
-
-        let gov_comm_rand = pallas::Base::random(&mut rng);
-        let vote_round_id = pallas::Base::random(&mut rng);
-
-        let g_d_new_x = *output_recipient.g_d().to_affine().coordinates().unwrap().x();
-        let pk_d_new_x = *output_recipient.pk_d().inner().to_affine().coordinates().unwrap().x();
-        let gov_comm = gov_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand);
-
-        let (_, _, note1) = Note::dummy(&mut rng, None);
-        let (_, _, note2) = Note::dummy(&mut rng, None);
-        let (_, _, note3) = Note::dummy(&mut rng, None);
-        let (_, _, note4) = Note::dummy(&mut rng, None);
-        let cmx_1 = ExtractedNoteCommitment::from(note1.commitment()).inner();
-        let cmx_2 = ExtractedNoteCommitment::from(note2.commitment()).inner();
-        let cmx_3 = ExtractedNoteCommitment::from(note3.commitment()).inner();
-        let cmx_4 = ExtractedNoteCommitment::from(note4.commitment()).inner();
-
-        let rho = rho_binding_hash(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id);
-        let note = Note::new(recipient, NoteValue::zero(), Nullifier(rho), &mut rng);
-        let nf = note.nullifier(&fvk);
-        let output_note = Note::new(output_recipient, NoteValue::zero(), nf, &mut rng);
-        let cmx_new = ExtractedNoteCommitment::from(output_note.commitment()).inner();
-
-        let ak: SpendValidatingKey = fvk.clone().into();
-        let alpha = pallas::Scalar::random(&mut rng);
-        let rk = ak.randomize(&alpha);
-        let circuit = Circuit::from_note_unchecked(&fvk, &note, alpha)
-            .with_rho_binding(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
-            .with_output_note(&output_note)
-            .with_gov_commitment_data(v_1, v_2, v_3, v_4, gov_comm_rand);
-
-        let instance = Instance::from_parts(nf, rk, cmx_new, gov_comm, vote_round_id);
-        let public_inputs = instance.to_halo2_instance();
-        let prover = MockProver::run(K, &circuit, vec![public_inputs]).unwrap();
-        assert!(prover.verify().is_err());
-    }
-
-    // ================================================================
-    // Real prove/verify cycle (not MockProver).
-    // Exercises the IPA polynomial commitment scheme, the Blake2b
-    // transcript, and constraint-degree checks that MockProver skips.
-    // ================================================================
-
-    #[test]
-    fn real_prove_verify_roundtrip() {
-        let t = make_test_note();
-
-        // Key generation from the empty (without-witnesses) circuit.
-        let params = Params::<vesta::Affine>::new(K);
-        let circuit_default = Circuit::default();
-        let vk = halo2_plonk::keygen_vk(&params, &circuit_default).unwrap();
-        let pk = halo2_plonk::keygen_pk(&params, vk.clone(), &circuit_default).unwrap();
-
-        let instance = make_instance(&t);
         let pi = instance.to_halo2_instance();
-
-        // Create proof.
-        let mut transcript = Blake2bWrite::<_, vesta::Affine, _>::init(vec![]);
-        halo2_plonk::create_proof(
-            &params,
-            &pk,
-            &[t.circuit],
-            &[&[&pi]],
-            &mut OsRng,
-            &mut transcript,
-        )
-        .unwrap();
-        let proof_bytes = transcript.finalize();
-
-        // Verify proof.
-        let strategy = SingleVerifier::new(&params);
-        let mut transcript = Blake2bRead::init(&proof_bytes[..]);
+        let prover = MockProver::run(K, &circuit, vec![pi]).unwrap();
         assert!(
-            halo2_plonk::verify_proof(&params, &vk, strategy, &[&[&pi]], &mut transcript).is_ok()
-        );
-    }
-
-    #[test]
-    fn real_prove_verify_wrong_instance_fails() {
-        let t1 = make_test_note();
-        let t2 = make_test_note();
-
-        let params = Params::<vesta::Affine>::new(K);
-        let circuit_default = Circuit::default();
-        let vk = halo2_plonk::keygen_vk(&params, &circuit_default).unwrap();
-        let pk = halo2_plonk::keygen_pk(&params, vk.clone(), &circuit_default).unwrap();
-
-        // Prove with t1's circuit and public inputs.
-        let pi1 = make_instance(&t1).to_halo2_instance();
-        let mut transcript = Blake2bWrite::<_, vesta::Affine, _>::init(vec![]);
-        halo2_plonk::create_proof(
-            &params,
-            &pk,
-            &[t1.circuit],
-            &[&[&pi1]],
-            &mut OsRng,
-            &mut transcript,
-        )
-        .unwrap();
-        let proof_bytes = transcript.finalize();
-
-        // Attempt to verify the proof against t2's public inputs.
-        let pi2 = make_instance(&t2).to_halo2_instance();
-        let strategy = SingleVerifier::new(&params);
-        let mut transcript = Blake2bRead::init(&proof_bytes[..]);
-        assert!(
-            halo2_plonk::verify_proof(&params, &vk, strategy, &[&[&pi2]], &mut transcript)
-                .is_err()
+            prover.verify().is_err(),
+            "duplicate note slot must be rejected by gov null distinctness check"
         );
     }
 }
