@@ -7,10 +7,10 @@ todos:
     status: done
   - id: elgamal-core
     content: "Implement El Gamal: keypair generation, Encrypt (v,r) -> (r*G, v*G+r*pk), DecryptToPoint, HomomorphicAdd, with property-based tests for homomorphism"
-    status: pending
+    status: done
   - id: bsgs
     content: "Implement baby-step giant-step (BSGS) for bounded discrete log recovery of v from v*G, with configurable upper bound (default 2^32), precomputed table, and tests"
-    status: pending
+    status: done
   - id: dleq-proof
     content: "Implement Chaum-Pedersen DLEQ proof (prove/verify) for correct decryption, with Fiat-Shamir transcript, and tests"
     status: pending
