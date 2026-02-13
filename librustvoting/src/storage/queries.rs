@@ -158,6 +158,13 @@ pub fn clear_round(conn: &Connection, round_id: &str) -> Result<(), VotingError>
         message: format!("failed to clear proofs: {}", e),
     })?;
     conn.execute(
+        "DELETE FROM witnesses WHERE round_id = :round_id",
+        named_params! { ":round_id": round_id },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear witnesses: {}", e),
+    })?;
+    conn.execute(
         "DELETE FROM cached_tree_state WHERE round_id = :round_id",
         named_params! { ":round_id": round_id },
     )
@@ -409,6 +416,109 @@ pub fn load_tree_state(conn: &Connection, round_id: &str) -> Result<Vec<u8>, Vot
     .map_err(|e| VotingError::InvalidInput {
         message: format!("no cached tree state for round: {} ({})", round_id, e),
     })
+}
+
+// --- Witnesses (Merkle inclusion proofs for Orchard notes) ---
+
+/// Check if witnesses are already cached for a round.
+pub fn has_witnesses(conn: &Connection, round_id: &str) -> Result<bool, VotingError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM witnesses WHERE round_id = :round_id",
+        named_params! { ":round_id": round_id },
+        |row| row.get::<_, i64>(0).map(|c| c > 0),
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to check witnesses: {}", e),
+    })
+}
+
+/// Store witness data for multiple notes in a round.
+/// Each WitnessData's auth_path (Vec<Vec<u8>>) is serialized as a flat 1024-byte blob
+/// (32 levels × 32 bytes each).
+pub fn store_witnesses(
+    conn: &Connection,
+    round_id: &str,
+    witnesses: &[crate::types::WitnessData],
+) -> Result<(), VotingError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    for w in witnesses {
+        // Serialize auth_path as flat blob: 32 × 32 = 1024 bytes
+        let auth_blob: Vec<u8> = w.auth_path.iter().flat_map(|h| h.iter().copied()).collect();
+
+        conn.execute(
+            "INSERT OR REPLACE INTO witnesses (round_id, note_position, note_commitment, root, auth_path, created_at)
+             VALUES (:round_id, :position, :commitment, :root, :auth_path, :created_at)",
+            named_params! {
+                ":round_id": round_id,
+                ":position": w.position as i64,
+                ":commitment": w.note_commitment,
+                ":root": w.root,
+                ":auth_path": auth_blob,
+                ":created_at": now,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to store witness for position {}: {}", w.position, e),
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Load cached witnesses for a round, ordered by position.
+pub fn load_witnesses(conn: &Connection, round_id: &str) -> Result<Vec<crate::types::WitnessData>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT note_position, note_commitment, root, auth_path FROM witnesses
+             WHERE round_id = :round_id ORDER BY note_position",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare load_witnesses: {}", e),
+        })?;
+
+    let witnesses = stmt
+        .query_map(named_params! { ":round_id": round_id }, |row| {
+            let position: i64 = row.get(0)?;
+            let note_commitment: Vec<u8> = row.get(1)?;
+            let root: Vec<u8> = row.get(2)?;
+            let auth_blob: Vec<u8> = row.get(3)?;
+            Ok((position as u64, note_commitment, root, auth_blob))
+        })
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load witnesses: {}", e),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to collect witnesses: {}", e),
+        })?;
+
+    witnesses
+        .into_iter()
+        .map(|(position, note_commitment, root, auth_blob)| {
+            // Deserialize auth_path from flat blob back to Vec<Vec<u8>>
+            if auth_blob.len() != 32 * 32 {
+                return Err(VotingError::Internal {
+                    message: format!(
+                        "corrupt auth_path blob for position {}: expected 1024 bytes, got {}",
+                        position,
+                        auth_blob.len()
+                    ),
+                });
+            }
+            let auth_path: Vec<Vec<u8>> = auth_blob.chunks_exact(32).map(|c| c.to_vec()).collect();
+
+            Ok(crate::types::WitnessData {
+                note_commitment,
+                position,
+                root,
+                auth_path,
+            })
+        })
+        .collect()
 }
 
 // --- Proofs ---

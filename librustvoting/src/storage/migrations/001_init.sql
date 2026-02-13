@@ -32,6 +32,17 @@ CREATE TABLE proofs (
     created_at  INTEGER NOT NULL
 );
 
+CREATE TABLE witnesses (
+    round_id        TEXT NOT NULL,
+    note_position   INTEGER NOT NULL,
+    note_commitment BLOB NOT NULL,
+    root            BLOB NOT NULL,
+    auth_path       BLOB NOT NULL,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (round_id, note_position),
+    FOREIGN KEY (round_id) REFERENCES rounds(round_id)
+);
+
 CREATE TABLE votes (
     id              INTEGER PRIMARY KEY,
     round_id        TEXT NOT NULL REFERENCES rounds(round_id),
