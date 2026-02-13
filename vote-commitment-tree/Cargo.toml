@@ -1,0 +1,17 @@
+[package]
+name = "vote-commitment-tree"
+version = "0.1.0"
+edition = "2021"
+description = "Append-only Poseidon Merkle tree for Vote Authority Notes and Vote Commitments (Zally voting protocol)"
+
+[dependencies]
+imt-tree = { path = "../nullifier-ingest/imt-tree" }
+pasta_curves = "0.5"
+ff = "0.13"
+anyhow = "1.0"
+incrementalmerkletree = "0.8.1"
+shardtree = "0.6"
+lazy_static = "1"
+
+[dev-dependencies]
+rand = "0.8"

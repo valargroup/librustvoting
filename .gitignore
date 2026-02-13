@@ -3,6 +3,7 @@ sdk/zallyd
 
 # Rust build artifacts
 sdk/circuits/target/
+vote-commitment-tree/target/
 
 # Node
 node_modules/
