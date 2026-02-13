@@ -553,7 +553,7 @@ public protocol VotingDatabaseProtocol: AnyObject, Sendable {
     
     func generateDelegationProof(roundId: String, progress: ProofProgressReporter) throws  -> ProofResult
     
-    func generateHotkey(roundId: String) throws  -> VotingHotkey
+    func generateHotkey(roundId: String, seed: Data) throws  -> VotingHotkey
     
     func getRoundState(roundId: String) throws  -> RoundState
     
@@ -701,10 +701,11 @@ open func generateDelegationProof(roundId: String, progress: ProofProgressReport
 })
 }
     
-open func generateHotkey(roundId: String)throws  -> VotingHotkey  {
+open func generateHotkey(roundId: String, seed: Data)throws  -> VotingHotkey  {
     return try  FfiConverterTypeVotingHotkey_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_method_votingdatabase_generate_hotkey(self.uniffiClonePointer(),
-        FfiConverterString.lower(roundId),$0
+        FfiConverterString.lower(roundId),
+        FfiConverterData.lower(seed),$0
     )
 })
 }
@@ -2486,9 +2487,10 @@ public func generateDelegationProof(witness: Data)throws  -> ProofResult  {
     )
 })
 }
-public func generateHotkey()throws  -> VotingHotkey  {
+public func generateHotkey(seed: Data)throws  -> VotingHotkey  {
     return try  FfiConverterTypeVotingHotkey_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
-    uniffi_zcash_voting_ffi_fn_func_generate_hotkey($0
+    uniffi_zcash_voting_ffi_fn_func_generate_hotkey(
+        FfiConverterData.lower(seed),$0
     )
 })
 }
@@ -2544,7 +2546,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_func_generate_delegation_proof() != 5320) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_func_generate_hotkey() != 51001) {
+    if (uniffi_zcash_voting_ffi_checksum_func_generate_hotkey() != 8015) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_func_generate_note_witness() != 45780) {
@@ -2574,7 +2576,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_generate_delegation_proof() != 9050) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_generate_hotkey() != 26380) {
+    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_generate_hotkey() != 38599) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_get_round_state() != 4975) {

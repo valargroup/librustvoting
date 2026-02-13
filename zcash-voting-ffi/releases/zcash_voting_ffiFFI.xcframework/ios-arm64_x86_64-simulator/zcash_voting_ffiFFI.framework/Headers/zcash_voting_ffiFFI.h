@@ -318,7 +318,7 @@ RustBuffer uniffi_zcash_voting_ffi_fn_method_votingdatabase_generate_delegation_
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_METHOD_VOTINGDATABASE_GENERATE_HOTKEY
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_METHOD_VOTINGDATABASE_GENERATE_HOTKEY
-RustBuffer uniffi_zcash_voting_ffi_fn_method_votingdatabase_generate_hotkey(void*_Nonnull ptr, RustBuffer round_id, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_zcash_voting_ffi_fn_method_votingdatabase_generate_hotkey(void*_Nonnull ptr, RustBuffer round_id, RustBuffer seed, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_METHOD_VOTINGDATABASE_GET_ROUND_STATE
@@ -398,8 +398,7 @@ RustBuffer uniffi_zcash_voting_ffi_fn_func_generate_delegation_proof(RustBuffer 
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_GENERATE_HOTKEY
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_GENERATE_HOTKEY
-RustBuffer uniffi_zcash_voting_ffi_fn_func_generate_hotkey(RustCallStatus *_Nonnull out_status
-    
+RustBuffer uniffi_zcash_voting_ffi_fn_func_generate_hotkey(RustBuffer seed, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_GENERATE_NOTE_WITNESS

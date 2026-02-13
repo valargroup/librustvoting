@@ -426,8 +426,8 @@ impl VotingDatabase {
 
     // --- Phase 1: Delegation setup ---
 
-    pub fn generate_hotkey(&self, round_id: String) -> Result<VotingHotkey, VotingError> {
-        Ok(self.db.generate_hotkey(&round_id)?.into())
+    pub fn generate_hotkey(&self, round_id: String, seed: Vec<u8>) -> Result<VotingHotkey, VotingError> {
+        Ok(self.db.generate_hotkey(&round_id, &seed)?.into())
     }
 
     pub fn construct_delegation_action(
@@ -509,8 +509,8 @@ impl VotingDatabase {
 // =============================================================================
 
 #[uniffi::export]
-pub fn generate_hotkey() -> Result<VotingHotkey, VotingError> {
-    Ok(voting::hotkey::generate_hotkey()?.into())
+pub fn generate_hotkey(seed: Vec<u8>) -> Result<VotingHotkey, VotingError> {
+    Ok(voting::hotkey::generate_hotkey(&seed)?.into())
 }
 
 #[uniffi::export]

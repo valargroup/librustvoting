@@ -57,11 +57,10 @@ impl VotingDb {
 
     // --- Phase 1: Delegation setup ---
 
-    /// Generate a voting hotkey. Returns the hotkey (SDK needs address for Keystone flow).
-    /// NOTE: hotkey is NOT stored in the database yet (no hotkeys table).
-    /// TODO(pre-production): Store secret key in iOS Keychain, public key in db.
-    pub fn generate_hotkey(&self, _round_id: &str) -> Result<VotingHotkey, VotingError> {
-        crate::hotkey::generate_hotkey()
+    /// Generate a voting hotkey from seed bytes. Returns the hotkey (SDK needs address for Keystone flow).
+    /// The seed comes from a BIP39 mnemonic stored in iOS Keychain.
+    pub fn generate_hotkey(&self, _round_id: &str, seed: &[u8]) -> Result<VotingHotkey, VotingError> {
+        crate::hotkey::generate_hotkey(seed)
     }
 
     /// Construct the delegation action for Keystone signing.
@@ -253,7 +252,8 @@ mod tests {
     #[test]
     fn test_generate_hotkey() {
         let db = test_db();
-        let hotkey = db.generate_hotkey(ROUND_ID).unwrap();
+        let seed = [0x42_u8; 64];
+        let hotkey = db.generate_hotkey(ROUND_ID, &seed).unwrap();
         assert_eq!(hotkey.secret_key.len(), 32);
         assert_eq!(hotkey.public_key.len(), 32);
     }
@@ -263,7 +263,8 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let hotkey = db.generate_hotkey(ROUND_ID).unwrap();
+        let seed = [0x42_u8; 64];
+        let hotkey = db.generate_hotkey(ROUND_ID, &seed).unwrap();
         let note = NoteInfo {
             commitment: vec![0x01; 32],
             nullifier: vec![0x02; 32],
