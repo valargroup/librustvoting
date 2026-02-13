@@ -1,0 +1,41 @@
+name: IMT ZK Integration Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nullifier-ingest/**'
+      - 'orchard/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'nullifier-ingest/**'
+      - 'orchard/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test-imt-integration:
+    name: IMT ZK Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            nullifier-ingest/imt-tree/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-imt-tree-${{ hashFiles('nullifier-ingest/imt-tree/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-imt-tree-
+      - name: Run IMT integration test
+        run: cargo test --test imt_circuit_integration -- --nocapture
+        working-directory: nullifier-ingest/imt-tree
