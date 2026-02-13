@@ -3,6 +3,8 @@
         "build.buildFlags": ["-tags=halo2"]
     },
     "rust-analyzer.linkedProjects": [
-        "nullifier-ingest/nullifier-tree/Cargo.toml"
-    ]
+        "nullifier-ingest/nullifier-tree/Cargo.toml",
+        "orchard/Cargo.toml"
+    ],
+    "rust-analyzer.cargo.features": ["delegation"]
 }
