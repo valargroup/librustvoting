@@ -106,7 +106,7 @@ extension VotingCryptoClient: DependencyKey {
                     address: hotkey.address
                 )
             },
-            constructDelegationAction: { roundId, hotkey, notes in
+            constructDelegationAction: { roundId, hotkey, notes, nk, gdNewX, pkdNewX in
                 let db = try await dbActor.database()
                 let ffiHotkey = ZcashVotingFFI.VotingHotkey(
                     secretKey: hotkey.secretKey,
@@ -124,12 +124,19 @@ extension VotingCryptoClient: DependencyKey {
                 let result = try db.constructDelegationAction(
                     roundId: roundId,
                     hotkey: ffiHotkey,
-                    notes: ffiNotes
+                    notes: ffiNotes,
+                    nk: [UInt8](nk),
+                    gDNewX: [UInt8](gdNewX),
+                    pkDNewX: [UInt8](pkdNewX)
                 )
                 return DelegationAction(
                     actionBytes: result.actionBytes,
                     rk: result.rk,
-                    sighash: result.sighash
+                    sighash: result.sighash,
+                    govNullifiers: result.govNullifiers.map { Data($0) },
+                    van: Data(result.van),
+                    govCommRand: Data(result.govCommRand),
+                    dummyNullifiers: result.dummyNullifiers.map { Data($0) }
                 )
             },
             storeTreeState: { roundId, treeState in
@@ -141,7 +148,11 @@ extension VotingCryptoClient: DependencyKey {
                 let ffiAction = ZcashVotingFFI.DelegationAction(
                     actionBytes: action.actionBytes,
                     rk: action.rk,
-                    sighash: action.sighash
+                    sighash: action.sighash,
+                    govNullifiers: action.govNullifiers.map { [UInt8]($0) },
+                    van: [UInt8](action.van),
+                    govCommRand: [UInt8](action.govCommRand),
+                    dummyNullifiers: action.dummyNullifiers.map { [UInt8]($0) }
                 )
                 let witness = try db.buildDelegationWitness(
                     roundId: roundId,

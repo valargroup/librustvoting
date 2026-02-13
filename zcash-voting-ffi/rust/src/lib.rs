@@ -159,6 +159,10 @@ pub struct DelegationAction {
     pub action_bytes: Vec<u8>,
     pub rk: Vec<u8>,
     pub sighash: Vec<u8>,
+    pub gov_nullifiers: Vec<Vec<u8>>,
+    pub van: Vec<u8>,
+    pub gov_comm_rand: Vec<u8>,
+    pub dummy_nullifiers: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -253,6 +257,10 @@ impl From<voting::DelegationAction> for DelegationAction {
             action_bytes: a.action_bytes,
             rk: a.rk,
             sighash: a.sighash,
+            gov_nullifiers: a.gov_nullifiers,
+            van: a.van,
+            gov_comm_rand: a.gov_comm_rand,
+            dummy_nullifiers: a.dummy_nullifiers,
         }
     }
 }
@@ -263,6 +271,10 @@ impl From<DelegationAction> for voting::DelegationAction {
             action_bytes: a.action_bytes,
             rk: a.rk,
             sighash: a.sighash,
+            gov_nullifiers: a.gov_nullifiers,
+            van: a.van,
+            gov_comm_rand: a.gov_comm_rand,
+            dummy_nullifiers: a.dummy_nullifiers,
         }
     }
 }
@@ -398,9 +410,14 @@ impl VotingDatabase {
         round_id: String,
         hotkey: VotingHotkey,
         notes: Vec<NoteInfo>,
+        nk: Vec<u8>,
+        g_d_new_x: Vec<u8>,
+        pk_d_new_x: Vec<u8>,
     ) -> Result<DelegationAction, VotingError> {
         let core_notes: Vec<voting::NoteInfo> = notes.into_iter().map(Into::into).collect();
-        Ok(self.db.construct_delegation_action(&round_id, &hotkey.into(), &core_notes)?.into())
+        Ok(self.db.construct_delegation_action(
+            &round_id, &hotkey.into(), &core_notes, &nk, &g_d_new_x, &pk_d_new_x,
+        )?.into())
     }
 
     pub fn store_tree_state(&self, round_id: String, tree_state_bytes: Vec<u8>) -> Result<(), VotingError> {
@@ -489,9 +506,14 @@ pub fn construct_delegation_action(
     hotkey: VotingHotkey,
     notes: Vec<NoteInfo>,
     params: VotingRoundParams,
+    nk: Vec<u8>,
+    g_d_new_x: Vec<u8>,
+    pk_d_new_x: Vec<u8>,
 ) -> Result<DelegationAction, VotingError> {
     let core_notes: Vec<voting::NoteInfo> = notes.into_iter().map(Into::into).collect();
-    Ok(voting::action::construct_delegation_action(&hotkey.into(), &core_notes, &params.into())?.into())
+    Ok(voting::action::construct_delegation_action(
+        &hotkey.into(), &core_notes, &params.into(), &nk, &g_d_new_x, &pk_d_new_x,
+    )?.into())
 }
 
 #[uniffi::export]

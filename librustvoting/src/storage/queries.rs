@@ -143,6 +143,82 @@ pub fn clear_round(conn: &Connection, round_id: &str) -> Result<(), VotingError>
     Ok(())
 }
 
+// --- Delegation Secrets ---
+//
+// After construct_delegation_action computes the VAN (governance commitment),
+// we persist two values needed for later proof steps:
+//   - gov_comm_rand: the 32-byte blinding factor used in the VAN Poseidon hash.
+//     Needed again in ZKP #2 (vote commitment) to reconstruct the VAN as a witness.
+//   - dummy_nullifiers: random nullifiers generated for padded note slots (§1.3.5).
+//     Each is 32 bytes. Stored so the witness builder can reconstruct padded notes.
+
+/// Persist the blinding factor and dummy nullifiers produced during delegation action construction.
+pub fn store_delegation_secrets(
+    conn: &Connection,
+    round_id: &str,
+    gov_comm_rand: &[u8],
+    dummy_nullifiers: &[Vec<u8>],
+) -> Result<(), VotingError> {
+    // Serialize dummy nullifiers as a flat byte blob: [nf0 (32 bytes) | nf1 | nf2 | ...].
+    // Length 0 means no padding was needed (all 4 notes were real).
+    // Length 32/64/96 means 1/2/3 dummy notes respectively.
+    let dummy_blob: Vec<u8> = dummy_nullifiers
+        .iter()
+        .flat_map(|n| n.iter().copied())
+        .collect();
+
+    let rows = conn
+        .execute(
+            "UPDATE rounds SET gov_comm_rand = :rand, dummy_nullifiers = :dummies WHERE round_id = :round_id",
+            named_params! {
+                ":rand": gov_comm_rand,
+                ":dummies": dummy_blob,
+                ":round_id": round_id,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to store delegation secrets: {}", e),
+        })?;
+
+    // If no rows were updated, the round_id doesn't exist in the rounds table.
+    if rows == 0 {
+        return Err(VotingError::InvalidInput {
+            message: format!("round not found: {}", round_id),
+        });
+    }
+
+    Ok(())
+}
+
+/// Load the VAN blinding factor for a round. Needed as a private witness in ZKP #2.
+pub fn load_gov_comm_rand(conn: &Connection, round_id: &str) -> Result<Vec<u8>, VotingError> {
+    conn.query_row(
+        "SELECT gov_comm_rand FROM rounds WHERE round_id = :round_id",
+        named_params! { ":round_id": round_id },
+        |row| row.get(0),
+    )
+    .map_err(|e| VotingError::InvalidInput {
+        message: format!("no gov_comm_rand for round: {} ({})", round_id, e),
+    })
+}
+
+/// Load dummy nullifiers for padded note slots. Returns 0-3 entries of 32 bytes each.
+/// Deserializes the flat blob back into individual 32-byte nullifiers.
+pub fn load_dummy_nullifiers(conn: &Connection, round_id: &str) -> Result<Vec<Vec<u8>>, VotingError> {
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT dummy_nullifiers FROM rounds WHERE round_id = :round_id",
+            named_params! { ":round_id": round_id },
+            |row| row.get(0),
+        )
+        .map_err(|e| VotingError::InvalidInput {
+            message: format!("no dummy_nullifiers for round: {} ({})", round_id, e),
+        })?;
+
+    // Split the flat blob back into 32-byte chunks, one per dummy nullifier.
+    Ok(blob.chunks_exact(32).map(|c| c.to_vec()).collect())
+}
+
 // --- Cached Tree State ---
 
 pub fn store_tree_state(conn: &Connection, round_id: &str, snapshot_height: u64, tree_state: &[u8]) -> Result<(), VotingError> {

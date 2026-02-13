@@ -1,15 +1,19 @@
-use crate::storage::{RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb};
 use crate::storage::queries;
+use crate::storage::{RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb};
 use crate::types::{
-    DelegationAction, EncryptedShare, NoteInfo, ProofProgressReporter, ProofResult,
-    SharePayload, VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
+    DelegationAction, EncryptedShare, NoteInfo, ProofProgressReporter, ProofResult, SharePayload,
+    VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
 };
 
 impl VotingDb {
     // --- Round management ---
 
     /// Initialize a new voting round. Stores params, sets phase to Initialized.
-    pub fn init_round(&self, params: &VotingRoundParams, session_json: Option<&str>) -> Result<(), VotingError> {
+    pub fn init_round(
+        &self,
+        params: &VotingRoundParams,
+        session_json: Option<&str>,
+    ) -> Result<(), VotingError> {
         let conn = self.conn();
         queries::insert_round(&conn, params, session_json)
     }
@@ -47,18 +51,34 @@ impl VotingDb {
         crate::hotkey::generate_hotkey()
     }
 
-    /// Construct the dummy action for Keystone signing.
+    /// Construct the delegation action for Keystone signing.
     /// Loads round params from db. Hotkey + notes come from caller (not stored yet).
-    /// Returns DelegationAction (SDK passes to Keystone for signing).
+    /// Computes real governance nullifiers, VAN, and persists gov_comm_rand.
+    ///
+    /// - `nk`: 32-byte nullifier deriving key
+    /// - `g_d_new_x`: 32-byte x-coordinate of hotkey diversified generator
+    /// - `pk_d_new_x`: 32-byte x-coordinate of hotkey transmission key
     pub fn construct_delegation_action(
         &self,
         round_id: &str,
         hotkey: &VotingHotkey,
         notes: &[NoteInfo],
+        nk: &[u8],
+        g_d_new_x: &[u8],
+        pk_d_new_x: &[u8],
     ) -> Result<DelegationAction, VotingError> {
         let conn = self.conn();
         let params = queries::load_round_params(&conn, round_id)?;
-        crate::action::construct_delegation_action(hotkey, notes, &params)
+        let action = crate::action::construct_delegation_action(
+            hotkey, notes, &params, nk, g_d_new_x, pk_d_new_x,
+        )?;
+        queries::store_delegation_secrets(
+            &conn,
+            round_id,
+            &action.gov_comm_rand,
+            &action.dummy_nullifiers,
+        )?;
+        Ok(action)
     }
 
     /// Cache tree state fetched from lightwalletd by SDK.
@@ -79,7 +99,8 @@ impl VotingDb {
         inclusion_proofs: &[Vec<u8>],
         exclusion_proofs: &[Vec<u8>],
     ) -> Result<Vec<u8>, VotingError> {
-        let witness = crate::zkp1::build_delegation_witness(action, inclusion_proofs, exclusion_proofs)?;
+        let witness =
+            crate::zkp1::build_delegation_witness(action, inclusion_proofs, exclusion_proofs)?;
         let conn = self.conn();
         queries::store_witness(&conn, round_id, &witness)?;
         queries::update_round_phase(&conn, round_id, RoundPhase::WitnessBuilt)?;
@@ -145,7 +166,8 @@ impl VotingDb {
             "vote_authority_note_new": hex::encode(&bundle.vote_authority_note_new),
             "vote_commitment": hex::encode(&bundle.vote_commitment),
             "proof": hex::encode(&bundle.proof),
-        })).map_err(|e| VotingError::Internal {
+        }))
+        .map_err(|e| VotingError::Internal {
             message: format!("failed to serialize vote commitment: {}", e),
         })?;
 
@@ -175,13 +197,17 @@ mod tests {
     use super::*;
     use crate::types::NoopProgressReporter;
 
+    // 64 hex chars = 32 bytes when decoded. Required because construct_delegation_action
+    // hex-decodes vote_round_id and validates it as exactly 32 bytes (a Pallas field element).
+    const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
     fn test_db() -> VotingDb {
         VotingDb::open(":memory:").unwrap()
     }
 
     fn test_params() -> VotingRoundParams {
         VotingRoundParams {
-            vote_round_id: "test-round-1".to_string(),
+            vote_round_id: ROUND_ID.to_string(),
             snapshot_height: 1000,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],
@@ -194,7 +220,7 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let state = db.get_round_state("test-round-1").unwrap();
+        let state = db.get_round_state(ROUND_ID).unwrap();
         assert_eq!(state.phase, RoundPhase::Initialized);
         assert_eq!(state.snapshot_height, 1000);
     }
@@ -207,14 +233,14 @@ mod tests {
         let rounds = db.list_rounds().unwrap();
         assert_eq!(rounds.len(), 1);
 
-        db.clear_round("test-round-1").unwrap();
+        db.clear_round(ROUND_ID).unwrap();
         assert!(db.list_rounds().unwrap().is_empty());
     }
 
     #[test]
     fn test_generate_hotkey() {
         let db = test_db();
-        let hotkey = db.generate_hotkey("test-round-1").unwrap();
+        let hotkey = db.generate_hotkey(ROUND_ID).unwrap();
         assert_eq!(hotkey.secret_key.len(), 32);
         assert_eq!(hotkey.public_key.len(), 32);
     }
@@ -224,17 +250,32 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let hotkey = db.generate_hotkey("test-round-1").unwrap();
+        let hotkey = db.generate_hotkey(ROUND_ID).unwrap();
         let note = NoteInfo {
             commitment: vec![0x01; 32],
             nullifier: vec![0x02; 32],
             value: 1_000_000,
             position: 42,
         };
+        let nk = vec![0x11; 32];
+        let g_d = vec![0x22; 32];
+        let pk_d = vec![0x33; 32];
 
-        let action = db.construct_delegation_action("test-round-1", &hotkey, &[note]).unwrap();
+        let action = db
+            .construct_delegation_action(ROUND_ID, &hotkey, &[note], &nk, &g_d, &pk_d)
+            .unwrap();
         assert_eq!(action.rk.len(), 32);
         assert_eq!(action.sighash.len(), 32);
+        assert_eq!(action.gov_nullifiers.len(), 4);
+        assert_eq!(action.van.len(), 32);
+        assert_eq!(action.gov_comm_rand.len(), 32);
+
+        // Verify delegation secrets were persisted
+        let conn = db.conn();
+        let stored_rand = queries::load_gov_comm_rand(&conn, ROUND_ID).unwrap();
+        assert_eq!(stored_rand, action.gov_comm_rand);
+        let stored_dummies = queries::load_dummy_nullifiers(&conn, ROUND_ID).unwrap();
+        assert_eq!(stored_dummies, action.dummy_nullifiers);
     }
 
     #[test]
@@ -243,11 +284,10 @@ mod tests {
         db.init_round(&test_params(), None).unwrap();
 
         let tree_state = vec![0xCC; 1024];
-        db.store_tree_state("test-round-1", &tree_state).unwrap();
+        db.store_tree_state(ROUND_ID, &tree_state).unwrap();
 
-        // Verify via direct query
         let conn = db.conn();
-        let loaded = queries::load_tree_state(&conn, "test-round-1").unwrap();
+        let loaded = queries::load_tree_state(&conn, ROUND_ID).unwrap();
         assert_eq!(loaded, tree_state);
     }
 
@@ -260,21 +300,27 @@ mod tests {
             action_bytes: vec![0xDA; 128],
             rk: vec![0xDE; 32],
             sighash: vec![0x5A; 32],
+            gov_nullifiers: vec![vec![0x01; 32]; 4],
+            van: vec![0x02; 32],
+            gov_comm_rand: vec![0x03; 32],
+            dummy_nullifiers: vec![],
         };
         let inclusion = vec![vec![0x01; 32]; 4];
         let exclusion = vec![vec![0x02; 32]; 4];
 
-        let witness = db.build_delegation_witness("test-round-1", &action, &inclusion, &exclusion).unwrap();
+        let witness = db
+            .build_delegation_witness(ROUND_ID, &action, &inclusion, &exclusion)
+            .unwrap();
         assert!(!witness.is_empty());
 
-        let state = db.get_round_state("test-round-1").unwrap();
+        let state = db.get_round_state(ROUND_ID).unwrap();
         assert_eq!(state.phase, RoundPhase::WitnessBuilt);
 
         let reporter = NoopProgressReporter;
-        let proof = db.generate_delegation_proof("test-round-1", &reporter).unwrap();
+        let proof = db.generate_delegation_proof(ROUND_ID, &reporter).unwrap();
         assert!(proof.success);
 
-        let state = db.get_round_state("test-round-1").unwrap();
+        let state = db.get_round_state(ROUND_ID).unwrap();
         assert_eq!(state.phase, RoundPhase::DelegationProved);
     }
 
@@ -283,7 +329,7 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let shares = db.encrypt_shares("test-round-1", &[1, 4]).unwrap();
+        let shares = db.encrypt_shares(ROUND_ID, &[1, 4]).unwrap();
         assert_eq!(shares.len(), 2);
         assert_eq!(shares[0].plaintext_value, 1);
         assert_eq!(shares[1].plaintext_value, 4);
@@ -294,16 +340,16 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let enc_shares = db.encrypt_shares("test-round-1", &[1, 4]).unwrap();
+        let enc_shares = db.encrypt_shares(ROUND_ID, &[1, 4]).unwrap();
         let van_witness = vec![0xDD; 64];
         let reporter = NoopProgressReporter;
 
-        let bundle = db.build_vote_commitment(
-            "test-round-1", 0, 0, &enc_shares, &van_witness, &reporter,
-        ).unwrap();
+        let bundle = db
+            .build_vote_commitment(ROUND_ID, 0, 0, &enc_shares, &van_witness, &reporter)
+            .unwrap();
         assert_eq!(bundle.van_nullifier.len(), 32);
         assert_eq!(bundle.proposal_id, 0);
 
-        db.mark_vote_submitted("test-round-1", 0).unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0).unwrap();
     }
 }

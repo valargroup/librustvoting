@@ -96,7 +96,7 @@ public struct Voting {
             votingRound: VotingRound = MockVotingService.votingRound,
             votingWeight: UInt64 = MockVotingService.votingWeight,
             isKeystoneUser: Bool = false,
-            roundId: String = "01010101010101010101010101010101"
+            roundId: String = "0101010101010101010101010101010101010101010101010101010101010101"
         ) {
             self.votingRound = votingRound
             self.votingWeight = votingWeight
@@ -203,7 +203,7 @@ public struct Voting {
                         // Clear any previous data for this round, then initialize
                         try? await votingCrypto.clearRound(roundId)
                         let params = VotingRoundParams(
-                            voteRoundId: Data(repeating: 0x01, count: 16),
+                            voteRoundId: Data(repeating: 0x01, count: 32),
                             snapshotHeight: snapshotHeight,
                             eaPK: Data(repeating: 0xEA, count: 32),
                             ncRoot: Data(repeating: 0xAA, count: 32),
@@ -219,8 +219,12 @@ public struct Voting {
                             value: 1_000_000,
                             position: 42
                         )
+                        // Mock nk/g_d/pk_d — real derivation comes in a later step
+                        let mockNk = Data(repeating: 0x11, count: 32)
+                        let mockGd = Data(repeating: 0x22, count: 32)
+                        let mockPkd = Data(repeating: 0x33, count: 32)
                         let action = try await votingCrypto.constructDelegationAction(
-                            roundId, hotkey, [mockNote]
+                            roundId, hotkey, [mockNote], mockNk, mockGd, mockPkd
                         )
                         _ = try await votingCrypto.buildDelegationWitness(
                             roundId, action,

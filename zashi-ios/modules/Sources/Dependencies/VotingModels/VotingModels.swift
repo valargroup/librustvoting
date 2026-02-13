@@ -197,11 +197,23 @@ public struct DelegationAction: Equatable, Sendable {
     public let actionBytes: Data
     public let rk: Data
     public let sighash: Data
+    /// Governance nullifiers, always padded to 4.
+    public let govNullifiers: [Data]
+    /// 32-byte governance commitment (VAN).
+    public let van: Data
+    /// 32-byte blinding factor used for VAN.
+    public let govCommRand: Data
+    /// Random nullifiers used for padded dummy notes (needed for circuit witness).
+    public let dummyNullifiers: [Data]
 
-    public init(actionBytes: Data, rk: Data, sighash: Data) {
+    public init(actionBytes: Data, rk: Data, sighash: Data, govNullifiers: [Data], van: Data, govCommRand: Data, dummyNullifiers: [Data]) {
         self.actionBytes = actionBytes
         self.rk = rk
         self.sighash = sighash
+        self.govNullifiers = govNullifiers
+        self.van = van
+        self.govCommRand = govCommRand
+        self.dummyNullifiers = dummyNullifiers
     }
 }
 

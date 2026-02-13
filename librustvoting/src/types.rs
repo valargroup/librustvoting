@@ -37,12 +37,20 @@ pub struct VotingRoundParams {
     pub nullifier_imt_root: Vec<u8>,
 }
 
-/// Constructed dummy action for keystone signing.
+/// Delegation action for Keystone signing.
 #[derive(Clone, Debug)]
 pub struct DelegationAction {
     pub action_bytes: Vec<u8>,
     pub rk: Vec<u8>,
     pub sighash: Vec<u8>,
+    /// Governance nullifiers, always padded to 4.
+    pub gov_nullifiers: Vec<Vec<u8>>,
+    /// 32-byte governance commitment (VAN).
+    pub van: Vec<u8>,
+    /// 32-byte blinding factor used for VAN (must be persisted for later use).
+    pub gov_comm_rand: Vec<u8>,
+    /// Random nullifiers used for padded dummy notes (needed for circuit witness in later steps).
+    pub dummy_nullifiers: Vec<Vec<u8>>,
 }
 
 /// El Gamal ciphertext of a voting share.

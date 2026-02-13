@@ -85,4 +85,32 @@ mod tests {
         assert!(tables.contains(&"proofs".to_string()));
         assert!(tables.contains(&"votes".to_string()));
     }
+
+    /// Verify that the delegation secret columns (gov_comm_rand, dummy_nullifiers)
+    /// exist in the rounds table after migration and can round-trip BLOB data.
+    #[test]
+    fn test_delegation_secret_columns_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // Insert a row using both new nullable BLOB columns.
+        // These columns are populated later by store_delegation_secrets()
+        // after construct_delegation_action() computes the VAN.
+        conn.execute(
+            "INSERT INTO rounds (round_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at, gov_comm_rand, dummy_nullifiers) VALUES ('test', 1, X'00', X'00', X'00', 0, 0, X'AA', X'BB')",
+            [],
+        ).unwrap();
+
+        // Verify gov_comm_rand round-trips (the VAN blinding factor)
+        let rand: Vec<u8> = conn
+            .query_row("SELECT gov_comm_rand FROM rounds WHERE round_id = 'test'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rand, vec![0xAA]);
+
+        // Verify dummy_nullifiers round-trips (padded note nullifiers, stored as flat blob)
+        let dummies: Vec<u8> = conn
+            .query_row("SELECT dummy_nullifiers FROM rounds WHERE round_id = 'test'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dummies, vec![0xBB]);
+    }
 }

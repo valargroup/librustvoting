@@ -6,7 +6,9 @@ CREATE TABLE rounds (
     nullifier_imt_root  BLOB NOT NULL,
     session_json        TEXT,
     phase               INTEGER NOT NULL DEFAULT 0,
-    created_at          INTEGER NOT NULL
+    created_at          INTEGER NOT NULL,
+    gov_comm_rand       BLOB,
+    dummy_nullifiers    BLOB
 );
 
 CREATE TABLE cached_tree_state (

@@ -74,6 +74,10 @@ mod tests {
             action_bytes: vec![0xDA; 128],
             rk: vec![0xDE; 32],
             sighash: vec![0x5A; 32],
+            gov_nullifiers: vec![vec![0x01; 32]; 4],
+            van: vec![0x02; 32],
+            gov_comm_rand: vec![0x03; 32],
+            dummy_nullifiers: vec![],
         }
     }
 

@@ -29,7 +29,10 @@ public struct VotingCryptoClient {
     public var constructDelegationAction: @Sendable (
         _ roundId: String,
         _ hotkey: VotingHotkey,
-        _ notes: [NoteInfo]
+        _ notes: [NoteInfo],
+        _ nk: Data,
+        _ gdNewX: Data,
+        _ pkdNewX: Data
     ) async throws -> DelegationAction
     public var storeTreeState: @Sendable (_ roundId: String, _ treeState: Data) async throws -> Void
     public var buildDelegationWitness: @Sendable (
