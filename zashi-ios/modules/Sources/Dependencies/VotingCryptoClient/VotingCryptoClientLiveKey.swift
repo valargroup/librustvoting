@@ -122,13 +122,24 @@ extension VotingCryptoClient: DependencyKey {
                     address: hotkey.address
                 )
             },
-            constructDelegationAction: { roundId, hotkey, notes, nk, gdNewX, pkdNewX in
-                let db = try await dbActor.database()
-                let ffiHotkey = ZcashVotingFFI.VotingHotkey(
-                    secretKey: hotkey.secretKey,
-                    publicKey: hotkey.publicKey,
-                    address: hotkey.address
+            generateDelegationInputs: { senderSeed, hotkeySeed, networkId, accountIndex in
+                let inputs = try ZcashVotingFFI.generateDelegationInputs(
+                    senderSeed: Data(senderSeed),
+                    hotkeySeed: Data(hotkeySeed),
+                    networkId: networkId,
+                    accountIndex: accountIndex
                 )
+                return DelegationInputs(
+                    fvkBytes: inputs.fvkBytes,
+                    gdNewX: inputs.gDNewX,
+                    pkdNewX: inputs.pkDNewX,
+                    hotkeyRawAddress: inputs.hotkeyRawAddress,
+                    hotkeyPublicKey: inputs.hotkeyPublicKey,
+                    hotkeyAddress: inputs.hotkeyAddress
+                )
+            },
+            constructDelegationAction: { roundId, notes, fvkBytes, gdNewX, pkdNewX, hotkeyRawAddress in
+                let db = try await dbActor.database()
                 let ffiNotes = notes.map {
                     ZcashVotingFFI.NoteInfo(
                         commitment: $0.commitment,
@@ -139,11 +150,11 @@ extension VotingCryptoClient: DependencyKey {
                 }
                 let result = try db.constructDelegationAction(
                     roundId: roundId,
-                    hotkey: ffiHotkey,
                     notes: ffiNotes,
-                    nk: nk,
+                    fvkBytes: fvkBytes,
                     gDNewX: gdNewX,
-                    pkDNewX: pkdNewX
+                    pkDNewX: pkdNewX,
+                    hotkeyRawAddress: hotkeyRawAddress
                 )
                 return DelegationAction(
                     actionBytes: result.actionBytes,
@@ -154,7 +165,12 @@ extension VotingCryptoClient: DependencyKey {
                     govCommRand: result.govCommRand,
                     dummyNullifiers: result.dummyNullifiers,
                     rhoSigned: result.rhoSigned,
-                    paddedCmx: result.paddedCmx
+                    paddedCmx: result.paddedCmx,
+                    nfSigned: result.nfSigned,
+                    cmxNew: result.cmxNew,
+                    alpha: result.alpha,
+                    rseedSigned: result.rseedSigned,
+                    rseedOutput: result.rseedOutput
                 )
             },
             storeTreeState: { roundId, treeState in
@@ -172,7 +188,12 @@ extension VotingCryptoClient: DependencyKey {
                     govCommRand: action.govCommRand,
                     dummyNullifiers: action.dummyNullifiers,
                     rhoSigned: action.rhoSigned,
-                    paddedCmx: action.paddedCmx
+                    paddedCmx: action.paddedCmx,
+                    nfSigned: action.nfSigned,
+                    cmxNew: action.cmxNew,
+                    alpha: action.alpha,
+                    rseedSigned: action.rseedSigned,
+                    rseedOutput: action.rseedOutput
                 )
                 let witness = try db.buildDelegationWitness(
                     roundId: roundId,
@@ -352,8 +373,8 @@ private extension VoteChoice {
     }
 }
 
-private extension Data {
-    var hexString: String {
+public extension Data {
+    public var hexString: String {
         map { String(format: "%02x", $0) }.joined()
     }
 }

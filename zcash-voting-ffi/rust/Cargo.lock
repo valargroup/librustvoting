@@ -1971,8 +1971,12 @@ name = "zcash-voting-ffi"
 version = "0.1.0"
 dependencies = [
  "librustvoting",
+ "orchard",
  "thiserror 2.0.18",
  "uniffi",
+ "zcash_keys",
+ "zcash_protocol",
+ "zip32",
 ]
 
 [[package]]

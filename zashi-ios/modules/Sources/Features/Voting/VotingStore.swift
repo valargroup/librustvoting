@@ -13,6 +13,20 @@ import VotingModels
 import WalletStorage
 import ZcashSDKEnvironment
 
+private enum VotingFlowError: LocalizedError {
+    case missingActiveSession
+    case hotkeySeedBindingMismatch
+
+    var errorDescription: String? {
+        switch self {
+        case .missingActiveSession:
+            return "missing active voting session"
+        case .hotkeySeedBindingMismatch:
+            return "hotkey from generateHotkey does not match delegation input hotkey material"
+        }
+    }
+}
+
 @Reducer
 public struct Voting {
     @Dependency(\.databaseFiles) var databaseFiles
@@ -42,6 +56,7 @@ public struct Voting {
         public var votingWeight: UInt64
         public var isKeystoneUser: Bool
         public var roundId: String
+        public var activeSession: VotingSession?
 
         /// Cached wallet notes from the snapshot query, used by delegation proof.
         public var walletNotes: [NoteInfo] = []
@@ -117,7 +132,7 @@ public struct Voting {
             votingRound: VotingRound = MockVotingService.votingRound,
             votingWeight: UInt64 = 0,
             isKeystoneUser: Bool = false,
-            roundId: String = "0101010101010101010101010101010101010101010101010101010101010101"
+            roundId: String = ""
         ) {
             self.votingRound = votingRound
             self.votingWeight = votingWeight
@@ -135,6 +150,7 @@ public struct Voting {
 
         // Initialization (DB, wallet notes, hotkey)
         case initialize
+        case activeSessionLoaded(VotingSession)
         case votingWeightLoaded(UInt64, [NoteInfo])
         case initializeFailed(String)
         case hotkeyLoaded(String)
@@ -188,17 +204,20 @@ public struct Voting {
             // MARK: - Initialization
 
             case .initialize:
-                let snapshotHeight = state.votingRound.snapshotHeight
-                let roundId = state.roundId
                 let network = zcashSDKEnvironment.network
                 let walletDbPath = databaseFiles.dataDbURLFor(network).path
                 let networkId: UInt32 = network.networkType == .mainnet ? 0 : 1
-                return .run { [votingCrypto, mnemonic, walletStorage] send in
+                return .run { [votingAPI, votingCrypto, mnemonic, walletStorage] send in
                     // Open the voting database (needed for FFI method)
                     let dbPath = FileManager.default
                         .urls(for: .documentDirectory, in: .userDomainMask)[0]
                         .appendingPathComponent("voting.sqlite3").path
                     try await votingCrypto.openDatabase(dbPath)
+
+                    let activeSession = try await votingAPI.fetchActiveVotingSession()
+                    let snapshotHeight = activeSession.snapshotHeight
+                    let roundId = activeSession.voteRoundId.hexString
+                    await send(.activeSessionLoaded(activeSession))
 
                     let notes = try await votingCrypto.getWalletNotes(
                         walletDbPath, snapshotHeight, networkId
@@ -227,6 +246,13 @@ public struct Voting {
                     print("[Voting] Failed to load wallet notes: \(error)")
                     await send(.initializeFailed(error.localizedDescription))
                 }
+
+            case .activeSessionLoaded(let session):
+                state.activeSession = session
+                state.roundId = session.voteRoundId.hexString
+                state.votingRound = sessionBackedRound(from: session, fallback: state.votingRound)
+                reconcileProposalState(&state)
+                return .none
 
             case .votingWeightLoaded(let weight, let notes):
                 state.votingWeight = weight
@@ -276,10 +302,17 @@ public struct Voting {
             // MARK: - Background ZKP Delegation
 
             case .startDelegationProof:
+                guard let activeSession = state.activeSession else {
+                    return .send(.delegationProofFailed(
+                        VotingFlowError.missingActiveSession.localizedDescription
+                    ))
+                }
                 state.delegationProofStatus = .generating(progress: 0)
-                let roundId = state.roundId
-                let snapshotHeight = state.votingRound.snapshotHeight
+                let roundId = activeSession.voteRoundId.hexString
+                let snapshotHeight = activeSession.snapshotHeight
                 let cachedNotes = state.walletNotes
+                let networkId: UInt32 = zcashSDKEnvironment.network.networkType == .mainnet ? 0 : 1
+                let accountIndex: UInt32 = 0
                 return .merge(
                     // Subscribe to DB state stream (follows SDKSynchronizer pattern)
                     .publisher {
@@ -295,24 +328,38 @@ public struct Voting {
                         // Clear any previous data for this round, then initialize
                         try? await votingCrypto.clearRound(roundId)
                         let params = VotingRoundParams(
-                            voteRoundId: Data(repeating: 0x01, count: 32),
+                            voteRoundId: activeSession.voteRoundId,
                             snapshotHeight: snapshotHeight,
-                            eaPK: Data(repeating: 0xEA, count: 32),
-                            ncRoot: Data(repeating: 0xAA, count: 32),
-                            nullifierIMTRoot: Data(repeating: 0xBB, count: 32)
+                            eaPK: activeSession.eaPK,
+                            ncRoot: activeSession.ncRoot,
+                            nullifierIMTRoot: activeSession.nullifierIMTRoot
                         )
                         try await votingCrypto.initRound(params, nil)
 
                         // Reload hotkey from keychain (generated during initialize)
-                        let phrase = try walletStorage.exportVotingHotkey().seedPhrase.value()
-                        let seed = try mnemonic.toSeed(phrase)
-                        let hotkey = try await votingCrypto.generateHotkey(roundId, seed)
-                        // Mock nk/g_d/pk_d — real derivation comes in a later step
-                        let mockNk = Data(repeating: 0x11, count: 32)
-                        let mockGd = Data(repeating: 0x22, count: 32)
-                        let mockPkd = Data(repeating: 0x33, count: 32)
+                        let senderPhrase = try walletStorage.exportWallet().seedPhrase.value()
+                        let senderSeed = try mnemonic.toSeed(senderPhrase)
+                        let hotkeyPhrase = try walletStorage.exportVotingHotkey().seedPhrase.value()
+                        let hotkeySeed = try mnemonic.toSeed(hotkeyPhrase)
+                        let hotkey = try await votingCrypto.generateHotkey(roundId, hotkeySeed)
+                        let delegationInputs = try await votingCrypto.generateDelegationInputs(
+                            senderSeed,
+                            hotkeySeed,
+                            networkId,
+                            accountIndex
+                        )
+                        guard hotkey.publicKey == delegationInputs.hotkeyPublicKey,
+                              hotkey.address == delegationInputs.hotkeyAddress
+                        else {
+                            throw VotingFlowError.hotkeySeedBindingMismatch
+                        }
                         let action = try await votingCrypto.constructDelegationAction(
-                            roundId, hotkey, cachedNotes, mockNk, mockGd, mockPkd
+                            roundId,
+                            cachedNotes,
+                            delegationInputs.fvkBytes,
+                            delegationInputs.gdNewX,
+                            delegationInputs.pkdNewX,
+                            delegationInputs.hotkeyRawAddress
                         )
                         _ = try await votingCrypto.buildDelegationWitness(
                             roundId, action,
@@ -367,12 +414,15 @@ public struct Voting {
 
             case .confirmVote:
                 guard let pending = state.pendingVote else { return .none }
+                guard let activeSession = state.activeSession else { return .none }
                 state.votes[pending.proposalId] = pending.choice
                 state.pendingVote = nil
 
                 let proposalId = pending.proposalId
                 let choice = pending.choice
                 let roundId = state.roundId
+                let voteRoundId = activeSession.voteRoundId
+                let voteCommTreeAnchorHeight = activeSession.snapshotHeight
                 let votingWeight = state.votingWeight
                 let nextId = nextUnvotedId(after: proposalId, in: state)
 
@@ -401,8 +451,8 @@ public struct Voting {
                             voteCommitment: Data(repeating: 0, count: 32),
                             proposalId: proposalId,
                             proof: proofData,
-                            voteRoundId: Data(repeating: 0, count: 32),
-                            voteCommTreeAnchorHeight: 0
+                            voteRoundId: voteRoundId,
+                            voteCommTreeAnchorHeight: voteCommTreeAnchorHeight
                         )
                         _ = try await votingAPI.submitVoteCommitment(bundle)
                         let payloads = try await votingCrypto.buildSharePayloads(encShares, bundle)
@@ -477,5 +527,42 @@ public struct Voting {
         // Look forward first, then wrap
         return proposals[(currentIndex + 1)...].first { state.votes[$0.id] == nil }?.id
             ?? proposals[..<currentIndex].first { state.votes[$0.id] == nil }?.id
+    }
+
+    private func sessionBackedRound(from session: VotingSession, fallback: VotingRound) -> VotingRound {
+        let proposals = session.proposals.isEmpty ? fallback.proposals : session.proposals
+        return VotingRound(
+            id: session.voteRoundId.hexString,
+            title: fallback.title,
+            description: fallback.description,
+            snapshotHeight: session.snapshotHeight,
+            snapshotDate: fallback.snapshotDate,
+            votingStart: fallback.votingStart,
+            votingEnd: session.voteEndTime,
+            proposals: proposals
+        )
+    }
+
+    private func reconcileProposalState(_ state: inout State) {
+        let validProposalIDs = Set(state.votingRound.proposals.map(\.id))
+        state.votes = state.votes.filter { validProposalIDs.contains($0.key) }
+
+        if let selectedProposalId = state.selectedProposalId,
+           !validProposalIDs.contains(selectedProposalId) {
+            state.selectedProposalId = nil
+        }
+
+        if let pendingVote = state.pendingVote,
+           !validProposalIDs.contains(pendingVote.proposalId) {
+            state.pendingVote = nil
+        }
+
+        if case .proposalDetail(let proposalId) = state.currentScreen,
+           !validProposalIDs.contains(proposalId) {
+            if !state.screenStack.isEmpty {
+                state.screenStack.removeLast()
+            }
+            state.screenStack.append(.proposalList)
+        }
     }
 }

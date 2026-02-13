@@ -192,6 +192,32 @@ public struct VotingHotkey: Equatable, Sendable {
 
 // MARK: - Delegation
 
+/// Inputs needed to construct a delegation action.
+public struct DelegationInputs: Equatable, Sendable {
+    public let fvkBytes: Data
+    public let gdNewX: Data
+    public let pkdNewX: Data
+    public let hotkeyRawAddress: Data
+    public let hotkeyPublicKey: Data
+    public let hotkeyAddress: String
+
+    public init(
+        fvkBytes: Data,
+        gdNewX: Data,
+        pkdNewX: Data,
+        hotkeyRawAddress: Data,
+        hotkeyPublicKey: Data,
+        hotkeyAddress: String
+    ) {
+        self.fvkBytes = fvkBytes
+        self.gdNewX = gdNewX
+        self.pkdNewX = pkdNewX
+        self.hotkeyRawAddress = hotkeyRawAddress
+        self.hotkeyPublicKey = hotkeyPublicKey
+        self.hotkeyAddress = hotkeyAddress
+    }
+}
+
 /// Intermediate client-side type: the built action before proof generation.
 public struct DelegationAction: Equatable, Sendable {
     public let actionBytes: Data
@@ -209,6 +235,16 @@ public struct DelegationAction: Equatable, Sendable {
     public let rhoSigned: Data
     /// Extracted note commitments (cmx) for padded dummy notes.
     public let paddedCmx: [Data]
+    /// Signed note nullifier (32 bytes). Public input to ZKP #1.
+    public let nfSigned: Data
+    /// Output note commitment (32 bytes). Public input to ZKP #1.
+    public let cmxNew: Data
+    /// Spend auth randomizer scalar (32 bytes). Needed for Keystone signing.
+    public let alpha: Data
+    /// Signed note rseed (32 bytes). Needed for witness reconstruction.
+    public let rseedSigned: Data
+    /// Output note rseed (32 bytes). Needed for witness reconstruction.
+    public let rseedOutput: Data
 
     public init(
         actionBytes: Data,
@@ -219,7 +255,12 @@ public struct DelegationAction: Equatable, Sendable {
         govCommRand: Data,
         dummyNullifiers: [Data],
         rhoSigned: Data,
-        paddedCmx: [Data]
+        paddedCmx: [Data],
+        nfSigned: Data,
+        cmxNew: Data,
+        alpha: Data,
+        rseedSigned: Data,
+        rseedOutput: Data
     ) {
         self.actionBytes = actionBytes
         self.rk = rk
@@ -230,6 +271,11 @@ public struct DelegationAction: Equatable, Sendable {
         self.dummyNullifiers = dummyNullifiers
         self.rhoSigned = rhoSigned
         self.paddedCmx = paddedCmx
+        self.nfSigned = nfSigned
+        self.cmxNew = cmxNew
+        self.alpha = alpha
+        self.rseedSigned = rseedSigned
+        self.rseedOutput = rseedOutput
     }
 }
 

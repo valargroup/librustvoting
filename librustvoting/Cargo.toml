@@ -29,7 +29,6 @@ thiserror = "2"
 
 # Zcash / Orchard note reconstruction
 # Uses orchard 0.11 to match the wallet stack (zcash_keys, zcash_client_sqlite).
-# The local orchard/ (v0.12) is for the delegation circuit only.
 subtle = "2.6"
 orchard = "0.11"
 zcash_keys = { version = "0.12", features = ["orchard"] }

@@ -10,7 +10,12 @@ CREATE TABLE rounds (
     gov_comm_rand       BLOB,
     dummy_nullifiers    BLOB,
     rho_signed          BLOB,
-    padded_note_data    BLOB
+    padded_note_data    BLOB,
+    nf_signed           BLOB,
+    cmx_new             BLOB,
+    alpha               BLOB,
+    rseed_signed        BLOB,
+    rseed_output        BLOB
 );
 
 CREATE TABLE cached_tree_state (

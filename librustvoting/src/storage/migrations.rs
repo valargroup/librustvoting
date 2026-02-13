@@ -97,7 +97,7 @@ mod tests {
         // These columns are populated later by store_delegation_data()
         // after construct_delegation_action() computes the VAN.
         conn.execute(
-            "INSERT INTO rounds (round_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at, gov_comm_rand, dummy_nullifiers, rho_signed, padded_note_data) VALUES ('test', 1, X'00', X'00', X'00', 0, 0, X'AA', X'BB', X'CC', X'DD')",
+            "INSERT INTO rounds (round_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at, gov_comm_rand, dummy_nullifiers, rho_signed, padded_note_data, nf_signed, cmx_new, alpha, rseed_signed, rseed_output) VALUES ('test', 1, X'00', X'00', X'00', 0, 0, X'AA', X'BB', X'CC', X'DD', X'EE', X'FF', X'11', X'22', X'33')",
             [],
         ).unwrap();
 
@@ -140,5 +140,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(padded, vec![0xDD]);
+
+        // Verify nf_signed round-trips (signed note nullifier)
+        let nf: Vec<u8> = conn
+            .query_row(
+                "SELECT nf_signed FROM rounds WHERE round_id = 'test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nf, vec![0xEE]);
+
+        // Verify cmx_new round-trips (output note commitment)
+        let cmx: Vec<u8> = conn
+            .query_row(
+                "SELECT cmx_new FROM rounds WHERE round_id = 'test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cmx, vec![0xFF]);
+
+        // Verify alpha round-trips (spend auth randomizer)
+        let alpha: Vec<u8> = conn
+            .query_row(
+                "SELECT alpha FROM rounds WHERE round_id = 'test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alpha, vec![0x11]);
+
+        // Verify rseed_signed round-trips (signed note randomness)
+        let rseed_signed: Vec<u8> = conn
+            .query_row(
+                "SELECT rseed_signed FROM rounds WHERE round_id = 'test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rseed_signed, vec![0x22]);
+
+        // Verify rseed_output round-trips (output note randomness)
+        let rseed_output: Vec<u8> = conn
+            .query_row(
+                "SELECT rseed_output FROM rounds WHERE round_id = 'test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rseed_output, vec![0x33]);
     }
 }
