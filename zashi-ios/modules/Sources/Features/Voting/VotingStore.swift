@@ -16,14 +16,14 @@ import ZcashSDKEnvironment
 
 private enum VotingFlowError: LocalizedError {
     case missingActiveSession
-    case hotkeySeedBindingMismatch
+    case missingVoteCommitmentBundle
 
     var errorDescription: String? {
         switch self {
         case .missingActiveSession:
             return "missing active voting session"
-        case .hotkeySeedBindingMismatch:
-            return "hotkey from generateHotkey does not match delegation input hotkey material"
+        case .missingVoteCommitmentBundle:
+            return "vote commitment build completed without a commitment bundle"
         }
     }
 }
@@ -104,6 +104,12 @@ public struct Voting {
 
         // ZKP #1 (delegation) — runs in background
         public var delegationProofStatus: ProofStatus = .notStarted
+
+        /// Most recent Vote Commitment (VC) bundle built for UI/debug stubs.
+        public var lastVoteCommitmentBundle: VoteCommitmentBundle?
+
+        /// Last tx hash returned by submitVoteCommitment, used for completion/debug UI.
+        public var lastVoteCommitmentTxHash: String?
 
         public var currentScreen: Screen {
             screenStack.last ?? .proposalList
@@ -213,6 +219,8 @@ public struct Voting {
         case castVote(proposalId: UInt32, choice: VoteChoice)
         case confirmVote
         case cancelPendingVote
+        case voteCommitmentBuilt(VoteCommitmentBundle)
+        case voteCommitmentSubmitted(String)
         case advanceAfterVote(nextId: UInt32?)
         case backToList
         case nextProposalDetail
@@ -463,25 +471,13 @@ public struct Voting {
                         let senderSeed = try mnemonic.toSeed(senderPhrase)
                         let hotkeyPhrase = try walletStorage.exportVotingHotkey().seedPhrase.value()
                         let hotkeySeed = try mnemonic.toSeed(hotkeyPhrase)
-                        let hotkey = try await votingCrypto.generateHotkey(roundId, hotkeySeed)
-                        let delegationInputs = try await votingCrypto.generateDelegationInputs(
+                        let action = try await votingCrypto.buildDelegationSignAction(
+                            roundId,
+                            cachedNotes,
                             senderSeed,
                             hotkeySeed,
                             networkId,
                             accountIndex
-                        )
-                        guard hotkey.publicKey == delegationInputs.hotkeyPublicKey,
-                              hotkey.address == delegationInputs.hotkeyAddress
-                        else {
-                            throw VotingFlowError.hotkeySeedBindingMismatch
-                        }
-                        let action = try await votingCrypto.constructDelegationAction(
-                            roundId,
-                            cachedNotes,
-                            delegationInputs.fvkBytes,
-                            delegationInputs.gdNewX,
-                            delegationInputs.pkdNewX,
-                            delegationInputs.hotkeyRawAddress
                         )
                         // Use real Merkle inclusion proofs from verified witnesses
                         _ = try await votingCrypto.buildDelegationWitness(
@@ -545,9 +541,11 @@ public struct Voting {
                 let choice = pending.choice
                 let roundId = state.roundId
                 let voteRoundId = activeSession.voteRoundId
-                let voteCommTreeAnchorHeight = activeSession.snapshotHeight
+                // Placeholder until tree-anchor query is wired in Gov Steps Phase 3 (voting).
+                let voteCommTreeAnchorHeight: UInt64 = 0
                 let votingWeight = state.votingWeight
                 let nextId = nextUnvotedId(after: proposalId, in: state)
+                state.lastVoteCommitmentTxHash = nil
 
                 return .merge(
                     // Submit this vote to chain in background
@@ -560,24 +558,29 @@ public struct Voting {
                         let vanWitness = Data(repeating: 0xDD, count: 64) // mock VAN witness
 
                         // Build vote commitment + ZKP #2 (stored in DB)
-                        var proofData = Data()
+                        var builtBundle: VoteCommitmentBundle?
                         for try await event in votingCrypto.buildVoteCommitment(roundId, proposalId, choice, encShares, vanWitness) {
-                            if case .completed(let proof) = event {
-                                proofData = proof
+                            if case .completed(let bundle) = event {
+                                builtBundle = bundle
+                                await send(.voteCommitmentBuilt(bundle))
                             }
+                        }
+                        guard let builtBundle else {
+                            throw VotingFlowError.missingVoteCommitmentBundle
                         }
 
                         // Submit to chain (API stubs for now)
                         let bundle = VoteCommitmentBundle(
-                            vanNullifier: Data(repeating: 0, count: 32),
-                            voteAuthorityNoteNew: Data(repeating: 0, count: 32),
-                            voteCommitment: Data(repeating: 0, count: 32),
+                            vanNullifier: builtBundle.vanNullifier,
+                            voteAuthorityNoteNew: builtBundle.voteAuthorityNoteNew,
+                            voteCommitment: builtBundle.voteCommitment,
                             proposalId: proposalId,
-                            proof: proofData,
+                            proof: builtBundle.proof,
                             voteRoundId: voteRoundId,
                             voteCommTreeAnchorHeight: voteCommTreeAnchorHeight
                         )
-                        _ = try await votingAPI.submitVoteCommitment(bundle)
+                        let txResult = try await votingAPI.submitVoteCommitment(bundle)
+                        await send(.voteCommitmentSubmitted(txResult.txHash))
                         let payloads = try await votingCrypto.buildSharePayloads(encShares, bundle)
                         try await votingAPI.delegateShares(payloads)
 
@@ -592,6 +595,14 @@ public struct Voting {
                         await send(.advanceAfterVote(nextId: nextId))
                     }
                 )
+
+            case .voteCommitmentBuilt(let bundle):
+                state.lastVoteCommitmentBundle = bundle
+                return .none
+
+            case .voteCommitmentSubmitted(let txHash):
+                state.lastVoteCommitmentTxHash = txHash
+                return .none
 
             case .advanceAfterVote(let nextId):
                 if case .proposalDetail = state.currentScreen {
