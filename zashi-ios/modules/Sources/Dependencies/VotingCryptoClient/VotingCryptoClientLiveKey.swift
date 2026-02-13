@@ -373,8 +373,8 @@ private extension VoteChoice {
     }
 }
 
-private extension Data {
-    var hexString: String {
+public extension Data {
+    public var hexString: String {
         map { String(format: "%02x", $0) }.joined()
     }
 }
