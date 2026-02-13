@@ -22,8 +22,6 @@ fn main() -> Result<()> {
         hex::encode(tree.root().to_repr())
     );
 
-    let root = tree.root();
-
     // ── 2. Load a raw nullifier for testing ────────────────────────────
     let mut stmt = connection.prepare("SELECT nullifier FROM nullifiers LIMIT 1")?;
     let existing_nf: Fp = stmt.query_row([], |r| {
@@ -43,21 +41,19 @@ fn main() -> Result<()> {
         .prove(test_value)
         .expect("BUG: Fp::zero() was not found in any gap range — unexpected");
 
-    let [low, high] = proof.range;
     println!(
         "  Found in range: [0x{}..0x{}]",
-        hex::encode(low.to_repr()),
-        hex::encode(high.to_repr())
+        hex::encode(proof.low.to_repr()),
+        hex::encode(proof.high.to_repr())
     );
-    assert!(test_value >= low && test_value <= high);
+    assert!(test_value >= proof.low && test_value <= proof.high);
     assert!(
-        proof.verify(test_value, root),
+        proof.verify(test_value),
         "Exclusion proof did not verify"
     );
     println!(
-        "  Merkle path verified (position {}, leaf 0x{})",
-        proof.position,
-        hex::encode(proof.leaf.to_repr())
+        "  Merkle path verified (position {})",
+        proof.leaf_pos
     );
     println!("  PASS: Non-inclusion proof SUCCEEDED");
 
@@ -95,10 +91,9 @@ fn main() -> Result<()> {
         .prove(test_value_2)
         .expect("BUG: test value in middle of a gap range was not found");
 
-    let [low2, high2] = proof2.range;
-    assert!(test_value_2 >= low2 && test_value_2 <= high2);
+    assert!(test_value_2 >= proof2.low && test_value_2 <= proof2.high);
     assert!(
-        proof2.verify(test_value_2, root),
+        proof2.verify(test_value_2),
         "Exclusion proof did not verify for range {}",
         mid_range
     );

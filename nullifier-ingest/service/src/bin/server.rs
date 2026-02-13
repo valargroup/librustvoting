@@ -25,18 +25,12 @@ fn fp_hex(fp: &Fp) -> String {
 }
 
 #[derive(Serialize)]
-struct RangeJson {
+struct ImtProofJson {
+    root: String,
     low: String,
     high: String,
-}
-
-#[derive(Serialize)]
-struct ExclusionProofJson {
-    range: RangeJson,
-    position: u32,
-    leaf: String,
-    auth_path: Vec<String>,
-    root: String,
+    leaf_pos: u32,
+    path: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -116,16 +110,12 @@ async fn exclusion_proof(
     // Generate proof
     match state.tree.prove(value) {
         Some(proof) => {
-            let [low, high] = proof.range;
-            let json = ExclusionProofJson {
-                range: RangeJson {
-                    low: fp_hex(&low),
-                    high: fp_hex(&high),
-                },
-                position: proof.position,
-                leaf: fp_hex(&proof.leaf),
-                auth_path: proof.auth_path.iter().map(fp_hex).collect(),
-                root: fp_hex(&state.tree.root()),
+            let json = ImtProofJson {
+                root: fp_hex(&proof.root),
+                low: fp_hex(&proof.low),
+                high: fp_hex(&proof.high),
+                leaf_pos: proof.leaf_pos,
+                path: proof.path.iter().map(fp_hex).collect(),
             };
             (StatusCode::OK, Json(json)).into_response()
         }

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use ff::{Field, PrimeField as _};
-use halo2_gadgets::poseidon::primitives::{self as poseidon, ConstantLength, P128Pow5T3, Spec};
+use halo2_gadgets::poseidon::primitives::{P128Pow5T3, Spec};
 use pasta_curves::Fp;
 use rayon::prelude::*;
 
@@ -44,10 +44,10 @@ pub const TREE_DEPTH: usize = 29;
 /// the tree contains `n + 1` populated leaves. The remaining `2^TREE_DEPTH -
 /// (n + 1)` leaf slots are empty.
 ///
-/// Empty slots are filled with `poseidon_hash(0, 0)` — the commitment of an
+/// Empty slots are filled with `hash(0, 0)` — the commitment of an
 /// empty (low=0, high=0) leaf. At each level of the tree, the empty hash is
 /// computed by self-hashing the level below:
-/// `empty[0] = poseidon_hash(0, 0)`, `empty[i+1] = hash(empty[i], empty[i])`. Any
+/// `empty[0] = hash(0, 0)`, `empty[i+1] = hash(empty[i], empty[i])`. Any
 /// subtree consisting entirely of empty leaves collapses to the empty hash for
 /// that level. Odd-length layers are padded with the empty hash before hashing
 /// up to the next level.
@@ -76,32 +76,13 @@ pub fn build_nf_ranges(nfs: impl IntoIterator<Item = Fp>) -> Vec<Range> {
     ranges
 }
 
-/// Hash two field elements using Poseidon with the P128Pow5T3 spec.
-///
-/// This is the single hash primitive used throughout the tree: leaf
-/// commitments (`hash(low, high)`) and internal node combines
-/// (`hash(left_child, right_child)`) both call this function.
-///
-/// Unlike the previous Sinsemilla-based hash, Poseidon does not use
-/// level-based domain separation — the same function is applied at
-/// every tree level. This is the standard approach for Poseidon
-/// Merkle trees (Semaphore, Tornado Cash, etc.).
-///
-/// **Note**: This convenience wrapper re-initialises the hasher on every call
-/// (including a ~6 KiB heap allocation for round constants). It is fine for
-/// one-off hashes (proofs, tests) but should *not* be used in tight loops.
-/// For bulk hashing see [`PoseidonHasher`].
-pub fn poseidon_hash(left: Fp, right: Fp) -> Fp {
-    poseidon::Hash::<_, P128Pow5T3, ConstantLength<2>, 3, 2>::init().hash([left, right])
-}
-
 /// A reusable Poseidon hasher that avoids per-call initialisation overhead.
 ///
 /// `poseidon::Hash::init()` calls `P128Pow5T3::constants()` every time,
 /// heap-allocating and copying 64 round constants (~6 KiB). During tree
 /// building this adds up to ~128 M unnecessary allocations. `PoseidonHasher`
 /// computes the constants once and implements the permutation inline,
-/// producing identical results to [`poseidon_hash`].
+/// producing identical results to the canonical `poseidon::Hash` API.
 ///
 /// Correctness is verified by `test_poseidon_hasher_equivalence`.
 pub(crate) struct PoseidonHasher {
@@ -124,7 +105,7 @@ impl PoseidonHasher {
         }
     }
 
-    /// Hash two field elements using Poseidon, equivalent to [`poseidon_hash`].
+    /// Hash two field elements using Poseidon.
     ///
     /// For `ConstantLength<2>` with width = 3, rate = 2 the sponge absorbs
     /// both inputs in a single block (no padding), so the hash reduces to:
@@ -205,9 +186,9 @@ pub fn commit_ranges(ranges: &[Range]) -> Vec<Fp> {
 
 /// Pre-compute the empty subtree hash at each tree level.
 ///
-/// `empty[0] = poseidon_hash(0, 0)` — the hash of an empty (low=0, high=0) leaf.
+/// `empty[0] = hash(0, 0)` — the hash of an empty (low=0, high=0) leaf.
 /// `empty[i]` is the hash of a fully-empty subtree of height `i`, computed as
-/// `poseidon_hash(empty[i-1], empty[i-1])`.
+/// `hash(empty[i-1], empty[i-1])`.
 ///
 /// These are used during tree construction and proof generation to represent
 /// the hash of any subtree that contains no populated leaves, avoiding the
@@ -485,20 +466,26 @@ pub struct NullifierTree {
     root: Fp,
 }
 
-/// An exclusion proof demonstrating that a value is not in the nullifier set.
+/// Circuit-compatible IMT non-membership proof data.
 ///
-/// Contains the gap range `[low, high]` that includes the value, the leaf
-/// commitment, and a Merkle authentication path proving the range is
-/// committed in the tree.
-pub struct ExclusionProof {
-    /// The gap range containing the proven value (`low <= value <= high`).
-    pub range: Range,
-    /// Leaf index in the Merkle tree.
-    pub position: u32,
-    /// The leaf commitment `hash(low, high)`.
-    pub leaf: Fp,
-    /// Merkle authentication path (sibling hashes from leaf to root).
-    pub auth_path: Vec<Fp>,
+/// Each field maps directly to a circuit witness:
+///
+/// - `root`: public input, checked against the IMT root in the instance column
+/// - `low`, `high`: witnessed interval bounds, hashed to the leaf commitment
+/// - `leaf_pos`: position bits determine swap ordering at each Merkle level
+/// - `path`: sibling hashes for the 29-level Merkle authentication path
+#[derive(Clone, Debug)]
+pub struct ImtProofData {
+    /// The Merkle root of the IMT.
+    pub root: Fp,
+    /// Interval start (low bound of the bracketing leaf).
+    pub low: Fp,
+    /// Interval end (high bound of the bracketing leaf).
+    pub high: Fp,
+    /// Position of the leaf in the tree.
+    pub leaf_pos: u32,
+    /// Sibling hashes along the 29-level Merkle path (pure siblings).
+    pub path: [Fp; TREE_DEPTH],
 }
 
 impl NullifierTree {
@@ -561,32 +548,36 @@ impl NullifierTree {
         &self.levels[0][..self.ranges.len()]
     }
 
-    /// Generate an exclusion proof for `value`.
+    /// Generate a non-membership proof for `value`.
     ///
     /// Returns `Some(proof)` if `value` falls within a gap range (i.e., is
     /// not a nullifier), or `None` if `value` is an existing nullifier.
     ///
+    /// The returned [`ImtProofData`] can be fed directly to the delegation
+    /// circuit's condition 13 (IMT non-membership verification).
+    ///
     /// This is O([`TREE_DEPTH`]) — it walks the pre-computed levels collecting
     /// sibling hashes rather than rebuilding the entire tree.
-    pub fn prove(&self, value: Fp) -> Option<ExclusionProof> {
+    pub fn prove(&self, value: Fp) -> Option<ImtProofData> {
         let idx = find_range_for_value(&self.ranges, value)?;
-        let mut auth_path = Vec::with_capacity(TREE_DEPTH);
+        let mut path = [Fp::zero(); TREE_DEPTH];
         let mut pos = idx;
         for level in 0..TREE_DEPTH {
             let sibling = pos ^ 1;
-            let hash = if sibling < self.levels[level].len() {
+            path[level] = if sibling < self.levels[level].len() {
                 self.levels[level][sibling]
             } else {
                 self.empty_hashes[level]
             };
-            auth_path.push(hash);
             pos >>= 1;
         }
-        Some(ExclusionProof {
-            range: self.ranges[idx],
-            position: idx as u32,
-            leaf: self.levels[0][idx],
-            auth_path,
+        let [low, high] = self.ranges[idx];
+        Some(ImtProofData {
+            root: self.root,
+            low,
+            high,
+            leaf_pos: idx as u32,
+            path,
         })
     }
 
@@ -613,83 +604,6 @@ impl NullifierTree {
     }
 }
 
-impl ExclusionProof {
-    /// Verify the proof against a known Merkle root.
-    ///
-    /// Checks that `value` is within the gap range and that the
-    /// authentication path recomputes to `root`.
-    pub fn verify(&self, value: Fp, root: Fp) -> bool {
-        let [low, high] = self.range;
-        if value < low || value > high {
-            return false;
-        }
-        // Recompute the leaf commitment
-        let expected_leaf = poseidon_hash(low, high);
-        if self.leaf != expected_leaf {
-            return false;
-        }
-        // Walk the auth path from leaf to root
-        let mut current = self.leaf;
-        let mut pos = self.position;
-        for sibling in self.auth_path.iter() {
-            let (l, r) = if pos & 1 == 0 {
-                (current, *sibling)
-            } else {
-                (*sibling, current)
-            };
-            current = poseidon_hash(l, r);
-            pos >>= 1;
-        }
-        current == root
-    }
-
-    /// Convert this exclusion proof into a circuit-compatible proof structure.
-    ///
-    /// Returns an [`ImtProofData`] that can be fed directly to the delegation
-    /// circuit's condition 13 (IMT non-membership verification).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `auth_path.len() != TREE_DEPTH` (29).
-    pub fn to_imt_proof_data(&self, root: Fp) -> ImtProofData {
-        let path: [Fp; TREE_DEPTH] = self
-            .auth_path
-            .clone()
-            .try_into()
-            .expect("auth_path must have exactly TREE_DEPTH elements");
-        ImtProofData {
-            root,
-            low: self.range[0],
-            high: self.range[1],
-            leaf_pos: self.position,
-            path,
-        }
-    }
-}
-
-/// Circuit-compatible IMT non-membership proof data.
-///
-/// Mirrors the `ImtProofData` struct from the delegation circuit. Each field
-/// maps directly to a circuit witness:
-///
-/// - `root`: public input, checked against the IMT root in the instance column
-/// - `low`, `high`: witnessed interval bounds, hashed to the leaf commitment
-/// - `leaf_pos`: position bits determine swap ordering at each Merkle level
-/// - `path`: sibling hashes for the 29-level Merkle authentication path
-#[derive(Clone, Debug)]
-pub struct ImtProofData {
-    /// The Merkle root of the IMT.
-    pub root: Fp,
-    /// Interval start (low bound of the bracketing leaf).
-    pub low: Fp,
-    /// Interval end (high bound of the bracketing leaf).
-    pub high: Fp,
-    /// Position of the leaf in the tree.
-    pub leaf_pos: u32,
-    /// Sibling hashes along the 29-level Merkle path (pure siblings).
-    pub path: [Fp; TREE_DEPTH],
-}
-
 impl ImtProofData {
     /// Verify this proof out-of-circuit.
     ///
@@ -699,7 +613,8 @@ impl ImtProofData {
         if value < self.low || value > self.high {
             return false;
         }
-        let leaf = poseidon_hash(self.low, self.high);
+        let hasher = PoseidonHasher::new();
+        let leaf = hasher.hash(self.low, self.high);
         let mut current = leaf;
         let mut pos = self.leaf_pos;
         for sibling in self.path.iter() {
@@ -708,7 +623,7 @@ impl ImtProofData {
             } else {
                 (*sibling, current)
             };
-            current = poseidon_hash(l, r);
+            current = hasher.hash(l, r);
             pos >>= 1;
         }
         current == self.root
@@ -736,6 +651,7 @@ pub fn build_sentinel_tree(extra: &[Fp]) -> NullifierTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use halo2_gadgets::poseidon::primitives::{self as poseidon, ConstantLength};
 
     /// Helper: make an Fp from a u64.
     fn fp(v: u64) -> Fp {
@@ -802,15 +718,14 @@ mod tests {
     #[test]
     fn test_merkle_paths_verify_for_each_range() {
         let tree = NullifierTree::build(four_nullifiers());
-        let root = tree.root();
 
         // Verify an exclusion proof for a value in every range
         let test_values = [fp(5), fp(15), fp(25), fp(35), fp(41)];
         for (i, &value) in test_values.iter().enumerate() {
             let proof = tree.prove(value).expect("should produce proof");
-            assert_eq!(proof.position, i as u32);
+            assert_eq!(proof.leaf_pos, i as u32);
             assert!(
-                proof.verify(value, root),
+                proof.verify(value),
                 "exclusion proof for range {} does not verify",
                 i
             );
@@ -820,36 +735,34 @@ mod tests {
     #[test]
     fn test_exclusion_proof_end_to_end() {
         let tree = NullifierTree::build(four_nullifiers());
-        let root = tree.root();
 
         // Prove that 15 is not a nullifier
         let value = fp(15);
         let proof = tree.prove(value).expect("should produce proof");
-        assert_eq!(proof.position, 1); // range [11, 19]
+        assert_eq!(proof.leaf_pos, 1); // range [11, 19]
 
-        let [low, high] = proof.range;
-        assert_eq!(low, fp(11));
-        assert_eq!(high, fp(19));
-        assert!(value >= low && value <= high);
-        assert!(proof.verify(value, root));
+        assert_eq!(proof.low, fp(11));
+        assert_eq!(proof.high, fp(19));
+        assert!(value >= proof.low && value <= proof.high);
+        assert!(proof.verify(value));
     }
 
     #[test]
     fn test_proof_verify_rejects_wrong_value() {
         let tree = NullifierTree::build(four_nullifiers());
-        let root = tree.root();
 
         let proof = tree.prove(fp(15)).unwrap();
-        assert!(!proof.verify(fp(5), root));
-        assert!(!proof.verify(fp(10), root));
+        assert!(!proof.verify(fp(5)));
+        assert!(!proof.verify(fp(10)));
     }
 
     #[test]
     fn test_proof_verify_rejects_wrong_root() {
         let tree = NullifierTree::build(four_nullifiers());
 
-        let proof = tree.prove(fp(15)).unwrap();
-        assert!(!proof.verify(fp(15), Fp::zero()));
+        let mut proof = tree.prove(fp(15)).unwrap();
+        proof.root = Fp::zero();
+        assert!(!proof.verify(fp(15)));
     }
 
     #[test]
@@ -908,7 +821,7 @@ mod tests {
         // Verify proofs still work on the loaded tree
         let value = fp(15);
         let proof = loaded.prove(value).unwrap();
-        assert!(proof.verify(value, loaded.root()));
+        assert!(proof.verify(value));
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -922,12 +835,13 @@ mod tests {
 
     #[test]
     fn test_precompute_empty_hashes_chain() {
+        let hasher = PoseidonHasher::new();
         let empty = precompute_empty_hashes();
 
-        assert_eq!(empty[0], poseidon_hash(Fp::zero(), Fp::zero()));
+        assert_eq!(empty[0], hasher.hash(Fp::zero(), Fp::zero()));
 
         for i in 1..TREE_DEPTH {
-            let expected = poseidon_hash(empty[i - 1], empty[i - 1]);
+            let expected = hasher.hash(empty[i - 1], empty[i - 1]);
             assert_eq!(
                 empty[i], expected,
                 "empty hash mismatch at level {}",
@@ -938,6 +852,7 @@ mod tests {
 
     #[test]
     fn test_build_levels_consistency() {
+        let hasher = PoseidonHasher::new();
         let tree = NullifierTree::build(four_nullifiers());
 
         for i in 0..TREE_DEPTH - 1 {
@@ -945,7 +860,7 @@ mod tests {
             let next = &tree.levels[i + 1];
             let pairs = prev.len() / 2;
             for j in 0..pairs {
-                let expected = poseidon_hash(prev[j * 2], prev[j * 2 + 1]);
+                let expected = hasher.hash(prev[j * 2], prev[j * 2 + 1]);
                 assert_eq!(
                     next[j], expected,
                     "level {} node {} does not match hash of level {} children",
@@ -955,7 +870,7 @@ mod tests {
         }
 
         let top = &tree.levels[TREE_DEPTH - 1];
-        let expected_root = poseidon_hash(top[0], top[1]);
+        let expected_root = hasher.hash(top[0], top[1]);
         assert_eq!(tree.root(), expected_root);
     }
 
@@ -1073,13 +988,12 @@ mod tests {
     #[test]
     fn test_verify_rejects_tampered_auth_path_level_0() {
         let tree = NullifierTree::build(four_nullifiers());
-        let root = tree.root();
         let value = fp(15);
         let mut proof = tree.prove(value).unwrap();
 
-        proof.auth_path[0] = proof.auth_path[0] + Fp::one();
+        proof.path[0] = proof.path[0] + Fp::one();
         assert!(
-            !proof.verify(value, root),
+            !proof.verify(value),
             "tampered auth_path[0] should fail verification"
         );
     }
@@ -1087,62 +1001,59 @@ mod tests {
     #[test]
     fn test_verify_rejects_tampered_auth_path_mid_level() {
         let tree = NullifierTree::build(four_nullifiers());
-        let root = tree.root();
         let value = fp(15);
         let mut proof = tree.prove(value).unwrap();
 
         let mid = TREE_DEPTH / 2;
-        proof.auth_path[mid] = Fp::zero();
+        proof.path[mid] = Fp::zero();
         assert!(
-            !proof.verify(value, root),
+            !proof.verify(value),
             "tampered auth_path[{}] should fail verification",
             mid
         );
     }
 
     #[test]
-    fn test_verify_rejects_tampered_leaf() {
+    fn test_verify_rejects_tampered_low() {
         let tree = NullifierTree::build(four_nullifiers());
-        let root = tree.root();
         let value = fp(15);
         let mut proof = tree.prove(value).unwrap();
 
-        proof.leaf = Fp::from(999u64);
+        proof.low = Fp::from(999u64);
         assert!(
-            !proof.verify(value, root),
-            "tampered leaf commitment should fail verification"
+            !proof.verify(value),
+            "tampered low bound should fail verification"
         );
     }
 
     #[test]
     fn test_verify_rejects_tampered_position() {
         let tree = NullifierTree::build(four_nullifiers());
-        let root = tree.root();
         let value = fp(15);
         let mut proof = tree.prove(value).unwrap();
-        assert_eq!(proof.position, 1);
+        assert_eq!(proof.leaf_pos, 1);
 
-        proof.position = 0;
-        assert!(!proof.verify(value, root), "position 0 (wrong) should fail");
+        proof.leaf_pos = 0;
+        assert!(!proof.verify(value), "position 0 (wrong) should fail");
 
-        proof.position = 2;
-        assert!(!proof.verify(value, root), "position 2 (wrong) should fail");
+        proof.leaf_pos = 2;
+        assert!(!proof.verify(value), "position 2 (wrong) should fail");
 
-        proof.position = u32::MAX;
-        assert!(!proof.verify(value, root), "position MAX (wrong) should fail");
+        proof.leaf_pos = u32::MAX;
+        assert!(!proof.verify(value), "position MAX (wrong) should fail");
     }
 
     #[test]
     fn test_verify_rejects_swapped_range_bounds() {
         let tree = NullifierTree::build(four_nullifiers());
-        let root = tree.root();
         let value = fp(15);
         let mut proof = tree.prove(value).unwrap();
 
-        let [low, high] = proof.range;
-        proof.range = [high, low];
+        let (low, high) = (proof.low, proof.high);
+        proof.low = high;
+        proof.high = low;
         assert!(
-            !proof.verify(value, root),
+            !proof.verify(value),
             "swapped range bounds should fail verification"
         );
     }
@@ -1159,15 +1070,13 @@ mod tests {
         assert_eq!(ranges[1][0], fp(101));
         assert_eq!(ranges[1][1], Fp::one().neg());
 
-        let root = tree.root();
-
         let proof_low = tree.prove(fp(50)).unwrap();
-        assert_eq!(proof_low.position, 0);
-        assert!(proof_low.verify(fp(50), root));
+        assert_eq!(proof_low.leaf_pos, 0);
+        assert!(proof_low.verify(fp(50)));
 
         let proof_high = tree.prove(fp(200)).unwrap();
-        assert_eq!(proof_high.position, 1);
-        assert!(proof_high.verify(fp(200), root));
+        assert_eq!(proof_high.leaf_pos, 1);
+        assert!(proof_high.verify(fp(200)));
 
         assert!(tree.prove(fp(100)).is_none());
     }
@@ -1180,10 +1089,8 @@ mod tests {
         assert_eq!(tree.ranges()[0], [fp(0), fp(4)]);
         assert_eq!(tree.ranges()[1][0], fp(8));
 
-        let root = tree.root();
-
-        assert!(tree.prove(fp(2)).unwrap().verify(fp(2), root));
-        assert!(tree.prove(fp(100)).unwrap().verify(fp(100), root));
+        assert!(tree.prove(fp(2)).unwrap().verify(fp(2)));
+        assert!(tree.prove(fp(100)).unwrap().verify(fp(100)));
 
         for nf in [5u64, 6, 7] {
             assert!(tree.prove(fp(nf)).is_none(), "nullifier {} should have no proof", nf);
@@ -1198,9 +1105,8 @@ mod tests {
         assert_eq!(tree.ranges()[0], [fp(0), fp(4)]);
         assert_eq!(tree.ranges()[1][0], fp(7));
 
-        let root = tree.root();
-        assert!(tree.prove(fp(4)).unwrap().verify(fp(4), root));
-        assert!(tree.prove(fp(7)).unwrap().verify(fp(7), root));
+        assert!(tree.prove(fp(4)).unwrap().verify(fp(4)));
+        assert!(tree.prove(fp(7)).unwrap().verify(fp(7)));
         assert!(tree.prove(fp(5)).is_none());
         assert!(tree.prove(fp(6)).is_none());
     }
@@ -1212,10 +1118,9 @@ mod tests {
         assert_eq!(tree.ranges()[0][0], fp(1));
         assert_eq!(tree.ranges()[0][1], Fp::one().neg());
 
-        let root = tree.root();
         assert!(tree.prove(Fp::zero()).is_none());
-        assert!(tree.prove(fp(1)).unwrap().verify(fp(1), root));
-        assert!(tree.prove(fp(1000)).unwrap().verify(fp(1000), root));
+        assert!(tree.prove(fp(1)).unwrap().verify(fp(1)));
+        assert!(tree.prove(fp(1000)).unwrap().verify(fp(1000)));
     }
 
     #[test]
@@ -1224,10 +1129,9 @@ mod tests {
         assert_eq!(tree.len(), 1);
         assert_eq!(tree.ranges()[0][0], fp(2));
 
-        let root = tree.root();
         assert!(tree.prove(Fp::zero()).is_none());
         assert!(tree.prove(fp(1)).is_none());
-        assert!(tree.prove(fp(2)).unwrap().verify(fp(2), root));
+        assert!(tree.prove(fp(2)).unwrap().verify(fp(2)));
     }
 
     #[test]
@@ -1237,15 +1141,13 @@ mod tests {
 
         assert_eq!(tree.len(), 201);
 
-        let root = tree.root();
-
         let test_indices = [0usize, 1, 50, 100, 150, 199, 200];
         for &idx in &test_indices {
             let range = tree.ranges()[idx];
             let value = range[0];
             let proof = tree.prove(value).unwrap();
-            assert_eq!(proof.position, idx as u32);
-            assert!(proof.verify(value, root), "proof at leaf index {} does not verify", idx);
+            assert_eq!(proof.leaf_pos, idx as u32);
+            assert!(proof.verify(value), "proof at leaf index {} does not verify", idx);
         }
 
         for nf in &nullifiers {
@@ -1301,36 +1203,28 @@ mod tests {
         }
 
         let proof = tree.prove(fp(43)).unwrap();
-        assert!(proof.verify(fp(43), tree.root()));
+        assert!(proof.verify(fp(43)));
     }
 
     #[test]
-    fn test_imt_proof_data_round_trip() {
+    fn test_proof_fields_match_tree() {
         let tree = build_sentinel_tree(&[fp(42), fp(100)]);
         let value = fp(50);
 
         let proof = tree.prove(value).expect("value should be in a gap");
-        assert!(proof.verify(value, tree.root()));
-
-        let imt = proof.to_imt_proof_data(tree.root());
-        assert_eq!(imt.root, tree.root());
-        assert_eq!(imt.low, proof.range[0]);
-        assert_eq!(imt.high, proof.range[1]);
-        assert_eq!(imt.leaf_pos, proof.position);
-        assert_eq!(imt.path.len(), TREE_DEPTH);
-
-        assert!(imt.verify(value), "ImtProofData should verify the same value");
+        assert_eq!(proof.root, tree.root());
+        assert_eq!(proof.path.len(), TREE_DEPTH);
+        assert!(proof.verify(value));
     }
 
     #[test]
-    fn test_imt_proof_data_rejects_wrong_value() {
+    fn test_proof_rejects_wrong_value() {
         let tree = build_sentinel_tree(&[fp(42), fp(100)]);
         let value = fp(50);
         let proof = tree.prove(value).expect("value should be in a gap");
-        let imt = proof.to_imt_proof_data(tree.root());
 
-        assert!(!imt.verify(fp(42)), "nullifier should not verify");
-        assert!(!imt.verify(fp(100)), "nullifier should not verify");
+        assert!(!proof.verify(fp(42)), "nullifier should not verify");
+        assert!(!proof.verify(fp(100)), "nullifier should not verify");
     }
 
     #[test]
@@ -1342,14 +1236,8 @@ mod tests {
         assert!(tree.prove(test_value).is_some(), "test value should be in a gap range");
 
         let proof = tree.prove(test_value).unwrap();
-
-        assert!(proof.verify(test_value, tree.root()));
-
-        let imt = proof.to_imt_proof_data(tree.root());
-        assert!(imt.verify(test_value));
-
-        assert_eq!(imt.path.len(), TREE_DEPTH);
-        assert_eq!(proof.auth_path.len(), TREE_DEPTH);
+        assert!(proof.verify(test_value));
+        assert_eq!(proof.path.len(), TREE_DEPTH);
 
         let tree2 = build_sentinel_tree(&extra_nfs);
         assert_eq!(tree.root(), tree2.root());
@@ -1357,34 +1245,39 @@ mod tests {
 
     #[test]
     fn test_empty_hashes_match_circuit_convention() {
+        let hasher = PoseidonHasher::new();
         let empty = precompute_empty_hashes();
-        let expected_leaf = poseidon_hash(Fp::zero(), Fp::zero());
+        let expected_leaf = hasher.hash(Fp::zero(), Fp::zero());
         assert_eq!(empty[0], expected_leaf);
 
         for i in 1..TREE_DEPTH {
-            assert_eq!(empty[i], poseidon_hash(empty[i - 1], empty[i - 1]));
+            assert_eq!(empty[i], hasher.hash(empty[i - 1], empty[i - 1]));
         }
     }
 
     #[test]
     fn test_poseidon_hasher_equivalence() {
+        // Compare PoseidonHasher against the canonical poseidon::Hash implementation.
         let hasher = PoseidonHasher::new();
+        let canonical = |l: Fp, r: Fp| -> Fp {
+            poseidon::Hash::<_, P128Pow5T3, ConstantLength<2>, 3, 2>::init().hash([l, r])
+        };
 
         assert_eq!(
             hasher.hash(Fp::zero(), Fp::zero()),
-            poseidon_hash(Fp::zero(), Fp::zero()),
+            canonical(Fp::zero(), Fp::zero()),
         );
 
-        assert_eq!(hasher.hash(fp(1), fp(2)), poseidon_hash(fp(1), fp(2)));
-        assert_eq!(hasher.hash(fp(42), fp(0)), poseidon_hash(fp(42), fp(0)));
+        assert_eq!(hasher.hash(fp(1), fp(2)), canonical(fp(1), fp(2)));
+        assert_eq!(hasher.hash(fp(42), fp(0)), canonical(fp(42), fp(0)));
 
         let a = fp(0xDEAD_BEEF);
         let b = fp(0xCAFE_BABE);
-        assert_eq!(hasher.hash(a, b), poseidon_hash(a, b));
+        assert_eq!(hasher.hash(a, b), canonical(a, b));
 
         assert_eq!(
             hasher.hash(Fp::one().neg(), Fp::one()),
-            poseidon_hash(Fp::one().neg(), Fp::one()),
+            canonical(Fp::one().neg(), Fp::one()),
         );
     }
 }

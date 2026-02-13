@@ -38,13 +38,12 @@ impl ImtProvider for NullifierTreeAdapter<'_> {
 
     fn non_membership_proof(&self, nf: pallas::Base) -> OrchardImtProofData {
         let proof = self.0.prove(nf).expect("nullifier should be in a gap range");
-        let data = proof.to_imt_proof_data(self.0.root());
         OrchardImtProofData {
-            root: data.root,
-            low: data.low,
-            high: data.high,
-            leaf_pos: data.leaf_pos,
-            path: data.path,
+            root: proof.root,
+            low: proof.low,
+            high: proof.high,
+            leaf_pos: proof.leaf_pos,
+            path: proof.path,
         }
     }
 }
