@@ -126,6 +126,39 @@ extension VotingCryptoClient: DependencyKey {
                     )
                 }
             },
+            generateNoteWitnesses: { roundId, walletDbPath, notes in
+                let db = try await dbActor.database()
+                let ffiNotes = notes.map {
+                    ZcashVotingFFI.NoteInfo(
+                        commitment: $0.commitment,
+                        nullifier: $0.nullifier,
+                        value: $0.value,
+                        position: $0.position
+                    )
+                }
+                let ffiWitnesses = try db.generateNoteWitnesses(
+                    roundId: roundId,
+                    walletDbPath: walletDbPath,
+                    notes: ffiNotes
+                )
+                return ffiWitnesses.map {
+                    WitnessData(
+                        noteCommitment: $0.noteCommitment,
+                        position: $0.position,
+                        root: $0.root,
+                        authPath: $0.authPath
+                    )
+                }
+            },
+            verifyWitness: { witness in
+                let ffiWitness = ZcashVotingFFI.WitnessData(
+                    noteCommitment: witness.noteCommitment,
+                    position: witness.position,
+                    root: witness.root,
+                    authPath: witness.authPath
+                )
+                return try ZcashVotingFFI.verifyWitness(witness: ffiWitness)
+            },
             generateHotkey: { roundId, seed in
                 let db = try await dbActor.database()
                 let hotkey = try db.generateHotkey(roundId: roundId, seed: Data(seed))

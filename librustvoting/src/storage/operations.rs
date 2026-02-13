@@ -2,7 +2,7 @@ use crate::storage::queries;
 use crate::storage::{RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb};
 use crate::types::{
     DelegationAction, EncryptedShare, NoteInfo, ProofProgressReporter, ProofResult, SharePayload,
-    VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
+    VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams, WitnessData,
 };
 
 impl VotingDb {
@@ -120,6 +120,59 @@ impl VotingDb {
         let conn = self.conn();
         let params = queries::load_round_params(&conn, round_id)?;
         queries::store_tree_state(&conn, round_id, params.snapshot_height, tree_state)
+    }
+
+    /// Generate Merkle inclusion witnesses for notes in a round.
+    /// Uses cached tree state + wallet DB shard data to build witnesses.
+    /// Results are cached in the witnesses table — subsequent calls return cached data.
+    ///
+    /// Must be called after store_tree_state and before build_delegation_witness.
+    pub fn generate_note_witnesses(
+        &self,
+        round_id: &str,
+        wallet_db_path: &str,
+        notes: &[NoteInfo],
+    ) -> Result<Vec<WitnessData>, VotingError> {
+        let conn = self.conn();
+
+        // Return cached witnesses if available
+        if queries::has_witnesses(&conn, round_id)? {
+            return queries::load_witnesses(&conn, round_id);
+        }
+
+        // Load cached tree state (must have been stored via store_tree_state)
+        let tree_state_bytes = queries::load_tree_state(&conn, round_id)?;
+        let params = queries::load_round_params(&conn, round_id)?;
+
+        let positions: Vec<u64> = notes.iter().map(|n| n.position).collect();
+        let commitments: Vec<Vec<u8>> = notes.iter().map(|n| n.commitment.clone()).collect();
+
+        // Generate witnesses from wallet DB + frontier
+        let witnesses = crate::witness::generate_note_witnesses(
+            wallet_db_path,
+            &positions,
+            &commitments,
+            params.snapshot_height,
+            &tree_state_bytes,
+        )?;
+
+        // Verify each witness before caching
+        for w in &witnesses {
+            let valid = crate::witness::verify_witness(w)?;
+            if !valid {
+                return Err(VotingError::Internal {
+                    message: format!(
+                        "witness verification failed for position {} (internal bug)",
+                        w.position
+                    ),
+                });
+            }
+        }
+
+        // Cache results
+        queries::store_witnesses(&conn, round_id, &witnesses)?;
+
+        Ok(witnesses)
     }
 
     // --- Phase 2: Delegation proof ---

@@ -555,6 +555,13 @@ public protocol VotingDatabaseProtocol: AnyObject, Sendable {
 
     func generateHotkey(roundId: String, seed: Data) throws  -> VotingHotkey
 
+    /**
+     * Generate Merkle inclusion witnesses for notes in a round.
+     * Requires store_tree_state to have been called first.
+     * Results are cached — subsequent calls return cached data.
+     */
+    func generateNoteWitnesses(roundId: String, walletDbPath: String, notes: [NoteInfo]) throws  -> [WitnessData]
+
     func getRoundState(roundId: String) throws  -> RoundState
 
     func getVotes(roundId: String) throws  -> [VoteRecord]
@@ -706,6 +713,21 @@ open func generateHotkey(roundId: String, seed: Data)throws  -> VotingHotkey  {
     uniffi_zcash_voting_ffi_fn_method_votingdatabase_generate_hotkey(self.uniffiClonePointer(),
         FfiConverterString.lower(roundId),
         FfiConverterData.lower(seed),$0
+    )
+})
+}
+
+    /**
+     * Generate Merkle inclusion witnesses for notes in a round.
+     * Requires store_tree_state to have been called first.
+     * Results are cached — subsequent calls return cached data.
+     */
+open func generateNoteWitnesses(roundId: String, walletDbPath: String, notes: [NoteInfo])throws  -> [WitnessData]  {
+    return try  FfiConverterSequenceTypeWitnessData.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
+    uniffi_zcash_voting_ffi_fn_method_votingdatabase_generate_note_witnesses(self.uniffiClonePointer(),
+        FfiConverterString.lower(roundId),
+        FfiConverterString.lower(walletDbPath),
+        FfiConverterSequenceTypeNoteInfo.lower(notes),$0
     )
 })
 }
@@ -2587,6 +2609,31 @@ fileprivate struct FfiConverterSequenceTypeVoteRecord: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeWitnessData: FfiConverterRustBuffer {
+    typealias SwiftType = [WitnessData]
+
+    public static func write(_ value: [WitnessData], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeWitnessData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [WitnessData] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [WitnessData]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeWitnessData.read(from: &buf))
+        }
+        return seq
+    }
+}
 public func buildDelegationWitness(action: DelegationAction, inclusionProofs: [Data], exclusionProofs: [Data])throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_func_build_delegation_witness(
@@ -2674,6 +2721,13 @@ public func generateNoteWitness(notePosition: UInt64, snapshotHeight: UInt32, tr
     )
 })
 }
+public func verifyWitness(witness: WitnessData)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
+    uniffi_zcash_voting_ffi_fn_func_verify_witness(
+        FfiConverterTypeWitnessData_lower(witness),$0
+    )
+})
+}
 public func votingFfiVersion() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_zcash_voting_ffi_fn_func_voting_ffi_version($0
@@ -2726,6 +2780,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_func_generate_note_witness() != 45780) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_zcash_voting_ffi_checksum_func_verify_witness() != 40865) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_zcash_voting_ffi_checksum_func_voting_ffi_version() != 33187) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2751,6 +2808,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_generate_hotkey() != 38599) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_generate_note_witnesses() != 50700) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_get_round_state() != 4975) {

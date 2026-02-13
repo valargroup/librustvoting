@@ -404,6 +404,17 @@ impl From<voting::WitnessData> for WitnessData {
     }
 }
 
+impl From<WitnessData> for voting::WitnessData {
+    fn from(w: WitnessData) -> Self {
+        Self {
+            note_commitment: w.note_commitment,
+            position: w.position,
+            root: w.root,
+            auth_path: w.auth_path,
+        }
+    }
+}
+
 // =============================================================================
 // VotingDatabase — stateful UniFFI Object (new API)
 // =============================================================================
@@ -511,6 +522,22 @@ impl VotingDatabase {
         tree_state_bytes: Vec<u8>,
     ) -> Result<(), VotingError> {
         Ok(self.db.store_tree_state(&round_id, &tree_state_bytes)?)
+    }
+
+    /// Generate Merkle inclusion witnesses for notes in a round.
+    /// Requires store_tree_state to have been called first.
+    /// Results are cached — subsequent calls return cached data.
+    pub fn generate_note_witnesses(
+        &self,
+        round_id: String,
+        wallet_db_path: String,
+        notes: Vec<NoteInfo>,
+    ) -> Result<Vec<WitnessData>, VotingError> {
+        let core_notes: Vec<voting::NoteInfo> = notes.into_iter().map(Into::into).collect();
+        Ok(self.db.generate_note_witnesses(&round_id, &wallet_db_path, &core_notes)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     // --- Phase 2: Delegation proof ---
@@ -761,6 +788,11 @@ pub fn generate_note_witness(
         voting::witness::generate_note_witness(note_position, snapshot_height, &tree_state_bytes)?
             .into(),
     )
+}
+
+#[uniffi::export]
+pub fn verify_witness(witness: WitnessData) -> Result<bool, VotingError> {
+    Ok(voting::witness::verify_witness(&witness.into())?)
 }
 
 #[uniffi::export]

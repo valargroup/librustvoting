@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
     let version: u32 = conn
@@ -17,6 +17,35 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
                 message: format!("migration 001_init failed: {}", e),
             })?;
         conn.pragma_update(None, "user_version", 1)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to update database version: {}", e),
+            })?;
+    }
+
+    if version < 2 {
+        // Add tables for witness caching that were added to 001_init.sql
+        // after some DBs had already been created at version 1.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cached_tree_state (
+                round_id        TEXT PRIMARY KEY REFERENCES rounds(round_id),
+                snapshot_height INTEGER NOT NULL,
+                tree_state      BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS witnesses (
+                round_id        TEXT NOT NULL,
+                note_position   INTEGER NOT NULL,
+                note_commitment BLOB NOT NULL,
+                root            BLOB NOT NULL,
+                auth_path       BLOB NOT NULL,
+                created_at      INTEGER NOT NULL,
+                PRIMARY KEY (round_id, note_position),
+                FOREIGN KEY (round_id) REFERENCES rounds(round_id)
+            );",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("migration to version 2 failed: {}", e),
+        })?;
+        conn.pragma_update(None, "user_version", 2)
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to update database version: {}", e),
             })?;

@@ -31,6 +31,14 @@ public struct VotingCryptoClient {
         _ networkId: UInt32
     ) async throws -> [NoteInfo]
 
+    // --- Witness generation & verification ---
+    public var generateNoteWitnesses: @Sendable (
+        _ roundId: String,
+        _ walletDbPath: String,
+        _ notes: [NoteInfo]
+    ) async throws -> [WitnessData]
+    public var verifyWitness: @Sendable (_ witness: WitnessData) async throws -> Bool
+
     // --- Crypto operations ---
     public var generateHotkey: @Sendable (_ roundId: String, _ seed: [UInt8]) async throws -> VotingHotkey
     /// High-level boundary for sign-action generation:

@@ -420,6 +420,22 @@ public struct NoteInfo: Equatable, Sendable {
     }
 }
 
+// MARK: - Witnesses
+
+public struct WitnessData: Equatable, Sendable {
+    public let noteCommitment: Data
+    public let position: UInt64
+    public let root: Data
+    public let authPath: [Data]
+
+    public init(noteCommitment: Data, position: UInt64, root: Data, authPath: [Data]) {
+        self.noteCommitment = noteCommitment
+        self.position = position
+        self.root = root
+        self.authPath = authPath
+    }
+}
+
 // MARK: - Proof Events
 
 public enum ProofEvent: Equatable, Sendable {
