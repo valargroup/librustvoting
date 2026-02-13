@@ -17,7 +17,6 @@
 //! - **Condition 13** (×4): IMT non-membership.
 //! - **Condition 14** (×4): Governance nullifier publication.
 //! - **Condition 15** (×4): Padded-note zero-value enforcement.
-//! - **Condition 16**: Gov null pairwise distinctness.
 
 use alloc::vec::Vec;
 use ff::Field;
@@ -223,10 +222,6 @@ pub struct Config {
     // Proves low <= real_nf <= high by constraining x and x_shifted
     // values that are then range-checked to [0, 2^250).
     q_interval: Selector,
-    // Gov null pairwise distinctness gate selector (condition 16).
-    // For each of the 6 pairs (i,j), constrains (gov_null_i - gov_null_j) * inv = 1,
-    // which is unsatisfiable when two gov nullifiers are equal.
-    q_gov_null_distinct: Selector,
 }
 
 impl Config {
@@ -419,6 +414,9 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         ];
 
         // Per-note custom gates (conditions 10, 13, 15).
+        // q_per_note is a selector that activates these constraints only on rows
+        // where note data is assigned. Each of the (up to 4) input notes gets one
+        // such row; on all other rows the selector is 0 and the gate is inactive.
         let q_per_note = meta.selector();
         meta.create_gate("Per-note checks", |meta| {
             let q_per_note = meta.query_selector(q_per_note);
@@ -664,7 +662,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             q_per_note,
             q_imt_swap,
             q_interval,
-            q_gov_null_distinct,
         }
     }
 
@@ -1031,59 +1028,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             cmx_cells.push(cmx_i);
             v_cells.push(v_i);
             gov_null_cells.push(gov_null_i);
-        }
-
-        // ---------------------------------------------------------------
-        // Condition 16: Gov null pairwise distinctness.
-        // ---------------------------------------------------------------
-
-        // Prevents double-delegation: no two note slots may produce the same
-        // governance nullifier. We check all 6 pairs of the 4 gov nullifiers.
-        //
-        // For each pair (i, j), we place gov_null_i, gov_null_j, and a witness
-        // inv = 1/(gov_null_i - gov_null_j) into the same row. The gate constrains
-        // (a - b) * inv = 1, which is only satisfiable when a != b (no field
-        // element has a multiplicative inverse of zero).
-        {
-            const PAIRS: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
-
-            layouter.assign_region(
-                || "gov null distinctness",
-                |mut region| {
-                    for (row, &(i, j)) in PAIRS.iter().enumerate() {
-                        config.q_gov_null_distinct.enable(&mut region, row)?;
-
-                        // Copy the two gov nullifiers from their note slots.
-                        gov_null_cells[i].copy_advice(
-                            || format!("gov_null_{i}"),
-                            &mut region,
-                            config.advices[0],
-                            row,
-                        )?;
-                        gov_null_cells[j].copy_advice(
-                            || format!("gov_null_{j}"),
-                            &mut region,
-                            config.advices[1],
-                            row,
-                        )?;
-
-                        // Witness the inverse of their difference.
-                        region.assign_advice(
-                            || format!("inv_{i}_{j}"),
-                            config.advices[2],
-                            row,
-                            || {
-                                gov_null_cells[i]
-                                    .value()
-                                    .copied()
-                                    .zip(gov_null_cells[j].value().copied())
-                                    .map(|(a, b)| (a - b).invert().unwrap_or(pallas::Base::zero()))
-                            },
-                        )?;
-                    }
-                    Ok(())
-                },
-            )?;
         }
 
         // ---------------------------------------------------------------

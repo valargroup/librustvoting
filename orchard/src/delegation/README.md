@@ -358,40 +358,6 @@ For real notes (`is_note_real = 1`), the constraint is trivially satisfied and `
 
 **Constructions:** `q_per_note`.
 
-## 16. Gov Null Pairwise Distinctness
-
-Purpose: prevent a malicious prover from placing the same note in multiple slots to inflate `v_total`. If the same note occupies two slots, both produce the same `gov_null`. This gate rejects such proofs in-circuit, removing the dependency on the verifier performing pairwise uniqueness checks on the public `gov_null` outputs.
-
-```
-For each pair (i, j) where i < j:
-  (gov_null_i - gov_null_j) * inv_ij = 1
-```
-
-Where `inv_ij` is a witness computed by the prover as `(gov_null_i - gov_null_j)^{-1}`. If `gov_null_i = gov_null_j`, no valid inverse exists and the proof fails.
-
-Gate layout: a single region with 6 rows (one per pair from C(4,2) = 6), each using 3 advice columns.
-
-**Constructions:** `q_gov_null_distinct`.
-
-## Chip Reuse Chart
-
-| Chip / Gadget                     | Source             | Conditions               |
-| --------------------------------- | ------------------ | ------------------------ |
-| EccChip                           | halo2_gadgets      | 1, 2, 4, 5, 6, 9, 11, 12 |
-| PoseidonChip                      | halo2_gadgets      | 2, 3, 7, 12, 13, 14      |
-| SinsemillaChip (config 1)         | halo2_gadgets      | 1, 5, 9, 10              |
-| SinsemillaChip (config 2)         | halo2_gadgets      | 6, 10                    |
-| MerkleChip (configs 1+2)          | halo2_gadgets      | 10                       |
-| LookupRangeCheckConfig            | halo2_gadgets      | 8, 13                    |
-| CommitIvkChip                     | orchard circuit    | 5                        |
-| NoteCommitChip (signed)           | orchard circuit    | 1, 9                     |
-| NoteCommitChip (new)              | orchard circuit    | 6                        |
-| AddChip                           | orchard circuit    | 2, 7, 8, 12              |
-| q_per_note (custom gate)          | delegation circuit | 10, 13, 15               |
-| q_imt_swap (custom gate)          | delegation circuit | 13                       |
-| q_interval (custom gate)          | delegation circuit | 13                       |
-| q_gov_null_distinct (custom gate) | delegation circuit | 16                       |
-
 ## FAQ
 
 - **"Why is cm_signed witnessed as a Point but ak_P as a NonIdentityPoint?"** — ak_P being identity would be a degenerate key (any signature verifies). cm_signed being identity is cryptographically negligible and caught by the equality constraint with the recomputed commitment.
