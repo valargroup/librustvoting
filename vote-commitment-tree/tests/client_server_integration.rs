@@ -565,8 +565,8 @@ fn merkle_path_serialization_roundtrip() {
     let path = server.path(1, 1).unwrap();
     let bytes = path.to_bytes();
 
-    // Expected size: 4 (position) + 32 * 32 (auth_path) = 1028 bytes.
-    assert_eq!(bytes.len(), 4 + 32 * 32);
+    // Expected size: 4 (position) + 32 * TREE_DEPTH (auth_path).
+    assert_eq!(bytes.len(), 4 + 32 * vote_commitment_tree::TREE_DEPTH);
 
     let restored = MerklePath::from_bytes(&bytes).expect("deserialization must succeed");
     assert_eq!(restored.position(), path.position());

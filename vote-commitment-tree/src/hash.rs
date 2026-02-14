@@ -11,8 +11,14 @@ use pasta_curves::Fp;
 
 use crate::poseidon_hash;
 
-/// Fixed depth of the Vote Commitment Tree (2^32 leaf capacity).
-pub const TREE_DEPTH: usize = 32;
+/// Fixed depth of the Vote Commitment Tree (2^24 ≈ 16.7M leaf capacity).
+///
+/// Reduced from Zcash's depth 32 (~4.3B) because governance voting produces
+/// far fewer leaves than a full shielded pool. Each voter generates 1 leaf per
+/// delegation + 2 per vote, so even 10K voters × 50 proposals = ~1M leaves per
+/// round — well within 2^24. This saves 8 Poseidon hashes per ZKP proof
+/// (~2,000 fewer constraints) and shrinks Merkle paths from 1,028 to 772 bytes.
+pub const TREE_DEPTH: usize = 24;
 
 /// Shard height for the underlying `ShardTree` (each shard covers 2^4 = 16 leaves).
 pub(crate) const SHARD_HEIGHT: u8 = 4;

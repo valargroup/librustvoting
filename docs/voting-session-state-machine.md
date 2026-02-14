@@ -123,7 +123,7 @@ Three independent nullifier sets per voting round prevent double-spending at eac
 
 ## Vote Commitment Tree
 
-An append-only Poseidon Merkle tree (depth 32) shared by Vote Authority Notes (VANs) and Vote Commitments (VCs), with domain separation:
+An append-only Poseidon Merkle tree (depth 24, capacity 2^24 ≈ 16.7M leaves) shared by Vote Authority Notes (VANs) and Vote Commitments (VCs), with domain separation:
 
 - `DOMAIN_VAN = 0` — prepended to VAN leaf preimage
 - `DOMAIN_VC = 1` — prepended to VC leaf preimage

@@ -180,7 +180,7 @@ This is the same optimization Zcash's lightwalletd uses for wallet fast-sync (`p
 The tree has `SHARD_HEIGHT = 4`, so each shard covers `2^4 = 16` leaves. Once a shard is full (all 16 leaf positions filled), its root hash is deterministic and never changes (append-only tree). The server can pre-compute and cache these.
 
 ```
-Tree depth 32, shard height 4:
+Tree depth 24, shard height 4:
   - Shard 0: leaves [0..15]   -> subtree_root_0
   - Shard 1: leaves [16..31]  -> subtree_root_1
   - Shard N: leaves [16N..16N+15] -> subtree_root_N

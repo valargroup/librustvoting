@@ -62,7 +62,7 @@ enum Command {
         #[arg(long)]
         leaf: String,
 
-        /// Merkle path as hex (1028 bytes = 2056 hex chars).
+        /// Merkle path as hex (MERKLE_PATH_BYTES bytes).
         #[arg(long)]
         witness: String,
 

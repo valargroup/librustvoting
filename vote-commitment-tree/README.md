@@ -22,7 +22,7 @@ Append-only Poseidon Merkle tree for the **Vote Commitment Tree** in the Zally v
 ## Role in the protocol
 
 - **Note commitment tree (ZCash mainnet)**: We only use its root `nc_root` at snapshot height as an anchor for ZKP #1. We do not build it in this repo.
-- **Vote Commitment Tree (vote chain)**: This crate implements the tree that the vote chain maintains. It is an append-only Merkle tree of fixed depth (32) whose leaves are:
+- **Vote Commitment Tree (vote chain)**: This crate implements the tree that the vote chain maintains. It is an append-only Merkle tree of fixed depth (24, capacity 2^24 ≈ 16.7M leaves) whose leaves are:
   - **Vote Authority Notes (VANs)** — from `MsgDelegateVote` and the new VAN from `MsgCastVote`
   - **Vote Commitments (VCs)** — from `MsgCastVote`
 
@@ -122,7 +122,7 @@ Our vote commitment tree is structurally the same (append-only, fixed-depth Merk
 |---|---|---|
 | Hash function | Sinsemilla (Sapling/Orchard) | **Poseidon** (cheaper in-circuit) |
 | Layer tagging | Sinsemilla prepends 10-bit level prefix | **No layer tag** — `Poseidon(left, right)` is the same at every level ([rationale](#no-layer-tagging-in-poseidon-combine)) |
-| Depth | 32 | 32 |
+| Depth | 32 | **24** ([rationale](#tree-depth-choice)) |
 | Leaf contents | Note commitments only | **Both VANs and VCs** (domain-separated) |
 | Where it lives | ZCash mainnet | **Vote chain** (Cosmos SDK) |
 | Block format | CompactBlock via lightwalletd | Vote chain blocks via REST API (`/zally/v1/commitment-tree/leaves`) |
@@ -197,17 +197,42 @@ fn combine(_level: Level, left: &Self, right: &Self) -> Self {
 
 This is a deliberate choice. Three properties make the attack infeasible in our setting:
 
-1. **Fixed depth enforced by circuits.** ZKP #2 and ZKP #3 hardcode `TREE_DEPTH = 32` — every Merkle path verified in-circuit has exactly 32 sibling hashes. The verifier rejects paths of any other length, so an attacker cannot present an internal node as a leaf in a "shorter" tree. The level ambiguity only matters if the verifier accepts variable-depth proofs, which ours does not.
+1. **Fixed depth enforced by circuits.** ZKP #2 and ZKP #3 hardcode `TREE_DEPTH = 24` — every Merkle path verified in-circuit has exactly 24 sibling hashes. The verifier rejects paths of any other length, so an attacker cannot present an internal node as a leaf in a "shorter" tree. The level ambiguity only matters if the verifier accepts variable-depth proofs, which ours does not.
 
 2. **Consensus-gated insertion.** Only `MsgDelegateVote` and `MsgCastVote` can append leaves, and both require valid ZKPs verified on-chain. An attacker cannot insert an arbitrary field element as a leaf — they must produce a valid delegation proof (ZKP #1) or vote proof (ZKP #2).
 
 3. **Domain-separated commitments with randomness.** Leaves are `Poseidon(DOMAIN_VAN, hotkey, weight, round, authority, rand)` or `Poseidon(DOMAIN_VC, shares_hash, proposal_id, decision)`. The probability that such a commitment collides with an internal node value `Poseidon(left_child, right_child)` is ~1/2^254 (negligible over the Pallas field).
 
-Property (1) alone is sufficient: even if an attacker could somehow produce a leaf equal to an internal node, the circuit would still require a 32-element path from that leaf to the root. The "reinterpret the tree at a different depth" attack is structurally impossible.
+Property (1) alone is sufficient: even if an attacker could somehow produce a leaf equal to an internal node, the circuit would still require a 24-element path from that leaf to the root. The "reinterpret the tree at a different depth" attack is structurally impossible.
 
-**Trade-off**: Omitting the level tag saves one constraint per hash in the circuit's Merkle path verification (no level field element to allocate or constrain). Over 32 levels that is 32 fewer constraints per ZKP #2 / ZKP #3 proof, with no security cost given the properties above.
+**Trade-off**: Omitting the level tag saves one constraint per hash in the circuit's Merkle path verification (no level field element to allocate or constrain). Over 24 levels that is 24 fewer constraints per ZKP #2 / ZKP #3 proof, with no security cost given the properties above.
 
 **If this changes**: If the protocol ever allows variable-depth proofs or adversarial leaf insertion without a ZKP gate, layer tagging should be revisited. Adding it later would change every tree root, Merkle path, and on-chain anchor — effectively a hard fork.
+
+### Tree depth choice
+
+The vote commitment tree uses **depth 24** (2^24 ≈ 16.7M leaf capacity), reduced from Zcash's depth 32 (~4.3B). This is deliberate because governance voting produces far fewer leaves than a full shielded transaction pool.
+
+**Usage analysis:** Each voter generates 1 leaf per delegation (`MsgDelegateVote`) + 2 leaves per vote (`MsgCastVote`). For V voters voting on P proposals: V(1 + 2P) leaves.
+
+| Scenario | Voters | Proposals | Leaves | Fits in depth... |
+|---|---|---|---|---|
+| Small round | 500 | 5 | 5,500 | 13+ |
+| Medium round | 5,000 | 10 | 105,000 | 17+ |
+| Large round | 10,000 | 50 | 1,010,000 | 20+ |
+| 100 large rounds | 10,000 | 50 | 101,000,000 | 27+ |
+
+Depth 24 provides comfortable headroom for any realistic governance scenario — over 165 "large" rounds before filling the tree.
+
+**Performance gains vs depth 32:**
+
+| Metric | Depth 32 | Depth 24 | Improvement |
+|---|---|---|---|
+| Poseidon hashes per ZKP | 32 | 24 | 8 fewer (~2,000 constraints) |
+| MerklePath size | 1,028 bytes | 772 bytes | 25% smaller |
+| Leaf capacity | 4.3 billion | 16.7 million | Right-sized |
+
+**If this needs to change:** Increasing the depth later changes every root, Merkle path, and on-chain anchor — effectively a hard fork. Depth 24 is chosen to avoid that scenario while not over-provisioning.
 
 ## How the tree participates in each message
 
@@ -295,7 +320,7 @@ EndBlocker  ──  tree relationship
 ```mermaid
 graph TB
     subgraph "vote-commitment-tree (core crate)"
-        HASH["MerkleHashVote<br/>Anchor, MerklePath<br/><i>Poseidon hash, depth 32</i>"]
+        HASH["MerkleHashVote<br/>Anchor, MerklePath<br/><i>Poseidon hash, depth 24</i>"]
         SERVER["TreeServer<br/><i>Full tree: append, checkpoint,<br/>root, path, serves TreeSyncApi</i>"]
         CLIENT["TreeClient<br/><i>Sparse tree: sync, mark,<br/>witness generation</i>"]
         SYNC["TreeSyncApi (trait)<br/><i>get_block_commitments()<br/>get_root_at_height()<br/>get_tree_state()</i>"]
@@ -591,7 +616,7 @@ Sync complete.
   root match:        OK
 ```
 
-The `witness` command outputs the Merkle path as hex (1028 bytes = position + 32 sibling hashes) and the anchor root. This output is consumed by the SDK's TypeScript API tests via `runTreeCli()`.
+The `witness` command outputs the Merkle path as hex (772 bytes = 4-byte position + 24 sibling hashes × 32 bytes) and the anchor root. This output is consumed by the SDK's TypeScript API tests via `runTreeCli()`.
 
 ---
 
@@ -727,7 +752,7 @@ The Rust FFI exposes two functions:
 | FFI function | Purpose |
 |---|---|
 | `compute_root_from_raw(ptr, count) -> [u8; 32]` | Build tree from raw leaf bytes, return root |
-| `compute_path_from_raw(ptr, count, position) -> [u8; 1028]` | Build tree, return MerklePath at position |
+| `compute_path_from_raw(ptr, count, position) -> [u8; 772]` | Build tree, return MerklePath at position |
 
 Golden test vectors (3 leaves `[1, 2, 3]`) ensure Go and Rust produce identical roots. These are checked in `sdk/crypto/votetree/tree_ffi_test.go`.
 

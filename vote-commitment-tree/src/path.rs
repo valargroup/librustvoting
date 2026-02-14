@@ -22,8 +22,8 @@ pub struct MerklePath {
     auth_path: [MerkleHashVote; TREE_DEPTH],
 }
 
-impl From<incrementalmerkletree::MerklePath<MerkleHashVote, 32>> for MerklePath {
-    fn from(path: incrementalmerkletree::MerklePath<MerkleHashVote, 32>) -> Self {
+impl From<incrementalmerkletree::MerklePath<MerkleHashVote, { TREE_DEPTH as u8 }>> for MerklePath {
+    fn from(path: incrementalmerkletree::MerklePath<MerkleHashVote, { TREE_DEPTH as u8 }>) -> Self {
         let position: u64 = path.position().into();
         Self {
             position: position as u32,
@@ -75,9 +75,9 @@ impl MerklePath {
 
     /// Serialize to bytes for FFI / network transport.
     ///
-    /// Format (little-endian, [`MERKLE_PATH_BYTES`] = 1028 bytes total):
+    /// Format (little-endian, [`MERKLE_PATH_BYTES`] bytes total):
     /// - Bytes `[0..4)`: position (`u32` LE)
-    /// - Bytes `[4..1028)`: auth path (`TREE_DEPTH` sibling hashes, 32 bytes each,
+    /// - Remaining bytes: auth path (`TREE_DEPTH` sibling hashes, 32 bytes each,
     ///   in order from leaf level to root level)
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(MERKLE_PATH_BYTES);
