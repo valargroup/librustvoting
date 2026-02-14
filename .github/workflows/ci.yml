@@ -166,7 +166,7 @@ jobs:
         run: npm ci
         working-directory: sdk/tests/api
       - name: Run API tests
-        run: make test-api
+        run: cd tests/api && npm test -- --reporter=verbose
         env:
           ZALLY_API_URL: http://localhost:1317
       - name: Upload chain log on failure

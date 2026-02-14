@@ -1,15 +1,16 @@
 # vote-commitment-tree
 
-Append-only Poseidon Merkle tree for the **Vote Commitment Tree** in the Zally voting protocol (Gov Steps V1).
+Append-only Poseidon Merkle tree for the **Vote Commitment Tree** in the Zally voting protocol. This crate provides the tree structure, sync protocol, and witness generation used by the vote chain for ZKP #2 (VAN membership) and ZKP #3 (VC membership). The design follows **Gov Steps V1** and the **Wallet SDK → Cosmos SDK Messages** flow.
 
 ## Table of contents
 
+- [Design sources](#design-sources)
 - [Role in the protocol](#role-in-the-protocol)
 - [What is an anchor?](#what-is-an-anchor)
+- [How the tree participates in each message](#how-the-tree-participates-in-each-message)
 - [How the note commitment tree works in ZCash](#how-the-note-commitment-tree-works-in-zcash)
 - [How we modify this for the vote commitment tree](#how-we-modify-this-for-the-vote-commitment-tree)
 - [Privacy model](#privacy-model)
-- [How the tree participates in each message](#how-the-tree-participates-in-each-message)
 - [Architecture overview](#architecture-overview)
 - [Sync architecture](#sync-architecture)
 - [CLI reference (`vote-tree-cli`)](#cli-reference-vote-tree-cli)
@@ -17,13 +18,25 @@ Append-only Poseidon Merkle tree for the **Vote Commitment Tree** in the Zally v
 - [Integration with the Go chain](#integration-with-the-go-chain)
 - [Testing](#testing)
 - [Where things live](#where-things-live)
+- [Relationship to protocol spec](#relationship-to-protocol-spec)
+
+---
+
+## Design sources
+
+The voting protocol is specified in two places; this README assumes that context.
+
+| Source | Content |
+|--------|--------|
+| **Gov Steps V1** | Full protocol spec: glossary, Phase 0–5, ZKP #1 (delegation), ZKP #2 (vote), ZKP #3 (share reveal), El Gamal and tally appendices. In-repo ref: `docs/cosmos-sdk-messages-spec.md` (derived from Gov Steps V1). The canonical spec lives in the Obsidian vault `zcaloooors/Voting/Gov Steps V1.md` when the symlink is present. |
+| **Wallet SDK Operations → Cosmos SDK Messages** (Figma) | [Figma board](https://www.figma.com/board/CCKJMV6iozvYV8mT6H050a/Wallet-SDK-V2?node-id=0-1): client flow (note identification, Keystone signing, ZKP #1/#2), helper server (share relay, ZKP #3), Cosmos messages (`MsgDelegateVote`, `MsgCastVote`, `MsgRevealShare`), and chain state (nullifier sets, vote commitment tree, encrypted tally). |
 
 ---
 
 ## Role in the protocol
 
 - **Note commitment tree (ZCash mainnet)**: We only use its root `nc_root` at snapshot height as an anchor for ZKP #1. We do not build it in this repo.
-- **Vote Commitment Tree (vote chain)**: This crate implements the tree that the vote chain maintains. It is an append-only Merkle tree of fixed depth (24, capacity 2^24 ≈ 16.7M leaves) whose leaves are:
+- **Vote Commitment Tree (vote chain)**: This crate implements the tree structure that the vote chain maintains. The protocol specifies **one tree per voting round** (see [Relationship to protocol spec](#relationship-to-protocol-spec)); this crate provides a single tree instance — the chain is responsible for round scoping. The tree is append-only, fixed depth 24 (capacity 2^24 ≈ 16.7M leaves). Leaves are:
   - **Vote Authority Notes (VANs)** — from `MsgDelegateVote` and the new VAN from `MsgCastVote`
   - **Vote Commitments (VCs)** — from `MsgCastVote`
 
@@ -48,6 +61,85 @@ An **anchor** is a committed Merkle root at a fixed point in time that everyone 
 - **Vote commitment tree root at `vote_comm_tree_anchor_height`** — tree root on the **vote chain** at a given block height. ZKP #2 (VAN membership) and ZKP #3 (VC membership) prove inclusion against this root. The chain stores the root at each height via EndBlocker; provers use the root at their chosen anchor height, and the chain verifies the proof against the stored value.
 
 In one sentence: **the anchor is the agreed Merkle root (and its height) that all inclusion proofs are verified against, so proofs are bound to a single, committed tree state.**
+
+## How the tree participates in each message
+
+Three messages interact with the tree. The first two **write** leaves into it; the third only **reads** from it (via a ZKP). Between blocks, EndBlocker **snapshots the root** so later messages can reference it as an anchor.
+
+### MsgDelegateVote (Phase 2 — ZKP #1) — WRITE only
+
+**What happens:** A voter delegates their mainchain ZEC notes to a voting hotkey. The chain verifies ZKP #1, records governance nullifiers, and **appends the VAN** (the governance commitment `gov_comm`) as a new leaf in the tree.
+
+**Tree's role:** Storage. The VAN is planted into the tree so that future ZKP #2 proofs can prove membership of this VAN. At this point nobody reads from the tree — the tree just grows.
+
+**Why it matters:** Without this append, there would be no leaf for ZKP #2 to prove inclusion against. The VAN must be in the tree before the voter can cast a vote.
+
+```
+MsgDelegateVote  ──  tree relationship
+─────────────────────────────────────────
+  ZKP #1 proves:  "I own unspent ZCash notes"
+                  (uses nc_root from mainchain, NOT the vote tree)
+
+  Chain action:   tree.append(gov_comm)   ← VAN goes in as a new leaf
+                  tree now has this VAN at index N
+```
+
+### MsgCastVote (Phase 3 — ZKP #2) — READ then WRITE
+
+**What happens:** The voter casts an encrypted vote on a proposal. ZKP #2 proves that the voter's **old VAN is already in the tree** (read), then the chain **appends two new leaves** (write): the new VAN (with decremented proposal authority) and the vote commitment (VC).
+
+**Tree's role — read side:** The prover builds a Merkle inclusion proof for the old VAN against the tree root at a specific anchor height (`vote_comm_tree_anchor_height`). The chain looks up the stored root at that height and the ZKP is verified against it. This proves "I hold a registered VAN" without revealing which one.
+
+**Tree's role — write side:** Two new leaves are appended:
+1. **New VAN** — same voter, same weight, but proposal authority decremented by 1. This VAN can be spent again to vote on another proposal.
+2. **Vote commitment (VC)** — commits to the 4 encrypted shares, proposal ID, and vote decision. This VC will later be opened by ZKP #3.
+
+```
+MsgCastVote  ──  tree relationship
+─────────────────────────────────────────
+  ZKP #2 proves:  "My old VAN is in the tree at anchor root R"
+                  (Merkle inclusion proof against vote_comm_tree_root)
+
+  Chain checks:   root_at_height(anchor_height) == R   ← anchor validation
+                  van_nullifier not seen before         ← no double-vote
+
+  Chain action:   tree.append(vote_authority_note_new)  ← new VAN, leaf N
+                  tree.append(vote_commitment)          ← VC, leaf N+1
+```
+
+### MsgRevealShare (Phase 5 — ZKP #3) — READ only
+
+**What happens:** The helper server reveals one encrypted share from a registered vote commitment. ZKP #3 proves that the **VC is in the tree** (read). The chain does NOT write any new leaves.
+
+**Tree's role:** The prover builds a Merkle inclusion proof for the VC against the tree root at a specific anchor height. This proves "this share comes from a real, registered vote commitment" without revealing which VC it came from. The chain then accumulates the encrypted share into the homomorphic tally.
+
+```
+MsgRevealShare  ──  tree relationship
+─────────────────────────────────────────
+  ZKP #3 proves:  "This VC is in the tree at anchor root R"
+                  "This enc_share is one of the 4 shares in that VC"
+                  (Merkle inclusion proof against vote_comm_tree_root)
+
+  Chain checks:   root_at_height(anchor_height) == R   ← anchor validation
+                  share_nullifier not seen before       ← no double-count
+
+  Chain action:   tally.accumulate(enc_share)           ← homomorphic add
+                  (no tree writes)
+```
+
+### EndBlocker — ROOT SNAPSHOT
+
+Between blocks, EndBlocker computes the current tree root and stores it at the block height. This stored root becomes the **anchor** that future MsgCastVote and MsgRevealShare reference when they say "prove inclusion against the tree root at height H."
+
+```
+EndBlocker  ──  tree relationship
+─────────────────────────────────────────
+  if tree grew this block:
+    root = tree.root()
+    store root at current block height   ← this root becomes a valid anchor
+```
+
+---
 
 ## How the note commitment tree works in ZCash
 
@@ -296,85 +388,6 @@ After a wallet reset, positions can be recovered by querying the wallet's own tr
 We currently do not implement the ability to recover. This can be done in the future.
 
 The VAN preimage (specifically the `rand` blinding factor) must be recoverable for the wallet to produce future ZKPs. If `rand` is derived deterministically from the wallet seed (e.g., `rand = PRF(seed, round_id, counter)`), full recovery is possible. If `rand` is truly random and only stored locally, it is lost on reset and the VAN cannot be spent — this is a wallet-implementation concern, not a protocol-level risk.
-
----
-
-## How the tree participates in each message
-
-Three messages interact with the tree. The first two **write** leaves into it; the third only **reads** from it (via a ZKP). Between blocks, EndBlocker **snapshots the root** so later messages can reference it as an anchor.
-
-### MsgDelegateVote (Phase 2 — ZKP #1) — WRITE only
-
-**What happens:** A voter delegates their mainchain ZEC notes to a voting hotkey. The chain verifies ZKP #1, records governance nullifiers, and **appends the VAN** (the governance commitment `gov_comm`) as a new leaf in the tree.
-
-**Tree's role:** Storage. The VAN is planted into the tree so that future ZKP #2 proofs can prove membership of this VAN. At this point nobody reads from the tree — the tree just grows.
-
-**Why it matters:** Without this append, there would be no leaf for ZKP #2 to prove inclusion against. The VAN must be in the tree before the voter can cast a vote.
-
-```
-MsgDelegateVote  ──  tree relationship
-─────────────────────────────────────────
-  ZKP #1 proves:  "I own unspent ZCash notes"
-                  (uses nc_root from mainchain, NOT the vote tree)
-
-  Chain action:   tree.append(gov_comm)   ← VAN goes in as a new leaf
-                  tree now has this VAN at index N
-```
-
-### MsgCastVote (Phase 3 — ZKP #2) — READ then WRITE
-
-**What happens:** The voter casts an encrypted vote on a proposal. ZKP #2 proves that the voter's **old VAN is already in the tree** (read), then the chain **appends two new leaves** (write): the new VAN (with decremented proposal authority) and the vote commitment (VC).
-
-**Tree's role — read side:** The prover builds a Merkle inclusion proof for the old VAN against the tree root at a specific anchor height (`vote_comm_tree_anchor_height`). The chain looks up the stored root at that height and the ZKP is verified against it. This proves "I hold a registered VAN" without revealing which one.
-
-**Tree's role — write side:** Two new leaves are appended:
-1. **New VAN** — same voter, same weight, but proposal authority decremented by 1. This VAN can be spent again to vote on another proposal.
-2. **Vote commitment (VC)** — commits to the 4 encrypted shares, proposal ID, and vote decision. This VC will later be opened by ZKP #3.
-
-```
-MsgCastVote  ──  tree relationship
-─────────────────────────────────────────
-  ZKP #2 proves:  "My old VAN is in the tree at anchor root R"
-                  (Merkle inclusion proof against vote_comm_tree_root)
-
-  Chain checks:   root_at_height(anchor_height) == R   ← anchor validation
-                  van_nullifier not seen before         ← no double-vote
-
-  Chain action:   tree.append(vote_authority_note_new)  ← new VAN, leaf N
-                  tree.append(vote_commitment)          ← VC, leaf N+1
-```
-
-### MsgRevealShare (Phase 5 — ZKP #3) — READ only
-
-**What happens:** The helper server reveals one encrypted share from a registered vote commitment. ZKP #3 proves that the **VC is in the tree** (read). The chain does NOT write any new leaves.
-
-**Tree's role:** The prover builds a Merkle inclusion proof for the VC against the tree root at a specific anchor height. This proves "this share comes from a real, registered vote commitment" without revealing which VC it came from. The chain then accumulates the encrypted share into the homomorphic tally.
-
-```
-MsgRevealShare  ──  tree relationship
-─────────────────────────────────────────
-  ZKP #3 proves:  "This VC is in the tree at anchor root R"
-                  "This enc_share is one of the 4 shares in that VC"
-                  (Merkle inclusion proof against vote_comm_tree_root)
-
-  Chain checks:   root_at_height(anchor_height) == R   ← anchor validation
-                  share_nullifier not seen before       ← no double-count
-
-  Chain action:   tally.accumulate(enc_share)           ← homomorphic add
-                  (no tree writes)
-```
-
-### EndBlocker — ROOT SNAPSHOT
-
-Between blocks, EndBlocker computes the current tree root and stores it at the block height. This stored root becomes the **anchor** that future MsgCastVote and MsgRevealShare reference when they say "prove inclusion against the tree root at height H."
-
-```
-EndBlocker  ──  tree relationship
-─────────────────────────────────────────
-  if tree grew this block:
-    root = tree.root()
-    store root at current block height   ← this root becomes a valid anchor
-```
 
 ---
 
@@ -1014,3 +1027,26 @@ vote-commitment-tree-client/
   tests/
     mock_server_tests.rs  Mock HTTP server integration tests
 ```
+
+---
+
+## Relationship to protocol spec
+
+This section records how this crate aligns with the governance plan (Gov Steps V1 + Cosmos SDK messages spec) and what is left to the chain or other components.
+
+### Documented in the spec but not in this README (until now)
+
+| Topic | Spec / design | Note |
+|-------|----------------|------|
+| **Tree per voting round** | Cosmos spec §3.3: `vote_tree/{round_id}/root`, `vote_tree/{round_id}/leaf/{index}`. One tree per `voting_round_id`. | This crate implements the **tree structure** (append, checkpoint, root, path). **Round scoping is a chain responsibility**: the keeper stores one tree per round (spec) or a single tree (current POC). Clients must sync the tree for the round they care about; if the REST API is per-round, the base URL or query params include `round_id`. |
+| **Phase 0 — tree initialization** | Cosmos spec §4.1 (MsgCreateVotingSession): "Initialize empty Vote Commitment Tree for this round." | The tree is created when the session is created. This crate does not define when the chain creates the tree; it only provides the empty-tree primitive (`TreeServer::empty()`). |
+| **Anchor height selection** | MsgCastVote and MsgRevealShare carry `vote_comm_tree_anchor_height`; the prover chooses which block height’s root to prove against. | Not specified in this README: how the wallet or helper server picks the anchor height (e.g. latest finalized block before building the proof, or a fixed delay). Implementation detail for clients. |
+| **`delegated_voting_share_payload`** | Figma: "Build delegated_voting_share_payload (1 per share, send to server)". Wallet sends payload to helper server; server uses VC position to sync and generate ZKP #3. | Payload shape (e.g. VC leaf index, encrypted share, share index) is part of the client–helper contract; this README mentions it but does not define the wire format. See mobile/sdk docs for the actual structure. |
+| **Vote window and share grace period** | Cosmos spec: `vote_end_time`, and for MsgRevealShare a grace period after vote window close. | Tree behavior is unchanged; only message validity and session status depend on timing. No tree-specific documentation needed. |
+
+### What this crate does not cover
+
+- **ZKP #1, #2, #3 circuits** — Proof generation and verification are defined in the protocol spec and implemented in the circuits repo; this crate only provides Merkle paths and roots for the public inputs.
+- **Note commitment tree (`nc_root`)** — Built and anchored on ZCash mainnet; we only consume its root as an anchor for ZKP #1.
+- **Nullifier sets, tally accumulator, MsgSubmitTally** — Chain state and message handling; see Cosmos SDK messages spec and keeper code.
+- **REST API round scoping** — Current SDK endpoints (`/zally/v1/commitment-tree/latest`, `/{height}`, `/leaves`) may not include `round_id` in the path; production may need per-round routes or query params. See `sdk/api/query_handler.go` and keeper store keys.
