@@ -3,7 +3,7 @@
 Proves that a registered voter is casting a valid vote, without revealing which VAN they hold. The structure follows the delegation circuit's pattern (ZKP 1) and implements conditions incrementally.
 
 **Public inputs:** 7 field elements.
-**Current K:** 11 (2,048 rows) — sufficient for condition 2 alone, will increase.
+**Current K:** 12 (4,096 rows) — accommodates conditions 2, 4, 5, 6 plus the 10-bit lookup table.
 
 ## Inputs
 
@@ -110,7 +110,7 @@ Three-layer `ConstantLength<2>` chain matching ZKP 1 condition 14's governance n
 
 **Constructions:** `PoseidonChip` (reused from condition 2), `constrain_instance`.
 
-## Condition 5: Proposal Authority Decrement (TODO)
+## Condition 5: Proposal Authority Decrement ✅
 
 Purpose: ensure the voter still has authority and correctly decrements it.
 
@@ -119,9 +119,16 @@ proposal_authority_new = proposal_authority_old - 1
 proposal_authority_old > 0
 ```
 
-**Constructions:** `AddChip`, range check.
+Where:
+- **proposal_authority_old**: the remaining proposal authority from the old VAN. Reused from condition 2's witness cell via cell equality.
+- **proposal_authority_new**: witnessed as `proposal_authority_old - 1` and constrained via `AddChip`: `proposal_authority_new + 1 == proposal_authority_old`.
+- **Range check**: `proposal_authority_new` is range-checked to [0, 2^70) using `LookupRangeCheckConfig` with 7 × 10-bit words. If `proposal_authority_old == 0`, the subtraction wraps to `p - 1 ≈ 2^254`, failing the range check — enforcing `proposal_authority_old > 0`.
 
-## Condition 6: New VAN Integrity (TODO)
+**Structure:** One `AddChip` constraint (1 row) + one running-sum range check (8 rows). The constant `1` is assigned via `assign_advice_from_constant`, baking it into the verification key.
+
+**Constructions:** `AddChip`, `LookupRangeCheckConfig`.
+
+## Condition 6: New VAN Integrity ✅
 
 Purpose: the new VAN has the same fields as the old except with decremented authority.
 
@@ -129,6 +136,16 @@ Purpose: the new VAN has the same fields as the old except with decremented auth
 vote_authority_note_new = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value,
                                    voting_round_id, proposal_authority_new, gov_comm_rand)
 ```
+
+Where:
+- All inputs except `proposal_authority_new` are cell-equality-linked to the same witness cells used in condition 2.
+- **proposal_authority_new**: flows from condition 5's output. This is the only difference between the condition 2 and condition 6 Poseidon hashes.
+
+**Function:** `Poseidon` with `ConstantLength<6>` (same as condition 2).
+
+**Constraint:** The circuit computes the hash and enforces `constrain_instance(derived_van_new, VOTE_AUTHORITY_NOTE_NEW)` — binding the result to the public input at offset 1.
+
+**Out-of-circuit helper:** Reuses `van_integrity_hash()` with `proposal_authority_old - 1` as the authority argument.
 
 **Constructions:** `PoseidonChip`.
 
@@ -188,10 +205,13 @@ vote_commitment = H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)
 |---------|------------|------------|
 | `advices[0..5]` | General witness assignment | Sinsemilla/Merkle (if needed) |
 | `advices[5]` | Poseidon partial S-box | — |
-| `advices[6..9]` | Poseidon state (width 3) | — |
-| `advices[9]` | Unused | Range check |
-| `lagrange_coeffs[0]` | Constants (DOMAIN_VAN) | Constants (DOMAIN_VC, etc.) |
+| `advices[6]` | Poseidon state + AddChip output (c) | — |
+| `advices[7]` | Poseidon state + AddChip input (a) | — |
+| `advices[8]` | Poseidon state + AddChip input (b) | — |
+| `advices[9]` | Range check running sum | — |
+| `lagrange_coeffs[0]` | Constants (DOMAIN_VAN, ONE) | Constants (DOMAIN_VC, etc.) |
 | `lagrange_coeffs[1]` | Unused | ECC / Sinsemilla |
 | `lagrange_coeffs[2..5]` | Poseidon rc_a | — |
 | `lagrange_coeffs[5..8]` | Poseidon rc_b | — |
+| `table_idx` | 10-bit lookup table [0, 1024) | — |
 | `primary` | 7 public inputs | — |

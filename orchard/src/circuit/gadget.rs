@@ -24,7 +24,7 @@ use halo2_proofs::{
     plonk::{self, Advice, Assigned, Column},
 };
 
-pub(in crate::circuit) mod add_chip;
+pub(crate) mod add_chip;
 
 impl super::Config {
     pub(super) fn add_chip(&self) -> add_chip::AddChip {
@@ -77,7 +77,7 @@ impl super::Config {
 }
 
 /// An instruction set for adding two circuit words (field elements).
-pub(in crate::circuit) trait AddInstruction<F: Field>: Chip<F> {
+pub(crate) trait AddInstruction<F: Field>: Chip<F> {
     /// Constraints `a + b` and returns the sum.
     fn add(
         &self,
