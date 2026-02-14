@@ -4,7 +4,6 @@
   },
   "rust-analyzer.linkedProjects": [
     "nullifier-ingest/imt-tree/Cargo.toml",
-    "nullifier-ingest/nullifier-tree/Cargo.toml",
     "nullifier-ingest/service/Cargo.toml",
     "orchard/Cargo.toml",
     "librustzcash/Cargo.toml",
