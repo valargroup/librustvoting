@@ -68,6 +68,7 @@ pub mod delegation;
 pub mod vote_proof;
 pub mod gadget;
 mod note_commit;
+pub mod van_integrity;
 
 pub use crate::Proof;
 

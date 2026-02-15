@@ -72,9 +72,9 @@ Where:
 
 **Constraint:** The circuit computes the two-layer hash and enforces strict equality with `vote_authority_note_old`. Since `vote_authority_note_old` will also be used as the Merkle leaf in condition 1, this creates a binding: the VAN membership proof and the VAN integrity check are tied to the same commitment.
 
-**Out-of-circuit helper:** `van_integrity_hash(g_d_x, pk_d_x, total_note_value, voting_round_id, proposal_authority_old, gov_comm_rand)` computes the same two-layer hash outside the circuit for builder and test use.
+**Out-of-circuit helper:** `van_integrity::van_integrity_hash(g_d_x, pk_d_x, total_note_value, voting_round_id, proposal_authority_old, gov_comm_rand)` from the shared `circuit::van_integrity` module computes the same two-layer hash outside the circuit for builder and test use.
 
-**Constructions:** `PoseidonChip`.
+**Constructions:** `van_integrity::van_integrity_poseidon` (shared gadget from `circuit::van_integrity`).
 
 ## Condition 1: VAN Membership ✅
 
@@ -171,9 +171,9 @@ Where:
 
 **Constraint:** The circuit computes the two-layer hash and enforces `constrain_instance(derived_van_new, VOTE_AUTHORITY_NOTE_NEW)` — binding the result to the public input at offset 1.
 
-**Out-of-circuit helper:** Reuses `van_integrity_hash(g_d_x, pk_d_x, total_note_value, voting_round_id, proposal_authority_new, gov_comm_rand)` with `proposal_authority_new = proposal_authority_old - 1`.
+**Out-of-circuit helper:** Reuses `van_integrity::van_integrity_hash(g_d_x, pk_d_x, total_note_value, voting_round_id, proposal_authority_new, gov_comm_rand)` with `proposal_authority_new = proposal_authority_old - 1`.
 
-**Constructions:** `PoseidonChip`.
+**Constructions:** `van_integrity::van_integrity_poseidon` (shared gadget from `circuit::van_integrity`).
 
 ## Condition 7: Shares Sum Correctness ✅
 

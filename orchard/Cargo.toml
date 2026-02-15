@@ -108,8 +108,11 @@ name = "delegation"
 harness = false
 required-features = ["delegation", "test-dependencies"]
 
+[profile.dev]
+opt-level = 1       # Faster runtime for ZK circuits without full release optimization cost
+
 [profile.release]
-debug = true
+debug = false
 
 [profile.bench]
-debug = true
+debug = false
