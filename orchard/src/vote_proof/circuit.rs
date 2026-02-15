@@ -31,7 +31,7 @@
 //!
 //! New VAN construction:
 //! - **Condition 5**: Proposal Authority Decrement — `proposal_authority_new =
-//!   proposal_authority_old - 1`, and `proposal_authority_old > 0`. *(implemented)*
+//!   proposal_authority_old - (1 << proposal_id)`, with bitmask range [0, 2^16). *(implemented)*
 //! - **Condition 6**: New VAN Integrity — same two-layer structure as condition 2
 //!   but with decremented authority. *(implemented)*
 //!
@@ -384,8 +384,8 @@ pub struct Config {
     ///
     /// Uses advices[9] as the running-sum column. Each word is 10 bits,
     /// so `num_words` × 10 gives the total bit-width checked.
-    /// Used in condition 5 to ensure `proposal_authority_old > 0`, and
-    /// condition 8 to ensure each share is in `[0, 2^24)`.
+    /// Used in condition 5 to ensure authority values and diff are in [0, 2^16)
+    /// (16-bit bitmask), and condition 8 to ensure each share is in `[0, 2^24)`.
     range_check: LookupRangeCheckConfig<pallas::Base, 10>,
     /// Selector for the Merkle conditional swap gate (condition 1).
     ///
@@ -1237,6 +1237,11 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // via lookup; proposal_authority_new + one_shifted = proposal_authority_old;
         // and proposal_authority_new < one_shifted (so the proposal_id-th bit of
         // proposal_authority_new is 0, i.e. we had authority for that proposal).
+        //
+        // Range checks: diff, proposal_authority_old, and proposal_authority_new
+        // must be in [0, 2^16) per spec (16-bit bitmask). copy_check(·, 2, true)
+        // only proves [0, 2^20). We add an upper bound by range-checking
+        // (2^16 - 1 - value): that forces value <= 2^16 - 1.
         // ---------------------------------------------------------------
 
         // Copy proposal_id from instance and assign one_shifted in the lookup row.
@@ -1320,23 +1325,103 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 || "sum2 = one_shifted",
                 |mut region| region.constrain_equal(sum2.cell(), one_shifted_cell.cell()),
             )?;
+
+            // 16-bit upper bound: spec requires [0, 2^16). copy_check(·, 2, true) only
+            // gives [0, 2^20). Enforce value <= 2^16 - 1 by range-checking
+            // (2^16 - 1 - value), which is in [0, 2^20) iff value <= 65535.
+            let base_16_max = pallas::Base::from(65535u64); // 2^16 - 1
+            let constant_65535 = layouter.assign_region(
+                || "2^16 - 1 (condition 5 upper bound)",
+                |mut region| {
+                    region.assign_advice_from_constant(
+                        || "65535",
+                        config.advices[0],
+                        0,
+                        base_16_max,
+                    )
+                },
+            )?;
+
+            // diff in [0, 2^16): 20-bit range check + upper bound via gap.
             config.range_check_config().copy_check(
-                layouter.namespace(|| "diff < 2^16"),
-                diff,
-                2,    // 2 × 10 = 20 bits, covers 16-bit diff
+                layouter.namespace(|| "diff < 2^20 (limbs)"),
+                diff.clone(),
+                2,
+                true,
+            )?;
+            let gap_diff = assign_free_advice(
+                layouter.namespace(|| "witness (2^16 - 1) - diff"),
+                config.advices[0],
+                diff.value().map(|v| base_16_max - v),
+            )?;
+            let sum_diff = config.add_chip().add(
+                layouter.namespace(|| "diff + gap_diff"),
+                &diff,
+                &gap_diff,
+            )?;
+            layouter.assign_region(
+                || "diff + gap_diff = 2^16 - 1",
+                |mut region| region.constrain_equal(sum_diff.cell(), constant_65535.cell()),
+            )?;
+            config.range_check_config().copy_check(
+                layouter.namespace(|| "(2^16 - 1) - diff in [0, 2^20) => diff <= 65535"),
+                gap_diff,
+                2,
                 true,
             )?;
 
-            // Range-check proposal_authority_old and proposal_authority_new to 16 bits.
+            // proposal_authority_old in [0, 2^16): same pattern.
             config.range_check_config().copy_check(
-                layouter.namespace(|| "proposal_authority_old < 2^16"),
+                layouter.namespace(|| "proposal_authority_old < 2^20 (limbs)"),
                 proposal_authority_old_cond5.clone(),
                 2,
                 true,
             )?;
+            let gap_old = assign_free_advice(
+                layouter.namespace(|| "witness (2^16 - 1) - proposal_authority_old"),
+                config.advices[0],
+                proposal_authority_old_cond5.value().map(|v| base_16_max - v),
+            )?;
+            let sum_old = config.add_chip().add(
+                layouter.namespace(|| "proposal_authority_old + gap_old"),
+                &proposal_authority_old_cond5,
+                &gap_old,
+            )?;
+            layouter.assign_region(
+                || "proposal_authority_old + gap_old = 2^16 - 1",
+                |mut region| region.constrain_equal(sum_old.cell(), constant_65535.cell()),
+            )?;
             config.range_check_config().copy_check(
-                layouter.namespace(|| "proposal_authority_new < 2^16"),
+                layouter.namespace(|| "(2^16 - 1) - proposal_authority_old in [0, 2^20)"),
+                gap_old,
+                2,
+                true,
+            )?;
+
+            // proposal_authority_new in [0, 2^16): same pattern.
+            config.range_check_config().copy_check(
+                layouter.namespace(|| "proposal_authority_new < 2^20 (limbs)"),
                 proposal_authority_new.clone(),
+                2,
+                true,
+            )?;
+            let gap_new = assign_free_advice(
+                layouter.namespace(|| "witness (2^16 - 1) - proposal_authority_new"),
+                config.advices[0],
+                proposal_authority_new.value().map(|v| base_16_max - v),
+            )?;
+            let sum_new = config.add_chip().add(
+                layouter.namespace(|| "proposal_authority_new + gap_new"),
+                &proposal_authority_new,
+                &gap_new,
+            )?;
+            layouter.assign_region(
+                || "proposal_authority_new + gap_new = 2^16 - 1",
+                |mut region| region.constrain_equal(sum_new.cell(), constant_65535.cell()),
+            )?;
+            config.range_check_config().copy_check(
+                layouter.namespace(|| "(2^16 - 1) - proposal_authority_new in [0, 2^20)"),
+                gap_new,
                 2,
                 true,
             )?;
@@ -2484,7 +2569,7 @@ mod tests {
         let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
 
         // Should fail: diff = 0 - 1 = p - 1 ≈ 2^254, which fails the
-        // 70-bit range check in condition 5.
+        // 16-bit range check in condition 5 (and the 20-bit limb check).
         assert!(prover.verify().is_err());
     }
 

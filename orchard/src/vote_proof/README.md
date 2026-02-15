@@ -187,11 +187,11 @@ Where:
 - **proposal_authority_old**: the remaining proposal authority bitmask from the old VAN (16-bit). Reused from condition 2's witness cell via cell equality.
 - **one_shifted**: witness equal to `2^proposal_id`. Constrained by a lookup table: table rows are `(i, 2^i)` for `i = 0..16`; when the condition is active the circuit looks up `(proposal_id, one_shifted)` so `one_shifted` must equal `2^proposal_id`.
 - **proposal_authority_new**: constrained via `AddChip`: `proposal_authority_new + one_shifted == proposal_authority_old`. A "bit was set" check is enforced by range-checking a derived value so that the cleared authority is non-negative and consistent.
-- **Range checks**: `proposal_authority_old` and `proposal_authority_new` are range-checked to 16 bits. If the `proposal_id`-th bit of `proposal_authority_old` is 0, the subtraction would underflow and fail the range check.
+- **Range checks**: `diff`, `proposal_authority_old`, and `proposal_authority_new` are enforced to be in `[0, 2^16)` per spec. The chip's `copy_check(·, 2, true)` only proves `[0, 2^20)` (2 × 10-bit limbs); we add an upper bound by range-checking `(2^16 - 1 - value)`, which is in `[0, 2^20)` iff `value <= 65535`. If the `proposal_id`-th bit of `proposal_authority_old` is 0, the subtraction would underflow and fail the range check.
 
-**Structure:** Lookup table of 17 rows `(i, 2^i)` for `i = 0..=16`; one region to assign `proposal_id` and `one_shifted` and perform the lookup; one region for `proposal_authority_new + one_shifted = proposal_authority_old`, the bit-set check (via `diff` and 16-bit range check), and 16-bit range checks for both authority values.
+**Structure:** Lookup table of 17 rows `(i, 2^i)` for `i = 0..=16`; one region to assign `proposal_id` and `one_shifted` and perform the lookup; one region for `proposal_authority_new + one_shifted = proposal_authority_old`, the bit-set check (via `diff` and 16-bit range check), and 16-bit range checks for all three values (20-bit limb decomposition plus gap-based upper bound).
 
-**Constructions:** Lookup table (`table_proposal_id`, `table_one_shifted`), `AddChip`, `LookupRangeCheckConfig` (10-bit words for 16-bit range).
+**Constructions:** Lookup table (`table_proposal_id`, `table_one_shifted`), `AddChip`, `LookupRangeCheckConfig` (10-bit words; 16-bit range enforced via limb checks and `(2^16 - 1) - value` gap check).
 
 ## Condition 6: New VAN Integrity ✅
 
