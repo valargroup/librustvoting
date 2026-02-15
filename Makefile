@@ -3,7 +3,7 @@ SDK_DIR     = sdk
 INGEST_DIR  = nullifier-ingest
 
 .PHONY: install install-ffi init init-ffi start clean build fmt lint \
-	test test-unit test-integration test-api \
+	test test-unit test-integration test-api test-api-restart test-api-reinit test-e2e \
 	fixtures-ts circuits circuits-test fixtures \
 	test-halo2 test-halo2-ante test-redpallas test-redpallas-ante test-all-ffi \
 	ingest ingest-status ingest-test ingest-proof ingest-clean ingest-serve \
@@ -47,6 +47,15 @@ test:
 
 test-api:
 	$(MAKE) -C $(SDK_DIR) test-api
+
+test-e2e:
+	cargo test --release --manifest-path e2e-tests/Cargo.toml -- --nocapture --ignored
+
+test-api-restart:
+	$(MAKE) -C $(SDK_DIR) test-api-restart
+
+test-api-reinit:
+	$(MAKE) -C $(SDK_DIR) test-api-reinit
 
 fixtures-ts:
 	$(MAKE) -C $(SDK_DIR) fixtures-ts

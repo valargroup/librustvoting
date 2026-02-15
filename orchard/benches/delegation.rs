@@ -153,7 +153,9 @@ fn make_real_note_inputs(
         let merkle_path = MerklePath::from_parts(i as u32, auth_path);
 
         let nf = nullifier_base(&note, fvk);
-        let imt_proof = imt_provider.non_membership_proof(nf);
+        let imt_proof = imt_provider
+            .non_membership_proof(nf)
+            .expect("non_membership_proof");
 
         inputs.push(RealNoteInput {
             note,

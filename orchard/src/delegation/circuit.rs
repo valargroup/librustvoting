@@ -79,6 +79,17 @@ use crate::circuit::van_integrity;
 use crate::constants::MERKLE_DEPTH_ORCHARD;
 
 // ================================================================
+// Circuit size
+// ================================================================
+
+/// Circuit size (2^K rows).
+///
+/// K=14 (16,384 rows) fits all 15 conditions including 4 per-note slots
+/// with Sinsemilla NoteCommit, Merkle paths, IMT non-membership, and
+/// ECC operations.
+pub const K: u32 = 14;
+
+// ================================================================
 // Public input offsets (12 field elements).
 // ================================================================
 
@@ -1882,11 +1893,8 @@ mod tests {
     use pasta_curves::{arithmetic::CurveAffine, pallas};
     use rand::rngs::OsRng;
 
-    /// Size of the delegation circuit (2^K rows).
-    ///
-    /// K=14 (16,384 rows) fits all conditions including 4 per-note slots.
-    /// (Poseidon IMT hashing requires more rows than the former Poseidon2 chip.)
-    const K: u32 = 14;
+    // Re-use the public K constant from the circuit module.
+    use super::K;
 
     /// Helper: build a NoteSlotWitness for a note with a Merkle path and IMT proof.
     fn make_note_slot(

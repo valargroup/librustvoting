@@ -1,6 +1,12 @@
 # Go binary
 sdk/zallyd
 
+# Go build cache (used in CI; keep local cache out of git)
+sdk/.cache/
+
+# Debug chain data (launch.json uses this to avoid replay errors)
+.zallyd-debug/
+
 # Rust build artifacts
 **/target/
 

@@ -1,0 +1,213 @@
+//! JSON payload builders and round_id derivation for Zally REST API.
+//!
+//! Matches the chain's deriveRoundID: Blake2b-256(snapshot_height_BE ||
+//! snapshot_blockhash || proposals_hash || vote_end_time_BE ||
+//! nullifier_imt_root || nc_root).
+
+use crate::elgamal::{self, Ciphertext, PublicKey};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 32-byte arrays for session fields.
+pub type Bytes32 = [u8; 32];
+
+/// Session fields used to derive vote_round_id (and to create the session).
+#[derive(Clone, Debug)]
+pub struct SetupRoundFields {
+    pub snapshot_height: u64,
+    pub snapshot_blockhash: Bytes32,
+    pub proposals_hash: Bytes32,
+    pub vote_end_time: u64,
+    pub nullifier_imt_root: Bytes32,
+    pub nc_root: Bytes32,
+}
+
+static ROUND_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn round_counter_next() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    (now % 1_000_000) + ROUND_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Derive vote_round_id = Blake2b-256(snapshot_height_BE || snapshot_blockhash ||
+/// proposals_hash || vote_end_time_BE || nullifier_imt_root || nc_root).
+pub fn derive_round_id(fields: &SetupRoundFields) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(&fields.snapshot_height.to_be_bytes());
+    hasher.update(&fields.snapshot_blockhash);
+    hasher.update(&fields.proposals_hash);
+    hasher.update(&fields.vote_end_time.to_be_bytes());
+    hasher.update(&fields.nullifier_imt_root);
+    hasher.update(&fields.nc_root);
+    let hash = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hash.as_bytes());
+    out
+}
+
+fn to_base64(bytes: &[u8]) -> String {
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        bytes,
+    )
+}
+
+/// Build MsgCreateVotingSession body and derive round_id.
+/// If session_override is Some, use those fields (e.g. from delegation bundle);
+/// otherwise use synthetic values with vote_end_time = now + expires_in_sec.
+pub fn create_voting_session_payload(
+    ea_pk: &[u8],
+    expires_in_sec: u64,
+    session_override: Option<SetupRoundFields>,
+) -> (Value, SetupRoundFields, [u8; 32]) {
+    let fields = session_override.unwrap_or_else(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        SetupRoundFields {
+            snapshot_height: 1000 + round_counter_next(),
+            snapshot_blockhash: [0xaa; 32],
+            proposals_hash: [0xbb; 32],
+            vote_end_time: now + expires_in_sec,
+            nullifier_imt_root: [0xcc; 32],
+            nc_root: [0xdd; 32],
+        }
+    });
+    let round_id = derive_round_id(&fields);
+    let body = json!({
+        "creator": "zvote1admin",
+        "snapshot_height": fields.snapshot_height,
+        "snapshot_blockhash": to_base64(&fields.snapshot_blockhash),
+        "proposals_hash": to_base64(&fields.proposals_hash),
+        "vote_end_time": fields.vote_end_time,
+        "nullifier_imt_root": to_base64(&fields.nullifier_imt_root),
+        "nc_root": to_base64(&fields.nc_root),
+        "ea_pk": to_base64(ea_pk),
+        "vk_zkp1": to_base64(&[0xf1u8; 64]),
+        "vk_zkp2": to_base64(&[0xf2u8; 64]),
+        "vk_zkp3": to_base64(&[0xf3u8; 64]),
+        "proposals": [
+            { "id": 0, "title": "Proposal A", "description": "First proposal" },
+            { "id": 1, "title": "Proposal B", "description": "Second proposal" },
+        ],
+    });
+    (body, fields, round_id)
+}
+
+/// Delegation bundle fields (from build_delegation_bundle + create_delegation_proof).
+pub struct DelegationBundlePayload {
+    pub rk: Vec<u8>,
+    pub spend_auth_sig: Vec<u8>,
+    pub sighash: Vec<u8>,
+    pub signed_note_nullifier: Vec<u8>,
+    pub cmx_new: Vec<u8>,
+    pub enc_memo: Vec<u8>,
+    pub gov_comm: Vec<u8>,
+    pub gov_nullifiers: Vec<Vec<u8>>,
+    pub proof: Vec<u8>,
+}
+
+/// Build MsgDelegateVote body.
+pub fn delegate_vote_payload(round_id: &[u8], bundle: &DelegationBundlePayload) -> Value {
+    let gov_nulls: Vec<String> = bundle
+        .gov_nullifiers
+        .iter()
+        .map(|b| to_base64(b))
+        .collect();
+    json!({
+        "rk": to_base64(&bundle.rk),
+        "spend_auth_sig": to_base64(&bundle.spend_auth_sig),
+        "sighash": to_base64(&bundle.sighash),
+        "signed_note_nullifier": to_base64(&bundle.signed_note_nullifier),
+        "cmx_new": to_base64(&bundle.cmx_new),
+        "enc_memo": to_base64(&bundle.enc_memo),
+        "gov_comm": to_base64(&bundle.gov_comm),
+        "gov_nullifiers": gov_nulls,
+        "proof": to_base64(&bundle.proof),
+        "vote_round_id": to_base64(round_id),
+    })
+}
+
+static NULLIFIER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Unique 32-byte nullifier (canonical Pallas Fp: MSB < 0x40).
+fn unique_nullifier() -> [u8; 32] {
+    let c = NULLIFIER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut nf = [0xab; 32];
+    nf[0..4].copy_from_slice(&(c as u32).to_be_bytes());
+    nf[31] = 0x0a;
+    nf
+}
+
+/// Build MsgCastVote body (mock proof).
+pub fn cast_vote_payload(round_id: &[u8], anchor_height: u32) -> Value {
+    json!({
+        "van_nullifier": to_base64(&unique_nullifier()),
+        "vote_authority_note_new": to_base64(&unique_nullifier()),
+        "vote_commitment": to_base64(&unique_nullifier()),
+        "proposal_id": 0,
+        "proof": to_base64(b"mock-cast-vote-proof"),
+        "vote_round_id": to_base64(round_id),
+        "vote_comm_tree_anchor_height": anchor_height,
+    })
+}
+
+/// Build MsgRevealShare body. enc_share is 64-byte ciphertext (base64).
+pub fn reveal_share_payload(
+    round_id: &[u8],
+    anchor_height: u32,
+    enc_share_b64: &str,
+    proposal_id: u32,
+    vote_decision: u32,
+) -> Value {
+    json!({
+        "share_nullifier": to_base64(&unique_nullifier()),
+        "enc_share": enc_share_b64,
+        "proposal_id": proposal_id,
+        "vote_decision": vote_decision,
+        "proof": to_base64(b"mock-reveal-share-proof"),
+        "vote_round_id": to_base64(round_id),
+        "vote_comm_tree_anchor_height": anchor_height,
+    })
+}
+
+/// Tally entry for MsgSubmitTally.
+pub struct TallyEntry {
+    pub proposal_id: u32,
+    pub vote_decision: u32,
+    pub total_value: u64,
+}
+
+/// Build MsgSubmitTally body.
+pub fn submit_tally_payload(round_id: &[u8], creator: &str, entries: &[TallyEntry]) -> Value {
+    let entries_json: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "proposal_id": e.proposal_id,
+                "vote_decision": e.vote_decision,
+                "total_value": e.total_value,
+            })
+        })
+        .collect();
+    json!({
+        "vote_round_id": to_base64(round_id),
+        "creator": creator,
+        "entries": entries_json,
+    })
+}
+
+/// Encode ElGamal ciphertext to base64 (64 bytes).
+pub fn ciphertext_to_base64(ct: &Ciphertext) -> String {
+    to_base64(&elgamal::marshal(ct))
+}
+
+/// Encrypt a vote value and return base64 enc_share for reveal_share payload.
+pub fn encrypt_share(pk: &PublicKey, value: u64, rng: &mut impl rand_core::RngCore) -> String {
+    let ct = elgamal::encrypt(pk, value, rng);
+    ciphertext_to_base64(&ct)
+}

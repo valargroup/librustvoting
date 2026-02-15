@@ -8,5 +8,10 @@
 pub mod builder;
 pub mod circuit;
 pub mod imt;
+pub mod prove;
 
-pub use circuit::{Circuit, Instance};
+pub use circuit::{Circuit, Instance, K};
+pub use prove::{
+    create_delegation_proof, delegation_params, delegation_proving_key,
+    verify_delegation_proof, verify_delegation_proof_raw,
+};
