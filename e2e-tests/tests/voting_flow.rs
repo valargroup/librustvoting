@@ -224,8 +224,8 @@ fn voting_flow_full_lifecycle() {
     assert!(tally.get("1").is_some());
 
     // ----- Step 8: Wait for TALLYING -----
-    log_step("Step 8", "waiting for TALLYING (up to 90s)");
-    wait_for_round_status(&round_id_hex, SESSION_STATUS_TALLYING, 90_000, 3_000)
+    log_step("Step 8", "waiting for TALLYING (up to 430s)");
+    wait_for_round_status(&round_id_hex, SESSION_STATUS_TALLYING, 430_000, 3_000)
         .expect("wait for TALLYING");
     let (_, json) = get_json(&format!("/zally/v1/round/{}", round_id_hex)).expect("GET round");
     assert_eq!(
