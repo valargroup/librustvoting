@@ -143,8 +143,6 @@ jobs:
         run: cargo build --manifest-path ../vote-commitment-tree-client/Cargo.toml
       - name: Initialize chain
         run: bash scripts/init.sh
-      - name: Enable REST API server
-        run: sed -i '/\[api\]/,/\[.*\]/ s/enable = false/enable = true/' ~/.zallyd/config/app.toml
       - name: Start chain in background
         run: |
           zallyd start --home ~/.zallyd > chain.log 2>&1 &
@@ -165,6 +163,8 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
         working-directory: sdk/tests/api
+      - name: Generate delegation fixtures
+        run: make fixtures
       - name: Run API tests
         run: cd tests/api && npm test -- --reporter=verbose
         env:

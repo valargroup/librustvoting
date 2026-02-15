@@ -1,6 +1,9 @@
 # Go binary
 sdk/zallyd
 
+# Debug chain data (launch.json uses this to avoid replay errors)
+.zallyd-debug/
+
 # Rust build artifacts
 **/target/
 
