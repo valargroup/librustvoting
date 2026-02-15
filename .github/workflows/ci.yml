@@ -124,13 +124,14 @@ jobs:
           go-version: "1.23"
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Cache Rust build (circuits + tree client)
+      - name: Cache Rust build (circuits + e2e-tests + tree client)
         uses: actions/cache@v4
         with:
           path: |
             sdk/circuits/target
+            e2e-tests/target
             vote-commitment-tree-client/target
-          key: ${{ runner.os }}-api-rust-${{ hashFiles('sdk/circuits/Cargo.lock', 'vote-commitment-tree-client/Cargo.lock') }}
+          key: ${{ runner.os }}-api-rust-${{ hashFiles('sdk/circuits/Cargo.lock', 'e2e-tests/Cargo.lock', 'vote-commitment-tree-client/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-api-rust-
       - name: Cache Go build
@@ -140,16 +141,12 @@ jobs:
           key: ${{ runner.os }}-api-go-${{ hashFiles('sdk/go.sum', 'sdk/circuits/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-api-go-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
       - name: Build and install zallyd
         run: make install-ffi
         env:
           GOCACHE: ${{ github.workspace }}/sdk/.cache/go-build
       - name: Pre-build vote-commitment-tree-client
-        run: cargo build --manifest-path ../vote-commitment-tree-client/Cargo.toml
+        run: cargo build --release --manifest-path ../vote-commitment-tree-client/Cargo.toml
       - name: Initialize chain
         run: bash scripts/init.sh
       - name: Start chain in background
@@ -169,13 +166,8 @@ jobs:
           echo "Chain failed to start within 120s"
           cat chain.log
           exit 1
-      - name: Install npm dependencies
-        run: npm ci
-        working-directory: sdk/tests/api
-      - name: Generate delegation fixtures
-        run: make fixtures
-      - name: Run API tests
-        run: cd tests/api && npm test -- --reporter=verbose
+      - name: Run Rust E2E API tests
+        run: cargo test --release --manifest-path ../e2e-tests/Cargo.toml -- --nocapture --ignored --test-threads=1
         env:
           ZALLY_API_URL: http://localhost:1317
       - name: Upload chain log on failure

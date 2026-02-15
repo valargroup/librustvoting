@@ -3,6 +3,7 @@
     "build.buildFlags": ["-tags=halo2"]
   },
   "rust-analyzer.linkedProjects": [
+    "e2e-tests/Cargo.toml",
     "nullifier-ingest/imt-tree/Cargo.toml",
     "nullifier-ingest/service/Cargo.toml",
     "orchard/Cargo.toml",

@@ -1,0 +1,183 @@
+//! Build a real delegation bundle for E2E tests (ZKP #1 + RedPallas).
+//!
+//! Generates session params with vote_end_time = now + 120s and a canonical
+//! vote_round_id, then builds the delegation bundle and RedPallas signature
+//! so the test can create the session and delegate without fixture files.
+
+use crate::payloads::{DelegationBundlePayload, SetupRoundFields};
+use blake2b_simd::Params as Blake2bParams;
+use ff::{Field, PrimeField};
+use incrementalmerkletree::{Hashable, Level};
+use orchard::{
+    delegation::{
+        builder::{build_delegation_bundle, RealNoteInput},
+        imt::{ImtProvider, SpacedLeafImtProvider},
+        prove::{create_delegation_proof, verify_delegation_proof},
+    },
+    keys::{FullViewingKey, Scope, SpendAuthorizingKey, SpendingKey},
+    note::{ExtractedNoteCommitment, Note, Rho},
+    tree::{MerkleHashOrchard, MerklePath},
+    value::NoteValue,
+    NOTE_COMMITMENT_TREE_DEPTH,
+};
+use pasta_curves::pallas;
+use rand::rngs::OsRng;
+
+/// Build delegation bundle and session fields for the E2E test.
+/// vote_end_time = now + 120s. Returns payload for MsgDelegateVote and
+/// session fields for MsgCreateVotingSession (so round_id matches the proof).
+pub fn build_delegation_bundle_for_test(
+) -> Result<(DelegationBundlePayload, SetupRoundFields), Box<dyn std::error::Error + Send + Sync>>
+{
+    let mut rng = OsRng;
+
+    let sk = SpendingKey::random(&mut rng);
+    let fvk: FullViewingKey = (&sk).into();
+    let output_recipient = fvk.address_at(1u32, Scope::External);
+    let alpha = pallas::Scalar::random(&mut rng);
+    let gov_comm_rand = pallas::Base::random(&mut rng);
+
+    let note_value = 15_000_000u64;
+    let recipient = fvk.address_at(0u32, Scope::External);
+    let (_, _, dummy_parent) = Note::dummy(&mut rng, None);
+    let note = Note::new(
+        recipient,
+        NoteValue::from_raw(note_value),
+        Rho::from_nf_old(dummy_parent.nullifier(&fvk)),
+        &mut rng,
+    );
+
+    let empty_leaf = MerkleHashOrchard::empty_leaf();
+    let cmx = ExtractedNoteCommitment::from(note.commitment());
+    let leaves = [
+        MerkleHashOrchard::from_cmx(&cmx),
+        empty_leaf,
+        empty_leaf,
+        empty_leaf,
+    ];
+    let l1_0 = MerkleHashOrchard::combine(Level::from(0), &leaves[0], &leaves[1]);
+    let l1_1 = MerkleHashOrchard::combine(Level::from(0), &leaves[2], &leaves[3]);
+    let l2_0 = MerkleHashOrchard::combine(Level::from(1), &l1_0, &l1_1);
+    let mut current = l2_0;
+    for level in 2..NOTE_COMMITMENT_TREE_DEPTH {
+        let sibling = MerkleHashOrchard::empty_root(Level::from(level as u8));
+        current = MerkleHashOrchard::combine(Level::from(level as u8), &current, &sibling);
+    }
+    let nc_root_bytes = current.to_bytes();
+    let nc_root: pallas::Base = pallas::Base::from_repr(nc_root_bytes).unwrap();
+
+    let mut auth_path = [MerkleHashOrchard::empty_leaf(); NOTE_COMMITMENT_TREE_DEPTH];
+    auth_path[0] = leaves[1];
+    auth_path[1] = l1_1;
+    for level in 2..NOTE_COMMITMENT_TREE_DEPTH {
+        auth_path[level] = MerkleHashOrchard::empty_root(Level::from(level as u8));
+    }
+    let merkle_path = MerklePath::from_parts(0u32, auth_path);
+
+    let imt = SpacedLeafImtProvider::new();
+    let nf_imt_root = imt.root();
+    let real_nf = note.nullifier(&fvk);
+    let nf_fp: pallas::Base = pallas::Base::from_repr(real_nf.to_bytes()).unwrap();
+    let imt_proof = imt.non_membership_proof(nf_fp);
+
+    let note_input = RealNoteInput {
+        note,
+        fvk: fvk.clone(),
+        merkle_path,
+        imt_proof,
+    };
+
+    let snapshot_blockhash = [0xAAu8; 32];
+    let proposals_hash = [0xBBu8; 32];
+    let vote_end_time: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 120;
+
+    let nc_root_repr = nc_root.to_repr();
+    let nf_imt_root_repr = nf_imt_root.to_repr();
+
+    let mut snapshot_height: u64 = 42_000;
+    let vote_round_id: pallas::Base;
+    loop {
+        let mut data = Vec::with_capacity(8 + 32 + 32 + 8 + 32 + 32);
+        data.extend_from_slice(&snapshot_height.to_be_bytes());
+        data.extend_from_slice(&snapshot_blockhash);
+        data.extend_from_slice(&proposals_hash);
+        data.extend_from_slice(&vote_end_time.to_be_bytes());
+        data.extend_from_slice(nf_imt_root_repr.as_ref());
+        data.extend_from_slice(nc_root_repr.as_ref());
+
+        let hash = Blake2bParams::new().hash_length(32).hash(&data);
+        let mut repr = [0u8; 32];
+        repr.copy_from_slice(hash.as_bytes());
+
+        if let Some(fp) = pallas::Base::from_repr(repr).into() {
+            vote_round_id = fp;
+            break;
+        }
+        snapshot_height += 1;
+    }
+
+    let bundle = build_delegation_bundle(
+        vec![note_input],
+        &fvk,
+        alpha,
+        output_recipient,
+        vote_round_id,
+        nc_root,
+        gov_comm_rand,
+        &imt,
+        &mut rng,
+    )
+    .map_err(|e| format!("build_delegation_bundle: {}", e))?;
+
+    let proof = create_delegation_proof(bundle.circuit, &bundle.instance);
+    verify_delegation_proof(&proof, &bundle.instance)
+        .map_err(|e| format!("verify_delegation_proof: {}", e))?;
+
+    let ask = SpendAuthorizingKey::from(&sk);
+    let rsk = ask.randomize(&alpha);
+    let sighash_full = Blake2bParams::new().hash_length(32).hash(b"ZALLY_SIGHASH_V0");
+    let mut sighash = [0u8; 32];
+    sighash.copy_from_slice(sighash_full.as_bytes());
+    let sig = rsk.sign(&mut rng, &sighash);
+
+    let rk_bytes: [u8; 32] = bundle.instance.rk.clone().into();
+    let sig_bytes: [u8; 64] = (&sig).into();
+    let nf_signed_bytes = bundle.instance.nf_signed.to_bytes();
+    let cmx_new_bytes = bundle.instance.cmx_new.to_repr();
+    let gov_comm_bytes = bundle.instance.gov_comm.to_repr();
+    let _vote_round_id_repr = bundle.instance.vote_round_id.to_repr();
+    let gov_null_bytes: Vec<[u8; 32]> = bundle
+        .instance
+        .gov_null
+        .iter()
+        .map(|g| g.to_repr())
+        .collect();
+    let enc_memo = [0x05u8; 64];
+
+    let payload = DelegationBundlePayload {
+        rk: rk_bytes.to_vec(),
+        spend_auth_sig: sig_bytes.to_vec(),
+        sighash: sighash.to_vec(),
+        signed_note_nullifier: nf_signed_bytes.to_vec(),
+        cmx_new: cmx_new_bytes.as_ref().to_vec(),
+        enc_memo: enc_memo.to_vec(),
+        gov_comm: gov_comm_bytes.as_ref().to_vec(),
+        gov_nullifiers: gov_null_bytes.iter().map(|b| b.to_vec()).collect(),
+        proof,
+    };
+
+    let fields = SetupRoundFields {
+        snapshot_height,
+        snapshot_blockhash,
+        proposals_hash,
+        vote_end_time,
+        nullifier_imt_root: nf_imt_root_repr.as_ref().try_into().unwrap(),
+        nc_root: nc_root_repr.as_ref().try_into().unwrap(),
+    };
+
+    Ok((payload, fields))
+}
