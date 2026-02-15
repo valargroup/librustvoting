@@ -74,6 +74,9 @@ impl core::fmt::Display for ImtError {
     }
 }
 
+#[cfg(feature = "std")]
+impl std::error::Error for ImtError {}
+
 /// Trait for providing IMT non-membership proofs.
 ///
 /// Implementations must return proofs against a consistent root — all proofs
