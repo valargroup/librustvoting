@@ -1,0 +1,115 @@
+# Deploy zallyd chain to a remote host on every push to main.
+# Requires repository secrets: DEPLOY_HOST, DEPLOY_USER, SSH_PASSWORD.
+# See sdk/docs/deploy-setup.md for one-time remote setup.
+
+name: Deploy SDK chain
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'sdk/**'
+  workflow_dispatch: # allow manual run
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_PATH: /opt/zally-chain
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            sdk/circuits/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-sdk-circuits-${{ hashFiles('sdk/circuits/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sdk-circuits-
+
+      - name: Build Rust circuits library
+        run: make circuits
+
+      - name: Build zallyd with FFI
+        run: make build-ffi
+
+      - name: Copy init script to build root
+        run: cp scripts/init.sh init.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-chain-binaries
+          path: |
+            sdk/zallyd
+            sdk/init.sh
+
+  deploy:
+    name: Deploy to remote
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-chain-binaries
+
+      - name: Make binary executable
+        run: chmod +x zallyd
+
+      - name: Create deploy directory
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script: mkdir -p ${{ env.DEPLOY_PATH }}
+
+      - name: Deploy via SSH
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          source: "zallyd,init.sh"
+          target: ${{ env.DEPLOY_PATH }}
+
+      - name: Initialize chain
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script: |
+            export HOME=${{ env.DEPLOY_PATH }} PATH=${{ env.DEPLOY_PATH }}:$PATH
+            chmod +x ${{ env.DEPLOY_PATH }}/zallyd
+            bash ${{ env.DEPLOY_PATH }}/init.sh
+
+      - name: Restart service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script: |
+            sudo systemctl restart zallyd || true
