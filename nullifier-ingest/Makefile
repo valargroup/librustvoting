@@ -32,9 +32,11 @@ serve: ## Start the exclusion proof query server
 # Same binary and env as CI deploy; use for local testing before pushing.
 # Put nullifiers.db and nullifiers.db.tree in $(DATA_DIR) (default: ./nullifier-service).
 DATA_DIR ?= nullifier-service
+# If DATA_DIR is absolute, use it as-is; otherwise path is relative to $(SERVICE_DIR) so use ../
+SERVE_DB_PATH := $(if $(filter /%,$(DATA_DIR)),$(DATA_DIR)/nullifiers.db,../$(DATA_DIR)/nullifiers.db)
 serve-deploy: build ## Build release and run query-server (like deploy); DB_PATH=$(DATA_DIR)/nullifiers.db
 	@mkdir -p $(DATA_DIR)
-	cd $(SERVICE_DIR) && DB_PATH="../$(DATA_DIR)/nullifiers.db" PORT=$(PORT) ./target/release/query-server
+	cd $(SERVICE_DIR) && DB_PATH="$(SERVE_DB_PATH)" PORT=$(PORT) ./target/release/query-server
 
 test: ## Run unit tests for all subcrates
 	cd $(IMT_DIR) && cargo test --lib
