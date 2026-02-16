@@ -4,6 +4,7 @@
 //! ElGamal PK is read from the node's EA keypair (ZALLY_EA_PK_PATH env var).
 
 use base64::Engine;
+use blake2b_simd::Params as Blake2bParams;
 use e2e_tests::{
     api::{
         self, commitment_tree_next_index, get_json, post_json, post_json_accept_committed,
@@ -16,9 +17,11 @@ use e2e_tests::{
     },
     setup::{build_delegation_bundle_for_test, build_van_merkle_witness},
 };
-use ff::PrimeField;
+use ff::{Field, PrimeField};
 use group::Curve;
+use orchard::keys::SpendAuthorizingKey;
 use orchard::vote_proof::build_vote_proof_from_delegation;
+use pasta_curves::pallas;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -188,6 +191,9 @@ fn voting_flow_full_lifecycle() {
     // elgamal::keygen which uses pallas::Point::generator().
     let ea_pk_affine = elgamal_pk.0.to_affine();
 
+    // 4c: Generate alpha_v for spend auth randomization (caller controls signing).
+    let alpha_v = pallas::Scalar::random(&mut rng);
+
     // 4c: Generate real vote proof.
     let vote_bundle = build_vote_proof_from_delegation(
         &vote_proof_data.sk,
@@ -201,6 +207,7 @@ fn voting_flow_full_lifecycle() {
         1,                              // proposal_id
         1,                              // vote_decision
         ea_pk_affine,
+        alpha_v,
         &mut rng,
     )
     .expect("build_vote_proof_from_delegation");
@@ -222,6 +229,54 @@ fn voting_flow_full_lifecycle() {
     let r_vpk_y_bytes = vote_bundle.instance.r_vpk_y.to_repr();
     let van_new_bytes = vote_bundle.instance.vote_authority_note_new.to_repr();
     let vote_comm_bytes = vote_bundle.instance.vote_commitment.to_repr();
+    let r_vpk_bytes = &vote_bundle.r_vpk_bytes;
+
+    // 4e: Compute canonical sighash for MsgCastVote (must match Go's ComputeCastVoteSighash).
+    // Domain || vote_round_id || r_vpk || van_nullifier || vote_authority_note_new ||
+    // vote_commitment || proposal_id (4 LE, padded 32) || anchor_height (8 LE, padded 32)
+    const CAST_VOTE_SIGHASH_DOMAIN: &[u8] = b"ZALLY_CAST_VOTE_SIGHASH_V0";
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(CAST_VOTE_SIGHASH_DOMAIN);
+    // vote_round_id: pad to 32 bytes
+    let mut buf32 = [0u8; 32];
+    let vr_len = round_id.len().min(32);
+    buf32[..vr_len].copy_from_slice(&round_id[..vr_len]);
+    canonical.extend_from_slice(&buf32);
+    // r_vpk: already 32 bytes
+    canonical.extend_from_slice(r_vpk_bytes);
+    // van_nullifier: 32 bytes
+    buf32 = [0u8; 32];
+    let vn = van_nullifier_bytes.as_ref();
+    buf32[..vn.len().min(32)].copy_from_slice(&vn[..vn.len().min(32)]);
+    canonical.extend_from_slice(&buf32);
+    // vote_authority_note_new: 32 bytes
+    buf32 = [0u8; 32];
+    let vn_new = van_new_bytes.as_ref();
+    buf32[..vn_new.len().min(32)].copy_from_slice(&vn_new[..vn_new.len().min(32)]);
+    canonical.extend_from_slice(&buf32);
+    // vote_commitment: 32 bytes
+    buf32 = [0u8; 32];
+    let vc = vote_comm_bytes.as_ref();
+    buf32[..vc.len().min(32)].copy_from_slice(&vc[..vc.len().min(32)]);
+    canonical.extend_from_slice(&buf32);
+    // proposal_id: 4 bytes LE, padded to 32 bytes
+    let mut pid_buf = [0u8; 32];
+    pid_buf[..4].copy_from_slice(&1u32.to_le_bytes());
+    canonical.extend_from_slice(&pid_buf);
+    // anchor_height: 8 bytes LE, padded to 32 bytes
+    let mut ah_buf = [0u8; 32];
+    ah_buf[..8].copy_from_slice(&(anchor_height as u64).to_le_bytes());
+    canonical.extend_from_slice(&ah_buf);
+
+    let sighash_full = Blake2bParams::new().hash_length(32).hash(&canonical);
+    let mut sighash = [0u8; 32];
+    sighash.copy_from_slice(sighash_full.as_bytes());
+
+    // 4f: Sign the sighash with the randomized voting key (rsk_v = ask_v.randomize(&alpha_v)).
+    let ask_v = SpendAuthorizingKey::from(&vote_proof_data.sk);
+    let rsk_v = ask_v.randomize(&alpha_v);
+    let vote_auth_sig = rsk_v.sign(&mut rng, &sighash);
+    let vote_auth_sig_bytes: [u8; 64] = (&vote_auth_sig).into();
 
     let cast_body = cast_vote_payload_real(
         &round_id,
@@ -233,6 +288,9 @@ fn voting_flow_full_lifecycle() {
         vote_comm_bytes.as_ref(),
         1,  // proposal_id
         &vote_bundle.proof,
+        r_vpk_bytes,
+        &sighash,
+        &vote_auth_sig_bytes,
     );
 
     let (status, json) = {
@@ -272,6 +330,14 @@ fn voting_flow_full_lifecycle() {
         code,
         json.get("log").or(json.get("error"))
     );
+    // broadcast_tx_sync returns after CheckTx; wait until the cast is committed (tree has 3 leaves).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while std::time::Instant::now() < deadline {
+        if commitment_tree_next_index().map(|n| n >= 3).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
     block_wait();
 
     // ----- Step 5: Tree updated after cast (3 leaves: 1 from delegation + 2 from cast) -----
@@ -280,9 +346,12 @@ fn voting_flow_full_lifecycle() {
     assert_eq!(status, 200, "GET tree latest: status={} body={:?}", status, json);
     let tree = json.get("tree").expect("tree");
     anchor_height = tree.get("height").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let next_index = tree.get("next_index").and_then(|x| x.as_u64()).unwrap_or(0);
     assert_eq!(
-        tree.get("next_index").and_then(|x| x.as_u64()).unwrap_or(0),
-        3
+        next_index,
+        3,
+        "commitment tree next_index: expected 3 after cast (1 delegation + 2 from cast), got {}; cast may not be in a block yet",
+        next_index
     );
 
     // Step 4c: tree client sync 3 leaves

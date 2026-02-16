@@ -42,6 +42,9 @@ pub fn post_json_once(path: &str, body: &Value) -> Result<(u16, Value), Box<dyn 
 }
 
 /// POST JSON to path; retry on 502 (node busy) and on retryable socket errors.
+/// Stops retrying immediately if the 502 body indicates the tx is already in the
+/// mempool cache (no point retrying — the server now returns 200 for that case,
+/// but this guard catches older server versions or race windows).
 pub fn post_json(path: &str, body: &Value) -> Result<(u16, Value), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}{}", base_url(), path);
     let mut last_err = None;
@@ -50,6 +53,13 @@ pub fn post_json(path: &str, body: &Value) -> Result<(u16, Value), Box<dyn std::
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 if status == 502 && attempt < MAX_RETRIES - 1 {
+                    // Read body to check for "already in cache" before deciding to retry.
+                    let json: Value = resp.json().unwrap_or(Value::Null);
+                    let err_text = json.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                    if err_text.contains("already exists in cache") || err_text.contains("already in cache") {
+                        eprintln!("[E2E] POST {} tx already in mempool cache; not retrying", path);
+                        return Ok((status, json));
+                    }
                     let backoff = 4 * (attempt + 1) as u64;
                     eprintln!("[E2E] POST {} returned 502 (attempt {}/{}), retrying in {}s...", path, attempt + 1, MAX_RETRIES, backoff);
                     std::thread::sleep(std::time::Duration::from_secs(backoff));

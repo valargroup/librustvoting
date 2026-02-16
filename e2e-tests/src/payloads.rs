@@ -153,11 +153,17 @@ pub fn cast_vote_payload(round_id: &[u8], anchor_height: u32) -> Value {
         "proof": to_base64(b"mock-cast-vote-proof"),
         "vote_round_id": to_base64(round_id),
         "vote_comm_tree_anchor_height": anchor_height,
+        "r_vpk_x": to_base64(&[0u8; 32]),
+        "r_vpk_y": to_base64(&[0u8; 32]),
+        "vote_auth_sig": to_base64(&[0u8; 64]),
+        "sighash": to_base64(&[0u8; 32]),
+        "r_vpk": to_base64(&[0u8; 32]),
     })
 }
 
 /// Build MsgCastVote body with a real ZKP #2 proof and public inputs.
-/// Condition 4 (Spend Authority) requires r_vpk_x and r_vpk_y in the payload.
+/// Condition 4 (Spend Authority) requires r_vpk_x and r_vpk_y in the payload,
+/// plus the RedPallas signature fields (vote_auth_sig, sighash, r_vpk).
 pub fn cast_vote_payload_real(
     round_id: &[u8],
     anchor_height: u32,
@@ -168,6 +174,9 @@ pub fn cast_vote_payload_real(
     vote_commitment: &[u8],
     proposal_id: u32,
     proof: &[u8],
+    r_vpk: &[u8],
+    sighash: &[u8],
+    vote_auth_sig: &[u8],
 ) -> Value {
     json!({
         "van_nullifier": to_base64(van_nullifier),
@@ -179,6 +188,9 @@ pub fn cast_vote_payload_real(
         "proof": to_base64(proof),
         "vote_round_id": to_base64(round_id),
         "vote_comm_tree_anchor_height": anchor_height,
+        "r_vpk": to_base64(r_vpk),
+        "sighash": to_base64(sighash),
+        "vote_auth_sig": to_base64(vote_auth_sig),
     })
 }
 

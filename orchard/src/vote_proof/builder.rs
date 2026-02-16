@@ -33,6 +33,8 @@ pub struct VoteProofBundle {
     pub proof: Vec<u8>,
     /// Public inputs for the proof.
     pub instance: Instance,
+    /// Compressed r_vpk (32 bytes) for sighash computation and signature verification.
+    pub r_vpk_bytes: [u8; 32],
 }
 
 /// Errors that can occur during vote proof construction.
@@ -106,6 +108,8 @@ fn random_valid_base_as_scalar(rng: &mut impl RngCore) -> pallas::Base {
 /// * `proposal_id` - Which proposal to vote on (0-indexed, must be < 16).
 /// * `vote_decision` - The voter's choice.
 /// * `ea_pk` - Election authority public key (Pallas affine point from session).
+/// * `alpha_v` - Spend auth randomizer for the voting hotkey. The caller
+///   retains this to sign the sighash with `rsk_v = ask_v.randomize(&alpha_v)`.
 /// * `rng` - Random number generator for El Gamal encryption randomness.
 ///
 /// **Expensive**: K=14 proof generation takes ~30-60 seconds in release mode.
@@ -122,6 +126,7 @@ pub fn build_vote_proof_from_delegation(
     proposal_id: u64,
     vote_decision: u64,
     ea_pk: pallas::Affine,
+    alpha_v: pallas::Scalar,
     rng: &mut impl RngCore,
 ) -> Result<VoteProofBundle, VoteProofBuildError> {
     // ---- Key derivation (matches delegation's key hierarchy) ----
@@ -256,12 +261,13 @@ pub fn build_vote_proof_from_delegation(
     let shares_hash_val = shares_hash(enc_c1_x, enc_c2_x);
 
     // ---- Condition 4: r_vpk = ak + [alpha_v] * G ----
+    // alpha_v is now provided by the caller so they can sign with rsk_v.
     let ak_point = pallas::Point::from(spend_auth_g_affine()) * vsk;
-    let alpha_v = pallas::Scalar::random(rng);
     let r_vpk = (ak_point + pallas::Point::from(spend_auth_g_affine()) * alpha_v)
         .to_affine();
     let r_vpk_x = *r_vpk.coordinates().unwrap().x();
     let r_vpk_y = *r_vpk.coordinates().unwrap().y();
+    let r_vpk_bytes: [u8; 32] = r_vpk.to_bytes();
 
     // ---- Vote commitment ----
 
@@ -360,5 +366,5 @@ pub fn build_vote_proof_from_delegation(
 
     let proof = create_vote_proof(circuit, &instance);
 
-    Ok(VoteProofBundle { proof, instance })
+    Ok(VoteProofBundle { proof, instance, r_vpk_bytes })
 }
