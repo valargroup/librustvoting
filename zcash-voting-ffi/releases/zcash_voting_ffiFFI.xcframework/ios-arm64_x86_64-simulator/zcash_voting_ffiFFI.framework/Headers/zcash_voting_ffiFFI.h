@@ -436,6 +436,11 @@ RustBuffer uniffi_zcash_voting_ffi_fn_func_generate_hotkey(RustBuffer seed, Rust
 RustBuffer uniffi_zcash_voting_ffi_fn_func_generate_note_witness(uint64_t note_position, uint32_t snapshot_height, RustBuffer tree_state_bytes, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_SIGN_CAST_VOTE
+#define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_SIGN_CAST_VOTE
+RustBuffer uniffi_zcash_voting_ffi_fn_func_sign_cast_vote(RustBuffer hotkey_seed, uint32_t network_id, RustBuffer vote_round_id_hex, RustBuffer r_vpk_bytes, RustBuffer van_nullifier, RustBuffer vote_authority_note_new, RustBuffer vote_commitment, uint32_t proposal_id, uint32_t anchor_height, RustBuffer alpha_v, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_VERIFY_WITNESS
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_VERIFY_WITNESS
 int8_t uniffi_zcash_voting_ffi_fn_func_verify_witness(RustBuffer witness, RustCallStatus *_Nonnull out_status
@@ -784,6 +789,12 @@ uint16_t uniffi_zcash_voting_ffi_checksum_func_generate_hotkey(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_CHECKSUM_FUNC_GENERATE_NOTE_WITNESS
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_CHECKSUM_FUNC_GENERATE_NOTE_WITNESS
 uint16_t uniffi_zcash_voting_ffi_checksum_func_generate_note_witness(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_CHECKSUM_FUNC_SIGN_CAST_VOTE
+#define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_CHECKSUM_FUNC_SIGN_CAST_VOTE
+uint16_t uniffi_zcash_voting_ffi_checksum_func_sign_cast_vote(void
 
 );
 #endif

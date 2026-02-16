@@ -984,6 +984,119 @@ public func FfiConverterTypeVotingDatabase_lower(_ value: VotingDatabase) -> Uns
 
 
 
+/**
+ * Computed signature fields for cast-vote TX submission.
+ */
+public struct CastVoteSignature {
+    /**
+     * Decompressed r_vpk x-coordinate (32 bytes).
+     */
+    public var rVpkX: Data
+    /**
+     * Decompressed r_vpk y-coordinate (32 bytes).
+     */
+    public var rVpkY: Data
+    /**
+     * Canonical cast-vote sighash (32 bytes).
+     */
+    public var sighash: Data
+    /**
+     * Spend auth signature over sighash (64 bytes).
+     */
+    public var voteAuthSig: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Decompressed r_vpk x-coordinate (32 bytes).
+         */rVpkX: Data,
+        /**
+         * Decompressed r_vpk y-coordinate (32 bytes).
+         */rVpkY: Data,
+        /**
+         * Canonical cast-vote sighash (32 bytes).
+         */sighash: Data,
+        /**
+         * Spend auth signature over sighash (64 bytes).
+         */voteAuthSig: Data) {
+        self.rVpkX = rVpkX
+        self.rVpkY = rVpkY
+        self.sighash = sighash
+        self.voteAuthSig = voteAuthSig
+    }
+}
+
+#if compiler(>=6)
+extension CastVoteSignature: Sendable {}
+#endif
+
+
+extension CastVoteSignature: Equatable, Hashable {
+    public static func ==(lhs: CastVoteSignature, rhs: CastVoteSignature) -> Bool {
+        if lhs.rVpkX != rhs.rVpkX {
+            return false
+        }
+        if lhs.rVpkY != rhs.rVpkY {
+            return false
+        }
+        if lhs.sighash != rhs.sighash {
+            return false
+        }
+        if lhs.voteAuthSig != rhs.voteAuthSig {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(rVpkX)
+        hasher.combine(rVpkY)
+        hasher.combine(sighash)
+        hasher.combine(voteAuthSig)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCastVoteSignature: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CastVoteSignature {
+        return
+            try CastVoteSignature(
+                rVpkX: FfiConverterData.read(from: &buf),
+                rVpkY: FfiConverterData.read(from: &buf),
+                sighash: FfiConverterData.read(from: &buf),
+                voteAuthSig: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CastVoteSignature, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.rVpkX, into: &buf)
+        FfiConverterData.write(value.rVpkY, into: &buf)
+        FfiConverterData.write(value.sighash, into: &buf)
+        FfiConverterData.write(value.voteAuthSig, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCastVoteSignature_lift(_ buf: RustBuffer) throws -> CastVoteSignature {
+    return try FfiConverterTypeCastVoteSignature.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCastVoteSignature_lower(_ value: CastVoteSignature) -> RustBuffer {
+    return FfiConverterTypeCastVoteSignature.lower(value)
+}
+
+
 public struct DelegationAction {
     public var actionBytes: Data
     public var rk: Data
@@ -3515,6 +3628,28 @@ public func generateNoteWitness(notePosition: UInt64, snapshotHeight: UInt32, tr
     )
 })
 }
+/**
+ * Compute the canonical cast-vote sighash, decompress r_vpk, and sign.
+ *
+ * Pure computation — takes fields from `VoteCommitmentBundle` plus hotkey seed.
+ * Returns signature fields needed for the cast-vote TX payload.
+ */
+public func signCastVote(hotkeySeed: Data, networkId: UInt32, voteRoundIdHex: String, rVpkBytes: Data, vanNullifier: Data, voteAuthorityNoteNew: Data, voteCommitment: Data, proposalId: UInt32, anchorHeight: UInt32, alphaV: Data)throws  -> CastVoteSignature  {
+    return try  FfiConverterTypeCastVoteSignature_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
+    uniffi_zcash_voting_ffi_fn_func_sign_cast_vote(
+        FfiConverterData.lower(hotkeySeed),
+        FfiConverterUInt32.lower(networkId),
+        FfiConverterString.lower(voteRoundIdHex),
+        FfiConverterData.lower(rVpkBytes),
+        FfiConverterData.lower(vanNullifier),
+        FfiConverterData.lower(voteAuthorityNoteNew),
+        FfiConverterData.lower(voteCommitment),
+        FfiConverterUInt32.lower(proposalId),
+        FfiConverterUInt32.lower(anchorHeight),
+        FfiConverterData.lower(alphaV),$0
+    )
+})
+}
 public func verifyWitness(witness: WitnessData)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_func_verify_witness(
@@ -3572,6 +3707,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_func_generate_note_witness() != 45780) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zcash_voting_ffi_checksum_func_sign_cast_vote() != 44725) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_func_verify_witness() != 40865) {
