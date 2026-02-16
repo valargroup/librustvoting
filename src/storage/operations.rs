@@ -89,6 +89,7 @@ impl VotingDb {
         g_d_new_x: &[u8],
         pk_d_new_x: &[u8],
         hotkey_raw_address: &[u8],
+        address_index: u32,
     ) -> Result<DelegationAction, VotingError> {
         let conn = self.conn();
         let params = queries::load_round_params(&conn, round_id)?;
@@ -100,6 +101,13 @@ impl VotingDb {
             pk_d_new_x,
             hotkey_raw_address,
         )?;
+        // Compute total note value from input notes
+        let total_note_value: u64 = notes
+            .iter()
+            .try_fold(0u64, |acc, n| acc.checked_add(n.value))
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "total note weight overflows u64".to_string(),
+            })?;
         queries::store_delegation_data(
             &conn,
             round_id,
@@ -112,6 +120,9 @@ impl VotingDb {
             &action.alpha,
             &action.rseed_signed,
             &action.rseed_output,
+            &action.van,
+            total_note_value,
+            address_index,
         )?;
         Ok(action)
     }
@@ -138,6 +149,7 @@ impl VotingDb {
         seed_fingerprint: &[u8; 32],
         account_index: u32,
         round_name: &str,
+        address_index: u32,
     ) -> Result<GovernancePczt, VotingError> {
         let conn = self.conn();
         let params = queries::load_round_params(&conn, round_id)?;
@@ -152,6 +164,13 @@ impl VotingDb {
             account_index,
             round_name,
         )?;
+        // Compute total note value from input notes
+        let total_note_value: u64 = notes
+            .iter()
+            .try_fold(0u64, |acc, n| acc.checked_add(n.value))
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "total note weight overflows u64".to_string(),
+            })?;
         // Persist the same delegation data fields as construct_delegation_action
         queries::store_delegation_data(
             &conn,
@@ -165,6 +184,9 @@ impl VotingDb {
             &result.alpha,
             &result.rseed_signed,
             &result.rseed_output,
+            &result.van,
+            total_note_value,
+            address_index,
         )?;
         Ok(result)
     }
@@ -360,25 +382,53 @@ impl VotingDb {
     }
 
     /// Build vote commitment + ZKP #2 for a proposal. Stores vote in db.
-    /// enc_shares and van_witness come from caller (encrypted shares not stored in db yet).
+    ///
+    /// Loads ZKP #2 inputs (gov_comm_rand, total_note_value, address_index, ea_pk,
+    /// voting_round_id) from the DB, derives the SpendingKey from hotkey_seed,
+    /// and generates a real Halo2 vote proof.
+    ///
+    /// The builder handles share decomposition and El Gamal encryption internally.
+    /// The returned bundle includes the encrypted shares for reveal-share payloads.
     pub fn build_vote_commitment(
         &self,
         round_id: &str,
+        hotkey_seed: &[u8],
+        network_id: u32,
         proposal_id: u32,
         choice: u32,
-        enc_shares: &[EncryptedShare],
-        van_witness: &[u8],
+        van_auth_path: &[[u8; 32]],
+        van_position: u32,
+        anchor_height: u32,
         progress: &dyn ProofProgressReporter,
     ) -> Result<VoteCommitmentBundle, VotingError> {
+        let conn = self.conn();
+        let zkp2_data = queries::load_zkp2_inputs(&conn, round_id)?;
+
+        // Decode voting_round_id from hex string to 32 bytes
+        let voting_round_id_bytes =
+            hex::decode(&zkp2_data.voting_round_id).map_err(|e| VotingError::Internal {
+                message: format!(
+                    "invalid voting_round_id hex '{}': {e}",
+                    zkp2_data.voting_round_id
+                ),
+            })?;
+
         let bundle = crate::zkp2::build_vote_commitment(
+            hotkey_seed,
+            network_id,
+            zkp2_data.address_index,
+            zkp2_data.total_note_value,
+            &zkp2_data.gov_comm_rand,
+            &voting_round_id_bytes,
+            &zkp2_data.ea_pk,
             proposal_id,
             choice,
-            enc_shares,
-            van_witness,
+            van_auth_path,
+            van_position,
+            anchor_height,
             progress,
         )?;
 
-        let conn = self.conn();
         // Store the vote commitment as serialized bytes
         let commitment_bytes = serde_json::to_vec(&serde_json::json!({
             "van_nullifier": hex::encode(&bundle.van_nullifier),
@@ -404,6 +454,19 @@ impl VotingDb {
         crate::vote_commitment::build_share_payloads(enc_shares, commitment)
     }
 
+    /// Store the VAN leaf position after delegation TX is confirmed on chain.
+    /// The app calls this after parsing the delegation TX response events.
+    pub fn store_van_position(&self, round_id: &str, position: u32) -> Result<(), VotingError> {
+        let conn = self.conn();
+        queries::store_van_position(&conn, round_id, position)
+    }
+
+    /// Load the VAN leaf position for a round.
+    pub fn load_van_position(&self, round_id: &str) -> Result<u32, VotingError> {
+        let conn = self.conn();
+        queries::load_van_position(&conn, round_id)
+    }
+
     /// Mark a vote as submitted to the vote chain.
     pub fn mark_vote_submitted(&self, round_id: &str, proposal_id: u32) -> Result<(), VotingError> {
         let conn = self.conn();
@@ -414,7 +477,6 @@ impl VotingDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::NoopProgressReporter;
 
     // 64 hex chars = 32 bytes when decoded. Required because construct_delegation_action
     // hex-decodes vote_round_id and validates it as exactly 32 bytes (a Pallas field element).
@@ -517,6 +579,7 @@ mod tests {
                 &g_d,
                 &pk_d,
                 &hotkey_raw_address,
+                0u32, // address_index
             )
             .unwrap();
         assert_eq!(action.rk.len(), 32);
@@ -598,20 +661,71 @@ mod tests {
     }
 
     #[test]
-    fn test_vote_commitment_flow() {
+    fn test_zkp2_inputs_round_trip() {
+        // Verify that delegation data persisted for ZKP #2 can be loaded back.
+        // The real vote proof generation is too expensive for a unit test (~30-60s);
+        // the e2e test exercises the full path.
+        use orchard::keys::{FullViewingKey, SpendingKey};
+        use zip32::Scope;
+
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let enc_shares = db.encrypt_shares(ROUND_ID, &[1, 4]).unwrap();
-        let van_witness = vec![0xDD; 64];
-        let reporter = NoopProgressReporter;
+        let note = NoteInfo {
+            commitment: vec![0x01; 32],
+            nullifier: vec![0x02; 32],
+            value: 1_000_000,
+            position: 42,
+            diversifier: vec![0; 11],
+            rho: vec![0; 32],
+            rseed: vec![0; 32],
+            scope: 0,
+            ufvk_str: String::new(),
+        };
+        let sk = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
+        let fvk = FullViewingKey::from(&sk);
+        let fvk_bytes = fvk.to_bytes().to_vec();
+        let hotkey_sk = SpendingKey::from_bytes([0x43; 32]).expect("valid spending key");
+        let hotkey_fvk = FullViewingKey::from(&hotkey_sk);
+        let hotkey_addr = hotkey_fvk.address_at(0u32, Scope::External);
+        let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
+        let hotkey_addr_43: [u8; 43] = hotkey_raw_address.as_slice().try_into().unwrap();
+        let (g_d_x, pk_d_x) =
+            crate::action::derive_hotkey_x_coords_from_raw_address(&hotkey_addr_43).unwrap();
 
-        let bundle = db
-            .build_vote_commitment(ROUND_ID, 0, 0, &enc_shares, &van_witness, &reporter)
-            .unwrap();
-        assert_eq!(bundle.van_nullifier.len(), 32);
-        assert_eq!(bundle.proposal_id, 0);
+        db.construct_delegation_action(
+            ROUND_ID,
+            &[note],
+            &fvk_bytes,
+            &g_d_x.to_vec(),
+            &pk_d_x.to_vec(),
+            &hotkey_raw_address,
+            0u32,
+        )
+        .unwrap();
 
+        // Verify ZKP2 inputs can be loaded
+        let conn = db.conn();
+        let zkp2 = queries::load_zkp2_inputs(&conn, ROUND_ID).unwrap();
+        assert_eq!(zkp2.total_note_value, 1_000_000);
+        assert_eq!(zkp2.address_index, 0);
+        assert_eq!(zkp2.gov_comm_rand.len(), 32);
+        assert_eq!(zkp2.ea_pk.len(), 32);
+        assert_eq!(zkp2.voting_round_id, ROUND_ID);
+
+        // Verify VAN position can be stored and loaded
+        db.store_van_position(ROUND_ID, 42).unwrap();
+        let pos = queries::load_van_position(&conn, ROUND_ID).unwrap();
+        assert_eq!(pos, 42);
+    }
+
+    #[test]
+    fn test_mark_vote_submitted() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+
+        let conn = db.conn();
+        queries::store_vote(&conn, ROUND_ID, 0, 0, &[0xAA; 32]).unwrap();
         db.mark_vote_submitted(ROUND_ID, 0).unwrap();
     }
 }
