@@ -4,7 +4,7 @@
 //!
 //! - **Condition 1**: Signed note commitment integrity.
 //! - **Condition 2**: Nullifier integrity.
-//! - **Condition 3**: Rho binding — keystone rho = Poseidon(cmx_1..4, gov_comm, vote_round_id).
+//! - **Condition 3**: Rho binding — keystone rho = Poseidon(cmx_1..4, van_comm, vote_round_id).
 //! - **Condition 4**: Spend authority.
 //! - **Condition 5**: CommitIvk & diversified address integrity.
 //! - **Condition 6**: Output note commitment integrity.
@@ -29,11 +29,11 @@ use pasta_curves::{arithmetic::CurveAffine, pallas, vesta};
 
 use crate::{
     circuit::{
-        address_ownership::{prove_address_ownership, spend_auth_g_mul},
+        address_ownership::prove_address_ownership,
         commit_ivk::{CommitIvkChip, CommitIvkConfig},
         gadget::{
             add_chip::{AddChip, AddConfig},
-            assign_free_advice, derive_nullifier, note_commit, AddInstruction,
+            assign_constant, assign_free_advice, derive_nullifier, note_commit, AddInstruction,
         },
         note_commit::{NoteCommitChip, NoteCommitConfig},
     },
@@ -102,7 +102,7 @@ const RK_Y: usize = 2;
 /// Public input offset for the output note's extracted commitment (condition 6).
 const CMX_NEW: usize = 3;
 /// Public input offset for the governance commitment.
-const GOV_COMM: usize = 4;
+const VAN_COMM: usize = 4;
 /// Public input offset for the vote round identifier.
 const VOTE_ROUND_ID: usize = 5;
 /// Public input offset for the note commitment tree root.
@@ -124,7 +124,7 @@ const GOV_NULL_OFFSETS: [usize; 4] = [GOV_NULL_1, GOV_NULL_2, GOV_NULL_3, GOV_NU
 /// corresponding proposal (proposal ID = bit index from LSB).  Full authority
 /// is `2^16 - 1 = 65535`, meaning all 16 proposals are authorized.
 ///
-/// This constant is hashed into `gov_comm` (condition 7) as a constant-
+/// This constant is hashed into `van_comm` (condition 7) as a constant-
 /// constrained witness, baked into the verification key so a malicious prover
 /// cannot substitute a different authority value.
 pub(crate) const MAX_PROPOSAL_AUTHORITY: u64 = 65535; // 2^16 - 1
@@ -135,23 +135,23 @@ pub(crate) fn rho_binding_hash(
     cmx_2: pallas::Base,
     cmx_3: pallas::Base,
     cmx_4: pallas::Base,
-    gov_comm: pallas::Base,
+    van_comm: pallas::Base,
     vote_round_id: pallas::Base,
 ) -> pallas::Base {
     poseidon::Hash::<_, poseidon::P128Pow5T3, ConstantLength<6>, 3, 2>::init()
-        .hash([cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id])
+        .hash([cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id])
 }
 
 /// Out-of-circuit governance commitment hash used by the builder and tests.
 ///
 /// Delegates to `van_integrity::van_integrity_hash` with
 /// `MAX_PROPOSAL_AUTHORITY` as the proposal authority (fresh delegation).
-pub(crate) fn gov_commitment_hash(
+pub(crate) fn van_commitment_hash(
     g_d_new_x: pallas::Base,
     pk_d_new_x: pallas::Base,
     v_total: pallas::Base,
     vote_round_id: pallas::Base,
-    gov_comm_rand: pallas::Base,
+    van_comm_rand: pallas::Base,
 ) -> pallas::Base {
     van_integrity::van_integrity_hash(
         g_d_new_x,
@@ -159,7 +159,7 @@ pub(crate) fn gov_commitment_hash(
         v_total,
         vote_round_id,
         pallas::Base::from(MAX_PROPOSAL_AUTHORITY),
-        gov_comm_rand,
+        van_comm_rand,
     )
 }
 
@@ -333,7 +333,7 @@ pub struct Circuit {
     // Per-note slots (conditions 9–15).
     notes: [NoteSlotWitness; 4],
     // Gov commitment blinding factor (condition 7).
-    gov_comm_rand: Value<pallas::Base>,
+    van_comm_rand: Value<pallas::Base>,
     // Condition 8 (minimum voting weight) has no witnesses — it uses v_total
     // derived in-circuit from per-note values plus the constant MIN_WEIGHT.
 }
@@ -379,8 +379,8 @@ impl Circuit {
     }
 
     /// Sets the governance commitment blinding factor (condition 7).
-    pub fn with_gov_comm_rand(mut self, gov_comm_rand: pallas::Base) -> Self {
-        self.gov_comm_rand = Value::known(gov_comm_rand);
+    pub fn with_van_comm_rand(mut self, van_comm_rand: pallas::Base) -> Self {
+        self.van_comm_rand = Value::known(van_comm_rand);
         self
     }
 }
@@ -398,7 +398,9 @@ impl plonk::Circuit<pallas::Base> for Circuit {
     }
 
     fn configure(meta: &mut plonk::ConstraintSystem<pallas::Base>) -> Self::Config {
-        // Advice columns used in the circuit.
+        // ── Column declarations ──────────────────────────────────────────
+
+        // 10 advice columns used throughout the circuit.
         let advices = [
             meta.advice_column(),
             meta.advice_column(),
@@ -411,6 +413,46 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             meta.advice_column(),
             meta.advice_column(),
         ];
+
+        // Instance column used for public inputs.
+        let primary = meta.instance_column();
+
+        // Fixed columns for the Sinsemilla generator lookup table.
+        let table_idx = meta.lookup_table_column();
+        let lookup = (
+            table_idx,
+            meta.lookup_table_column(),
+            meta.lookup_table_column(),
+        );
+
+        // 8 fixed columns shared between ECC (Lagrange interpolation coefficients)
+        // and Poseidon (round constants). Different rows hold different data.
+        let lagrange_coeffs = [
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+            meta.fixed_column(),
+        ];
+        let rc_a = lagrange_coeffs[2..5].try_into().unwrap();
+        let rc_b = lagrange_coeffs[5..8].try_into().unwrap();
+
+        // ── Column properties ────────────────────────────────────────────
+
+        // Enable equality constraints (permutation argument) on all advice columns
+        // and the instance column, so any cell can be copy-constrained to any other.
+        meta.enable_equality(primary);
+        for advice in advices.iter() {
+            meta.enable_equality(*advice);
+        }
+
+        // Use the first Lagrange coefficient column for loading global constants.
+        meta.enable_constant(lagrange_coeffs[0]);
+
+        // ── Custom gates ─────────────────────────────────────────────────
 
         // Per-note custom gates (conditions 10, 13, 15).
         // q_per_note is a selector that activates these constraints only on rows
@@ -454,50 +496,16 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // IMT non-membership gates (condition 13): conditional swap + interval check.
         let imt_config = ImtNonMembershipConfig::configure(meta, &advices);
 
+        // ── Chip configurations ──────────────────────────────────────────
+
         let add_config = AddChip::configure(meta, advices[7], advices[8], advices[6]);
-
-        // Fixed columns for the Sinsemilla generator lookup table.
-        let table_idx = meta.lookup_table_column();
-        let lookup = (
-            table_idx,
-            meta.lookup_table_column(),
-            meta.lookup_table_column(),
-        );
-
-        // Instance column used for public inputs.
-        let primary = meta.instance_column();
-        meta.enable_equality(primary);
-
-        // Permutation over all advice columns.
-        for advice in advices.iter() {
-            meta.enable_equality(*advice);
-        }
-
-        // Fixed columns shared between ECC and Poseidon chips.
-        let lagrange_coeffs = [
-            meta.fixed_column(),
-            meta.fixed_column(),
-            meta.fixed_column(),
-            meta.fixed_column(),
-            meta.fixed_column(),
-            meta.fixed_column(),
-            meta.fixed_column(),
-            meta.fixed_column(),
-        ];
-        let rc_a = lagrange_coeffs[2..5].try_into().unwrap();
-        let rc_b = lagrange_coeffs[5..8].try_into().unwrap();
-
-        // Use the first Lagrange coefficient column for loading global constants.
-        meta.enable_constant(lagrange_coeffs[0]);
 
         // Range check configuration using the right-most advice column.
         let range_check = LookupRangeCheckConfig::configure(meta, advices[9], table_idx);
 
-        // Configuration for curve point operations.
         let ecc_config =
             EccChip::<OrchardFixedBases>::configure(meta, advices, lagrange_coeffs, range_check);
 
-        // Configuration for the Poseidon hash.
         let poseidon_config = PoseidonChip::configure::<poseidon::P128Pow5T3>(
             meta,
             advices[6..9].try_into().unwrap(),
@@ -506,39 +514,36 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             rc_b,
         );
 
-        // Sinsemilla config 1 + Merkle config 1.
-        // Sinsemilla: loads the lookup table, used for CommitIvk, and the signed
-        // note's NoteCommit. Uses advices[..5].
-        // Merkle: used for even levels of the per-note Merkle path (condition 10).
-        let (sinsemilla_config_1, merkle_config_1) = {
-            let sinsemilla_config_1 = SinsemillaChip::configure(
-                meta,
-                advices[..5].try_into().unwrap(),
-                advices[6],
-                lagrange_coeffs[0],
-                lookup,
-                range_check,
-            );
-            let merkle_config_1 = MerkleChip::configure(meta, sinsemilla_config_1.clone());
-            (sinsemilla_config_1, merkle_config_1)
-        };
+        // Two Sinsemilla + Merkle chip pairs. NoteCommit internally needs two
+        // Sinsemilla instances (one per hash), so we can't reuse a single config.
+        // The Merkle chips alternate between the two at each tree level
+        // (even levels use pair 1, odd levels use pair 2) for the same reason.
+        //
+        // Column layout:
+        //   Pair 1: main = advices[0..5], witness = advices[6]
+        //   Pair 2: main = advices[5..10], witness = advices[7]
+        //
+        // The pairs intentionally overlap on advices[5..7] to keep the total
+        // column count at 10 (matching upstream Orchard). This is safe because
+        // each pair's gates are gated by their own selectors, and the two chips
+        // are never assigned to the same rows.
+        let configure_sinsemilla_merkle =
+            |meta: &mut plonk::ConstraintSystem<pallas::Base>,
+             advice_cols: [Column<Advice>; 5],
+             witness_col: Column<Advice>,
+             lagrange_col: Column<plonk::Fixed>| {
+                let sinsemilla =
+                    SinsemillaChip::configure(meta, advice_cols, witness_col, lagrange_col, lookup, range_check);
+                let merkle = MerkleChip::configure(meta, sinsemilla.clone());
+                (sinsemilla, merkle)
+            };
 
-        // Sinsemilla config 2 + Merkle config 2.
-        // Sinsemilla: used for the output note's NoteCommit. Uses advices[5..],
-        // so the two Sinsemilla chips lay out side-by-side.
-        // Merkle: used for odd levels of the per-note Merkle path (condition 10).
-        let (sinsemilla_config_2, merkle_config_2) = {
-            let sinsemilla_config_2 = SinsemillaChip::configure(
-                meta,
-                advices[5..].try_into().unwrap(),
-                advices[7],
-                lagrange_coeffs[1],
-                lookup,
-                range_check,
-            );
-            let merkle_config_2 = MerkleChip::configure(meta, sinsemilla_config_2.clone());
-            (sinsemilla_config_2, merkle_config_2)
-        };
+        let (sinsemilla_config_1, merkle_config_1) = configure_sinsemilla_merkle(
+            meta, advices[..5].try_into().unwrap(), advices[6], lagrange_coeffs[0],
+        );
+        let (sinsemilla_config_2, merkle_config_2) = configure_sinsemilla_merkle(
+            meta, advices[5..].try_into().unwrap(), advices[7], lagrange_coeffs[1],
+        );
 
         // Configuration to handle decomposition and canonicity checking for CommitIvk.
         let commit_ivk_config = CommitIvkChip::configure(meta, advices);
@@ -696,15 +701,20 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // Spend authority: proves that the public rk is a valid rerandomization of the prover's ak.
         // The out-of-circuit verifier checks that the keystone signature is valid under rk,
         // so this links the ZKP to the signature without revealing ak.
-        {
-            let alpha =
-                ScalarFixed::new(ecc_chip.clone(), layouter.namespace(|| "alpha"), self.alpha)?;
-            let alpha_commitment =
-                spend_auth_g_mul(ecc_chip.clone(), layouter.namespace(|| "cond4"), "[alpha] SpendAuthG", alpha)?;
-            let rk = alpha_commitment.add(layouter.namespace(|| "rk"), &ak_P)?;
-            layouter.constrain_instance(rk.inner().x().cell(), config.primary, RK_X)?;
-            layouter.constrain_instance(rk.inner().y().cell(), config.primary, RK_Y)?;
-        }
+        //
+        // Uses the shared gadget from crate::shared_primitives – a 1:1 copy of
+        // the upstream Orchard spend authority check:
+        //   https://github.com/zcash/orchard/blob/main/src/circuit.rs#L542-L558
+        // Note: RK_X and RK_Y are public inputs.ß
+        crate::shared_primitives::spend_authority::prove_spend_authority(
+            ecc_chip.clone(),
+            layouter.namespace(|| "cond4 spend authority"),
+            self.alpha,
+            &ak_P.clone().into(),
+            config.primary,
+            RK_X,
+            RK_Y,
+        )?;
 
         // ---------------------------------------------------------------
         // Condition 5: CommitIvk → ivk (internal wire, not a public input).
@@ -791,7 +801,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
 
         // Rho binding (condition 3).
-        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
         // Binds the signed note to the exact notes being delegated, the governance
         // commitment, and the round, making the keystone signature non-replayable.
         //
@@ -800,15 +810,15 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // advice cell with a copy constraint, so the prover cannot substitute a
         // different value. The resulting cells are then passed into downstream gates.
 
-        // gov_comm: used in condition 3 (rho binding hash) and condition 7 (gov
+        // van_comm: used in condition 3 (rho binding hash) and condition 7 (gov
         // commitment integrity check).
-        let gov_comm_cell = layouter.assign_region(
-            || "copy gov_comm from instance",
+        let van_comm_cell = layouter.assign_region(
+            || "copy van_comm from instance",
             |mut region| {
                 region.assign_advice_from_instance(
-                    || "gov_comm",
+                    || "van_comm",
                     config.primary,
-                    GOV_COMM,
+                    VAN_COMM,
                     config.advices[0],
                     0,
                 )
@@ -903,7 +913,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
         // ---------------------------------------------------------------
         // Condition 3: Rho binding.
-        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
         // ---------------------------------------------------------------
 
         // The keystone note's rho is deterministically derived from the 4 note
@@ -913,13 +923,13 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // would change the nullifier (cond 2) and break the proof.
         {
             // Hash the 6 inputs: 4 note commitment x-coords (from cond 9),
-            // gov_comm (public input), and vote_round_id (public input).
+            // van_comm (public input), and vote_round_id (public input).
             let poseidon_message = [
                 cmx_cells[0].clone(),
                 cmx_cells[1].clone(),
                 cmx_cells[2].clone(),
                 cmx_cells[3].clone(),
-                gov_comm_cell.clone(),
+                van_comm_cell.clone(),
                 vote_round_id_cell.clone(),
             ];
             let poseidon_hasher = PoseidonHash::<
@@ -934,7 +944,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 layouter.namespace(|| "rho binding Poseidon init"),
             )?;
             let derived_rho = poseidon_hasher.hash(
-                layouter.namespace(|| "Poseidon(cmx_1..4, gov_comm, vote_round_id)"),
+                layouter.namespace(|| "Poseidon(cmx_1..4, van_comm, vote_round_id)"),
                 poseidon_message,
             )?;
 
@@ -959,7 +969,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // where rho_new = nf_signed (the nullifier derived in condition 2).
         //
         // The output address (g_d_new, pk_d_new) is NOT checked against ivk.
-        // The voting hotkey is bound transitively through gov_comm (condition 7)
+        // The voting hotkey is bound transitively through van_comm (condition 7)
         // which is hashed into rho_signed (condition 3), so the keystone
         // signature authenticates the output address without an in-circuit check.
         //
@@ -1036,16 +1046,16 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
         // ---------------------------------------------------------------
         // Condition 7: Gov commitment integrity.
-        // gov_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total,
+        // van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total,
         //                          vote_round_id, MAX_PROPOSAL_AUTHORITY)
-        // gov_comm = Poseidon(gov_comm_core, gov_comm_rand)
+        // van_comm = Poseidon(van_comm_core, van_comm_rand)
         // ---------------------------------------------------------------
 
         // Gov commitment integrity (condition 7).
         //
-        // gov_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total,
+        // van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total,
         //                          vote_round_id, MAX_PROPOSAL_AUTHORITY)
-        // gov_comm = Poseidon(gov_comm_core, gov_comm_rand)
+        // van_comm = Poseidon(van_comm_core, van_comm_rand)
         //
         // Proves that the governance commitment (public input) is correctly derived
         // from the domain tag, the output note's voting hotkey address, the total
@@ -1055,10 +1065,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         //
         // Uses two Poseidon invocations over even arities (6 then 2).
         let v_total = {
-            let gov_comm_rand = assign_free_advice(
-                layouter.namespace(|| "witness gov_comm_rand"),
+            let van_comm_rand = assign_free_advice(
+                layouter.namespace(|| "witness van_comm_rand"),
                 config.advices[0],
-                self.gov_comm_rand,
+                self.van_comm_rand,
             )?;
 
             // v_total = v_1 + v_2 + v_3 + v_4  (three AddChip additions)
@@ -1076,38 +1086,24 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 &v_cells[3],
             )?;
 
-            // DOMAIN_VAN — constant-constrained domain tag for Vote Authority
-            // Notes.  Provides domain separation from Vote Commitments in the
-            // shared vote commitment tree.
-            let domain_van = layouter.assign_region(
-                || "DOMAIN_VAN constant",
-                |mut region| {
-                    region.assign_advice_from_constant(
-                        || "domain_van",
-                        config.advices[0],
-                        0,
-                        pallas::Base::from(van_integrity::DOMAIN_VAN),
-                    )
-                },
+            // DOMAIN_VAN — domain tag for Vote Authority Notes. Provides domain
+            // separation from Vote Commitments in the shared vote commitment tree.
+            let domain_van = assign_constant(
+                layouter.namespace(|| "DOMAIN_VAN constant"),
+                config.advices[0],
+                pallas::Base::from(van_integrity::DOMAIN_VAN),
             )?;
 
-            // MAX_PROPOSAL_AUTHORITY — constant-constrained so the value is
-            // baked into the verification key and cannot be altered by a
-            // malicious prover.
-            let max_proposal_authority = layouter.assign_region(
-                || "MAX_PROPOSAL_AUTHORITY constant",
-                |mut region| {
-                    region.assign_advice_from_constant(
-                        || "max_proposal_authority",
-                        config.advices[0],
-                        0,
-                        pallas::Base::from(MAX_PROPOSAL_AUTHORITY),
-                    )
-                },
+            // MAX_PROPOSAL_AUTHORITY — baked into the verification key so the
+            // prover cannot alter it.
+            let max_proposal_authority = assign_constant(
+                layouter.namespace(|| "MAX_PROPOSAL_AUTHORITY constant"),
+                config.advices[0],
+                pallas::Base::from(MAX_PROPOSAL_AUTHORITY),
             )?;
 
             // Two-layer Poseidon hash via the shared VAN integrity gadget.
-            let derived_gov_comm = van_integrity::van_integrity_poseidon(
+            let derived_van_comm = van_integrity::van_integrity_poseidon(
                 &config.poseidon_config,
                 &mut layouter,
                 "Gov commitment",
@@ -1117,13 +1113,13 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 v_total.clone(),
                 vote_round_id_cell,
                 max_proposal_authority,
-                gov_comm_rand,
+                van_comm_rand,
             )?;
 
-            // Constrain: derived_gov_comm == gov_comm (from condition 3).
+            // Constrain: derived_van_comm == van_comm (from condition 3).
             layouter.assign_region(
-                || "gov_comm integrity",
-                |mut region| region.constrain_equal(derived_gov_comm.cell(), gov_comm_cell.cell()),
+                || "van_comm integrity",
+                |mut region| region.constrain_equal(derived_van_comm.cell(), van_comm_cell.cell()),
             )?;
 
             v_total
@@ -1152,20 +1148,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 diff,
             )?;
 
-            // Assign MIN_WEIGHT as a constant-constrained advice cell.
-            // This binds the advice cell to the fixed column via enable_constant,
-            // so the value is baked into the verification key and cannot be
-            // altered by a malicious prover.
-            let min_weight = layouter.assign_region(
-                || "MIN_WEIGHT constant",
-                |mut region| {
-                    region.assign_advice_from_constant(
-                        || "min_weight",
-                        config.advices[0],
-                        0,
-                        pallas::Base::from(MIN_WEIGHT),
-                    )
-                },
+            let min_weight = assign_constant(
+                layouter.namespace(|| "MIN_WEIGHT constant"),
+                config.advices[0],
+                pallas::Base::from(MIN_WEIGHT),
             )?;
 
             // Constrain: diff + MIN_WEIGHT == v_total.
@@ -1381,18 +1367,12 @@ fn synthesize_note_slot(
     // The result is constrained to the public instance so the vote chain can
     // track which notes have already been delegated this round.
 
-    // Domain tag = "governance authorization" as a field element. Assigned as a
-    // constant so it's baked into the verification key.
-    let domain_tag = layouter.assign_region(
-        || format!("note {s} gov_auth domain tag"),
-        |mut region| {
-            region.assign_advice_from_constant(
-                || "domain_tag",
-                config.advices[0],
-                0,
-                crate::delegation::imt::gov_auth_domain_tag(),
-            )
-        },
+    // Domain tag = "governance authorization" as a field element, baked into
+    // the verification key.
+    let domain_tag = assign_constant(
+        layouter.namespace(|| format!("note {s} gov_auth domain tag")),
+        config.advices[0],
+        crate::delegation::imt::gov_auth_domain_tag(),
     )?;
 
     // Step 1: Poseidon(vote_round_id, real_nf) — scope to this round + note.
@@ -1541,7 +1521,7 @@ pub struct Instance {
     /// The extracted commitment of the output note.
     pub cmx_new: pallas::Base,
     /// The governance commitment hash.
-    pub gov_comm: pallas::Base,
+    pub van_comm: pallas::Base,
     /// The voting round identifier.
     pub vote_round_id: pallas::Base,
     /// The note commitment tree root (shared anchor).
@@ -1558,7 +1538,7 @@ impl Instance {
         nf_signed: Nullifier,
         rk: VerificationKey<SpendAuth>,
         cmx_new: pallas::Base,
-        gov_comm: pallas::Base,
+        van_comm: pallas::Base,
         vote_round_id: pallas::Base,
         nc_root: pallas::Base,
         nf_imt_root: pallas::Base,
@@ -1568,7 +1548,7 @@ impl Instance {
             nf_signed,
             rk,
             cmx_new,
-            gov_comm,
+            van_comm,
             vote_round_id,
             nc_root,
             nf_imt_root,
@@ -1597,7 +1577,7 @@ impl Instance {
             *rk.x(),
             *rk.y(),
             self.cmx_new,
-            self.gov_comm,
+            self.van_comm,
             self.vote_round_id,
             self.nc_root,
             self.nf_imt_root,
@@ -1684,7 +1664,7 @@ mod tests {
         let ak: SpendValidatingKey = fvk.clone().into();
 
         let vote_round_id = pallas::Base::random(&mut rng);
-        let gov_comm_rand = pallas::Base::random(&mut rng);
+        let van_comm_rand = pallas::Base::random(&mut rng);
 
         // Shared IMT provider (consistent root for all notes).
         let imt_provider = SpacedLeafImtProvider::new();
@@ -1774,7 +1754,7 @@ mod tests {
         // Values: real note = 13M, padded = 0.
         let v_total = pallas::Base::from(13_000_000u64);
 
-        // Compute gov_comm.
+        // Compute van_comm.
         let g_d_new_x = *output_recipient
             .g_d()
             .to_affine()
@@ -1788,8 +1768,8 @@ mod tests {
             .coordinates()
             .unwrap()
             .x();
-        let gov_comm =
-            gov_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand);
+        let van_comm =
+            van_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, van_comm_rand);
 
         // Compute rho.
         let rho = rho_binding_hash(
@@ -1797,7 +1777,7 @@ mod tests {
             cmx_values[1],
             cmx_values[2],
             cmx_values[3],
-            gov_comm,
+            van_comm,
             vote_round_id,
         );
 
@@ -1826,13 +1806,13 @@ mod tests {
         let circuit = Circuit::from_note_unchecked(&fvk, &signed_note, alpha)
             .with_output_note(&output_note)
             .with_notes(notes)
-            .with_gov_comm_rand(gov_comm_rand);
+            .with_van_comm_rand(van_comm_rand);
 
         let instance = Instance::from_parts(
             nf_signed,
             rk,
             cmx_new,
-            gov_comm,
+            van_comm,
             vote_round_id,
             nc_root,
             nf_imt_root,
@@ -1914,10 +1894,10 @@ mod tests {
     }
 
     #[test]
-    fn wrong_gov_comm_fails() {
+    fn wrong_van_comm_fails() {
         let t = make_test_data();
         let mut instance = t.instance.clone();
-        instance.gov_comm = pallas::Base::random(&mut OsRng);
+        instance.van_comm = pallas::Base::random(&mut OsRng);
 
         let pi = instance.to_halo2_instance();
         let prover = MockProver::run(K, &t.circuit, vec![pi]).unwrap();
@@ -1942,7 +1922,7 @@ mod tests {
         assert_eq!(pi.len(), 12, "Expected exactly 12 public inputs");
         assert_eq!(pi[NF_SIGNED], t.instance.nf_signed.0);
         assert_eq!(pi[CMX_NEW], t.instance.cmx_new);
-        assert_eq!(pi[GOV_COMM], t.instance.gov_comm);
+        assert_eq!(pi[VAN_COMM], t.instance.van_comm);
         assert_eq!(pi[NC_ROOT], t.instance.nc_root);
         assert_eq!(pi[NF_IMT_ROOT], t.instance.nf_imt_root);
         assert_eq!(pi[GOV_NULL_1], t.instance.gov_null[0]);

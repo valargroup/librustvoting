@@ -148,11 +148,11 @@ TODO: Finalize personalization string.
 
 We construct a single "vote authority note" (VAN), representing the vote authority for all our notes combined. The VAN binds together the voting hotkey, the voting weight, and the voting round, along with permission to vote on all proposal. This note will later be inserted into the voting commitment tree.
 
-First we sample commitment randomness `gov_comm_rand`. (TODO: Note how to derive this from governance voting hotkey.) The wallet must store this.
+First we sample commitment randomness `van_comm_rand`. (TODO: Note how to derive this from governance voting hotkey.) The wallet must store this.
 
 We also construct available proposals, as MAX_PROPOSAL_AUTHORITY which is `2^16 - 1 = 65535`
 
-`vote_authority_note = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, MAX_PROPOSAL_AUTHORITY, gov_comm_rand)`
+`vote_authority_note = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, MAX_PROPOSAL_AUTHORITY, van_comm_rand)`
 
 (TBD, we should be able to pack `total_note_value` and `MAX_PROPOSAL_AUTHORITY` into one field elem)
 
@@ -293,7 +293,7 @@ I will reference the exact name from the ZCash spec if its a re-used component, 
 - `rivk` — CommitIvk randomness
 - `alpha` — spend auth randomizer (for the signed action)
 - `vpk` — voting hotkey public key as a tuple (`vpk_d`, `vpk_pk_d`)
-- `gov_comm_rand` - randomness for the VAN commitment
+- `van_comm_rand` - randomness for the VAN commitment
 - For the signed (dummy) note:
   - `d_signed, pk_d_signed, rho_signed, psi_signed, rcm_signed, cm_signed`
   - (recall `v_signed = 0`)
@@ -329,7 +329,7 @@ Conditions on the signed output note:
 
 Global conditions (computed once, not per-note):
 
-7. **(VAN Integrity) (NEW)** `vote_authority_note = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, MAX_PROPOSAL_AUTHORITY, gov_comm_rand)`. The initial VAN correctly encodes the voting hotkey, total delegated weight, and round. Computed once over all notes. (Per §1.3.3)
+7. **(VAN Integrity) (NEW)** `vote_authority_note = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, MAX_PROPOSAL_AUTHORITY, van_comm_rand)`. The initial VAN correctly encodes the voting hotkey, total delegated weight, and round. Computed once over all notes. (Per §1.3.3)
 
 8. **(Total Ballots Integrity) (NEW)** `snapshot_balance = sum(v_i for all notes) Num_ballots = floor(snapshot_balance / 12,500,000); num_ballots > 0`
 	1. This prevents dust-delegations from bloating the chain state.
@@ -493,11 +493,11 @@ This means anyone can publicly sum encrypted shares without decrypting them — 
 
 We construct a new Vote Authority Note.
 
-Recall `vote_authority_note_old = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, proposal_authority, gov_comm_rand)`
+Recall `vote_authority_note_old = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, proposal_authority, van_comm_rand)`
 
 We take the index of the proposal we are voting on. We subtract proposal_authority accordingly to get `proposal_authority_new`. We keep all other fields the same.
 
-`vote_authority_note_new = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, proposal_authority_new, gov_comm_rand)`
+`vote_authority_note_new = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, proposal_authority_new, van_comm_rand)`
 
 ### 3.6 Construct VAN nullifier
 
@@ -563,7 +563,7 @@ This ZKP proves that a registered voter is casting a valid vote, without reveali
 - `total_note_value` — the voter's total delegated weight
 - `proposal_authority_old` — remaining proposal authority in the old VAN
 - `proposal_authority_new` — decremented proposal authority in the new VAN
-- `gov_comm_rand` — commitment randomness for the VAN
+- `van_comm_rand` — commitment randomness for the VAN
 - `vote_comm_tree_path, vote_comm_tree_position` — Merkle path proving VAN membership
 - `vote_authority_note_old` — the old VAN commitment
 - For the vote commitment:
@@ -578,7 +578,7 @@ VAN ownership and spending:
 
 1. **(VAN Membership)** `(vote_comm_tree_path, vote_comm_tree_position)` is a valid Merkle path from `vote_authority_note_old` to `vote_comm_tree_root`. Proves the voter's VAN is registered, without revealing which one. (Analogous to ZKP #1 cond. 10 — Merkle Path Validity)
 
-2. **(VAN Integrity)** `vote_authority_note_old = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, proposal_authority_old, gov_comm_rand)`. The old VAN (pre-delegation governance commitment) is correctly constructed from its components. (Analogous to ZKP #1 cond. 9 — Old Note Commitment Integrity)
+2. **(VAN Integrity)** `vote_authority_note_old = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, proposal_authority_old, van_comm_rand)`. The old VAN (pre-delegation governance commitment) is correctly constructed from its components. (Analogous to ZKP #1 cond. 9 — Old Note Commitment Integrity)
 
 3. **(Spend Authority)** `r_vpk = voting_hotkey_pk + [alpha_v] * G`. The public `r_vpk` is a valid rerandomization of `voting_hotkey_pk`. Links to the vote signature verified out-of-circuit. (Same pattern as ZKP #1 cond. 4 — Spend Authority)
 
@@ -588,7 +588,7 @@ New VAN construction:
 
 5. **(Proposal Authority Decrement)** Decompose `proposal_authority_old` into 16 bits, assert bit `proposal_id` is set, then `proposal_authority_new = proposal_authority_old - (1 << proposal_id)`. Clears exactly the voted proposal's bit; all other authority bits unchanged.
 
-6. **(New VAN Integrity)** `vote_authority_note_new = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, proposal_authority_new, gov_comm_rand)`. All fields are the same as the old VAN except `proposal_authority` is decremented. (Analogous to ZKP #1 cond. 6 — New Note Commitment Integrity)
+6. **(New VAN Integrity)** `vote_authority_note_new = Poseidon(DOMAIN_VAN, voting_hotkey_pk, total_note_value, voting_round_id, proposal_authority_new, van_comm_rand)`. All fields are the same as the old VAN except `proposal_authority` is decremented. (Analogous to ZKP #1 cond. 6 — New Note Commitment Integrity)
 
 Vote commitment construction:
 

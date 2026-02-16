@@ -106,6 +106,19 @@ where
     )
 }
 
+/// Assigns a constant value in a standalone region, constrained by the
+/// verification key (the prover cannot alter it).
+pub(crate) fn assign_constant<F: Field>(
+    mut layouter: impl Layouter<F>,
+    column: Column<Advice>,
+    constant: F,
+) -> Result<AssignedCell<F, F>, plonk::Error> {
+    layouter.assign_region(
+        || "load constant",
+        |mut region| region.assign_advice_from_constant(|| "constant", column, 0, constant),
+    )
+}
+
 /// `ValueCommit^Orchard` from [Section 5.4.8.3 Homomorphic Pedersen commitments (Sapling and Orchard)].
 ///
 /// [Section 5.4.8.3 Homomorphic Pedersen commitments (Sapling and Orchard)]: https://zips.z.cash/protocol/protocol.pdf#concretehomomorphiccommit

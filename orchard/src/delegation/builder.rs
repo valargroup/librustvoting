@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    circuit::{self, gov_commitment_hash, rho_binding_hash, NoteSlotWitness},
+    circuit::{self, van_commitment_hash, rho_binding_hash, NoteSlotWitness},
     imt::{gov_null_hash, ImtProofData, ImtProvider},
 };
 
@@ -84,7 +84,7 @@ impl std::fmt::Display for DelegationBuildError {
 /// - `output_recipient`: Address of the voting hotkey (output note recipient).
 /// - `vote_round_id`: Voting round identifier.
 /// - `nc_root`: Note commitment tree root (shared anchor).
-/// - `gov_comm_rand`: Blinding factor for the governance commitment.
+/// - `van_comm_rand`: Blinding factor for the governance commitment.
 /// - `imt_provider`: Provider for padded-note IMT non-membership proofs.
 /// - `rng`: Random number generator.
 #[allow(clippy::too_many_arguments)]
@@ -95,7 +95,7 @@ pub fn build_delegation_bundle(
     output_recipient: crate::Address,
     vote_round_id: pallas::Base,
     nc_root: pallas::Base,
-    gov_comm_rand: pallas::Base,
+    van_comm_rand: pallas::Base,
     imt_provider: &impl ImtProvider,
     rng: &mut impl RngCore,
 ) -> Result<DelegationBundle, DelegationBuildError> {
@@ -218,8 +218,8 @@ pub fn build_delegation_bundle(
     let notes: [NoteSlotWitness; 4] = note_slots.try_into().unwrap_or_else(|_| unreachable!());
 
     // Condition 7: gov commitment integrity.
-    // gov_comm = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total,
-    //                     vote_round_id, MAX_PROPOSAL_AUTHORITY, gov_comm_rand)
+    // van_comm = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total,
+    //                     vote_round_id, MAX_PROPOSAL_AUTHORITY, van_comm_rand)
     // Extract the output address as two x-coordinates (vpk representation).
     let v_total = pallas::Base::from(v_values.iter().sum::<u64>());
 
@@ -237,17 +237,17 @@ pub fn build_delegation_bundle(
         .unwrap()
         .x();
 
-    let gov_comm = gov_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand);
+    let van_comm = van_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, van_comm_rand);
 
     // Condition 3: rho binding.
-    // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+    // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
     // Binds the keystone note to the exact notes being delegated.
     let rho = rho_binding_hash(
         cmx_values[0],
         cmx_values[1],
         cmx_values[2],
         cmx_values[3],
-        gov_comm,
+        van_comm,
         vote_round_id,
     );
 
@@ -284,13 +284,13 @@ pub fn build_delegation_bundle(
     let circuit = circuit::Circuit::from_note_unchecked(fvk, &signed_note, alpha)
         .with_output_note(&output_note)
         .with_notes(notes)
-        .with_gov_comm_rand(gov_comm_rand);
+        .with_van_comm_rand(van_comm_rand);
 
     let instance = circuit::Instance::from_parts(
         nf_signed,
         rk,
         cmx_new,
-        gov_comm,
+        van_comm,
         vote_round_id,
         nc_root,
         nf_imt_root,
@@ -406,7 +406,7 @@ mod tests {
         let fvk: FullViewingKey = (&sk).into();
         let output_recipient = fvk.address_at(1u32, Scope::External);
         let vote_round_id = pallas::Base::random(&mut rng);
-        let gov_comm_rand = pallas::Base::random(&mut rng);
+        let van_comm_rand = pallas::Base::random(&mut rng);
         let alpha = pallas::Scalar::random(&mut rng);
 
         let imt = SpacedLeafImtProvider::new();
@@ -419,7 +419,7 @@ mod tests {
             output_recipient,
             vote_round_id,
             nc_root,
-            gov_comm_rand,
+            van_comm_rand,
             &imt,
             &mut rng,
         )
@@ -463,7 +463,7 @@ mod tests {
         let fvk: FullViewingKey = (&sk).into();
         let output_recipient = fvk.address_at(1u32, Scope::External);
         let vote_round_id = pallas::Base::random(&mut rng);
-        let gov_comm_rand = pallas::Base::random(&mut rng);
+        let van_comm_rand = pallas::Base::random(&mut rng);
         let alpha = pallas::Scalar::random(&mut rng);
 
         let imt = SpacedLeafImtProvider::new();
@@ -476,7 +476,7 @@ mod tests {
             output_recipient,
             vote_round_id,
             nc_root,
-            gov_comm_rand,
+            van_comm_rand,
             &imt,
             &mut rng,
         )

@@ -52,7 +52,7 @@ Shared circuit gadget that encapsulates the **VAN (Vote Authority Note) integrit
 
 Both delegation and vote proof circuits need a shared commitment shape for the governance commitment / Vote Authority Note:
 
-- **Delegation (condition 7):** when creating the output note, the circuit commits to `gov_comm` = two-layer hash(domain_van, g_d, pk_d, value, round, proposal_authority; rand). This becomes the VAN that can later be spent in vote proof.
+- **Delegation (condition 7):** when creating the output note, the circuit commits to `van_comm` = two-layer hash(domain_van, g_d, pk_d, value, round, proposal_authority; rand). This becomes the VAN that can later be spent in vote proof.
 - **Vote proof (condition 2):** the voter proves the old VAN commitment is correctly formed (same hash structure) so that VANs created by delegation are valid leaves.
 - **Vote proof (condition 6):** the new VAN commitment (after decrementing proposal authority) uses the same hash structure.
 
@@ -62,18 +62,18 @@ A single module provides the two-layer Poseidon (core hash then blind with rand)
 
 **`DOMAIN_VAN`** — `u64` constant `0`. Domain tag for Vote Authority Notes; `DOMAIN_VC = 1` for Vote Commitments. Prepended as the first Poseidon input for domain separation in the shared vote commitment tree.
 
-**`van_integrity_hash(g_d_x, pk_d_x, value, voting_round_id, proposal_authority, gov_comm_rand) -> pallas::Base`**
+**`van_integrity_hash(g_d_x, pk_d_x, value, voting_round_id, proposal_authority, van_comm_rand) -> pallas::Base`**
 
 Out-of-circuit two-layer hash. Computes:
 
-- `gov_comm_core = Poseidon(DOMAIN_VAN, g_d_x, pk_d_x, value, voting_round_id, proposal_authority)`
-- `result = Poseidon(gov_comm_core, gov_comm_rand)`
+- `van_comm_core = Poseidon(DOMAIN_VAN, g_d_x, pk_d_x, value, voting_round_id, proposal_authority)`
+- `result = Poseidon(van_comm_core, van_comm_rand)`
 
-Used by builders and tests to compute the expected VAN / gov_comm value.
+Used by builders and tests to compute the expected VAN / van_comm value.
 
-**`van_integrity_poseidon(poseidon_config, layouter, label, domain_van, g_d_x, pk_d_x, value, voting_round_id, proposal_authority, gov_comm_rand) -> Result<AssignedCell<Base, Base>, Error>`**
+**`van_integrity_poseidon(poseidon_config, layouter, label, domain_van, g_d_x, pk_d_x, value, voting_round_id, proposal_authority, van_comm_rand) -> Result<AssignedCell<Base, Base>, Error>`**
 
-In-circuit two-layer hash with the same structure. Takes assigned cells and a `PoseidonConfig` (P128Pow5T3, width 3, rate 2). Returns the final hash cell. Callers constrain it to their witnessed commitment (delegation: gov_comm; vote proof: vote_authority_note_old or vote_authority_note_new).
+In-circuit two-layer hash with the same structure. Takes assigned cells and a `PoseidonConfig` (P128Pow5T3, width 3, rate 2). Returns the final hash cell. Callers constrain it to their witnessed commitment (delegation: van_comm; vote proof: vote_authority_note_old or vote_authority_note_new).
 
 ### Dependencies
 
@@ -81,7 +81,7 @@ In-circuit two-layer hash with the same structure. Takes assigned cells and a `P
 
 ### Usage
 
-- **Delegation:** `orchard/src/delegation/circuit.rs` — condition 7 assigns `domain_van` from `DOMAIN_VAN`, then calls `van_integrity_poseidon` and constrains the result to `gov_comm` (public input).
+- **Delegation:** `orchard/src/delegation/circuit.rs` — condition 7 assigns `domain_van` from `DOMAIN_VAN`, then calls `van_integrity_poseidon` and constrains the result to `van_comm` (public input).
 - **Vote proof:** `orchard/src/vote_proof/circuit.rs` — condition 2 (old VAN) and condition 6 (new VAN) call `van_integrity_poseidon` and constrain to `vote_authority_note_old` and `vote_authority_note_new` respectively.
 
 ### Constraint flow (conceptual)
@@ -98,7 +98,7 @@ Poseidon(core)                Poseidon(core)                Poseidon(core)
         ↓                              ↓                            ↓
 Poseidon(core, rand)          Poseidon(core, rand)          Poseidon(core, rand)
         ↓                              ↓                            ↓
-constrain gov_comm            constrain vote_authority_    constrain vote_authority_
+constrain van_comm            constrain vote_authority_    constrain vote_authority_
 (public input)                note_old                     note_new (public input)
 ```
 

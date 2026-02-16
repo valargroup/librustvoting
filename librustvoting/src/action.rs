@@ -115,7 +115,7 @@ fn make_dummy_note(
 /// Canonical delegate action payload encoding for external signing.
 ///
 /// Field order:
-/// nf_signed || rk || cmx_new || gov_comm || gov_null_1 || gov_null_2 ||
+/// nf_signed || rk || cmx_new || van_comm || gov_null_1 || gov_null_2 ||
 /// gov_null_3 || gov_null_4 || vote_round_id.
 ///
 /// TODO: This format might change when we standardize what the cosmos chain expects.
@@ -123,11 +123,11 @@ fn encode_delegation_action_bytes(
     nf_signed: &[u8; 32],
     rk: &[u8; 32],
     cmx_new: &[u8; 32],
-    gov_comm: &[u8],
+    van_comm: &[u8],
     gov_nullifiers: &[Vec<u8>],
     vote_round_id: &[u8; 32],
 ) -> Result<Vec<u8>, VotingError> {
-    crate::types::validate_32_bytes(gov_comm, "gov_comm")?;
+    crate::types::validate_32_bytes(van_comm, "van_comm")?;
     if gov_nullifiers.len() != 4 {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -141,7 +141,7 @@ fn encode_delegation_action_bytes(
     out.extend_from_slice(nf_signed);
     out.extend_from_slice(rk);
     out.extend_from_slice(cmx_new);
-    out.extend_from_slice(gov_comm);
+    out.extend_from_slice(van_comm);
     for (i, gn) in gov_nullifiers.iter().enumerate() {
         crate::types::validate_32_bytes(gn, &format!("gov_nullifiers[{}]", i))?;
         out.extend_from_slice(gn);
@@ -273,9 +273,9 @@ pub fn construct_delegation_action(
             message: "total note weight overflows u64".to_string(),
         })?;
 
-    // Sample gov_comm_rand as a proper random field element
-    let gov_comm_rand_fp = pallas::Base::random(&mut rng);
-    let gov_comm_rand: [u8; 32] = gov_comm_rand_fp.to_repr();
+    // Sample van_comm_rand as a proper random field element
+    let van_comm_rand_fp = pallas::Base::random(&mut rng);
+    let van_comm_rand: [u8; 32] = van_comm_rand_fp.to_repr();
 
     // Compute real VAN
     let van = governance::construct_van(
@@ -283,7 +283,7 @@ pub fn construct_delegation_action(
         &derived_pk_d_new_x,
         total_weight,
         &vri_32,
-        &gov_comm_rand,
+        &van_comm_rand,
     )?;
 
     // Collect all 4 cmx values: real from NoteInfo.commitment, padded from above
@@ -298,7 +298,7 @@ pub fn construct_delegation_action(
         });
     }
 
-    // Compute rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+    // Compute rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
     let rho_signed = governance::compute_rho_binding(
         &all_cmx[0],
         &all_cmx[1],
@@ -367,7 +367,7 @@ pub fn construct_delegation_action(
         rk: rk_bytes.to_vec(),
         gov_nullifiers,
         van,
-        gov_comm_rand: gov_comm_rand.to_vec(),
+        van_comm_rand: van_comm_rand.to_vec(),
         dummy_nullifiers,
         rho_signed,
         padded_cmx,
@@ -488,9 +488,9 @@ pub fn build_governance_pczt(
             message: "total note weight overflows u64".to_string(),
         })?;
 
-    // Sample gov_comm_rand
-    let gov_comm_rand_fp = pallas::Base::random(&mut rng);
-    let gov_comm_rand: [u8; 32] = gov_comm_rand_fp.to_repr();
+    // Sample van_comm_rand
+    let van_comm_rand_fp = pallas::Base::random(&mut rng);
+    let van_comm_rand: [u8; 32] = van_comm_rand_fp.to_repr();
 
     // Compute VAN
     let van = governance::construct_van(
@@ -498,7 +498,7 @@ pub fn build_governance_pczt(
         &derived_pk_d_new_x,
         total_weight,
         &vri_32,
-        &gov_comm_rand,
+        &van_comm_rand,
     )?;
 
     // Collect all 4 cmx values
@@ -709,7 +709,7 @@ pub fn build_governance_pczt(
         cmx_new: cmx_new_bytes.to_vec(),
         gov_nullifiers,
         van,
-        gov_comm_rand: gov_comm_rand.to_vec(),
+        van_comm_rand: van_comm_rand.to_vec(),
         dummy_nullifiers,
         rho_signed,
         padded_cmx,
@@ -880,8 +880,8 @@ mod tests {
         assert_eq!(result.van.len(), 32);
         assert_ne!(result.van, vec![0xBB; 32]);
 
-        // gov_comm_rand is 32 bytes
-        assert_eq!(result.gov_comm_rand.len(), 32);
+        // van_comm_rand is 32 bytes
+        assert_eq!(result.van_comm_rand.len(), 32);
 
         // First gov nullifier is real (deterministic for same inputs)
         assert_ne!(result.gov_nullifiers[0], vec![0xAA; 32]);
@@ -969,7 +969,7 @@ mod tests {
         // First gov nullifier (real) should be deterministic
         assert_eq!(result1.gov_nullifiers[0], result2.gov_nullifiers[0]);
 
-        // VAN will differ because gov_comm_rand is randomly sampled each time
+        // VAN will differ because van_comm_rand is randomly sampled each time
         // (this is expected)
     }
 
@@ -1099,7 +1099,7 @@ mod tests {
         .unwrap();
 
         // Different note commitments should produce different rho
-        // (VAN also differs due to random gov_comm_rand, reinforcing the difference)
+        // (VAN also differs due to random van_comm_rand, reinforcing the difference)
         assert_ne!(
             result_a.rho_signed, result_b.rho_signed,
             "different note sets must produce different rho_signed"
@@ -1228,7 +1228,7 @@ mod tests {
         let nf_signed = [0x01; 32];
         let rk = [0x02; 32];
         let cmx_new = [0x03; 32];
-        let gov_comm = vec![0x04; 32];
+        let van_comm = vec![0x04; 32];
         let gov_nullifiers = vec![
             vec![0x05; 32],
             vec![0x06; 32],
@@ -1241,7 +1241,7 @@ mod tests {
             &nf_signed,
             &rk,
             &cmx_new,
-            &gov_comm,
+            &van_comm,
             &gov_nullifiers,
             &vote_round_id,
         )
@@ -1251,7 +1251,7 @@ mod tests {
         assert_eq!(&encoded[0..32], &nf_signed);
         assert_eq!(&encoded[32..64], &rk);
         assert_eq!(&encoded[64..96], &cmx_new);
-        assert_eq!(&encoded[96..128], &gov_comm);
+        assert_eq!(&encoded[96..128], &van_comm);
         assert_eq!(&encoded[128..160], &gov_nullifiers[0]);
         assert_eq!(&encoded[160..192], &gov_nullifiers[1]);
         assert_eq!(&encoded[192..224], &gov_nullifiers[2]);
@@ -1369,8 +1369,8 @@ mod tests {
         // VAN is 32 bytes
         assert_eq!(result.van.len(), 32);
 
-        // gov_comm_rand is 32 bytes
-        assert_eq!(result.gov_comm_rand.len(), 32);
+        // van_comm_rand is 32 bytes
+        assert_eq!(result.van_comm_rand.len(), 32);
 
         // rho_signed is 32 bytes
         assert_eq!(result.rho_signed.len(), 32);
@@ -1470,7 +1470,7 @@ mod tests {
         assert_ne!(result1.alpha, result2.alpha);
 
         // nf_signed should be deterministic (same rho_signed from same notes/params)
-        // but rho_signed differs because VAN includes random gov_comm_rand
+        // but rho_signed differs because VAN includes random van_comm_rand
         // So nf_signed will differ between calls
     }
 }

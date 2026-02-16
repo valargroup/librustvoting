@@ -31,6 +31,8 @@ pub mod builder;
 pub mod bundle;
 #[cfg(feature = "circuit")]
 pub mod circuit;
+#[cfg(feature = "circuit")]
+mod shared_primitives;
 mod constants;
 pub mod keys;
 pub mod note;

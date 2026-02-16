@@ -237,5 +237,5 @@ The builder layer (separate milestone) will:
 - Generate a proof per circuit using `Proof::<Circuit>::create`
 - Bundle proofs into a `DelegationBallot` struct
 - Enforce `ak` consistency across all proofs (e.g., shared `rk` public input or binding signature)
-- Compute `gov_comm` from the sum of all note values
+- Compute `van_comm` from the sum of all note values
 

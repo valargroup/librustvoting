@@ -232,7 +232,7 @@ pub fn build_and_prove_delegation(
     notes: &[NoteInfo],
     hotkey_raw_address: &[u8],     // 43-byte raw Orchard address
     alpha_bytes: &[u8],            // 32-byte scalar
-    gov_comm_rand_bytes: &[u8],    // 32-byte field element
+    van_comm_rand_bytes: &[u8],    // 32-byte field element
     vote_round_id_bytes: &[u8],    // 32-byte field element
     merkle_witnesses: &[WitnessData],
     imt_proof_jsons: &[Vec<u8>],   // raw JSON from IMT server
@@ -247,14 +247,14 @@ pub fn build_and_prove_delegation(
 | `notes`               | `[NoteInfo]` | 1–4 wallet notes from `get_wallet_notes_at_snapshot`     |
 | `hotkey_raw_address`  | `Data`           | 43-byte raw Orchard address of the voting hotkey              |
 | `alpha_bytes`         | `Data`           | 32-byte spend auth randomizer (from `GovernancePczt`)         |
-| `gov_comm_rand_bytes` | `Data`           | 32-byte governance commitment blinding factor                 |
+| `van_comm_rand_bytes` | `Data`           | 32-byte governance commitment blinding factor                 |
 | `vote_round_id_bytes` | `Data`           | 32-byte voting round identifier                               |
 | `merkle_witnesses`    | `[WitnessData]`  | Merkle inclusion proofs from `generate_note_witnesses`        |
 | `imt_proof_jsons`     | `[Data]`         | Raw JSON from `GET /exclusion-proof/{hex}`, one per real note |
 | `imt_server_url`      | `String`         | IMT server base URL (for padded-note proofs fetched by Rust)  |
 | `network_id`          | `UInt32`         | 0 = mainnet, 1 = testnet                                      |
 
-**Output:** `DelegationProofResult` — contains Halo2 proof bytes, 12 public inputs (32 bytes each), nf_signed, cmx_new, gov_nullifiers, gov_comm, and rk.
+**Output:** `DelegationProofResult` — contains Halo2 proof bytes, 12 public inputs (32 bytes each), nf_signed, cmx_new, gov_nullifiers, van_comm, and rk.
 
 ### buildGovernancePczt
 

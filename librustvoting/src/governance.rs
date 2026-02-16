@@ -10,7 +10,7 @@ use crate::types::VotingError;
 pub(crate) const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
 
 /// Domain tag for Vote Authority Notes.
-/// Prepended as the first Poseidon input in gov_comm for domain separation.
+/// Prepended as the first Poseidon input in van_comm for domain separation.
 pub(crate) const DOMAIN_VAN: u64 = 0;
 
 /// Domain tag for governance authorization nullifier (per spec §1.3.2).
@@ -68,18 +68,18 @@ pub fn derive_gov_nullifier(
 /// Construct a Vote Authority Note (governance commitment, per spec §1.3.3).
 ///
 /// ```text
-/// gov_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total, vote_round_id, MAX_PROPOSAL_AUTHORITY)
-/// gov_comm = Poseidon(gov_comm_core, gov_comm_rand)
+/// van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total, vote_round_id, MAX_PROPOSAL_AUTHORITY)
+/// van_comm = Poseidon(van_comm_core, van_comm_rand)
 /// ```
 ///
 /// First hash is ConstantLength<6>, second is ConstantLength<2>.
-/// Matches `orchard/src/delegation/circuit.rs:gov_commitment_hash`.
+/// Matches `orchard/src/delegation/circuit.rs:van_commitment_hash`.
 pub fn construct_van(
     g_d_new_x: &[u8],
     pk_d_new_x: &[u8],
     total_weight: u64,
     vote_round_id: &[u8],
-    gov_comm_rand: &[u8],
+    van_comm_rand: &[u8],
 ) -> Result<Vec<u8>, VotingError> {
     if total_weight == 0 {
         return Err(VotingError::InvalidInput {
@@ -92,13 +92,13 @@ pub fn construct_van(
     let pk_d = bytes_to_fp(pk_d_new_x)?;
     let v_total = pallas::Base::from(total_weight);
     let vri = bytes_to_fp(vote_round_id)?;
-    let rcm = bytes_to_fp(gov_comm_rand)?;
+    let rcm = bytes_to_fp(van_comm_rand)?;
 
     // Step 1: Hash the 6 core VAN fields into a single digest (ConstantLength<6>).
     // This binds the VAN to a specific hotkey address (g_d, pk_d), delegated weight,
     // voting round, and full proposal authority. DOMAIN_VAN=0 provides domain
     // separation from Vote Commitments (DOMAIN_VC=1) in the shared commitment tree.
-    let gov_comm_core = poseidon::Hash::<_, P128Pow5T3, ConstantLength<6>, 3, 2>::init().hash([
+    let van_comm_core = poseidon::Hash::<_, P128Pow5T3, ConstantLength<6>, 3, 2>::init().hash([
         pallas::Base::from(DOMAIN_VAN),
         g_d,
         pk_d,
@@ -108,16 +108,16 @@ pub fn construct_van(
     ]);
 
     // Step 2: Fold in the blinding factor (ConstantLength<2>).
-    // gov_comm_rand hides the VAN preimage so observers can't brute-force
+    // van_comm_rand hides the VAN preimage so observers can't brute-force
     // the hotkey or weight from the on-chain commitment.
-    let gov_comm = poseidon_hash_2(gov_comm_core, rcm);
+    let van_comm = poseidon_hash_2(van_comm_core, rcm);
 
-    Ok(fp_to_bytes(gov_comm))
+    Ok(fp_to_bytes(van_comm))
 }
 
 /// Compute constrained rho (spec §1.3.4.1, condition 3).
 ///
-/// `rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)`
+/// `rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)`
 ///
 /// ConstantLength<6>, matching `orchard/src/delegation/circuit.rs:rho_binding_hash`.
 pub fn compute_rho_binding(
@@ -125,14 +125,14 @@ pub fn compute_rho_binding(
     cmx_2: &[u8],
     cmx_3: &[u8],
     cmx_4: &[u8],
-    gov_comm: &[u8],
+    van_comm: &[u8],
     vote_round_id: &[u8],
 ) -> Result<Vec<u8>, VotingError> {
     let c1 = bytes_to_fp(cmx_1)?;
     let c2 = bytes_to_fp(cmx_2)?;
     let c3 = bytes_to_fp(cmx_3)?;
     let c4 = bytes_to_fp(cmx_4)?;
-    let gc = bytes_to_fp(gov_comm)?;
+    let gc = bytes_to_fp(van_comm)?;
     let vri = bytes_to_fp(vote_round_id)?;
 
     let rho = poseidon::Hash::<_, P128Pow5T3, ConstantLength<6>, 3, 2>::init()
@@ -243,7 +243,7 @@ mod tests {
     /// These values are deterministic for the given inputs. If this test breaks,
     /// the Poseidon formula or input ordering has diverged from the spec.
     /// Cross-reference: orchard/src/delegation/imt.rs:gov_null_hash,
-    ///                  orchard/src/delegation/circuit.rs:gov_commitment_hash.
+    ///                  orchard/src/delegation/circuit.rs:van_commitment_hash.
     #[test]
     fn test_known_answer_gov_nullifier() {
         let nk = [0x01u8; 32];

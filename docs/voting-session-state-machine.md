@@ -80,7 +80,7 @@ enum SessionStatus {
 
 **MsgDelegateVote** (Phase 2):
 1. Record 4 gov nullifiers into the gov nullifier set
-2. Append VAN (`gov_comm`) to the vote commitment tree
+2. Append VAN (`van_comm`) to the vote commitment tree
 3. Update tree root
 
 **MsgCastVote** (Phase 3):

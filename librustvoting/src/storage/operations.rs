@@ -75,7 +75,7 @@ impl VotingDb {
     /// Construct the delegation action for Keystone signing.
     /// Loads round params from db. Notes come from caller (not stored yet).
     /// Computes real governance nullifiers, VAN, signed note, output note, and rk.
-    /// Persists delegation data (gov_comm_rand, dummy_nullifiers, rho_signed, etc.) to DB.
+    /// Persists delegation data (van_comm_rand, dummy_nullifiers, rho_signed, etc.) to DB.
     ///
     /// - `fvk_bytes`: 96-byte orchard FullViewingKey (ak[32] || nk[32] || rivk[32])
     /// - `g_d_new_x`: 32-byte x-coordinate of hotkey diversified generator (for VAN)
@@ -103,7 +103,7 @@ impl VotingDb {
         queries::store_delegation_data(
             &conn,
             round_id,
-            &action.gov_comm_rand,
+            &action.van_comm_rand,
             &action.dummy_nullifiers,
             &action.rho_signed,
             &action.padded_cmx,
@@ -156,7 +156,7 @@ impl VotingDb {
         queries::store_delegation_data(
             &conn,
             round_id,
-            &result.gov_comm_rand,
+            &result.van_comm_rand,
             &result.dummy_nullifiers,
             &result.rho_signed,
             &result.padded_cmx,
@@ -234,7 +234,7 @@ impl VotingDb {
     /// Build and prove the real delegation ZKP (#1). Long-running.
     ///
     /// Loads all required data from the voting DB and wallet DB:
-    /// - alpha, gov_comm_rand from delegation data (stored by `build_governance_pczt`)
+    /// - alpha, van_comm_rand from delegation data (stored by `build_governance_pczt`)
     /// - Merkle witnesses (stored by `generate_note_witnesses`)
     /// - Full note data (queried from wallet DB)
     /// - Vote round params (stored by `init_round`)
@@ -259,7 +259,7 @@ impl VotingDb {
         let conn = self.conn();
         let params = queries::load_round_params(&conn, round_id)?;
         let alpha = queries::load_alpha(&conn, round_id)?;
-        let gov_comm_rand = queries::load_gov_comm_rand(&conn, round_id)?;
+        let van_comm_rand = queries::load_van_comm_rand(&conn, round_id)?;
         let witnesses = queries::load_witnesses(&conn, round_id)?;
 
         // Query full note data from wallet DB (includes diversifier, rseed, etc.)
@@ -318,7 +318,7 @@ impl VotingDb {
             &full_notes,
             hotkey_raw_address,
             &alpha,
-            &gov_comm_rand,
+            &van_comm_rand,
             &vote_round_id_bytes,
             &witnesses,
             &imt_proofs,
@@ -523,7 +523,7 @@ mod tests {
         assert_ne!(action.rk, vec![0xDE; 32]);
         assert_eq!(action.gov_nullifiers.len(), 4);
         assert_eq!(action.van.len(), 32);
-        assert_eq!(action.gov_comm_rand.len(), 32);
+        assert_eq!(action.van_comm_rand.len(), 32);
 
         // rho_signed is 32 bytes, non-zero
         assert_eq!(action.rho_signed.len(), 32);
@@ -549,8 +549,8 @@ mod tests {
 
         // Verify delegation secrets were persisted
         let conn = db.conn();
-        let stored_rand = queries::load_gov_comm_rand(&conn, ROUND_ID).unwrap();
-        assert_eq!(stored_rand, action.gov_comm_rand);
+        let stored_rand = queries::load_van_comm_rand(&conn, ROUND_ID).unwrap();
+        assert_eq!(stored_rand, action.van_comm_rand);
         let stored_dummies = queries::load_dummy_nullifiers(&conn, ROUND_ID).unwrap();
         assert_eq!(stored_dummies, action.dummy_nullifiers);
 

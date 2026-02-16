@@ -4,9 +4,9 @@
 //! condition 7) and ZKP #2 (vote proof, conditions 2 and 6):
 //!
 //! ```text
-//! gov_comm_core = Poseidon(DOMAIN_VAN, g_d_x, pk_d_x, value,
+//! van_comm_core = Poseidon(DOMAIN_VAN, g_d_x, pk_d_x, value,
 //!                          voting_round_id, proposal_authority)
-//! result = Poseidon(gov_comm_core, gov_comm_rand)
+//! result = Poseidon(van_comm_core, van_comm_rand)
 //! ```
 //!
 //! The first layer commits to the structural fields (domain tag,
@@ -45,9 +45,9 @@ pub const DOMAIN_VAN: u64 = 0;
 /// Two-layer structure used by both ZKP #1 (delegation) and ZKP #2
 /// (vote proof) for cross-circuit interoperability:
 /// ```text
-/// gov_comm_core = Poseidon(DOMAIN_VAN, g_d_x, pk_d_x, value,
+/// van_comm_core = Poseidon(DOMAIN_VAN, g_d_x, pk_d_x, value,
 ///                          voting_round_id, proposal_authority)
-/// result = Poseidon(gov_comm_core, gov_comm_rand)
+/// result = Poseidon(van_comm_core, van_comm_rand)
 /// ```
 ///
 /// Used by builders and tests to compute the expected VAN commitment.
@@ -57,9 +57,9 @@ pub fn van_integrity_hash(
     value: pallas::Base,
     voting_round_id: pallas::Base,
     proposal_authority: pallas::Base,
-    gov_comm_rand: pallas::Base,
+    van_comm_rand: pallas::Base,
 ) -> pallas::Base {
-    let gov_comm_core =
+    let van_comm_core =
         poseidon::Hash::<_, poseidon::P128Pow5T3, ConstantLength<6>, 3, 2>::init().hash([
             pallas::Base::from(DOMAIN_VAN),
             g_d_x,
@@ -69,7 +69,7 @@ pub fn van_integrity_hash(
             proposal_authority,
         ]);
     poseidon::Hash::<_, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>::init()
-        .hash([gov_comm_core, gov_comm_rand])
+        .hash([van_comm_core, van_comm_rand])
 }
 
 // ================================================================
@@ -80,9 +80,9 @@ pub fn van_integrity_hash(
 ///
 /// Two-layer structure matching the out-of-circuit helper:
 /// ```text
-/// gov_comm_core = Poseidon(domain_van, g_d_x, pk_d_x, value,
+/// van_comm_core = Poseidon(domain_van, g_d_x, pk_d_x, value,
 ///                          voting_round_id, proposal_authority)
-/// result = Poseidon(gov_comm_core, gov_comm_rand)
+/// result = Poseidon(van_comm_core, van_comm_rand)
 /// ```
 ///
 /// Takes a `PoseidonConfig` so it can be used by any circuit that
@@ -102,7 +102,7 @@ pub fn van_integrity_poseidon(
     value: AssignedCell<pallas::Base, pallas::Base>,
     voting_round_id: AssignedCell<pallas::Base, pallas::Base>,
     proposal_authority: AssignedCell<pallas::Base, pallas::Base>,
-    gov_comm_rand: AssignedCell<pallas::Base, pallas::Base>,
+    van_comm_rand: AssignedCell<pallas::Base, pallas::Base>,
 ) -> Result<AssignedCell<pallas::Base, pallas::Base>, plonk::Error> {
     let core_message = [
         domain_van,
@@ -123,7 +123,7 @@ pub fn van_integrity_poseidon(
         PoseidonChip::construct(poseidon_config.clone()),
         layouter.namespace(|| alloc::format!("{label} core Poseidon init")),
     )?;
-    let gov_comm_core = poseidon_hasher_6.hash(
+    let van_comm_core = poseidon_hasher_6.hash(
         layouter.namespace(|| alloc::format!("{label} Poseidon(core)")),
         core_message,
     )?;
@@ -140,6 +140,6 @@ pub fn van_integrity_poseidon(
     )?;
     poseidon_hasher_2.hash(
         layouter.namespace(|| alloc::format!("{label} Poseidon(core, rand)")),
-        [gov_comm_core, gov_comm_rand],
+        [van_comm_core, van_comm_rand],
     )
 }

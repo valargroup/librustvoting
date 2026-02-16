@@ -364,7 +364,7 @@ fn two_clients_wallet_and_helper_server() {
     let mut server = TreeServer::empty();
 
     // -- Block 1: Alice delegates (MsgDelegateVote) -----------------------
-    let van_alice = fp(100); // Alice's VAN (gov_comm)
+    let van_alice = fp(100); // Alice's VAN (van_comm)
     server.append(van_alice); // index 0
     server.checkpoint(1);
 

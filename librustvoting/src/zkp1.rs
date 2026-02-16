@@ -295,7 +295,7 @@ fn parse_merkle_path(witness: &WitnessData) -> Result<MerklePath, VotingError> {
 /// - `full_notes`: 1–4 wallet notes (from `get_wallet_notes_at_snapshot`).
 /// - `hotkey_raw_address`: 43-byte raw Orchard address of the voting hotkey.
 /// - `alpha_bytes`: 32-byte spend auth randomizer scalar.
-/// - `gov_comm_rand_bytes`: 32-byte governance commitment blinding factor.
+/// - `van_comm_rand_bytes`: 32-byte governance commitment blinding factor.
 /// - `vote_round_id_bytes`: 32-byte voting round identifier.
 /// - `merkle_witnesses`: Merkle inclusion proofs for each note (from `generate_note_witnesses`).
 /// - `imt_proof_jsons`: Raw JSON from IMT server `GET /exclusion-proof/{hex}`, one per note.
@@ -307,7 +307,7 @@ pub fn build_and_prove_delegation(
     full_notes: &[NoteInfo],
     hotkey_raw_address: &[u8],
     alpha_bytes: &[u8],
-    gov_comm_rand_bytes: &[u8],
+    van_comm_rand_bytes: &[u8],
     vote_round_id_bytes: &[u8],
     merkle_witnesses: &[WitnessData],
     imt_proof_jsons: &[Vec<u8>],
@@ -352,7 +352,7 @@ pub fn build_and_prove_delegation(
 
     // Parse scalar/field inputs.
     let alpha = bytes_to_scalar(alpha_bytes, "alpha")?;
-    let gov_comm_rand = bytes_to_base(gov_comm_rand_bytes, "gov_comm_rand")?;
+    let van_comm_rand = bytes_to_base(van_comm_rand_bytes, "van_comm_rand")?;
     let vote_round_id = bytes_to_base(vote_round_id_bytes, "vote_round_id")?;
 
     // Parse hotkey address (43-byte raw Orchard address).
@@ -447,7 +447,7 @@ pub fn build_and_prove_delegation(
         output_recipient,
         vote_round_id,
         nc_root,
-        gov_comm_rand,
+        van_comm_rand,
         &imt_provider,
         &mut rng,
     )
@@ -515,7 +515,7 @@ pub fn build_and_prove_delegation(
             .iter()
             .map(|g| g.to_repr().to_vec())
             .collect(),
-        gov_comm: bundle.instance.gov_comm.to_repr().to_vec(),
+        van_comm: bundle.instance.van_comm.to_repr().to_vec(),
         rk: rk_bytes.to_vec(),
     })
 }
@@ -855,7 +855,7 @@ mod tests {
 
         // 7. Generate random parameters
         let alpha = pallas::Scalar::random(&mut rng);
-        let gov_comm_rand = pallas::Base::random(&mut rng);
+        let van_comm_rand = pallas::Base::random(&mut rng);
         let vote_round_id = pallas::Base::random(&mut rng);
 
         let count = Arc::new(AtomicU32::new(0));
@@ -871,7 +871,7 @@ mod tests {
             &full_notes,
             &hotkey_raw_address,
             &alpha.to_repr(),
-            &gov_comm_rand.to_repr(),
+            &van_comm_rand.to_repr(),
             &vote_round_id.to_repr(),
             &merkle_witnesses,
             &imt_proof_jsons,
@@ -907,7 +907,7 @@ mod tests {
         for (i, gn) in result.gov_nullifiers.iter().enumerate() {
             assert_eq!(gn.len(), 32, "gov_nullifier[{i}] should be 32 bytes");
         }
-        assert_eq!(result.gov_comm.len(), 32, "gov_comm should be 32 bytes");
+        assert_eq!(result.van_comm.len(), 32, "van_comm should be 32 bytes");
         assert_eq!(result.rk.len(), 32, "rk should be 32 bytes");
 
         // Verify proof is NOT the old mock pattern

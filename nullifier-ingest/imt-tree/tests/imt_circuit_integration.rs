@@ -169,7 +169,7 @@ fn imt_proof_from_nullifier_tree_verifies_in_circuit() {
     let fvk: FullViewingKey = (&sk).into();
     let output_recipient = fvk.address_at(1u32, Scope::External);
     let vote_round_id = pallas::Base::random(&mut rng);
-    let gov_comm_rand = pallas::Base::random(&mut rng);
+    let van_comm_rand = pallas::Base::random(&mut rng);
     let alpha = pallas::Scalar::random(&mut rng);
 
     // 3. Build a single real note with value >= 12,500,000 (the min weight).
@@ -183,7 +183,7 @@ fn imt_proof_from_nullifier_tree_verifies_in_circuit() {
         output_recipient,
         vote_round_id,
         nc_root,
-        gov_comm_rand,
+        van_comm_rand,
         &adapter,
         &mut rng,
     )
@@ -216,7 +216,7 @@ fn four_notes_with_nullifier_tree_verify_in_circuit() {
     let fvk: FullViewingKey = (&sk).into();
     let output_recipient = fvk.address_at(1u32, Scope::External);
     let vote_round_id = pallas::Base::random(&mut rng);
-    let gov_comm_rand = pallas::Base::random(&mut rng);
+    let van_comm_rand = pallas::Base::random(&mut rng);
     let alpha = pallas::Scalar::random(&mut rng);
 
     // 4 notes x 3,200,000 = 12,800,000 >= 12,500,000.
@@ -234,7 +234,7 @@ fn four_notes_with_nullifier_tree_verify_in_circuit() {
         output_recipient,
         vote_round_id,
         nc_root,
-        gov_comm_rand,
+        van_comm_rand,
         &adapter,
         &mut rng,
     )

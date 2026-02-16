@@ -285,7 +285,7 @@ message MsgCreateVotingSessionResponse {
 
 **Phase 2 — Delegation.** Submitted by the wallet after keystone signing. Proves ownership of up to 4 ZCash Orchard notes and delegates their voting weight to a hotkey.
 
-> Figma label: "MsgDelegateVote — rk, sig, signed_note_nullifier, cmx_new, gov_nullifiers, gov_comm, ZKP #1 proof"
+> Figma label: "MsgDelegateVote — rk, sig, signed_note_nullifier, cmx_new, gov_nullifiers, van_comm, ZKP #1 proof"
 
 ```protobuf
 message MsgDelegateVote {
@@ -307,7 +307,7 @@ message MsgDelegateVote {
   repeated FieldElement gov_nullifiers = 7; // [gov_null_1, gov_null_2, gov_null_3, gov_null_4]
 
   // Governance commitment (binds hotkey, weight, round, §1.3.3)
-  FieldElement gov_comm         = 8;
+  FieldElement van_comm         = 8;
 
   // ZKP #1 proof (Halo2 delegation proof, §Phase 2)
   Halo2Proof  proof             = 9;
@@ -329,7 +329,7 @@ Current client implementation uses a custom domain-separated Blake2b-256 sighash
   1. `nf_signed`
   2. `rk`
   3. `cmx_new`
-  4. `gov_comm`
+  4. `van_comm`
   5. `gov_null_1`
   6. `gov_null_2`
   7. `gov_null_3`
@@ -350,7 +350,7 @@ These are extracted from the message and passed to the on-chain Halo2 verifier:
 | 2   | `rk`                    | `msg.rk`                                           |
 | 3   | `nc_root`               | `session.nc_root` (from chain state)               |
 | 4   | `nullifier_imt_root`    | `session.nullifier_imt_root` (from chain state)    |
-| 5   | `gov_comm`              | `msg.gov_comm`                                     |
+| 5   | `van_comm`              | `msg.van_comm`                                     |
 | 6–9 | `gov_null_1..4`         | `msg.gov_nullifiers[0..3]`                         |
 | 10  | `vote_round_id`         | `msg.voting_round_id` (cross-checked with session) |
 | 11  | `cmx_new`               | `msg.cmx_new`                                      |
@@ -370,14 +370,14 @@ These are extracted from the message and passed to the on-chain Halo2 verifier:
 On success:
 
 1. **Record gov nullifiers:** For each `gov_nullifiers[i]`, insert into the gov nullifier set: `gov_null/{round_id}/{nullifier} → true`.
-2. **Append VAN to vote commitment tree:** Insert `gov_comm` as a new leaf. Record the tree index. (Per §2.5: "The `vote_action_note` is added to the chain's `vote_commitment_tree`".) Note: The Figma board labels this as "insert VAN" under the state update.
+2. **Append VAN to vote commitment tree:** Insert `van_comm` as a new leaf. Record the tree index. (Per §2.5: "The `vote_action_note` is added to the chain's `vote_commitment_tree`".) Note: The Figma board labels this as "insert VAN" under the state update.
 3. **Update tree root.**
 4. **Emit event:**
 
 ```protobuf
 message EventDelegateVote {
   bytes   voting_round_id       = 1;
-  bytes   gov_comm              = 2;
+  bytes   van_comm              = 2;
   uint64  van_tree_index        = 3;
   repeated bytes gov_nullifiers = 4;
 }
@@ -772,4 +772,4 @@ These are items marked as TODO in the protocol spec that affect message design:
 | 7 | **Delegation support (§6.0):** The spec mentions optional delegation — this would require additional messages (MsgDelegateToVoter, etc.). | §6.0 | Future message additions |
 | 8 | **Tree depth:** Resolved — depth 24 (2^24 ≈ 16.7M leaves). Reduced from ZCash's depth 32 for governance voting scale. Saves 8 Poseidon hashes per ZKP proof. | §Vote Commitment Tree | Affects Merkle path sizes and circuit parameters |
 | 9 | **Proposal authority decrement model:** The spec uses a single decrement per vote (§3.8 condition 5). Should this support weighted authority decrements for multi-proposal voting? | §3.5 | Affects ZKP #2 conditions |
-| 10 | **VAN insertion for MsgDelegateVote:** The spec says `vote_action_note` (i.e., `gov_comm`) is inserted into the tree. Confirm this is `gov_comm` and not `cmx_new`. | §2.5 | Affects which value becomes the VAN leaf |
+| 10 | **VAN insertion for MsgDelegateVote:** The spec says `vote_action_note` (i.e., `van_comm`) is inserted into the tree. Confirm this is `van_comm` and not `cmx_new`. | §2.5 | Affects which value becomes the VAN leaf |

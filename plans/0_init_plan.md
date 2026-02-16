@@ -139,7 +139,7 @@ message MsgRegisterDelegation {
   bytes signed_note_nullifier = 3; // Nullifier of the dummy signed note
   bytes cmx_new = 4;               // Output note commitment
   bytes enc_memo = 5;              // Encrypted memo
-  bytes gov_comm = 6;              // Governance commitment
+  bytes van_comm = 6;              // Governance commitment
   repeated bytes gov_nullifiers = 7; // Up to 4 governance nullifiers
   bytes proof = 8;                 // Halo2 ZKP #1
   bytes vote_round_id = 9;
@@ -250,7 +250,7 @@ func ValidateVoteTx(ctx sdk.Context, msg VoteMessage, keeper Keeper, opts Valida
 
 - Verify `vote_round_id` matches an active round (checked in AnteHandler or here)
 - Record each `gov_nullifier` in the nullifier set (fail if any already exists)
-- Append `gov_comm` to the vote commitment tree (new leaf)
+- Append `van_comm` to the vote commitment tree (new leaf)
 - Append `cmx_new` to the vote commitment tree (new leaf)
 - Snapshot: after each block, compute and store the tree root for that height
 - Emit event with delegation details

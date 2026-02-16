@@ -11,7 +11,7 @@ A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384
    * **nf_signed** (offset 0): the derived nullifier of the keystone note.
    * **rk** (offsets 1–2): the randomized public key for spend authorization (x, y coordinates).
    * **cmx_new** (offset 3): the extracted note commitment (`ExtractP(cm_new)`) of the output note.
-   * **gov_comm** (offset 4): the governance commitment — a Pallas base field element identifying the governance context.
+   * **van_comm** (offset 4): the governance commitment — a Pallas base field element identifying the governance context.
    * **vote_round_id** (offset 5): the vote round identifier — prevents cross-round replay.
    * **nc_root** (offset 6): the note commitment tree root (shared anchor for Merkle path verification).
    * **nf_imt_root** (offset 7): the nullifier Indexed Merkle Tree root (for non-membership proofs).
@@ -52,7 +52,7 @@ A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384
    * **imt_path**: Poseidon-based IMT Merkle authentication path (29 pure siblings).
 
 - Private (governance — condition 7)
-   * **gov_comm_rand**: a random blinding factor for the governance commitment.
+   * **van_comm_rand**: a random blinding factor for the governance commitment.
 
 - Internal wires (not public inputs, not free witnesses)
    * **ivk**: derived in condition 5 (CommitIvk), shared with condition 11.
@@ -119,17 +119,17 @@ DeriveNullifier_nk(rho, psi, cm) = ExtractP(
 Purpose: the signed note's rho is bound to the exact notes being delegated, the governance commitment, and the round. This makes the keystone signature non-replayable and scoped.
 
 ```
-rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
 ```
 
 Where:
 - **cmx_1..4**: the extracted note commitments (`ExtractP(cm_i)`) of the four delegated notes. **These are internal wires** — produced by per-note condition 9 (note commitment integrity), not free witnesses. By hashing all four commitments into rho, the keystone signature is bound to the exact set of notes the delegator chose.
-- **gov_comm**: the governance commitment (public input).
+- **van_comm**: the governance commitment (public input).
 - **vote_round_id**: the vote round identifier (public input).
 
 **Function:** `Poseidon` with `ConstantLength<6>`. Uses `Pow5Chip` / `P128Pow5T3` with rate 2 (3 absorption rounds for 6 inputs).
 
-**Constraint:** The circuit computes `derived_rho = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)` and enforces strict equality `derived_rho == rho_signed`. Since `rho_signed` is the same value used in both note commitment integrity (condition 1) and nullifier integrity (condition 2), this creates a three-way binding: the nullifier, the note commitment, and the delegation scope are all tied to the same rho.
+**Constraint:** The circuit computes `derived_rho = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)` and enforces strict equality `derived_rho == rho_signed`. Since `rho_signed` is the same value used in both note commitment integrity (condition 1) and nullifier integrity (condition 2), this creates a three-way binding: the nullifier, the note commitment, and the delegation scope are all tied to the same rho.
 
 **Constructions:** `PoseidonChip`.
 
@@ -201,8 +201,8 @@ Where:
 Purpose: prove that the governance commitment (a public input) is correctly derived from the domain tag, the output note's diversified address components (`g_d_new_x`, `pk_d_new_x`), the total voting weight, the vote round identifier, a blinding factor, and the proposal authority bitmask. The diversified address binds the VAN to the delegator's key material: `pk_d = [ivk] * g_d` where `ivk` is derived from `(ak, nk)` in condition 5, so the VAN can only be spent by someone who controls the same keys. Binds the delegated weight, address, and authority scope into a single public commitment that ZKP #2 (vote proof) can open. The domain tag provides domain separation from Vote Commitments in the shared vote commitment tree.
 
 ```
-gov_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total, vote_round_id, MAX_PROPOSAL_AUTHORITY)
-gov_comm = Poseidon(gov_comm_core, gov_comm_rand)
+van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total, vote_round_id, MAX_PROPOSAL_AUTHORITY)
+van_comm = Poseidon(van_comm_core, van_comm_rand)
 ```
 
 Where:
@@ -212,15 +212,15 @@ Where:
 - **v_total**: the sum `v_1 + v_2 + v_3 + v_4`, computed in-circuit via three `AddChip` additions. **Each `v_i` is an internal wire** — produced by per-note condition 9 (note commitment integrity), not a free witness. The value is bound to the actual note commitment.
 - **vote_round_id**: the vote round identifier (public input, same cell as condition 3).
 - **MAX_PROPOSAL_AUTHORITY**: `2^16 - 1 = 65535`. A 16-bit bitmask authorizing voting on all 16 proposals. Assigned via `assign_advice_from_constant` so the value is baked into the verification key.
-- **gov_comm_rand**: a random blinding factor. Prevents observers from brute-forcing the address or weight from the public `gov_comm`.
+- **van_comm_rand**: a random blinding factor. Prevents observers from brute-forcing the address or weight from the public `van_comm`.
 
 **Function layout:** Two Poseidon hashes via the shared `circuit::van_integrity` gadget:
-- `gov_comm_core` uses `ConstantLength<6>` over the structural fields.
-- `gov_comm` finalizes with `ConstantLength<2>` over `(gov_comm_core, gov_comm_rand)`.
+- `van_comm_core` uses `ConstantLength<6>` over the structural fields.
+- `van_comm` finalizes with `ConstantLength<2>` over `(van_comm_core, van_comm_rand)`.
 
 The same two-layer hash structure is used by ZKP #2 (vote proof, conditions 2 and 6) for cross-circuit interoperability — a VAN created here can be opened by the vote proof circuit.
 
-**Out-of-circuit helper:** `gov_commitment_hash()` delegates to `van_integrity::van_integrity_hash()` with `MAX_PROPOSAL_AUTHORITY` as the proposal authority.
+**Out-of-circuit helper:** `van_commitment_hash()` delegates to `van_integrity::van_integrity_hash()` with `MAX_PROPOSAL_AUTHORITY` as the proposal authority.
 
 **Constructions:** `van_integrity::van_integrity_poseidon` (shared gadget from `circuit::van_integrity`), `AddChip`.
 

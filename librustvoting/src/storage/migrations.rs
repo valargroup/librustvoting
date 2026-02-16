@@ -126,14 +126,14 @@ mod tests {
         // These columns are populated later by store_delegation_data()
         // after construct_delegation_action() computes the VAN.
         conn.execute(
-            "INSERT INTO rounds (round_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at, gov_comm_rand, dummy_nullifiers, rho_signed, padded_note_data, nf_signed, cmx_new, alpha, rseed_signed, rseed_output) VALUES ('test', 1, X'00', X'00', X'00', 0, 0, X'AA', X'BB', X'CC', X'DD', X'EE', X'FF', X'11', X'22', X'33')",
+            "INSERT INTO rounds (round_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at, van_comm_rand, dummy_nullifiers, rho_signed, padded_note_data, nf_signed, cmx_new, alpha, rseed_signed, rseed_output) VALUES ('test', 1, X'00', X'00', X'00', 0, 0, X'AA', X'BB', X'CC', X'DD', X'EE', X'FF', X'11', X'22', X'33')",
             [],
         ).unwrap();
 
-        // Verify gov_comm_rand round-trips (the VAN blinding factor)
+        // Verify van_comm_rand round-trips (the VAN blinding factor)
         let rand: Vec<u8> = conn
             .query_row(
-                "SELECT gov_comm_rand FROM rounds WHERE round_id = 'test'",
+                "SELECT van_comm_rand FROM rounds WHERE round_id = 'test'",
                 [],
                 |r| r.get(0),
             )

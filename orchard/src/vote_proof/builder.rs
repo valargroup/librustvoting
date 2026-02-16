@@ -96,7 +96,7 @@ fn random_valid_base_as_scalar(rng: &mut impl RngCore) -> pallas::Base {
 /// * `address_index` - The diversifier index of the output recipient
 ///   address used in delegation (typically 1).
 /// * `total_note_value` - Sum of delegated note values (e.g. 15_000_000).
-/// * `gov_comm_rand` - The blinding factor used for the VAN in delegation.
+/// * `van_comm_rand` - The blinding factor used for the VAN in delegation.
 /// * `voting_round_id` - The vote round identifier (Pallas base field element).
 /// * `vote_comm_tree_path` - Merkle authentication path (24 siblings) for
 ///   the VAN in the vote commitment tree.
@@ -114,7 +114,7 @@ pub fn build_vote_proof_from_delegation(
     sk: &SpendingKey,
     address_index: u32,
     total_note_value: u64,
-    gov_comm_rand: pallas::Base,
+    van_comm_rand: pallas::Base,
     voting_round_id: pallas::Base,
     vote_comm_tree_path: [pallas::Base; VOTE_COMM_TREE_DEPTH],
     vote_comm_tree_position: u32,
@@ -196,7 +196,7 @@ pub fn build_vote_proof_from_delegation(
         total_note_value_base,
         voting_round_id,
         proposal_authority_old,
-        gov_comm_rand,
+        van_comm_rand,
     );
 
     let van_nullifier =
@@ -208,7 +208,7 @@ pub fn build_vote_proof_from_delegation(
         total_note_value_base,
         voting_round_id,
         proposal_authority_new,
-        gov_comm_rand,
+        van_comm_rand,
     );
 
     // ---- Shares (split total_note_value into 4 parts) ----
@@ -297,7 +297,7 @@ pub fn build_vote_proof_from_delegation(
         Value::known(vpk_pk_d_affine),
         Value::known(total_note_value_base),
         Value::known(proposal_authority_old),
-        Value::known(gov_comm_rand),
+        Value::known(van_comm_rand),
         Value::known(vote_authority_note_old),
         Value::known(vsk),
         Value::known(rivk_v),

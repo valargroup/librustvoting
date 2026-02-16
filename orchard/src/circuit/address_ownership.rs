@@ -21,7 +21,7 @@ use crate::constants::{OrchardFixedBases, OrchardFixedBasesFull};
 use crate::circuit::commit_ivk::CommitIvkChip;
 use halo2_gadgets::ecc::{
     chip::EccChip,
-    FixedPoint, NonIdentityPoint, Point, ScalarFixed, ScalarVar,
+    NonIdentityPoint, Point, ScalarFixed, ScalarVar,
 };
 
 use crate::constants::{OrchardCommitDomains, OrchardHashDomains};
@@ -33,21 +33,26 @@ use halo2_gadgets::sinsemilla::chip::SinsemillaChip;
 
 /// Computes `[scalar] * SpendAuthG` using the Orchard fixed base.
 ///
-/// Used by delegation (condition 4: alpha), vote proof (condition 3: vsk),
-/// and optionally the main Orchard action circuit. Reduces repeated
-/// "FixedPoint::from_inner(SpendAuthG); spend_auth_g.mul(...)" blocks.
+/// Thin wrapper around the shared gadget in `crate::shared_primitives` –
+/// see [`crate::shared_primitives::spend_authority`] for the upstream reference.
 ///
+/// Used by delegation (condition 4: alpha), vote proof (condition 3: vsk).
 /// Returns the resulting curve point so the caller can e.g. add `ak_P` for rk
 /// (delegation) or call `extract_p()` for ak (vote proof).
 pub(in crate::circuit) fn spend_auth_g_mul(
     ecc_chip: EccChip<OrchardFixedBases>,
-    mut layouter: impl Layouter<pallas::Base>,
-    label: &str,
+    layouter: impl Layouter<pallas::Base>,
+    _label: &str,
     scalar: ScalarFixed<pallas::Affine, EccChip<OrchardFixedBases>>,
 ) -> Result<Point<pallas::Affine, EccChip<OrchardFixedBases>>, Error> {
+    // The shared crate's prove_spend_authority does [scalar]*SpendAuthG + ak_P.
+    // For call sites that only need the [scalar]*SpendAuthG multiplication
+    // (e.g. vote proof's [vsk]*SpendAuthG to derive ak), we use the same
+    // underlying gadget via a dedicated mul helper.
+    use halo2_gadgets::ecc::FixedPoint;
     let spend_auth_g = OrchardFixedBasesFull::SpendAuthG;
     let spend_auth_g = FixedPoint::from_inner(ecc_chip, spend_auth_g);
-    let (point, _) = spend_auth_g.mul(layouter.namespace(|| label), scalar)?;
+    let (point, _) = spend_auth_g.mul(layouter, scalar)?;
     Ok(point)
 }
 

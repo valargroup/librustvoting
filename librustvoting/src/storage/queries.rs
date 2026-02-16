@@ -185,7 +185,7 @@ pub fn clear_round(conn: &Connection, round_id: &str) -> Result<(), VotingError>
 //
 // After construct_delegation_action computes the VAN (governance commitment),
 // we persist two values needed for later proof steps:
-//   - gov_comm_rand: the 32-byte blinding factor used in the VAN Poseidon hash.
+//   - van_comm_rand: the 32-byte blinding factor used in the VAN Poseidon hash.
 //     Needed again in ZKP #2 (vote commitment) to reconstruct the VAN as a witness.
 //   - dummy_nullifiers: random nullifiers generated for padded note slots (§1.3.5).
 //     Each is 32 bytes. Stored so the witness builder can reconstruct padded notes.
@@ -196,7 +196,7 @@ pub fn clear_round(conn: &Connection, round_id: &str) -> Result<(), VotingError>
 pub fn store_delegation_data(
     conn: &Connection,
     round_id: &str,
-    gov_comm_rand: &[u8],
+    van_comm_rand: &[u8],
     dummy_nullifiers: &[Vec<u8>],
     rho_signed: &[u8],
     padded_cmx: &[Vec<u8>],
@@ -219,9 +219,9 @@ pub fn store_delegation_data(
 
     let rows = conn
         .execute(
-            "UPDATE rounds SET gov_comm_rand = :rand, dummy_nullifiers = :dummies, rho_signed = :rho, padded_note_data = :padded, nf_signed = :nf_signed, cmx_new = :cmx_new, alpha = :alpha, rseed_signed = :rseed_signed, rseed_output = :rseed_output WHERE round_id = :round_id",
+            "UPDATE rounds SET van_comm_rand = :rand, dummy_nullifiers = :dummies, rho_signed = :rho, padded_note_data = :padded, nf_signed = :nf_signed, cmx_new = :cmx_new, alpha = :alpha, rseed_signed = :rseed_signed, rseed_output = :rseed_output WHERE round_id = :round_id",
             named_params! {
-                ":rand": gov_comm_rand,
+                ":rand": van_comm_rand,
                 ":dummies": dummy_blob,
                 ":rho": rho_signed,
                 ":padded": padded_blob,
@@ -308,14 +308,14 @@ pub fn load_rseed_output(conn: &Connection, round_id: &str) -> Result<Vec<u8>, V
 }
 
 /// Load the VAN blinding factor for a round. Needed as a private witness in ZKP #2.
-pub fn load_gov_comm_rand(conn: &Connection, round_id: &str) -> Result<Vec<u8>, VotingError> {
+pub fn load_van_comm_rand(conn: &Connection, round_id: &str) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT gov_comm_rand FROM rounds WHERE round_id = :round_id",
+        "SELECT van_comm_rand FROM rounds WHERE round_id = :round_id",
         named_params! { ":round_id": round_id },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
-        message: format!("no gov_comm_rand for round: {} ({})", round_id, e),
+        message: format!("no van_comm_rand for round: {} ({})", round_id, e),
     })
 }
 

@@ -26,7 +26,7 @@ use self::{
 use crate::{
     builder::SpendInfo,
     constants::{
-        OrchardCommitDomains, OrchardFixedBases, OrchardFixedBasesFull, OrchardHashDomains,
+        OrchardCommitDomains, OrchardFixedBases, OrchardHashDomains,
         MERKLE_DEPTH_ORCHARD,
     },
     keys::{
@@ -45,7 +45,7 @@ use crate::{
 use halo2_gadgets::{
     ecc::{
         chip::{EccChip, EccConfig},
-        FixedPoint, NonIdentityPoint, Point, ScalarFixed, ScalarFixedShort, ScalarVar,
+        NonIdentityPoint, Point, ScalarFixed, ScalarFixedShort, ScalarVar,
     },
     poseidon::{primitives as poseidon, Pow5Chip as PoseidonChip, Pow5Config as PoseidonConfig},
     sinsemilla::{
@@ -559,24 +559,19 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         };
 
         // Spend authority (https://p.z.cash/ZKS:action-spend-authority)
-        {
-            let alpha =
-                ScalarFixed::new(ecc_chip.clone(), layouter.namespace(|| "alpha"), self.alpha)?;
-
-            // alpha_commitment = [alpha] SpendAuthG
-            let (alpha_commitment, _) = {
-                let spend_auth_g = OrchardFixedBasesFull::SpendAuthG;
-                let spend_auth_g = FixedPoint::from_inner(ecc_chip.clone(), spend_auth_g);
-                spend_auth_g.mul(layouter.namespace(|| "[alpha] SpendAuthG"), alpha)?
-            };
-
-            // [alpha] SpendAuthG + ak_P
-            let rk = alpha_commitment.add(layouter.namespace(|| "rk"), &ak_P)?;
-
-            // Constrain rk to equal public input
-            layouter.constrain_instance(rk.inner().x().cell(), config.primary, RK_X)?;
-            layouter.constrain_instance(rk.inner().y().cell(), config.primary, RK_Y)?;
-        }
+        //
+        // Uses the shared gadget from crate::shared_primitives – a 1:1 copy of
+        // the upstream Orchard spend authority check:
+        //   https://github.com/zcash/orchard/blob/main/src/circuit.rs#L542-L558
+        crate::shared_primitives::spend_authority::prove_spend_authority(
+            ecc_chip.clone(),
+            layouter.namespace(|| "spend authority"),
+            self.alpha,
+            &ak_P.clone().into(),
+            config.primary,
+            RK_X,
+            RK_Y,
+        )?;
 
         // Diversified address integrity (https://p.z.cash/ZKS:action-addr-integrity?partial).
         let pk_d_old = {

@@ -175,7 +175,7 @@ fn build_test_bundle(values: &[u64]) -> DelegationBundle {
     let fvk: FullViewingKey = (&sk).into();
     let output_recipient = fvk.address_at(1u32, Scope::External);
     let vote_round_id = pallas::Base::random(&mut rng);
-    let gov_comm_rand = pallas::Base::random(&mut rng);
+    let van_comm_rand = pallas::Base::random(&mut rng);
     let alpha = pallas::Scalar::random(&mut rng);
 
     let imt = SpacedLeafImtProvider::new();
@@ -188,7 +188,7 @@ fn build_test_bundle(values: &[u64]) -> DelegationBundle {
         output_recipient,
         vote_round_id,
         nc_root,
-        gov_comm_rand,
+        van_comm_rand,
         &imt,
         &mut rng,
     )

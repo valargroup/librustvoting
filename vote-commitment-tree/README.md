@@ -68,7 +68,7 @@ Three messages interact with the tree. The first two **write** leaves into it; t
 
 ### MsgDelegateVote (Phase 2 — ZKP #1) — WRITE only
 
-**What happens:** A voter delegates their mainchain ZEC notes to a voting hotkey. The chain verifies ZKP #1, records governance nullifiers, and **appends the VAN** (the governance commitment `gov_comm`) as a new leaf in the tree.
+**What happens:** A voter delegates their mainchain ZEC notes to a voting hotkey. The chain verifies ZKP #1, records governance nullifiers, and **appends the VAN** (the governance commitment `van_comm`) as a new leaf in the tree.
 
 **Tree's role:** Storage. The VAN is planted into the tree so that future ZKP #2 proofs can prove membership of this VAN. At this point nobody reads from the tree — the tree just grows.
 
@@ -80,7 +80,7 @@ MsgDelegateVote  ──  tree relationship
   ZKP #1 proves:  "I own unspent ZCash notes"
                   (uses nc_root from mainchain, NOT the vote tree)
 
-  Chain action:   tree.append(gov_comm)   ← VAN goes in as a new leaf
+  Chain action:   tree.append(van_comm)   ← VAN goes in as a new leaf
                   tree now has this VAN at index N
 ```
 
@@ -462,10 +462,10 @@ sequenceDiagram
     Note over W,T: Phase 2 — MsgDelegateVote (ZKP #1)
     W->>W: Build VAN = Poseidon(DOMAIN_VAN, hotkey, weight, round, authority, rand)
     W->>W: Generate ZKP #1 (proves note ownership on mainchain)
-    W->>C: MsgDelegateVote { gov_comm, gov_nullifiers, proof }
+    W->>C: MsgDelegateVote { van_comm, gov_nullifiers, proof }
     C->>C: Verify ZKP #1 against nc_root (mainchain anchor)
     C->>C: Record gov_nullifiers (prevent double-delegation)
-    C->>T: tree.append(gov_comm)
+    C->>T: tree.append(van_comm)
     T-->>C: leaf index = N
     Note over T: Tree now contains VAN at position N
 
@@ -875,7 +875,7 @@ The vote chain lives in **`sdk/`** (Cosmos SDK app in Go). The integration is fu
 ### What the chain does
 
 - **Stores leaves** in KV at `0x02 || big-endian index → 32-byte commitment` (one Fp per leaf).
-- **Appends** via `keeper.AppendCommitment(kvStore, commitment)` on `MsgDelegateVote` (1 leaf: `gov_comm`) and `MsgCastVote` (2 leaves: `vote_authority_note_new`, `vote_commitment`).
+- **Appends** via `keeper.AppendCommitment(kvStore, commitment)` on `MsgDelegateVote` (1 leaf: `van_comm`) and `MsgCastVote` (2 leaves: `vote_authority_note_new`, `vote_commitment`).
 - **Computes root in EndBlocker** via Poseidon FFI (`tree_root_poseidon.go` → `votetree.ComputePoseidonRoot`) and stores it at the current block height.
 - **Serves REST endpoints** for tree state, roots at height, and leaf batches.
 

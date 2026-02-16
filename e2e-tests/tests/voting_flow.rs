@@ -158,7 +158,7 @@ fn voting_flow_full_lifecycle() {
 
     // 4a: Build local commitment tree witness for the VAN (van_cmx at position 0).
     let (van_auth_path, van_position, van_tree_root) = build_van_merkle_witness(
-        vote_proof_data.gov_comm,
+        vote_proof_data.van_comm,
         anchor_height,
     );
 
@@ -193,7 +193,7 @@ fn voting_flow_full_lifecycle() {
         &vote_proof_data.sk,
         1u32,                           // address_index used in delegation
         vote_proof_data.total_note_value,
-        vote_proof_data.gov_comm_rand,
+        vote_proof_data.van_comm_rand,
         vote_proof_data.vote_round_id,
         van_auth_path,
         van_position,

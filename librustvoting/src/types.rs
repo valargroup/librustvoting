@@ -74,7 +74,7 @@ pub struct DelegationAction {
     /// 32-byte governance commitment (VAN).
     pub van: Vec<u8>,
     /// 32-byte blinding factor used for VAN (must be persisted for later use).
-    pub gov_comm_rand: Vec<u8>,
+    pub van_comm_rand: Vec<u8>,
     /// Random nullifiers used for padded dummy notes (needed for circuit witness in later steps).
     pub dummy_nullifiers: Vec<Vec<u8>>,
     /// Constrained rho for the signed note (32 bytes). Spec §1.3.4.1.
@@ -119,7 +119,7 @@ pub struct GovernancePczt {
     /// 32-byte governance commitment (VAN).
     pub van: Vec<u8>,
     /// 32-byte blinding factor used for VAN (must be persisted for later use).
-    pub gov_comm_rand: Vec<u8>,
+    pub van_comm_rand: Vec<u8>,
     /// Random nullifiers used for padded dummy notes (needed for circuit witness).
     pub dummy_nullifiers: Vec<Vec<u8>>,
     /// Constrained rho for the signed note (32 bytes). Spec §1.3.4.1.
@@ -199,7 +199,7 @@ pub struct DelegationProofResult {
     /// 4 governance nullifiers (each 32 bytes).
     pub gov_nullifiers: Vec<Vec<u8>>,
     /// Governance commitment / VAN (32 bytes).
-    pub gov_comm: Vec<u8>,
+    pub van_comm: Vec<u8>,
     /// Randomized verification key (32 bytes, compressed).
     pub rk: Vec<u8>,
 }

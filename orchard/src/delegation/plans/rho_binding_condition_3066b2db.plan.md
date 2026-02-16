@@ -1,15 +1,15 @@
 ---
 name: Rho Binding Condition
-overview: "Implement Condition 3 (Rho Binding) in the delegation circuit: constrain rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id) using a single ConstantLength<6> Poseidon hash, with new public inputs for gov_comm and vote_round_id."
+overview: "Implement Condition 3 (Rho Binding) in the delegation circuit: constrain rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id) using a single ConstantLength<6> Poseidon hash, with new public inputs for van_comm and vote_round_id."
 todos:
   - id: add-imports
     content: Add ConstantLength and PoseidonHash imports to delegation/circuit.rs
     status: completed
   - id: add-public-input-offsets
-    content: Add GOV_COMM and VOTE_ROUND_ID public input offset constants
+    content: Add VAN_COMM and VOTE_ROUND_ID public input offset constants
     status: completed
   - id: add-witness-fields
-    content: Add cmx_1..4, gov_comm, vote_round_id to Circuit struct
+    content: Add cmx_1..4, van_comm, vote_round_id to Circuit struct
     status: completed
   - id: add-builder-method
     content: Add with_rho_binding builder method to Circuit
@@ -18,7 +18,7 @@ todos:
     content: "Add rho binding constraint block in synthesize(): witness inputs, constrain public, Poseidon hash, equality check"
     status: completed
   - id: update-instance
-    content: Add gov_comm and vote_round_id to Instance struct and to_halo2_instance()
+    content: Add van_comm and vote_round_id to Instance struct and to_halo2_instance()
     status: completed
   - id: add-spec-fn
     content: Add rho_binding_hash spec function to src/spec.rs
@@ -27,7 +27,7 @@ todos:
     content: Update make_test_note and all existing tests to provide rho binding witnesses and public inputs
     status: completed
   - id: add-new-tests
-    content: Add rho_binding_happy_path, wrong_cmx, wrong_gov_comm, wrong_vote_round_id tests
+    content: Add rho_binding_happy_path, wrong_cmx, wrong_van_comm, wrong_vote_round_id tests
     status: completed
 isProject: false
 ---
@@ -36,7 +36,7 @@ isProject: false
 
 ## Spec Condition
 
-> `rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)`
+> `rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)`
 >
 > The signed note's rho is bound to the exact notes being delegated, the governance commitment, and the round. This makes the keystone signature non-replayable and scoped.
 
@@ -79,7 +79,7 @@ poseidon::{
 Add after the existing `RK_Y` constant (line 62):
 
 ```rust
-const GOV_COMM: usize = 3;
+const VAN_COMM: usize = 3;
 const VOTE_ROUND_ID: usize = 4;
 ```
 
@@ -92,7 +92,7 @@ cmx_1: Value<pallas::Base>,
 cmx_2: Value<pallas::Base>,
 cmx_3: Value<pallas::Base>,
 cmx_4: Value<pallas::Base>,
-gov_comm: Value<pallas::Base>,
+van_comm: Value<pallas::Base>,
 vote_round_id: Value<pallas::Base>,
 ```
 
@@ -109,14 +109,14 @@ pub fn with_rho_binding(
     cmx_2: pallas::Base,
     cmx_3: pallas::Base,
     cmx_4: pallas::Base,
-    gov_comm: pallas::Base,
+    van_comm: pallas::Base,
     vote_round_id: pallas::Base,
 ) -> Self {
     self.cmx_1 = Value::known(cmx_1);
     self.cmx_2 = Value::known(cmx_2);
     self.cmx_3 = Value::known(cmx_3);
     self.cmx_4 = Value::known(cmx_4);
-    self.gov_comm = Value::known(gov_comm);
+    self.van_comm = Value::known(van_comm);
     self.vote_round_id = Value::known(vote_round_id);
     self
 }
@@ -128,7 +128,7 @@ Insert after the note commitment integrity block (after line 511). The `rho_sign
 
 ```rust
 // Rho binding (condition 3).
-// rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+// rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
 // Binds the signed note to the exact notes being delegated, the governance
 // commitment, and the round, making the keystone signature non-replayable.
 {
@@ -140,18 +140,18 @@ Insert after the note commitment integrity block (after line 511). The `rho_sign
         layouter.namespace(|| "witness cmx_3"), config.advices[0], self.cmx_3)?;
     let cmx_4 = assign_free_advice(
         layouter.namespace(|| "witness cmx_4"), config.advices[0], self.cmx_4)?;
-    let gov_comm = assign_free_advice(
-        layouter.namespace(|| "witness gov_comm"), config.advices[0], self.gov_comm)?;
+    let van_comm = assign_free_advice(
+        layouter.namespace(|| "witness van_comm"), config.advices[0], self.van_comm)?;
     let vote_round_id = assign_free_advice(
         layouter.namespace(|| "witness vote_round_id"), config.advices[0], self.vote_round_id)?;
 
-    // Bind gov_comm and vote_round_id to the public inputs.
-    layouter.constrain_instance(gov_comm.cell(), config.primary, GOV_COMM)?;
+    // Bind van_comm and vote_round_id to the public inputs.
+    layouter.constrain_instance(van_comm.cell(), config.primary, VAN_COMM)?;
     layouter.constrain_instance(vote_round_id.cell(), config.primary, VOTE_ROUND_ID)?;
 
     // Poseidon hash over 6 inputs using ConstantLength<6>.
     let derived_rho = {
-        let poseidon_message = [cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id];
+        let poseidon_message = [cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id];
         let poseidon_hasher = PoseidonHash::<
             pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<6>, 3, 2,
         >::init(
@@ -159,7 +159,7 @@ Insert after the note commitment integrity block (after line 511). The `rho_sign
             layouter.namespace(|| "rho binding Poseidon init"),
         )?;
         poseidon_hasher.hash(
-            layouter.namespace(|| "Poseidon(cmx_1..4, gov_comm, vote_round_id)"),
+            layouter.namespace(|| "Poseidon(cmx_1..4, van_comm, vote_round_id)"),
             poseidon_message,
         )?
     };
@@ -177,7 +177,7 @@ Insert after the note commitment integrity block (after line 511). The `rho_sign
 Add two new public fields to `Instance` (line 519):
 
 ```rust
-pub gov_comm: pallas::Base,
+pub van_comm: pallas::Base,
 pub vote_round_id: pallas::Base,
 ```
 
@@ -186,7 +186,7 @@ Update `from_parts` to accept them and `to_halo2_instance` to include them at of
 ```rust
 pub fn to_halo2_instance(&self) -> Vec<vesta::Scalar> {
     let rk = /* ... existing rk logic ... */;
-    vec![self.nf_signed.0, *rk.x(), *rk.y(), self.gov_comm, self.vote_round_id]
+    vec![self.nf_signed.0, *rk.x(), *rk.y(), self.van_comm, self.vote_round_id]
 }
 ```
 
@@ -196,20 +196,20 @@ Add to [src/spec.rs](src/spec.rs) (after `prf_nf`, ~line 237). This provides the
 
 ```rust
 /// Rho binding hash for the delegation circuit (condition 3).
-/// rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id)
+/// rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
 pub(crate) fn rho_binding_hash(
     cmx_1: pallas::Base, cmx_2: pallas::Base,
     cmx_3: pallas::Base, cmx_4: pallas::Base,
-    gov_comm: pallas::Base, vote_round_id: pallas::Base,
+    van_comm: pallas::Base, vote_round_id: pallas::Base,
 ) -> pallas::Base {
     poseidon::Hash::<_, poseidon::P128Pow5T3, poseidon::ConstantLength<6>, 3, 2>::init()
-        .hash([cmx_1, cmx_2, cmx_3, cmx_4, gov_comm, vote_round_id])
+        .hash([cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id])
 }
 ```
 
 ### 8. Update Existing Tests
 
-All existing tests must provide the new public inputs (`gov_comm`, `vote_round_id`) in the instance vector, and the circuit must have consistent rho binding witnesses. Two approaches:
+All existing tests must provide the new public inputs (`van_comm`, `vote_round_id`) in the instance vector, and the circuit must have consistent rho binding witnesses. Two approaches:
 
 - **Option A**: Modify `make_test_note` to construct a note with correct rho binding (compute rho from 4 dummy cmx values).
 - **Option B**: Keep `make_test_note` as-is and use it only for a simpler helper; create a new `make_test_note_with_rho_binding` for the full flow.
@@ -217,11 +217,11 @@ All existing tests must provide the new public inputs (`gov_comm`, `vote_round_i
 **Chosen: Option A.** Update `make_test_note` so every existing test still passes. The new helper:
 
 1. Creates 4 dummy notes, extracts `cmx_1..4 = ExtractP(cm_i)`
-2. Picks random `gov_comm`, `vote_round_id`
-3. Computes `rho = rho_binding_hash(cmx_1..4, gov_comm, vote_round_id)`
+2. Picks random `van_comm`, `vote_round_id`
+3. Computes `rho = rho_binding_hash(cmx_1..4, van_comm, vote_round_id)`
 4. Creates the signed note via `Note::dummy(rng, Some(Nullifier(rho)))`
-5. Builds the circuit via `Circuit::from_note_unchecked(...).with_rho_binding(cmx_1..4, gov_comm, vote_round_id)`
-6. Returns the circuit, `Instance` (now including `gov_comm`, `vote_round_id`), and the cmx values
+5. Builds the circuit via `Circuit::from_note_unchecked(...).with_rho_binding(cmx_1..4, van_comm, vote_round_id)`
+6. Returns the circuit, `Instance` (now including `van_comm`, `vote_round_id`), and the cmx values
 
 ### 9. New Tests
 
@@ -229,7 +229,7 @@ All existing tests must provide the new public inputs (`gov_comm`, `vote_round_i
 
 `**rho_binding_wrong_cmx**`: Build circuit with correct rho binding, then tamper with `cmx_1` in the circuit witness. The Poseidon hash will differ from `rho_signed`, so the equality constraint fails.
 
-`**rho_binding_wrong_gov_comm_public_input**`: Build circuit with correct witness, but supply a different `gov_comm` in the public instance. The `constrain_instance` on `gov_comm` will fail.
+`**rho_binding_wrong_van_comm_public_input**`: Build circuit with correct witness, but supply a different `van_comm` in the public instance. The `constrain_instance` on `van_comm` will fail.
 
 `**rho_binding_wrong_vote_round_id**`: Same pattern — correct witness but wrong `vote_round_id` in the public instance. The `constrain_instance` on `vote_round_id` will fail.
 

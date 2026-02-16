@@ -47,14 +47,14 @@ fn extend_padded64(out: &mut Vec<u8>, b: &[u8]) {
 pub struct VoteProofDelegationData {
     /// The spending key used during delegation.
     pub sk: SpendingKey,
-    /// Blinding factor for the VAN (gov_comm).
-    pub gov_comm_rand: pallas::Base,
+    /// Blinding factor for the VAN (van_comm).
+    pub van_comm_rand: pallas::Base,
     /// Vote round identifier as a Pallas field element.
     pub vote_round_id: pallas::Base,
     /// Sum of delegated note values.
     pub total_note_value: u64,
-    /// The VAN leaf value (gov_comm) appended to the commitment tree.
-    pub gov_comm: pallas::Base,
+    /// The VAN leaf value (van_comm) appended to the commitment tree.
+    pub van_comm: pallas::Base,
     /// The cmx_new value appended to the commitment tree (sibling at position 0).
     pub cmx_new: pallas::Base,
 }
@@ -72,7 +72,7 @@ pub fn build_delegation_bundle_for_test(
     let fvk: FullViewingKey = (&sk).into();
     let output_recipient = fvk.address_at(1u32, Scope::External);
     let alpha = pallas::Scalar::random(&mut rng);
-    let gov_comm_rand = pallas::Base::random(&mut rng);
+    let van_comm_rand = pallas::Base::random(&mut rng);
 
     let note_value = 15_000_000u64;
     let recipient = fvk.address_at(0u32, Scope::External);
@@ -164,7 +164,7 @@ pub fn build_delegation_bundle_for_test(
         output_recipient,
         vote_round_id,
         nc_root,
-        gov_comm_rand,
+        van_comm_rand,
         &imt,
         &mut rng,
     )
@@ -181,7 +181,7 @@ pub fn build_delegation_bundle_for_test(
     let nf_signed_bytes = bundle.instance.nf_signed.to_bytes();
     let cmx_new_bytes = bundle.instance.cmx_new.to_repr();
     let vote_round_id_repr = bundle.instance.vote_round_id.to_repr();
-    let van_cmx_bytes = bundle.instance.gov_comm.to_repr();
+    let van_cmx_bytes = bundle.instance.van_comm.to_repr();
     let gov_null_bytes: Vec<[u8; 32]> = bundle
         .instance
         .gov_null
@@ -240,10 +240,10 @@ pub fn build_delegation_bundle_for_test(
 
     let vote_proof_data = VoteProofDelegationData {
         sk,
-        gov_comm_rand,
+        van_comm_rand,
         vote_round_id,
         total_note_value: note_value,
-        gov_comm: bundle.instance.gov_comm,
+        van_comm: bundle.instance.van_comm,
         cmx_new: bundle.instance.cmx_new,
     };
 

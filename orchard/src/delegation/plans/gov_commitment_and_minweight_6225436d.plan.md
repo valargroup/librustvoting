@@ -1,6 +1,6 @@
 ---
 name: Gov Commitment and MinWeight
-overview: Add conditions 7 (Gov Commitment Integrity) and 8 (Minimum Voting Weight) to the delegation circuit. Condition 7 verifies gov_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand). Condition 8 enforces v_total >= 12,500,000 zatoshi via a 64-bit range check on the difference.
+overview: Add conditions 7 (Gov Commitment Integrity) and 8 (Minimum Voting Weight) to the delegation circuit. Condition 7 verifies van_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id, van_comm_rand). Condition 8 enforces v_total >= 12,500,000 zatoshi via a 64-bit range check on the difference.
 todos: []
 isProject: false
 ---
@@ -11,10 +11,10 @@ isProject: false
 
 `vpk` is a **full diversified address** -- the tuple `(g_d_new, pk_d_new)` -- which are the same ECC points already witnessed for the output note in condition 6. For the Poseidon hash, represent vpk as **two Pallas base field elements** by extracting x-coordinates: `g_d_new_x = ExtractP(g_d_new)` and `pk_d_new_x = ExtractP(pk_d_new)`.
 
-This means the gov_comm Poseidon becomes a **5-input hash** (`ConstantLength<5>`):
+This means the van_comm Poseidon becomes a **5-input hash** (`ConstantLength<5>`):
 
 ```
-gov_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand)
+van_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id, van_comm_rand)
 ```
 
 Rationale for 5 inputs vs nested hashing:
@@ -29,8 +29,8 @@ Conditions 7 and 8 stay **inside the existing per-note delegation circuit**, not
 
 The 4 note values `v_1..v_4` are added as **free private witnesses** (field elements). Today they have no in-circuit binding to actual note commitments -- that binding arrives with condition 9 (Old Note Commitment Integrity). This is safe because:
 
-- Condition 7 binds `v_total` into `gov_comm`, which is a public input
-- `gov_comm` enters the delegation commitment tree and is opened in ZKP #2 (vote proof), so inflating `v_total` would fail at vote time
+- Condition 7 binds `v_total` into `van_comm`, which is a public input
+- `van_comm` enters the delegation commitment tree and is opened in ZKP #2 (vote proof), so inflating `v_total` would fail at vote time
 - Condition 8 prevents dust (v_total < 0.125 ZEC) regardless of whether v_i are bound to real notes yet
 
 ## Files to change
@@ -58,34 +58,34 @@ v_1: Value<pallas::Base>,
 v_2: Value<pallas::Base>,
 v_3: Value<pallas::Base>,
 v_4: Value<pallas::Base>,
-gov_comm_rand: Value<pallas::Base>,
+van_comm_rand: Value<pallas::Base>,
 ```
 
-**New builder method** `with_gov_commitment_data`:
+**New builder method** `with_van_commitment_data`:
 
 ```rust
-pub fn with_gov_commitment_data(
+pub fn with_van_commitment_data(
     mut self,
     v_1: u64, v_2: u64, v_3: u64, v_4: u64,
-    gov_comm_rand: pallas::Base,
+    van_comm_rand: pallas::Base,
 ) -> Self {
     self.v_1 = Value::known(pallas::Base::from(v_1));
     self.v_2 = Value::known(pallas::Base::from(v_2));
     self.v_3 = Value::known(pallas::Base::from(v_3));
     self.v_4 = Value::known(pallas::Base::from(v_4));
-    self.gov_comm_rand = Value::known(gov_comm_rand);
+    self.van_comm_rand = Value::known(van_comm_rand);
     self
 }
 ```
 
 **Synthesize changes:**
 
-Step A: Restructure condition 3 block (rho binding, lines 619-661) to return `gov_comm_cell` and `vote_round_id_cell`:
+Step A: Restructure condition 3 block (rho binding, lines 619-661) to return `van_comm_cell` and `vote_round_id_cell`:
 
 ```rust
-let (gov_comm_cell, vote_round_id_cell) = {
+let (van_comm_cell, vote_round_id_cell) = {
     // ... existing rho binding logic ...
-    (gov_comm, vote_round_id)
+    (van_comm, vote_round_id)
 };
 ```
 
@@ -104,13 +104,13 @@ Step C: Add condition 7 block after condition 6:
 
 ```rust
 // Condition 7: Gov Commitment Integrity
-// gov_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand)
+// van_comm = Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id, van_comm_rand)
 let v_total = {
     let v_1 = assign_free_advice(layouter, config.advices[0], self.v_1)?;
     let v_2 = assign_free_advice(layouter, config.advices[0], self.v_2)?;
     let v_3 = assign_free_advice(layouter, config.advices[0], self.v_3)?;
     let v_4 = assign_free_advice(layouter, config.advices[0], self.v_4)?;
-    let gov_comm_rand = assign_free_advice(layouter, config.advices[0], self.gov_comm_rand)?;
+    let van_comm_rand = assign_free_advice(layouter, config.advices[0], self.van_comm_rand)?;
 
     // v_total = v_1 + v_2 + v_3 + v_4  (three AddChip additions)
     let add_chip = config.add_chip();
@@ -118,18 +118,18 @@ let v_total = {
     let sum_123 = add_chip.add(layouter, &sum_12, &v_3)?;
     let v_total = add_chip.add(layouter, &sum_123, &v_4)?;
 
-    // Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand)
-    let derived_gov_comm = {
-        let msg = [g_d_new_x, pk_d_new_x, v_total.clone(), vote_round_id_cell, gov_comm_rand];
+    // Poseidon(g_d_new_x, pk_d_new_x, v_total, vote_round_id, van_comm_rand)
+    let derived_van_comm = {
+        let msg = [g_d_new_x, pk_d_new_x, v_total.clone(), vote_round_id_cell, van_comm_rand];
         let hasher = PoseidonHash::<
             pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<5>, 3, 2,
         >::init(config.poseidon_chip(), layouter)?;
         hasher.hash(layouter, msg)?
     };
 
-    // Constrain: derived_gov_comm == gov_comm (from condition 3)
-    layouter.assign_region(|| "gov_comm integrity", |mut region| {
-        region.constrain_equal(derived_gov_comm.cell(), gov_comm_cell.cell())
+    // Constrain: derived_van_comm == van_comm (from condition 3)
+    layouter.assign_region(|| "van_comm integrity", |mut region| {
+        region.constrain_equal(derived_van_comm.cell(), van_comm_cell.cell())
     })?;
 
     v_total
@@ -173,18 +173,18 @@ Step D: Add condition 8 block after condition 7:
 
 ### 2. [src/spec.rs](src/spec.rs) -- Out-of-circuit helper
 
-Add a `gov_commitment_hash` function next to the existing `rho_binding_hash` (line 245):
+Add a `van_commitment_hash` function next to the existing `rho_binding_hash` (line 245):
 
 ```rust
-pub(crate) fn gov_commitment_hash(
+pub(crate) fn van_commitment_hash(
     g_d_new_x: pallas::Base,
     pk_d_new_x: pallas::Base,
     v_total: pallas::Base,
     vote_round_id: pallas::Base,
-    gov_comm_rand: pallas::Base,
+    van_comm_rand: pallas::Base,
 ) -> pallas::Base {
     poseidon::Hash::<_, poseidon::P128Pow5T3, poseidon::ConstantLength<5>, 3, 2>::init()
-        .hash([g_d_new_x, pk_d_new_x, v_total, vote_round_id, gov_comm_rand])
+        .hash([g_d_new_x, pk_d_new_x, v_total, vote_round_id, van_comm_rand])
 }
 ```
 
