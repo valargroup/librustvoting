@@ -5,17 +5,18 @@
 //!
 //! - **Condition 1**: VAN Membership (Poseidon Merkle path, `constrain_instance`).
 //! - **Condition 2**: VAN Integrity (Poseidon hash).
-//! - **Condition 3**: Spend Authority (`vpk_pk_d = [ivk_v] * vpk_g_d` via CommitIvk).
-//! - **Condition 4**: VAN Nullifier Integrity (nested Poseidon, `constrain_instance`).
-//! - **Condition 5**: Proposal Authority Decrement (AddChip + range check).
-//! - **Condition 6**: New VAN Integrity (Poseidon hash, `constrain_instance`).
-//! - **Condition 7**: Shares Sum Correctness (AddChip, `constrain_equal`).
-//! - **Condition 8**: Shares Range (LookupRangeCheck, `[0, 2^30)`).
-//! - **Condition 9**: Shares Hash Integrity (Poseidon `ConstantLength<8>`; output flows to condition 11).
-//! - **Condition 10**: Encryption Integrity (ECC variable-base mul, `constrain_equal`).
-//! - **Condition 11**: Vote Commitment Integrity (Poseidon `ConstantLength<4>`, `constrain_instance`).
+//! - **Condition 3**: Diversified Address Integrity (`vpk_pk_d = [ivk_v] * vpk_g_d` via CommitIvk).
+//! - **Condition 4**: Spend Authority — verified out-of-circuit (`r_vpk = vsk.ak + [alpha_v] * G`, signature).
+//! - **Condition 5**: VAN Nullifier Integrity (nested Poseidon, `constrain_instance`).
+//! - **Condition 6**: Proposal Authority Decrement (AddChip + range check).
+//! - **Condition 7**: New VAN Integrity (Poseidon hash, `constrain_instance`).
+//! - **Condition 8**: Shares Sum Correctness (AddChip, `constrain_equal`).
+//! - **Condition 9**: Shares Range (LookupRangeCheck, `[0, 2^30)`).
+//! - **Condition 10**: Shares Hash Integrity (Poseidon `ConstantLength<8>`; output flows to condition 12).
+//! - **Condition 11**: Encryption Integrity (ECC variable-base mul, `constrain_equal`).
+//! - **Condition 12**: Vote Commitment Integrity (Poseidon `ConstantLength<4>`, `constrain_instance`).
 //!
-//! All 11 conditions are fully constrained.
+//! Conditions 1–3 and 5–12 are fully constrained in-circuit; condition 4 is enforced out-of-circuit.
 //!
 //! ## Conditions overview
 //!
@@ -24,27 +25,28 @@
 //!   to `vote_comm_tree_root`.
 //! - **Condition 2**: VAN Integrity — `vote_authority_note_old` is the two-layer
 //!   Poseidon hash (ZKP 1–compatible: core then finalize with rand). *(implemented)*
-//! - **Condition 3**: Spend Authority — prover controls the VAN address via
-//!   `vpk_pk_d = [ivk_v] * vpk_g_d` where `ivk_v = CommitIvk(ExtractP([vsk]*SpendAuthG), vsk.nk)`. *(implemented)*
-//! - **Condition 4**: VAN Nullifier Integrity — `van_nullifier` is correctly
+//! - **Condition 3**: Diversified Address Integrity — `vpk_pk_d = [ivk_v] * vpk_g_d`
+//!   where `ivk_v = CommitIvk(ExtractP([vsk]*SpendAuthG), vsk.nk)`. *(implemented)*
+//! - **Condition 4**: Spend Authority — `r_vpk = vsk.ak + [alpha_v] * G`; verified out-of-circuit via signature.
+//! - **Condition 5**: VAN Nullifier Integrity — `van_nullifier` is correctly
 //!   derived from `vsk.nk`. *(implemented)*
 //!
 //! New VAN construction:
-//! - **Condition 5**: Proposal Authority Decrement — `proposal_authority_new =
+//! - **Condition 6**: Proposal Authority Decrement — `proposal_authority_new =
 //!   proposal_authority_old - (1 << proposal_id)`, with bitmask range [0, 2^16). *(implemented)*
-//! - **Condition 6**: New VAN Integrity — same two-layer structure as condition 2
+//! - **Condition 7**: New VAN Integrity — same two-layer structure as condition 2
 //!   but with decremented authority. *(implemented)*
 //!
 //! Vote commitment construction:
-//! - **Condition 7**: Shares Sum Correctness — `sum(shares_1..4) = total_note_value`.
+//! - **Condition 8**: Shares Sum Correctness — `sum(shares_1..4) = total_note_value`.
 //!   *(implemented)*
-//! - **Condition 8**: Shares Range — each `shares_j` in `[0, 2^24)`.
+//! - **Condition 9**: Shares Range — each `shares_j` in `[0, 2^24)`.
 //!   *(implemented)*
-//! - **Condition 9**: Shares Hash Integrity — `shares_hash = H(enc_share_1..4)`.
+//! - **Condition 10**: Shares Hash Integrity — `shares_hash = H(enc_share_1..4)`.
 //!   *(implemented)*
-//! - **Condition 10**: Encryption Integrity — each `enc_share_i = ElGamal(shares_i, r_i, ea_pk)`.
+//! - **Condition 11**: Encryption Integrity — each `enc_share_i = ElGamal(shares_i, r_i, ea_pk)`.
 //!   *(implemented)*
-//! - **Condition 11**: Vote Commitment Integrity — `vote_commitment = H(DOMAIN_VC, shares_hash,
+//! - **Condition 12**: Vote Commitment Integrity — `vote_commitment = H(DOMAIN_VC, shares_hash,
 //!   proposal_id, vote_decision)`. *(implemented)*
 
 use alloc::vec::Vec;
@@ -95,9 +97,9 @@ pub const VOTE_COMM_TREE_DEPTH: usize = 24;
 
 /// Circuit size (2^K rows).
 ///
-/// K=14 (16,384 rows). Conditions 1–9 use ~29 Poseidon hashes plus
+/// K=14 (16,384 rows). Conditions 1–3 and 5–10 use ~29 Poseidon hashes plus
 /// AddChip additions, range-check running sums, ECC fixed-base mul
-/// (condition 3), and 24 Merkle swap regions. Condition 10 adds 12
+/// (condition 3), and 24 Merkle swap regions. Condition 11 adds 12
 /// variable-base scalar multiplications (~6,000 rows) and 4 point
 /// additions. The 10-bit lookup table requires 1,024 rows.
 /// K=14 provides headroom.
@@ -167,7 +169,7 @@ pub fn domain_van_nullifier() -> pallas::Base {
     ])
 }
 
-/// Out-of-circuit VAN nullifier hash (condition 4).
+/// Out-of-circuit VAN nullifier hash (condition 5).
 ///
 /// Three-layer `ConstantLength<2>` Poseidon chain (matches ZKP 1
 /// condition 14's governance nullifier pattern):
@@ -209,7 +211,7 @@ pub fn poseidon_hash_2(a: pallas::Base, b: pallas::Base) -> pallas::Base {
     poseidon::Hash::<_, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>::init().hash([a, b])
 }
 
-/// Out-of-circuit shares hash (condition 9).
+/// Out-of-circuit shares hash (condition 10).
 ///
 /// Computes:
 /// ```text
@@ -238,7 +240,7 @@ pub fn shares_hash(
     ])
 }
 
-/// Out-of-circuit vote commitment hash (condition 11).
+/// Out-of-circuit vote commitment hash (condition 12).
 ///
 /// Computes:
 /// ```text
@@ -268,7 +270,7 @@ pub fn vote_commitment_hash(
 ///
 /// This is the same generator used for spend authorization in the Zcash
 /// Orchard protocol. We reuse it as the El Gamal generator so that
-/// condition 3 (spend authority) and condition 10 (encryption integrity)
+/// condition 3 (diversified address integrity) and condition 11 (encryption integrity)
 /// share the same ECC chip configuration.
 pub fn spend_auth_g_affine() -> pallas::Affine {
     use group::Curve;
@@ -279,7 +281,7 @@ pub fn spend_auth_g_affine() -> pallas::Affine {
 /// Converts a `pallas::Base` field element to a `pallas::Scalar`.
 ///
 /// Both fields have 255-bit moduli that differ only in the low bits.
-/// For small values (< 2^30, as guaranteed by condition 8 for shares),
+/// For small values (< 2^30, as guaranteed by condition 9 for shares),
 /// the integer representation is identical in both fields. For full-size
 /// values (El Gamal randomness), the conversion is valid as long as the
 /// base element is < scalar field modulus (overwhelmingly likely for
@@ -291,7 +293,7 @@ pub fn base_to_scalar(b: pallas::Base) -> Option<pallas::Scalar> {
     pallas::Scalar::from_repr(b.to_repr()).into()
 }
 
-/// Out-of-circuit El Gamal encryption under SpendAuthG (condition 10).
+/// Out-of-circuit El Gamal encryption under SpendAuthG (condition 11).
 ///
 /// Computes:
 /// ```text
@@ -332,10 +334,9 @@ pub fn elgamal_encrypt(
 
 /// Configuration for the Vote Proof circuit.
 ///
-/// Holds chip configs for Poseidon (conditions 1, 2, 4, 6, 9), AddChip
-/// (conditions 5, 7), LookupRangeCheck (conditions 5, 8), ECC
-/// (conditions 3, 10), and the Merkle swap gate (condition 1). Will
-/// be extended with custom gates as condition 11 is added.
+/// Holds chip configs for Poseidon (conditions 1, 2, 5, 7, 10), AddChip
+/// (conditions 6, 8), LookupRangeCheck (conditions 6, 9), ECC
+/// (conditions 3, 11), and the Merkle swap gate (condition 1).
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Public input column (9 field elements).
@@ -351,18 +352,18 @@ pub struct Config {
     /// Poseidon hash chip configuration.
     ///
     /// P128Pow5T3 with width 3, rate 2. Used for VAN integrity (condition 2),
-    /// VAN nullifier (condition 4), new VAN integrity (condition 6),
+    /// VAN nullifier (condition 5), new VAN integrity (condition 7),
     /// vote commitment Merkle path (condition 1), and vote commitment
-    /// integrity (conditions 9, 11).
+    /// integrity (conditions 10, 12).
     poseidon_config: PoseidonConfig<pallas::Base, 3, 2>,
     /// AddChip: constrains `a + b = c` on a single row.
     ///
     /// Uses advices[7] (a), advices[8] (b), advices[6] (c), matching
     /// the delegation circuit's column assignment.
-    /// Used in conditions 5 (proposal authority decrement) and 7 (shares
+    /// Used in conditions 6 (proposal authority decrement) and 8 (shares
     /// sum correctness).
     add_config: AddConfig,
-    /// ECC chip configuration (condition 3: spend authority, condition 10: El Gamal).
+    /// ECC chip configuration (condition 3: diversified address integrity, condition 11: El Gamal).
     ///
     /// Condition 3 proves `vpk_pk_d = [ivk_v] * vpk_g_d` via the CommitIvk chain:
     /// `[vsk] * SpendAuthG → ak → CommitIvk(ExtractP(ak), nk, rivk_v) → ivk_v → [ivk_v] * vpk_g_d`.
@@ -384,8 +385,8 @@ pub struct Config {
     ///
     /// Uses advices[9] as the running-sum column. Each word is 10 bits,
     /// so `num_words` × 10 gives the total bit-width checked.
-    /// Used in condition 5 to ensure authority values and diff are in [0, 2^16)
-    /// (16-bit bitmask), and condition 8 to ensure each share is in `[0, 2^24)`.
+    /// Used in condition 6 to ensure authority values and diff are in [0, 2^16)
+    /// (16-bit bitmask), and condition 9 to ensure each share is in `[0, 2^24)`.
     range_check: LookupRangeCheckConfig<pallas::Base, 10>,
     /// Selector for the Merkle conditional swap gate (condition 1).
     ///
@@ -394,7 +395,7 @@ pub struct Config {
     /// Uses advices[0..5]: pos_bit, current, sibling, left, right.
     /// Identical to the delegation circuit's `q_imt_swap` gate.
     q_merkle_swap: Selector,
-    /// Selector for condition 5 (Proposal Authority Decrement) row.
+    /// Selector for condition 6 (Proposal Authority Decrement) row.
     /// When 1, the (proposal_id, one_shifted) lookup is enforced; when 0,
     /// the lookup input is (0, 1) so it passes without constraining.
     q_cond5: Selector,
@@ -419,7 +420,7 @@ impl Config {
         AddChip::construct(self.add_config.clone())
     }
 
-    /// Constructs an ECC chip for curve operations (conditions 3, 10).
+    /// Constructs an ECC chip for curve operations (conditions 3, 11).
     fn ecc_chip(&self) -> EccChip<OrchardFixedBases> {
         EccChip::construct(self.ecc_config.clone())
     }
@@ -450,15 +451,13 @@ impl Config {
 ///
 /// Proves that a registered voter is casting a valid vote, without
 /// revealing which VAN they hold. Contains witness fields for all
-/// 11 conditions; constraint logic is added incrementally.
+/// 12 conditions (condition 4 enforced out-of-circuit); constraint logic is added incrementally.
 ///
-/// All 11 conditions are fully constrained: VAN membership, VAN
-/// integrity, spend authority, nullifier, authority decrement, new
-/// VAN integrity, shares sum, shares range, shares hash integrity,
-/// encryption integrity, vote commitment integrity.
+/// Conditions 1–3 and 5–12 are fully constrained in-circuit; condition 4 (Spend Authority) is
+/// enforced out-of-circuit via signature verification.
 #[derive(Clone, Debug, Default)]
 pub struct Circuit {
-    // === VAN ownership and spending (conditions 1–4) ===
+    // === VAN ownership and spending (conditions 1–5; condition 4 out-of-circuit) ===
 
     // Condition 1 (VAN Membership): Poseidon-based Merkle path from
     // vote_authority_note_old to vote_comm_tree_root.
@@ -472,17 +471,17 @@ pub struct Circuit {
     //                          voting_round_id, proposal_authority_old);
     // vote_authority_note_old = Poseidon(gov_comm_core, gov_comm_rand).
     //
-    // Condition 3 (Spend Authority): vpk_pk_d = [ivk_v] * vpk_g_d
+    // Condition 3 (Diversified Address Integrity): vpk_pk_d = [ivk_v] * vpk_g_d
     // where ivk_v = CommitIvk(ExtractP([vsk]*SpendAuthG), vsk.nk, rivk_v).
     // Full affine points are needed for condition 3's ECC operations;
-    // x-coordinates are extracted in-circuit for Poseidon hashing (conditions 2, 6).
+    // x-coordinates are extracted in-circuit for Poseidon hashing (conditions 2, 7).
     /// Voting public key — diversified base point (from DiversifyHash(d)).
     /// This is the vpk_g_d component of the voting hotkey address.
     /// Condition 3 performs `[ivk_v] * vpk_g_d` to derive vpk_pk_d.
     pub(crate) vpk_g_d: Value<pallas::Affine>,
     /// Voting public key — diversified transmission key (pk_d = [ivk_v] * g_d).
     /// This is the vpk_pk_d component of the voting hotkey address.
-    /// Condition 3 constrains this to equal `[ivk_v] * vpk_g_d`.
+    /// Condition 3 (Diversified Address Integrity) constrains this to equal `[ivk_v] * vpk_g_d`.
     pub(crate) vpk_pk_d: Value<pallas::Affine>,
     /// The voter's total delegated weight.
     pub(crate) total_note_value: Value<pallas::Base>,
@@ -494,7 +493,7 @@ pub struct Circuit {
     /// leaf in condition 1 and constrained to equal the derived hash here.
     pub(crate) vote_authority_note_old: Value<pallas::Base>,
 
-    // Condition 3 (Spend Authority): prover controls the VAN address.
+    // Condition 3 (Diversified Address Integrity): prover controls the VAN address.
     // vpk_pk_d = [ivk_v] * vpk_g_d
     //   where ivk_v = CommitIvk_rivk_v(ExtractP([vsk]*SpendAuthG), vsk.nk)
     /// Voting spending key (scalar for ECC multiplication).
@@ -504,32 +503,32 @@ pub struct Circuit {
     /// Used as the blinding scalar in `CommitIvk(ak, nk, rivk_v)`.
     pub(crate) rivk_v: Value<pallas::Scalar>,
 
-    // Condition 4 (VAN Nullifier Integrity): nullifier deriving key.
+    // Condition 5 (VAN Nullifier Integrity): nullifier deriving key.
     // Also used in condition 3 as the nk input to CommitIvk.
     /// Nullifier deriving key derived from vsk.
     pub(crate) vsk_nk: Value<pallas::Base>,
 
-    // Condition 5 (Proposal Authority Decrement): one_shifted = 2^proposal_id.
+    // Condition 6 (Proposal Authority Decrement): one_shifted = 2^proposal_id.
     /// Cleared bit value: one_shifted = 2^proposal_id (witness; lookup constrains it).
     pub(crate) one_shifted: Value<pallas::Base>,
 
-    // === Vote commitment construction (conditions 7–11) ===
+    // === Vote commitment construction (conditions 8–12) ===
 
-    // Condition 7 (Shares Sum): sum(shares_1..4) = total_note_value.
-    // Condition 8 (Shares Range): each share in [0, 2^24).
+    // Condition 8 (Shares Sum): sum(shares_1..4) = total_note_value.
+    // Condition 9 (Shares Range): each share in [0, 2^24).
     /// Voting share vector (4 shares that sum to total_note_value).
     pub(crate) shares: [Value<pallas::Base>; 4],
 
-    // Condition 9 (Shares Hash Integrity): El Gamal ciphertext x-coordinates.
+    // Condition 10 (Shares Hash Integrity): El Gamal ciphertext x-coordinates.
     // These are the x-coordinates of the curve points comprising each
-    // El Gamal ciphertext. Condition 10 (not yet implemented) will
-    // constrain these to be correct encryptions; condition 9 hashes them.
+    // El Gamal ciphertext. Condition 11 constrains these to be correct
+    // encryptions; condition 10 hashes them.
     /// X-coordinates of C1_i = r_i * G for each share (via ExtractP).
     pub(crate) enc_share_c1_x: [Value<pallas::Base>; 4],
     /// X-coordinates of C2_i = shares_i * G + r_i * ea_pk for each share (via ExtractP).
     pub(crate) enc_share_c2_x: [Value<pallas::Base>; 4],
 
-    // Condition 10 (Encryption Integrity): El Gamal randomness and public key.
+    // Condition 11 (Encryption Integrity): El Gamal randomness and public key.
     /// El Gamal encryption randomness for each share (base field element,
     /// converted to scalar via ScalarVar::from_base in-circuit).
     pub(crate) share_randomness: [Value<pallas::Base>; 4],
@@ -538,13 +537,13 @@ pub struct Circuit {
     /// Both coordinates are public inputs (EA_PK_X, EA_PK_Y).
     pub(crate) ea_pk: Value<pallas::Affine>,
 
-    // Condition 11 (Vote Commitment Integrity): vote decision.
+    // Condition 12 (Vote Commitment Integrity): vote decision.
     /// The voter's choice (hidden inside the vote commitment).
     pub(crate) vote_decision: Value<pallas::Base>,
 }
 
 impl Circuit {
-    /// Creates a circuit with conditions 1–6 witnesses populated.
+    /// Creates a circuit with conditions 1–3 and 5–7 witnesses populated.
     ///
     /// All other witness fields are set to `Value::unknown()`.
     /// - Condition 1 uses `vote_authority_note_old` as the Merkle leaf,
@@ -552,14 +551,14 @@ impl Circuit {
     ///   the authentication path.
     /// - Condition 2 binds `vote_authority_note_old` to the Poseidon hash
     ///   of its components (using x-coordinates extracted from vpk_g_d, vpk_pk_d).
-    /// - Condition 3 proves spend authority via CommitIvk chain:
+    /// - Condition 3 proves diversified address integrity via CommitIvk chain:
     ///   `[vsk] * SpendAuthG → ak → CommitIvk(ak, nk, rivk_v) → ivk_v → [ivk_v] * vpk_g_d = vpk_pk_d`.
-    /// - Condition 4 reuses `vote_authority_note_old` and `voting_round_id`.
-    /// - Condition 5 derives `proposal_authority_new` from
+    /// - Condition 5 reuses `vote_authority_note_old` and `voting_round_id`.
+    /// - Condition 6 derives `proposal_authority_new` from
     ///   `proposal_authority_old`.
-    /// - Condition 6 reuses all condition 2 witnesses except
+    /// - Condition 7 reuses all condition 2 witnesses except
     ///   `proposal_authority_old`, which is replaced by the
-    ///   in-circuit `proposal_authority_new` from condition 5.
+    ///   in-circuit `proposal_authority_new` from condition 6.
     pub fn with_van_witnesses(
         vote_comm_tree_path: Value<[pallas::Base; VOTE_COMM_TREE_DEPTH]>,
         vote_comm_tree_position: Value<u32>,
@@ -660,7 +659,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         let range_check = LookupRangeCheckConfig::configure(meta, advices[9], table_idx);
 
         // ECC chip: fixed- and variable-base scalar multiplication for
-        // condition 3 (spend authority via CommitIvk chain) and condition 10
+        // condition 3 (diversified address integrity via CommitIvk chain) and condition 11
         // (El Gamal encryption integrity).
         // Shares columns with Poseidon per delegation circuit layout.
         let ecc_config =
@@ -784,7 +783,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
         SinsemillaChip::load(config.sinsemilla_config.clone(), &mut layouter)?;
 
-        // Load (proposal_id, 2^proposal_id) lookup table for condition 5.
+        // Load (proposal_id, 2^proposal_id) lookup table for condition 6.
         // Rows: (0, 1), (1, 2), (2, 4), ..., (15, 32768).
         layouter.assign_table(
             || "proposal_id one_shifted table",
@@ -893,8 +892,8 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // Witness assignment for conditions 3 and 4.
         //
         // vsk_nk is shared between condition 3 (CommitIvk input) and
-        // condition 4 (VAN nullifier). Witnessed here so it's available
-        // for condition 3 which runs before condition 4.
+        // condition 5 (VAN nullifier). Witnessed here so it's available
+        // for condition 3 which runs before condition 5.
         // ---------------------------------------------------------------
 
         // Private witness: nullifier deriving key (shared by conditions 3, 4).
@@ -907,11 +906,11 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // Clone cells that are consumed by condition 2's Poseidon hash but
         // reused in later conditions:
         // - vote_authority_note_old: also used in condition 1 (Merkle leaf).
-        // - voting_round_id: also used in condition 4 (VAN nullifier).
+        // - voting_round_id: also used in condition 5 (VAN nullifier).
         // - vpk_g_d, vpk_pk_d, total_note_value, voting_round_id, proposal_authority_old,
-        //   gov_comm_rand, domain_van: also used in condition 6 (new VAN integrity).
-        // - total_note_value: also used in condition 7 (shares sum check).
-        // - vsk_nk: also used in condition 4 (VAN nullifier).
+        //   gov_comm_rand, domain_van: also used in condition 7 (new VAN integrity).
+        // - total_note_value: also used in condition 8 (shares sum check).
+        // - vsk_nk: also used in condition 5 (VAN nullifier).
         let vote_authority_note_old_cond1 = vote_authority_note_old.clone();
         let voting_round_id_cond4 = voting_round_id.clone();
         let domain_van_cond6 = domain_van.clone();
@@ -951,7 +950,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         )?;
 
         // ---------------------------------------------------------------
-        // Condition 3: Spend Authority.
+        // Condition 3: Diversified Address Integrity.
         //
         // vpk_pk_d = [ivk_v] * vpk_g_d where ivk_v = CommitIvk(ExtractP([vsk]*SpendAuthG), vsk_nk, rivk_v).
         // ---------------------------------------------------------------
@@ -1123,10 +1122,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         }
 
         // ---------------------------------------------------------------
-        // Witness assignment for condition 4.
+        // Witness assignment for condition 5.
         //
         // vsk_nk was already witnessed before condition 3 (shared between
-        // conditions 3 and 4). The vsk_nk_cond4 clone is used here.
+        // conditions 3 and 5). The vsk_nk_cond4 clone is used here.
         // ---------------------------------------------------------------
 
         // "vote authority spend" domain tag — constant-constrained so the
@@ -1144,7 +1143,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         )?;
 
         // ---------------------------------------------------------------
-        // Condition 4: VAN Nullifier Integrity.
+        // Condition 5: VAN Nullifier Integrity.
         // van_nullifier = Poseidon(vsk_nk,
         //     Poseidon(domain, Poseidon(voting_round_id, vote_authority_note_old)))
         //
@@ -1219,12 +1218,12 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         layouter.constrain_instance(van_nullifier.cell(), config.primary, VAN_NULLIFIER)?;
 
         // ---------------------------------------------------------------
-        // Condition 5: Proposal Authority Decrement — TEMPORARILY DISABLED.
+        // Condition 6: Proposal Authority Decrement — TEMPORARILY DISABLED.
         //
         // TODO: Re-enable the lookup, addition constraints, and range checks
         // once the strict range-check layout conflict is resolved.
-        // Only the witness assignments are kept so that condition 6 (which
-        // needs proposal_authority_new) and condition 11 (which needs
+        // Only the witness assignments are kept so that condition 7 (which
+        // needs proposal_authority_new) and condition 12 (which needs
         // proposal_id) can still reference them.
         // ---------------------------------------------------------------
 
@@ -1253,10 +1252,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         };
 
         // ---------------------------------------------------------------
-        // Condition 6: New VAN Integrity (ZKP 1–compatible two-layer hash).
+        // Condition 7: New VAN Integrity (ZKP 1–compatible two-layer hash).
         //
         // Same structure as condition 2; proposal_authority_new (from
-        // condition 5) replaces proposal_authority_old. vpk_g_d and vpk_pk_d
+        // condition 6) replaces proposal_authority_old. vpk_g_d and vpk_pk_d
         // are unchanged (same diversified address).
         // ---------------------------------------------------------------
 
@@ -1283,7 +1282,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         )?;
 
         // ---------------------------------------------------------------
-        // Condition 7: Shares Sum Correctness.
+        // Condition 8: Shares Sum Correctness.
         //
         // sum(share_0, share_1, share_2, share_3) = total_note_value
         //
@@ -1296,7 +1295,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
 
         // Witness the 4 plaintext shares. These cells will also be used
-        // by condition 8 (range check) and condition 10 (El Gamal
+        // by condition 9 (range check) and condition 11 (El Gamal
         // encryption inputs) when those conditions are implemented.
         let share_0 = assign_free_advice(
             layouter.namespace(|| "witness share_0"),
@@ -1347,7 +1346,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         )?;
 
         // ---------------------------------------------------------------
-        // Condition 8: Shares Range.
+        // Condition 9: Shares Range.
         //
         // Each share_i in [0, 2^30)
         //
@@ -1366,7 +1365,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
 
         // Share cells are cloned because copy_check takes ownership;
-        // the originals remain available for condition 10 (El Gamal).
+        // the originals remain available for condition 11 (El Gamal).
         config.range_check_config().copy_check(
             layouter.namespace(|| "share_0 < 2^30"),
             share_0.clone(),
@@ -1393,7 +1392,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         )?;
 
         // ---------------------------------------------------------------
-        // Condition 9: Shares Hash Integrity.
+        // Condition 10: Shares Hash Integrity.
         //
         // shares_hash = Poseidon(c1_0_x, c2_0_x, c1_1_x, c2_1_x,
         //                        c1_2_x, c2_2_x, c1_3_x, c2_3_x)
@@ -1401,9 +1400,9 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // Hashes the 8 x-coordinates of the 4 El Gamal ciphertext pairs
         // into a single commitment. The order interleaves C1 and C2
         // per share for locality. shares_hash is an internal wire; it
-        // is not bound to the instance column. Condition 10 constrains
+        // is not bound to the instance column. Condition 11 constrains
         // that each (c1_i_x, c2_i_x) is a valid El Gamal encryption of
-        // shares_i. Condition 11 computes the full vote commitment
+        // shares_i. Condition 12 computes the full vote commitment
         // H(DOMAIN_VC, shares_hash, proposal_id, vote_decision) and
         // binds that value to the VOTE_COMMITMENT public input.
         // ---------------------------------------------------------------
@@ -1451,7 +1450,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         )?;
 
         // Clone enc_share cells before the Poseidon hash (which consumes
-        // them). These clones are used by condition 10 to constrain that
+        // them). These clones are used by condition 11 to constrain that
         // the hashed x-coordinates match the computed El Gamal ciphertexts.
         let enc_c1_0_cond10 = enc_c1_0.clone();
         let enc_c2_0_cond10 = enc_c2_0.clone();
@@ -1464,7 +1463,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
         // Compute shares_hash = Poseidon(c1_0, c2_0, c1_1, c2_1,
         //                                c1_2, c2_2, c1_3, c2_3).
-        // The result is used by condition 11 (vote commitment integrity).
+        // The result is used by condition 12 (vote commitment integrity).
         let shares_hash = {
             let message = [
                 enc_c1_0, enc_c2_0,
@@ -1490,7 +1489,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         };
 
         // ---------------------------------------------------------------
-        // Condition 10: Encryption Integrity.
+        // Condition 11: Encryption Integrity.
         //
         // For each share i:
         //   C1_i = [r_i] * G
@@ -1502,7 +1501,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // Each multiplication uses variable-base scalar multiplication
         // via ScalarVar::from_base (converting base field elements to
         // scalars). The computed x-coordinates are constrained against
-        // condition 9's witnessed enc_share cells, creating a binding
+        // condition 10's witnessed enc_share cells, creating a binding
         // between the Poseidon hash and the actual ECC computation.
         //
         // G is constrained to SpendAuthG by fixing both coordinates to
@@ -1715,12 +1714,12 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         }
 
         // ---------------------------------------------------------------
-        // Condition 11: Vote Commitment Integrity.
+        // Condition 12: Vote Commitment Integrity.
         //
         // vote_commitment = Poseidon(DOMAIN_VC, shares_hash,
         //                            proposal_id, vote_decision)
         //
-        // Binds the encrypted shares (via shares_hash from condition 9),
+        // Binds the encrypted shares (via shares_hash from condition 10),
         // the proposal choice, and the vote decision into a single
         // commitment with domain separation from VANs (DOMAIN_VC = 1).
         //
@@ -1743,7 +1742,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             },
         )?;
 
-        // proposal_id was already copied from instance in condition 5; reuse that cell.
+        // proposal_id was already copied from instance in condition 6; reuse that cell.
 
         // Private witness: vote decision.
         let vote_decision = assign_free_advice(
@@ -1975,12 +1974,12 @@ mod tests {
     const TEST_PROPOSAL_ID: u64 = 3;
     const TEST_VOTE_DECISION: u64 = 1;
 
-    /// Sets condition 11 fields on a circuit and returns the vote_commitment.
+    /// Sets condition 12 fields on a circuit and returns the vote_commitment.
     ///
     /// Computes `H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`
     /// and sets `circuit.vote_decision`. Returns the vote_commitment
     /// for use in the Instance. The `proposal_id` must match the
-    /// instance's proposal_id so the circuit's condition 11 (which
+    /// instance's proposal_id so the circuit's condition 12 (which
     /// copies proposal_id from the instance) agrees with the instance.
     fn set_condition_11(
         circuit: &mut Circuit,
@@ -2034,7 +2033,7 @@ mod tests {
         let vpk_pk_d_x = *vpk_pk_d_affine.coordinates().unwrap().x();
 
         // total_note_value must be small enough that all 4 shares
-        // fit in [0, 2^24) for condition 8's range check.
+        // fit in [0, 2^24) for condition 9's range check.
         let total_note_value = pallas::Base::from(10_000u64);
         let voting_round_id = pallas::Base::random(&mut rng);
         let gov_comm_rand = pallas::Base::random(&mut rng);
@@ -2062,15 +2061,15 @@ mod tests {
             gov_comm_rand,
         );
 
-        // Create shares that sum to total_note_value (conditions 7 + 8).
-        // Each share must be in [0, 2^24) for condition 8's range check.
+        // Create shares that sum to total_note_value (conditions 8 + 9).
+        // Each share must be in [0, 2^24) for condition 9's range check.
         let shares_u64: [u64; 4] = [1_000, 2_000, 3_000, 4_000]; // sum = 10000
         let s0 = pallas::Base::from(shares_u64[0]);
         let s1 = pallas::Base::from(shares_u64[1]);
         let s2 = pallas::Base::from(shares_u64[2]);
         let s3 = pallas::Base::from(shares_u64[3]);
 
-        // Condition 10: El Gamal encryption of shares under ea_pk.
+        // Condition 11: El Gamal encryption of shares under ea_pk.
         let (_ea_sk, ea_pk_point, ea_pk_affine) = generate_ea_keypair();
         let ea_pk_x = *ea_pk_affine.coordinates().unwrap().x();
         let ea_pk_y = *ea_pk_affine.coordinates().unwrap().y();
@@ -2102,7 +2101,7 @@ mod tests {
         circuit.share_randomness = randomness.map(Value::known);
         circuit.ea_pk = Value::known(ea_pk_affine);
 
-        // Condition 11: vote commitment from shares_hash + proposal + decision.
+        // Condition 12: vote commitment from shares_hash + proposal + decision.
         let vote_commitment = set_condition_11(&mut circuit, shares_hash_val, proposal_id);
 
         let instance = Instance::from_parts(
@@ -2164,7 +2163,7 @@ mod tests {
         let (enc_c1_x, enc_c2_x, randomness, shares_hash_val) =
             encrypt_shares(shares_u64, ea_pk_point);
 
-        // Use authority 13 (bit 3 set) and one_shifted = 8 so condition 5 is consistent;
+        // Use authority 13 (bit 3 set) and one_shifted = 8 so condition 6 is consistent;
         // only condition 2 (VAN hash) should fail due to wrong_van.
         let proposal_authority_old = pallas::Base::from(13u64);
         let gov_comm_rand = pallas::Base::random(&mut rng);
@@ -2240,7 +2239,7 @@ mod tests {
     }
 
     // ================================================================
-    // Condition 3 (Spend Authority / Address Ownership) tests
+    // Condition 3 (Diversified Address Integrity / Address Ownership) tests
     //
     // These tests ensure the circuit rejects witnesses that violate
     // vpk_pk_d = [ivk_v] * vpk_g_d. Without condition 3 enabled, they
@@ -2417,7 +2416,7 @@ mod tests {
     // Condition 4 (VAN Nullifier Integrity) tests
     // ================================================================
 
-    /// Wrong VAN_NULLIFIER public input should fail condition 4.
+    /// Wrong VAN_NULLIFIER public input should fail condition 5.
     #[test]
     fn van_nullifier_wrong_public_input_fails() {
         let (circuit, mut instance) = make_test_data();
@@ -2432,7 +2431,7 @@ mod tests {
     }
 
     /// Using a different vsk_nk in the circuit than was used to compute
-    /// the instance nullifier should fail condition 4.
+    /// the instance nullifier should fail condition 5.
     /// Note: since vsk_nk is also used in CommitIvk (condition 3), the
     /// wrong value also breaks condition 3 — but the test still verifies
     /// that the proof fails as expected.
@@ -2471,10 +2470,10 @@ mod tests {
         // Use a DIFFERENT vsk_nk in the circuit.
         let wrong_vsk_nk = pallas::Base::random(&mut rng);
 
-        // Shares that sum to total_note_value (conditions 7 + 8).
+        // Shares that sum to total_note_value (conditions 8 + 9).
         let shares_u64: [u64; 4] = [1_000, 2_000, 3_000, 4_000];
 
-        // Condition 10: real El Gamal encryption.
+        // Condition 11: real El Gamal encryption.
         let (_ea_sk, ea_pk_point, ea_pk_affine) = generate_ea_keypair();
         let (enc_c1_x, enc_c2_x, randomness, shares_hash_val) =
             encrypt_shares(shares_u64, ea_pk_point);
@@ -2568,7 +2567,7 @@ mod tests {
         let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
 
         // Should fail: diff = 0 - 1 = p - 1 ≈ 2^254, which fails the
-        // 16-bit range check in condition 5 (and the 20-bit limb check).
+        // 16-bit range check in condition 6 (and the 20-bit limb check).
         assert!(prover.verify().is_err());
     }
 
@@ -2576,7 +2575,7 @@ mod tests {
     // Condition 6 (New VAN Integrity) tests
     // ================================================================
 
-    /// Wrong vote_authority_note_new public input should fail condition 6.
+    /// Wrong vote_authority_note_new public input should fail condition 7.
     #[test]
     fn new_van_integrity_wrong_public_input_fails() {
         let (circuit, mut instance) = make_test_data();
@@ -2667,10 +2666,10 @@ mod tests {
             proposal_authority_new, gov_comm_rand,
         );
 
-        // Shares that sum to total_note_value (conditions 7 + 8).
+        // Shares that sum to total_note_value (conditions 8 + 9).
         let shares_u64: [u64; 4] = [1_000, 2_000, 3_000, 4_000];
 
-        // Condition 10: real El Gamal encryption.
+        // Condition 11: real El Gamal encryption.
         let (_ea_sk, ea_pk_point, ea_pk_affine) = generate_ea_keypair();
         let (enc_c1_x, enc_c2_x, randomness, shares_hash_val) =
             encrypt_shares(shares_u64, ea_pk_point);
@@ -2725,14 +2724,14 @@ mod tests {
     // Condition 7 (Shares Sum Correctness) tests
     // ================================================================
 
-    /// Shares that do NOT sum to total_note_value should fail condition 7.
+    /// Shares that do NOT sum to total_note_value should fail condition 8.
     #[test]
     fn shares_sum_wrong_total_fails() {
         let (mut circuit, instance) = make_test_data();
 
         // Corrupt shares[3] so the sum no longer equals total_note_value.
-        // Use a small value that still passes condition 8's range check,
-        // isolating the condition 7 failure.
+        // Use a small value that still passes condition 9's range check,
+        // isolating the condition 8 failure.
         circuit.shares[3] = Value::known(pallas::Base::from(999u64));
 
         let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
@@ -2778,7 +2777,7 @@ mod tests {
             proposal_authority_new, gov_comm_rand,
         );
 
-        // Condition 10: real El Gamal encryption with max-value shares.
+        // Condition 11: real El Gamal encryption with max-value shares.
         let max_share_u64 = (1u64 << 30) - 1;
         let shares_u64: [u64; 4] = [max_share_u64; 4];
         let (_ea_sk, ea_pk_point, ea_pk_affine) = generate_ea_keypair();
@@ -2825,7 +2824,7 @@ mod tests {
         let (mut circuit, instance) = make_test_data();
 
         // Set share_0 to 2^30 (one above the max valid value).
-        // This will fail condition 8 AND condition 7 (sum mismatch),
+        // This will fail condition 9 AND condition 8 (sum mismatch),
         // but the important thing is the circuit rejects it.
         circuit.shares[0] = Value::known(pallas::Base::from(1u64 << 30));
 
@@ -2860,7 +2859,7 @@ mod tests {
         assert_eq!(prover.verify(), Ok(()));
     }
 
-    /// A corrupted enc_share_c1_x[0] should cause condition 9 failure:
+    /// A corrupted enc_share_c1_x[0] should cause condition 10 failure:
     /// the in-circuit hash won't match the VOTE_COMMITMENT instance.
     #[test]
     fn shares_hash_wrong_enc_share_fails() {
@@ -2913,7 +2912,7 @@ mod tests {
     }
 
     // ================================================================
-    // Condition 10 (Encryption Integrity) tests
+    // Condition 11 (Encryption Integrity) tests
     // ================================================================
 
     /// Valid El Gamal encryptions should produce a valid proof.
@@ -2925,7 +2924,7 @@ mod tests {
         assert_eq!(prover.verify(), Ok(()));
     }
 
-    /// A corrupted share_randomness[0] should fail condition 10:
+    /// A corrupted share_randomness[0] should fail condition 11:
     /// the computed C1[0] won't match enc_share_c1_x[0].
     #[test]
     fn encryption_integrity_wrong_randomness_fails() {
@@ -2938,7 +2937,7 @@ mod tests {
         assert!(prover.verify().is_err());
     }
 
-    /// A wrong ea_pk in the instance should fail condition 10:
+    /// A wrong ea_pk in the instance should fail condition 11:
     /// the computed r * ea_pk won't match the ciphertexts.
     #[test]
     fn encryption_integrity_wrong_ea_pk_instance_fails() {
@@ -2983,7 +2982,7 @@ mod tests {
         assert_eq!(prover.verify(), Ok(()));
     }
 
-    /// A wrong vote_decision in the circuit should fail condition 11:
+    /// A wrong vote_decision in the circuit should fail condition 12:
     /// the derived vote_commitment won't match the instance.
     #[test]
     fn vote_commitment_wrong_decision_fails() {
@@ -2996,7 +2995,7 @@ mod tests {
         assert!(prover.verify().is_err());
     }
 
-    /// A wrong proposal_id in the instance should fail condition 11:
+    /// A wrong proposal_id in the instance should fail condition 12:
     /// the in-circuit proposal_id (copied from instance) will produce
     /// a different vote_commitment.
     #[test]
