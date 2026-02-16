@@ -19,7 +19,9 @@ CREATE TABLE rounds (
     gov_comm            BLOB,
     total_note_value    INTEGER,
     address_index       INTEGER,
-    van_leaf_position   INTEGER
+    van_leaf_position   INTEGER,
+    rk                  BLOB,
+    gov_nullifiers_blob BLOB
 );
 
 CREATE TABLE cached_tree_state (

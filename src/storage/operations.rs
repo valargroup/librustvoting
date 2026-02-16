@@ -1,10 +1,28 @@
+use ff::PrimeField;
+
 use crate::storage::queries;
 use crate::storage::{RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb};
 use crate::types::{
-    DelegationAction, DelegationProofResult, EncryptedShare, GovernancePczt, NoteInfo,
-    ProofProgressReporter, SharePayload, VoteCommitmentBundle, VotingError,
-    VotingHotkey, VotingRoundParams, WitnessData,
+    DelegationAction, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
+    GovernancePczt, NoteInfo, ProofProgressReporter, SharePayload, VoteCommitmentBundle,
+    VotingError, VotingHotkey, VotingRoundParams, WitnessData,
 };
+
+/// Append exactly 32 bytes to `out` from `b` (pad with zeros if shorter).
+fn extend_padded32(out: &mut Vec<u8>, b: &[u8]) {
+    let mut buf = [0u8; 32];
+    let n = b.len().min(32);
+    buf[..n].copy_from_slice(&b[..n]);
+    out.extend_from_slice(&buf);
+}
+
+/// Append exactly 64 bytes to `out` from `b` (pad with zeros if shorter).
+fn extend_padded64(out: &mut Vec<u8>, b: &[u8]) {
+    let mut buf = [0u8; 64];
+    let n = b.len().min(64);
+    buf[..n].copy_from_slice(&b[..n]);
+    out.extend_from_slice(&buf);
+}
 
 impl VotingDb {
     // --- Round management ---
@@ -353,6 +371,8 @@ impl VotingDb {
 
         // Store proof bytes for debugging/recovery
         queries::store_proof(&conn, round_id, &result.proof)?;
+        // Persist rk and gov_nullifiers — needed later for delegation TX submission
+        queries::store_proof_result_fields(&conn, round_id, &result.rk, &result.gov_nullifiers)?;
         queries::update_round_phase(&conn, round_id, RoundPhase::DelegationProved)?;
 
         let total_elapsed = total_start.elapsed();
@@ -476,6 +496,96 @@ impl VotingDb {
     pub fn load_van_position(&self, round_id: &str) -> Result<u32, VotingError> {
         let conn = self.conn();
         queries::load_van_position(&conn, round_id)
+    }
+
+    /// Reconstruct the full chain-ready delegation TX payload from DB + seed.
+    ///
+    /// After `build_and_prove_delegation` completes, all proof artifacts (proof, rk,
+    /// gov_nullifiers, nf_signed, cmx_new, gov_comm, alpha) are persisted in the DB.
+    /// This method loads them, derives the sender's SpendingKey from seed, computes the
+    /// canonical sighash, signs it, and returns everything the chain needs.
+    pub fn get_delegation_submission(
+        &self,
+        round_id: &str,
+        sender_seed: &[u8],
+        network_id: u32,
+        _account_index: u32,
+    ) -> Result<DelegationSubmissionData, VotingError> {
+        let conn = self.conn();
+        let data = queries::load_delegation_submission_data(&conn, round_id)?;
+        drop(conn);
+
+        // Derive sender SpendingKey from seed via ZIP-32 (same as delegation)
+        let sk = crate::zkp2::derive_spending_key(sender_seed, network_id)?;
+        let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
+
+        // Deserialize alpha
+        let alpha_arr: [u8; 32] = data.alpha.as_slice().try_into().map_err(|_| {
+            VotingError::Internal {
+                message: format!("alpha must be 32 bytes, got {}", data.alpha.len()),
+            }
+        })?;
+        let alpha: pasta_curves::pallas::Scalar =
+            Option::from(pasta_curves::pallas::Scalar::from_repr(alpha_arr)).ok_or_else(|| {
+                VotingError::Internal {
+                    message: "alpha is not a valid Pallas scalar".to_string(),
+                }
+            })?;
+
+        // Compute rsk = ask.randomize(alpha)
+        let rsk = ask.randomize(&alpha);
+
+        // Decode vote_round_id from hex string to bytes
+        let vote_round_id_bytes =
+            hex::decode(&data.vote_round_id).map_err(|e| VotingError::Internal {
+                message: format!("invalid vote_round_id hex: {e}"),
+            })?;
+
+        // enc_memo = [0x05; 64] (mock, matches e2e test and chain expectations)
+        let enc_memo = [0x05u8; 64];
+
+        // Canonical sighash: Blake2b-256(domain || vote_round_id || rk || nf_signed || cmx_new || enc_memo || gov_comm || gov_nullifiers)
+        // Must match Go's ComputeDelegationSighash.
+        const SIGHASH_DOMAIN: &[u8] = b"ZALLY_DELEGATION_SIGHASH_V0";
+        let mut canonical = Vec::with_capacity(
+            SIGHASH_DOMAIN.len() + 32 + 32 + 32 + 32 + 64 + 32 + 4 * 32,
+        );
+        canonical.extend_from_slice(SIGHASH_DOMAIN);
+        extend_padded32(&mut canonical, &vote_round_id_bytes);
+        canonical.extend_from_slice(&data.rk);
+        extend_padded32(&mut canonical, &data.nf_signed);
+        canonical.extend_from_slice(&data.cmx_new);
+        extend_padded64(&mut canonical, &enc_memo);
+        extend_padded32(&mut canonical, &data.gov_comm);
+        for i in 0..4 {
+            if i < data.gov_nullifiers.len() {
+                canonical.extend_from_slice(&data.gov_nullifiers[i]);
+            } else {
+                canonical.extend_from_slice(&[0u8; 32]);
+            }
+        }
+        let sighash_full = blake2b_simd::Params::new().hash_length(32).hash(&canonical);
+        let mut sighash = [0u8; 32];
+        sighash.copy_from_slice(sighash_full.as_bytes());
+
+        // Sign
+        let mut rng = rand::rngs::OsRng;
+        let sig = rsk.sign(&mut rng, &sighash);
+        let sig_bytes: [u8; 64] = (&sig).into();
+
+        Ok(DelegationSubmissionData {
+            proof: data.proof,
+            rk: data.rk,
+            nf_signed: data.nf_signed,
+            cmx_new: data.cmx_new,
+            gov_comm: data.gov_comm,
+            gov_nullifiers: data.gov_nullifiers,
+            alpha: data.alpha,
+            vote_round_id: data.vote_round_id,
+            spend_auth_sig: sig_bytes.to_vec(),
+            sighash: sighash.to_vec(),
+            enc_memo: enc_memo.to_vec(),
+        })
     }
 
     /// Mark a vote as submitted to the vote chain.

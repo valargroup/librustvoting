@@ -474,6 +474,117 @@ pub fn load_van_position(conn: &Connection, round_id: &str) -> Result<u32, Votin
     })
 }
 
+// --- Delegation proof result fields ---
+
+/// Persist rk and gov_nullifiers from DelegationProofResult after proof generation.
+/// These survive the FFI boundary and are needed later for delegation TX submission.
+pub fn store_proof_result_fields(
+    conn: &Connection,
+    round_id: &str,
+    rk: &[u8],
+    gov_nullifiers: &[Vec<u8>],
+) -> Result<(), VotingError> {
+    // Serialize gov_nullifiers as flat blob: [nf0 (32 bytes) | nf1 | nf2 | nf3]
+    let gov_nullifiers_blob: Vec<u8> = gov_nullifiers
+        .iter()
+        .flat_map(|n| n.iter().copied())
+        .collect();
+
+    let rows = conn
+        .execute(
+            "UPDATE rounds SET rk = :rk, gov_nullifiers_blob = :gov_nullifiers_blob \
+             WHERE round_id = :round_id",
+            named_params! {
+                ":rk": rk,
+                ":gov_nullifiers_blob": gov_nullifiers_blob,
+                ":round_id": round_id,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to store proof result fields: {}", e),
+        })?;
+
+    if rows == 0 {
+        return Err(VotingError::InvalidInput {
+            message: format!("round not found: {}", round_id),
+        });
+    }
+
+    Ok(())
+}
+
+/// Raw delegation data loaded from DB for submission reconstruction.
+pub struct DelegationDbFields {
+    pub proof: Vec<u8>,
+    pub rk: Vec<u8>,
+    pub nf_signed: Vec<u8>,
+    pub cmx_new: Vec<u8>,
+    pub gov_comm: Vec<u8>,
+    pub gov_nullifiers: Vec<Vec<u8>>,
+    pub alpha: Vec<u8>,
+    pub vote_round_id: String,
+}
+
+/// Load all fields needed to reconstruct the chain-ready delegation TX payload.
+pub fn load_delegation_submission_data(
+    conn: &Connection,
+    round_id: &str,
+) -> Result<DelegationDbFields, VotingError> {
+    let (proof_bytes, rk, nf_signed, cmx_new, gov_comm, gov_nullifiers_blob, alpha, vote_round_id): (
+        Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, String,
+    ) = conn
+        .query_row(
+            "SELECT p.proof, r.rk, r.nf_signed, r.cmx_new, r.gov_comm, \
+             r.gov_nullifiers_blob, r.alpha, r.round_id \
+             FROM rounds r JOIN proofs p ON r.round_id = p.round_id \
+             WHERE r.round_id = :round_id AND p.success = 1",
+            named_params! { ":round_id": round_id },
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::InvalidInput {
+            message: format!(
+                "failed to load delegation submission data for round: {} ({})",
+                round_id, e
+            ),
+        })?;
+
+    // Deserialize gov_nullifiers from flat blob back to Vec<Vec<u8>>
+    if gov_nullifiers_blob.len() % 32 != 0 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "corrupt gov_nullifiers_blob: length {} is not a multiple of 32",
+                gov_nullifiers_blob.len()
+            ),
+        });
+    }
+    let gov_nullifiers: Vec<Vec<u8>> = gov_nullifiers_blob
+        .chunks_exact(32)
+        .map(|c| c.to_vec())
+        .collect();
+
+    Ok(DelegationDbFields {
+        proof: proof_bytes,
+        rk,
+        nf_signed,
+        cmx_new,
+        gov_comm,
+        gov_nullifiers,
+        alpha,
+        vote_round_id,
+    })
+}
+
 // --- Cached Tree State ---
 
 pub fn store_tree_state(
