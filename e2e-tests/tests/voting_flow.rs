@@ -297,21 +297,11 @@ fn voting_flow_full_lifecycle() {
     let tally = json.get("tally").expect("tally");
     assert!(tally.get("1").is_some());
 
-    // ----- Step 8: Wait for TALLYING -----
-    log_step("Step 8", "waiting for TALLYING (up to 250s)");
-    wait_for_round_status(&round_id_hex, SESSION_STATUS_TALLYING, 250_000, 3_000)
-        .expect("wait for TALLYING");
-    let (_, json) = get_json(&format!("/zally/v1/round/{}", round_id_hex)).expect("GET round");
-    assert_eq!(
-        json.get("round").and_then(|r| r.get("status")).and_then(|s| s.as_i64()).unwrap(),
-        SESSION_STATUS_TALLYING
-    );
-
-    // ----- Step 9: Reveal second share during TALLYING -----
-    log_step("Step 9", "reveal second share during TALLYING");
+    // ----- Step 8: Reveal second share (while still ACTIVE) -----
+    // RevealShare is only accepted during ACTIVE, so both reveals must happen before TALLYING.
+    log_step("Step 8", "reveal second share (while ACTIVE)");
     let enc_share_1 = encrypt_share(&elgamal_pk, 1, &mut rng);
     let reveal_body_1 = reveal_share_payload(&round_id, anchor_height, &enc_share_1, 1, 1);
-    // Committed = tally equals HomomorphicAdd(share0, share1) so we don't treat 502 as success when only first reveal was in.
     let expected_accumulated_b64 = {
         let dec0 = base64::engine::general_purpose::STANDARD.decode(&enc_share_0).expect("decode enc_share_0");
         let dec1 = base64::engine::general_purpose::STANDARD.decode(&enc_share_1).expect("decode enc_share_1");
@@ -336,12 +326,12 @@ fn voting_flow_full_lifecycle() {
         },
     )
     .expect("POST");
-    assert_eq!(status, 200, "reveal-share (TALLYING): expected 200, got {} body={:?}", status, json);
+    assert_eq!(status, 200, "reveal-share (second): expected 200, got {} body={:?}", status, json);
     assert_eq!(json.get("code").and_then(|c| c.as_i64()).unwrap_or(-1), 0);
     block_wait();
 
-    // ----- Step 10: Accumulated tally matches HomomorphicAdd(share0, share1) -----
-    log_step("Step 10", "accumulated tally matches HomomorphicAdd(share0, share1)");
+    // ----- Step 9: Accumulated tally matches HomomorphicAdd(share0, share1) -----
+    log_step("Step 9", "accumulated tally matches HomomorphicAdd(share0, share1)");
     let dec0 = base64::engine::general_purpose::STANDARD
         .decode(&enc_share_0)
         .expect("decode enc_share_0");
@@ -354,9 +344,19 @@ fn voting_flow_full_lifecycle() {
     let expected_accumulated_b64 = ciphertext_to_base64(&expected_accumulated);
 
     let (status, json) = get_json(&format!("/zally/v1/tally/{}/1", round_id_hex)).expect("GET tally");
-    assert_eq!(status, 200, "GET tally (step 10): expected 200, got {} body={:?}", status, json);
+    assert_eq!(status, 200, "GET tally (step 9): expected 200, got {} body={:?}", status, json);
     let on_chain = json.get("tally").and_then(|t| t.get("1")).and_then(|v| v.as_str()).expect("tally[\"1\"]");
     assert_eq!(on_chain, expected_accumulated_b64, "accumulated ciphertext mismatch");
+
+    // ----- Step 10: Wait for TALLYING -----
+    log_step("Step 10", "waiting for TALLYING (up to 250s)");
+    wait_for_round_status(&round_id_hex, SESSION_STATUS_TALLYING, 250_000, 3_000)
+        .expect("wait for TALLYING");
+    let (_, json) = get_json(&format!("/zally/v1/round/{}", round_id_hex)).expect("GET round");
+    assert_eq!(
+        json.get("round").and_then(|r| r.get("status")).and_then(|s| s.as_i64()).unwrap(),
+        SESSION_STATUS_TALLYING
+    );
 
     // ----- Step 11: Submit tally finalizes -----
     log_step("Step 11", "submit tally finalizes");
