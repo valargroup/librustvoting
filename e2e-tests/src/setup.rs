@@ -3,7 +3,7 @@
 //! Generates session params with vote_end_time = now + configured window and a canonical
 //! vote_round_id, then builds the delegation bundle and RedPallas signature
 //! so the test can create the session and delegate without fixture files.
-//! The window defaults to 12 minutes and can be overridden with
+//! The window defaults to 8 minutes and can be overridden with
 //! ZALLY_E2E_VOTE_WINDOW_SECS. This timestamp is part of vote_round_id, so it must
 //! be chosen before proof generation starts.
 
@@ -28,7 +28,7 @@ use pasta_curves::pallas;
 use rand::rngs::OsRng;
 use vote_commitment_tree::TreeServer;
 
-const DEFAULT_E2E_VOTE_WINDOW_SECS: u64 = 720;
+const DEFAULT_E2E_VOTE_WINDOW_SECS: u64 = 480;
 const MIN_E2E_VOTE_WINDOW_SECS: u64 = 300;
 
 fn vote_window_secs() -> u64 {
@@ -72,7 +72,7 @@ pub struct VoteProofDelegationData {
 }
 
 /// Build delegation bundle and session fields for the E2E test.
-/// vote_end_time = now + vote_window_secs() where the default window is 12 min
+/// vote_end_time = now + vote_window_secs() where the default window is 8 min
 /// (override with ZALLY_E2E_VOTE_WINDOW_SECS, clamped to >= 300s).
 /// The round must stay ACTIVE through all submissions, then expire for auto-tally.
 /// Returns payload for MsgDelegateVote, session fields for MsgCreateVotingSession,
