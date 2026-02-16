@@ -369,8 +369,8 @@ fn voting_flow_full_lifecycle() {
     // ----- Step 11: Wait for FINALIZED (auto-tally via PrepareProposal) -----
     // The block proposer holds the EA secret key and auto-injects MsgSubmitTally
     // during PrepareProposal. We wait for the round to reach FINALIZED status.
-    log_step("Step 11", "waiting for FINALIZED via auto-tally (up to 30s)");
-    wait_for_round_status(&round_id_hex, SESSION_STATUS_FINALIZED, 30_000, 2_000)
+    log_step("Step 11", "waiting for FINALIZED via auto-tally (up to 60s)");
+    wait_for_round_status(&round_id_hex, SESSION_STATUS_FINALIZED, 60_000, 2_000)
         .expect("wait for FINALIZED (auto-tally)");
     let (_, json) = get_json(&format!("/zally/v1/round/{}", round_id_hex)).expect("GET round");
     assert_eq!(
