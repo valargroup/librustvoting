@@ -776,7 +776,7 @@ mod tests {
         NoteInfo {
             commitment: vec![0x01; 32],
             nullifier: vec![0x02; 32],
-            value: 1_000_000,
+            value: 15_000_000,
             position: 42,
             diversifier: vec![0; 11],
             rho: vec![0; 32],
@@ -903,7 +903,7 @@ mod tests {
             .map(|i| NoteInfo {
                 commitment: vec![i as u8 + 1; 32],
                 nullifier: vec![i as u8 + 0x10; 32],
-                value: 250_000,
+                value: 13_000_000,
                 position: i as u64,
                 diversifier: vec![0; 11],
                 rho: vec![0; 32],
@@ -1047,7 +1047,7 @@ mod tests {
                 NoteInfo {
                     commitment,
                     nullifier,
-                    value: 250_000,
+                    value: 13_000_000,
                     position: i as u64,
                     diversifier: vec![0; 11],
                     rho: vec![0; 32],
@@ -1067,7 +1067,7 @@ mod tests {
                 NoteInfo {
                     commitment,
                     nullifier,
-                    value: 250_000,
+                    value: 13_000_000,
                     position: i as u64,
                     diversifier: vec![0; 11],
                     rho: vec![0; 32],
@@ -1402,7 +1402,7 @@ mod tests {
             .map(|i| NoteInfo {
                 commitment: vec![i as u8 + 1; 32],
                 nullifier: vec![i as u8 + 0x10; 32],
-                value: 250_000,
+                value: 13_000_000,
                 position: i as u64,
                 diversifier: vec![0; 11],
                 rho: vec![0; 32],
