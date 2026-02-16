@@ -200,6 +200,12 @@ fn voting_flow_full_lifecycle() {
     // 4c-verify: Verify the proof locally (same binary = same VK as prover).
     orchard::vote_proof::verify_vote_proof(&vote_bundle.proof, &vote_bundle.instance)
         .expect("local vote proof verification must pass");
+    // Instance must have 11 public inputs (van_nullifier, r_vpk_x, r_vpk_y, vote_authority_note_new, ...).
+    assert_eq!(
+        vote_bundle.instance.to_halo2_instance().len(),
+        11,
+        "vote proof instance must have 11 public inputs (condition 4: r_vpk in-circuit)"
+    );
     log_step("Step 4", "local verification passed, submitting cast-vote");
 
     // 4d: Extract public inputs from the instance for the payload.
