@@ -20,16 +20,35 @@ use orchard::{
     note::{ExtractedNoteCommitment, Note, Rho},
     tree::{MerkleHashOrchard, MerklePath},
     value::NoteValue,
+    vote_proof::VOTE_COMM_TREE_DEPTH,
     NOTE_COMMITMENT_TREE_DEPTH,
 };
 use pasta_curves::pallas;
 use rand::rngs::OsRng;
+use vote_commitment_tree::TreeServer;
+
+/// Data from delegation that the vote proof builder needs.
+pub struct VoteProofDelegationData {
+    /// The spending key used during delegation.
+    pub sk: SpendingKey,
+    /// Blinding factor for the VAN (gov_comm).
+    pub gov_comm_rand: pallas::Base,
+    /// Vote round identifier as a Pallas field element.
+    pub vote_round_id: pallas::Base,
+    /// Sum of delegated note values.
+    pub total_note_value: u64,
+    /// The VAN leaf value (gov_comm) appended to the commitment tree.
+    pub gov_comm: pallas::Base,
+    /// The cmx_new value appended to the commitment tree (sibling at position 0).
+    pub cmx_new: pallas::Base,
+}
 
 /// Build delegation bundle and session fields for the E2E test.
 /// vote_end_time = now + 240s (4 min). CI logs: ~173s from bundle to cast-vote; 4 min keeps round ACTIVE.
-/// Returns payload for MsgDelegateVote and session fields for MsgCreateVotingSession (so round_id matches the proof).
+/// Returns payload for MsgDelegateVote, session fields for MsgCreateVotingSession,
+/// and private witness data for building ZKP #2 (vote proof).
 pub fn build_delegation_bundle_for_test(
-) -> Result<(DelegationBundlePayload, SetupRoundFields), Box<dyn std::error::Error + Send + Sync>>
+) -> Result<(DelegationBundlePayload, SetupRoundFields, VoteProofDelegationData), Box<dyn std::error::Error + Send + Sync>>
 {
     let mut rng = OsRng;
 
@@ -181,5 +200,56 @@ pub fn build_delegation_bundle_for_test(
         nc_root: nc_root_repr.as_ref().try_into().unwrap(),
     };
 
-    Ok((payload, fields))
+    let vote_proof_data = VoteProofDelegationData {
+        sk,
+        gov_comm_rand,
+        vote_round_id,
+        total_note_value: note_value,
+        gov_comm: bundle.instance.gov_comm,
+        cmx_new: bundle.instance.cmx_new,
+    };
+
+    Ok((payload, fields, vote_proof_data))
+}
+
+/// Build a vote commitment tree locally with the two leaves from delegation
+/// (cmx_new at position 0, gov_comm at position 1) and return the Merkle
+/// authentication path for the VAN (gov_comm) at position 1.
+///
+/// The `checkpoint_height` should be the on-chain anchor height at which
+/// the delegation block was committed.
+///
+/// Returns `(auth_path, position, root)` suitable for the vote proof builder.
+pub fn build_van_merkle_witness(
+    cmx_new: pallas::Base,
+    gov_comm: pallas::Base,
+    checkpoint_height: u32,
+) -> ([pallas::Base; VOTE_COMM_TREE_DEPTH], u32, pallas::Base) {
+    let mut tree = TreeServer::empty();
+    tree.append(cmx_new);
+    tree.append(gov_comm);
+    tree.checkpoint(checkpoint_height);
+
+    let root = tree.root_at_height(checkpoint_height)
+        .expect("checkpoint should exist");
+
+    let path = tree.path(1, checkpoint_height)
+        .expect("VAN at position 1 should have a valid path");
+
+    // Convert MerkleHashVote siblings to pallas::Base for the circuit.
+    let auth_path_hashes = path.auth_path();
+    let mut auth_path = [pallas::Base::zero(); VOTE_COMM_TREE_DEPTH];
+    for (i, hash) in auth_path_hashes.iter().enumerate() {
+        auth_path[i] = hash.inner();
+    }
+
+    let position = path.position();
+
+    // Sanity: verify the path produces the expected root.
+    assert!(
+        path.verify(gov_comm, root),
+        "merkle path verification failed for VAN at position 1"
+    );
+
+    (auth_path, position, root)
 }

@@ -91,8 +91,8 @@ pub fn create_voting_session_payload(
         "vk_zkp2": to_base64(&[0xf2u8; 64]),
         "vk_zkp3": to_base64(&[0xf3u8; 64]),
         "proposals": [
-            { "id": 0, "title": "Proposal A", "description": "First proposal" },
-            { "id": 1, "title": "Proposal B", "description": "Second proposal" },
+            { "id": 1, "title": "Proposal A", "description": "First proposal" },
+            { "id": 2, "title": "Proposal B", "description": "Second proposal" },
         ],
     });
     (body, fields, round_id)
@@ -149,8 +149,29 @@ pub fn cast_vote_payload(round_id: &[u8], anchor_height: u32) -> Value {
         "van_nullifier": to_base64(&unique_nullifier()),
         "vote_authority_note_new": to_base64(&unique_nullifier()),
         "vote_commitment": to_base64(&unique_nullifier()),
-        "proposal_id": 0,
+        "proposal_id": 1,
         "proof": to_base64(b"mock-cast-vote-proof"),
+        "vote_round_id": to_base64(round_id),
+        "vote_comm_tree_anchor_height": anchor_height,
+    })
+}
+
+/// Build MsgCastVote body with a real ZKP #2 proof and public inputs.
+pub fn cast_vote_payload_real(
+    round_id: &[u8],
+    anchor_height: u32,
+    van_nullifier: &[u8],
+    vote_authority_note_new: &[u8],
+    vote_commitment: &[u8],
+    proposal_id: u32,
+    proof: &[u8],
+) -> Value {
+    json!({
+        "van_nullifier": to_base64(van_nullifier),
+        "vote_authority_note_new": to_base64(vote_authority_note_new),
+        "vote_commitment": to_base64(vote_commitment),
+        "proposal_id": proposal_id,
+        "proof": to_base64(proof),
         "vote_round_id": to_base64(round_id),
         "vote_comm_tree_anchor_height": anchor_height,
     })

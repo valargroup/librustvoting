@@ -121,7 +121,7 @@ pub struct SpendAuthorizingKey(redpallas::SigningKey<SpendAuth>);
 
 impl SpendAuthorizingKey {
     /// Derives ask from sk. Internal use only, does not enforce all constraints.
-    fn derive_inner(sk: &SpendingKey) -> pallas::Scalar {
+    pub(crate) fn derive_inner(sk: &SpendingKey) -> pallas::Scalar {
         to_scalar(PrfExpand::ORCHARD_ASK.with(&sk.0))
     }
 
