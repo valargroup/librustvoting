@@ -7,6 +7,7 @@
 //! the librustvoting / vote-commitment-tree-client APIs.
 
 use base64::Engine;
+use blake2b_simd::Params as Blake2bParams;
 use e2e_tests::{
     api::{
         self, commitment_tree_next_index, get_json, post_json, post_json_accept_committed,
@@ -20,7 +21,10 @@ use e2e_tests::{
     setup::build_delegation_bundle_for_test,
 };
 use ff::PrimeField;
+use group::GroupEncoding;
 use librustvoting::{NoopProgressReporter, VotingRoundParams};
+use orchard::keys::SpendAuthorizingKey;
+use pasta_curves::{arithmetic::CurveAffine, pallas};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use vote_commitment_tree::TreeClient;
@@ -100,27 +104,22 @@ fn voting_flow_librustvoting_path() {
     // ---- Step 3: Wait for tree to have root after delegation ----
     log_step("Step 3", "waiting for commitment tree (2 leaves)");
     let mut anchor_height: u32 = 0;
-    for _ in 0..10 {
+    for _ in 0..30 {
         let (status, json) =
             get_json("/zally/v1/commitment-tree/latest").expect("GET tree latest");
         assert_eq!(status, 200);
         if let Some(tree) = json.get("tree") {
             let h = tree.get("height").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            if h > 0 {
+            let next_idx = tree.get("next_index").and_then(|x| x.as_u64()).unwrap_or(0);
+            if h > 0 && next_idx >= 2 {
                 anchor_height = h;
                 assert!(tree.get("root").is_some());
-                assert!(
-                    tree.get("next_index")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0)
-                        >= 2
-                );
                 break;
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    assert!(anchor_height > 0, "tree never populated after delegation");
+    assert!(anchor_height > 0, "tree never reached 2 leaves after delegation");
 
     // ---- Step 4: Create VotingDb and persist delegation data ----
     log_step("Step 4", "creating VotingDb, persisting delegation data");
@@ -145,7 +144,7 @@ fn voting_flow_librustvoting_path() {
         librustvoting::storage::queries::store_delegation_data(
             &conn,
             &round_id_hex,
-            vote_proof_data.gov_comm_rand.to_repr().as_ref(),
+            vote_proof_data.van_comm_rand.to_repr().as_ref(),
             &[],          // dummy_nullifiers (not needed for ZKP #2)
             &[0u8; 32],   // rho_signed
             &[],          // padded_cmx
@@ -154,7 +153,7 @@ fn voting_flow_librustvoting_path() {
             &[0u8; 32],   // alpha
             &[0u8; 32],   // rseed_signed
             &[0u8; 32],   // rseed_output
-            &delegation_bundle.gov_comm,
+            &delegation_bundle.van_cmx,
             vote_proof_data.total_note_value,
             1, // address_index (matches delegation output_recipient = fvk.address_at(1, External))
         )
@@ -252,15 +251,77 @@ fn voting_flow_librustvoting_path() {
     assert_eq!(bundle.shares_hash.len(), 32);
 
     // ---- Step 8: Submit cast-vote TX ----
-    log_step("Step 8", "submitting cast-vote TX");
+    log_step("Step 8", "computing sighash and signing cast-vote TX");
+
+    // 8a: Decompress r_vpk to get x, y coordinates for the payload.
+    let r_vpk_arr: [u8; 32] = bundle.r_vpk_bytes.as_slice().try_into().unwrap();
+    let r_vpk_affine: pallas::Affine =
+        Option::from(pallas::Affine::from_bytes(&r_vpk_arr)).expect("decompress r_vpk");
+    let coords = r_vpk_affine.coordinates().unwrap();
+    let r_vpk_x_bytes = coords.x().to_repr();
+    let r_vpk_y_bytes = coords.y().to_repr();
+
+    // 8b: Compute canonical sighash (must match Go's ComputeCastVoteSighash).
+    const CAST_VOTE_SIGHASH_DOMAIN: &[u8] = b"ZALLY_CAST_VOTE_SIGHASH_V0";
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(CAST_VOTE_SIGHASH_DOMAIN);
+    // vote_round_id: pad to 32 bytes
+    let mut buf32 = [0u8; 32];
+    let vr_len = round_id.len().min(32);
+    buf32[..vr_len].copy_from_slice(&round_id[..vr_len]);
+    canonical.extend_from_slice(&buf32);
+    // r_vpk: already 32 bytes
+    canonical.extend_from_slice(&bundle.r_vpk_bytes);
+    // van_nullifier: 32 bytes
+    buf32 = [0u8; 32];
+    let vn = &bundle.van_nullifier;
+    buf32[..vn.len().min(32)].copy_from_slice(&vn[..vn.len().min(32)]);
+    canonical.extend_from_slice(&buf32);
+    // vote_authority_note_new: 32 bytes
+    buf32 = [0u8; 32];
+    let vn_new = &bundle.vote_authority_note_new;
+    buf32[..vn_new.len().min(32)].copy_from_slice(&vn_new[..vn_new.len().min(32)]);
+    canonical.extend_from_slice(&buf32);
+    // vote_commitment: 32 bytes
+    buf32 = [0u8; 32];
+    let vc = &bundle.vote_commitment;
+    buf32[..vc.len().min(32)].copy_from_slice(&vc[..vc.len().min(32)]);
+    canonical.extend_from_slice(&buf32);
+    // proposal_id: 4 bytes LE, padded to 32 bytes
+    let mut pid_buf = [0u8; 32];
+    pid_buf[..4].copy_from_slice(&1u32.to_le_bytes());
+    canonical.extend_from_slice(&pid_buf);
+    // anchor_height: 8 bytes LE, padded to 32 bytes
+    let mut ah_buf = [0u8; 32];
+    ah_buf[..8].copy_from_slice(&(anchor_height as u64).to_le_bytes());
+    canonical.extend_from_slice(&ah_buf);
+
+    let sighash_full = Blake2bParams::new().hash_length(32).hash(&canonical);
+    let mut sighash = [0u8; 32];
+    sighash.copy_from_slice(sighash_full.as_bytes());
+
+    // 8c: Sign the sighash with the randomized voting key (rsk_v = ask_v.randomize(&alpha_v)).
+    let alpha_v_arr: [u8; 32] = bundle.alpha_v.as_slice().try_into().unwrap();
+    let alpha_v: pallas::Scalar =
+        Option::from(pallas::Scalar::from_repr(alpha_v_arr)).expect("deserialize alpha_v");
+    let ask_v = SpendAuthorizingKey::from(&vote_proof_data.sk);
+    let rsk_v = ask_v.randomize(&alpha_v);
+    let vote_auth_sig = rsk_v.sign(&mut rng, &sighash);
+    let vote_auth_sig_bytes: [u8; 64] = (&vote_auth_sig).into();
+
     let cast_body = cast_vote_payload_real(
         &round_id,
         anchor_height,
         &bundle.van_nullifier,
+        r_vpk_x_bytes.as_ref(),
+        r_vpk_y_bytes.as_ref(),
         &bundle.vote_authority_note_new,
         &bundle.vote_commitment,
         1, // proposal_id
         &bundle.proof,
+        &bundle.r_vpk_bytes,
+        &sighash,
+        &vote_auth_sig_bytes,
     );
 
     let (status, json) = {

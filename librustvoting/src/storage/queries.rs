@@ -413,7 +413,7 @@ pub fn load_zkp2_inputs(
     round_id: &str,
 ) -> Result<Zkp2DelegationData, VotingError> {
     conn.query_row(
-        "SELECT gov_comm_rand, total_note_value, address_index, ea_pk, round_id \
+        "SELECT van_comm_rand, total_note_value, address_index, ea_pk, round_id \
          FROM rounds WHERE round_id = :round_id",
         named_params! { ":round_id": round_id },
         |row| {
