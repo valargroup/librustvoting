@@ -203,6 +203,27 @@ pub struct ImtProofJson {
     pub path: Vec<String>,
 }
 
+/// All fields needed to submit a delegation TX to the chain.
+/// Fields from DB (proof, rk, nf_signed, cmx_new, gov_comm, gov_nullifiers, alpha)
+/// plus computed fields (spend_auth_sig, sighash, enc_memo).
+#[derive(Clone, Debug)]
+pub struct DelegationSubmissionData {
+    pub proof: Vec<u8>,
+    pub rk: Vec<u8>,
+    pub nf_signed: Vec<u8>,
+    pub cmx_new: Vec<u8>,
+    pub gov_comm: Vec<u8>,
+    pub gov_nullifiers: Vec<Vec<u8>>,
+    pub alpha: Vec<u8>,
+    pub vote_round_id: String,
+    /// Spend auth signature over sighash (64 bytes). Computed from seed + alpha.
+    pub spend_auth_sig: Vec<u8>,
+    /// Canonical sighash (32 bytes). Blake2b-256 of domain-separated fields.
+    pub sighash: Vec<u8>,
+    /// Encrypted memo (64 bytes). Currently mock: [0x05; 64].
+    pub enc_memo: Vec<u8>,
+}
+
 /// Result of real delegation proof generation (ZKP #1).
 #[derive(Clone, Debug)]
 pub struct DelegationProofResult {
