@@ -887,7 +887,7 @@ public struct DelegationAction {
     public var rk: Data
     public var govNullifiers: [Data]
     public var van: Data
-    public var govCommRand: Data
+    public var vanCommRand: Data
     public var dummyNullifiers: [Data]
     public var rhoSigned: Data
     public var paddedCmx: [Data]
@@ -900,12 +900,12 @@ public struct DelegationAction {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(actionBytes: Data, rk: Data, govNullifiers: [Data], van: Data, govCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], nfSigned: Data, cmxNew: Data, alpha: Data, spendAuthSig: Data?, rseedSigned: Data, rseedOutput: Data) {
+    public init(actionBytes: Data, rk: Data, govNullifiers: [Data], van: Data, vanCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], nfSigned: Data, cmxNew: Data, alpha: Data, spendAuthSig: Data?, rseedSigned: Data, rseedOutput: Data) {
         self.actionBytes = actionBytes
         self.rk = rk
         self.govNullifiers = govNullifiers
         self.van = van
-        self.govCommRand = govCommRand
+        self.vanCommRand = vanCommRand
         self.dummyNullifiers = dummyNullifiers
         self.rhoSigned = rhoSigned
         self.paddedCmx = paddedCmx
@@ -937,7 +937,7 @@ extension DelegationAction: Equatable, Hashable {
         if lhs.van != rhs.van {
             return false
         }
-        if lhs.govCommRand != rhs.govCommRand {
+        if lhs.vanCommRand != rhs.vanCommRand {
             return false
         }
         if lhs.dummyNullifiers != rhs.dummyNullifiers {
@@ -975,7 +975,7 @@ extension DelegationAction: Equatable, Hashable {
         hasher.combine(rk)
         hasher.combine(govNullifiers)
         hasher.combine(van)
-        hasher.combine(govCommRand)
+        hasher.combine(vanCommRand)
         hasher.combine(dummyNullifiers)
         hasher.combine(rhoSigned)
         hasher.combine(paddedCmx)
@@ -1001,7 +1001,7 @@ public struct FfiConverterTypeDelegationAction: FfiConverterRustBuffer {
                 rk: FfiConverterData.read(from: &buf),
                 govNullifiers: FfiConverterSequenceData.read(from: &buf),
                 van: FfiConverterData.read(from: &buf),
-                govCommRand: FfiConverterData.read(from: &buf),
+                vanCommRand: FfiConverterData.read(from: &buf),
                 dummyNullifiers: FfiConverterSequenceData.read(from: &buf),
                 rhoSigned: FfiConverterData.read(from: &buf),
                 paddedCmx: FfiConverterSequenceData.read(from: &buf),
@@ -1019,7 +1019,7 @@ public struct FfiConverterTypeDelegationAction: FfiConverterRustBuffer {
         FfiConverterData.write(value.rk, into: &buf)
         FfiConverterSequenceData.write(value.govNullifiers, into: &buf)
         FfiConverterData.write(value.van, into: &buf)
-        FfiConverterData.write(value.govCommRand, into: &buf)
+        FfiConverterData.write(value.vanCommRand, into: &buf)
         FfiConverterSequenceData.write(value.dummyNullifiers, into: &buf)
         FfiConverterData.write(value.rhoSigned, into: &buf)
         FfiConverterSequenceData.write(value.paddedCmx, into: &buf)
@@ -1176,18 +1176,18 @@ public struct DelegationProofResult {
     public var nfSigned: Data
     public var cmxNew: Data
     public var govNullifiers: [Data]
-    public var govComm: Data
+    public var vanComm: Data
     public var rk: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(proof: Data, publicInputs: [Data], nfSigned: Data, cmxNew: Data, govNullifiers: [Data], govComm: Data, rk: Data) {
+    public init(proof: Data, publicInputs: [Data], nfSigned: Data, cmxNew: Data, govNullifiers: [Data], vanComm: Data, rk: Data) {
         self.proof = proof
         self.publicInputs = publicInputs
         self.nfSigned = nfSigned
         self.cmxNew = cmxNew
         self.govNullifiers = govNullifiers
-        self.govComm = govComm
+        self.vanComm = vanComm
         self.rk = rk
     }
 }
@@ -1214,7 +1214,7 @@ extension DelegationProofResult: Equatable, Hashable {
         if lhs.govNullifiers != rhs.govNullifiers {
             return false
         }
-        if lhs.govComm != rhs.govComm {
+        if lhs.vanComm != rhs.vanComm {
             return false
         }
         if lhs.rk != rhs.rk {
@@ -1229,7 +1229,7 @@ extension DelegationProofResult: Equatable, Hashable {
         hasher.combine(nfSigned)
         hasher.combine(cmxNew)
         hasher.combine(govNullifiers)
-        hasher.combine(govComm)
+        hasher.combine(vanComm)
         hasher.combine(rk)
     }
 }
@@ -1248,7 +1248,7 @@ public struct FfiConverterTypeDelegationProofResult: FfiConverterRustBuffer {
                 nfSigned: FfiConverterData.read(from: &buf),
                 cmxNew: FfiConverterData.read(from: &buf),
                 govNullifiers: FfiConverterSequenceData.read(from: &buf),
-                govComm: FfiConverterData.read(from: &buf),
+                vanComm: FfiConverterData.read(from: &buf),
                 rk: FfiConverterData.read(from: &buf)
         )
     }
@@ -1259,7 +1259,7 @@ public struct FfiConverterTypeDelegationProofResult: FfiConverterRustBuffer {
         FfiConverterData.write(value.nfSigned, into: &buf)
         FfiConverterData.write(value.cmxNew, into: &buf)
         FfiConverterSequenceData.write(value.govNullifiers, into: &buf)
-        FfiConverterData.write(value.govComm, into: &buf)
+        FfiConverterData.write(value.vanComm, into: &buf)
         FfiConverterData.write(value.rk, into: &buf)
     }
 }
@@ -1388,7 +1388,7 @@ public struct GovernancePczt {
     public var cmxNew: Data
     public var govNullifiers: [Data]
     public var van: Data
-    public var govCommRand: Data
+    public var vanCommRand: Data
     public var dummyNullifiers: [Data]
     public var rhoSigned: Data
     public var paddedCmx: [Data]
@@ -1399,7 +1399,7 @@ public struct GovernancePczt {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(pcztBytes: Data, rk: Data, alpha: Data, nfSigned: Data, cmxNew: Data, govNullifiers: [Data], van: Data, govCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], rseedSigned: Data, rseedOutput: Data, actionBytes: Data, actionIndex: UInt32) {
+    public init(pcztBytes: Data, rk: Data, alpha: Data, nfSigned: Data, cmxNew: Data, govNullifiers: [Data], van: Data, vanCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], rseedSigned: Data, rseedOutput: Data, actionBytes: Data, actionIndex: UInt32) {
         self.pcztBytes = pcztBytes
         self.rk = rk
         self.alpha = alpha
@@ -1407,7 +1407,7 @@ public struct GovernancePczt {
         self.cmxNew = cmxNew
         self.govNullifiers = govNullifiers
         self.van = van
-        self.govCommRand = govCommRand
+        self.vanCommRand = vanCommRand
         self.dummyNullifiers = dummyNullifiers
         self.rhoSigned = rhoSigned
         self.paddedCmx = paddedCmx
@@ -1446,7 +1446,7 @@ extension GovernancePczt: Equatable, Hashable {
         if lhs.van != rhs.van {
             return false
         }
-        if lhs.govCommRand != rhs.govCommRand {
+        if lhs.vanCommRand != rhs.vanCommRand {
             return false
         }
         if lhs.dummyNullifiers != rhs.dummyNullifiers {
@@ -1481,7 +1481,7 @@ extension GovernancePczt: Equatable, Hashable {
         hasher.combine(cmxNew)
         hasher.combine(govNullifiers)
         hasher.combine(van)
-        hasher.combine(govCommRand)
+        hasher.combine(vanCommRand)
         hasher.combine(dummyNullifiers)
         hasher.combine(rhoSigned)
         hasher.combine(paddedCmx)
@@ -1508,7 +1508,7 @@ public struct FfiConverterTypeGovernancePczt: FfiConverterRustBuffer {
                 cmxNew: FfiConverterData.read(from: &buf),
                 govNullifiers: FfiConverterSequenceData.read(from: &buf),
                 van: FfiConverterData.read(from: &buf),
-                govCommRand: FfiConverterData.read(from: &buf),
+                vanCommRand: FfiConverterData.read(from: &buf),
                 dummyNullifiers: FfiConverterSequenceData.read(from: &buf),
                 rhoSigned: FfiConverterData.read(from: &buf),
                 paddedCmx: FfiConverterSequenceData.read(from: &buf),
@@ -1527,7 +1527,7 @@ public struct FfiConverterTypeGovernancePczt: FfiConverterRustBuffer {
         FfiConverterData.write(value.cmxNew, into: &buf)
         FfiConverterSequenceData.write(value.govNullifiers, into: &buf)
         FfiConverterData.write(value.van, into: &buf)
-        FfiConverterData.write(value.govCommRand, into: &buf)
+        FfiConverterData.write(value.vanCommRand, into: &buf)
         FfiConverterSequenceData.write(value.dummyNullifiers, into: &buf)
         FfiConverterData.write(value.rhoSigned, into: &buf)
         FfiConverterSequenceData.write(value.paddedCmx, into: &buf)
@@ -1874,15 +1874,23 @@ public struct SharePayload {
     public var voteDecision: UInt32
     public var encShare: EncryptedShare
     public var treePosition: UInt64
+    /**
+     * All 4 encrypted shares (needed for ZKP #3 shares_hash witness).
+     */
+    public var allEncShares: [EncryptedShare]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(sharesHash: Data, proposalId: UInt32, voteDecision: UInt32, encShare: EncryptedShare, treePosition: UInt64) {
+    public init(sharesHash: Data, proposalId: UInt32, voteDecision: UInt32, encShare: EncryptedShare, treePosition: UInt64,
+        /**
+         * All 4 encrypted shares (needed for ZKP #3 shares_hash witness).
+         */allEncShares: [EncryptedShare]) {
         self.sharesHash = sharesHash
         self.proposalId = proposalId
         self.voteDecision = voteDecision
         self.encShare = encShare
         self.treePosition = treePosition
+        self.allEncShares = allEncShares
     }
 }
 
@@ -1908,6 +1916,9 @@ extension SharePayload: Equatable, Hashable {
         if lhs.treePosition != rhs.treePosition {
             return false
         }
+        if lhs.allEncShares != rhs.allEncShares {
+            return false
+        }
         return true
     }
 
@@ -1917,6 +1928,7 @@ extension SharePayload: Equatable, Hashable {
         hasher.combine(voteDecision)
         hasher.combine(encShare)
         hasher.combine(treePosition)
+        hasher.combine(allEncShares)
     }
 }
 
@@ -1933,7 +1945,8 @@ public struct FfiConverterTypeSharePayload: FfiConverterRustBuffer {
                 proposalId: FfiConverterUInt32.read(from: &buf),
                 voteDecision: FfiConverterUInt32.read(from: &buf),
                 encShare: FfiConverterTypeEncryptedShare.read(from: &buf),
-                treePosition: FfiConverterUInt64.read(from: &buf)
+                treePosition: FfiConverterUInt64.read(from: &buf),
+                allEncShares: FfiConverterSequenceTypeEncryptedShare.read(from: &buf)
         )
     }
 
@@ -1943,6 +1956,7 @@ public struct FfiConverterTypeSharePayload: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.voteDecision, into: &buf)
         FfiConverterTypeEncryptedShare.write(value.encShare, into: &buf)
         FfiConverterUInt64.write(value.treePosition, into: &buf)
+        FfiConverterSequenceTypeEncryptedShare.write(value.allEncShares, into: &buf)
     }
 }
 

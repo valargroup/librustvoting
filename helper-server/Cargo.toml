@@ -30,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 pasta_curves = "0.5"
 ff = "0.13"
+orchard = { path = "../orchard", features = ["share-reveal"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

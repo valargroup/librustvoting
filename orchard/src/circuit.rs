@@ -68,6 +68,10 @@ pub mod delegation;
 #[cfg(feature = "vote-proof")]
 #[path = "vote_proof/mod.rs"]
 pub mod vote_proof;
+
+#[cfg(feature = "share-reveal")]
+#[path = "share_reveal/mod.rs"]
+pub mod share_reveal;
 pub mod gadget;
 mod note_commit;
 pub mod van_integrity;

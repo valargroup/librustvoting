@@ -5,11 +5,11 @@
 //! 1. Syncs the tree (if needed)
 //! 2. Generates VC Merkle witness at latest anchor height
 //! 3. Derives share_nullifier
-//! 4. Generates ZKP #3 proof (currently mocked)
+//! 4. Generates ZKP #3 proof via the real Halo2 circuit
 //! 5. POSTs MsgRevealShare to the chain endpoint
 
 use base64::prelude::*;
-use ff::PrimeField;
+use ff::{FromUniformBytes, PrimeField};
 use pasta_curves::Fp;
 
 use crate::chain_client::ChainClient;
@@ -69,6 +69,49 @@ pub async fn run_processor(
     }
 }
 
+/// Decode a base64 compressed Pallas point into its x-coordinate (Fp).
+///
+/// Clears the sign bit (bit 7 of byte 31) to extract the raw x-coordinate,
+/// matching the ExtractP convention used by the vote proof circuit.
+fn decode_x_coord(b64: &str) -> Result<Fp, String> {
+    let bytes = BASE64_STANDARD
+        .decode(b64)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!("expected 32 bytes, got {}", bytes.len()));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    // Clear the sign bit to get the raw x-coordinate.
+    arr[31] &= 0x7F;
+    Option::from(Fp::from_repr(arr)).ok_or_else(|| "non-canonical Fp encoding".to_string())
+}
+
+/// Decode all 4 encrypted share x-coordinates from the payload.
+///
+/// The `all_enc_shares` field must contain exactly 4 entries, sorted by
+/// share_index. Returns `(c1_x[4], c2_x[4])`.
+fn decode_all_share_x_coords(
+    share: &QueuedShare,
+) -> Result<([Fp; 4], [Fp; 4]), String> {
+    if share.payload.all_enc_shares.len() != 4 {
+        return Err(format!(
+            "expected 4 encrypted shares, got {}",
+            share.payload.all_enc_shares.len()
+        ));
+    }
+
+    let mut c1_x = [Fp::zero(); 4];
+    let mut c2_x = [Fp::zero(); 4];
+
+    for (i, es) in share.payload.all_enc_shares.iter().enumerate() {
+        c1_x[i] = decode_x_coord(&es.c1)?;
+        c2_x[i] = decode_x_coord(&es.c2)?;
+    }
+
+    Ok((c1_x, c2_x))
+}
+
 /// Process a single share: witness → nullifier → proof → submit.
 async fn process_share(
     share: &QueuedShare,
@@ -80,7 +123,7 @@ async fn process_share(
         .ok_or("tree not synced yet (no checkpoint)")?;
 
     // Generate VC Merkle witness.
-    let _witness = tree
+    let witness = tree
         .witness(share.payload.tree_position, anchor_height)
         .ok_or_else(|| {
             format!(
@@ -106,8 +149,29 @@ async fn process_share(
         Fp::from(u64::from(share.payload.vote_decision)),
     );
 
-    // Derive share nullifier.
-    let nullifier = derive_share_nullifier(&share.payload, vote_commitment)
+    // Convert vote_round_id from hex to bytes and to Fp (needed for nullifier + circuit).
+    let round_id_bytes = hex::decode(&share.payload.vote_round_id)
+        .map_err(|e| format!("decode vote_round_id: {}", e))?;
+
+    // Decode voting_round_id as an Fp element.
+    // Round IDs are Blake2b-256 hashes which are frequently non-canonical as
+    // raw Fp encodings (~75% of random 32-byte values exceed the Pallas
+    // modulus). Use wide reduction (zero-extend to 64 bytes) to get a
+    // canonical field element, matching the FFI verifier's hash_bytes_to_fp.
+    let voting_round_id_fp = {
+        if round_id_bytes.len() != 32 {
+            return Err(format!(
+                "vote_round_id must be 32 bytes, got {}",
+                round_id_bytes.len()
+            ));
+        }
+        let mut wide = [0u8; 64];
+        wide[..32].copy_from_slice(&round_id_bytes);
+        Fp::from_uniform_bytes(&wide)
+    };
+
+    // Derive share nullifier (includes voting_round_id for round binding).
+    let nullifier = derive_share_nullifier(&share.payload, vote_commitment, voting_round_id_fp)
         .ok_or("nullifier derivation failed")?;
 
     // Build MsgRevealShare.
@@ -122,17 +186,58 @@ async fn process_share(
     enc_share_bytes.extend_from_slice(&c1);
     enc_share_bytes.extend_from_slice(&c2);
 
-    // Convert vote_round_id from hex to base64 (chain expects base64).
-    let round_id_bytes = hex::decode(&share.payload.vote_round_id)
-        .map_err(|e| format!("decode vote_round_id: {}", e))?;
+    // --- ZKP #3 proof generation ---
+    // Decode all 4 encrypted share x-coordinates from the payload.
+    let (all_c1_x, all_c2_x) = decode_all_share_x_coords(share)?;
+
+    // Verify shares_hash consistency: the payload's shares_hash must match
+    // what all_enc_shares actually hash to. A mismatch means the circuit
+    // witness (from all_enc_shares) would produce a different vote_commitment
+    // than the nullifier (from payload.shares_hash), causing proof verification
+    // to fail on-chain after wasting 30-60s of proof generation.
+    let recomputed_shares_hash = orchard::vote_proof::shares_hash(all_c1_x, all_c2_x);
+    if recomputed_shares_hash != shares_hash_fp {
+        return Err(
+            "shares_hash does not match all_enc_shares: payload is internally inconsistent"
+                .to_string(),
+        );
+    }
+
+    // Extract the Merkle auth path as raw Fp values for the builder.
+    let auth_path_fp: [Fp; vote_commitment_tree::TREE_DEPTH] = {
+        let raw = witness.auth_path();
+        let mut arr = [Fp::zero(); vote_commitment_tree::TREE_DEPTH];
+        for (i, h) in raw.iter().enumerate() {
+            arr[i] = h.inner();
+        }
+        arr
+    };
+
+    // Build the share reveal bundle (circuit + instance).
+    let bundle = orchard::share_reveal::builder::build_share_reveal(
+        auth_path_fp,
+        witness.position(),
+        all_c1_x,
+        all_c2_x,
+        share.payload.enc_share.share_index,
+        Fp::from(u64::from(share.payload.proposal_id)),
+        Fp::from(u64::from(share.payload.vote_decision)),
+        voting_round_id_fp,
+    );
+
+    // Generate the real Halo2 proof (CPU-intensive, ~30-60s in release mode).
+    let proof_bytes = tokio::task::spawn_blocking(move || {
+        orchard::share_reveal::create_share_reveal_proof(bundle.circuit, &bundle.instance)
+    })
+    .await
+    .map_err(|e| format!("proof generation task failed: {}", e))?;
 
     let msg = MsgRevealShareJson {
         share_nullifier: BASE64_STANDARD.encode(nullifier.to_repr()),
         enc_share: BASE64_STANDARD.encode(&enc_share_bytes),
         proposal_id: share.payload.proposal_id,
         vote_decision: share.payload.vote_decision,
-        // ZKP #3 proof — mocked until the Halo2 circuit exists.
-        proof: BASE64_STANDARD.encode(vec![0u8; 192]),
+        proof: BASE64_STANDARD.encode(&proof_bytes),
         vote_round_id: BASE64_STANDARD.encode(&round_id_bytes),
         vote_comm_tree_anchor_height: anchor_height as u64,
     };

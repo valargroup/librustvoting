@@ -258,9 +258,10 @@ pub struct SharePayload {
     pub vote_decision: u32,
     pub enc_share: EncryptedShare,
     pub tree_position: u64,
+    /// All 4 encrypted shares (needed for ZKP #3 shares_hash witness).
+    /// TODO: This is a temp hack
+    pub all_enc_shares: Vec<EncryptedShare>,
 }
-
-
 
 /// Result of real delegation proof generation (ZKP #1).
 #[derive(Clone, uniffi::Record)]
@@ -446,10 +447,10 @@ impl From<voting::SharePayload> for SharePayload {
             vote_decision: p.vote_decision,
             enc_share: p.enc_share.into(),
             tree_position: p.tree_position,
+            all_enc_shares: p.all_enc_shares.into_iter().map(|s| s.into()).collect(),
         }
     }
 }
-
 
 impl From<voting::WitnessData> for WitnessData {
     fn from(w: voting::WitnessData) -> Self {
@@ -472,7 +473,6 @@ impl From<WitnessData> for voting::WitnessData {
         }
     }
 }
-
 
 impl From<voting::DelegationProofResult> for DelegationProofResult {
     fn from(r: voting::DelegationProofResult) -> Self {
@@ -602,11 +602,12 @@ impl VotingDatabase {
         round_name: String,
     ) -> Result<GovernancePczt, VotingError> {
         let core_notes: Vec<voting::NoteInfo> = notes.into_iter().map(Into::into).collect();
-        let seed_fp_32: [u8; 32] = seed_fingerprint.try_into().map_err(|_| {
-            VotingError::InvalidInput {
-                message: "seed_fingerprint must be 32 bytes".to_string(),
-            }
-        })?;
+        let seed_fp_32: [u8; 32] =
+            seed_fingerprint
+                .try_into()
+                .map_err(|_| VotingError::InvalidInput {
+                    message: "seed_fingerprint must be 32 bytes".to_string(),
+                })?;
         Ok(self
             .db
             .build_governance_pczt(
@@ -641,7 +642,9 @@ impl VotingDatabase {
         notes: Vec<NoteInfo>,
     ) -> Result<Vec<WitnessData>, VotingError> {
         let core_notes: Vec<voting::NoteInfo> = notes.into_iter().map(Into::into).collect();
-        Ok(self.db.generate_note_witnesses(&round_id, &wallet_db_path, &core_notes)?
+        Ok(self
+            .db
+            .generate_note_witnesses(&round_id, &wallet_db_path, &core_notes)?
             .into_iter()
             .map(Into::into)
             .collect())
@@ -807,11 +810,12 @@ pub fn build_governance_pczt(
     round_name: String,
 ) -> Result<GovernancePczt, VotingError> {
     let core_notes: Vec<voting::NoteInfo> = notes.into_iter().map(Into::into).collect();
-    let seed_fp_32: [u8; 32] = seed_fingerprint.try_into().map_err(|_| {
-        VotingError::InvalidInput {
-            message: "seed_fingerprint must be 32 bytes".to_string(),
-        }
-    })?;
+    let seed_fp_32: [u8; 32] =
+        seed_fingerprint
+            .try_into()
+            .map_err(|_| VotingError::InvalidInput {
+                message: "seed_fingerprint must be 32 bytes".to_string(),
+            })?;
     Ok(voting::action::build_governance_pczt(
         &core_notes,
         &params.into(),
@@ -917,9 +921,11 @@ pub fn generate_delegation_inputs(
 
     // Compute ZIP-32 seed fingerprint from the sender seed.
     // Keystone uses this to identify which seed to derive the spending key from.
-    let seed_fp = zip32::fingerprint::SeedFingerprint::from_seed(&sender_seed)
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: "failed to compute seed fingerprint (seed too short?)".to_string(),
+    let seed_fp =
+        zip32::fingerprint::SeedFingerprint::from_seed(&sender_seed).ok_or_else(|| {
+            VotingError::InvalidInput {
+                message: "failed to compute seed fingerprint (seed too short?)".to_string(),
+            }
         })?;
 
     Ok(DelegationInputs {
@@ -955,11 +961,7 @@ pub fn extract_spend_auth_sig(
     signed_pczt_bytes: Vec<u8>,
     action_index: u32,
 ) -> Result<Vec<u8>, VotingError> {
-    Ok(voting::action::extract_spend_auth_sig(
-        &signed_pczt_bytes,
-        action_index as usize,
-    )?
-    .to_vec())
+    Ok(voting::action::extract_spend_auth_sig(&signed_pczt_bytes, action_index as usize)?.to_vec())
 }
 
 #[uniffi::export]

@@ -4,7 +4,7 @@
 //! snapshot_blockhash || proposals_hash || vote_end_time_BE ||
 //! nullifier_imt_root || nc_root).
 
-use crate::elgamal::{self, Ciphertext, PublicKey};
+use crate::elgamal::{self, Ciphertext};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -49,10 +49,7 @@ pub fn derive_round_id(fields: &SetupRoundFields) -> [u8; 32] {
 }
 
 fn to_base64(bytes: &[u8]) -> String {
-    base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        bytes,
-    )
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
 }
 
 /// Build MsgCreateVotingSession body and derive round_id.
@@ -113,11 +110,7 @@ pub struct DelegationBundlePayload {
 
 /// Build MsgDelegateVote body.
 pub fn delegate_vote_payload(round_id: &[u8], bundle: &DelegationBundlePayload) -> Value {
-    let gov_nulls: Vec<String> = bundle
-        .gov_nullifiers
-        .iter()
-        .map(|b| to_base64(b))
-        .collect();
+    let gov_nulls: Vec<String> = bundle.gov_nullifiers.iter().map(|b| to_base64(b)).collect();
     json!({
         "rk": to_base64(&bundle.rk),
         "spend_auth_sig": to_base64(&bundle.spend_auth_sig),
@@ -194,20 +187,22 @@ pub fn cast_vote_payload_real(
     })
 }
 
-/// Build MsgRevealShare body. enc_share is 64-byte ciphertext (base64).
+/// Build MsgRevealShare body with a real ZKP #3 proof and public inputs.
 pub fn reveal_share_payload(
     round_id: &[u8],
     anchor_height: u32,
-    enc_share_b64: &str,
+    share_nullifier: &[u8],
+    enc_share: &[u8], // 64 bytes: C1 || C2 compressed Pallas points
     proposal_id: u32,
     vote_decision: u32,
+    proof: &[u8],
 ) -> Value {
     json!({
-        "share_nullifier": to_base64(&unique_nullifier()),
-        "enc_share": enc_share_b64,
+        "share_nullifier": to_base64(share_nullifier),
+        "enc_share": to_base64(enc_share),
         "proposal_id": proposal_id,
         "vote_decision": vote_decision,
-        "proof": to_base64(b"mock-reveal-share-proof"),
+        "proof": to_base64(proof),
         "vote_round_id": to_base64(round_id),
         "vote_comm_tree_anchor_height": anchor_height,
     })
@@ -242,10 +237,4 @@ pub fn submit_tally_payload(round_id: &[u8], creator: &str, entries: &[TallyEntr
 /// Encode ElGamal ciphertext to base64 (64 bytes).
 pub fn ciphertext_to_base64(ct: &Ciphertext) -> String {
     to_base64(&elgamal::marshal(ct))
-}
-
-/// Encrypt a vote value and return base64 enc_share for reveal_share payload.
-pub fn encrypt_share(pk: &PublicKey, value: u64, rng: &mut impl rand_core::RngCore) -> String {
-    let ct = elgamal::encrypt(pk, value, rng);
-    ciphertext_to_base64(&ct)
 }

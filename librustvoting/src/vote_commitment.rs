@@ -10,6 +10,8 @@ pub fn build_share_payloads(
 ) -> Result<Vec<SharePayload>, VotingError> {
     validate_encrypted_shares(enc_shares)?;
 
+    let all_enc_shares: Vec<EncryptedShare> = enc_shares.to_vec();
+
     let mut payloads = Vec::with_capacity(enc_shares.len());
     for share in enc_shares {
         payloads.push(SharePayload {
@@ -18,6 +20,7 @@ pub fn build_share_payloads(
             vote_decision: 0,
             enc_share: share.clone(),
             tree_position: 0,
+            all_enc_shares: all_enc_shares.clone(),
         });
     }
 

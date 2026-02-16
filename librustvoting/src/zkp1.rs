@@ -7,8 +7,6 @@ use halo2_proofs::{
     transcript::{Blake2bWrite, Challenge255},
 };
 use incrementalmerkletree::Hashable;
-use pasta_curves::{pallas, vesta};
-use rand::rngs::OsRng;
 use orchard::{
     delegation::{
         builder::{build_delegation_bundle, RealNoteInput},
@@ -21,11 +19,13 @@ use orchard::{
     value::NoteValue,
     NOTE_COMMITMENT_TREE_DEPTH,
 };
+use pasta_curves::{pallas, vesta};
+use rand::rngs::OsRng;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::Network;
 
 use crate::types::{
-    ct_option_to_result, validate_32_bytes, DelegationProofResult, NoteInfo, ImtProofJson,
+    ct_option_to_result, validate_32_bytes, DelegationProofResult, ImtProofJson, NoteInfo,
     ProofProgressReporter, VotingError, WitnessData,
 };
 
@@ -139,15 +139,12 @@ fn fetch_exclusion_proof_blocking(
         });
     }
 
-    let body = resp
-        .bytes()
-        .map_err(|e| VotingError::ProofFailed {
-            message: format!("failed to read IMT server response body: {e}"),
-        })?;
+    let body = resp.bytes().map_err(|e| VotingError::ProofFailed {
+        message: format!("failed to read IMT server response body: {e}"),
+    })?;
 
     parse_imt_proof_json(&body)
 }
-
 
 /// Parse a 32-byte LE slice as a `pallas::Base` field element.
 fn bytes_to_base(bytes: &[u8], name: &str) -> Result<pallas::Base, VotingError> {
@@ -158,6 +155,22 @@ fn bytes_to_base(bytes: &[u8], name: &str) -> Result<pallas::Base, VotingError> 
     opt.ok_or_else(|| VotingError::InvalidInput {
         message: format!("{name} is not a valid field element"),
     })
+}
+
+/// Parse a 32-byte hash as a `pallas::Base` via wide reduction.
+///
+/// Blake2b-256 outputs are non-canonical Pallas Fp ~75% of the time
+/// (field modulus byte[31] = 0x40). Zero-extends to 64 bytes and uses
+/// `from_uniform_bytes` for canonical reduction, matching the FFI
+/// verifier's `hash_bytes_to_fp`.
+///
+/// TODO: Once we move vote round to a field element we can delete this.
+fn hash_bytes_to_base(bytes: &[u8], name: &str) -> Result<pallas::Base, VotingError> {
+    use ff::FromUniformBytes;
+    validate_32_bytes(bytes, name)?;
+    let mut wide = [0u8; 64];
+    wide[..32].copy_from_slice(bytes);
+    Ok(pallas::Base::from_uniform_bytes(&wide))
 }
 
 /// Parse a 32-byte LE slice as a `pallas::Scalar`.
@@ -176,12 +189,11 @@ fn reconstruct_note(
     full_note: &NoteInfo,
     network: &Network,
 ) -> Result<(orchard::Note, FullViewingKey), VotingError> {
-    let ufvk =
-        UnifiedFullViewingKey::decode(network, &full_note.ufvk_str).map_err(|e| {
-            VotingError::Internal {
-                message: format!("failed to decode UFVK: {e}"),
-            }
-        })?;
+    let ufvk = UnifiedFullViewingKey::decode(network, &full_note.ufvk_str).map_err(|e| {
+        VotingError::Internal {
+            message: format!("failed to decode UFVK: {e}"),
+        }
+    })?;
 
     let fvk = ufvk.orchard().ok_or_else(|| VotingError::Internal {
         message: "UFVK has no Orchard component".into(),
@@ -353,7 +365,10 @@ pub fn build_and_prove_delegation(
     // Parse scalar/field inputs.
     let alpha = bytes_to_scalar(alpha_bytes, "alpha")?;
     let van_comm_rand = bytes_to_base(van_comm_rand_bytes, "van_comm_rand")?;
-    let vote_round_id = bytes_to_base(vote_round_id_bytes, "vote_round_id")?;
+    // vote_round_id is a Blake2b-256 hash — use wide reduction for canonical Fp.
+    //
+    // TODO: Once we move vote round to a field element we use bytes_to_base directly.
+    let vote_round_id = hash_bytes_to_base(vote_round_id_bytes, "vote_round_id")?;
 
     // Parse hotkey address (43-byte raw Orchard address).
     let addr_arr: [u8; 43] =
@@ -467,12 +482,11 @@ pub fn build_and_prove_delegation(
             message: format!("keygen_vk failed: {e}"),
         }
     })?;
-    let pk =
-        plonk::keygen_pk(&params, vk.clone(), &DelegationCircuit::default()).map_err(|e| {
-            VotingError::ProofFailed {
-                message: format!("keygen_pk failed: {e}"),
-            }
-        })?;
+    let pk = plonk::keygen_pk(&params, vk.clone(), &DelegationCircuit::default()).map_err(|e| {
+        VotingError::ProofFailed {
+            message: format!("keygen_pk failed: {e}"),
+        }
+    })?;
 
     progress.on_progress(0.5);
 
@@ -530,13 +544,9 @@ mod tests {
     use halo2_gadgets::poseidon::primitives::{self as poseidon, ConstantLength};
     use incrementalmerkletree::{Hashable, Level};
     use orchard::{
-        delegation::imt::IMT_DEPTH as TEST_IMT_DEPTH,
-        keys::Scope,
-        note::commitment::ExtractedNoteCommitment,
-        note::Rho,
-        tree::MerkleHashOrchard,
-        value::NoteValue,
-        NOTE_COMMITMENT_TREE_DEPTH as TEST_TREE_DEPTH,
+        delegation::imt::IMT_DEPTH as TEST_IMT_DEPTH, keys::Scope,
+        note::commitment::ExtractedNoteCommitment, note::Rho, tree::MerkleHashOrchard,
+        value::NoteValue, NOTE_COMMITMENT_TREE_DEPTH as TEST_TREE_DEPTH,
     };
 
     struct TestReporter {
@@ -807,8 +817,7 @@ mod tests {
             auth_path_hashes[0] = leaves[i ^ 1];
             auth_path_hashes[1] = l1[1 - (i >> 1)];
             for level in 2..TEST_TREE_DEPTH {
-                auth_path_hashes[level] =
-                    MerkleHashOrchard::empty_root(Level::from(level as u8));
+                auth_path_hashes[level] = MerkleHashOrchard::empty_root(Level::from(level as u8));
             }
 
             let cmx = ExtractedNoteCommitment::from(note.commitment());
@@ -816,7 +825,10 @@ mod tests {
                 note_commitment: MerkleHashOrchard::from_cmx(&cmx).to_bytes().to_vec(),
                 position: i as u64,
                 root: nc_root_bytes.clone(),
-                auth_path: auth_path_hashes.iter().map(|h| h.to_bytes().to_vec()).collect(),
+                auth_path: auth_path_hashes
+                    .iter()
+                    .map(|h| h.to_bytes().to_vec())
+                    .collect(),
             });
         }
 
@@ -885,10 +897,7 @@ mod tests {
         println!("Proof generated in {:.1}s", elapsed.as_secs_f64());
 
         // 8. Verify result structure
-        assert!(
-            !result.proof.is_empty(),
-            "proof bytes should be non-empty"
-        );
+        assert!(!result.proof.is_empty(), "proof bytes should be non-empty");
         assert_eq!(
             result.public_inputs.len(),
             12,

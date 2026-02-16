@@ -20,8 +20,8 @@ use super::circuit::{
     shares_hash, van_integrity_hash, van_nullifier_hash, vote_commitment_hash, Circuit, Instance,
     VOTE_COMM_TREE_DEPTH,
 };
-use super::{base_to_scalar, elgamal_encrypt, spend_auth_g_affine};
 use super::prove::create_vote_proof;
+use super::{base_to_scalar, spend_auth_g_affine};
 
 /// Maximum proposal authority bitmask for a fresh VAN (16 proposals).
 const MAX_PROPOSAL_AUTHORITY: u64 = 65535; // 2^16 - 1
@@ -38,6 +38,13 @@ pub struct VoteProofBundle {
     pub instance: Instance,
     /// Compressed r_vpk (32 bytes) for sighash computation and signature verification.
     pub r_vpk_bytes: [u8; 32],
+    /// El Gamal encrypted share C1 x-coordinates (needed for ZKP #3).
+    pub enc_c1_x: [pallas::Base; 4],
+    /// El Gamal encrypted share C2 x-coordinates (needed for ZKP #3).
+    pub enc_c2_x: [pallas::Base; 4],
+    /// Compressed encrypted share bytes per share (64 bytes each: C1 || C2).
+    /// Used for the chain's `enc_share` field in MsgRevealShare.
+    pub enc_shares_compressed: [[u8; 64]; 4],
 }
 
 /// Errors that can occur during vote proof construction.
@@ -149,10 +156,10 @@ pub fn build_vote_proof_from_delegation(
 
     // ---- Fast key-chain consistency checks (instant, no circuit) ----
     {
+        use crate::constants::{fixed_bases::COMMIT_IVK_PERSONALIZATION, L_ORCHARD_BASE};
         use core::iter;
         use group::ff::PrimeFieldBits;
         use halo2_gadgets::sinsemilla::primitives::CommitDomain;
-        use crate::constants::{fixed_bases::COMMIT_IVK_PERSONALIZATION, L_ORCHARD_BASE};
 
         // Check 1: [vsk] * SpendAuthG must match the ak from the FullViewingKey.
         let ak_from_vsk = (pallas::Point::from(spend_auth_g_affine()) * vsk).to_affine();
@@ -178,8 +185,7 @@ pub fn build_vote_proof_from_delegation(
                 &rivk_v,
             )
             .expect("CommitIvk must not produce bottom");
-        let ivk_scalar = base_to_scalar(ivk)
-            .expect("ivk must be convertible to scalar");
+        let ivk_scalar = base_to_scalar(ivk).expect("ivk must be convertible to scalar");
         let pk_d_derived = (pallas::Point::from(vpk_g_d_affine) * ivk_scalar).to_affine();
         assert_eq!(
             pk_d_derived, vpk_pk_d_affine,
@@ -213,8 +219,7 @@ pub fn build_vote_proof_from_delegation(
         van_comm_rand,
     );
 
-    let van_nullifier =
-        van_nullifier_hash(vsk_nk, voting_round_id, vote_authority_note_old);
+    let van_nullifier = van_nullifier_hash(vsk_nk, voting_round_id, vote_authority_note_old);
 
     let vote_authority_note_new = van_integrity_hash(
         vpk_g_d_x,
@@ -256,16 +261,28 @@ pub fn build_vote_proof_from_delegation(
     let ea_pk_x = *ea_pk.coordinates().unwrap().x();
     let ea_pk_y = *ea_pk.coordinates().unwrap().y();
 
+    let g = pallas::Point::from(spend_auth_g_affine());
     let mut enc_c1_x = [pallas::Base::zero(); 4];
     let mut enc_c2_x = [pallas::Base::zero(); 4];
     let mut share_randomness = [pallas::Base::zero(); 4];
+    let mut enc_shares_compressed = [[0u8; 64]; 4];
 
     for i in 0..4 {
         let r = random_valid_base_as_scalar(rng);
         share_randomness[i] = r;
-        let (c1, c2) = elgamal_encrypt(shares_base[i], r, ea_pk_point);
-        enc_c1_x[i] = c1;
-        enc_c2_x[i] = c2;
+        let r_scalar =
+            base_to_scalar(r).expect("randomness was validated in random_valid_base_as_scalar");
+        let v_scalar =
+            base_to_scalar(shares_base[i]).expect("share value must fit in scalar field");
+        let c1_point = g * r_scalar;
+        let c2_point = g * v_scalar + ea_pk_point * r_scalar;
+        enc_c1_x[i] = *c1_point.to_affine().coordinates().unwrap().x();
+        enc_c2_x[i] = *c2_point.to_affine().coordinates().unwrap().x();
+        // Full compressed bytes for the chain's enc_share field.
+        let c1_bytes = c1_point.to_bytes();
+        let c2_bytes = c2_point.to_bytes();
+        enc_shares_compressed[i][..32].copy_from_slice(c1_bytes.as_ref());
+        enc_shares_compressed[i][32..].copy_from_slice(c2_bytes.as_ref());
     }
 
     let shares_hash_val = shares_hash(enc_c1_x, enc_c2_x);
@@ -273,8 +290,7 @@ pub fn build_vote_proof_from_delegation(
     // ---- Condition 4: r_vpk = ak + [alpha_v] * G ----
     // alpha_v is now provided by the caller so they can sign with rsk_v.
     let ak_point = pallas::Point::from(spend_auth_g_affine()) * vsk;
-    let r_vpk = (ak_point + pallas::Point::from(spend_auth_g_affine()) * alpha_v)
-        .to_affine();
+    let r_vpk = (ak_point + pallas::Point::from(spend_auth_g_affine()) * alpha_v).to_affine();
     let r_vpk_x = *r_vpk.coordinates().unwrap().x();
     let r_vpk_y = *r_vpk.coordinates().unwrap().y();
     let r_vpk_bytes: [u8; 32] = r_vpk.to_bytes();
@@ -376,5 +392,12 @@ pub fn build_vote_proof_from_delegation(
 
     let proof = create_vote_proof(circuit, &instance);
 
-    Ok(VoteProofBundle { proof, instance, r_vpk_bytes })
+    Ok(VoteProofBundle {
+        proof,
+        instance,
+        r_vpk_bytes,
+        enc_c1_x,
+        enc_c2_x,
+        enc_shares_compressed,
+    })
 }

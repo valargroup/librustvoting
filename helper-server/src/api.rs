@@ -111,6 +111,46 @@ fn validate_payload(p: &SharePayload) -> Result<(), (StatusCode, String)> {
         ));
     }
 
+    // all_enc_shares: must have exactly 4 entries with valid c1/c2 fields.
+    if p.all_enc_shares.len() != 4 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "all_enc_shares: expected 4 entries, got {}",
+                p.all_enc_shares.len()
+            ),
+        ));
+    }
+    for (i, es) in p.all_enc_shares.iter().enumerate() {
+        validate_b64_field(&es.c1, 32, &format!("all_enc_shares[{}].c1", i))?;
+        validate_b64_field(&es.c2, 32, &format!("all_enc_shares[{}].c2", i))?;
+        if es.share_index != i as u32 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "all_enc_shares[{}].share_index: expected {}, got {}",
+                    i, i, es.share_index
+                ),
+            ));
+        }
+    }
+
+    // enc_share must match all_enc_shares[enc_share.share_index].
+    // The proof builder uses all_enc_shares for circuit witnesses while
+    // the chain message uses enc_share directly — a mismatch wastes
+    // 30-60s of proof generation only to produce an invalid proof.
+    let idx = p.enc_share.share_index as usize;
+    let expected = &p.all_enc_shares[idx];
+    if p.enc_share.c1 != expected.c1 || p.enc_share.c2 != expected.c2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "enc_share c1/c2 must match all_enc_shares[{}]",
+                idx
+            ),
+        ));
+    }
+
     Ok(())
 }
 

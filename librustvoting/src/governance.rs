@@ -1,4 +1,4 @@
-use ff::PrimeField;
+use ff::{FromUniformBytes, PrimeField};
 use halo2_gadgets::poseidon::primitives::{self as poseidon, ConstantLength, P128Pow5T3};
 use pasta_curves::pallas;
 
@@ -40,6 +40,23 @@ pub fn bytes_to_fp(bytes: &[u8]) -> Result<pallas::Base, VotingError> {
     })
 }
 
+/// Convert a 32-byte hash to a Pallas field element using wide reduction.
+///
+/// Blake2b-256 outputs are non-canonical as raw Fp encodings ~75% of the time
+/// (any value >= Pallas modulus). Zero-extend to 64 bytes and use
+/// `from_uniform_bytes` for canonical reduction, matching `zkp1::hash_bytes_to_base`
+/// and the FFI verifier's `hash_bytes_to_fp`.
+///
+/// TODO: Once we move vote round to a field element we can delete this.
+fn bytes_to_fp_wide(bytes: &[u8]) -> Result<pallas::Base, VotingError> {
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| VotingError::InvalidInput {
+        message: format!("expected 32 bytes, got {}", bytes.len()),
+    })?;
+    let mut wide = [0u8; 64];
+    wide[..32].copy_from_slice(&arr);
+    Ok(pallas::Base::from_uniform_bytes(&wide))
+}
+
 /// Convert a Pallas base field element to 32 bytes.
 fn fp_to_bytes(fp: pallas::Base) -> Vec<u8> {
     let repr: [u8; 32] = fp.to_repr();
@@ -58,7 +75,8 @@ pub fn derive_gov_nullifier(
     note_nullifier: &[u8],
 ) -> Result<Vec<u8>, VotingError> {
     let nk_fp = bytes_to_fp(nk)?;
-    let vri_fp = bytes_to_fp(vote_round_id)?;
+    // TODO: Once we move vote round to a field element we can use bytes_to_fp directly.
+    let vri_fp = bytes_to_fp_wide(vote_round_id)?;
     let nf_fp = bytes_to_fp(note_nullifier)?;
 
     let step1 = poseidon_hash_2(vri_fp, nf_fp);
@@ -99,7 +117,8 @@ pub fn construct_van(
     let g_d = bytes_to_fp(g_d_new_x)?;
     let pk_d = bytes_to_fp(pk_d_new_x)?;
     let num_ballots_base = pallas::Base::from(num_ballots);
-    let vri = bytes_to_fp(vote_round_id)?;
+    // TODO: Once we move vote round to a field element we can use bytes_to_fp directly.
+    let vri = bytes_to_fp_wide(vote_round_id)?;
     let rcm = bytes_to_fp(van_comm_rand)?;
 
     // Step 1: Hash the 6 core VAN fields into a single digest (ConstantLength<6>).
@@ -141,7 +160,8 @@ pub fn compute_rho_binding(
     let c3 = bytes_to_fp(cmx_3)?;
     let c4 = bytes_to_fp(cmx_4)?;
     let gc = bytes_to_fp(van_comm)?;
-    let vri = bytes_to_fp(vote_round_id)?;
+    // TODO: Once we move vote round to a field element we can use bytes_to_fp directly.
+    let vri = bytes_to_fp_wide(vote_round_id)?;
 
     let rho = poseidon::Hash::<_, P128Pow5T3, ConstantLength<6>, 3, 2>::init()
         .hash([c1, c2, c3, c4, gc, vri]);
@@ -359,5 +379,4 @@ mod tests {
             "rho_binding known-answer mismatch — formula may have diverged"
         );
     }
-
 }

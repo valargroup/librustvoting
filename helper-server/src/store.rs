@@ -79,20 +79,30 @@ impl ShareStore {
         }
     }
 
-    /// Mark a share as failed (for retry).
+    /// Mark a share as failed (for retry, up to MAX_ATTEMPTS).
     pub fn mark_failed(&self, round_id: &str, share_index: u32) {
+        const MAX_ATTEMPTS: u32 = 5;
         let mut store = self.inner.lock().unwrap();
         if let Some(shares) = store.get_mut(round_id) {
             for share in shares.iter_mut() {
                 if share.payload.enc_share.share_index == share_index
                     && share.state == ShareState::Witnessed
                 {
-                    share.state = ShareState::Failed;
                     share.attempts += 1;
-                    // Re-schedule with backoff.
-                    let backoff = Duration::from_secs(2u64.pow(share.attempts.min(6)));
-                    share.scheduled_submit_at = Instant::now() + backoff;
-                    share.state = ShareState::Received;
+                    if share.attempts >= MAX_ATTEMPTS {
+                        share.state = ShareState::Failed;
+                        tracing::warn!(
+                            round_id,
+                            share_index,
+                            attempts = share.attempts,
+                            "share permanently failed after max attempts"
+                        );
+                    } else {
+                        // Re-schedule with exponential backoff.
+                        let backoff = Duration::from_secs(2u64.pow(share.attempts.min(6)));
+                        share.scheduled_submit_at = Instant::now() + backoff;
+                        share.state = ShareState::Received;
+                    }
                 }
             }
         }
@@ -113,12 +123,17 @@ impl ShareStore {
                     .iter()
                     .filter(|s| s.state == ShareState::Submitted)
                     .count();
+                let failed = shares
+                    .iter()
+                    .filter(|s| s.state == ShareState::Failed)
+                    .count();
                 (
                     round_id.clone(),
                     QueueStatus {
                         total,
                         pending,
                         submitted,
+                        failed,
                     },
                 )
             })
@@ -138,4 +153,5 @@ pub struct QueueStatus {
     pub total: usize,
     pub pending: usize,
     pub submitted: usize,
+    pub failed: usize,
 }

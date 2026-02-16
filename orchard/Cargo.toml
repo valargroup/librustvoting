@@ -90,6 +90,7 @@ dev-graph = ["halo2_proofs?/dev-graph", "image", "plotters"]
 test-dependencies = ["proptest"]
 delegation = ["circuit", "std"]
 vote-proof = ["circuit", "std"]
+share-reveal = ["circuit", "std", "vote-proof"]
 
 [[bench]]
 name = "note_decryption"

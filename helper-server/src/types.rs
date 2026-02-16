@@ -48,6 +48,10 @@ pub struct SharePayload {
     /// via VoteCommitmentBundle.voteRoundId and will include it when
     /// buildSharePayloads is wired to the real network layer.
     pub vote_round_id: String,
+    /// All 4 encrypted shares (C1/C2 pairs). Needed for ZKP #3 to
+    /// recompute shares_hash in-circuit.
+    /// TODO: This is a temp hack
+    pub all_enc_shares: Vec<EncryptedShareWire>,
 }
 
 // ---------------------------------------------------------------------------

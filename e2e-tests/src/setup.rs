@@ -1,10 +1,11 @@
 //! Build a real delegation bundle for E2E tests (ZKP #1 + RedPallas).
 //!
-//! Generates session params with vote_end_time = now + 240s (4 min) and a canonical
+//! Generates session params with vote_end_time = now + configured window and a canonical
 //! vote_round_id, then builds the delegation bundle and RedPallas signature
 //! so the test can create the session and delegate without fixture files.
-//! vote_end_time is fixed at bundle build. Raw CI logs: bundle at 19:59:19, cast-vote at 20:02:11
-//! (~173s); 4 min keeps the round ACTIVE through delegate/cast/first reveal with margin.
+//! The window defaults to 8 minutes and can be overridden with
+//! ZALLY_E2E_VOTE_WINDOW_SECS. This timestamp is part of vote_round_id, so it must
+//! be chosen before proof generation starts.
 
 use crate::payloads::{DelegationBundlePayload, SetupRoundFields};
 use blake2b_simd::Params as Blake2bParams;
@@ -26,6 +27,17 @@ use orchard::{
 use pasta_curves::pallas;
 use rand::rngs::OsRng;
 use vote_commitment_tree::TreeServer;
+
+const DEFAULT_E2E_VOTE_WINDOW_SECS: u64 = 480;
+const MIN_E2E_VOTE_WINDOW_SECS: u64 = 300;
+
+fn vote_window_secs() -> u64 {
+    std::env::var("ZALLY_E2E_VOTE_WINDOW_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(|secs| secs.max(MIN_E2E_VOTE_WINDOW_SECS))
+        .unwrap_or(DEFAULT_E2E_VOTE_WINDOW_SECS)
+}
 
 /// Append exactly 32 bytes to `out` from `b` (pad with zeros if shorter).
 fn extend_padded32(out: &mut Vec<u8>, b: &[u8]) {
@@ -60,12 +72,19 @@ pub struct VoteProofDelegationData {
 }
 
 /// Build delegation bundle and session fields for the E2E test.
-/// vote_end_time = now + 240s (4 min). CI logs: ~173s from bundle to cast-vote; 4 min keeps round ACTIVE.
+/// vote_end_time = now + vote_window_secs() where the default window is 8 min
+/// (override with ZALLY_E2E_VOTE_WINDOW_SECS, clamped to >= 300s).
+/// The round must stay ACTIVE through all submissions, then expire for auto-tally.
 /// Returns payload for MsgDelegateVote, session fields for MsgCreateVotingSession,
 /// and private witness data for building ZKP #2 (vote proof).
-pub fn build_delegation_bundle_for_test(
-) -> Result<(DelegationBundlePayload, SetupRoundFields, VoteProofDelegationData), Box<dyn std::error::Error + Send + Sync>>
-{
+pub fn build_delegation_bundle_for_test() -> Result<
+    (
+        DelegationBundlePayload,
+        SetupRoundFields,
+        VoteProofDelegationData,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let mut rng = OsRng;
 
     let sk = SpendingKey::random(&mut rng);
@@ -130,7 +149,7 @@ pub fn build_delegation_bundle_for_test(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
-        + 240;
+        + vote_window_secs();
 
     let nc_root_repr = nc_root.to_repr();
     let nf_imt_root_repr = nf_imt_root.to_repr();
@@ -193,9 +212,8 @@ pub fn build_delegation_bundle_for_test(
     // Canonical sighash: Blake2b-256(domain || vote_round_id || rk || ...).
     // Must match sdk/x/vote/types/sighash.go ComputeDelegationSighash.
     const SIGHASH_DOMAIN: &[u8] = b"ZALLY_DELEGATION_SIGHASH_V0";
-    let mut canonical = Vec::with_capacity(
-        SIGHASH_DOMAIN.len() + 32 + 32 + 32 + 32 + 64 + 32 + 4 * 32,
-    );
+    let mut canonical =
+        Vec::with_capacity(SIGHASH_DOMAIN.len() + 32 + 32 + 32 + 32 + 64 + 32 + 4 * 32);
     canonical.extend_from_slice(SIGHASH_DOMAIN);
     extend_padded32(&mut canonical, vote_round_id_repr.as_ref());
     canonical.extend_from_slice(&rk_bytes);
@@ -266,10 +284,12 @@ pub fn build_van_merkle_witness(
     tree.append(van_cmx);
     tree.checkpoint(checkpoint_height);
 
-    let root = tree.root_at_height(checkpoint_height)
+    let root = tree
+        .root_at_height(checkpoint_height)
         .expect("checkpoint should exist");
 
-    let path = tree.path(0, checkpoint_height)
+    let path = tree
+        .path(0, checkpoint_height)
         .expect("VAN at position 0 should have a valid path");
 
     // Convert MerkleHashVote siblings to pallas::Base for the circuit.
@@ -285,6 +305,49 @@ pub fn build_van_merkle_witness(
     assert!(
         path.verify(van_cmx, root),
         "merkle path verification failed for VAN at position 0"
+    );
+
+    (auth_path, position, root)
+}
+
+/// Build a vote commitment tree locally with all 3 leaves from delegation + cast
+/// (van_cmx at 0, vote_authority_note_new at 1, vote_commitment at 2) and return
+/// the Merkle authentication path for vote_commitment at position 2.
+///
+/// Returns `(auth_path, position, root)` suitable for the share reveal builder (ZKP #3).
+pub fn build_vote_commitment_merkle_witness(
+    van_cmx: pallas::Base,
+    vote_authority_note_new: pallas::Base,
+    vote_commitment: pallas::Base,
+    checkpoint_height: u32,
+) -> ([pallas::Base; VOTE_COMM_TREE_DEPTH], u32, pallas::Base) {
+    let mut tree = TreeServer::empty();
+    tree.append(van_cmx); // position 0
+    tree.append(vote_authority_note_new); // position 1
+    tree.append(vote_commitment); // position 2
+    tree.checkpoint(checkpoint_height);
+
+    let root = tree
+        .root_at_height(checkpoint_height)
+        .expect("checkpoint should exist");
+
+    let path = tree
+        .path(2, checkpoint_height)
+        .expect("vote_commitment at position 2 should have a valid path");
+
+    // Convert MerkleHashVote siblings to pallas::Base for the circuit.
+    let auth_path_hashes = path.auth_path();
+    let mut auth_path = [pallas::Base::zero(); VOTE_COMM_TREE_DEPTH];
+    for (i, hash) in auth_path_hashes.iter().enumerate() {
+        auth_path[i] = hash.inner();
+    }
+
+    let position = path.position();
+
+    // Sanity: verify the path produces the expected root.
+    assert!(
+        path.verify(vote_commitment, root),
+        "merkle path verification failed for vote_commitment at position 2"
     );
 
     (auth_path, position, root)

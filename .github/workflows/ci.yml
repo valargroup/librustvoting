@@ -179,6 +179,7 @@ jobs:
         env:
           ZALLY_API_URL: http://localhost:1318
           ZALLY_EA_PK_PATH: /home/runner/.zallyd/ea.pk
+          ZALLY_E2E_VOTE_WINDOW_SECS: "420"
       - name: Upload chain log on failure
         if: failure()
         uses: actions/upload-artifact@v4

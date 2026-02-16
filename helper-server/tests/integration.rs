@@ -73,6 +73,17 @@ fn test_share_payload(
     tree_position: u64,
     round_id_hex: &str,
 ) -> Value {
+    // Build all 4 encrypted shares for ZKP #3.
+    let all_enc_shares: Vec<Value> = (0..4)
+        .map(|i| {
+            json!({
+                "c1": BASE64_STANDARD.encode(Fp::from(100 + i as u64).to_repr()),
+                "c2": BASE64_STANDARD.encode(Fp::from(200 + i as u64).to_repr()),
+                "share_index": i,
+            })
+        })
+        .collect();
+
     json!({
         "shares_hash": BASE64_STANDARD.encode([0x42u8; 32]),
         "proposal_id": 0,
@@ -85,6 +96,7 @@ fn test_share_payload(
         "share_index": share_index,
         "tree_position": tree_position,
         "vote_round_id": round_id_hex,
+        "all_enc_shares": all_enc_shares,
     })
 }
 
@@ -234,18 +246,30 @@ async fn post_share(app: axum::Router, payload: &Value) -> u16 {
 
 /// Valid payload template for validation tests.
 fn valid_payload() -> Value {
+    let all_enc_shares: Vec<Value> = (0..4)
+        .map(|i| {
+            json!({
+                "c1": BASE64_STANDARD.encode(Fp::from(i as u64).to_repr()),
+                "c2": BASE64_STANDARD.encode(Fp::from(i as u64 + 10).to_repr()),
+                "share_index": i,
+            })
+        })
+        .collect();
+
+    // enc_share must match all_enc_shares[0] exactly.
     json!({
         "shares_hash": BASE64_STANDARD.encode([0u8; 32]),
         "proposal_id": 0,
         "vote_decision": 1,
         "enc_share": {
-            "c1": BASE64_STANDARD.encode([0u8; 32]),
-            "c2": BASE64_STANDARD.encode([0u8; 32]),
+            "c1": BASE64_STANDARD.encode(Fp::from(0u64).to_repr()),
+            "c2": BASE64_STANDARD.encode(Fp::from(10u64).to_repr()),
             "share_index": 0,
         },
         "share_index": 0,
         "tree_position": 0,
         "vote_round_id": hex::encode([0u8; 32]),
+        "all_enc_shares": all_enc_shares,
     })
 }
 
@@ -292,6 +316,38 @@ async fn validation_rejects_bad_round_id() {
     // Wrong length (16 bytes hex instead of 32).
     let mut p = valid_payload();
     p["vote_round_id"] = json!(hex::encode([0u8; 16]));
+    assert_eq!(post_share(make_app(), &p).await, 400);
+}
+
+#[tokio::test]
+async fn validation_rejects_bad_all_enc_shares() {
+    // Missing all_enc_shares (wrong count).
+    let mut p = valid_payload();
+    p["all_enc_shares"] = json!([]);
+    assert_eq!(post_share(make_app(), &p).await, 400);
+
+    // Only 3 entries instead of 4.
+    let mut p = valid_payload();
+    let arr = p["all_enc_shares"].as_array().unwrap().clone();
+    p["all_enc_shares"] = json!(arr[..3]);
+    assert_eq!(post_share(make_app(), &p).await, 400);
+
+    // Wrong share_index ordering.
+    let mut p = valid_payload();
+    p["all_enc_shares"][0]["share_index"] = json!(2);
+    assert_eq!(post_share(make_app(), &p).await, 400);
+}
+
+#[tokio::test]
+async fn validation_rejects_enc_share_mismatch() {
+    // enc_share.c1 differs from all_enc_shares[0].c1.
+    let mut p = valid_payload();
+    p["enc_share"]["c1"] = json!(BASE64_STANDARD.encode(Fp::from(9999u64).to_repr()));
+    assert_eq!(post_share(make_app(), &p).await, 400);
+
+    // enc_share.c2 differs from all_enc_shares[0].c2.
+    let mut p = valid_payload();
+    p["enc_share"]["c2"] = json!(BASE64_STANDARD.encode(Fp::from(9999u64).to_repr()));
     assert_eq!(post_share(make_app(), &p).await, 400);
 }
 

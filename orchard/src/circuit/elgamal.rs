@@ -31,8 +31,12 @@ use halo2_gadgets::ecc::{
 
 /// Returns the SpendAuthG generator point (used as G in El Gamal).
 ///
-/// Same generator as Orchard spend authorization; reused as the El Gamal
-/// generator so condition 3 and condition 11 share the same ECC chip.
+/// Why SpendAuthG? El Gamal requires a prime-order generator with an unknown
+/// discrete log. SpendAuthG is derived via `GroupPHash("z.cash:Orchard", "G")`
+/// — a nothing-up-my-sleeve point. The circuit already loads SpendAuthG as a
+/// fixed-base with precomputed lookup tables for spend-auth re-randomization
+/// (Condition 4). Reusing it for El Gamal (Condition 11) avoids a second
+/// fixed-base table, saving significant circuit size and proving time.
 pub fn spend_auth_g_affine() -> pallas::Affine {
     use group::Curve;
     let g = crate::constants::fixed_bases::spend_auth_g::generator();

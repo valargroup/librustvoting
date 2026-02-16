@@ -1,16 +1,20 @@
 //! Share nullifier derivation.
 //!
-//! Per Gov Steps V1 §5.3:
+//! Per Gov Steps V1 §5.3 (extended with round binding):
 //! ```text
-//! share_nullifier = Poseidon(
-//!     Poseidon(domain_tag, vote_commitment),
-//!     Poseidon(share_index_fp, enc_share_hash)
-//! )
+//! enc_share_hash  = Poseidon(c1_x, c2_x)
+//! left            = Poseidon(domain_tag, vote_commitment)
+//! right           = Poseidon(share_index_fp, enc_share_hash)
+//! inner           = Poseidon(left, right)
+//! share_nullifier = Poseidon(inner, voting_round_id)
 //! ```
 //!
+//! The final hash with `voting_round_id` binds the nullifier to a specific
+//! voting round, preventing cross-round proof replay (the commitment tree is
+//! global, not per-round).
+//!
 //! Uses the same Poseidon (P128Pow5T3 over Pallas Fp) as the vote-commitment-tree
-//! crate. The two-level hash-chain approach packs 4 logical inputs into arity-2
-//! Poseidon calls.
+//! crate.
 
 use base64::prelude::*;
 use ff::PrimeField;
@@ -35,11 +39,14 @@ fn domain_tag() -> Fp {
 ///
 /// Inputs:
 /// - `vote_commitment`: the VC leaf value (Fp) from the vote commitment tree
-/// - `share_index`: which of the 4 shares (0..3)
-/// - `enc_share_c1`, `enc_share_c2`: the El Gamal ciphertext components
+/// - `voting_round_id`: the round identifier (as Fp, using wide reduction)
 ///
 /// Returns `None` if any field decoding fails.
-pub fn derive_share_nullifier(payload: &SharePayload, vote_commitment: Fp) -> Option<Fp> {
+pub fn derive_share_nullifier(
+    payload: &SharePayload,
+    vote_commitment: Fp,
+    voting_round_id: Fp,
+) -> Option<Fp> {
     let share_index_fp = Fp::from(payload.enc_share.share_index as u64);
 
     // Hash the encrypted share: Poseidon(c1_fp, c2_fp).
@@ -60,10 +67,11 @@ pub fn derive_share_nullifier(payload: &SharePayload, vote_commitment: Fp) -> Op
     let c2_fp = Option::from(Fp::from_repr(c2_arr))?;
     let enc_share_hash = poseidon_hash(c1_fp, c2_fp);
 
-    // Two-level hash chain: pack 4 inputs into 3 arity-2 calls.
+    // Four arity-2 Poseidon hashes (matches ZKP #3 circuit condition 5).
     let left = poseidon_hash(domain_tag(), vote_commitment);
     let right = poseidon_hash(share_index_fp, enc_share_hash);
-    Some(poseidon_hash(left, right))
+    let inner = poseidon_hash(left, right);
+    Some(poseidon_hash(inner, voting_round_id))
 }
 
 #[cfg(test)]
@@ -74,6 +82,7 @@ mod tests {
     #[test]
     fn nullifier_deterministic() {
         let vc = Fp::from(42);
+        let round_id = Fp::from(777);
         let c1 = BASE64_STANDARD.encode(Fp::from(1).to_repr());
         let c2 = BASE64_STANDARD.encode(Fp::from(2).to_repr());
 
@@ -89,17 +98,22 @@ mod tests {
             share_index: 0,
             tree_position: 1,
             vote_round_id: hex::encode([0u8; 32]),
+            all_enc_shares: vec![],
         };
 
-        let nf1 = derive_share_nullifier(&payload, vc).unwrap();
-        let nf2 = derive_share_nullifier(&payload, vc).unwrap();
+        let nf1 = derive_share_nullifier(&payload, vc, round_id).unwrap();
+        let nf2 = derive_share_nullifier(&payload, vc, round_id).unwrap();
         assert_eq!(nf1, nf2);
 
         // Different share_index → different nullifier.
         let mut payload2 = payload.clone();
         payload2.enc_share.share_index = 1;
-        let nf3 = derive_share_nullifier(&payload2, vc).unwrap();
+        let nf3 = derive_share_nullifier(&payload2, vc, round_id).unwrap();
         assert_ne!(nf1, nf3);
+
+        // Different voting_round_id → different nullifier.
+        let nf4 = derive_share_nullifier(&payload, vc, Fp::from(888)).unwrap();
+        assert_ne!(nf1, nf4);
     }
 
     #[test]
@@ -125,10 +139,11 @@ mod tests {
             share_index: 2,
             tree_position: 5,
             vote_round_id: hex::encode([0u8; 32]),
+            all_enc_shares: vec![],
         };
 
         // Must not return None — the sign bit should be cleared internally.
-        let nf = derive_share_nullifier(&payload, Fp::from(99));
+        let nf = derive_share_nullifier(&payload, Fp::from(99), Fp::from(555));
         assert!(nf.is_some(), "nullifier derivation must handle sign bit");
     }
 }

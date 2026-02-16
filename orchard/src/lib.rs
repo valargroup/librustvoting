@@ -53,6 +53,9 @@ pub use crate::circuit::delegation;
 #[cfg(feature = "vote-proof")]
 pub use crate::circuit::vote_proof;
 
+#[cfg(feature = "share-reveal")]
+pub use crate::circuit::share_reveal;
+
 pub use action::Action;
 pub use address::Address;
 pub use bundle::Bundle;

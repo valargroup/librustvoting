@@ -167,8 +167,10 @@ pub struct SharePayload {
     pub vote_decision: u32,
     pub enc_share: EncryptedShare,
     pub tree_position: u64,
+    /// All 4 encrypted shares (needed for ZKP #3 shares_hash witness).
+    /// TODO: This is a temp hack
+    pub all_enc_shares: Vec<EncryptedShare>,
 }
-
 
 /// JSON deserialization struct for IMT server exclusion proof responses.
 #[derive(serde::Deserialize, Clone, Debug)]
