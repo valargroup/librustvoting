@@ -217,11 +217,17 @@ pub fn build_delegation_bundle(
 
     let notes: [NoteSlotWitness; 4] = note_slots.try_into().unwrap_or_else(|_| unreachable!());
 
+    // Condition 8: ballot scaling.
+    // num_ballots = floor(v_total / BALLOT_DIVISOR)
+    let v_total_u64: u64 = v_values.iter().sum();
+    let num_ballots_u64 = v_total_u64 / circuit::BALLOT_DIVISOR;
+    let remainder_u64 = v_total_u64 % circuit::BALLOT_DIVISOR;
+    let num_ballots_field = pallas::Base::from(num_ballots_u64);
+
     // Condition 7: gov commitment integrity.
-    // van_comm = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total,
+    // van_comm = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, num_ballots,
     //                     vote_round_id, MAX_PROPOSAL_AUTHORITY, van_comm_rand)
     // Extract the output address as two x-coordinates (vpk representation).
-    let v_total = pallas::Base::from(v_values.iter().sum::<u64>());
 
     let g_d_new_x = *output_recipient
         .g_d()
@@ -237,7 +243,7 @@ pub fn build_delegation_bundle(
         .unwrap()
         .x();
 
-    let van_comm = van_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, van_comm_rand);
+    let van_comm = van_commitment_hash(g_d_new_x, pk_d_new_x, num_ballots_field, vote_round_id, van_comm_rand);
 
     // Condition 3: rho binding.
     // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
@@ -284,7 +290,11 @@ pub fn build_delegation_bundle(
     let circuit = circuit::Circuit::from_note_unchecked(fvk, &signed_note, alpha)
         .with_output_note(&output_note)
         .with_notes(notes)
-        .with_van_comm_rand(van_comm_rand);
+        .with_van_comm_rand(van_comm_rand)
+        .with_ballot_scaling(
+            pallas::Base::from(num_ballots_u64),
+            pallas::Base::from(remainder_u64),
+        );
 
     let instance = circuit::Instance::from_parts(
         nf_signed,
@@ -440,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_four_real_notes() {
-        // 3,200,000 x 4 = 12,800,000 >= 12,500,000.
+        // 3,200,000 x 4 = 12,800,000 → num_ballots = 1, remainder = 300,000.
         build_and_verify(&[3_200_000, 3_200_000, 3_200_000, 3_200_000]);
     }
 
@@ -451,13 +461,14 @@ mod tests {
 
     #[test]
     fn test_min_weight_boundary() {
-        // v_total = 12,500,000 exactly. Should pass.
+        // v_total = 12,500,000 exactly → num_ballots = 1, remainder = 0. Should pass.
         build_and_verify(&[12_500_000]);
     }
 
     #[test]
-    fn test_below_min_weight() {
-        // v_total < 12,500,000. Circuit should fail.
+    fn test_below_one_ballot() {
+        // v_total = 12,499,999 → num_ballots = 0. Circuit should fail
+        // (non-zero check on num_ballots causes nb_minus_one to wrap).
         let mut rng = OsRng;
         let sk = SpendingKey::random(&mut rng);
         let fvk: FullViewingKey = (&sk).into();
@@ -484,7 +495,13 @@ mod tests {
 
         let pi = bundle.instance.to_halo2_instance();
         let prover = MockProver::run(K, &bundle.circuit, vec![pi]).unwrap();
-        assert!(prover.verify().is_err(), "below min weight should fail");
+        assert!(prover.verify().is_err(), "below one ballot should fail");
+    }
+
+    #[test]
+    fn test_three_ballots() {
+        // 3 notes × 12,500,000 = 37,500,000 → num_ballots = 3, remainder = 0.
+        build_and_verify(&[12_500_000, 12_500_000, 12_500_000]);
     }
 
     #[test]

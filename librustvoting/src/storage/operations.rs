@@ -481,7 +481,7 @@ mod tests {
         let note = NoteInfo {
             commitment: vec![0x01; 32],
             nullifier: vec![0x02; 32],
-            value: 1_000_000,
+            value: 15_000_000,
             position: 42,
             diversifier: vec![0; 11],
             rho: vec![0; 32],

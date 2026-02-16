@@ -25,6 +25,7 @@ use halo2_proofs::{
 };
 
 pub(crate) mod add_chip;
+pub(crate) mod mul_chip;
 
 impl super::Config {
     pub(super) fn add_chip(&self) -> add_chip::AddChip {
@@ -80,6 +81,17 @@ impl super::Config {
 pub(crate) trait AddInstruction<F: Field>: Chip<F> {
     /// Constraints `a + b` and returns the sum.
     fn add(
+        &self,
+        layouter: impl Layouter<F>,
+        a: &AssignedCell<F, F>,
+        b: &AssignedCell<F, F>,
+    ) -> Result<AssignedCell<F, F>, plonk::Error>;
+}
+
+/// An instruction set for multiplying two circuit words (field elements).
+pub(crate) trait MulInstruction<F: Field>: Chip<F> {
+    /// Constraints `a * b` and returns the product.
+    fn mul(
         &self,
         layouter: impl Layouter<F>,
         a: &AssignedCell<F, F>,

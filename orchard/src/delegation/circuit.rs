@@ -8,8 +8,8 @@
 //! - **Condition 4**: Spend authority.
 //! - **Condition 5**: CommitIvk & diversified address integrity.
 //! - **Condition 6**: Output note commitment integrity.
-//! - **Condition 7**: Governance commitment integrity.
-//! - **Condition 8**: Minimum voting weight.
+//! - **Condition 7**: Governance commitment integrity (hashes `num_ballots`).
+//! - **Condition 8**: Ballot scaling (`num_ballots = floor(v_total / 12,500,000)`).
 //! - **Condition 9** (×4): Note commitment integrity.
 //! - **Condition 10** (×4): Merkle path validity.
 //! - **Condition 11** (×4): Diversified address integrity.
@@ -33,7 +33,9 @@ use crate::{
         commit_ivk::{CommitIvkChip, CommitIvkConfig},
         gadget::{
             add_chip::{AddChip, AddConfig},
+            mul_chip::{MulChip, MulConfig},
             assign_constant, assign_free_advice, derive_nullifier, note_commit, AddInstruction,
+            MulInstruction,
         },
         note_commit::{NoteCommitChip, NoteCommitConfig},
     },
@@ -142,21 +144,28 @@ pub(crate) fn rho_binding_hash(
         .hash([cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id])
 }
 
+/// Ballot divisor for converting raw zatoshi balance to ballot count.
+///
+/// `num_ballots = floor(v_total / BALLOT_DIVISOR)`
+pub(crate) const BALLOT_DIVISOR: u64 = 12_500_000;
+
 /// Out-of-circuit governance commitment hash used by the builder and tests.
 ///
 /// Delegates to `van_integrity::van_integrity_hash` with
 /// `MAX_PROPOSAL_AUTHORITY` as the proposal authority (fresh delegation).
+/// The `value` parameter is `num_ballots` (ballot count after floor-division),
+/// NOT the raw zatoshi sum.
 pub(crate) fn van_commitment_hash(
     g_d_new_x: pallas::Base,
     pk_d_new_x: pallas::Base,
-    v_total: pallas::Base,
+    num_ballots: pallas::Base,
     vote_round_id: pallas::Base,
     van_comm_rand: pallas::Base,
 ) -> pallas::Base {
     van_integrity::van_integrity_hash(
         g_d_new_x,
         pk_d_new_x,
-        v_total,
+        num_ballots,
         vote_round_id,
         pallas::Base::from(MAX_PROPOSAL_AUTHORITY),
         van_comm_rand,
@@ -182,6 +191,9 @@ pub struct Config {
     // Configuration for the AddChip which constrains a + b = c over field elements.
     // Used inside DeriveNullifier to combine intermediate values.
     add_config: AddConfig,
+    // Configuration for the MulChip which constrains a * b = c over field elements.
+    // Used in condition 8 (ballot scaling) to compute num_ballots * BALLOT_DIVISOR.
+    mul_config: MulConfig,
     // Configuration for the ECCChip which provides elliptic curve operations
     // (point addition, scalar multiplication) on the Pallas curve with Orchard's fixes bases.
     // We use it to convert cm_signed from NoteCommitment to a Field point for the DeriveNullifier function.
@@ -205,8 +217,8 @@ pub struct Config {
     // Configuration for decomposition and canonicity checking for the output note's NoteCommit.
     new_note_commit_config: NoteCommitConfig,
     // Range check configuration for the 10-bit lookup table.
-    // Used in condition 8 (minimum voting weight) to verify that
-    // v_total - MIN_WEIGHT fits in 70 bits (non-negative).
+    // Used in condition 8 (ballot scaling) to range-check nb_minus_one (30 bits
+    // direct) and remainder (24 bits via shift-by-2^6 into 30-bit check).
     range_check: LookupRangeCheckConfig<pallas::Base, 10>,
     // Merkle config 1 — Sinsemilla-based Merkle path verification for condition 10.
     // Paired with sinsemilla_config_1. Uses advices[..5].
@@ -226,6 +238,10 @@ pub struct Config {
 impl Config {
     fn add_chip(&self) -> AddChip {
         AddChip::construct(self.add_config.clone())
+    }
+
+    fn mul_chip(&self) -> MulChip {
+        MulChip::construct(self.mul_config.clone())
     }
 
     fn ecc_chip(&self) -> EccChip<OrchardFixedBases> {
@@ -334,8 +350,10 @@ pub struct Circuit {
     notes: [NoteSlotWitness; 4],
     // Gov commitment blinding factor (condition 7).
     van_comm_rand: Value<pallas::Base>,
-    // Condition 8 (minimum voting weight) has no witnesses — it uses v_total
-    // derived in-circuit from per-note values plus the constant MIN_WEIGHT.
+    // Condition 8 (ballot scaling) witnesses.
+    // num_ballots = floor(v_total / BALLOT_DIVISOR), remainder = v_total % BALLOT_DIVISOR.
+    num_ballots: Value<pallas::Base>,
+    remainder: Value<pallas::Base>,
 }
 
 impl Circuit {
@@ -381,6 +399,13 @@ impl Circuit {
     /// Sets the governance commitment blinding factor (condition 7).
     pub fn with_van_comm_rand(mut self, van_comm_rand: pallas::Base) -> Self {
         self.van_comm_rand = Value::known(van_comm_rand);
+        self
+    }
+
+    /// Sets the ballot scaling witnesses (condition 8).
+    pub fn with_ballot_scaling(mut self, num_ballots: pallas::Base, remainder: pallas::Base) -> Self {
+        self.num_ballots = Value::known(num_ballots);
+        self.remainder = Value::known(remainder);
         self
     }
 }
@@ -499,6 +524,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ── Chip configurations ──────────────────────────────────────────
 
         let add_config = AddChip::configure(meta, advices[7], advices[8], advices[6]);
+        let mul_config = MulChip::configure(meta, advices[7], advices[8], advices[6]);
 
         // Range check configuration using the right-most advice column.
         let range_check = LookupRangeCheckConfig::configure(meta, advices[9], table_idx);
@@ -560,6 +586,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             primary,
             advices,
             add_config,
+            mul_config,
             ecc_config,
             poseidon_config,
             sinsemilla_config_1,
@@ -1045,45 +1072,179 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         };
 
         // ---------------------------------------------------------------
+        // Compute v_total = v_1 + v_2 + v_3 + v_4 (used by conditions 7 & 8).
+        // ---------------------------------------------------------------
+
+        // v_total = v_1 + v_2 + v_3 + v_4  (three AddChip additions)
+        let add_chip = config.add_chip();
+        let sum_12 =
+            add_chip.add(layouter.namespace(|| "v_1 + v_2"), &v_cells[0], &v_cells[1])?;
+        let sum_123 = add_chip.add(
+            layouter.namespace(|| "(v_1 + v_2) + v_3"),
+            &sum_12,
+            &v_cells[2],
+        )?;
+        let v_total = add_chip.add(
+            layouter.namespace(|| "(v_1 + v_2 + v_3) + v_4"),
+            &sum_123,
+            &v_cells[3],
+        )?;
+
+        // ---------------------------------------------------------------
+        // Condition 8: Ballot scaling.
+        // num_ballots = floor(v_total / BALLOT_DIVISOR)
+        // Proved by: num_ballots * BALLOT_DIVISOR + remainder == v_total,
+        //            range checks on num_ballots and remainder,
+        //            and a non-zero check on num_ballots.
+        // ---------------------------------------------------------------
+
+        // Ballot scaling (condition 8).
+        //
+        // Converts the raw zatoshi balance into a ballot count via floor-division:
+        //   num_ballots = floor(v_total / 12,500,000)
+        //
+        // Constraints:
+        //   1. num_ballots * BALLOT_DIVISOR + remainder == v_total
+        //   2. remainder < 2^24   (24-bit range check via shift-by-2^6)
+        //   3. 0 < num_ballots <= 2^30  (via nb_minus_one 30-bit range check)
+        //
+        // Range check implementation: the lookup table operates in 10-bit words,
+        // so it directly checks multiples of 10 bits. For remainder (24 bits),
+        // we multiply by 2^6 before a 30-bit check. For num_ballots, 30 bits is
+        // already a multiple of 10, so nb_minus_one is checked directly with
+        // 3 words — no shift needed. 2^30 ballots × 0.125 ZEC ≈ 134M ZEC,
+        // well above the 21M ZEC supply, so 30 bits is a safe upper bound.
+        //
+        // The nb_minus_one check simultaneously enforces both the upper bound
+        // and non-zero: if nb_minus_one < 2^30 then num_ballots ∈ [1, 2^30].
+        // If num_ballots = 0, nb_minus_one wraps to p-1 ≈ 2^254, failing the check.
+        let num_ballots = {
+            // Witness num_ballots and remainder as free advice.
+            let num_ballots = assign_free_advice(
+                layouter.namespace(|| "witness num_ballots"),
+                config.advices[0],
+                self.num_ballots,
+            )?;
+
+            let remainder = assign_free_advice(
+                layouter.namespace(|| "witness remainder"),
+                config.advices[0],
+                self.remainder,
+            )?;
+
+            // Assign the BALLOT_DIVISOR constant (baked into verification key).
+            let ballot_divisor = assign_constant(
+                layouter.namespace(|| "BALLOT_DIVISOR constant"),
+                config.advices[0],
+                pallas::Base::from(BALLOT_DIVISOR),
+            )?;
+
+            // product = num_ballots * BALLOT_DIVISOR
+            let product = config.mul_chip().mul(
+                layouter.namespace(|| "num_ballots * BALLOT_DIVISOR"),
+                &num_ballots,
+                &ballot_divisor,
+            )?;
+
+            // reconstructed = product + remainder
+            let reconstructed = config.add_chip().add(
+                layouter.namespace(|| "product + remainder"),
+                &product,
+                &remainder,
+            )?;
+
+            // Constrain: reconstructed == v_total
+            layouter.assign_region(
+                || "num_ballots * BALLOT_DIVISOR + remainder == v_total",
+                |mut region| region.constrain_equal(reconstructed.cell(), v_total.cell()),
+            )?;
+
+            // Range check remainder to [0, 2^24).
+            // 24 is not a multiple of 10, so we multiply by 2^(30-24) = 2^6 = 64
+            // and range-check the shifted value to 30 bits (3 words × 10 bits).
+            // If remainder >= 2^24, then remainder * 64 >= 2^30, failing the check.
+            let shift_6 = assign_constant(
+                layouter.namespace(|| "2^6 shift constant"),
+                config.advices[0],
+                pallas::Base::from(1u64 << 6),
+            )?;
+            let remainder_shifted = config.mul_chip().mul(
+                layouter.namespace(|| "remainder * 2^6"),
+                &remainder,
+                &shift_6,
+            )?;
+            config.range_check_config().copy_check(
+                layouter.namespace(|| "remainder * 2^6 < 2^30 (i.e. remainder < 2^24)"),
+                remainder_shifted,
+                3,    // num_words: 3 * 10 = 30 bits
+                true, // strict: running sum terminates at 0
+            )?;
+
+            // Non-zero and upper bound: 0 < num_ballots <= 2^30.
+            // Witness nb_minus_one = num_ballots - 1 and constrain
+            // nb_minus_one + 1 == num_ballots. Range-check nb_minus_one
+            // directly to 30 bits (3 words × 10 — no shift needed).
+            // This single check enforces both bounds: if nb_minus_one < 2^30
+            // then num_ballots ∈ [1, 2^30]. If num_ballots = 0, nb_minus_one
+            // wraps to p - 1 ≈ 2^254, which fails the range check.
+            let one = assign_constant(
+                layouter.namespace(|| "one constant"),
+                config.advices[0],
+                pallas::Base::one(),
+            )?;
+
+            let nb_minus_one = num_ballots.value().map(|v| *v - pallas::Base::one());
+            let nb_minus_one = assign_free_advice(
+                layouter.namespace(|| "witness nb_minus_one"),
+                config.advices[0],
+                nb_minus_one,
+            )?;
+
+            let nb_recomputed = config.add_chip().add(
+                layouter.namespace(|| "nb_minus_one + 1"),
+                &nb_minus_one,
+                &one,
+            )?;
+            layouter.assign_region(
+                || "nb_minus_one + 1 == num_ballots",
+                |mut region| region.constrain_equal(nb_recomputed.cell(), num_ballots.cell()),
+            )?;
+
+            config.range_check_config().copy_check(
+                layouter.namespace(|| "nb_minus_one < 2^30"),
+                nb_minus_one,
+                3,    // num_words: 3 * 10 = 30 bits
+                true, // strict: running sum terminates at 0
+            )?;
+
+            num_ballots
+        };
+
+        // ---------------------------------------------------------------
         // Condition 7: Gov commitment integrity.
-        // van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total,
+        // van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, num_ballots,
         //                          vote_round_id, MAX_PROPOSAL_AUTHORITY)
         // van_comm = Poseidon(van_comm_core, van_comm_rand)
         // ---------------------------------------------------------------
 
         // Gov commitment integrity (condition 7).
         //
-        // van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total,
+        // van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, num_ballots,
         //                          vote_round_id, MAX_PROPOSAL_AUTHORITY)
         // van_comm = Poseidon(van_comm_core, van_comm_rand)
         //
         // Proves that the governance commitment (public input) is correctly derived
-        // from the domain tag, the output note's voting hotkey address, the total
-        // voting weight, the vote round identifier, a blinding factor, and the
-        // proposal authority bitmask (MAX_PROPOSAL_AUTHORITY = 65535 for full
-        // authority).
+        // from the domain tag, the output note's voting hotkey address, the ballot
+        // count (floor-divided from v_total), the vote round identifier, a blinding
+        // factor, and the proposal authority bitmask (MAX_PROPOSAL_AUTHORITY = 65535
+        // for full authority).
         //
         // Uses two Poseidon invocations over even arities (6 then 2).
-        let v_total = {
+        {
             let van_comm_rand = assign_free_advice(
                 layouter.namespace(|| "witness van_comm_rand"),
                 config.advices[0],
                 self.van_comm_rand,
-            )?;
-
-            // v_total = v_1 + v_2 + v_3 + v_4  (three AddChip additions)
-            let add_chip = config.add_chip();
-            let sum_12 =
-                add_chip.add(layouter.namespace(|| "v_1 + v_2"), &v_cells[0], &v_cells[1])?;
-            let sum_123 = add_chip.add(
-                layouter.namespace(|| "(v_1 + v_2) + v_3"),
-                &sum_12,
-                &v_cells[2],
-            )?;
-            let v_total = add_chip.add(
-                layouter.namespace(|| "(v_1 + v_2 + v_3) + v_4"),
-                &sum_123,
-                &v_cells[3],
             )?;
 
             // DOMAIN_VAN — domain tag for Vote Authority Notes. Provides domain
@@ -1103,6 +1264,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             )?;
 
             // Two-layer Poseidon hash via the shared VAN integrity gadget.
+            // Uses num_ballots (from condition 8) instead of v_total.
             let derived_van_comm = van_integrity::van_integrity_poseidon(
                 &config.poseidon_config,
                 &mut layouter,
@@ -1110,7 +1272,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 domain_van,
                 g_d_new_x,
                 pk_d_new_x,
-                v_total.clone(),
+                num_ballots,
                 vote_round_id_cell,
                 max_proposal_authority,
                 van_comm_rand,
@@ -1120,64 +1282,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             layouter.assign_region(
                 || "van_comm integrity",
                 |mut region| region.constrain_equal(derived_van_comm.cell(), van_comm_cell.cell()),
-            )?;
-
-            v_total
-        };
-
-        // ---------------------------------------------------------------
-        // Condition 8: Minimum voting weight.
-        // v_total >= 12,500,000 zatoshi (0.125 ZEC)
-        // ---------------------------------------------------------------
-
-        // Minimum voting weight (condition 8).
-        //
-        // v_total >= 12,500,000 zatoshi (0.125 ZEC)
-        //
-        // Proved by witnessing diff = v_total - MIN_WEIGHT, constraining
-        // diff + MIN_WEIGHT == v_total, and range-checking diff to [0, 2^70).
-        // If v_total < MIN_WEIGHT, diff wraps to ~2^254, failing the range check.
-        {
-            const MIN_WEIGHT: u64 = 12_500_000;
-
-            // Witness diff = v_total - MIN_WEIGHT.
-            let diff = v_total.value().map(|v| *v - pallas::Base::from(MIN_WEIGHT));
-            let diff = assign_free_advice(
-                layouter.namespace(|| "witness diff = v_total - MIN_WEIGHT"),
-                config.advices[0],
-                diff,
-            )?;
-
-            let min_weight = assign_constant(
-                layouter.namespace(|| "MIN_WEIGHT constant"),
-                config.advices[0],
-                pallas::Base::from(MIN_WEIGHT),
-            )?;
-
-            // Constrain: diff + MIN_WEIGHT == v_total.
-            let recomputed = config.add_chip().add(
-                layouter.namespace(|| "diff + MIN_WEIGHT"),
-                &diff,
-                &min_weight,
-            )?;
-            layouter.assign_region(
-                || "v_total = diff + MIN_WEIGHT",
-                |mut region| region.constrain_equal(recomputed.cell(), v_total.cell()),
-            )?;
-
-            // Range-check diff to [0, 2^70) — ensures diff is non-negative.
-            // 7 words * 10 bits/word = 70 bits >= 64 bits (sufficient for u64 sums).
-            // If v_total < MIN_WEIGHT, diff wraps to ~2^254, failing this check.
-            // Why 70 bits and not 64? Each v_i is a u64,
-            // so v_total = v_1 + v_2 + v_3 + v_4 can be at most 4 * (2^64 - 1),
-            // which needs ~66 bits. After subtracting MIN_WEIGHT,
-            // the result still needs up to ~66 bits.
-            // 70 bits (the next multiple of the 10-bit word size) provides sufficient headroom.
-            config.range_check_config().copy_check(
-                layouter.namespace(|| "diff < 2^70"),
-                diff,
-                7,    // num_words: 7 * 10 = 70 bits
-                true, // strict: running sum terminates at 0
             )?;
         }
         Ok(())
@@ -1752,7 +1856,11 @@ mod tests {
         let notes: [NoteSlotWitness; 4] = note_slots.try_into().unwrap();
 
         // Values: real note = 13M, padded = 0.
-        let v_total = pallas::Base::from(13_000_000u64);
+        // Ballot scaling: 13,000,000 / 12,500,000 = 1 ballot, remainder = 500,000.
+        let v_total_u64: u64 = 13_000_000;
+        let num_ballots_u64 = v_total_u64 / BALLOT_DIVISOR;
+        let remainder_u64 = v_total_u64 % BALLOT_DIVISOR;
+        let num_ballots_field = pallas::Base::from(num_ballots_u64);
 
         // Compute van_comm.
         let g_d_new_x = *output_recipient
@@ -1769,7 +1877,7 @@ mod tests {
             .unwrap()
             .x();
         let van_comm =
-            van_commitment_hash(g_d_new_x, pk_d_new_x, v_total, vote_round_id, van_comm_rand);
+            van_commitment_hash(g_d_new_x, pk_d_new_x, num_ballots_field, vote_round_id, van_comm_rand);
 
         // Compute rho.
         let rho = rho_binding_hash(
@@ -1806,7 +1914,11 @@ mod tests {
         let circuit = Circuit::from_note_unchecked(&fvk, &signed_note, alpha)
             .with_output_note(&output_note)
             .with_notes(notes)
-            .with_van_comm_rand(van_comm_rand);
+            .with_van_comm_rand(van_comm_rand)
+            .with_ballot_scaling(
+                pallas::Base::from(num_ballots_u64),
+                pallas::Base::from(remainder_u64),
+            );
 
         let instance = Instance::from_parts(
             nf_signed,

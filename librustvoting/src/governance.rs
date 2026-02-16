@@ -9,6 +9,9 @@ use crate::types::VotingError;
 /// Full authority is 2^16 - 1 = 65535 (all 16 proposals authorized).
 pub(crate) const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
 
+/// Ballot divisor — must match `delegation::circuit::BALLOT_DIVISOR`.
+const BALLOT_DIVISOR: u64 = 12_500_000;
+
 /// Domain tag for Vote Authority Notes.
 /// Prepended as the first Poseidon input in van_comm for domain separation.
 pub(crate) const DOMAIN_VAN: u64 = 0;
@@ -68,9 +71,13 @@ pub fn derive_gov_nullifier(
 /// Construct a Vote Authority Note (governance commitment, per spec §1.3.3).
 ///
 /// ```text
-/// van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total, vote_round_id, MAX_PROPOSAL_AUTHORITY)
+/// num_ballots = total_weight / BALLOT_DIVISOR
+/// van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, num_ballots, vote_round_id, MAX_PROPOSAL_AUTHORITY)
 /// van_comm = Poseidon(van_comm_core, van_comm_rand)
 /// ```
+///
+/// The VAN hashes `num_ballots` (ballot count after floor-division by
+/// BALLOT_DIVISOR), NOT the raw zatoshi `total_weight`.
 ///
 /// First hash is ConstantLength<6>, second is ConstantLength<2>.
 /// Matches `orchard/src/delegation/circuit.rs:van_commitment_hash`.
@@ -81,35 +88,36 @@ pub fn construct_van(
     vote_round_id: &[u8],
     van_comm_rand: &[u8],
 ) -> Result<Vec<u8>, VotingError> {
-    if total_weight == 0 {
+    let num_ballots = total_weight / BALLOT_DIVISOR;
+    if num_ballots == 0 {
         return Err(VotingError::InvalidInput {
-            message: "total_weight must be > 0".to_string(),
+            message: "total_weight must yield at least 1 ballot (>= 12_500_000 zatoshi)".to_string(),
         });
     }
 
     // Parse all inputs into Pallas field elements for Poseidon.
     let g_d = bytes_to_fp(g_d_new_x)?;
     let pk_d = bytes_to_fp(pk_d_new_x)?;
-    let v_total = pallas::Base::from(total_weight);
+    let num_ballots_base = pallas::Base::from(num_ballots);
     let vri = bytes_to_fp(vote_round_id)?;
     let rcm = bytes_to_fp(van_comm_rand)?;
 
     // Step 1: Hash the 6 core VAN fields into a single digest (ConstantLength<6>).
-    // This binds the VAN to a specific hotkey address (g_d, pk_d), delegated weight,
+    // This binds the VAN to a specific hotkey address (g_d, pk_d), ballot count,
     // voting round, and full proposal authority. DOMAIN_VAN=0 provides domain
     // separation from Vote Commitments (DOMAIN_VC=1) in the shared commitment tree.
     let van_comm_core = poseidon::Hash::<_, P128Pow5T3, ConstantLength<6>, 3, 2>::init().hash([
         pallas::Base::from(DOMAIN_VAN),
         g_d,
         pk_d,
-        v_total,
+        num_ballots_base,
         vri,
         pallas::Base::from(MAX_PROPOSAL_AUTHORITY),
     ]);
 
     // Step 2: Fold in the blinding factor (ConstantLength<2>).
     // van_comm_rand hides the VAN preimage so observers can't brute-force
-    // the hotkey or weight from the on-chain commitment.
+    // the hotkey or ballot count from the on-chain commitment.
     let van_comm = poseidon_hash_2(van_comm_core, rcm);
 
     Ok(fp_to_bytes(van_comm))
@@ -193,8 +201,8 @@ mod tests {
         let vri = [0x05u8; 32];
         let rcm = [0x06u8; 32];
 
-        let result1 = construct_van(&g_d, &pk_d, 1000, &vri, &rcm).unwrap();
-        let result2 = construct_van(&g_d, &pk_d, 1000, &vri, &rcm).unwrap();
+        let result1 = construct_van(&g_d, &pk_d, 15_000_000, &vri, &rcm).unwrap();
+        let result2 = construct_van(&g_d, &pk_d, 15_000_000, &vri, &rcm).unwrap();
 
         assert_eq!(result1.len(), 32);
         assert_eq!(result1, result2, "VAN must be deterministic");
@@ -207,19 +215,22 @@ mod tests {
         let vri = [0x05u8; 32];
         let rcm = [0x06u8; 32];
 
-        let result = construct_van(&g_d, &pk_d, 1000, &vri, &rcm).unwrap();
+        let result = construct_van(&g_d, &pk_d, 15_000_000, &vri, &rcm).unwrap();
         assert_ne!(result, vec![0x00; 32]);
         assert_ne!(result, vec![0xBB; 32]); // not the old mock
     }
 
     #[test]
-    fn test_construct_van_zero_weight() {
+    fn test_construct_van_below_one_ballot() {
         let g_d = [0x10u8; 32];
         let pk_d = [0x20u8; 32];
         let vri = [0x05u8; 32];
         let rcm = [0x06u8; 32];
 
+        // Zero weight
         assert!(construct_van(&g_d, &pk_d, 0, &vri, &rcm).is_err());
+        // Below one ballot (< BALLOT_DIVISOR)
+        assert!(construct_van(&g_d, &pk_d, 12_499_999, &vri, &rcm).is_err());
     }
 
     #[test]
@@ -230,8 +241,8 @@ mod tests {
         let rcm1 = [0x06u8; 32];
         let rcm2 = [0x07u8; 32];
 
-        let result1 = construct_van(&g_d, &pk_d, 1000, &vri, &rcm1).unwrap();
-        let result2 = construct_van(&g_d, &pk_d, 1000, &vri, &rcm2).unwrap();
+        let result1 = construct_van(&g_d, &pk_d, 15_000_000, &vri, &rcm1).unwrap();
+        let result2 = construct_van(&g_d, &pk_d, 15_000_000, &vri, &rcm2).unwrap();
 
         assert_ne!(
             result1, result2,
@@ -264,9 +275,10 @@ mod tests {
         let vri = [0x05u8; 32];
         let rcm = [0x06u8; 32];
 
-        let result = construct_van(&g_d, &pk_d, 1000, &vri, &rcm).unwrap();
+        // total_weight = 15_000_000 → num_ballots = 1 (after / BALLOT_DIVISOR)
+        let result = construct_van(&g_d, &pk_d, 15_000_000, &vri, &rcm).unwrap();
         let expected =
-            hex::decode("4af713fb9de5d4f7b5ba4a28177a62f7963a084ba5e8f1a46a6b034b5fc93717")
+            hex::decode("60658dfc1b7ae3bd06b713ffc6e3c05c369547b10c4a392bd2d45f06fdd2b82d")
                 .unwrap();
         assert_eq!(
             result, expected,
@@ -280,8 +292,8 @@ mod tests {
         assert!(derive_gov_nullifier(&[0u8; 32], &[0u8; 31], &[0u8; 32]).is_err());
         assert!(derive_gov_nullifier(&[0u8; 32], &[0u8; 32], &[0u8; 31]).is_err());
 
-        assert!(construct_van(&[0u8; 31], &[0u8; 32], 1000, &[0u8; 32], &[0u8; 32]).is_err());
-        assert!(construct_van(&[0u8; 32], &[0u8; 31], 1000, &[0u8; 32], &[0u8; 32]).is_err());
+        assert!(construct_van(&[0u8; 31], &[0u8; 32], 15_000_000, &[0u8; 32], &[0u8; 32]).is_err());
+        assert!(construct_van(&[0u8; 32], &[0u8; 31], 15_000_000, &[0u8; 32], &[0u8; 32]).is_err());
     }
 
     #[test]

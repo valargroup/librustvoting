@@ -26,6 +26,9 @@ use super::prove::create_vote_proof;
 /// Maximum proposal authority bitmask for a fresh VAN (16 proposals).
 const MAX_PROPOSAL_AUTHORITY: u64 = 65535; // 2^16 - 1
 
+/// Ballot divisor — must match `delegation::circuit::BALLOT_DIVISOR`.
+const BALLOT_DIVISOR: u64 = 12_500_000;
+
 /// Result of building a vote proof.
 #[derive(Debug)]
 pub struct VoteProofBundle {
@@ -97,7 +100,8 @@ fn random_valid_base_as_scalar(rng: &mut impl RngCore) -> pallas::Base {
 /// * `sk` - The SpendingKey used during delegation (ZKP #1).
 /// * `address_index` - The diversifier index of the output recipient
 ///   address used in delegation (typically 1).
-/// * `total_note_value` - Sum of delegated note values (e.g. 15_000_000).
+/// * `total_note_value` - Sum of delegated note values in raw zatoshi (e.g. 15_000_000).
+///   Internally converted to ballot count via floor-division by BALLOT_DIVISOR.
 /// * `van_comm_rand` - The blinding factor used for the VAN in delegation.
 /// * `voting_round_id` - The vote round identifier (Pallas base field element).
 /// * `vote_comm_tree_path` - Merkle authentication path (24 siblings) for
@@ -191,14 +195,19 @@ pub fn build_vote_proof_from_delegation(
     let one_shifted = pallas::Base::from(1u64 << proposal_id);
     let proposal_authority_new = proposal_authority_old - one_shifted;
 
-    // ---- VAN integrity hashes ----
+    // ---- Ballot scaling (must match ZKP #1's BALLOT_DIVISOR) ----
 
-    let total_note_value_base = pallas::Base::from(total_note_value);
+    let num_ballots = total_note_value / BALLOT_DIVISOR;
+    let num_ballots_base = pallas::Base::from(num_ballots);
+
+    // ---- VAN integrity hashes ----
+    // The VAN commitment hashes num_ballots (not raw zatoshi), matching
+    // the delegation circuit (ZKP #1 condition 7).
 
     let vote_authority_note_old = van_integrity_hash(
         vpk_g_d_x,
         vpk_pk_d_x,
-        total_note_value_base,
+        num_ballots_base,
         voting_round_id,
         proposal_authority_old,
         van_comm_rand,
@@ -210,17 +219,18 @@ pub fn build_vote_proof_from_delegation(
     let vote_authority_note_new = van_integrity_hash(
         vpk_g_d_x,
         vpk_pk_d_x,
-        total_note_value_base,
+        num_ballots_base,
         voting_round_id,
         proposal_authority_new,
         van_comm_rand,
     );
 
-    // ---- Shares (split total_note_value into 4 parts) ----
+    // ---- Shares (split num_ballots into 4 parts) ----
     // Each share must be in [0, 2^30) for the range check.
+    // Shares sum to num_ballots (ballot count), not raw zatoshi.
 
-    let quarter = total_note_value / 4;
-    let remainder = total_note_value - quarter * 3;
+    let quarter = num_ballots / 4;
+    let remainder = num_ballots - quarter * 3;
     let shares_u64: [u64; 4] = [quarter, quarter, quarter, remainder];
 
     // Verify all shares are in range
@@ -301,7 +311,7 @@ pub fn build_vote_proof_from_delegation(
         Value::known(vote_comm_tree_position),
         Value::known(vpk_g_d_affine),
         Value::known(vpk_pk_d_affine),
-        Value::known(total_note_value_base),
+        Value::known(num_ballots_base),
         Value::known(proposal_authority_old),
         Value::known(van_comm_rand),
         Value::known(vote_authority_note_old),
