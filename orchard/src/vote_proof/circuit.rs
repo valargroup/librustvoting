@@ -2776,6 +2776,35 @@ mod tests {
         assert!(prover.verify().is_err());
     }
 
+    /// A corrupted share value (plaintext) should fail condition 11:
+    /// C2_i = [v_i]*G + [r_i]*ea_pk will not match enc_share_c2_x[i].
+    #[test]
+    fn encryption_integrity_wrong_share_fails() {
+        let (mut circuit, instance) = make_test_data();
+
+        // Corrupt share 0 — enc_share and randomness are unchanged (from
+        // make_test_data), so the in-circuit C2_0 will not match enc_c2_x[0].
+        circuit.shares[0] = Value::known(pallas::Base::from(9999u64));
+
+        let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    /// A corrupted enc_share_c2_x witness should cause verification to fail:
+    /// condition 11 constrains ExtractP(C2_i) == enc_c2_x[i].
+    #[test]
+    fn encryption_integrity_wrong_enc_c2_x_fails() {
+        let (mut circuit, instance) = make_test_data();
+
+        // Corrupt one C2 x-coordinate — the ECC will compute the real C2_0
+        // from share_0 and r_0; constrain_equal will fail (or the resulting
+        // shares_hash will not match the instance vote_commitment).
+        circuit.enc_share_c2_x[0] = Value::known(pallas::Base::random(&mut OsRng));
+
+        let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
     /// The out-of-circuit elgamal_encrypt helper is deterministic.
     #[test]
     fn elgamal_encrypt_deterministic() {
@@ -2792,6 +2821,26 @@ mod tests {
         // Different randomness → different C1.
         let (c1_c, _) = elgamal_encrypt(v, pallas::Base::from(99u64), ea_pk_point);
         assert_ne!(c1_a, c1_c);
+    }
+
+    /// base_to_scalar (used by El Gamal) accepts share-sized values and
+    /// the fixed randomness used in encrypt_shares.
+    #[test]
+    fn base_to_scalar_accepts_elgamal_inputs() {
+        // Share-sized values (condition 9: [0, 2^30)) must convert.
+        assert!(base_to_scalar(pallas::Base::zero()).is_some());
+        assert!(base_to_scalar(pallas::Base::from(1u64)).is_some());
+        assert!(base_to_scalar(pallas::Base::from(1_000u64)).is_some());
+        assert!(base_to_scalar(pallas::Base::from(404u64)).is_some()); // encrypt_shares randomness
+
+        // Encrypt_shares uses 101, 202, 303, 404 as r_i — all must convert.
+        for r in [101u64, 202, 303, 404] {
+            assert!(
+                base_to_scalar(pallas::Base::from(r)).is_some(),
+                "r = {} must convert for El Gamal",
+                r
+            );
+        }
     }
 
     // ================================================================
