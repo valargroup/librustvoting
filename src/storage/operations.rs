@@ -705,17 +705,19 @@ mod tests {
         .unwrap();
 
         // Verify ZKP2 inputs can be loaded
-        let conn = db.conn();
-        let zkp2 = queries::load_zkp2_inputs(&conn, ROUND_ID).unwrap();
-        assert_eq!(zkp2.total_note_value, 1_000_000);
-        assert_eq!(zkp2.address_index, 0);
-        assert_eq!(zkp2.gov_comm_rand.len(), 32);
-        assert_eq!(zkp2.ea_pk.len(), 32);
-        assert_eq!(zkp2.voting_round_id, ROUND_ID);
+        {
+            let conn = db.conn();
+            let zkp2 = queries::load_zkp2_inputs(&conn, ROUND_ID).unwrap();
+            assert_eq!(zkp2.total_note_value, 1_000_000);
+            assert_eq!(zkp2.address_index, 0);
+            assert_eq!(zkp2.gov_comm_rand.len(), 32);
+            assert_eq!(zkp2.ea_pk.len(), 32);
+            assert_eq!(zkp2.voting_round_id, ROUND_ID);
+        }
 
         // Verify VAN position can be stored and loaded
         db.store_van_position(ROUND_ID, 42).unwrap();
-        let pos = queries::load_van_position(&conn, ROUND_ID).unwrap();
+        let pos = queries::load_van_position(&db.conn(), ROUND_ID).unwrap();
         assert_eq!(pos, 42);
     }
 
@@ -724,8 +726,7 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let conn = db.conn();
-        queries::store_vote(&conn, ROUND_ID, 0, 0, &[0xAA; 32]).unwrap();
+        queries::store_vote(&db.conn(), ROUND_ID, 0, 0, &[0xAA; 32]).unwrap();
         db.mark_vote_submitted(ROUND_ID, 0).unwrap();
     }
 }
