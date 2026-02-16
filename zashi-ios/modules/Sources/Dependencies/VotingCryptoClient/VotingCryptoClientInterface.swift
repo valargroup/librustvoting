@@ -88,15 +88,23 @@ public struct VotingCryptoClient {
     ) async throws -> [EncryptedShare]
     public var buildVoteCommitment: @Sendable (
         _ roundId: String,
+        _ hotkeySeed: [UInt8],
+        _ networkId: UInt32,
         _ proposalId: UInt32,
         _ choice: VoteChoice,
-        _ encShares: [EncryptedShare],
-        _ vanWitness: Data
+        _ vanAuthPath: [Data],
+        _ vanPosition: UInt32,
+        _ anchorHeight: UInt32
     ) -> AsyncThrowingStream<VoteCommitmentBuildEvent, Error>
-        = { _, _, _, _, _ in AsyncThrowingStream { $0.finish() } }
+        = { _, _, _, _, _, _, _, _ in AsyncThrowingStream { $0.finish() } }
     public var buildSharePayloads: @Sendable (
         _ encShares: [EncryptedShare],
-        _ commitment: VoteCommitmentBundle
+        _ commitment: VoteCommitmentBundle,
+        _ voteDecision: VoteChoice,
+        _ vcTreePosition: UInt64
     ) async throws -> [SharePayload]
+    public var storeVanPosition: @Sendable (_ roundId: String, _ position: UInt32) async throws -> Void
+    public var syncVoteTree: @Sendable (_ roundId: String, _ nodeUrl: String) async throws -> UInt32
+    public var generateVanWitness: @Sendable (_ roundId: String, _ anchorHeight: UInt32) async throws -> VanWitness
     public var markVoteSubmitted: @Sendable (_ roundId: String, _ proposalId: UInt32) async throws -> Void
 }

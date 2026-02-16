@@ -758,33 +758,41 @@ public struct Voting {
 
             case .confirmVote:
                 guard let pending = state.pendingVote else { return .none }
-                guard let activeSession = state.activeSession else { return .none }
+                guard state.activeSession != nil else { return .none }
                 state.votes[pending.proposalId] = pending.choice
                 state.pendingVote = nil
 
                 let proposalId = pending.proposalId
                 let choice = pending.choice
                 let roundId = state.roundId
-                let voteRoundId = activeSession.voteRoundId
-                // Placeholder until tree-anchor query is wired in Gov Steps Phase 3 (voting).
-                let voteCommTreeAnchorHeight: UInt64 = 0
-                let votingWeight = state.votingWeight
+                let network = zcashSDKEnvironment.network
+                let networkId: UInt32 = network.networkType == .mainnet ? 0 : 1
                 let nextId = nextUnvotedId(after: proposalId, in: state)
                 state.lastVoteCommitmentTxHash = nil
 
                 return .merge(
                     // Submit this vote to chain in background
-                    .run { [votingAPI, votingCrypto] send in
-                        // Decompose weight into binary shares, encrypt under EA public key
-                        let shares = votingCrypto.decomposeWeight(votingWeight)
-                        print("[Voting] decomposeWeight(\(votingWeight)) → \(shares.count) shares")
-                        let encShares = try await votingCrypto.encryptShares(roundId, shares)
+                    .run { [votingAPI, votingCrypto, mnemonic, walletStorage] send in
+                        // Derive hotkey seed (same seed used during delegation)
+                        let hotkeyPhrase = try walletStorage.exportVotingHotkey().seedPhrase.value()
+                        let hotkeySeed = try mnemonic.toSeed(hotkeyPhrase)
 
-                        let vanWitness = Data(repeating: 0xDD, count: 64) // mock VAN witness
+                        // Sync vote commitment tree from chain and generate VAN witness.
+                        // Requires storeVanPosition to have been called after delegation TX.
+                        // TODO: Wire chainNodeBaseUrl from server config / VotingSession
+                        let chainNodeUrl = "http://localhost:1317"
+                        let anchorHeight = try await votingCrypto.syncVoteTree(roundId, chainNodeUrl)
+                        let vanWitness = try await votingCrypto.generateVanWitness(roundId, anchorHeight)
+                        print("[Voting] VAN witness: position=\(vanWitness.position), anchor=\(vanWitness.anchorHeight)")
 
-                        // Build vote commitment + ZKP #2 (stored in DB)
+                        // Build vote commitment + ZKP #2 (stored in DB).
+                        // The builder internally decomposes weight, encrypts shares under EA pk,
+                        // and returns encrypted shares in the bundle.
                         var builtBundle: VoteCommitmentBundle?
-                        for try await event in votingCrypto.buildVoteCommitment(roundId, proposalId, choice, encShares, vanWitness) {
+                        for try await event in votingCrypto.buildVoteCommitment(
+                            roundId, hotkeySeed, networkId, proposalId, choice,
+                            vanWitness.authPath, vanWitness.position, vanWitness.anchorHeight
+                        ) {
                             if case .completed(let bundle) = event {
                                 builtBundle = bundle
                                 await send(.voteCommitmentBuilt(bundle))
@@ -794,19 +802,16 @@ public struct Voting {
                             throw VotingFlowError.missingVoteCommitmentBundle
                         }
 
-                        // Submit to chain (API stubs for now)
-                        let bundle = VoteCommitmentBundle(
-                            vanNullifier: builtBundle.vanNullifier,
-                            voteAuthorityNoteNew: builtBundle.voteAuthorityNoteNew,
-                            voteCommitment: builtBundle.voteCommitment,
-                            proposalId: proposalId,
-                            proof: builtBundle.proof,
-                            voteRoundId: voteRoundId,
-                            voteCommTreeAnchorHeight: voteCommTreeAnchorHeight
-                        )
-                        let txResult = try await votingAPI.submitVoteCommitment(bundle)
+                        // Submit cast-vote TX to chain
+                        let txResult = try await votingAPI.submitVoteCommitment(builtBundle)
                         await send(.voteCommitmentSubmitted(txResult.txHash))
-                        let payloads = try await votingCrypto.buildSharePayloads(encShares, bundle)
+
+                        // Build share payloads from the encrypted shares returned by ZKP #2.
+                        // TODO: Parse VC tree position from cast-vote TX response events
+                        let vcTreePosition: UInt64 = 0
+                        let payloads = try await votingCrypto.buildSharePayloads(
+                            builtBundle.encShares, builtBundle, choice, vcTreePosition
+                        )
                         try await votingAPI.delegateShares(payloads)
 
                         // Mark vote submitted in DB
