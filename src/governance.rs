@@ -65,9 +65,9 @@ fn fp_to_bytes(fp: pallas::Base) -> Vec<u8> {
 
 /// Derive governance nullifier (per spec §1.3.2, condition 14).
 ///
-/// `gov_null = Poseidon(nk, Poseidon(domain_tag, Poseidon(vote_round_id, real_nf)))`
+/// `gov_null = Poseidon(nk, domain_tag, vote_round_id, real_nf)`
 ///
-/// Each step is Poseidon with ConstantLength<2>.
+/// Single Poseidon call with ConstantLength<4> (2 permutations at rate=2).
 /// Matches `orchard/src/delegation/imt.rs:gov_null_hash`.
 pub fn derive_gov_nullifier(
     nk: &[u8],
@@ -79,9 +79,13 @@ pub fn derive_gov_nullifier(
     let vri_fp = bytes_to_fp_wide(vote_round_id)?;
     let nf_fp = bytes_to_fp(note_nullifier)?;
 
-    let step1 = poseidon_hash_2(vri_fp, nf_fp);
-    let step2 = poseidon_hash_2(gov_auth_domain_tag(), step1);
-    let gov_null = poseidon_hash_2(nk_fp, step2);
+    let gov_null =
+        poseidon::Hash::<_, P128Pow5T3, ConstantLength<4>, 3, 2>::init().hash([
+            nk_fp,
+            gov_auth_domain_tag(),
+            vri_fp,
+            nf_fp,
+        ]);
 
     Ok(fp_to_bytes(gov_null))
 }
@@ -283,7 +287,7 @@ mod tests {
 
         let result = derive_gov_nullifier(&nk, &vri, &nf).unwrap();
         let expected =
-            hex::decode("6a8038d1868237a643da723a441ace037c03502c7a70369b21d1e31293fc302b")
+            hex::decode("2cc64d6e6474545476a0724bb158af64526cc1966c81c58e81f36a79a6811402")
                 .unwrap();
         assert_eq!(result, expected, "gov nullifier known-answer mismatch — formula may have diverged from orchard reference");
     }
