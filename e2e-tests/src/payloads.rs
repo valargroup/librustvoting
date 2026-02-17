@@ -261,6 +261,14 @@ pub fn reinitialize_ea_payload(creator: &str) -> Value {
     })
 }
 
+/// Build MsgSetVoteManager JSON body.
+pub fn set_vote_manager_payload(creator: &str, new_manager: &str) -> Value {
+    json!({
+        "creator": creator,
+        "new_manager": new_manager,
+    })
+}
+
 // Note: MsgAckExecutiveAuthorityKey has no payload builder — acks are injected
 // in-protocol via PrepareProposal (auto-ack).
 

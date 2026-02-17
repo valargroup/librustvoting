@@ -13,13 +13,14 @@ use base64::Engine;
 use blake2b_simd::Params as Blake2bParams;
 use e2e_tests::{
     api::{
-        self, commitment_tree_next_index, get_json, helper_server_url, post_json,
-        post_json_accept_committed, post_helper_json, tally_has_proposal, wait_for_round_status,
-        SESSION_STATUS_FINALIZED, SESSION_STATUS_TALLYING,
+        self, commitment_tree_next_index, get_json, get_validator_operator_address,
+        helper_server_url, post_json, post_json_accept_committed, post_helper_json,
+        tally_has_proposal, wait_for_round_status, SESSION_STATUS_FINALIZED,
+        SESSION_STATUS_TALLYING,
     },
     payloads::{
         cast_vote_payload_real, create_voting_session_payload, delegate_vote_payload,
-        helper_share_payload,
+        helper_share_payload, set_vote_manager_payload,
     },
     setup::build_delegation_bundle_for_test,
 };
@@ -66,6 +67,29 @@ fn voting_flow_librustvoting_path() {
     log_step("Step 0", "bootstrapping EA key ceremony...");
     e2e_tests::setup::bootstrap_ceremony(&ea_sk_bytes, &ea_pk_bytes);
     log_step("Step 0", "ceremony CONFIRMED");
+
+    // ---- Step 0b: Set vote manager ----
+    // CreateVotingSession requires the caller to be the VoteManager.
+    // Use the genesis validator to bootstrap the VoteManager to "zvote1admin".
+    log_step("Step 0b", "setting vote manager to zvote1admin...");
+    let val_addr = get_validator_operator_address()
+        .expect("failed to query validator operator address");
+    let vm_body = set_vote_manager_payload(&val_addr, "zvote1admin");
+    let (vm_status, vm_json) =
+        post_json("/zally/v1/set-vote-manager", &vm_body).expect("POST set-vote-manager");
+    assert_eq!(
+        vm_status, 200,
+        "set-vote-manager: HTTP {}, body={:?}",
+        vm_status, vm_json
+    );
+    assert_eq!(
+        vm_json.get("code").and_then(|c| c.as_i64()).unwrap_or(-1),
+        0,
+        "set-vote-manager rejected: {:?}",
+        vm_json.get("log")
+    );
+    block_wait();
+    log_step("Step 0b", "vote manager set ✓");
 
     let mut rng = ChaCha20Rng::seed_from_u64(43);
 
