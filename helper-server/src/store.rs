@@ -18,9 +18,9 @@ use crate::types::{Config, EncryptedShareWire, QueuedShare, SharePayload, ShareS
 #[derive(Clone)]
 pub struct ShareStore {
     db: Arc<Mutex<Connection>>,
-    /// Ephemeral scheduling times, keyed by (round_id, share_index).
+    /// Ephemeral scheduling times, keyed by (round_id, share_index, proposal_id).
     /// Not persisted — fresh delays are assigned on recovery.
-    schedule: Arc<Mutex<HashMap<(String, u32), Instant>>>,
+    schedule: Arc<Mutex<HashMap<(String, u32, u32), Instant>>>,
     min_delay: Duration,
     max_delay: Duration,
 }
@@ -47,6 +47,7 @@ impl ShareStore {
     pub fn enqueue(&self, payload: SharePayload) {
         let round_id = payload.vote_round_id.clone();
         let share_index = payload.enc_share.share_index;
+        let proposal_id = payload.proposal_id;
         let all_enc_shares_json = serde_json::to_string(&payload.all_enc_shares)
             .expect("failed to serialize all_enc_shares");
 
@@ -59,7 +60,7 @@ impl ShareStore {
                 round_id,
                 share_index,
                 payload.shares_hash,
-                payload.proposal_id,
+                proposal_id,
                 payload.vote_decision,
                 payload.enc_share.c1,
                 payload.enc_share.c2,
@@ -73,7 +74,7 @@ impl ShareStore {
         // Schedule in-memory with random delay.
         let delay = self.random_delay();
         let mut schedule = self.schedule.lock().unwrap();
-        schedule.insert((round_id, share_index), Instant::now() + delay);
+        schedule.insert((round_id, share_index, proposal_id), Instant::now() + delay);
     }
 
     /// Take all shares that are past their scheduled submission time and in
@@ -100,18 +101,18 @@ impl ShareStore {
         let mut result = Vec::new();
         let db = self.db.lock().unwrap();
 
-        for (round_id, share_index) in &ready_keys {
+        for (round_id, share_index, proposal_id) in &ready_keys {
             // Only take shares in Received state (0).
             let updated = db
                 .execute(
-                    "UPDATE shares SET state = 1 WHERE round_id = ?1 AND share_index = ?2 AND state = 0",
-                    rusqlite::params![round_id, share_index],
+                    "UPDATE shares SET state = 1 WHERE round_id = ?1 AND share_index = ?2 AND proposal_id = ?3 AND state = 0",
+                    rusqlite::params![round_id, share_index, proposal_id],
                 )
                 .expect("failed to update share state");
 
             if updated > 0 {
                 // Load the payload from DB.
-                if let Some(queued) = self.load_share(&db, round_id, *share_index) {
+                if let Some(queued) = self.load_share(&db, round_id, *share_index, *proposal_id) {
                     result.push(queued);
                 }
             }
@@ -127,22 +128,22 @@ impl ShareStore {
         result
     }
 
-    /// Mark a share as submitted (by matching round_id + share_index).
-    pub fn mark_submitted(&self, round_id: &str, share_index: u32) {
+    /// Mark a share as submitted (by matching round_id + share_index + proposal_id).
+    pub fn mark_submitted(&self, round_id: &str, share_index: u32, proposal_id: u32) {
         let db = self.db.lock().unwrap();
         db.execute(
-            "UPDATE shares SET state = 2 WHERE round_id = ?1 AND share_index = ?2 AND state = 1",
-            rusqlite::params![round_id, share_index],
+            "UPDATE shares SET state = 2 WHERE round_id = ?1 AND share_index = ?2 AND proposal_id = ?3 AND state = 1",
+            rusqlite::params![round_id, share_index, proposal_id],
         )
         .expect("failed to mark share as submitted");
         drop(db);
 
         let mut schedule = self.schedule.lock().unwrap();
-        schedule.remove(&(round_id.to_string(), share_index));
+        schedule.remove(&(round_id.to_string(), share_index, proposal_id));
     }
 
     /// Mark a share as failed (for retry, up to MAX_ATTEMPTS).
-    pub fn mark_failed(&self, round_id: &str, share_index: u32) {
+    pub fn mark_failed(&self, round_id: &str, share_index: u32, proposal_id: u32) {
         const MAX_ATTEMPTS: u32 = 5;
 
         let db = self.db.lock().unwrap();
@@ -150,8 +151,8 @@ impl ShareStore {
         // Read current attempts.
         let attempts: u32 = db
             .query_row(
-                "SELECT attempts FROM shares WHERE round_id = ?1 AND share_index = ?2",
-                rusqlite::params![round_id, share_index],
+                "SELECT attempts FROM shares WHERE round_id = ?1 AND share_index = ?2 AND proposal_id = ?3",
+                rusqlite::params![round_id, share_index, proposal_id],
                 |row| row.get(0),
             )
             .unwrap_or(0);
@@ -160,25 +161,26 @@ impl ShareStore {
         if new_attempts >= MAX_ATTEMPTS {
             // Permanently failed.
             db.execute(
-                "UPDATE shares SET state = 3, attempts = ?3 WHERE round_id = ?1 AND share_index = ?2",
-                rusqlite::params![round_id, share_index, new_attempts],
+                "UPDATE shares SET state = 3, attempts = ?3 WHERE round_id = ?1 AND share_index = ?2 AND proposal_id = ?4",
+                rusqlite::params![round_id, share_index, new_attempts, proposal_id],
             )
             .expect("failed to mark share as permanently failed");
             tracing::warn!(
                 round_id,
                 share_index,
+                proposal_id,
                 attempts = new_attempts,
                 "share permanently failed after max attempts"
             );
 
             drop(db);
             let mut schedule = self.schedule.lock().unwrap();
-            schedule.remove(&(round_id.to_string(), share_index));
+            schedule.remove(&(round_id.to_string(), share_index, proposal_id));
         } else {
             // Re-schedule with exponential backoff.
             db.execute(
-                "UPDATE shares SET state = 0, attempts = ?3 WHERE round_id = ?1 AND share_index = ?2",
-                rusqlite::params![round_id, share_index, new_attempts],
+                "UPDATE shares SET state = 0, attempts = ?3 WHERE round_id = ?1 AND share_index = ?2 AND proposal_id = ?4",
+                rusqlite::params![round_id, share_index, new_attempts, proposal_id],
             )
             .expect("failed to reschedule share");
 
@@ -186,7 +188,7 @@ impl ShareStore {
             let backoff = Duration::from_secs(2u64.pow(new_attempts.min(6)));
             let mut schedule = self.schedule.lock().unwrap();
             schedule.insert(
-                (round_id.to_string(), share_index),
+                (round_id.to_string(), share_index, proposal_id),
                 Instant::now() + backoff,
             );
         }
@@ -246,12 +248,12 @@ impl ShareStore {
 
         // Load all non-terminal shares (Received = 0).
         let mut stmt = db
-            .prepare("SELECT round_id, share_index FROM shares WHERE state = 0")
+            .prepare("SELECT round_id, share_index, proposal_id FROM shares WHERE state = 0")
             .expect("failed to prepare recovery query");
 
-        let keys: Vec<(String, u32)> = stmt
+        let keys: Vec<(String, u32, u32)> = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?))
             })
             .expect("failed to query shares for recovery")
             .collect::<Result<_, _>>()
@@ -267,19 +269,19 @@ impl ShareStore {
         tracing::info!(count = keys.len(), "recovering shares with fresh random delays");
 
         let mut schedule = self.schedule.lock().unwrap();
-        for (round_id, share_index) in keys {
+        for (round_id, share_index, proposal_id) in keys {
             let delay = self.random_delay();
-            schedule.insert((round_id, share_index), Instant::now() + delay);
+            schedule.insert((round_id, share_index, proposal_id), Instant::now() + delay);
         }
     }
 
     /// Load a share from the database and reconstruct a QueuedShare.
-    fn load_share(&self, db: &Connection, round_id: &str, share_index: u32) -> Option<QueuedShare> {
+    fn load_share(&self, db: &Connection, round_id: &str, share_index: u32, proposal_id: u32) -> Option<QueuedShare> {
         db.query_row(
             "SELECT shares_hash, proposal_id, vote_decision, enc_share_c1, enc_share_c2, \
              tree_position, all_enc_shares, state, attempts \
-             FROM shares WHERE round_id = ?1 AND share_index = ?2",
-            rusqlite::params![round_id, share_index],
+             FROM shares WHERE round_id = ?1 AND share_index = ?2 AND proposal_id = ?3",
+            rusqlite::params![round_id, share_index, proposal_id],
             |row| {
                 let all_enc_shares_json: String = row.get(6)?;
                 let all_enc_shares: Vec<EncryptedShareWire> =

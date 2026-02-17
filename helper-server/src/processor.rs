@@ -43,6 +43,7 @@ pub async fn run_processor(
                         store.mark_submitted(
                             &share.payload.vote_round_id,
                             share.payload.enc_share.share_index,
+                            share.payload.proposal_id,
                         );
                         tracing::info!(
                             round_id = %share.payload.vote_round_id,
@@ -60,6 +61,7 @@ pub async fn run_processor(
                         store.mark_failed(
                             &share.payload.vote_round_id,
                             share.payload.enc_share.share_index,
+                            share.payload.proposal_id,
                         );
                     }
                 }

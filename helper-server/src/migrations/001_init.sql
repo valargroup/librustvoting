@@ -19,5 +19,5 @@ CREATE TABLE IF NOT EXISTS shares (
     state           INTEGER NOT NULL DEFAULT 0,  -- 0=Received, 1=Witnessed, 2=Submitted, 3=Failed
     attempts        INTEGER NOT NULL DEFAULT 0,
 
-    UNIQUE(round_id, share_index)
+    UNIQUE(round_id, share_index, proposal_id)
 );

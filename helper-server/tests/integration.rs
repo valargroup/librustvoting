@@ -550,7 +550,7 @@ async fn submitted_shares_not_recovered() {
         let ready = store.take_ready();
         assert_eq!(ready.len(), 1);
 
-        store.mark_submitted(&round_id, 0);
+        store.mark_submitted(&round_id, 0, 1);
 
         let status = store.status();
         assert_eq!(status[&round_id].submitted, 1);
