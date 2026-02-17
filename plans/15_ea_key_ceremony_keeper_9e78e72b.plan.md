@@ -13,7 +13,7 @@ todos:
     status: done
   - id: step4-register
     content: "Step 4: MsgRegisterPallasKey handler -- implement handler + tests (valid registration, reject duplicates, reject invalid points, reject wrong ceremony status)"
-    status: pending
+    status: done
   - id: step5-deal
     content: "Step 5: MsgDealExecutiveAuthorityKey handler -- implement handler + tests (valid deal, reject mismatched payloads, reject invalid ea_pk, reject wrong status, REGISTERING->DEALT transition)"
     status: pending
