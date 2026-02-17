@@ -11,6 +11,12 @@ const (
 	RouterKey = ModuleName
 )
 
+// DefaultRegistrationTimeout is the ceremony registration phase timeout in seconds (2 minutes).
+const DefaultRegistrationTimeout uint64 = 120
+
+// DefaultDealTimeout is the ceremony deal/ack phase timeout in seconds (30 seconds).
+const DefaultDealTimeout uint64 = 30
+
 // NullifierType distinguishes the three independent nullifier sets per voting round.
 type NullifierType byte
 
@@ -51,6 +57,9 @@ var (
 	// appended during that block: 0x08 || big-endian uint64 height -> (start_index uint64 BE, count uint64 BE)
 	// Written by EndBlocker when tree root changes. Used by the CommitmentLeaves query.
 	BlockLeafIndexPrefix = []byte{0x08}
+
+	// CeremonyStateKey stores the singleton EA key ceremony state: single key -> CeremonyState (protobuf)
+	CeremonyStateKey = []byte{0x09}
 )
 
 // NullifierKey returns the store key for a nullifier scoped by type and round.

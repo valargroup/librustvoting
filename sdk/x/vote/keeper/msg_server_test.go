@@ -108,7 +108,6 @@ func validSetupMsg() *types.MsgCreateVotingSession {
 		VoteEndTime:       2_000_000,
 		NullifierImtRoot:  bytes.Repeat([]byte{0x03}, 32),
 		NcRoot:            bytes.Repeat([]byte{0x04}, 32),
-		EaPk:              bytes.Repeat([]byte{0x05}, 32),
 		VkZkp1:            bytes.Repeat([]byte{0x06}, 64),
 		VkZkp2:            bytes.Repeat([]byte{0x07}, 64),
 		VkZkp3:            bytes.Repeat([]byte{0x08}, 64),
@@ -117,6 +116,24 @@ func validSetupMsg() *types.MsgCreateVotingSession {
 			{Id: 2, Title: "Proposal B", Description: "Second"},
 		},
 	}
+}
+
+// seedConfirmedCeremony writes a CONFIRMED CeremonyState with the given ea_pk.
+// Returns the ea_pk that was stored, for verification in tests.
+func (s *MsgServerTestSuite) seedConfirmedCeremony() []byte {
+	eaPk := testPallasPK()
+	kv := s.keeper.OpenKVStore(s.ctx)
+	s.Require().NoError(s.keeper.SetCeremonyState(kv, &types.CeremonyState{
+		Status: types.CeremonyStatus_CEREMONY_STATUS_CONFIRMED,
+		EaPk:   eaPk,
+		Validators: []*types.ValidatorPallasKey{
+			{ValidatorAddress: "val1", PallasPk: testPallasPK()},
+		},
+		Acks: []*types.AckEntry{
+			{ValidatorAddress: "val1", AckHeight: 1},
+		},
+	}))
+	return eaPk
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +154,10 @@ func (s *MsgServerTestSuite) TestCreateVotingSession() {
 	}{
 		{
 			name: "happy path: round created with ACTIVE status and ID returned",
-			msg:  msg,
+			setup: func() {
+				s.seedConfirmedCeremony()
+			},
+			msg: msg,
 			checkResp: func(resp *types.MsgCreateVotingSessionResponse) {
 				s.Require().Equal(expectedID, resp.VoteRoundId)
 
@@ -150,8 +170,6 @@ func (s *MsgServerTestSuite) TestCreateVotingSession() {
 				s.Require().Equal(msg.VoteEndTime, round.VoteEndTime)
 				s.Require().Equal(types.SessionStatus_SESSION_STATUS_ACTIVE, round.Status)
 
-				// Verify new session fields are stored.
-				s.Require().Equal(msg.EaPk, round.EaPk)
 				s.Require().Equal(msg.VkZkp1, round.VkZkp1)
 				s.Require().Equal(msg.VkZkp2, round.VkZkp2)
 				s.Require().Equal(msg.VkZkp3, round.VkZkp3)
@@ -166,6 +184,7 @@ func (s *MsgServerTestSuite) TestCreateVotingSession() {
 		{
 			name: "duplicate round rejected",
 			setup: func() {
+				s.seedConfirmedCeremony()
 				// Create the round first.
 				_, err := s.msgServer.CreateVotingSession(s.ctx, msg)
 				s.Require().NoError(err)
@@ -176,6 +195,9 @@ func (s *MsgServerTestSuite) TestCreateVotingSession() {
 		},
 		{
 			name: "different fields produce different round ID",
+			setup: func() {
+				s.seedConfirmedCeremony()
+			},
 			msg: &types.MsgCreateVotingSession{
 				Creator:           "zvote1admin",
 				SnapshotHeight:    999,
@@ -184,7 +206,6 @@ func (s *MsgServerTestSuite) TestCreateVotingSession() {
 				VoteEndTime:       2_000_000,
 				NullifierImtRoot:  bytes.Repeat([]byte{0x03}, 32),
 				NcRoot:            bytes.Repeat([]byte{0x04}, 32),
-				EaPk:              bytes.Repeat([]byte{0x05}, 32),
 				VkZkp1:            bytes.Repeat([]byte{0x06}, 64),
 				VkZkp2:            bytes.Repeat([]byte{0x07}, 64),
 				VkZkp3:            bytes.Repeat([]byte{0x08}, 64),
@@ -196,6 +217,70 @@ func (s *MsgServerTestSuite) TestCreateVotingSession() {
 			checkResp: func(resp *types.MsgCreateVotingSessionResponse) {
 				s.Require().NotEqual(expectedID, resp.VoteRoundId)
 				s.Require().Len(resp.VoteRoundId, 32)
+			},
+		},
+		{
+			name:        "rejected: no ceremony exists",
+			msg:         msg,
+			expectErr:   true,
+			errContains: "ceremony not in confirmed status",
+		},
+		{
+			name: "rejected: ceremony in DEALT status (not yet CONFIRMED)",
+			setup: func() {
+				kv := s.keeper.OpenKVStore(s.ctx)
+				s.Require().NoError(s.keeper.SetCeremonyState(kv, &types.CeremonyState{
+					Status: types.CeremonyStatus_CEREMONY_STATUS_DEALT,
+					EaPk:   testPallasPK(),
+				}))
+			},
+			msg:         msg,
+			expectErr:   true,
+			errContains: "ceremony not in confirmed status",
+		},
+		{
+			name: "rejected: ceremony in REGISTERING status",
+			setup: func() {
+				kv := s.keeper.OpenKVStore(s.ctx)
+				s.Require().NoError(s.keeper.SetCeremonyState(kv, &types.CeremonyState{
+					Status: types.CeremonyStatus_CEREMONY_STATUS_REGISTERING,
+				}))
+			},
+			msg:         msg,
+			expectErr:   true,
+			errContains: "ceremony not in confirmed status",
+		},
+		{
+			name: "rejected: ceremony in INITIALIZING status",
+			setup: func() {
+				kv := s.keeper.OpenKVStore(s.ctx)
+				s.Require().NoError(s.keeper.SetCeremonyState(kv, &types.CeremonyState{
+					Status: types.CeremonyStatus_CEREMONY_STATUS_INITIALIZING,
+				}))
+			},
+			msg:         msg,
+			expectErr:   true,
+			errContains: "ceremony not in confirmed status",
+		},
+		{
+			name: "round.EaPk matches ceremony ea_pk",
+			setup: func() {
+				s.seedConfirmedCeremony()
+			},
+			msg: msg,
+			checkResp: func(resp *types.MsgCreateVotingSessionResponse) {
+				kv := s.keeper.OpenKVStore(s.ctx)
+
+				// Read the ceremony ea_pk for comparison.
+				ceremony, err := s.keeper.GetCeremonyState(kv)
+				s.Require().NoError(err)
+
+				// Read the created round and verify EaPk was populated from ceremony.
+				round, err := s.keeper.GetVoteRound(kv, resp.VoteRoundId)
+				s.Require().NoError(err)
+				s.Require().Equal(ceremony.EaPk, round.EaPk,
+					"round.EaPk should match the ceremony's ea_pk")
+				s.Require().NotEmpty(round.EaPk, "round.EaPk should not be empty")
 			},
 		},
 	}
@@ -959,6 +1044,7 @@ func (s *MsgServerTestSuite) TestSubmitTally_FinalizedRejectsShares() {
 
 func (s *MsgServerTestSuite) TestCreateVotingSession_DeterministicID() {
 	s.SetupTest()
+	s.seedConfirmedCeremony()
 	msg := validSetupMsg()
 
 	resp1, err := s.msgServer.CreateVotingSession(s.ctx, msg)
@@ -976,6 +1062,7 @@ func (s *MsgServerTestSuite) TestCreateVotingSession_DeterministicID() {
 
 func (s *MsgServerTestSuite) TestCreateVotingSession_EmitsEvent() {
 	s.SetupTest()
+	s.seedConfirmedCeremony()
 	msg := validSetupMsg()
 
 	_, err := s.msgServer.CreateVotingSession(s.ctx, msg)

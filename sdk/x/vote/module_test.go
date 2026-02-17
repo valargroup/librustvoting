@@ -2,17 +2,22 @@ package vote_test
 
 import (
 	"encoding/binary"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"cosmossdk.io/log"
 	storetypes "cosmossdk.io/store/types"
+	"cosmossdk.io/x/tx/signing"
 
+	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	"github.com/cosmos/cosmos-sdk/runtime"
 	"github.com/cosmos/cosmos-sdk/testutil"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	vote "github.com/z-cale/zally/x/vote"
 	"github.com/z-cale/zally/x/vote/keeper"
@@ -174,5 +179,256 @@ func (s *EndBlockerTestSuite) TestEndBlock() {
 			s.Require().NoError(s.module.EndBlock(s.ctx))
 			tc.check()
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Ceremony phase timeout tests
+// ---------------------------------------------------------------------------
+
+func (s *EndBlockerTestSuite) TestEndBlock_CeremonyTimeout() {
+	// Helper: seed a DEALT ceremony with 3 validators.
+	// phase_start=999_400, phase_timeout=600 -> deadline = 1_000_000 == block_time.
+	seedDealtCeremony := func(ackCount int) {
+		kv := s.keeper.OpenKVStore(s.ctx)
+		state := &types.CeremonyState{
+			Status: types.CeremonyStatus_CEREMONY_STATUS_DEALT,
+			EaPk:   make([]byte, 32),
+			Validators: []*types.ValidatorPallasKey{
+				{ValidatorAddress: "val1", PallasPk: make([]byte, 32)},
+				{ValidatorAddress: "val2", PallasPk: make([]byte, 32)},
+				{ValidatorAddress: "val3", PallasPk: make([]byte, 32)},
+			},
+			Dealer:       "val1",
+			PhaseStart:   999_400,
+			PhaseTimeout: 600,
+		}
+		for i := 0; i < ackCount; i++ {
+			state.Acks = append(state.Acks, &types.AckEntry{
+				ValidatorAddress: state.Validators[i].ValidatorAddress,
+				AckHeight:        9,
+			})
+		}
+		s.Require().NoError(s.keeper.SetCeremonyState(kv, state))
+	}
+
+	// Helper: seed a REGISTERING ceremony.
+	// phase_start=999_400, phase_timeout=600 -> deadline = 1_000_000 == block_time.
+	seedRegisteringCeremony := func(valCount int) {
+		kv := s.keeper.OpenKVStore(s.ctx)
+		state := &types.CeremonyState{
+			Status:       types.CeremonyStatus_CEREMONY_STATUS_REGISTERING,
+			PhaseStart:   999_400,
+			PhaseTimeout: 600,
+		}
+		for i := 0; i < valCount; i++ {
+			state.Validators = append(state.Validators, &types.ValidatorPallasKey{
+				ValidatorAddress: fmt.Sprintf("val%d", i+1),
+				PallasPk:         make([]byte, 32),
+			})
+		}
+		s.Require().NoError(s.keeper.SetCeremonyState(kv, state))
+	}
+
+	tests := []struct {
+		name       string
+		setup      func()
+		wantStatus types.CeremonyStatus
+	}{
+		{
+			name: "DEALT + partial acks + timeout -> INITIALIZING",
+			setup: func() {
+				seedDealtCeremony(1) // 1 of 3 acked
+			},
+			wantStatus: types.CeremonyStatus_CEREMONY_STATUS_INITIALIZING,
+		},
+		{
+			name: "DEALT + all acks + timeout -> INITIALIZING",
+			setup: func() {
+				seedDealtCeremony(3) // 3 of 3 acked (timeout still resets)
+			},
+			wantStatus: types.CeremonyStatus_CEREMONY_STATUS_INITIALIZING,
+		},
+		{
+			name: "DEALT + zero acks + timeout -> INITIALIZING",
+			setup: func() {
+				seedDealtCeremony(0)
+			},
+			wantStatus: types.CeremonyStatus_CEREMONY_STATUS_INITIALIZING,
+		},
+		{
+			name: "DEALT + no timeout yet (block_time < deadline)",
+			setup: func() {
+				seedDealtCeremony(0)
+				// Push phase_start forward so deadline = 999_401 + 600 = 1_000_001 > block_time.
+				kv := s.keeper.OpenKVStore(s.ctx)
+				state, err := s.keeper.GetCeremonyState(kv)
+				s.Require().NoError(err)
+				state.PhaseStart = 999_401
+				s.Require().NoError(s.keeper.SetCeremonyState(kv, state))
+			},
+			wantStatus: types.CeremonyStatus_CEREMONY_STATUS_DEALT,
+		},
+		{
+			name: "DEALT + exact deadline -> INITIALIZING",
+			setup: func() {
+				seedDealtCeremony(2) // 2 of 3 acked
+				// phase_start=999_400 + phase_timeout=600 = 1_000_000 == block_time
+			},
+			wantStatus: types.CeremonyStatus_CEREMONY_STATUS_INITIALIZING,
+		},
+		{
+			name: "REGISTERING + timeout -> INITIALIZING",
+			setup: func() {
+				seedRegisteringCeremony(2)
+			},
+			wantStatus: types.CeremonyStatus_CEREMONY_STATUS_INITIALIZING,
+		},
+		{
+			name: "REGISTERING + no timeout yet",
+			setup: func() {
+				seedRegisteringCeremony(1)
+				kv := s.keeper.OpenKVStore(s.ctx)
+				state, err := s.keeper.GetCeremonyState(kv)
+				s.Require().NoError(err)
+				state.PhaseStart = 999_401
+				s.Require().NoError(s.keeper.SetCeremonyState(kv, state))
+			},
+			wantStatus: types.CeremonyStatus_CEREMONY_STATUS_REGISTERING,
+		},
+		{
+			name: "skip when ceremony is already CONFIRMED",
+			setup: func() {
+				kv := s.keeper.OpenKVStore(s.ctx)
+				s.Require().NoError(s.keeper.SetCeremonyState(kv, &types.CeremonyState{
+					Status: types.CeremonyStatus_CEREMONY_STATUS_CONFIRMED,
+				}))
+			},
+			wantStatus: types.CeremonyStatus_CEREMONY_STATUS_CONFIRMED,
+		},
+		{
+			name: "skip when ceremony is INITIALIZING",
+			setup: func() {
+				kv := s.keeper.OpenKVStore(s.ctx)
+				s.Require().NoError(s.keeper.SetCeremonyState(kv, &types.CeremonyState{
+					Status: types.CeremonyStatus_CEREMONY_STATUS_INITIALIZING,
+				}))
+			},
+			wantStatus: types.CeremonyStatus_CEREMONY_STATUS_INITIALIZING,
+		},
+	}
+
+	for _, tc := range tests {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+			tc.setup()
+			s.Require().NoError(s.module.EndBlock(s.ctx))
+
+			kv := s.keeper.OpenKVStore(s.ctx)
+			state, err := s.keeper.GetCeremonyState(kv)
+			s.Require().NoError(err)
+			s.Require().NotNil(state)
+			s.Require().Equal(tc.wantStatus, state.Status)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Ceremony signer provider tests (Step 9 wiring)
+// ---------------------------------------------------------------------------
+
+// TestCeremonySignerProviders verifies that each ceremony signer provider
+// returns a CustomGetSigner targeting the correct protobuf message type and
+// that the no-op Fn returns nil signers (ceremony messages use ZKP auth).
+func TestCeremonySignerProviders(t *testing.T) {
+	tests := []struct {
+		name    string
+		signer  func() signing.CustomGetSigner
+		wantMsg protoreflect.FullName
+	}{
+		{
+			name:    "RegisterPallasKey",
+			signer:  vote.ProvideRegisterPallasKeySigner,
+			wantMsg: "zvote.v1.MsgRegisterPallasKey",
+		},
+		{
+			name:    "DealExecutiveAuthorityKey",
+			signer:  vote.ProvideDealExecutiveAuthorityKeySigner,
+			wantMsg: "zvote.v1.MsgDealExecutiveAuthorityKey",
+		},
+		{
+			name:    "AckExecutiveAuthorityKey",
+			signer:  vote.ProvideAckExecutiveAuthorityKeySigner,
+			wantMsg: "zvote.v1.MsgAckExecutiveAuthorityKey",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.signer()
+			require.Equal(t, tc.wantMsg, s.MsgType, "MsgType mismatch")
+			require.NotNil(t, s.Fn, "Fn must not be nil")
+
+			// No-op signer: calling Fn returns nil signers, no error.
+			signers, err := s.Fn(nil)
+			require.NoError(t, err)
+			require.Nil(t, signers)
+		})
+	}
+}
+
+// TestRegisterInterfaces_IncludesCeremonyMsgs verifies that RegisterInterfaces
+// registers the ceremony message types so BaseApp's MsgServiceRouter can
+// resolve them.
+func TestRegisterInterfaces_IncludesCeremonyMsgs(t *testing.T) {
+	reg := codectypes.NewInterfaceRegistry()
+	types.RegisterInterfaces(reg)
+
+	ceremonyMsgs := []sdk.Msg{
+		&types.MsgRegisterPallasKey{},
+		&types.MsgDealExecutiveAuthorityKey{},
+		&types.MsgAckExecutiveAuthorityKey{},
+	}
+	for _, msg := range ceremonyMsgs {
+		require.NoError(t, reg.EnsureRegistered(msg),
+			"expected %T to be registered", msg)
+	}
+}
+
+// TestAllSignerProviders_Completeness verifies that every Msg type registered
+// in RegisterInterfaces has a corresponding signer provider in init(). This
+// catches the case where a new message is added to codec.go but forgotten in
+// module.go.
+func TestAllSignerProviders_Completeness(t *testing.T) {
+	allSigners := []signing.CustomGetSigner{
+		vote.ProvideCreateVotingSessionSigner(),
+		vote.ProvideDelegateVoteSigner(),
+		vote.ProvideCastVoteSigner(),
+		vote.ProvideRevealShareSigner(),
+		vote.ProvideSubmitTallySigner(),
+		vote.ProvideRegisterPallasKeySigner(),
+		vote.ProvideDealExecutiveAuthorityKeySigner(),
+		vote.ProvideAckExecutiveAuthorityKeySigner(),
+	}
+
+	wantMsgTypes := []protoreflect.FullName{
+		"zvote.v1.MsgCreateVotingSession",
+		"zvote.v1.MsgDelegateVote",
+		"zvote.v1.MsgCastVote",
+		"zvote.v1.MsgRevealShare",
+		"zvote.v1.MsgSubmitTally",
+		"zvote.v1.MsgRegisterPallasKey",
+		"zvote.v1.MsgDealExecutiveAuthorityKey",
+		"zvote.v1.MsgAckExecutiveAuthorityKey",
+	}
+
+	signerMap := make(map[protoreflect.FullName]bool, len(allSigners))
+	for _, s := range allSigners {
+		signerMap[s.MsgType] = true
+	}
+
+	for _, want := range wantMsgTypes {
+		require.True(t, signerMap[want],
+			"missing signer provider for %s", want)
 	}
 }

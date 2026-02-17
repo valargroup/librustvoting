@@ -7,9 +7,12 @@
 //! ZALLY_E2E_VOTE_WINDOW_SECS. This timestamp is part of vote_round_id, so it must
 //! be chosen before proof generation starts.
 
-use crate::payloads::{DelegationBundlePayload, SetupRoundFields};
+use crate::payloads::{
+    DealerPayloadInput, DelegationBundlePayload, SetupRoundFields,
+};
 use blake2b_simd::Params as Blake2bParams;
 use ff::{Field, PrimeField};
+use group::GroupEncoding;
 use incrementalmerkletree::{Hashable, Level};
 use orchard::{
     delegation::{
@@ -23,8 +26,10 @@ use orchard::{
     value::NoteValue,
     NOTE_COMMITMENT_TREE_DEPTH,
 };
+use orchard::vote_proof::VOTE_COMM_TREE_DEPTH;
 use pasta_curves::pallas;
 use rand::rngs::OsRng;
+use vote_commitment_tree::TreeServer;
 
 const DEFAULT_E2E_VOTE_WINDOW_SECS: u64 = 180;
 const MIN_E2E_VOTE_WINDOW_SECS: u64 = 120;
@@ -237,9 +242,9 @@ pub fn build_delegation_bundle_for_test(
         spend_auth_sig: sig_bytes.to_vec(),
         sighash: sighash.to_vec(),
         signed_note_nullifier: nf_signed_bytes.to_vec(),
-        cmx_new: cmx_new_bytes.as_ref().to_vec(),
+        cmx_new: cmx_new_bytes[..].to_vec(),
         enc_memo: enc_memo.to_vec(),
-        van_cmx: van_cmx_bytes.as_ref().to_vec(),
+        van_cmx: van_cmx_bytes[..].to_vec(),
         gov_nullifiers: gov_null_bytes.iter().map(|b| b.to_vec()).collect(),
         proof,
     };
@@ -249,8 +254,8 @@ pub fn build_delegation_bundle_for_test(
         snapshot_blockhash,
         proposals_hash,
         vote_end_time,
-        nullifier_imt_root: nf_imt_root_repr.as_ref().try_into().unwrap(),
-        nc_root: nc_root_repr.as_ref().try_into().unwrap(),
+        nullifier_imt_root: nf_imt_root_repr,
+        nc_root: nc_root_repr,
     };
 
     let vote_proof_data = VoteProofDelegationData {
@@ -265,3 +270,197 @@ pub fn build_delegation_bundle_for_test(
     Ok((payload, fields, vote_proof_data))
 }
 
+/// Build a vote commitment tree locally with the single van_cmx leaf from
+/// delegation (at position 0) and return the Merkle authentication path.
+/// cmx_new is NOT added to the tree — no subsequent proof references it.
+///
+/// The `checkpoint_height` should be the on-chain anchor height at which
+/// the delegation block was committed.
+///
+/// Returns `(auth_path, position, root)` suitable for the vote proof builder.
+pub fn build_van_merkle_witness(
+    van_cmx: pallas::Base,
+    checkpoint_height: u32,
+) -> ([pallas::Base; VOTE_COMM_TREE_DEPTH], u32, pallas::Base) {
+    let mut tree = TreeServer::empty();
+    tree.append(van_cmx);
+    tree.checkpoint(checkpoint_height);
+
+    let root = tree
+        .root_at_height(checkpoint_height)
+        .expect("checkpoint should exist");
+
+    let path = tree
+        .path(0, checkpoint_height)
+        .expect("VAN at position 0 should have a valid path");
+
+    // Convert MerkleHashVote siblings to pallas::Base for the circuit.
+    let auth_path_hashes = path.auth_path();
+    let mut auth_path = [pallas::Base::zero(); VOTE_COMM_TREE_DEPTH];
+    for (i, hash) in auth_path_hashes.iter().enumerate() {
+        auth_path[i] = hash.inner();
+    }
+
+    let position = path.position();
+
+    // Sanity: verify the path produces the expected root.
+    assert!(
+        path.verify(van_cmx, root),
+        "merkle path verification failed for VAN at position 0"
+    );
+
+    (auth_path, position, root)
+}
+
+/// Build a vote commitment tree locally with all 3 leaves from delegation + cast
+/// (van_cmx at 0, vote_authority_note_new at 1, vote_commitment at 2) and return
+/// the Merkle authentication path for vote_commitment at position 2.
+///
+/// Returns `(auth_path, position, root)` suitable for the share reveal builder (ZKP #3).
+pub fn build_vote_commitment_merkle_witness(
+    van_cmx: pallas::Base,
+    vote_authority_note_new: pallas::Base,
+    vote_commitment: pallas::Base,
+    checkpoint_height: u32,
+) -> ([pallas::Base; VOTE_COMM_TREE_DEPTH], u32, pallas::Base) {
+    let mut tree = TreeServer::empty();
+    tree.append(van_cmx); // position 0
+    tree.append(vote_authority_note_new); // position 1
+    tree.append(vote_commitment); // position 2
+    tree.checkpoint(checkpoint_height);
+
+    let root = tree
+        .root_at_height(checkpoint_height)
+        .expect("checkpoint should exist");
+
+    let path = tree
+        .path(2, checkpoint_height)
+        .expect("vote_commitment at position 2 should have a valid path");
+
+    // Convert MerkleHashVote siblings to pallas::Base for the circuit.
+    let auth_path_hashes = path.auth_path();
+    let mut auth_path = [pallas::Base::zero(); VOTE_COMM_TREE_DEPTH];
+    for (i, hash) in auth_path_hashes.iter().enumerate() {
+        auth_path[i] = hash.inner();
+    }
+
+    let position = path.position();
+
+    // Sanity: verify the path produces the expected root.
+    assert!(
+        path.verify(vote_commitment, root),
+        "merkle path verification failed for vote_commitment at position 2"
+    );
+
+    (auth_path, position, root)
+}
+
+/// Bootstrap the EA key ceremony so the chain reaches CONFIRMED status.
+///
+/// Performs the full ceremony: register the chain validator's Pallas key,
+/// deal the EA secret key (ECIES-encrypted to that Pallas key), then wait
+/// for the chain to auto-ack via PrepareProposal. Idempotent: if the
+/// ceremony is already CONFIRMED, returns immediately.
+///
+/// The function discovers the validator's operator address from the staking
+/// module and reads the validator's Pallas PK from disk (same directory as
+/// `ea.pk`). This ensures the ceremony participants match the actual chain
+/// validator, so PrepareProposal's auto-ack can find its ECIES payload and
+/// decrypt it with the on-disk Pallas SK.
+///
+/// `ea_sk_bytes` is the 32-byte EA secret key scalar (little-endian).
+/// `ea_pk_bytes` is the 32-byte compressed EA public key.
+pub fn bootstrap_ceremony(ea_sk_bytes: &[u8], ea_pk_bytes: &[u8]) {
+    use crate::api::{
+        get_ceremony_status, get_validator_operator_address, post_json,
+        wait_for_ceremony_confirmed, CEREMONY_STATUS_CONFIRMED,
+    };
+    use crate::ecies;
+    use crate::payloads::{deal_ea_key_payload, register_pallas_key_payload};
+
+    // Check if already CONFIRMED (idempotent).
+    if get_ceremony_status() == Some(CEREMONY_STATUS_CONFIRMED) {
+        eprintln!("[E2E] Ceremony already CONFIRMED, skipping bootstrap");
+        return;
+    }
+
+    // Discover the chain validator's operator address from the staking module.
+    let validator_addr = get_validator_operator_address()
+        .expect("failed to query validator operator address from staking module");
+    eprintln!(
+        "[E2E] Ceremony: discovered validator operator address: {}",
+        validator_addr
+    );
+
+    // Read the chain validator's Pallas PK from disk (generated by `zallyd pallas-keygen`
+    // during `make init`). The validator's matching SK is loaded by PrepareProposal
+    // for auto-ack ECIES decryption.
+    let pallas_pk_path = std::env::var("ZALLY_PALLAS_PK_PATH").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").expect("HOME env var must be set");
+        format!("{}/.zallyd/pallas.pk", home)
+    });
+    eprintln!(
+        "[E2E] Ceremony: reading validator Pallas PK from {}",
+        pallas_pk_path
+    );
+    let pallas_pk_bytes = std::fs::read(&pallas_pk_path)
+        .unwrap_or_else(|e| panic!("failed to read Pallas PK from {}: {}", pallas_pk_path, e));
+    assert_eq!(
+        pallas_pk_bytes.len(),
+        32,
+        "Pallas PK must be exactly 32 bytes, got {}",
+        pallas_pk_bytes.len()
+    );
+
+    let mut rng = OsRng;
+
+    // Step 1: Register the validator's Pallas key.
+    eprintln!("[E2E] Ceremony: registering Pallas key...");
+    let body = register_pallas_key_payload(&validator_addr, &pallas_pk_bytes);
+    let (status, json) = post_json("/zally/v1/register-pallas-key", &body)
+        .expect("POST register-pallas-key");
+    assert!(
+        status == 200
+            && json.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) == 0,
+        "register-pallas-key failed: HTTP {}, body={:?}",
+        status,
+        json
+    );
+
+    // Wait one block for state to commit.
+    std::thread::sleep(std::time::Duration::from_millis(6000));
+
+    // Step 2: ECIES-encrypt ea_sk to the validator's Pallas PK.
+    eprintln!("[E2E] Ceremony: dealing EA key...");
+    let recipient_pk = {
+        let pk_arr: [u8; 32] = pallas_pk_bytes.as_slice().try_into().unwrap();
+        Option::<pallas::Point>::from(pallas::Point::from_bytes(&pk_arr))
+            .expect("validator Pallas PK is a valid Pallas point")
+    };
+    let envelope = ecies::encrypt(&recipient_pk, ea_sk_bytes, &mut rng);
+
+    let dealer_payload = DealerPayloadInput {
+        validator_address: validator_addr.clone(),
+        ephemeral_pk: envelope.ephemeral_pk.to_vec(),
+        ciphertext: envelope.ciphertext.clone(),
+    };
+
+    let body = deal_ea_key_payload(&validator_addr, ea_pk_bytes, &[dealer_payload]);
+    let (status, json) =
+        post_json("/zally/v1/deal-ea-key", &body).expect("POST deal-ea-key");
+    assert!(
+        status == 200
+            && json.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) == 0,
+        "deal-ea-key failed: HTTP {}, body={:?}",
+        status,
+        json
+    );
+
+    // Step 3: Wait for CONFIRMED status.
+    // Acking is handled in-protocol via PrepareProposal (auto-ack). With
+    // round-robin proposer selection the ack lands within a few blocks after
+    // the deal tx commits.
+    eprintln!("[E2E] Ceremony: waiting for auto-ack → CONFIRMED...");
+    wait_for_ceremony_confirmed(60_000).expect("ceremony should reach CONFIRMED via auto-ack");
+    eprintln!("[E2E] Ceremony: CONFIRMED ✓");
+}

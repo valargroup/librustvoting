@@ -46,6 +46,15 @@ func (ms msgServer) CreateVotingSession(goCtx context.Context, msg *types.MsgCre
 		return nil, fmt.Errorf("%w: %x", types.ErrRoundAlreadyExists, roundID)
 	}
 
+	// Read ea_pk from confirmed ceremony state.
+	ceremony, err := ms.k.GetCeremonyState(kvStore)
+	if err != nil {
+		return nil, err
+	}
+	if ceremony == nil || ceremony.Status != types.CeremonyStatus_CEREMONY_STATUS_CONFIRMED {
+		return nil, fmt.Errorf("%w", types.ErrCeremonyNotReady)
+	}
+
 	round := &types.VoteRound{
 		VoteRoundId:       roundID,
 		SnapshotHeight:    msg.SnapshotHeight,
@@ -56,7 +65,7 @@ func (ms msgServer) CreateVotingSession(goCtx context.Context, msg *types.MsgCre
 		NcRoot:            msg.NcRoot,
 		Creator:           msg.Creator,
 		Status:            types.SessionStatus_SESSION_STATUS_ACTIVE,
-		EaPk:              msg.EaPk,
+		EaPk:              ceremony.EaPk,
 		VkZkp1:            msg.VkZkp1,
 		VkZkp2:            msg.VkZkp2,
 		VkZkp3:            msg.VkZkp3,

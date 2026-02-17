@@ -4,6 +4,7 @@
 //! snapshot_blockhash || proposals_hash || vote_end_time_BE ||
 //! nullifier_imt_root || nc_root).
 
+use crate::elgamal::{self, Ciphertext};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -211,6 +212,50 @@ pub fn submit_tally_payload(round_id: &[u8], creator: &str, entries: &[TallyEntr
         "entries": entries_json,
     })
 }
+
+/// Encode ElGamal ciphertext to base64 (64 bytes).
+pub fn ciphertext_to_base64(ct: &Ciphertext) -> String {
+    to_base64(&elgamal::marshal(ct))
+}
+
+// --- Ceremony payload builders ---
+
+/// Build MsgRegisterPallasKey JSON body.
+pub fn register_pallas_key_payload(creator: &str, pallas_pk: &[u8]) -> Value {
+    json!({
+        "creator": creator,
+        "pallas_pk": to_base64(pallas_pk),
+    })
+}
+
+/// Dealer payload for MsgDealExecutiveAuthorityKey.
+pub struct DealerPayloadInput {
+    pub validator_address: String,
+    pub ephemeral_pk: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+/// Build MsgDealExecutiveAuthorityKey JSON body.
+pub fn deal_ea_key_payload(creator: &str, ea_pk: &[u8], payloads: &[DealerPayloadInput]) -> Value {
+    let payloads_json: Vec<Value> = payloads
+        .iter()
+        .map(|p| {
+            json!({
+                "validator_address": p.validator_address,
+                "ephemeral_pk": to_base64(&p.ephemeral_pk),
+                "ciphertext": to_base64(&p.ciphertext),
+            })
+        })
+        .collect();
+    json!({
+        "creator": creator,
+        "ea_pk": to_base64(ea_pk),
+        "payloads": payloads_json,
+    })
+}
+
+// Note: MsgAckExecutiveAuthorityKey has no payload builder — acks are injected
+// in-protocol via PrepareProposal (auto-ack).
 
 /// Build a share payload for the helper server's POST /api/v1/shares endpoint.
 ///

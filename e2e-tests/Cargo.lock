@@ -497,6 +497,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -609,6 +610,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake2b_simd",
+ "chacha20poly1305",
  "ff",
  "group",
  "hex",
@@ -622,6 +624,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "vote-commitment-tree",
  "vote-commitment-tree-client",
  "zally-circuits",

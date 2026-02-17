@@ -29,6 +29,10 @@ pasta_curves = "0.5"
 ff = "0.13"
 group = "0.13"
 
+# ECIES encryption (matching Go's sdk/crypto/ecies)
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+
 # RNG
 rand = "0.8"
 rand_core = "0.6"

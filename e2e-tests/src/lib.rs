@@ -5,5 +5,7 @@
 //! fixture files.
 
 pub mod api;
+pub mod ecies;
+pub mod elgamal;
 pub mod payloads;
 pub mod setup;
