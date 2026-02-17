@@ -10,7 +10,7 @@ todos:
     status: done
   - id: step3-keeper-crud
     content: "Step 3: Keeper CRUD -- implement GetCeremonyState/SetCeremonyState and helper functions in keeper_ceremony.go; write unit tests for round-trip storage"
-    status: pending
+    status: done
   - id: step4-register
     content: "Step 4: MsgRegisterPallasKey handler -- implement handler + tests (valid registration, reject duplicates, reject invalid points, reject wrong ceremony status)"
     status: pending
