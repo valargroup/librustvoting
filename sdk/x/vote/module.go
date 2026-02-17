@@ -53,6 +53,7 @@ func init() {
 			ProvideRegisterPallasKeySigner,
 			ProvideDealExecutiveAuthorityKeySigner,
 			ProvideAckExecutiveAuthorityKeySigner,
+			ProvideCreateValidatorWithPallasKeySigner,
 		),
 	)
 }
@@ -126,6 +127,13 @@ func ProvideDealExecutiveAuthorityKeySigner() signing.CustomGetSigner {
 func ProvideAckExecutiveAuthorityKeySigner() signing.CustomGetSigner {
 	return signing.CustomGetSigner{
 		MsgType: protoreflect.FullName("zvote.v1.MsgAckExecutiveAuthorityKey"),
+		Fn:      noopSignerFn,
+	}
+}
+
+func ProvideCreateValidatorWithPallasKeySigner() signing.CustomGetSigner {
+	return signing.CustomGetSigner{
+		MsgType: protoreflect.FullName("zvote.v1.MsgCreateValidatorWithPallasKey"),
 		Fn:      noopSignerFn,
 	}
 }

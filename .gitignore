@@ -1,5 +1,6 @@
 # Go binary
 sdk/zallyd
+sdk/create-val-tx
 
 # Go build cache (used in CI; keep local cache out of git)
 sdk/.cache/

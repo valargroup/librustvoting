@@ -52,8 +52,9 @@ func NewHandler(cfg HandlerConfig) *Handler {
 //	POST /zally/v1/cast-vote              → MsgCastVote
 //	POST /zally/v1/reveal-share           → MsgRevealShare
 //	POST /zally/v1/submit-tally           → MsgSubmitTally
-//	POST /zally/v1/register-pallas-key    → MsgRegisterPallasKey
-//	POST /zally/v1/deal-ea-key            → MsgDealExecutiveAuthorityKey
+//	POST /zally/v1/register-pallas-key            → MsgRegisterPallasKey
+//	POST /zally/v1/deal-ea-key                    → MsgDealExecutiveAuthorityKey
+//	POST /zally/v1/create-validator-with-pallas   → MsgCreateValidatorWithPallasKey
 //
 // Note: MsgAckExecutiveAuthorityKey has no REST endpoint — acks are injected
 // in-protocol via PrepareProposal (auto-ack).
@@ -65,6 +66,7 @@ func (h *Handler) RegisterTxRoutes(router *mux.Router) {
 	router.HandleFunc("/zally/v1/submit-tally", h.handleSubmitTally).Methods("POST")
 	router.HandleFunc("/zally/v1/register-pallas-key", h.handleRegisterPallasKey).Methods("POST")
 	router.HandleFunc("/zally/v1/deal-ea-key", h.handleDealEAKey).Methods("POST")
+	router.HandleFunc("/zally/v1/create-validator-with-pallas", h.handleCreateValidatorWithPallasKey).Methods("POST")
 }
 
 // --- Tx submission handlers ---
@@ -125,6 +127,14 @@ func (h *Handler) handleDealEAKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.broadcastCeremonyTx(w, msg, TagDealExecutiveAuthorityKey)
+}
+
+func (h *Handler) handleCreateValidatorWithPallasKey(w http.ResponseWriter, r *http.Request) {
+	msg := &types.MsgCreateValidatorWithPallasKey{}
+	if !h.decodeCeremonyMsg(w, r, msg) {
+		return
+	}
+	h.broadcastCeremonyTx(w, msg, TagCreateValidatorWithPallasKey)
 }
 
 // decodeCeremonyMsg reads the JSON request body and unmarshals it into the

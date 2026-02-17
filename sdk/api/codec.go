@@ -21,15 +21,16 @@ const (
 	TagRevealShare         byte = 0x04
 	TagSubmitTally         byte = 0x05
 
-	TagRegisterPallasKey         byte = 0x06
-	TagDealExecutiveAuthorityKey byte = 0x07
-	TagAckExecutiveAuthorityKey  byte = 0x08
+	TagRegisterPallasKey              byte = 0x06
+	TagDealExecutiveAuthorityKey      byte = 0x07
+	TagAckExecutiveAuthorityKey       byte = 0x08
+	TagCreateValidatorWithPallasKey   byte = 0x09
 )
 
 // IsCustomTag returns true if b is a valid custom transaction type tag
-// (vote-round 0x01–0x05 or ceremony 0x06–0x08).
+// (vote-round 0x01–0x05 or ceremony 0x06–0x09).
 func IsCustomTag(b byte) bool {
-	return b >= TagCreateVotingSession && b <= TagAckExecutiveAuthorityKey
+	return b >= TagCreateVotingSession && b <= TagCreateValidatorWithPallasKey
 }
 
 // IsVoteTag returns true if b is a vote-round transaction type tag (0x01–0x05).
@@ -37,9 +38,9 @@ func IsVoteTag(b byte) bool {
 	return b >= TagCreateVotingSession && b <= TagSubmitTally
 }
 
-// IsCeremonyTag returns true if b is a ceremony transaction type tag (0x06–0x08).
+// IsCeremonyTag returns true if b is a ceremony transaction type tag (0x06–0x09).
 func IsCeremonyTag(b byte) bool {
-	return b >= TagRegisterPallasKey && b <= TagAckExecutiveAuthorityKey
+	return b >= TagRegisterPallasKey && b <= TagCreateValidatorWithPallasKey
 }
 
 // TagForMessage returns the wire-format tag for a VoteMessage.
@@ -157,6 +158,8 @@ func DecodeCeremonyTx(raw []byte) (byte, proto.Message, error) {
 		msg = &types.MsgDealExecutiveAuthorityKey{}
 	case TagAckExecutiveAuthorityKey:
 		msg = &types.MsgAckExecutiveAuthorityKey{}
+	case TagCreateValidatorWithPallasKey:
+		msg = &types.MsgCreateValidatorWithPallasKey{}
 	default:
 		return 0, nil, fmt.Errorf("invalid ceremony tx tag: 0x%02x", tag)
 	}
