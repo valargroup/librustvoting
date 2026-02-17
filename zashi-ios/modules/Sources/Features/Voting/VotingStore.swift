@@ -465,13 +465,15 @@ public struct Voting {
                 // Non-Keystone users skip the delegation signing screen entirely
                 if !state.isKeystoneUser {
                     state.screenStack = [.proposalList]
-                    state.delegationProofStatus = .complete
-                    return .publisher {
-                        votingCrypto.stateStream()
-                            .receive(on: DispatchQueue.main)
-                            .map(Action.votingDbStateChanged)
-                    }
-                    .cancellable(id: cancelStateStreamId, cancelInFlight: true)
+                    return .merge(
+                        .publisher {
+                            votingCrypto.stateStream()
+                                .receive(on: DispatchQueue.main)
+                                .map(Action.votingDbStateChanged)
+                        }
+                        .cancellable(id: cancelStateStreamId, cancelInFlight: true),
+                        .send(.startDelegationProof)
+                    )
                 }
                 // Keystone fresh round: now show the delegation signing screen
                 state.screenStack = [.delegationSigning]
@@ -526,9 +528,7 @@ public struct Voting {
             case .delegationApproved:
                 if !state.isKeystoneUser {
                     state.screenStack = [.proposalList]
-                    // Direct-wallet voting does not require delegation proof generation.
-                    state.delegationProofStatus = .complete
-                    return .none
+                    return .send(.startDelegationProof)
                 }
                 return .send(.startDelegationProof)
 
