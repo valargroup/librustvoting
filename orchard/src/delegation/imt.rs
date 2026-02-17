@@ -32,17 +32,21 @@ pub(crate) fn poseidon_hash_2(a: pallas::Base, b: pallas::Base) -> pallas::Base 
 
 /// Compute governance nullifier out-of-circuit (per spec §1.3.2, condition 14).
 ///
-/// `gov_null = Poseidon(nk, Poseidon(domain_tag, Poseidon(vote_round_id, real_nf)))`
+/// `gov_null = Poseidon(nk, domain_tag, vote_round_id, real_nf)`
 ///
 /// where `domain_tag` = `"governance authorization"` as a field element.
+/// Single ConstantLength<4> call (2 permutations at rate=2).
 pub(crate) fn gov_null_hash(
     nk: pallas::Base,
     vote_round_id: pallas::Base,
     real_nf: pallas::Base,
 ) -> pallas::Base {
-    let step1 = poseidon_hash_2(vote_round_id, real_nf);
-    let step2 = poseidon_hash_2(gov_auth_domain_tag(), step1);
-    poseidon_hash_2(nk, step2)
+    poseidon::Hash::<_, poseidon::P128Pow5T3, ConstantLength<4>, 3, 2>::init().hash([
+        nk,
+        gov_auth_domain_tag(),
+        vote_round_id,
+        real_nf,
+    ])
 }
 
 /// IMT non-membership proof data ((low, high) leaf model).

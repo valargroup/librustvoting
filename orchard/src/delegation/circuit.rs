@@ -1458,15 +1458,16 @@ fn synthesize_note_slot(
 
     // ---------------------------------------------------------------
     // Condition 14: Governance nullifier integrity.
-    // gov_null = Poseidon(nk, Poseidon(domain_tag, Poseidon(vote_round_id, real_nf)))
+    // gov_null = Poseidon(nk, domain_tag, vote_round_id, real_nf)
     // ---------------------------------------------------------------
 
     // Derives a governance-domain nullifier published on the vote chain to prevent
-    // double-delegation. The three-layer Poseidon hash ensures:
-    //   - Scoped to this voting round (vote_round_id)
-    //   - Domain-separated from other nullifier uses ("governance authorization" tag)
-    //   - Keyed by nk, so it can't be linked to real_nf even when real_nf is later
-    //     revealed on mainchain
+    // double-delegation. Single ConstantLength<4> Poseidon hash (2 permutations
+    // at rate=2) that:
+    //   - Is keyed by nk, so it can't be linked to real_nf even when real_nf is
+    //     later revealed on mainchain
+    //   - Is domain-separated from other nullifier uses ("governance authorization" tag)
+    //   - Is scoped to this voting round (vote_round_id)
     //
     // The result is constrained to the public instance so the vote chain can
     // track which notes have already been delegated this round.
@@ -1479,42 +1480,16 @@ fn synthesize_note_slot(
         crate::delegation::imt::gov_auth_domain_tag(),
     )?;
 
-    // Step 1: Poseidon(vote_round_id, real_nf) — scope to this round + note.
-    let intermediate = {
-        let poseidon_hasher =
-            PoseidonHash::<pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>::init(
-                config.poseidon_chip(),
-                layouter.namespace(|| format!("note {s} gov_null step 1 init")),
-            )?;
-        poseidon_hasher.hash(
-            layouter.namespace(|| format!("note {s} Poseidon(vote_round_id, real_nf)")),
-            [vote_round_id_cell.clone(), real_nf.inner().clone()],
-        )?
-    };
-
-    // Step 2: Poseidon(domain_tag, intermediate) — domain separation.
-    let tagged = {
-        let poseidon_hasher =
-            PoseidonHash::<pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>::init(
-                config.poseidon_chip(),
-                layouter.namespace(|| format!("note {s} gov_null step 2 init")),
-            )?;
-        poseidon_hasher.hash(
-            layouter.namespace(|| format!("note {s} Poseidon(domain_tag, intermediate)")),
-            [domain_tag, intermediate],
-        )?
-    };
-
-    // Step 3: Poseidon(nk, tagged) — key the result so it can't be reversed.
+    // Poseidon(nk, domain_tag, vote_round_id, real_nf)
     let gov_null = {
         let poseidon_hasher =
-            PoseidonHash::<pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<2>, 3, 2>::init(
+            PoseidonHash::<pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<4>, 3, 2>::init(
                 config.poseidon_chip(),
-                layouter.namespace(|| format!("note {s} gov_null step 3 init")),
+                layouter.namespace(|| format!("note {s} gov_null init")),
             )?;
         poseidon_hasher.hash(
-            layouter.namespace(|| format!("note {s} Poseidon(nk, tagged)")),
-            [nk_cell.clone(), tagged],
+            layouter.namespace(|| format!("note {s} Poseidon(nk, domain_tag, vote_round_id, real_nf)")),
+            [nk_cell.clone(), domain_tag, vote_round_id_cell.clone(), real_nf.inner().clone()],
         )?
     };
 
