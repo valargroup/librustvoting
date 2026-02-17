@@ -877,9 +877,16 @@ public struct Voting {
                     let txResult = try await votingAPI.submitVoteCommitment(builtBundle, castVoteSig)
                     await send(.voteCommitmentSubmitted(txResult.txHash))
 
-                    // Wait for the cast-vote TX to land and read the new tree position
+                    // Wait for the cast-vote TX to land and read the new tree position.
+                    // The chain appends vote_authority_note_new first, then vote_commitment,
+                    // so the new VAN is at nextIndex-2 and the VC is at nextIndex-1.
                     let postVCTree = try await votingAPI.awaitCommitmentTreeGrowth(preVCTree.nextIndex, 30)
+                    let newVanPosition = UInt32(postVCTree.nextIndex) - 2
                     let vcTreePosition = postVCTree.nextIndex - 1
+
+                    // Update VAN position so the next vote uses the new VAN leaf
+                    try await votingCrypto.storeVanPosition(roundId, newVanPosition)
+
                     let payloads = try await votingCrypto.buildSharePayloads(
                         builtBundle.encShares, builtBundle, choice, vcTreePosition
                     )

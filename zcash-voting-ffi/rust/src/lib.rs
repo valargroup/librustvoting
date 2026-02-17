@@ -1211,6 +1211,7 @@ pub fn build_vote_commitment(
     van_auth_path: Vec<Vec<u8>>,
     van_position: u32,
     anchor_height: u32,
+    proposal_authority: u64,
 ) -> Result<VoteCommitmentBundle, VotingError> {
     let auth_path: Vec<[u8; 32]> = van_auth_path
         .into_iter()
@@ -1234,6 +1235,7 @@ pub fn build_vote_commitment(
         &auth_path,
         van_position,
         anchor_height,
+        proposal_authority,
         &reporter,
     )?
     .into())

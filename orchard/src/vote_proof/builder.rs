@@ -23,9 +23,6 @@ use super::circuit::{
 use super::prove::create_vote_proof;
 use super::{base_to_scalar, spend_auth_g_affine};
 
-/// Maximum proposal authority bitmask for a fresh VAN (16 proposals).
-const MAX_PROPOSAL_AUTHORITY: u64 = 65535; // 2^16 - 1
-
 /// Ballot divisor — must match `delegation::circuit::BALLOT_DIVISOR`.
 const BALLOT_DIVISOR: u64 = 12_500_000;
 
@@ -158,6 +155,7 @@ pub fn build_vote_proof_from_delegation(
     vote_decision: u64,
     ea_pk: pallas::Affine,
     alpha_v: pallas::Scalar,
+    proposal_authority_old_u64: u64,
     rng: &mut impl RngCore,
 ) -> Result<VoteProofBundle, VoteProofBuildError> {
     // ---- Key derivation (matches delegation's key hierarchy) ----
@@ -217,7 +215,7 @@ pub fn build_vote_proof_from_delegation(
 
     // ---- Proposal authority ----
 
-    let proposal_authority_old = pallas::Base::from(MAX_PROPOSAL_AUTHORITY);
+    let proposal_authority_old = pallas::Base::from(proposal_authority_old_u64);
     let one_shifted = pallas::Base::from(1u64 << proposal_id);
     let proposal_authority_new = proposal_authority_old - one_shifted;
 

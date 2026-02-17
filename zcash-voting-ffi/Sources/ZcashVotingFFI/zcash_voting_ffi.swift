@@ -3551,7 +3551,7 @@ public func buildSharePayloads(encShares: [EncryptedShare], commitment: VoteComm
  *
  * Prefer the VotingDatabase method which loads inputs from DB automatically.
  */
-public func buildVoteCommitment(hotkeySeed: Data, networkId: UInt32, addressIndex: UInt32, totalNoteValue: UInt64, govCommRand: Data, votingRoundId: Data, eaPk: Data, proposalId: UInt32, choice: UInt32, vanAuthPath: [Data], vanPosition: UInt32, anchorHeight: UInt32)throws  -> VoteCommitmentBundle  {
+public func buildVoteCommitment(hotkeySeed: Data, networkId: UInt32, addressIndex: UInt32, totalNoteValue: UInt64, govCommRand: Data, votingRoundId: Data, eaPk: Data, proposalId: UInt32, choice: UInt32, vanAuthPath: [Data], vanPosition: UInt32, anchorHeight: UInt32, proposalAuthority: UInt64)throws  -> VoteCommitmentBundle  {
     return try  FfiConverterTypeVoteCommitmentBundle_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_func_build_vote_commitment(
         FfiConverterData.lower(hotkeySeed),
@@ -3565,7 +3565,8 @@ public func buildVoteCommitment(hotkeySeed: Data, networkId: UInt32, addressInde
         FfiConverterUInt32.lower(choice),
         FfiConverterSequenceData.lower(vanAuthPath),
         FfiConverterUInt32.lower(vanPosition),
-        FfiConverterUInt32.lower(anchorHeight),$0
+        FfiConverterUInt32.lower(anchorHeight),
+        FfiConverterUInt64.lower(proposalAuthority),$0
     )
 })
 }
@@ -3698,7 +3699,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_func_build_share_payloads() != 52214) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_func_build_vote_commitment() != 43579) {
+    if (uniffi_zcash_voting_ffi_checksum_func_build_vote_commitment() != 60099) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_func_construct_delegation_action() != 58555) {

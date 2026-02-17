@@ -45,6 +45,7 @@ pub fn build_vote_commitment(
     van_auth_path: &[[u8; 32]],
     van_position: u32,
     anchor_height: u32,
+    proposal_authority: u64,
     progress: &dyn ProofProgressReporter,
 ) -> Result<VoteCommitmentBundle, VotingError> {
     validate_vote_decision(choice)?;
@@ -131,6 +132,7 @@ pub fn build_vote_commitment(
         choice as u64,
         ea_pk_affine,
         alpha_v,
+        proposal_authority,
         &mut rng,
     )
     .map_err(|e| VotingError::ProofFailed {
@@ -241,6 +243,7 @@ mod tests {
             &[[0u8; 32]; 24],
             0,
             1,
+            65535,
             &TestReporter,
         )
         .is_err());
@@ -261,6 +264,7 @@ mod tests {
             &[[0u8; 32]; 24],
             0,
             1,
+            65535,
             &TestReporter,
         )
         .is_err());
@@ -281,6 +285,7 @@ mod tests {
             &[[0u8; 32]; 10], // wrong length
             0,
             1,
+            65535,
             &TestReporter,
         )
         .is_err());

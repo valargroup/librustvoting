@@ -398,7 +398,7 @@ RustBuffer uniffi_zcash_voting_ffi_fn_func_build_share_payloads(RustBuffer enc_s
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_BUILD_VOTE_COMMITMENT
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_BUILD_VOTE_COMMITMENT
-RustBuffer uniffi_zcash_voting_ffi_fn_func_build_vote_commitment(RustBuffer hotkey_seed, uint32_t network_id, uint32_t address_index, uint64_t total_note_value, RustBuffer gov_comm_rand, RustBuffer voting_round_id, RustBuffer ea_pk, uint32_t proposal_id, uint32_t choice, RustBuffer van_auth_path, uint32_t van_position, uint32_t anchor_height, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_zcash_voting_ffi_fn_func_build_vote_commitment(RustBuffer hotkey_seed, uint32_t network_id, uint32_t address_index, uint64_t total_note_value, RustBuffer gov_comm_rand, RustBuffer voting_round_id, RustBuffer ea_pk, uint32_t proposal_id, uint32_t choice, RustBuffer van_auth_path, uint32_t van_position, uint32_t anchor_height, uint64_t proposal_authority, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_CONSTRUCT_DELEGATION_ACTION
