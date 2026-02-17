@@ -164,10 +164,9 @@ pub const SESSION_STATUS_FINALIZED: i64 = 3;
 
 /// Ceremony status enum (protobuf int32, matching CeremonyStatus in types.proto).
 pub const CEREMONY_STATUS_UNSPECIFIED: i64 = 0;
-pub const CEREMONY_STATUS_INITIALIZING: i64 = 1;
-pub const CEREMONY_STATUS_REGISTERING: i64 = 2;
-pub const CEREMONY_STATUS_DEALT: i64 = 3;
-pub const CEREMONY_STATUS_CONFIRMED: i64 = 4;
+pub const CEREMONY_STATUS_REGISTERING: i64 = 1;
+pub const CEREMONY_STATUS_DEALT: i64 = 2;
+pub const CEREMONY_STATUS_CONFIRMED: i64 = 3;
 
 /// Returns the ceremony status from GET /zally/v1/ceremony.
 /// Returns None if the ceremony doesn't exist or the request fails.
@@ -183,29 +182,47 @@ pub fn get_ceremony_status() -> Option<i64> {
 pub fn wait_for_ceremony_confirmed(
     timeout_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_ceremony_status(CEREMONY_STATUS_CONFIRMED, timeout_ms)
+}
+
+/// Returns the full ceremony state JSON object from GET /zally/v1/ceremony.
+/// Returns None if the ceremony doesn't exist or the request fails.
+pub fn get_ceremony_state_json() -> Option<Value> {
+    let (status, json) = get_json("/zally/v1/ceremony").ok()?;
+    if status != 200 {
+        return None;
+    }
+    json.get("ceremony").cloned()
+}
+
+/// Poll GET /zally/v1/ceremony until status equals `expected` or timeout.
+pub fn wait_for_ceremony_status(
+    expected: i64,
+    timeout_ms: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut polls = 0u32;
     while std::time::Instant::now() < deadline {
         let status = get_ceremony_status().unwrap_or(CEREMONY_STATUS_UNSPECIFIED);
         polls += 1;
-        if status == CEREMONY_STATUS_CONFIRMED {
+        if status == expected {
             eprintln!(
-                "[E2E] Ceremony reached CONFIRMED after {} poll(s)",
-                polls
+                "[E2E] Ceremony reached status {} after {} poll(s)",
+                expected, polls
             );
             return Ok(());
         }
-        if polls == 1 || polls % 5 == 0 {
+        if polls == 1 || polls % 10 == 0 {
             eprintln!(
-                "[E2E] Ceremony status={} (waiting for CONFIRMED={}), poll #{}",
-                status, CEREMONY_STATUS_CONFIRMED, polls
+                "[E2E] Ceremony status={} (waiting for {}), poll #{}",
+                status, expected, polls
             );
         }
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        std::thread::sleep(std::time::Duration::from_millis(2000));
     }
     Err(format!(
-        "timeout waiting for ceremony CONFIRMED after {} polls",
-        polls
+        "timeout waiting for ceremony status {} after {} polls",
+        expected, polls
     )
     .into())
 }
@@ -223,6 +240,52 @@ pub fn get_validator_operator_address() -> Option<String> {
         .get("operator_address")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+/// Returns ALL validator operator addresses from the staking module.
+pub fn get_all_validator_operator_addresses() -> Option<Vec<String>> {
+    let (status, json) = get_json("/cosmos/staking/v1beta1/validators").ok()?;
+    if status != 200 {
+        return None;
+    }
+    let validators = json.get("validators")?.as_array()?;
+    let addrs: Vec<String> = validators
+        .iter()
+        .filter_map(|v| v.get("operator_address")?.as_str().map(|s| s.to_string()))
+        .collect();
+    if addrs.is_empty() {
+        None
+    } else {
+        Some(addrs)
+    }
+}
+
+/// Returns all validators' (operator_address, moniker) pairs from the staking module.
+/// Used by multi-validator setup to match operator addresses to home directories.
+pub fn get_validators_with_monikers() -> Option<Vec<(String, String)>> {
+    let (status, json) = get_json("/cosmos/staking/v1beta1/validators").ok()?;
+    if status != 200 {
+        return None;
+    }
+    let validators = json.get("validators")?.as_array()?;
+    let result: Vec<(String, String)> = validators
+        .iter()
+        .filter_map(|v| {
+            let addr = v.get("operator_address")?.as_str()?.to_string();
+            let moniker = v
+                .get("description")
+                .and_then(|d| d.get("moniker"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some((addr, moniker))
+        })
+        .collect();
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 /// Returns commitment tree next_index (number of leaves) from GET /zally/v1/commitment-tree/latest.

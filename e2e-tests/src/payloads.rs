@@ -254,6 +254,13 @@ pub fn deal_ea_key_payload(creator: &str, ea_pk: &[u8], payloads: &[DealerPayloa
     })
 }
 
+/// Build MsgReInitializeElectionAuthority JSON body.
+pub fn reinitialize_ea_payload(creator: &str) -> Value {
+    json!({
+        "creator": creator,
+    })
+}
+
 // Note: MsgAckExecutiveAuthorityKey has no payload builder — acks are injected
 // in-protocol via PrepareProposal (auto-ack).
 
