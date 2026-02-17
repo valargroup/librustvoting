@@ -16,7 +16,7 @@ todos:
     status: done
   - id: step5-deal
     content: "Step 5: MsgDealExecutiveAuthorityKey handler -- implement handler + tests (valid deal, reject mismatched payloads, reject invalid ea_pk, reject wrong status, REGISTERING->DEALT transition)"
-    status: pending
+    status: done
   - id: step6-ack
     content: "Step 6: MsgAckExecutiveAuthorityKey handler -- implement handler + tests (valid ack, reject duplicates, reject non-validator, all-ack triggers DEALT->CONFIRMED transition)"
     status: pending
