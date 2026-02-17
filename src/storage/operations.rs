@@ -446,6 +446,7 @@ impl VotingDb {
             van_auth_path,
             van_position,
             anchor_height,
+            zkp2_data.proposal_authority,
             progress,
         )?;
 
