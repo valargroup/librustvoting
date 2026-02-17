@@ -6,7 +6,7 @@ name: Deploy SDK chain
 
 on:
   push:
-    branches: [main]
+    branches: [main, adam/helper-go-port]
     paths:
       - 'sdk/**'
   workflow_dispatch: # allow manual run
