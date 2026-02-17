@@ -23,7 +23,7 @@ use e2e_tests::{
     },
     setup::build_delegation_bundle_for_test,
 };
-use ff::PrimeField;
+use ff::{FromUniformBytes, PrimeField};
 use group::{Curve, GroupEncoding};
 use librustvoting::{NoopProgressReporter, VotingRoundParams};
 use orchard::keys::SpendAuthorizingKey;
@@ -338,8 +338,11 @@ fn voting_flow_librustvoting_path() {
             bundle.vote_commitment.as_slice().try_into().unwrap(),
         ))
         .expect("vote_commitment");
-        let vri: pallas::Base =
-            Option::from(pallas::Base::from_repr(round_id)).expect("voting_round_id");
+        // vote_round_id is a Blake2b-256 hash — use wide reduction since ~75% of
+        // hash values exceed the Pallas modulus.
+        let mut vri_wide = [0u8; 64];
+        vri_wide[..32].copy_from_slice(&round_id);
+        let vri: pallas::Base = pallas::Base::from_uniform_bytes(&vri_wide);
 
         // EA PK coordinates
         let ea_pk_point: pallas::Point =
