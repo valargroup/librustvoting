@@ -440,13 +440,16 @@ public struct SharePayload: Equatable, Sendable {
     public let voteDecision: UInt32
     public let encShare: EncryptedShare
     public let treePosition: UInt64
+    /// All 4 encrypted shares (needed for ZKP #3 shares_hash witness).
+    public let allEncShares: [EncryptedShare]
 
-    public init(sharesHash: Data, proposalId: UInt32, voteDecision: UInt32, encShare: EncryptedShare, treePosition: UInt64) {
+    public init(sharesHash: Data, proposalId: UInt32, voteDecision: UInt32, encShare: EncryptedShare, treePosition: UInt64, allEncShares: [EncryptedShare]) {
         self.sharesHash = sharesHash
         self.proposalId = proposalId
         self.voteDecision = voteDecision
         self.encShare = encShare
         self.treePosition = treePosition
+        self.allEncShares = allEncShares
     }
 }
 

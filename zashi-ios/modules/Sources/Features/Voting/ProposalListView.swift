@@ -36,7 +36,11 @@ struct ProposalListView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(spacing: 12) {
-                    roundInfoCard()
+                    if store.activeSession == nil {
+                        createTestRoundCard()
+                    } else {
+                        roundInfoCard()
+                    }
                     zkpBanner()
                     progressHeader()
 
@@ -127,6 +131,55 @@ struct ProposalListView: View {
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
                 .foregroundStyle(Design.Text.primary.color(colorScheme))
         }
+    }
+
+    // MARK: - Create Test Round
+
+    @ViewBuilder
+    private func createTestRoundCard() -> some View {
+        VStack(spacing: 12) {
+            Text("No Active Voting Round")
+                .zFont(.semiBold, size: 18, style: Design.Text.primary)
+
+            Text("Create a test session on the local chain to start voting.")
+                .zFont(.regular, size: 13, style: Design.Text.secondary)
+                .multilineTextAlignment(.center)
+
+            if let error = store.testRoundError {
+                Text(error)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 8)
+            }
+
+            Button {
+                store.send(.createTestRound)
+            } label: {
+                HStack(spacing: 8) {
+                    if store.isCreatingTestRound {
+                        ProgressView()
+                            .tint(.white)
+                    }
+                    Text(store.isCreatingTestRound ? "Creating..." : "Create Test Round")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(Color.accentColor)
+                .foregroundColor(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .disabled(store.isCreatingTestRound)
+        }
+        .padding(16)
+        .background(Design.Surfaces.bgPrimary.color(colorScheme))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Design.Surfaces.strokeSecondary.color(colorScheme), lineWidth: 1)
+        )
+        .padding(.top, 8)
     }
 
     // MARK: - Status

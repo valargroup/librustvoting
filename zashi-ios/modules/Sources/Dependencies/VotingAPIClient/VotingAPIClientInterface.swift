@@ -19,7 +19,9 @@ public struct VotingAPIClient {
     public var fetchLatestCommitmentTree: @Sendable () async throws -> CommitmentTreeState
     public var submitDelegation: @Sendable (_ registration: DelegationRegistration) async throws -> TxResult
     public var submitVoteCommitment: @Sendable (_ bundle: VoteCommitmentBundle, _ signature: CastVoteSignature) async throws -> TxResult
-    public var delegateShares: @Sendable (_ payloads: [SharePayload], _ roundIdHex: String, _ anchorHeight: UInt32) async throws -> Void
+    public var delegateShares: @Sendable (_ payloads: [SharePayload], _ roundIdHex: String) async throws -> Void
     public var fetchProposalTally: @Sendable (_ roundId: Data, _ proposalId: UInt32) async throws -> TallyResult
     public var awaitCommitmentTreeGrowth: @Sendable (_ previousNextIndex: UInt64, _ timeoutSeconds: TimeInterval) async throws -> CommitmentTreeState
+    /// Create a new voting session on chain (dev/test only).
+    public var createTestSession: @Sendable (_ payload: [String: Any]) async throws -> Void
 }

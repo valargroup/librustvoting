@@ -122,4 +122,6 @@ public struct VotingCryptoClient {
         _ networkId: UInt32,
         _ bundle: VoteCommitmentBundle
     ) async throws -> CastVoteSignature
+    /// Extract the Orchard nc_root from a protobuf-encoded TreeState.
+    public var extractNcRoot: @Sendable (_ treeStateBytes: Data) throws -> Data
 }

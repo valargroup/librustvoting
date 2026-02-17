@@ -4,11 +4,14 @@ import VotingModels
 
 // MARK: - API Configuration
 
-/// Configuration for the Zally chain REST API.
+/// Configuration for the Zally chain REST API and helper server.
 public enum ZallyAPIConfig {
     /// Base URL for the chain REST API (e.g. "http://localhost:1317").
     /// TODO: Source from app configuration or server discovery.
-    public static var baseURL = "http://localhost:1317"
+    public static var baseURL = "http://localhost:1318"
+    /// Base URL for the helper server that generates ZKP #3 and submits reveal-share TXs.
+    /// TODO: Source from app configuration or round discovery.
+    public static var helperServerURL = "http://localhost:9091"
 }
 
 // MARK: - Errors
@@ -63,6 +66,30 @@ private func getJSON(_ path: String) async throws -> [String: Any] {
 private func postJSON(_ path: String, body: [String: Any]) async throws -> [String: Any] {
     guard let url = URL(string: "\(ZallyAPIConfig.baseURL)\(path)") else {
         throw ZallyAPIError.invalidResponse("invalid URL: \(ZallyAPIConfig.baseURL)\(path)")
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+    let (data, response) = try await httpSession.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+        throw ZallyAPIError.invalidResponse("not an HTTP response")
+    }
+    guard http.statusCode == 200 else {
+        let body = String(data: data, encoding: .utf8) ?? ""
+        throw ZallyAPIError.httpError(statusCode: http.statusCode, message: body)
+    }
+    guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw ZallyAPIError.invalidResponse("expected JSON object")
+    }
+    return json
+}
+
+/// POST JSON to the helper server. Returns parsed JSON response.
+private func postHelperJSON(_ path: String, body: [String: Any]) async throws -> [String: Any] {
+    guard let url = URL(string: "\(ZallyAPIConfig.helperServerURL)\(path)") else {
+        throw ZallyAPIError.invalidResponse("invalid URL: \(ZallyAPIConfig.helperServerURL)\(path)")
     }
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
@@ -251,35 +278,32 @@ extension VotingAPIClient: DependencyKey {
                 let json = try await postJSON("/zally/v1/cast-vote", body: body)
                 return try parseTxResult(json)
             },
-            delegateShares: { payloads, roundIdHex, anchorHeight in
-                let roundIdBytes = dataFromHex(roundIdHex)
-
-                // Submit each share as a separate reveal-share transaction
+            delegateShares: { payloads, roundIdHex in
+                // Submit each share to the helper server, which generates ZKP #3
+                // and submits reveal-share TXs to the chain on our behalf.
                 for payload in payloads {
-                    // Concatenate C1||C2 for the enc_share field (64 bytes total)
-                    var encShareBytes = Data()
-                    encShareBytes.append(payload.encShare.c1)
-                    encShareBytes.append(payload.encShare.c2)
-
-                    // Generate a unique share nullifier (32 bytes, canonical Pallas Fp: MSB < 0x40)
-                    var nullifier = Data(count: 32)
-                    nullifier.withUnsafeMutableBytes { ptr in
-                        _ = SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
+                    let allEncSharesJSON: [[String: Any]] = payload.allEncShares.map { share in
+                        [
+                            "c1": share.c1.base64EncodedString(),
+                            "c2": share.c2.base64EncodedString(),
+                            "share_index": share.shareIndex
+                        ]
                     }
-                    nullifier[0] &= 0x3F
-
                     let body: [String: Any] = [
-                        "share_nullifier": nullifier.base64EncodedString(),
-                        "enc_share": encShareBytes.base64EncodedString(),
+                        "shares_hash": payload.sharesHash.base64EncodedString(),
                         "proposal_id": payload.proposalId,
                         "vote_decision": payload.voteDecision,
-                        // TODO: Replace with real ZKP #3 proof
-                        "proof": Data("mock-reveal-share-proof".utf8).base64EncodedString(),
-                        "vote_round_id": roundIdBytes.base64EncodedString(),
-                        "vote_comm_tree_anchor_height": anchorHeight
+                        "enc_share": [
+                            "c1": payload.encShare.c1.base64EncodedString(),
+                            "c2": payload.encShare.c2.base64EncodedString(),
+                            "share_index": payload.encShare.shareIndex
+                        ],
+                        "share_index": payload.encShare.shareIndex,
+                        "tree_position": payload.treePosition,
+                        "vote_round_id": roundIdHex,
+                        "all_enc_shares": allEncSharesJSON
                     ]
-                    let json = try await postJSON("/zally/v1/reveal-share", body: body)
-                    _ = try parseTxResult(json)
+                    _ = try await postHelperJSON("/api/v1/shares", body: body)
                 }
             },
             fetchProposalTally: { roundId, proposalId in
@@ -313,6 +337,9 @@ extension VotingAPIClient: DependencyKey {
                     try await Task.sleep(for: .seconds(1))
                 }
                 throw ZallyAPIError.commitmentTreeTimeout(seconds: timeoutSeconds)
+            },
+            createTestSession: { payload in
+                _ = try await postJSON("/zally/v1/create-voting-session", body: payload)
             }
         )
     }

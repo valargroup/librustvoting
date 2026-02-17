@@ -12,3 +12,4 @@ pub mod zkp1;
 pub mod zkp2;
 
 pub use types::*;
+pub use witness::extract_nc_root;

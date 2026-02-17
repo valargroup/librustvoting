@@ -47,6 +47,17 @@ private enum VotingFlowError: LocalizedError {
     }
 }
 
+private enum ZallyTestRoundError: LocalizedError {
+    case invalidIMTResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidIMTResponse:
+            return "Invalid response from IMT server /root endpoint"
+        }
+    }
+}
+
 @Reducer
 public struct Voting {
     @Dependency(\.databaseFiles) var databaseFiles
@@ -147,6 +158,16 @@ public struct Voting {
         /// Last tx hash returned by submitVoteCommitment, used for completion/debug UI.
         public var lastVoteCommitmentTxHash: String?
 
+        /// Whether a vote commitment is being built and submitted to chain.
+        public var isSubmittingVote: Bool = false
+        /// Error from the last vote submission attempt.
+        public var voteSubmissionError: String?
+
+        /// Whether a test round creation is in progress.
+        public var isCreatingTestRound: Bool = false
+        /// Error from the last test round creation attempt.
+        public var testRoundError: String?
+
         public var currentScreen: Screen {
             screenStack.last ?? .proposalList
         }
@@ -172,10 +193,10 @@ public struct Voting {
             delegationProofStatus == .complete
         }
 
-        /// Whether the previous vote's VAN has landed in the vote commitment tree.
-        /// Always true in the prototype; real implementation checks tree sync.
+        /// Whether the user can confirm a vote: delegation proof must be complete
+        /// and no other vote can be in-flight (each vote needs the previous VAN committed).
         public var canConfirmVote: Bool {
-            true
+            isDelegationReady && !isSubmittingVote
         }
 
         public var nextUnvotedProposalId: UInt32? {
@@ -267,10 +288,16 @@ public struct Voting {
         case cancelPendingVote
         case voteCommitmentBuilt(VoteCommitmentBundle)
         case voteCommitmentSubmitted(String)
+        case voteSubmissionFailed(proposalId: UInt32, error: String)
         case advanceAfterVote(nextId: UInt32?)
         case backToList
         case nextProposalDetail
         case previousProposalDetail
+
+        // Test round creation (dev only)
+        case createTestRound
+        case testRoundCreated
+        case testRoundFailed(String)
 
         // Complete
         case doneTapped
@@ -765,7 +792,15 @@ public struct Voting {
                 return .none
 
             case .delegationProofFailed(let error):
-                state.delegationProofStatus = .failed(error)
+                let userMessage: String
+                if error.contains("total_weight must yield at least 1 ballot") {
+                    let weightStr = Zatoshi(Int64(state.votingWeight)).decimalString()
+                    let requiredStr = Zatoshi(12_500_000).decimalString()
+                    userMessage = "Your shielded balance at the snapshot (\(weightStr) ZEC) is below the minimum required to vote (\(requiredStr) ZEC)."
+                } else {
+                    userMessage = error
+                }
+                state.delegationProofStatus = .failed(userMessage)
                 return .none
 
             // MARK: - Proposal List
@@ -792,6 +827,9 @@ public struct Voting {
                 guard state.activeSession != nil else { return .none }
                 state.votes[pending.proposalId] = pending.choice
                 state.pendingVote = nil
+                state.isSubmittingVote = true
+                state.voteSubmissionError = nil
+                state.lastVoteCommitmentTxHash = nil
 
                 let proposalId = pending.proposalId
                 let choice = pending.choice
@@ -799,68 +837,70 @@ public struct Voting {
                 let network = zcashSDKEnvironment.network
                 let networkId: UInt32 = network.networkType == .mainnet ? 0 : 1
                 let nextId = nextUnvotedId(after: proposalId, in: state)
-                state.lastVoteCommitmentTxHash = nil
 
-                return .merge(
-                    // Submit this vote to chain in background
-                    .run { [votingAPI, votingCrypto, mnemonic, walletStorage] send in
-                        // Derive hotkey seed (same seed used during delegation)
-                        let hotkeyPhrase = try walletStorage.exportVotingHotkey().seedPhrase.value()
-                        let hotkeySeed = try mnemonic.toSeed(hotkeyPhrase)
+                return .run { [votingAPI, votingCrypto, mnemonic, walletStorage] send in
+                    // Derive hotkey seed (same seed used during delegation)
+                    let hotkeyPhrase = try walletStorage.exportVotingHotkey().seedPhrase.value()
+                    let hotkeySeed = try mnemonic.toSeed(hotkeyPhrase)
 
-                        // Sync vote commitment tree from chain and generate VAN witness.
-                        // Requires storeVanPosition to have been called after delegation TX.
-                        let chainNodeUrl = ZallyAPIConfig.baseURL
-                        let anchorHeight = try await votingCrypto.syncVoteTree(roundId, chainNodeUrl)
-                        let vanWitness = try await votingCrypto.generateVanWitness(roundId, anchorHeight)
-                        print("[Voting] VAN witness: position=\(vanWitness.position), anchor=\(vanWitness.anchorHeight)")
+                    // Sync vote commitment tree from chain and generate VAN witness.
+                    // Requires storeVanPosition to have been called after delegation TX.
+                    let chainNodeUrl = ZallyAPIConfig.baseURL
+                    let anchorHeight = try await votingCrypto.syncVoteTree(roundId, chainNodeUrl)
+                    let vanWitness = try await votingCrypto.generateVanWitness(roundId, anchorHeight)
+                    print("[Voting] VAN witness: position=\(vanWitness.position), anchor=\(vanWitness.anchorHeight)")
 
-                        // Build vote commitment + ZKP #2 (stored in DB).
-                        // The builder internally decomposes weight, encrypts shares under EA pk,
-                        // and returns encrypted shares in the bundle.
-                        var builtBundle: VoteCommitmentBundle?
-                        for try await event in votingCrypto.buildVoteCommitment(
-                            roundId, hotkeySeed, networkId, proposalId, choice,
-                            vanWitness.authPath, vanWitness.position, vanWitness.anchorHeight
-                        ) {
-                            if case .completed(let bundle) = event {
-                                builtBundle = bundle
-                                await send(.voteCommitmentBuilt(bundle))
-                            }
+                    // Build vote commitment + ZKP #2 (stored in DB).
+                    // The builder internally decomposes weight, encrypts shares under EA pk,
+                    // and returns encrypted shares in the bundle.
+                    var builtBundle: VoteCommitmentBundle?
+                    for try await event in votingCrypto.buildVoteCommitment(
+                        roundId, hotkeySeed, networkId, proposalId, choice,
+                        vanWitness.authPath, vanWitness.position, vanWitness.anchorHeight
+                    ) {
+                        if case .completed(let bundle) = event {
+                            builtBundle = bundle
+                            await send(.voteCommitmentBuilt(bundle))
                         }
-                        guard let builtBundle else {
-                            throw VotingFlowError.missingVoteCommitmentBundle
-                        }
-
-                        // Sign the cast-vote TX (sighash + spend auth signature)
-                        let castVoteSig = try await votingCrypto.signCastVote(
-                            hotkeySeed, networkId, builtBundle
-                        )
-
-                        // Submit cast-vote TX to chain, polling for tree growth
-                        let preVCTree = try await votingAPI.fetchLatestCommitmentTree()
-                        let txResult = try await votingAPI.submitVoteCommitment(builtBundle, castVoteSig)
-                        await send(.voteCommitmentSubmitted(txResult.txHash))
-
-                        // Wait for the cast-vote TX to land and read the new tree position
-                        let postVCTree = try await votingAPI.awaitCommitmentTreeGrowth(preVCTree.nextIndex, 30)
-                        let vcTreePosition = postVCTree.nextIndex - 1
-                        let payloads = try await votingCrypto.buildSharePayloads(
-                            builtBundle.encShares, builtBundle, choice, vcTreePosition
-                        )
-                        try await votingAPI.delegateShares(payloads, roundId, builtBundle.anchorHeight)
-
-                        // Mark vote submitted in DB
-                        try await votingCrypto.markVoteSubmitted(roundId, proposalId)
-                    } catch: { error, _ in
-                        print("[Voting] vote submission failed: \(error)")
-                    },
-                    // Advance UI after brief pause
-                    .run { send in
-                        try await Task.sleep(for: .milliseconds(600))
-                        await send(.advanceAfterVote(nextId: nextId))
                     }
-                )
+                    guard let builtBundle else {
+                        throw VotingFlowError.missingVoteCommitmentBundle
+                    }
+
+                    // Sign the cast-vote TX (sighash + spend auth signature)
+                    let castVoteSig = try await votingCrypto.signCastVote(
+                        hotkeySeed, networkId, builtBundle
+                    )
+
+                    // Submit cast-vote TX to chain, polling for tree growth
+                    let preVCTree = try await votingAPI.fetchLatestCommitmentTree()
+                    let txResult = try await votingAPI.submitVoteCommitment(builtBundle, castVoteSig)
+                    await send(.voteCommitmentSubmitted(txResult.txHash))
+
+                    // Wait for the cast-vote TX to land and read the new tree position.
+                    // The chain appends vote_authority_note_new first, then vote_commitment,
+                    // so the new VAN is at nextIndex-2 and the VC is at nextIndex-1.
+                    let postVCTree = try await votingAPI.awaitCommitmentTreeGrowth(preVCTree.nextIndex, 30)
+                    let newVanPosition = UInt32(postVCTree.nextIndex) - 2
+                    let vcTreePosition = postVCTree.nextIndex - 1
+
+                    // Update VAN position so the next vote uses the new VAN leaf
+                    try await votingCrypto.storeVanPosition(roundId, newVanPosition)
+
+                    let payloads = try await votingCrypto.buildSharePayloads(
+                        builtBundle.encShares, builtBundle, choice, vcTreePosition
+                    )
+                    try await votingAPI.delegateShares(payloads, roundId)
+
+                    // Mark vote submitted in DB
+                    try await votingCrypto.markVoteSubmitted(roundId, proposalId)
+
+                    // Vote is on chain — advance to next proposal
+                    await send(.advanceAfterVote(nextId: nextId))
+                } catch: { error, send in
+                    print("[Voting] vote submission failed: \(error)")
+                    await send(.voteSubmissionFailed(proposalId: proposalId, error: error.localizedDescription))
+                }
 
             case .voteCommitmentBuilt(let bundle):
                 state.lastVoteCommitmentBundle = bundle
@@ -870,7 +910,16 @@ public struct Voting {
                 state.lastVoteCommitmentTxHash = txHash
                 return .none
 
+            case .voteSubmissionFailed(let proposalId, let error):
+                state.isSubmittingVote = false
+                state.voteSubmissionError = error
+                // Remove the optimistic vote since it didn't land on chain
+                state.votes.removeValue(forKey: proposalId)
+                return .none
+
             case .advanceAfterVote(let nextId):
+                state.isSubmittingVote = false
+                state.voteSubmissionError = nil
                 if case .proposalDetail = state.currentScreen {
                     if let nextId {
                         state.selectedProposalId = nextId
@@ -909,6 +958,86 @@ public struct Voting {
                     state.screenStack.removeLast()
                     state.screenStack.append(.proposalDetail(id: prevId))
                 }
+                return .none
+
+            // MARK: - Test Round Creation
+
+            case .createTestRound:
+                state.isCreatingTestRound = true
+                state.testRoundError = nil
+                let snapshotHeight: UInt64 = 3_235_470
+                return .run { [sdkSynchronizer, votingCrypto, votingAPI] send in
+                    // 1. Fetch tree state at snapshot height from lightwalletd
+                    let treeStateBytes = try await sdkSynchronizer.getTreeState(snapshotHeight)
+
+                    // 2. Extract nc_root from tree state
+                    let ncRoot = try votingCrypto.extractNcRoot(treeStateBytes)
+                    print("[Voting] nc_root: \(ncRoot.hexString)")
+
+                    // 3. Fetch nullifier_imt_root from IMT server
+                    guard let imtURL = URL(string: "\(imtServerBaseUrl)/root") else {
+                        throw VotingFlowError.missingActiveSession
+                    }
+                    let (imtData, _) = try await URLSession.shared.data(from: imtURL)
+                    guard let imtJson = try JSONSerialization.jsonObject(with: imtData) as? [String: Any],
+                          let rootHex = imtJson["root"] as? String else {
+                        throw ZallyTestRoundError.invalidIMTResponse
+                    }
+                    let nullifierImtRoot = Data(hexString: rootHex)
+                    print("[Voting] nullifier_imt_root: \(nullifierImtRoot.hexString)")
+
+                    // 4. Build session payload (ea_pk omitted — the chain auto-fills it)
+                    let voteEndTime = Int(Date().addingTimeInterval(5 * 24 * 3600).timeIntervalSince1970)
+                    let proposals: [[String: Any]] = MockVotingService.proposals.map { p in
+                        [
+                            "id": p.id,
+                            "title": p.title,
+                            "description": p.description
+                        ]
+                    }
+
+                    let payload: [String: Any] = [
+                        "creator": "zvote1admin",
+                        "snapshot_height": snapshotHeight,
+                        "snapshot_blockhash": Data(repeating: 0xAA, count: 32).base64EncodedString(),
+                        "proposals_hash": Data(repeating: 0xBB, count: 32).base64EncodedString(),
+                        "vote_end_time": voteEndTime,
+                        "nc_root": ncRoot.base64EncodedString(),
+                        "nullifier_imt_root": nullifierImtRoot.base64EncodedString(),
+                        "vk_zkp1": Data(repeating: 0xF1, count: 64).base64EncodedString(),
+                        "vk_zkp2": Data(repeating: 0xF2, count: 64).base64EncodedString(),
+                        "vk_zkp3": Data(repeating: 0xF3, count: 64).base64EncodedString(),
+                        "proposals": proposals
+                    ]
+
+                    // 5. POST to chain
+                    try await votingAPI.createTestSession(payload)
+                    print("[Voting] Test session created successfully")
+
+                    // 6. Poll until the new round is queryable (TX needs to land in a block)
+                    let deadline = Date().addingTimeInterval(30)
+                    while Date() < deadline {
+                        if let _ = try? await votingAPI.fetchActiveVotingSession() {
+                            break
+                        }
+                        try await Task.sleep(for: .seconds(1))
+                    }
+
+                    await send(.testRoundCreated)
+                } catch: { error, send in
+                    print("[Voting] Test round creation failed: \(error)")
+                    await send(.testRoundFailed(error.localizedDescription))
+                }
+
+            case .testRoundCreated:
+                state.isCreatingTestRound = false
+                state.testRoundError = nil
+                // Re-initialize the entire flow — new session should now be active
+                return .send(.initialize)
+
+            case .testRoundFailed(let error):
+                state.isCreatingTestRound = false
+                state.testRoundError = error
                 return .none
 
             // MARK: - Complete

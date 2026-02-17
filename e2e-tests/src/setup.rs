@@ -464,3 +464,27 @@ pub fn bootstrap_ceremony(ea_sk_bytes: &[u8], ea_pk_bytes: &[u8]) {
     wait_for_ceremony_confirmed(60_000).expect("ceremony should reach CONFIRMED via auto-ack");
     eprintln!("[E2E] Ceremony: CONFIRMED ✓");
 }
+
+/// Load the EA keypair from disk (paths from env vars or defaults).
+///
+/// Returns `(ea_sk_bytes, ea_pk_bytes)` as 32-byte arrays.
+pub fn load_ea_keypair() -> ([u8; 32], [u8; 32]) {
+    let home = std::env::var("HOME").expect("HOME env var must be set");
+
+    let ea_pk_path = std::env::var("ZALLY_EA_PK_PATH")
+        .unwrap_or_else(|_| format!("{}/.zallyd/ea.pk", home));
+    let ea_sk_path = std::env::var("ZALLY_EA_SK_PATH")
+        .unwrap_or_else(|_| format!("{}/.zallyd/ea.sk", home));
+
+    let ea_pk_bytes: [u8; 32] = std::fs::read(&ea_pk_path)
+        .unwrap_or_else(|e| panic!("failed to read EA PK from {}: {}", ea_pk_path, e))
+        .try_into()
+        .expect("EA PK must be exactly 32 bytes");
+
+    let ea_sk_bytes: [u8; 32] = std::fs::read(&ea_sk_path)
+        .unwrap_or_else(|e| panic!("failed to read EA SK from {}: {}", ea_sk_path, e))
+        .try_into()
+        .expect("EA SK must be exactly 32 bytes");
+
+    (ea_sk_bytes, ea_pk_bytes)
+}

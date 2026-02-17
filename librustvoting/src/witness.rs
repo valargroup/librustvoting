@@ -147,6 +147,22 @@ pub fn generate_note_witnesses(
     Ok(witnesses)
 }
 
+/// Extract the Orchard note commitment tree root from a protobuf-encoded TreeState.
+///
+/// Returns the 32-byte root as a Vec<u8>. This is the `nc_root` parameter needed
+/// when creating a voting session — it anchors ZKP #1 to a specific Orchard state.
+pub fn extract_nc_root(tree_state_bytes: &[u8]) -> Result<Vec<u8>, VotingError> {
+    let tree_state = TreeState::decode(tree_state_bytes).map_err(|e| VotingError::Internal {
+        message: format!("failed to decode TreeState protobuf: {}", e),
+    })?;
+
+    let orchard_ct = tree_state.orchard_tree().map_err(|e| VotingError::Internal {
+        message: format!("failed to parse orchard tree from TreeState: {}", e),
+    })?;
+
+    Ok(orchard_ct.root().to_bytes().to_vec())
+}
+
 /// Backwards-compatible single-note wrapper around generate_note_witnesses.
 /// Uses a stub approach when no wallet_db_path is available (FFI legacy path).
 pub fn generate_note_witness(

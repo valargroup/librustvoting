@@ -317,6 +317,23 @@ extension VotingCryptoClient: DependencyKey {
                                 networkId: networkId,
                                 accountIndex: accountIndex
                             )
+                            // Construct delegation action to generate and store alpha
+                            // before proof generation (mirrors buildGovernancePczt in Keystone path)
+                            let roundState = try db.getRoundState(roundId: roundId)
+                            let notes = try db.getWalletNotes(
+                                walletDbPath: walletDbPath,
+                                snapshotHeight: roundState.snapshotHeight,
+                                networkId: networkId
+                            )
+                            _ = try db.constructDelegationAction(
+                                roundId: roundId,
+                                notes: notes,
+                                fvkBytes: ffiInputs.fvkBytes,
+                                gDNewX: ffiInputs.gDNewX,
+                                pkDNewX: ffiInputs.pkDNewX,
+                                hotkeyRawAddress: ffiInputs.hotkeyRawAddress,
+                                addressIndex: accountIndex
+                            )
                             let result = try db.buildAndProveDelegation(
                                 roundId: roundId,
                                 walletDbPath: walletDbPath,
@@ -438,7 +455,16 @@ extension VotingCryptoClient: DependencyKey {
                             plaintextValue: $0.encShare.plaintextValue,
                             randomness: $0.encShare.randomness
                         ),
-                        treePosition: $0.treePosition
+                        treePosition: $0.treePosition,
+                        allEncShares: $0.allEncShares.map {
+                            EncryptedShare(
+                                c1: $0.c1,
+                                c2: $0.c2,
+                                shareIndex: $0.shareIndex,
+                                plaintextValue: $0.plaintextValue,
+                                randomness: $0.randomness
+                            )
+                        }
                     )
                 }
             },
@@ -507,6 +533,9 @@ extension VotingCryptoClient: DependencyKey {
                     sighash: ffiSig.sighash,
                     voteAuthSig: ffiSig.voteAuthSig
                 )
+            },
+            extractNcRoot: { treeStateBytes in
+                try ZcashVotingFFI.extractNcRoot(treeStateBytes: treeStateBytes)
             }
         )
     }

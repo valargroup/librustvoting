@@ -398,7 +398,7 @@ RustBuffer uniffi_zcash_voting_ffi_fn_func_build_share_payloads(RustBuffer enc_s
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_BUILD_VOTE_COMMITMENT
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_BUILD_VOTE_COMMITMENT
-RustBuffer uniffi_zcash_voting_ffi_fn_func_build_vote_commitment(RustBuffer hotkey_seed, uint32_t network_id, uint32_t address_index, uint64_t total_note_value, RustBuffer gov_comm_rand, RustBuffer voting_round_id, RustBuffer ea_pk, uint32_t proposal_id, uint32_t choice, RustBuffer van_auth_path, uint32_t van_position, uint32_t anchor_height, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_zcash_voting_ffi_fn_func_build_vote_commitment(RustBuffer hotkey_seed, uint32_t network_id, uint32_t address_index, uint64_t total_note_value, RustBuffer gov_comm_rand, RustBuffer voting_round_id, RustBuffer ea_pk, uint32_t proposal_id, uint32_t choice, RustBuffer van_auth_path, uint32_t van_position, uint32_t anchor_height, uint64_t proposal_authority, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_CONSTRUCT_DELEGATION_ACTION
@@ -414,6 +414,11 @@ RustBuffer uniffi_zcash_voting_ffi_fn_func_decompose_weight(uint64_t weight, Rus
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_ENCRYPT_SHARES
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_ENCRYPT_SHARES
 RustBuffer uniffi_zcash_voting_ffi_fn_func_encrypt_shares(RustBuffer shares, RustBuffer ea_pk, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_EXTRACT_NC_ROOT
+#define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_EXTRACT_NC_ROOT
+RustBuffer uniffi_zcash_voting_ffi_fn_func_extract_nc_root(RustBuffer tree_state_bytes, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_EXTRACT_SPEND_AUTH_SIG
@@ -765,6 +770,12 @@ uint16_t uniffi_zcash_voting_ffi_checksum_func_decompose_weight(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_CHECKSUM_FUNC_ENCRYPT_SHARES
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_CHECKSUM_FUNC_ENCRYPT_SHARES
 uint16_t uniffi_zcash_voting_ffi_checksum_func_encrypt_shares(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_CHECKSUM_FUNC_EXTRACT_NC_ROOT
+#define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_CHECKSUM_FUNC_EXTRACT_NC_ROOT
+uint16_t uniffi_zcash_voting_ffi_checksum_func_extract_nc_root(void
 
 );
 #endif

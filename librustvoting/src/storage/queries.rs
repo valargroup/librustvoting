@@ -405,14 +405,20 @@ pub struct Zkp2DelegationData {
     pub address_index: u32,
     pub ea_pk: Vec<u8>,
     pub voting_round_id: String,
+    /// Current proposal authority bitmask (starts at 65535, decremented per submitted vote).
+    pub proposal_authority: u64,
 }
 
+const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
+
 /// Load all fields ZKP #2 needs from the rounds table (persisted during delegation).
+/// Computes proposal_authority from submitted votes — each submitted vote clears its
+/// proposal's bit, so the next vote's VAN reconstruction matches what's in the VC tree.
 pub fn load_zkp2_inputs(
     conn: &Connection,
     round_id: &str,
 ) -> Result<Zkp2DelegationData, VotingError> {
-    conn.query_row(
+    let data = conn.query_row(
         "SELECT van_comm_rand, total_note_value, address_index, ea_pk, round_id \
          FROM rounds WHERE round_id = :round_id",
         named_params! { ":round_id": round_id },
@@ -423,11 +429,38 @@ pub fn load_zkp2_inputs(
                 address_index: row.get::<_, i64>(2)? as u32,
                 ea_pk: row.get(3)?,
                 voting_round_id: row.get(4)?,
+                proposal_authority: 0, // computed below
             })
         },
     )
     .map_err(|e| VotingError::InvalidInput {
         message: format!("failed to load ZKP2 inputs for round: {} ({})", round_id, e),
+    })?;
+
+    // Compute current proposal_authority by clearing bits for already-submitted votes.
+    let mut authority = MAX_PROPOSAL_AUTHORITY;
+    let mut stmt = conn
+        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND submitted = 1")
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare proposal_authority query: {}", e),
+        })?;
+    let rows = stmt
+        .query_map(named_params! { ":round_id": round_id }, |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to query submitted votes: {}", e),
+        })?;
+    for row in rows {
+        let pid = row.map_err(|e| VotingError::Internal {
+            message: format!("failed to read proposal_id: {}", e),
+        })? as u64;
+        authority &= !(1u64 << pid);
+    }
+
+    Ok(Zkp2DelegationData {
+        proposal_authority: authority,
+        ..data
     })
 }
 

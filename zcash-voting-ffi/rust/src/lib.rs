@@ -1211,6 +1211,7 @@ pub fn build_vote_commitment(
     van_auth_path: Vec<Vec<u8>>,
     van_position: u32,
     anchor_height: u32,
+    proposal_authority: u64,
 ) -> Result<VoteCommitmentBundle, VotingError> {
     let auth_path: Vec<[u8; 32]> = van_auth_path
         .into_iter()
@@ -1234,6 +1235,7 @@ pub fn build_vote_commitment(
         &auth_path,
         van_position,
         anchor_height,
+        proposal_authority,
         &reporter,
     )?
     .into())
@@ -1290,6 +1292,13 @@ pub fn sign_cast_vote(
         &alpha_v,
     )?
     .into())
+}
+
+/// Extract the Orchard note commitment tree root from a protobuf-encoded TreeState.
+/// Returns the 32-byte nc_root needed when creating a voting session.
+#[uniffi::export]
+pub fn extract_nc_root(tree_state_bytes: Vec<u8>) -> Result<Vec<u8>, VotingError> {
+    Ok(voting::extract_nc_root(&tree_state_bytes)?)
 }
 
 #[uniffi::export]

@@ -150,16 +150,33 @@ struct ProposalDetailView: View {
                   pending.proposalId == proposal.id else { return nil }
             return pending.choice
         }()
+        let votingEnabled = store.canConfirmVote
 
         VStack(spacing: 12) {
             if let confirmed = confirmedVote {
-                confirmedBanner(choice: confirmed)
+                if store.isSubmittingVote {
+                    submittingBanner(choice: confirmed)
+                } else {
+                    confirmedBanner(choice: confirmed)
+                }
+            } else if let error = store.voteSubmissionError {
+                voteErrorBanner(error: error, proposalId: proposal.id)
             } else {
+                if !store.isDelegationReady {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Preparing voting credentials...")
+                            .zFont(.regular, size: 13, style: Design.Text.secondary)
+                    }
+                    .padding(.bottom, 4)
+                }
+
                 voteButton(
                     title: "Support",
                     icon: "hand.thumbsup.fill",
                     color: .green,
-                    isSelected: pendingChoice == .support
+                    isSelected: pendingChoice == .support,
+                    enabled: votingEnabled
                 ) {
                     store.send(.castVote(proposalId: proposal.id, choice: .support))
                 }
@@ -168,7 +185,8 @@ struct ProposalDetailView: View {
                     title: "Oppose",
                     icon: "hand.thumbsdown.fill",
                     color: .red,
-                    isSelected: pendingChoice == .oppose
+                    isSelected: pendingChoice == .oppose,
+                    enabled: votingEnabled
                 ) {
                     store.send(.castVote(proposalId: proposal.id, choice: .oppose))
                 }
@@ -198,6 +216,54 @@ struct ProposalDetailView: View {
             RoundedRectangle(cornerRadius: 14)
                 .stroke(voteColor(choice).opacity(0.2), lineWidth: 1)
         )
+    }
+
+    @ViewBuilder
+    private func submittingBanner(choice: VoteChoice) -> some View {
+        HStack(spacing: 10) {
+            ProgressView()
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Submitting vote...")
+                    .zFont(.semiBold, size: 15, style: Design.Text.primary)
+                Text(choice.label)
+                    .zFont(.medium, size: 14, style: Design.Text.secondary)
+            }
+            Spacer()
+            VoteChip(choice: choice)
+        }
+        .padding(16)
+        .background(voteColor(choice).opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(voteColor(choice).opacity(0.2), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func voteErrorBanner(error: String, proposalId: UInt32) -> some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 20))
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Vote submission failed")
+                        .zFont(.semiBold, size: 15, style: Design.Text.primary)
+                    Text(error)
+                        .zFont(.regular, size: 13, style: Design.Text.secondary)
+                        .lineLimit(3)
+                }
+                Spacer()
+            }
+            .padding(16)
+            .background(Color.orange.opacity(0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Color.orange.opacity(0.2), lineWidth: 1)
+            )
+        }
     }
 
     // MARK: - Confirmation Overlay
@@ -256,7 +322,9 @@ struct ProposalDetailView: View {
                     if !canConfirm {
                         HStack(spacing: 8) {
                             ProgressView()
-                            Text("Processing previous vote...")
+                            Text(store.isSubmittingVote
+                                 ? "Submitting previous vote..."
+                                 : "Preparing voting credentials...")
                                 .zFont(.regular, size: 13, style: Design.Text.secondary)
                         }
                         .padding(.bottom, 16)
@@ -308,6 +376,7 @@ struct ProposalDetailView: View {
         icon: String,
         color: Color,
         isSelected: Bool,
+        enabled: Bool = true,
         action: @escaping () -> Void
     ) -> some View {
         Button {
@@ -326,13 +395,15 @@ struct ProposalDetailView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 16)
             .foregroundStyle(isSelected ? .white : color)
-            .background(isSelected ? color : color.opacity(0.1))
+            .background(isSelected ? color : color.opacity(enabled ? 0.1 : 0.05))
             .clipShape(RoundedRectangle(cornerRadius: 14))
             .overlay(
                 RoundedRectangle(cornerRadius: 14)
                     .stroke(color.opacity(0.3), lineWidth: isSelected ? 0 : 1)
             )
         }
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.5)
     }
 
     private func voteColor(_ choice: VoteChoice) -> Color {
