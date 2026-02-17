@@ -6,7 +6,7 @@ public enum MockVotingService {
         id: "nu7-sentiment-0xab3f7c91e2d4",
         title: "NU7 Sentiment Poll",
         description: "Community sentiment polling for proposed NU7 network upgrade features. Your shielded balance is used as voting weight.",
-        snapshotHeight: 3_235_467,
+        snapshotHeight: 3_235_470,
         snapshotDate: Calendar.current.date(byAdding: .day, value: -3, to: Date())!,
         votingStart: Calendar.current.date(byAdding: .day, value: -1, to: Date())!,
         votingEnd: Calendar.current.date(byAdding: .day, value: 5, to: Date())!,

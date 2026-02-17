@@ -786,7 +786,15 @@ public struct Voting {
                 return .none
 
             case .delegationProofFailed(let error):
-                state.delegationProofStatus = .failed(error)
+                let userMessage: String
+                if error.contains("total_weight must yield at least 1 ballot") {
+                    let weightStr = Zatoshi(Int64(state.votingWeight)).decimalString()
+                    let requiredStr = Zatoshi(12_500_000).decimalString()
+                    userMessage = "Your shielded balance at the snapshot (\(weightStr) ZEC) is below the minimum required to vote (\(requiredStr) ZEC)."
+                } else {
+                    userMessage = error
+                }
+                state.delegationProofStatus = .failed(userMessage)
                 return .none
 
             // MARK: - Proposal List
@@ -937,7 +945,7 @@ public struct Voting {
             case .createTestRound:
                 state.isCreatingTestRound = true
                 state.testRoundError = nil
-                let snapshotHeight: UInt64 = 3_235_467
+                let snapshotHeight: UInt64 = 3_235_470
                 return .run { [sdkSynchronizer, votingCrypto, votingAPI] send in
                     // 1. Fetch tree state at snapshot height from lightwalletd
                     let treeStateBytes = try await sdkSynchronizer.getTreeState(snapshotHeight)
