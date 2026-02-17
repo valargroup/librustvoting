@@ -24,11 +24,11 @@ use ff::PrimeField;
 use group::{Curve, GroupEncoding};
 use librustvoting::{NoopProgressReporter, VotingRoundParams};
 use orchard::keys::SpendAuthorizingKey;
+use orchard::share_reveal::builder::build_share_reveal;
+use orchard::share_reveal::{create_share_reveal_proof, verify_share_reveal_proof};
 use pasta_curves::{arithmetic::CurveAffine, pallas};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use orchard::share_reveal::builder::build_share_reveal;
-use orchard::share_reveal::{create_share_reveal_proof, verify_share_reveal_proof};
 use vote_commitment_tree::TreeClient;
 use vote_commitment_tree_client::http_sync_api::HttpTreeSyncApi;
 
@@ -48,10 +48,13 @@ fn block_wait() {
 #[ignore = "requires running chain: make init && make start"]
 fn voting_flow_librustvoting_path() {
     // ---- Setup: derive SpendingKey from seed (same ZIP-32 path as production) ----
-    log_step("Setup", "deriving SpendingKey from hotkey seed via ZIP-32...");
+    log_step(
+        "Setup",
+        "deriving SpendingKey from hotkey seed via ZIP-32...",
+    );
     let seed = [0x42u8; 64];
-    let sk = librustvoting::zkp2::derive_spending_key(&seed, 1)
-        .expect("derive_spending_key from seed");
+    let sk =
+        librustvoting::zkp2::derive_spending_key(&seed, 1).expect("derive_spending_key from seed");
 
     let mut rng = ChaCha20Rng::seed_from_u64(43);
     let (_elgamal_sk, elgamal_pk) = elgamal::keygen(&mut rng);
@@ -76,7 +79,11 @@ fn voting_flow_librustvoting_path() {
     log_step("Step 1", "create voting session");
     let (status, json) =
         post_json("/zally/v1/create-voting-session", &body).expect("POST create-voting-session");
-    assert_eq!(status, 200, "create session: HTTP {}, body={:?}", status, json);
+    assert_eq!(
+        status, 200,
+        "create session: HTTP {}, body={:?}",
+        status, json
+    );
     assert_eq!(
         json.get("code").and_then(|c| c.as_i64()).unwrap_or(-1),
         0,
@@ -86,15 +93,23 @@ fn voting_flow_librustvoting_path() {
     block_wait();
 
     // ---- Step 2: Delegate vote (real ZKP #1) ----
+    // The commitment tree is global across rounds/tests. Capture the current
+    // next_index so we can compute our VAN/VC positions relative to it.
+    let pre_delegate_next_index = commitment_tree_next_index().unwrap_or(0);
+    let van_position = pre_delegate_next_index;
     log_step("Step 2", "delegate vote (ZKP #1)");
     let deleg_body = delegate_vote_payload(&round_id, &delegation_bundle);
-    let (status, json) = post_json_accept_committed(
-        "/zally/v1/delegate-vote",
-        &deleg_body,
-        || commitment_tree_next_index().map(|n| n >= 1).unwrap_or(false),
-    )
+    let (status, json) = post_json_accept_committed("/zally/v1/delegate-vote", &deleg_body, || {
+        commitment_tree_next_index()
+            .map(|n| n >= pre_delegate_next_index + 1)
+            .unwrap_or(false)
+    })
     .expect("POST delegate-vote");
-    assert_eq!(status, 200, "delegate-vote: HTTP {}, body={:?}", status, json);
+    assert_eq!(
+        status, 200,
+        "delegate-vote: HTTP {}, body={:?}",
+        status, json
+    );
     assert_eq!(
         json.get("code").and_then(|c| c.as_i64()).unwrap_or(-1),
         0,
@@ -103,18 +118,24 @@ fn voting_flow_librustvoting_path() {
     );
     block_wait();
 
-    // ---- Step 3: Wait for tree to have root after delegation ----
-    // Only van_cmx is appended to the tree (cmx_new is not included).
-    log_step("Step 3", "waiting for commitment tree (1 leaf: van_cmx)");
+    // ---- Step 3: Wait for tree to include this delegation's VAN ----
+    // Only van_cmx is appended to the tree (cmx_new is not included), so this
+    // tx contributes exactly one new leaf at `van_position`.
+    log_step(
+        "Step 3",
+        &format!(
+            "waiting for commitment tree to include VAN at position {}",
+            van_position
+        ),
+    );
     let mut anchor_height: u32 = 0;
     for _ in 0..30 {
-        let (status, json) =
-            get_json("/zally/v1/commitment-tree/latest").expect("GET tree latest");
+        let (status, json) = get_json("/zally/v1/commitment-tree/latest").expect("GET tree latest");
         assert_eq!(status, 200);
         if let Some(tree) = json.get("tree") {
             let h = tree.get("height").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             let next_idx = tree.get("next_index").and_then(|x| x.as_u64()).unwrap_or(0);
-            if h > 0 && next_idx >= 1 {
+            if h > 0 && next_idx >= pre_delegate_next_index + 1 {
                 anchor_height = h;
                 assert!(tree.get("root").is_some());
                 break;
@@ -122,7 +143,10 @@ fn voting_flow_librustvoting_path() {
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    assert!(anchor_height > 0, "tree never reached 1 leaf after delegation");
+    assert!(
+        anchor_height > 0,
+        "tree never included delegated VAN leaf after delegation"
+    );
 
     // ---- Step 4: Create VotingDb and persist delegation data ----
     log_step("Step 4", "creating VotingDb, persisting delegation data");
@@ -148,14 +172,14 @@ fn voting_flow_librustvoting_path() {
             &conn,
             &round_id_hex,
             vote_proof_data.van_comm_rand.to_repr().as_ref(),
-            &[],          // dummy_nullifiers (not needed for ZKP #2)
-            &[0u8; 32],   // rho_signed
-            &[],          // padded_cmx
-            &[0u8; 32],   // nf_signed
+            &[],        // dummy_nullifiers (not needed for ZKP #2)
+            &[0u8; 32], // rho_signed
+            &[],        // padded_cmx
+            &[0u8; 32], // nf_signed
             &delegation_bundle.cmx_new,
-            &[0u8; 32],   // alpha
-            &[0u8; 32],   // rseed_signed
-            &[0u8; 32],   // rseed_output
+            &[0u8; 32], // alpha
+            &[0u8; 32], // rseed_signed
+            &[0u8; 32], // rseed_output
             &delegation_bundle.van_cmx,
             vote_proof_data.total_note_value,
             1, // address_index (matches delegation output_recipient = fvk.address_at(1, External))
@@ -163,20 +187,26 @@ fn voting_flow_librustvoting_path() {
         .expect("store_delegation_data");
     }
 
-    // VAN is at position 0 in the commitment tree (only van_cmx is appended)
-    db.store_van_position(&round_id_hex, 0)
-        .expect("store_van_position");
+    // VAN position is global tree index captured before delegation.
+    db.store_van_position(
+        &round_id_hex,
+        u32::try_from(van_position).expect("van_position fits in u32"),
+    )
+    .expect("store_van_position");
 
     // ---- Step 5: Sync tree via TreeClient + HttpTreeSyncApi ----
     log_step("Step 5", "syncing vote commitment tree from chain");
     let base_url = api::base_url();
     let mut tree_client = TreeClient::empty();
-    tree_client.mark_position(0); // VAN at position 0
+    tree_client.mark_position(van_position);
     let sync_api = HttpTreeSyncApi::new(&base_url);
     tree_client
         .sync(&sync_api)
         .expect("TreeClient sync from chain");
-    assert!(tree_client.size() >= 1, "tree should have >= 1 leaf after sync");
+    assert!(
+        tree_client.size() >= van_position + 1,
+        "tree should include VAN leaf after sync"
+    );
     log_step(
         "Step 5",
         &format!(
@@ -187,11 +217,17 @@ fn voting_flow_librustvoting_path() {
     );
 
     // ---- Step 6: Generate VAN witness ----
-    log_step("Step 6", "generating VAN witness at position 0");
+    log_step(
+        "Step 6",
+        &format!("generating VAN witness at position {}", van_position),
+    );
     let witness = tree_client
-        .witness(0, anchor_height)
+        .witness(van_position, anchor_height)
         .expect("generate VAN witness");
-    assert_eq!(witness.position(), 0);
+    assert_eq!(
+        witness.position(),
+        u32::try_from(van_position).expect("van_position fits in u32")
+    );
 
     // Verify local root matches on-chain root
     let local_root = tree_client
@@ -218,11 +254,7 @@ fn voting_flow_librustvoting_path() {
     }
 
     // Convert witness auth_path to byte arrays for build_vote_commitment
-    let auth_path_bytes: Vec<[u8; 32]> = witness
-        .auth_path()
-        .iter()
-        .map(|h| h.to_bytes())
-        .collect();
+    let auth_path_bytes: Vec<[u8; 32]> = witness.auth_path().iter().map(|h| h.to_bytes()).collect();
 
     // ---- Step 7: Build vote commitment via VotingDb (real ZKP #2) ----
     log_step(
@@ -237,7 +269,7 @@ fn voting_flow_librustvoting_path() {
             1, // proposal_id
             1, // choice (oppose)
             &auth_path_bytes,
-            0,             // van_position
+            u32::try_from(van_position).expect("van_position fits in u32"),
             anchor_height,
             &NoopProgressReporter,
         )
@@ -252,6 +284,60 @@ fn voting_flow_librustvoting_path() {
     assert!(!bundle.proof.is_empty());
     assert_eq!(bundle.enc_shares.len(), 4, "should have 4 encrypted shares");
     assert_eq!(bundle.shares_hash.len(), 32);
+
+    // ---- Step 7b: Local proof verification (same binary = same VK) ----
+    // Reconstruct the Instance from bundle + test context to verify the proof
+    // locally before submitting to the chain. If this fails, the proof itself
+    // has wrong public inputs; if it passes but on-chain fails, the chain's
+    // verifier reconstructs different inputs.
+    {
+        log_step("Step 7b", "verifying vote proof locally...");
+        let van_nf: pallas::Base = Option::from(pallas::Base::from_repr(
+            bundle.van_nullifier.as_slice().try_into().unwrap(),
+        ))
+        .expect("van_nullifier");
+        let r_vpk_arr: [u8; 32] = bundle.r_vpk_bytes.as_slice().try_into().unwrap();
+        let r_vpk_affine: pallas::Affine =
+            Option::from(pallas::Affine::from_bytes(&r_vpk_arr)).expect("decompress r_vpk");
+        let r_vpk_coords = r_vpk_affine.coordinates().unwrap();
+        let van_new: pallas::Base = Option::from(pallas::Base::from_repr(
+            bundle
+                .vote_authority_note_new
+                .as_slice()
+                .try_into()
+                .unwrap(),
+        ))
+        .expect("van_new");
+        let vc: pallas::Base = Option::from(pallas::Base::from_repr(
+            bundle.vote_commitment.as_slice().try_into().unwrap(),
+        ))
+        .expect("vote_commitment");
+        let vri: pallas::Base =
+            Option::from(pallas::Base::from_repr(round_id)).expect("voting_round_id");
+
+        // EA PK coordinates
+        let ea_pk_point: pallas::Point =
+            Option::from(pallas::Point::from_bytes(&ea_pk_bytes)).expect("ea_pk point");
+        let ea_pk_affine = ea_pk_point.to_affine();
+        let ea_coords = ea_pk_affine.coordinates().unwrap();
+
+        let instance = orchard::vote_proof::Instance::from_parts(
+            van_nf,
+            *r_vpk_coords.x(),
+            *r_vpk_coords.y(),
+            van_new,
+            vc,
+            local_root,
+            pallas::Base::from(anchor_height as u64),
+            pallas::Base::from(1u64), // proposal_id
+            vri,
+            *ea_coords.x(),
+            *ea_coords.y(),
+        );
+        orchard::vote_proof::verify_vote_proof(&bundle.proof, &instance)
+            .expect("LOCAL vote proof verification must pass");
+        log_step("Step 7b", "local verification PASSED");
+    }
 
     // ---- Step 8: Submit cast-vote TX ----
     log_step("Step 8", "computing sighash and signing cast-vote TX");
@@ -326,15 +412,16 @@ fn voting_flow_librustvoting_path() {
         &sighash,
         &vote_auth_sig_bytes,
     );
+    let cast_target_next_index = van_position + 3; // delegation leaf + 2 cast leaves
 
     let (status, json) = {
         let mut last = None;
         for attempt in 1..=3 {
-            let result = post_json_accept_committed(
-                "/zally/v1/cast-vote",
-                &cast_body,
-                || commitment_tree_next_index().map(|n| n >= 3).unwrap_or(false),
-            )
+            let result = post_json_accept_committed("/zally/v1/cast-vote", &cast_body, || {
+                commitment_tree_next_index()
+                    .map(|n| n >= cast_target_next_index)
+                    .unwrap_or(false)
+            })
             .expect("POST cast-vote");
             let code = result.1.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
             if result.0 == 200 && code == 0 {
@@ -367,14 +454,15 @@ fn voting_flow_librustvoting_path() {
 
     // ---- Step 9: Build share payloads via VotingDb ----
     log_step("Step 9", "building share payloads via VotingDb");
-    // After cast-vote, tree has 3 leaves: van_cmx(0),
-    // vote_authority_note_new(1), vote_commitment(2). VC is at position 2.
+    // Relative to this test's VAN leaf, cast-vote appends:
+    // vote_authority_note_new at +1 and vote_commitment at +2.
+    let vc_position = van_position + 2;
     let payloads = db
         .build_share_payloads(
             &bundle.enc_shares,
             &bundle,
-            1, // vote_decision (oppose)
-            2, // vc_tree_position
+            1,           // vote_decision (oppose)
+            vc_position, // vc_tree_position
         )
         .expect("VotingDb::build_share_payloads");
     assert_eq!(payloads.len(), 4, "should have 4 share payloads");
@@ -382,20 +470,24 @@ fn voting_flow_librustvoting_path() {
         assert_eq!(p.shares_hash, bundle.shares_hash);
         assert_eq!(p.proposal_id, 1);
         assert_eq!(p.vote_decision, 1);
-        assert_eq!(p.tree_position, 2);
+        assert_eq!(p.tree_position, vc_position);
         assert_eq!(p.enc_share.share_index, i as u32);
     }
     log_step("Step 9", "share payloads built and validated");
 
     // ---- Step 10: Build real ZKP #3 and submit reveal-share ----
-    log_step("Step 10", "building share reveal proof (ZKP #3, share 0)...");
+    log_step(
+        "Step 10",
+        "building share reveal proof (ZKP #3, share 0)...",
+    );
 
-    // Resync tree to include cast-vote leaves (VAN_new at 1, VC at 2)
-    tree_client.mark_position(2); // VC position
-    tree_client.sync(&sync_api).expect("resync tree after cast-vote");
+    // Resync tree to include cast-vote leaves and witness VC.
+    tree_client.mark_position(vc_position);
+    tree_client
+        .sync(&sync_api)
+        .expect("resync tree after cast-vote");
 
-    let (_, tree_json) =
-        get_json("/zally/v1/commitment-tree/latest").expect("GET tree latest");
+    let (_, tree_json) = get_json("/zally/v1/commitment-tree/latest").expect("GET tree latest");
     let reveal_anchor = tree_json
         .get("tree")
         .and_then(|t| t.get("height"))
@@ -403,7 +495,9 @@ fn voting_flow_librustvoting_path() {
         .unwrap_or(anchor_height as u64) as u32;
 
     // Build VC auth path from tree
-    let vc_witness = tree_client.witness(2, reveal_anchor).expect("VC tree witness");
+    let vc_witness = tree_client
+        .witness(vc_position, reveal_anchor)
+        .expect("VC tree witness");
     let vc_auth_path: [pallas::Base; 24] = {
         let path_hashes = vc_witness.auth_path();
         let mut arr = [pallas::Base::zero(); 24];
@@ -442,18 +536,22 @@ fn voting_flow_librustvoting_path() {
 
     let share_0_bundle = build_share_reveal(
         vc_auth_path,
-        2, // vc_position
+        u32::try_from(vc_position).expect("vc_position fits in u32"), // vc_position
         enc_c1_x,
         enc_c2_x,
-        0, // share_index
+        0,                        // share_index
         pallas::Base::from(1u64), // proposal_id
         pallas::Base::from(1u64), // vote_decision
         vri,
     );
-    let share_0_proof = create_share_reveal_proof(share_0_bundle.circuit.clone(), &share_0_bundle.instance);
+    let share_0_proof =
+        create_share_reveal_proof(share_0_bundle.circuit.clone(), &share_0_bundle.instance);
     verify_share_reveal_proof(&share_0_proof, &share_0_bundle.instance)
         .expect("local share reveal proof verification must pass");
-    log_step("Step 10", "ZKP #3 verified locally, submitting reveal-share");
+    log_step(
+        "Step 10",
+        "ZKP #3 verified locally, submitting reveal-share",
+    );
 
     let share_0_nullifier = share_0_bundle.instance.share_nullifier.to_repr();
     let share = &payloads[0].enc_share;
@@ -468,13 +566,15 @@ fn voting_flow_librustvoting_path() {
         1, // vote_decision
         &share_0_proof,
     );
-    let (status, json) = post_json_accept_committed(
-        "/zally/v1/reveal-share",
-        &reveal_body,
-        || tally_has_proposal(&hex::encode(&round_id), 1),
-    )
+    let (status, json) = post_json_accept_committed("/zally/v1/reveal-share", &reveal_body, || {
+        tally_has_proposal(&hex::encode(&round_id), 1)
+    })
     .expect("POST reveal-share");
-    assert_eq!(status, 200, "reveal-share: HTTP {}, body={:?}", status, json);
+    assert_eq!(
+        status, 200,
+        "reveal-share: HTTP {}, body={:?}",
+        status, json
+    );
     assert_eq!(
         json.get("code").and_then(|c| c.as_i64()).unwrap_or(-1),
         0,
@@ -485,8 +585,8 @@ fn voting_flow_librustvoting_path() {
     // ---- Step 11: Verify tally has the encrypted ciphertext ----
     log_step("Step 11", "verifying tally has ciphertext");
     block_wait();
-    let (status, json) = get_json(&format!("/zally/v1/tally/{}/1", hex::encode(&round_id)))
-        .expect("GET tally");
+    let (status, json) =
+        get_json(&format!("/zally/v1/tally/{}/1", hex::encode(&round_id))).expect("GET tally");
     assert_eq!(status, 200);
     let tally = json.get("tally").expect("tally");
     assert!(
@@ -495,11 +595,23 @@ fn voting_flow_librustvoting_path() {
     );
 
     // ---- Step 12: Wait for TALLYING ----
-    log_step("Step 12", "waiting for TALLYING (up to 250s)");
+    // Compute dynamic timeout based on actual vote_end_time (like voting_flow.rs).
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs();
+    let secs_until_vote_end = fields_for_db.vote_end_time.saturating_sub(now_secs);
+    let wait_for_tallying_ms = (secs_until_vote_end.saturating_add(120))
+        .saturating_mul(1000)
+        .clamp(120_000, 900_000);
+    log_step(
+        "Step 12",
+        &format!("waiting for TALLYING (up to {}s)", wait_for_tallying_ms / 1000),
+    );
     wait_for_round_status(
         &hex::encode(&round_id),
         SESSION_STATUS_TALLYING,
-        250_000,
+        wait_for_tallying_ms,
         3_000,
     )
     .expect("wait for TALLYING");
