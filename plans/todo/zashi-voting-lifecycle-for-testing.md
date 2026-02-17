@@ -216,7 +216,11 @@ The key refactor: split the `.initialize` effect so notes/hotkey loading only ha
 
 **`VotingView.swift`** — Add `.tallying` and `.results` cases to `screenView(for:)` and `screenId(_:)`.
 
-### 10. Tallying view
+### 10. Share submission progress UI
+
+**`ProposalDetailView.swift`** or **`VotingStore.swift`** — After a vote is cast and shares are submitted to the helper server, show how many of the 4 reveal-share transactions have landed on-chain. Query the commitment tree leaves or chain state to determine how many shares have been confirmed. Display as a progress indicator (e.g., "2 of 4 shares confirmed") so the voter has visibility into the reveal process.
+
+### 11. Tallying view
 
 **`ProposalListView.swift`** — Add a `TallyingView` struct (keeps voting views in one place):
 
@@ -225,7 +229,7 @@ The key refactor: split the `.initialize` effect so notes/hotkey loading only ha
 - Spinner
 - Dismiss button in toolbar
 
-### 11. Results view
+### 12. Results view
 
 **New file: `ResultsView.swift`** in the Voting feature directory.
 
@@ -239,7 +243,7 @@ Shows:
 
 `.startNewRound` action: clears `activeSession`, `tallyResults`, `lastKnownRoundId`, and re-sends `.initialize`.
 
-### 12. TallyResult model
+### 13. TallyResult model
 
 Already exists in `VotingModels.swift` (lines 519-535) with `Entry(decision: UInt32, amount: UInt64)` — no changes needed.
 
@@ -277,7 +281,8 @@ Already exists in `VotingModels.swift` (lines 519-535) with `Entry(decision: UIn
 4. `VotingAPIClientInterface.swift` + `VotingAPIClientLiveKey.swift` (new API methods)
 5. `VotingStore.swift` (state, actions, init rework, polling — bulk of work)
 6. `VotingView.swift` + `ProposalListView.swift` (routing + UI changes)
-7. `ResultsView.swift` (new results view)
+7. Share submission progress UI (track reveal-share confirmations per proposal)
+8. `ResultsView.swift` (new results view)
 
 ## Verification
 
@@ -289,6 +294,7 @@ Already exists in `VotingModels.swift` (lines 519-535) with `Entry(decision: UIn
 5. Test with no active round: should show info card (without create button if flag off, with create button + snapshot height field if flag on)
 6. Test round creation with custom snapshot height
 7. Test status polling: after creating a round, set a short `vote_end_time` and observe ACTIVE → TALLYING → FINALIZED transitions in the UI
-8. Test results display: verify per-proposal tallies show correct ZEC amounts
-9. Test "Start New Round" flow from results screen
-10. TestFlight build: override xcconfig URLs to point at deployed chain/helper/IMT servers, verify full flow works remotely
+8. Test share progress: after voting, verify the UI shows reveal-share confirmations incrementing (e.g., "2 of 4 shares confirmed")
+9. Test results display: verify per-proposal tallies show correct ZEC amounts
+10. Test "Start New Round" flow from results screen
+11. TestFlight build: override xcconfig URLs to point at deployed chain/helper/IMT servers, verify full flow works remotely
