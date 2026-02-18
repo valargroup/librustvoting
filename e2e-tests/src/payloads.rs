@@ -87,8 +87,10 @@ pub fn create_voting_session_payload(
         "vk_zkp2": to_base64(&[0xf2u8; 64]),
         "vk_zkp3": to_base64(&[0xf3u8; 64]),
         "proposals": [
-            { "id": 1, "title": "Proposal A", "description": "First proposal" },
-            { "id": 2, "title": "Proposal B", "description": "Second proposal" },
+            { "id": 1, "title": "Proposal A", "description": "First proposal",
+              "options": [{"index": 0, "label": "Support"}, {"index": 1, "label": "Oppose"}] },
+            { "id": 2, "title": "Proposal B", "description": "Second proposal",
+              "options": [{"index": 0, "label": "Support"}, {"index": 1, "label": "Oppose"}] },
         ],
     });
     (body, fields, round_id)
