@@ -371,8 +371,17 @@ impl VotingDb {
 
         // Store proof bytes for debugging/recovery
         queries::store_proof(&conn, round_id, &result.proof)?;
-        // Persist rk and gov_nullifiers — needed later for delegation TX submission
-        queries::store_proof_result_fields(&conn, round_id, &result.rk, &result.gov_nullifiers)?;
+        // Persist prover's public inputs — needed later for delegation TX submission.
+        // Overwrites nf_signed/cmx_new from constructDelegationAction since the prover
+        // generates its own random rseeds for the signed/output notes.
+        queries::store_proof_result_fields(
+            &conn,
+            round_id,
+            &result.rk,
+            &result.gov_nullifiers,
+            &result.nf_signed,
+            &result.cmx_new,
+        )?;
         queries::update_round_phase(&conn, round_id, RoundPhase::DelegationProved)?;
 
         let total_elapsed = total_start.elapsed();

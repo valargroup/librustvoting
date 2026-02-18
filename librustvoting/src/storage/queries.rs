@@ -516,6 +516,8 @@ pub fn store_proof_result_fields(
     round_id: &str,
     rk: &[u8],
     gov_nullifiers: &[Vec<u8>],
+    nf_signed: &[u8],
+    cmx_new: &[u8],
 ) -> Result<(), VotingError> {
     // Serialize gov_nullifiers as flat blob: [nf0 (32 bytes) | nf1 | nf2 | nf3]
     let gov_nullifiers_blob: Vec<u8> = gov_nullifiers
@@ -525,11 +527,14 @@ pub fn store_proof_result_fields(
 
     let rows = conn
         .execute(
-            "UPDATE rounds SET rk = :rk, gov_nullifiers_blob = :gov_nullifiers_blob \
+            "UPDATE rounds SET rk = :rk, gov_nullifiers_blob = :gov_nullifiers_blob, \
+             nf_signed = :nf_signed, cmx_new = :cmx_new \
              WHERE round_id = :round_id",
             named_params! {
                 ":rk": rk,
                 ":gov_nullifiers_blob": gov_nullifiers_blob,
+                ":nf_signed": nf_signed,
+                ":cmx_new": cmx_new,
                 ":round_id": round_id,
             },
         )
