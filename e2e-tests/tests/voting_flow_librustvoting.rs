@@ -307,6 +307,7 @@ fn voting_flow_librustvoting_path() {
             1, // network_id (testnet)
             1, // proposal_id
             1, // choice (oppose)
+            2, // num_options
             &auth_path_bytes,
             u32::try_from(van_position).expect("van_position fits in u32"),
             anchor_height,
@@ -499,7 +500,8 @@ fn voting_flow_librustvoting_path() {
         .build_share_payloads(
             &bundle.enc_shares,
             &bundle,
-            1,           // vote_decision (oppose)
+            1, // vote_decision (oppose)
+            2, // num_options
             vc_position, // vc_tree_position
         )
         .expect("VotingDb::build_share_payloads");
