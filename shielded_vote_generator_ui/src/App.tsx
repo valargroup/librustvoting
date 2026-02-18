@@ -589,11 +589,14 @@ function SettingsPage() {
   const [connError, setConnError] = useState("");
   const [ceremony, setCeremony] = useState<chainApi.CeremonyState | null>(null);
   const [helperStatus, setHelperStatus] = useState<chainApi.HelperStatus | null>(null);
-  const [voteManager, setVoteManager] = useState<string>("");
+  const [voteManager, setVoteManager] = useState<string>(
+    () => localStorage.getItem("zally-vm-address") ?? ""
+  );
   // TEMPORARY: persist vote manager private key in localStorage for dev convenience.
   // Remove before production — private keys must never be stored in the browser.
+  const DEFAULT_VM_PRIVKEY = "b7e910eded435dd4e19c581b9a0b8e65104dcc4ebca8a1d55aa5c803e72ba2ee";
   const [vmPrivKey, setVmPrivKey] = useState(
-    () => localStorage.getItem("zally-vm-privkey-TEMP") ?? ""
+    () => localStorage.getItem("zally-vm-privkey-TEMP") ?? DEFAULT_VM_PRIVKEY
   );
   const [vmPrivKeyVisible, setVmPrivKeyVisible] = useState(false);
   const [vmDerivedAddr, setVmDerivedAddr] = useState("");
@@ -914,6 +917,10 @@ function SettingsPage() {
                     <p className="text-[10px] text-text-muted mb-1.5">
                       secp256k1 key of current vote manager or a bonded validator.
                       The tx will be signed locally in your browser.
+                      <br />
+                      <span className="text-text-muted/60">
+                        Test key: b7e910eded435dd4e19c581b9a0b8e65104dcc4ebca8a1d55aa5c803e72ba2ee
+                      </span>
                     </p>
                     <div className="relative">
                       <input
@@ -944,6 +951,17 @@ function SettingsPage() {
                         Key must be exactly 64 hex characters ({vmPrivKey.length}/64)
                       </p>
                     )}
+                    <button
+                      onClick={() => {
+                        localStorage.setItem("zally-vm-privkey-TEMP", vmPrivKey);
+                        setVmStatus("ok");
+                        setVmTxHash("");
+                      }}
+                      disabled={!vmPrivKey || vmPrivKey.length !== 64}
+                      className="mt-1.5 px-3 py-1 bg-surface-3 hover:bg-surface-2 text-text-secondary rounded-lg text-[10px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      Save key locally
+                    </button>
                   </div>
                   <div>
                     <label className="block text-[11px] text-text-secondary mb-1">
@@ -972,7 +990,7 @@ function SettingsPage() {
                         <Loader2 size={12} className="animate-spin" /> Signing & broadcasting...
                       </span>
                     ) : (
-                      "Sign & broadcast SetVoteManager"
+                      "Sign & broadcast on-chain"
                     )}
                   </button>
                   {vmStatus === "ok" && (
