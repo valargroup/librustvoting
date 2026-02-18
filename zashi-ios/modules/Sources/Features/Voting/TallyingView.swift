@@ -22,7 +22,7 @@ struct TallyingView: View {
                             .frame(width: 72, height: 72)
                         Image(systemName: "clock.badge.checkmark")
                             .font(.system(size: 32))
-                            .foregroundStyle(.accentColor)
+                            .foregroundStyle(Color.accentColor)
                     }
 
                     // Title

@@ -65,7 +65,7 @@ struct ResultsView: View {
             // Status pill
             Text("Finalized")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.accentColor)
+                .foregroundStyle(Color.accentColor)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
                 .background(Color.accentColor.opacity(0.12))
