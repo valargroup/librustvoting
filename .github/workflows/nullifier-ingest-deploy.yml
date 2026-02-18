@@ -67,6 +67,13 @@ jobs:
         with:
           name: nullifier-ingest-binaries
 
+      - name: Flatten artifacts
+        run: |
+          mv nullifier-ingest/service/target/release/query-server .
+          mv nullifier-ingest/service/target/release/ingest-nfs .
+          mv nullifier-ingest/docs/nullifier-query-server.service .
+          mv sdk/deploy/Caddyfile .
+
       - name: Deploy via SSH
         uses: appleboy/scp-action@v0.1.7
         with:
