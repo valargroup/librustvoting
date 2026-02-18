@@ -12,11 +12,12 @@ pub fn base_url() -> String {
     std::env::var("ZALLY_API_URL").unwrap_or_else(|_| "http://127.0.0.1:1318".to_string())
 }
 
-/// Helper server URL (default port 9091 to avoid the chain's gRPC on 9090).
+/// Helper server URL. Since the helper is now integrated into zallyd, it
+/// serves on the same port as the chain REST API (default 1318).
 /// Uses 127.0.0.1 instead of localhost to avoid IPv6 resolution issues on macOS.
 pub fn helper_server_url() -> String {
     std::env::var("HELPER_SERVER_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:9091".to_string())
+        .unwrap_or_else(|_| base_url())
 }
 
 /// POST JSON to the helper server. Retries on connection errors.

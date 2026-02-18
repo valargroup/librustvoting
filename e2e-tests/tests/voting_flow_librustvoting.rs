@@ -1,13 +1,12 @@
 //! E2E test exercising the full voting flow: VotingDb → TreeClient →
-//! real ZKP #2 → cast-vote → helper server (ZKP #3) → tally → finalize.
+//! real ZKP #2 → cast-vote → helper (ZKP #3) → tally → finalize.
 //!
 //! Validates that the full library stack works: DB persistence of delegation
 //! data, HTTP tree sync, witness generation, and proof generation all through
 //! the librustvoting / vote-commitment-tree-client APIs.
 //!
-//! Share payloads are sent to the helper server, which generates ZKP #3 and
-//! submits reveal-share TXs to the chain. Set `HELPER_SERVER_URL` to the
-//! helper server address (default: `http://localhost:9090`).
+//! Share payloads are sent to the helper (integrated into zallyd), which
+//! generates ZKP #3 and submits reveal-share TXs to the chain.
 
 use base64::Engine;
 use blake2b_simd::Params as Blake2bParams;
