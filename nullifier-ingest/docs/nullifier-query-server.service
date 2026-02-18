@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/nullifier-ingest
-Environment="DB_PATH=/opt/nullifier-ingest/nullifiers.db"
+Environment="DATA_DIR=/opt/nullifier-ingest"
 Environment="PORT=3000"
 ExecStart=/opt/nullifier-ingest/query-server
 Restart=on-failure
