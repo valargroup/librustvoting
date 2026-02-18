@@ -7,7 +7,7 @@ import { JsonView } from "./components/JsonView";
 import { RoundEditor } from "./components/RoundEditor";
 import { RoundsList } from "./components/RoundsList";
 import { useStore } from "./store/useStore";
-import { Shield, Plus, FileText, Settings, Settings2, RefreshCw, CheckCircle2, AlertCircle, X, Loader2, Server, Database, Eye, EyeOff } from "lucide-react";
+import { Shield, Plus, FileText, Settings, Settings2, RefreshCw, CheckCircle2, AlertCircle, X, Loader2, Server, Database, Eye, EyeOff, Wallet, Unplug } from "lucide-react";
 import type { Proposal, RoundSettings, RoundStatus, VotingRound } from "./types";
 import {
   LIGHTWALLETD_ENDPOINTS,
@@ -17,11 +17,14 @@ import {
 } from "./store/rpc";
 import * as chainApi from "./api/chain";
 import * as cosmosTx from "./api/cosmosTx";
+import { useWallet } from "./hooks/useWallet";
+import type { UseWallet } from "./hooks/useWallet";
 
 type Section = "about" | "rounds" | "builder" | "json" | "downloads" | "preview" | "settings" | "chain-rounds";
 
 function App() {
   const store = useStore();
+  const wallet = useWallet();
   const [section, setSection] = useState<Section>("about");
   const [filter, setFilter] = useState<RoundStatus | "all">("all");
   const importRef = useRef<HTMLInputElement>(null);
@@ -90,12 +93,10 @@ function App() {
     const round = store.rounds.find((r) => r.id === publishModal);
     if (!round) return;
 
-    const privKey = localStorage.getItem("zally-vm-privkey-TEMP") ?? "";
-    if (!privKey || privKey.length !== 64) {
+    if (!wallet.signer) {
       setPublishStatus("error");
       setPublishError(
-        "Vote manager private key not configured. " +
-        "Go to Settings → Voting chain → Set VoteManager address and enter your 64-character hex key."
+        "No wallet connected. Go to Settings → Wallet to connect Keplr or enter a dev key."
       );
       return;
     }
@@ -123,7 +124,7 @@ function App() {
     setPublishError("");
     try {
       const base = chainApi.getApiBase();
-      const result = await cosmosTx.createVotingSession(base, privKey, {
+      const result = await cosmosTx.createVotingSession(base, wallet.signer, {
         snapshotHeight,
         voteEndTime,
         proposals,
@@ -141,7 +142,7 @@ function App() {
       setPublishError(err instanceof Error ? err.message : String(err));
       setPublishStatus("error");
     }
-  }, [publishModal, store]);
+  }, [publishModal, store, wallet.signer]);
 
   const handleNavigate = useCallback(
     (s: string) => {
@@ -316,12 +317,13 @@ function App() {
         {section === "chain-rounds" && <ChainRoundsView />}
 
         {/* Settings */}
-        {section === "settings" && <SettingsPage />}
+        {section === "settings" && <SettingsPage wallet={wallet} />}
 
         {/* Publish modal */}
         {publishModal && (
           <PublishModal
             round={store.rounds.find((r) => r.id === publishModal)!}
+            signerAddress={wallet.address}
             status={publishStatus}
             result={publishResult}
             error={publishError}
@@ -577,7 +579,7 @@ function useNullifierStatus() {
   return { data, loading, error, refresh };
 }
 
-function SettingsPage() {
+function SettingsPage({ wallet }: { wallet: UseWallet }) {
   const [rpcUrl, setRpcUrl] = useState(getStoredRpc);
   const chain = useChainInfo();
   const nullifier = useNullifierStatus();
@@ -588,28 +590,21 @@ function SettingsPage() {
   const [connStatus, setConnStatus] = useState<"idle" | "testing" | "ok" | "error">("idle");
   const [connError, setConnError] = useState("");
   const [ceremony, setCeremony] = useState<chainApi.CeremonyState | null>(null);
+  const [latestBlock, setLatestBlock] = useState<chainApi.LatestBlockInfo | null>(null);
   const [helperStatus, setHelperStatus] = useState<chainApi.HelperStatus | null>(null);
-  const [voteManager, setVoteManager] = useState<string>(
+  const [voteManager, setVoteManagerAddr] = useState<string>(
     () => localStorage.getItem("zally-vm-address") ?? ""
   );
-  // TEMPORARY: persist vote manager private key in localStorage for dev convenience.
-  // Remove before production — private keys must never be stored in the browser.
-  const DEFAULT_VM_PRIVKEY = "b7e910eded435dd4e19c581b9a0b8e65104dcc4ebca8a1d55aa5c803e72ba2ee";
-  const [vmPrivKey, setVmPrivKey] = useState(
-    () => localStorage.getItem("zally-vm-privkey-TEMP") ?? DEFAULT_VM_PRIVKEY
-  );
-  const [vmPrivKeyVisible, setVmPrivKeyVisible] = useState(false);
-  const [vmDerivedAddr, setVmDerivedAddr] = useState("");
+
+  // Dev private key connection (collapsible section)
+  const [devKey, setDevKey] = useState("");
+  const [devKeyVisible, setDevKeyVisible] = useState(false);
+
+  // Set VoteManager flow
   const [vmNewAddr, setVmNewAddr] = useState("");
   const [vmStatus, setVmStatus] = useState<"idle" | "sending" | "ok" | "error">("idle");
   const [vmError, setVmError] = useState("");
   const [vmTxHash, setVmTxHash] = useState("");
-
-  // TEMPORARY: sync private key to localStorage (see useState initializer above).
-  const handleVmPrivKeyChange = (key: string) => {
-    setVmPrivKey(key);
-    localStorage.setItem("zally-vm-privkey-TEMP", key);
-  };
 
   const handleRpcChange = (url: string) => {
     setRpcUrl(url);
@@ -623,16 +618,23 @@ function SettingsPage() {
   };
 
   const handleTestConnection = async () => {
+    // Ensure the displayed URL is persisted so apiBase() uses it.
+    chainApi.setChainUrl(chainUrl);
     setConnStatus("testing");
     setConnError("");
     try {
+      // Query the standard Cosmos SDK blocks endpoint first — this is the
+      // most reliable way to confirm the chain is reachable.
+      const block = await chainApi.getLatestBlock();
+      setLatestBlock(block);
+
       const [state, vm, helper] = await Promise.all([
         chainApi.testConnection(),
         chainApi.getVoteManager(),
         chainApi.getHelperStatus().catch(() => null),
       ]);
       setCeremony(state);
-      setVoteManager(vm.address || "");
+      setVoteManagerAddr(vm.address || "");
       setHelperStatus(helper);
       setConnStatus("ok");
     } catch (err) {
@@ -641,39 +643,25 @@ function SettingsPage() {
     }
   };
 
-  // Derive bech32 address whenever the private key changes.
-  // Only run the async derivation when the key is the right length; the JSX
-  // guards display on vmPrivKey.length === 64 so stale state is never shown.
-  useEffect(() => {
-    if (!vmPrivKey || vmPrivKey.length !== 64) return;
-    let cancelled = false;
-    cosmosTx
-      .deriveAddress(vmPrivKey)
-      .then((addr) => {
-        if (!cancelled) setVmDerivedAddr(addr);
-      })
-      .catch(() => {
-        if (!cancelled) setVmDerivedAddr("");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [vmPrivKey]);
+  const handleConnectDev = async () => {
+    await wallet.connectDev(devKey);
+  };
 
   const handleSetVoteManager = async () => {
+    if (!wallet.signer) return;
     setVmStatus("sending");
     setVmError("");
     setVmTxHash("");
     try {
       const base = chainApi.getApiBase();
-      const result = await cosmosTx.setVoteManager(base, vmPrivKey, vmNewAddr);
+      const result = await cosmosTx.setVoteManager(base, wallet.signer, vmNewAddr);
       if (result.code !== 0) {
         setVmError(result.log || `tx failed with code ${result.code}`);
         setVmStatus("error");
       } else {
         setVmTxHash(result.tx_hash);
         setVmStatus("ok");
-        setVoteManager(vmNewAddr);
+        setVoteManagerAddr(vmNewAddr);
       }
     } catch (err) {
       setVmError(err instanceof Error ? err.message : String(err));
@@ -834,6 +822,98 @@ function SettingsPage() {
           )}
         </div>
 
+        {/* Wallet */}
+        <h2 className="text-xs font-semibold text-text-primary mb-3">
+          Wallet
+        </h2>
+        <div className="bg-surface-1 border border-border-subtle rounded-xl p-5 space-y-4 mb-6">
+          {wallet.address ? (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Wallet size={14} className="text-success" />
+                  <span className="text-xs text-text-secondary">Connected</span>
+                  <span className="text-[10px] text-text-muted">
+                    ({wallet.source === "keplr" ? "Keplr" : "dev key"})
+                  </span>
+                </div>
+                <button
+                  onClick={wallet.disconnect}
+                  className="flex items-center gap-1 px-2 py-1 text-[10px] text-text-muted hover:text-danger hover:bg-danger/10 rounded transition-colors cursor-pointer"
+                >
+                  <Unplug size={10} /> Disconnect
+                </button>
+              </div>
+              <div className="bg-surface-2 rounded-lg px-3 py-2">
+                <p className="text-[10px] text-text-muted mb-0.5">Address</p>
+                <p className="text-[11px] text-text-primary font-mono break-all">
+                  {wallet.address}
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <button
+                onClick={wallet.connect}
+                disabled={wallet.connecting}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-accent/90 hover:bg-accent text-surface-0 rounded-lg text-xs font-semibold transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {wallet.connecting ? (
+                  <><Loader2 size={14} className="animate-spin" /> Connecting...</>
+                ) : (
+                  <><Wallet size={14} /> Connect Keplr</>
+                )}
+              </button>
+
+              {wallet.error && (
+                <div className="flex items-start gap-1.5 text-[11px] text-danger">
+                  <AlertCircle size={12} className="mt-0.5 shrink-0" />
+                  <span>{wallet.error}</span>
+                </div>
+              )}
+
+              <details className="group">
+                <summary className="text-[11px] text-text-muted cursor-pointer hover:text-text-secondary">
+                  Developer: connect with private key
+                </summary>
+                <div className="mt-2 space-y-2">
+                  <div className="relative">
+                    <input
+                      type={devKeyVisible ? "text" : "password"}
+                      value={devKey}
+                      onChange={(e) => setDevKey(e.target.value.trim())}
+                      placeholder="64-character hex private key"
+                      spellCheck={false}
+                      autoComplete="off"
+                      className="w-full px-3 py-2 pr-9 bg-surface-2 border border-border-subtle rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50 font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setDevKeyVisible((v) => !v)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-text-muted hover:text-text-secondary cursor-pointer"
+                      title={devKeyVisible ? "Hide" : "Show"}
+                    >
+                      {devKeyVisible ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                  </div>
+                  {devKey.length > 0 && devKey.length !== 64 && (
+                    <p className="text-[10px] text-warning">
+                      Key must be exactly 64 hex characters ({devKey.length}/64)
+                    </p>
+                  )}
+                  <button
+                    onClick={handleConnectDev}
+                    disabled={devKey.length !== 64 || wallet.connecting}
+                    className="px-3 py-1.5 bg-surface-3 hover:bg-surface-2 text-text-secondary rounded-lg text-[11px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    Connect
+                  </button>
+                </div>
+              </details>
+            </div>
+          )}
+        </div>
+
         {/* Voting chain */}
         <h2 className="text-xs font-semibold text-text-primary mb-3">
           Voting chain
@@ -866,8 +946,16 @@ function SettingsPage() {
           </div>
 
           {connStatus === "ok" && (
-            <div className="flex items-center gap-1.5 text-[11px] text-success">
-              <CheckCircle2 size={12} /> Connected
+            <div className="space-y-2">
+              <div className="flex items-center gap-1.5 text-[11px] text-success">
+                <CheckCircle2 size={12} /> Connected
+              </div>
+              {latestBlock && (
+                <>
+                  <SettingsStubRow label="Chain ID" value={latestBlock.chainId} />
+                  <SettingsStubRow label="Latest height" value={latestBlock.height.toLocaleString()} />
+                </>
+              )}
             </div>
           )}
           {connStatus === "error" && (
@@ -905,113 +993,68 @@ function SettingsPage() {
                 </span>
               </div>
 
-              <details className="group">
-                <summary className="text-[11px] text-accent cursor-pointer hover:text-accent-glow">
-                  Set VoteManager address
-                </summary>
-                <div className="mt-3 space-y-3">
-                  <div>
-                    <label className="block text-[11px] text-text-secondary mb-1">
-                      Signer private key (hex)
-                    </label>
-                    <p className="text-[10px] text-text-muted mb-1.5">
-                      secp256k1 key of current vote manager or a bonded validator.
-                      The tx will be signed locally in your browser.
-                      <br />
-                      <span className="text-text-muted/60">
-                        Test key: b7e910eded435dd4e19c581b9a0b8e65104dcc4ebca8a1d55aa5c803e72ba2ee
-                      </span>
-                    </p>
-                    <div className="relative">
+              {wallet.signer && (
+                <details className="group">
+                  <summary className="text-[11px] text-accent cursor-pointer hover:text-accent-glow">
+                    Set VoteManager address
+                  </summary>
+                  <div className="mt-3 space-y-3">
+                    <div className="bg-surface-2 rounded-lg px-3 py-2">
+                      <p className="text-[10px] text-text-muted mb-0.5">Signing as</p>
+                      <p className="text-[11px] text-text-primary font-mono break-all">
+                        {wallet.address}
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-text-secondary mb-1">
+                        New VoteManager address
+                      </label>
                       <input
-                        type={vmPrivKeyVisible ? "text" : "password"}
-                        value={vmPrivKey}
-                        onChange={(e) => handleVmPrivKeyChange(e.target.value.trim())}
-                        placeholder="64-character hex private key"
-                        spellCheck={false}
-                        autoComplete="off"
-                        className="w-full px-3 py-2 pr-9 bg-surface-2 border border-border-subtle rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50 font-mono"
+                        type="text"
+                        value={vmNewAddr}
+                        onChange={(e) => setVmNewAddr(e.target.value)}
+                        placeholder="zvote1..."
+                        className="w-full px-3 py-2 bg-surface-2 border border-border-subtle rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50 font-mono"
                       />
-                      <button
-                        type="button"
-                        onClick={() => setVmPrivKeyVisible((v) => !v)}
-                        className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-text-muted hover:text-text-secondary cursor-pointer"
-                        title={vmPrivKeyVisible ? "Hide" : "Show"}
-                      >
-                        {vmPrivKeyVisible ? <EyeOff size={14} /> : <Eye size={14} />}
-                      </button>
                     </div>
-                    {vmPrivKey.length === 64 && vmDerivedAddr && (
-                      <p className="text-[10px] text-text-muted mt-1 font-mono">
-                        Signer: {vmDerivedAddr}
-                      </p>
-                    )}
-                    {vmPrivKey.length > 0 && vmPrivKey.length !== 64 && (
-                      <p className="text-[10px] text-warning mt-1">
-                        Key must be exactly 64 hex characters ({vmPrivKey.length}/64)
-                      </p>
-                    )}
                     <button
-                      onClick={() => {
-                        localStorage.setItem("zally-vm-privkey-TEMP", vmPrivKey);
-                        setVmStatus("ok");
-                        setVmTxHash("");
-                      }}
-                      disabled={!vmPrivKey || vmPrivKey.length !== 64}
-                      className="mt-1.5 px-3 py-1 bg-surface-3 hover:bg-surface-2 text-text-secondary rounded-lg text-[10px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                      onClick={handleSetVoteManager}
+                      disabled={!vmNewAddr || vmStatus === "sending"}
+                      className="px-3 py-1.5 bg-accent/90 hover:bg-accent text-surface-0 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
                     >
-                      Save key locally
-                    </button>
-                  </div>
-                  <div>
-                    <label className="block text-[11px] text-text-secondary mb-1">
-                      New VoteManager address
-                    </label>
-                    <input
-                      type="text"
-                      value={vmNewAddr}
-                      onChange={(e) => setVmNewAddr(e.target.value)}
-                      placeholder="zvote1..."
-                      className="w-full px-3 py-2 bg-surface-2 border border-border-subtle rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50 font-mono"
-                    />
-                  </div>
-                  <button
-                    onClick={handleSetVoteManager}
-                    disabled={
-                      !vmPrivKey ||
-                      vmPrivKey.length !== 64 ||
-                      !vmNewAddr ||
-                      vmStatus === "sending"
-                    }
-                    className="px-3 py-1.5 bg-accent/90 hover:bg-accent text-surface-0 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
-                  >
-                    {vmStatus === "sending" ? (
-                      <span className="flex items-center gap-1.5">
-                        <Loader2 size={12} className="animate-spin" /> Signing & broadcasting...
-                      </span>
-                    ) : (
-                      "Sign & broadcast on-chain"
-                    )}
-                  </button>
-                  {vmStatus === "ok" && (
-                    <div className="bg-success/10 border border-success/30 rounded-lg p-2.5">
-                      <p className="text-[11px] text-success font-semibold">
-                        VoteManager updated
-                      </p>
-                      {vmTxHash && (
-                        <p className="text-[10px] text-text-secondary font-mono mt-0.5 break-all">
-                          TX: {vmTxHash}
-                        </p>
+                      {vmStatus === "sending" ? (
+                        <span className="flex items-center gap-1.5">
+                          <Loader2 size={12} className="animate-spin" /> Signing & broadcasting...
+                        </span>
+                      ) : (
+                        "Sign & broadcast on-chain"
                       )}
-                    </div>
-                  )}
-                  {vmStatus === "error" && (
-                    <div className="bg-danger/10 border border-danger/30 rounded-lg p-2.5">
-                      <p className="text-[11px] text-danger">{vmError}</p>
-                    </div>
-                  )}
-                </div>
-              </details>
+                    </button>
+                    {vmStatus === "ok" && (
+                      <div className="bg-success/10 border border-success/30 rounded-lg p-2.5">
+                        <p className="text-[11px] text-success font-semibold">
+                          VoteManager updated
+                        </p>
+                        {vmTxHash && (
+                          <p className="text-[10px] text-text-secondary font-mono mt-0.5 break-all">
+                            TX: {vmTxHash}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                    {vmStatus === "error" && (
+                      <div className="bg-danger/10 border border-danger/30 rounded-lg p-2.5">
+                        <p className="text-[11px] text-danger">{vmError}</p>
+                      </div>
+                    )}
+                  </div>
+                </details>
+              )}
+              {!wallet.signer && connStatus === "ok" && (
+                <p className="text-[10px] text-text-muted">
+                  Connect a wallet above to sign VoteManager transactions.
+                </p>
+              )}
             </div>
           )}
 
@@ -1104,6 +1147,7 @@ function SettingsStubRow({
 
 function PublishModal({
   round,
+  signerAddress,
   status,
   result,
   error,
@@ -1111,6 +1155,7 @@ function PublishModal({
   onClose,
 }: {
   round: VotingRound;
+  signerAddress: string | null;
   status: "idle" | "publishing" | "ok" | "error";
   result: string;
   error: string;
@@ -1149,6 +1194,14 @@ function PublishModal({
                 round.settings.endTime
                   ? new Date(round.settings.endTime).toLocaleString()
                   : "7 days from now (default)"
+              }
+            />
+            <SettingsStubRow
+              label="Signer"
+              value={
+                signerAddress
+                  ? `${signerAddress.slice(0, 12)}...${signerAddress.slice(-6)}`
+                  : "No wallet connected"
               }
             />
           </div>

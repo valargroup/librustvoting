@@ -11,19 +11,24 @@ export function setChainUrl(url: string) {
   localStorage.setItem(CHAIN_URL_KEY, url);
 }
 
-// In dev mode the Vite proxy forwards /zally/* to the chain (relative paths).
-// In production the user sets the chain URL (e.g. https://…sslip.io) via the UI
-// which is stored in localStorage and used directly.
+// In dev mode the Vite proxy forwards /zally/* and /cosmos/* to the chain
+// (relative paths). The proxy target is set at Vite startup from VITE_CHAIN_URL.
+// If the user has explicitly saved a chain URL via the Settings UI, use it
+// directly so that changing the URL at runtime actually takes effect (the Vite
+// proxy target is static and won't follow runtime changes).
 function apiBase(): string {
-  const url = getChainUrl();
+  const explicit = localStorage.getItem(CHAIN_URL_KEY);
+  if (explicit) {
+    return explicit;
+  }
+  // No explicit override — use the Vite dev proxy when available.
   if (
-    url === DEFAULT_CHAIN_URL &&
     typeof window !== "undefined" &&
     window.location.port === "5173"
   ) {
     return "";
   }
-  return url;
+  return DEFAULT_CHAIN_URL;
 }
 
 /** Return the resolved API base URL for use by other modules (e.g. cosmosTx). */
@@ -119,6 +124,21 @@ export async function getCeremonyState(): Promise<CeremonyState> {
 
 // Alias: test connection by fetching ceremony state.
 export const testConnection = getCeremonyState;
+
+export interface LatestBlockInfo {
+  chainId: string;
+  height: number;
+}
+
+export async function getLatestBlock(): Promise<LatestBlockInfo> {
+  const data = await fetchJson<{
+    block?: { header?: { chain_id?: string; height?: string } };
+  }>("/cosmos/base/tendermint/v1beta1/blocks/latest");
+  return {
+    chainId: data.block?.header?.chain_id ?? "",
+    height: parseInt(data.block?.header?.height ?? "0", 10),
+  };
+}
 
 export async function getVoteManager(): Promise<{ address: string }> {
   return fetchJson<{ address: string }>("/zally/v1/vote-manager");

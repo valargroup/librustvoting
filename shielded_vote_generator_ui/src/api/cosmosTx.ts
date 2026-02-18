@@ -5,21 +5,20 @@
 // directly in the browser using cosmjs and broadcast via the chain's REST
 // API (/cosmos/tx/v1beta1/txs).
 
+import type { OfflineDirectSigner } from "@cosmjs/proto-signing";
 import {
-  DirectSecp256k1Wallet,
   Registry,
   makeSignDoc,
   makeAuthInfoBytes,
   encodePubkey,
 } from "@cosmjs/proto-signing";
 import { encodeSecp256k1Pubkey } from "@cosmjs/amino";
-import { fromHex, toBase64, fromBase64 } from "@cosmjs/encoding";
+import { toBase64, fromBase64 } from "@cosmjs/encoding";
 import { TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx";
 import { SignMode } from "cosmjs-types/cosmos/tx/signing/v1beta1/signing";
 import type { BroadcastResult } from "./chain";
 
-const BECH32_PREFIX = "zvote";
-const DEFAULT_GAS = "200000";
+const DEFAULT_GAS = "0";
 
 // ── Protobuf mini-writer ────────────────────────────────────────
 
@@ -273,7 +272,7 @@ async function broadcastTxRest(
 
 interface SignAndBroadcastOptions {
   apiBase: string;
-  privateKeyHex: string;
+  signer: OfflineDirectSigner;
   messages: Array<{ typeUrl: string; value: Record<string, unknown> }>;
   memo?: string;
   gas?: string;
@@ -281,14 +280,12 @@ interface SignAndBroadcastOptions {
 
 async function signAndBroadcast({
   apiBase,
-  privateKeyHex,
+  signer,
   messages,
   memo = "",
   gas = DEFAULT_GAS,
 }: SignAndBroadcastOptions): Promise<BroadcastResult> {
-  const privkey = fromHex(privateKeyHex);
-  const wallet = await DirectSecp256k1Wallet.fromKey(privkey, BECH32_PREFIX);
-  const [account] = await wallet.getAccounts();
+  const [account] = await signer.getAccounts();
 
   const [{ accountNumber, sequence }, chainId] = await Promise.all([
     fetchAccountInfo(apiBase, account.address),
@@ -302,7 +299,7 @@ async function signAndBroadcast({
   const gasLimit = parseInt(gas, 10);
   const authInfoBytes = makeAuthInfoBytes(
     [{ pubkey, sequence }],
-    [],
+    [{ denom: "uzvote", amount: "0" }],
     gasLimit,
     undefined,
     undefined,
@@ -310,7 +307,7 @@ async function signAndBroadcast({
   );
 
   const signDoc = makeSignDoc(txBodyBytes, authInfoBytes, chainId, accountNumber);
-  const { signature, signed } = await wallet.signDirect(account.address, signDoc);
+  const { signature, signed } = await signer.signDirect(account.address, signDoc);
 
   const txRaw = TxRaw.fromPartial({
     bodyBytes: signed.bodyBytes,
@@ -342,34 +339,24 @@ const STUB_VK_ZKP3            = filledBytes(0xf3, 64);
 // ── Public API ──────────────────────────────────────────────────
 
 /**
- * Derive the bech32 address from a hex-encoded secp256k1 private key.
- */
-export async function deriveAddress(privateKeyHex: string): Promise<string> {
-  const privkey = fromHex(privateKeyHex);
-  const wallet = await DirectSecp256k1Wallet.fromKey(privkey, BECH32_PREFIX);
-  const [account] = await wallet.getAccounts();
-  return account.address;
-}
-
-/**
  * Sign and broadcast a MsgSetVoteManager transaction.
  *
- * The `creator` field is derived from the private key (the signer must be
- * the current vote manager or a bonded validator).
+ * The `creator` field is derived from the signer (must be the current vote
+ * manager or a bonded validator).
  */
 export async function setVoteManager(
   apiBase: string,
-  privateKeyHex: string,
+  signer: OfflineDirectSigner,
   newManager: string,
 ): Promise<BroadcastResult> {
-  const signerAddress = await deriveAddress(privateKeyHex);
+  const [account] = await signer.getAccounts();
   return signAndBroadcast({
     apiBase,
-    privateKeyHex,
+    signer,
     messages: [
       {
         typeUrl: "/zvote.v1.MsgSetVoteManager",
-        value: { creator: signerAddress, newManager },
+        value: { creator: account.address, newManager },
       },
     ],
   });
@@ -383,7 +370,7 @@ export async function setVoteManager(
  */
 export async function createVotingSession(
   apiBase: string,
-  privateKeyHex: string,
+  signer: OfflineDirectSigner,
   params: {
     snapshotHeight: number;
     voteEndTime: number;
@@ -396,15 +383,15 @@ export async function createVotingSession(
     }>;
   },
 ): Promise<BroadcastResult> {
-  const signerAddress = await deriveAddress(privateKeyHex);
+  const [account] = await signer.getAccounts();
   return signAndBroadcast({
     apiBase,
-    privateKeyHex,
+    signer,
     messages: [
       {
         typeUrl: "/zvote.v1.MsgCreateVotingSession",
         value: {
-          creator: signerAddress,
+          creator: account.address,
           snapshotHeight: params.snapshotHeight,
           snapshotBlockhash: STUB_SNAPSHOT_BLOCKHASH,
           proposalsHash: STUB_PROPOSALS_HASH,
