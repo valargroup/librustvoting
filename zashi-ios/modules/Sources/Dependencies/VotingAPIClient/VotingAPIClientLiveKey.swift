@@ -10,11 +10,11 @@ actor ZallyAPIConfigStore {
     static let shared = ZallyAPIConfigStore()
 
     /// Primary vote server URL (serves both chain API and helper endpoints).
-    var baseURL = "http://localhost:1318"
+    var baseURL = "http://46.101.255.48:1318"
     /// All vote server URLs from CDN config (used for share distribution).
-    var voteServerURLs: [String] = ["http://localhost:1318"]
+    var voteServerURLs: [String] = ["http://46.101.255.48:1318"]
     /// Primary nullifier IMT provider URL.
-    var nullifierProviderURL = "http://localhost:3000"
+    var nullifierProviderURL = "http://46.101.255.48:3000"
 
     func configure(from config: VotingServiceConfig) {
         if let first = config.voteServers.first {
@@ -261,9 +261,9 @@ extension VotingAPIClient: DependencyKey {
                     print("[VotingAPI] CDN config fetch failed: \(error)")
                 }
 
-                // 3. Fall back to localhost defaults
-                print("[VotingAPI] Using localhost fallback config")
-                return .localhost
+                // 3. Fall back to deployed dev server defaults
+                print("[VotingAPI] Using fallback config (deployed dev server)")
+                return .fallback
             },
             configureURLs: { config in
                 await ZallyAPIConfigStore.shared.configure(from: config)

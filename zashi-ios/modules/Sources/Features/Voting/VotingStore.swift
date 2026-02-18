@@ -341,12 +341,12 @@ public struct Voting {
 
             case .initialize:
                 return .run { [votingAPI] send in
-                    // 1. Fetch service config (local override → CDN → localhost fallback)
+                    // 1. Fetch service config (local override → CDN → deployed dev server fallback)
                     let config = try await votingAPI.fetchServiceConfig()
                     await send(.serviceConfigLoaded(config))
                 } catch: { error, send in
                     print("[Voting] Service config fetch failed: \(error)")
-                    await send(.serviceConfigLoaded(.localhost))
+                    await send(.serviceConfigLoaded(.fallback))
                 }
 
             case .serviceConfigLoaded(let config):
@@ -779,7 +779,7 @@ public struct Voting {
                 let isKeystoneUser = state.isKeystoneUser
                 let roundName = state.votingRound.title
                 // IMT server URL from resolved service config
-                let imtServerUrl = state.serviceConfig?.nullifierProviders.first?.url ?? "http://localhost:3000"
+                let imtServerUrl = state.serviceConfig?.nullifierProviders.first?.url ?? "http://46.101.255.48:3000"
                 return .merge(
                     // Subscribe to DB state stream (follows SDKSynchronizer pattern)
                     .publisher {
@@ -918,7 +918,7 @@ public struct Voting {
                 let networkId: UInt32 = network.networkType == .mainnet ? 0 : 1
                 let accountIndex: UInt32 = 0
                 // IMT server URL from resolved service config
-                let imtServerUrl = state.serviceConfig?.nullifierProviders.first?.url ?? "http://localhost:3000"
+                let imtServerUrl = state.serviceConfig?.nullifierProviders.first?.url ?? "http://46.101.255.48:3000"
                 return .run { [votingCrypto, votingAPI, mnemonic, walletStorage] send in
                     let senderPhrase = try walletStorage.exportWallet().seedPhrase.value()
                     let senderSeed = try mnemonic.toSeed(senderPhrase)
@@ -1015,7 +1015,7 @@ public struct Voting {
                 let network = zcashSDKEnvironment.network
                 let networkId: UInt32 = network.networkType == .mainnet ? 0 : 1
                 let nextId = nextUnvotedId(after: proposalId, in: state)
-                let chainNodeUrl = state.serviceConfig?.voteServers.first?.url ?? "http://localhost:1318"
+                let chainNodeUrl = state.serviceConfig?.voteServers.first?.url ?? "http://46.101.255.48:1318"
 
                 return .run { [votingAPI, votingCrypto, mnemonic, walletStorage] send in
                     // Derive hotkey seed (same seed used during delegation)

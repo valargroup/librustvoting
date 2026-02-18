@@ -38,9 +38,10 @@ public struct VotingServiceConfig: Codable, Equatable, Sendable {
     public static let localOverrideFilename = "voting-config-local.json"
 
     /// Default config used when both local override and CDN are unavailable.
-    public static let localhost = VotingServiceConfig(
+    /// Points at the deployed dev server so TestFlight builds work without CDN.
+    public static let fallback = VotingServiceConfig(
         version: 1,
-        voteServers: [ServiceEndpoint(url: "http://localhost:1318", label: "Localhost")],
-        nullifierProviders: [ServiceEndpoint(url: "http://localhost:3000", label: "Localhost")]
+        voteServers: [ServiceEndpoint(url: "http://46.101.255.48:1318", label: "Primary")],
+        nullifierProviders: [ServiceEndpoint(url: "http://46.101.255.48:3000", label: "Primary")]
     )
 }
