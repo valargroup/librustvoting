@@ -520,6 +520,19 @@ interface NullifierStatus {
   nullifier_count: number;
 }
 
+const NULLIFIER_BASE_URL = import.meta.env.VITE_NULLIFIER_URL || "";
+
+function nullifierApiBase(): string {
+  if (
+    !NULLIFIER_BASE_URL &&
+    typeof window !== "undefined" &&
+    window.location.port === "5173"
+  ) {
+    return "/nullifier";
+  }
+  return NULLIFIER_BASE_URL || "/nullifier";
+}
+
 function useNullifierStatus() {
   const [data, setData] = useState<NullifierStatus | null>(null);
   const [loading, setLoading] = useState(false);
@@ -528,7 +541,7 @@ function useNullifierStatus() {
   const refresh = useCallback(() => {
     setLoading(true);
     setError(null);
-    fetch("/nullifier/status")
+    fetch(`${nullifierApiBase()}/status`)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
