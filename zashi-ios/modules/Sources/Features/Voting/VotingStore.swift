@@ -593,11 +593,10 @@ public struct Voting {
                 let network = zcashSDKEnvironment.network
                 let walletDbPath = databaseFiles.dataDbURLFor(network).path
                 return .run { [sdkSynchronizer, votingCrypto] send in
-                    // Check if this round already exists and is past delegation
+                    // Check if this round already exists and delegation is fully complete
+                    // (proof generated AND VAN position stored on chain)
                     let existingState = try? await votingCrypto.getRoundState(roundId)
-                    let alreadyAuthorized = existingState.map {
-                        $0.phase == .delegationProved || $0.phase == .voteReady
-                    } ?? false
+                    let alreadyAuthorized = existingState?.proofGenerated ?? false
 
                     if alreadyAuthorized {
                         await send(.roundResumeChecked(alreadyAuthorized: true))

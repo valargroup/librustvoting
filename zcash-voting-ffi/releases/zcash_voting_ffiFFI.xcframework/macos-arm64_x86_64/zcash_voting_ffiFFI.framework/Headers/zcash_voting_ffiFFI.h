@@ -293,12 +293,12 @@ RustBuffer uniffi_zcash_voting_ffi_fn_method_votingdatabase_build_governance_pcz
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_METHOD_VOTINGDATABASE_BUILD_SHARE_PAYLOADS
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_METHOD_VOTINGDATABASE_BUILD_SHARE_PAYLOADS
-RustBuffer uniffi_zcash_voting_ffi_fn_method_votingdatabase_build_share_payloads(void*_Nonnull ptr, RustBuffer enc_shares, RustBuffer commitment, uint32_t vote_decision, uint64_t vc_tree_position, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_zcash_voting_ffi_fn_method_votingdatabase_build_share_payloads(void*_Nonnull ptr, RustBuffer enc_shares, RustBuffer commitment, uint32_t vote_decision, uint32_t num_options, uint64_t vc_tree_position, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_METHOD_VOTINGDATABASE_BUILD_VOTE_COMMITMENT
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_METHOD_VOTINGDATABASE_BUILD_VOTE_COMMITMENT
-RustBuffer uniffi_zcash_voting_ffi_fn_method_votingdatabase_build_vote_commitment(void*_Nonnull ptr, RustBuffer round_id, RustBuffer hotkey_seed, uint32_t network_id, uint32_t proposal_id, uint32_t choice, RustBuffer van_auth_path, uint32_t van_position, uint32_t anchor_height, uint64_t progress, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_zcash_voting_ffi_fn_method_votingdatabase_build_vote_commitment(void*_Nonnull ptr, RustBuffer round_id, RustBuffer hotkey_seed, uint32_t network_id, uint32_t proposal_id, uint32_t choice, uint32_t num_options, RustBuffer van_auth_path, uint32_t van_position, uint32_t anchor_height, uint64_t progress, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_METHOD_VOTINGDATABASE_CLEAR_ROUND
@@ -393,12 +393,12 @@ RustBuffer uniffi_zcash_voting_ffi_fn_func_build_governance_pczt(RustBuffer note
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_BUILD_SHARE_PAYLOADS
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_BUILD_SHARE_PAYLOADS
-RustBuffer uniffi_zcash_voting_ffi_fn_func_build_share_payloads(RustBuffer enc_shares, RustBuffer commitment, uint32_t vote_decision, uint64_t vc_tree_position, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_zcash_voting_ffi_fn_func_build_share_payloads(RustBuffer enc_shares, RustBuffer commitment, uint32_t vote_decision, uint32_t num_options, uint64_t vc_tree_position, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_BUILD_VOTE_COMMITMENT
 #define UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_BUILD_VOTE_COMMITMENT
-RustBuffer uniffi_zcash_voting_ffi_fn_func_build_vote_commitment(RustBuffer hotkey_seed, uint32_t network_id, uint32_t address_index, uint64_t total_note_value, RustBuffer gov_comm_rand, RustBuffer voting_round_id, RustBuffer ea_pk, uint32_t proposal_id, uint32_t choice, RustBuffer van_auth_path, uint32_t van_position, uint32_t anchor_height, uint64_t proposal_authority, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_zcash_voting_ffi_fn_func_build_vote_commitment(RustBuffer hotkey_seed, uint32_t network_id, uint32_t address_index, uint64_t total_note_value, RustBuffer gov_comm_rand, RustBuffer voting_round_id, RustBuffer ea_pk, uint32_t proposal_id, uint32_t choice, uint32_t num_options, RustBuffer van_auth_path, uint32_t van_position, uint32_t anchor_height, uint64_t proposal_authority, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_ZCASH_VOTING_FFI_FN_FUNC_CONSTRUCT_DELEGATION_ACTION

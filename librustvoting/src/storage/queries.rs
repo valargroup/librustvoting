@@ -95,6 +95,10 @@ pub fn get_round_state(conn: &Connection, round_id: &str) -> Result<RoundState, 
             message: format!("round not found: {} ({})", round_id, e),
         })?;
 
+    // proof_generated is true only when the ZK proof exists AND the VAN leaf
+    // position has been stored (i.e., the delegation TX landed on chain).
+    // This prevents the UI from treating delegation as complete before the
+    // on-chain submission finishes.
     let proof_generated: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM proofs WHERE round_id = :round_id AND success = 1",
@@ -104,6 +108,18 @@ pub fn get_round_state(conn: &Connection, round_id: &str) -> Result<RoundState, 
         .map_err(|e| VotingError::Internal {
             message: format!("failed to query proof status: {}", e),
         })?;
+
+    let van_position_set: bool = conn
+        .query_row(
+            "SELECT van_leaf_position IS NOT NULL FROM rounds WHERE round_id = :round_id",
+            named_params! { ":round_id": round_id },
+            |row| row.get(0),
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to query van_leaf_position: {}", e),
+        })?;
+
+    let proof_generated = proof_generated && van_position_set;
 
     Ok(RoundState {
         round_id: round_id.to_string(),

@@ -557,9 +557,9 @@ public protocol VotingDatabaseProtocol: AnyObject, Sendable {
 
     func buildGovernancePczt(roundId: String, notes: [NoteInfo], fvkBytes: Data, hotkeyRawAddress: Data, consensusBranchId: UInt32, coinType: UInt32, seedFingerprint: Data, accountIndex: UInt32, roundName: String, addressIndex: UInt32) throws  -> GovernancePczt
 
-    func buildSharePayloads(encShares: [EncryptedShare], commitment: VoteCommitmentBundle, voteDecision: UInt32, vcTreePosition: UInt64) throws  -> [SharePayload]
+    func buildSharePayloads(encShares: [EncryptedShare], commitment: VoteCommitmentBundle, voteDecision: UInt32, numOptions: UInt32, vcTreePosition: UInt64) throws  -> [SharePayload]
 
-    func buildVoteCommitment(roundId: String, hotkeySeed: Data, networkId: UInt32, proposalId: UInt32, choice: UInt32, vanAuthPath: [Data], vanPosition: UInt32, anchorHeight: UInt32, progress: ProofProgressReporter) throws  -> VoteCommitmentBundle
+    func buildVoteCommitment(roundId: String, hotkeySeed: Data, networkId: UInt32, proposalId: UInt32, choice: UInt32, numOptions: UInt32, vanAuthPath: [Data], vanPosition: UInt32, anchorHeight: UInt32, progress: ProofProgressReporter) throws  -> VoteCommitmentBundle
 
     func clearRound(roundId: String) throws
 
@@ -728,18 +728,19 @@ open func buildGovernancePczt(roundId: String, notes: [NoteInfo], fvkBytes: Data
 })
 }
 
-open func buildSharePayloads(encShares: [EncryptedShare], commitment: VoteCommitmentBundle, voteDecision: UInt32, vcTreePosition: UInt64)throws  -> [SharePayload]  {
+open func buildSharePayloads(encShares: [EncryptedShare], commitment: VoteCommitmentBundle, voteDecision: UInt32, numOptions: UInt32, vcTreePosition: UInt64)throws  -> [SharePayload]  {
     return try  FfiConverterSequenceTypeSharePayload.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_method_votingdatabase_build_share_payloads(self.uniffiClonePointer(),
         FfiConverterSequenceTypeEncryptedShare.lower(encShares),
         FfiConverterTypeVoteCommitmentBundle_lower(commitment),
         FfiConverterUInt32.lower(voteDecision),
+        FfiConverterUInt32.lower(numOptions),
         FfiConverterUInt64.lower(vcTreePosition),$0
     )
 })
 }
 
-open func buildVoteCommitment(roundId: String, hotkeySeed: Data, networkId: UInt32, proposalId: UInt32, choice: UInt32, vanAuthPath: [Data], vanPosition: UInt32, anchorHeight: UInt32, progress: ProofProgressReporter)throws  -> VoteCommitmentBundle  {
+open func buildVoteCommitment(roundId: String, hotkeySeed: Data, networkId: UInt32, proposalId: UInt32, choice: UInt32, numOptions: UInt32, vanAuthPath: [Data], vanPosition: UInt32, anchorHeight: UInt32, progress: ProofProgressReporter)throws  -> VoteCommitmentBundle  {
     return try  FfiConverterTypeVoteCommitmentBundle_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_method_votingdatabase_build_vote_commitment(self.uniffiClonePointer(),
         FfiConverterString.lower(roundId),
@@ -747,6 +748,7 @@ open func buildVoteCommitment(roundId: String, hotkeySeed: Data, networkId: UInt
         FfiConverterUInt32.lower(networkId),
         FfiConverterUInt32.lower(proposalId),
         FfiConverterUInt32.lower(choice),
+        FfiConverterUInt32.lower(numOptions),
         FfiConverterSequenceData.lower(vanAuthPath),
         FfiConverterUInt32.lower(vanPosition),
         FfiConverterUInt32.lower(anchorHeight),
@@ -3536,12 +3538,13 @@ public func buildGovernancePczt(notes: [NoteInfo], params: VotingRoundParams, fv
     )
 })
 }
-public func buildSharePayloads(encShares: [EncryptedShare], commitment: VoteCommitmentBundle, voteDecision: UInt32, vcTreePosition: UInt64)throws  -> [SharePayload]  {
+public func buildSharePayloads(encShares: [EncryptedShare], commitment: VoteCommitmentBundle, voteDecision: UInt32, numOptions: UInt32, vcTreePosition: UInt64)throws  -> [SharePayload]  {
     return try  FfiConverterSequenceTypeSharePayload.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_func_build_share_payloads(
         FfiConverterSequenceTypeEncryptedShare.lower(encShares),
         FfiConverterTypeVoteCommitmentBundle_lower(commitment),
         FfiConverterUInt32.lower(voteDecision),
+        FfiConverterUInt32.lower(numOptions),
         FfiConverterUInt64.lower(vcTreePosition),$0
     )
 })
@@ -3551,7 +3554,7 @@ public func buildSharePayloads(encShares: [EncryptedShare], commitment: VoteComm
  *
  * Prefer the VotingDatabase method which loads inputs from DB automatically.
  */
-public func buildVoteCommitment(hotkeySeed: Data, networkId: UInt32, addressIndex: UInt32, totalNoteValue: UInt64, govCommRand: Data, votingRoundId: Data, eaPk: Data, proposalId: UInt32, choice: UInt32, vanAuthPath: [Data], vanPosition: UInt32, anchorHeight: UInt32, proposalAuthority: UInt64)throws  -> VoteCommitmentBundle  {
+public func buildVoteCommitment(hotkeySeed: Data, networkId: UInt32, addressIndex: UInt32, totalNoteValue: UInt64, govCommRand: Data, votingRoundId: Data, eaPk: Data, proposalId: UInt32, choice: UInt32, numOptions: UInt32, vanAuthPath: [Data], vanPosition: UInt32, anchorHeight: UInt32, proposalAuthority: UInt64)throws  -> VoteCommitmentBundle  {
     return try  FfiConverterTypeVoteCommitmentBundle_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_func_build_vote_commitment(
         FfiConverterData.lower(hotkeySeed),
@@ -3563,6 +3566,7 @@ public func buildVoteCommitment(hotkeySeed: Data, networkId: UInt32, addressInde
         FfiConverterData.lower(eaPk),
         FfiConverterUInt32.lower(proposalId),
         FfiConverterUInt32.lower(choice),
+        FfiConverterUInt32.lower(numOptions),
         FfiConverterSequenceData.lower(vanAuthPath),
         FfiConverterUInt32.lower(vanPosition),
         FfiConverterUInt32.lower(anchorHeight),
@@ -3696,10 +3700,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_func_build_governance_pczt() != 33879) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_func_build_share_payloads() != 52214) {
+    if (uniffi_zcash_voting_ffi_checksum_func_build_share_payloads() != 10217) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_func_build_vote_commitment() != 60099) {
+    if (uniffi_zcash_voting_ffi_checksum_func_build_vote_commitment() != 57877) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_func_construct_delegation_action() != 58555) {
@@ -3741,10 +3745,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_build_governance_pczt() != 14517) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_build_share_payloads() != 42149) {
+    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_build_share_payloads() != 40058) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_build_vote_commitment() != 38351) {
+    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_build_vote_commitment() != 54938) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_clear_round() != 15915) {

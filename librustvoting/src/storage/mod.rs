@@ -167,6 +167,11 @@ mod tests {
         queries::insert_round(&conn, &test_params(), None).unwrap();
         queries::store_proof(&conn, "test-round-1", &vec![0xAB; 256]).unwrap();
 
+        // proof_generated requires both proof AND van_leaf_position
+        let state = queries::get_round_state(&conn, "test-round-1").unwrap();
+        assert!(!state.proof_generated, "proof alone is not enough — VAN position required");
+
+        queries::store_van_position(&conn, "test-round-1", 42).unwrap();
         let state = queries::get_round_state(&conn, "test-round-1").unwrap();
         assert!(state.proof_generated);
     }
