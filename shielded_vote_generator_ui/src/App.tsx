@@ -7,7 +7,7 @@ import { JsonView } from "./components/JsonView";
 import { RoundEditor } from "./components/RoundEditor";
 import { RoundsList } from "./components/RoundsList";
 import { useStore } from "./store/useStore";
-import { Shield, Plus, FileText, Settings, Settings2, RefreshCw, CheckCircle2, AlertCircle, X, Loader2, Server, Database, Eye, EyeOff, Wallet, Unplug } from "lucide-react";
+import { Shield, Plus, FileText, Settings, Settings2, RefreshCw, CheckCircle2, AlertCircle, X, Loader2, Server, Database, Eye, EyeOff, Wallet, Unplug, BarChart3 } from "lucide-react";
 import type { Proposal, RoundSettings, RoundStatus, VotingRound } from "./types";
 import {
   LIGHTWALLETD_ENDPOINTS,
@@ -20,7 +20,7 @@ import * as cosmosTx from "./api/cosmosTx";
 import { useWallet } from "./hooks/useWallet";
 import type { UseWallet } from "./hooks/useWallet";
 
-type Section = "about" | "rounds" | "builder" | "json" | "downloads" | "preview" | "settings" | "chain-rounds";
+type Section = "about" | "rounds" | "builder" | "json" | "downloads" | "preview" | "settings" | "chain-rounds" | "vote-status";
 
 function App() {
   const store = useStore();
@@ -316,6 +316,9 @@ function App() {
         {/* On-chain rounds */}
         {section === "chain-rounds" && <ChainRoundsView />}
 
+        {/* Vote status */}
+        {section === "vote-status" && <VoteStatusView />}
+
         {/* Settings */}
         {section === "settings" && <SettingsPage wallet={wallet} />}
 
@@ -595,6 +598,7 @@ function SettingsPage({ wallet }: { wallet: UseWallet }) {
   const [voteManager, setVoteManagerAddr] = useState<string>(
     () => localStorage.getItem("zally-vm-address") ?? ""
   );
+  const [chainDetailsOpen, setChainDetailsOpen] = useState(false);
 
   // Dev private key connection (collapsible section)
   const [devKey, setDevKey] = useState("");
@@ -668,6 +672,12 @@ function SettingsPage({ wallet }: { wallet: UseWallet }) {
       setVmStatus("error");
     }
   };
+
+  // Auto-test voting chain connection on mount.
+  useEffect(() => {
+    handleTestConnection();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const ceremonyPhase = CEREMONY_STATUS_NAMES[Number(ceremony?.ceremony?.status)] ?? String(ceremony?.ceremony?.status ?? "unknown");
 
@@ -919,209 +929,251 @@ function SettingsPage({ wallet }: { wallet: UseWallet }) {
           Voting chain
         </h2>
         <div className="bg-surface-1 border border-border-subtle rounded-xl p-5 space-y-4 mb-6">
-          <div>
-            <label className="block text-[11px] text-text-secondary mb-1">
-              Chain API URL
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={chainUrl}
-                onChange={(e) => handleChainUrlChange(e.target.value)}
-                placeholder="http://localhost:1318"
-                className="flex-1 px-3 py-2 bg-surface-2 border border-border-subtle rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50 font-mono"
-              />
+          {/* Compact status line — always visible */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Server size={14} className="text-text-secondary" />
+              <span className="text-xs text-text-secondary">Status</span>
+            </div>
+            <div className="flex items-center gap-2">
+              {connStatus === "testing" && (
+                <span className="text-[11px] text-text-muted flex items-center gap-1">
+                  <RefreshCw size={10} className="animate-spin" /> Connecting...
+                </span>
+              )}
+              {connStatus === "ok" && (
+                <span className="text-[11px] text-success flex items-center gap-1">
+                  <CheckCircle2 size={10} /> Connected
+                  {latestBlock && (
+                    <span className="text-text-muted ml-1">
+                      (height {latestBlock.height.toLocaleString()})
+                    </span>
+                  )}
+                </span>
+              )}
+              {connStatus === "error" && (
+                <span className="text-[11px] text-danger flex items-center gap-1">
+                  <AlertCircle size={10} /> Disconnected
+                </span>
+              )}
+              {connStatus === "idle" && (
+                <span className="text-[11px] text-text-muted italic">not tested</span>
+              )}
               <button
                 onClick={handleTestConnection}
                 disabled={connStatus === "testing"}
-                className="px-3 py-2 bg-accent/90 hover:bg-accent text-surface-0 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                className="p-1 hover:bg-surface-3 rounded text-text-muted hover:text-text-secondary cursor-pointer disabled:opacity-50"
+                title="Refresh connection"
               >
-                {connStatus === "testing" ? (
-                  <RefreshCw size={12} className="animate-spin" />
-                ) : (
-                  "Test"
-                )}
+                <RefreshCw size={12} />
               </button>
             </div>
           </div>
 
-          {connStatus === "ok" && (
-            <div className="space-y-2">
-              <div className="flex items-center gap-1.5 text-[11px] text-success">
-                <CheckCircle2 size={12} /> Connected
+          {/* Error detail */}
+          {connStatus === "error" && (
+            <div className="flex items-start gap-1.5 text-[11px] text-danger bg-danger/10 border border-danger/30 rounded-lg p-2.5">
+              <AlertCircle size={12} className="mt-0.5 shrink-0" />
+              <span>{connError}</span>
+            </div>
+          )}
+
+          {/* Expandable details */}
+          <details
+            open={chainDetailsOpen}
+            onToggle={(e) => setChainDetailsOpen((e.target as HTMLDetailsElement).open)}
+          >
+            <summary className="text-[11px] text-text-muted cursor-pointer hover:text-text-secondary select-none">
+              {chainDetailsOpen ? "Hide details" : "Show details"}
+            </summary>
+            <div className="mt-3 space-y-4">
+              {/* Chain API URL */}
+              <div>
+                <label className="block text-[11px] text-text-secondary mb-1">
+                  Chain API URL
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={chainUrl}
+                    onChange={(e) => handleChainUrlChange(e.target.value)}
+                    placeholder="http://localhost:1318"
+                    className="flex-1 px-3 py-2 bg-surface-2 border border-border-subtle rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50 font-mono"
+                  />
+                  <button
+                    onClick={handleTestConnection}
+                    disabled={connStatus === "testing"}
+                    className="px-3 py-2 bg-accent/90 hover:bg-accent text-surface-0 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    {connStatus === "testing" ? (
+                      <RefreshCw size={12} className="animate-spin" />
+                    ) : (
+                      "Test"
+                    )}
+                  </button>
+                </div>
               </div>
-              {latestBlock && (
-                <>
+
+              {/* Connection info */}
+              {connStatus === "ok" && latestBlock && (
+                <div className="space-y-2">
                   <SettingsStubRow label="Chain ID" value={latestBlock.chainId} />
                   <SettingsStubRow label="Latest height" value={latestBlock.height.toLocaleString()} />
-                </>
+                </div>
               )}
-            </div>
-          )}
-          {connStatus === "error" && (
-            <div className="flex items-center gap-1.5 text-[11px] text-danger">
-              <AlertCircle size={12} /> {connError}
-            </div>
-          )}
 
-          {/* Ceremony status (shown when connected) */}
-          {connStatus === "ok" && ceremony?.ceremony && (
-            <>
-              <div className="border-t border-border-subtle pt-3 space-y-2">
-                <SettingsStubRow label="Ceremony phase" value={ceremonyPhase} />
-                {ceremony.ceremony.ea_pk && (
+              {/* Ceremony status */}
+              {connStatus === "ok" && ceremony?.ceremony && (
+                <div className="border-t border-border-subtle pt-3 space-y-2">
+                  <SettingsStubRow label="Ceremony phase" value={ceremonyPhase} />
+                  {ceremony.ceremony.ea_pk && (
+                    <SettingsStubRow
+                      label="EA public key"
+                      value={ceremony.ceremony.ea_pk.slice(0, 16) + "..."}
+                    />
+                  )}
                   <SettingsStubRow
-                    label="EA public key"
-                    value={ceremony.ceremony.ea_pk.slice(0, 16) + "..."}
+                    label="Validators"
+                    value={String(ceremony.ceremony.validators?.length ?? 0)}
                   />
-                )}
-                <SettingsStubRow
-                  label="Validators"
-                  value={String(ceremony.ceremony.validators?.length ?? 0)}
-                />
-              </div>
-            </>
-          )}
+                </div>
+              )}
 
-          {/* Vote manager (shown when connected) */}
-          {connStatus === "ok" && (
-            <div className="border-t border-border-subtle pt-3 space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-text-secondary">VoteManager</span>
-                <span className="text-[11px] font-mono text-text-primary">
-                  {voteManager || <span className="text-text-muted italic">not set</span>}
-                </span>
-              </div>
-
-              {wallet.signer && (
-                <details className="group">
-                  <summary className="text-[11px] text-accent cursor-pointer hover:text-accent-glow">
-                    Set VoteManager address
-                  </summary>
-                  <div className="mt-3 space-y-3">
-                    <div className="bg-surface-2 rounded-lg px-3 py-2">
-                      <p className="text-[10px] text-text-muted mb-0.5">Signing as</p>
-                      <p className="text-[11px] text-text-primary font-mono break-all">
-                        {wallet.address}
-                      </p>
-                    </div>
-                    <div>
-                      <label className="block text-[11px] text-text-secondary mb-1">
-                        New VoteManager address
-                      </label>
-                      <input
-                        type="text"
-                        value={vmNewAddr}
-                        onChange={(e) => setVmNewAddr(e.target.value)}
-                        placeholder="zvote1..."
-                        className="w-full px-3 py-2 bg-surface-2 border border-border-subtle rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50 font-mono"
-                      />
-                    </div>
-                    <button
-                      onClick={handleSetVoteManager}
-                      disabled={!vmNewAddr || vmStatus === "sending"}
-                      className="px-3 py-1.5 bg-accent/90 hover:bg-accent text-surface-0 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
-                    >
-                      {vmStatus === "sending" ? (
-                        <span className="flex items-center gap-1.5">
-                          <Loader2 size={12} className="animate-spin" /> Signing & broadcasting...
-                        </span>
-                      ) : (
-                        "Sign & broadcast on-chain"
-                      )}
-                    </button>
-                    {vmStatus === "ok" && (
-                      <div className="bg-success/10 border border-success/30 rounded-lg p-2.5">
-                        <p className="text-[11px] text-success font-semibold">
-                          VoteManager updated
-                        </p>
-                        {vmTxHash && (
-                          <p className="text-[10px] text-text-secondary font-mono mt-0.5 break-all">
-                            TX: {vmTxHash}
-                          </p>
-                        )}
-                      </div>
-                    )}
-                    {vmStatus === "error" && (
-                      <div className="bg-danger/10 border border-danger/30 rounded-lg p-2.5">
-                        <p className="text-[11px] text-danger">{vmError}</p>
-                      </div>
-                    )}
+              {/* Vote manager */}
+              {connStatus === "ok" && (
+                <div className="border-t border-border-subtle pt-3 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-text-secondary">VoteManager</span>
+                    <span className="text-[11px] font-mono text-text-primary">
+                      {voteManager || <span className="text-text-muted italic">not set</span>}
+                    </span>
                   </div>
-                </details>
-              )}
-              {!wallet.signer && connStatus === "ok" && (
-                <p className="text-[10px] text-text-muted">
-                  Connect a wallet above to sign VoteManager transactions.
-                </p>
-              )}
-            </div>
-          )}
 
-          {/* Helper server status (shown when connected) */}
-          {connStatus === "ok" && helperStatus && (
-            <div className="border-t border-border-subtle pt-3 space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-text-secondary">Helper server</span>
-                <span className="text-[11px] text-success flex items-center gap-1">
-                  <CheckCircle2 size={10} /> {helperStatus.status}
-                </span>
-              </div>
-              {helperStatus.tree && (
-                <>
-                  <SettingsStubRow
-                    label="Commitment leaves"
-                    value={helperStatus.tree.leaf_count.toLocaleString()}
-                  />
-                  <SettingsStubRow
-                    label="Anchor height"
-                    value={helperStatus.tree.anchor_height.toLocaleString()}
-                  />
-                </>
-              )}
-              {Object.keys(helperStatus.queues).length > 0 && (
-                <>
-                  {Object.entries(helperStatus.queues).map(([roundId, q]) => (
-                    <div key={roundId} className="bg-surface-2 rounded-lg px-3 py-2 space-y-1">
-                      <p className="text-[10px] text-text-muted font-mono truncate">
-                        {roundId.slice(0, 16)}...
-                      </p>
-                      <div className="flex gap-3 text-[10px]">
-                        <span className="text-text-secondary">
-                          {q.pending} pending
-                        </span>
-                        <span className="text-success">
-                          {q.submitted} submitted
-                        </span>
-                        {q.failed > 0 && (
-                          <span className="text-danger">
-                            {q.failed} failed
-                          </span>
+                  {wallet.signer && (
+                    <details className="group">
+                      <summary className="text-[11px] text-accent cursor-pointer hover:text-accent-glow">
+                        Set VoteManager address
+                      </summary>
+                      <div className="mt-3 space-y-3">
+                        <div className="bg-surface-2 rounded-lg px-3 py-2">
+                          <p className="text-[10px] text-text-muted mb-0.5">Signing as</p>
+                          <p className="text-[11px] text-text-primary font-mono break-all">
+                            {wallet.address}
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[11px] text-text-secondary mb-1">
+                            New VoteManager address
+                          </label>
+                          <input
+                            type="text"
+                            value={vmNewAddr}
+                            onChange={(e) => setVmNewAddr(e.target.value)}
+                            placeholder="zvote1..."
+                            className="w-full px-3 py-2 bg-surface-2 border border-border-subtle rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50 font-mono"
+                          />
+                        </div>
+                        <button
+                          onClick={handleSetVoteManager}
+                          disabled={!vmNewAddr || vmStatus === "sending"}
+                          className="px-3 py-1.5 bg-accent/90 hover:bg-accent text-surface-0 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                        >
+                          {vmStatus === "sending" ? (
+                            <span className="flex items-center gap-1.5">
+                              <Loader2 size={12} className="animate-spin" /> Signing & broadcasting...
+                            </span>
+                          ) : (
+                            "Sign & broadcast on-chain"
+                          )}
+                        </button>
+                        {vmStatus === "ok" && (
+                          <div className="bg-success/10 border border-success/30 rounded-lg p-2.5">
+                            <p className="text-[11px] text-success font-semibold">
+                              VoteManager updated
+                            </p>
+                            {vmTxHash && (
+                              <p className="text-[10px] text-text-secondary font-mono mt-0.5 break-all">
+                                TX: {vmTxHash}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                        {vmStatus === "error" && (
+                          <div className="bg-danger/10 border border-danger/30 rounded-lg p-2.5">
+                            <p className="text-[11px] text-danger">{vmError}</p>
+                          </div>
                         )}
                       </div>
-                    </div>
-                  ))}
-                </>
+                    </details>
+                  )}
+                  {!wallet.signer && connStatus === "ok" && (
+                    <p className="text-[10px] text-text-muted">
+                      Connect a wallet above to sign VoteManager transactions.
+                    </p>
+                  )}
+                </div>
               )}
-              {Object.keys(helperStatus.queues).length === 0 && (
-                <p className="text-[10px] text-text-muted">No shares in queue</p>
-              )}
-            </div>
-          )}
-          {connStatus === "ok" && !helperStatus && (
-            <div className="border-t border-border-subtle pt-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-text-secondary">Helper server</span>
-                <span className="text-[11px] text-text-muted italic">disabled</span>
-              </div>
-            </div>
-          )}
 
-          {connStatus === "idle" && (
-            <p className="text-[10px] text-text-muted">
-              Enter the Zally chain API URL and click Test to connect.
-            </p>
-          )}
+              {/* Helper server status */}
+              {connStatus === "ok" && helperStatus && (
+                <div className="border-t border-border-subtle pt-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-text-secondary">Helper server</span>
+                    <span className="text-[11px] text-success flex items-center gap-1">
+                      <CheckCircle2 size={10} /> {helperStatus.status}
+                    </span>
+                  </div>
+                  {helperStatus.tree && (
+                    <>
+                      <SettingsStubRow
+                        label="Commitment leaves"
+                        value={helperStatus.tree.leaf_count.toLocaleString()}
+                      />
+                      <SettingsStubRow
+                        label="Anchor height"
+                        value={helperStatus.tree.anchor_height.toLocaleString()}
+                      />
+                    </>
+                  )}
+                  {Object.keys(helperStatus.queues).length > 0 && (
+                    <>
+                      {Object.entries(helperStatus.queues).map(([roundId, q]) => (
+                        <div key={roundId} className="bg-surface-2 rounded-lg px-3 py-2 space-y-1">
+                          <p className="text-[10px] text-text-muted font-mono truncate">
+                            {roundId.slice(0, 16)}...
+                          </p>
+                          <div className="flex gap-3 text-[10px]">
+                            <span className="text-text-secondary">
+                              {q.pending} pending
+                            </span>
+                            <span className="text-success">
+                              {q.submitted} submitted
+                            </span>
+                            {q.failed > 0 && (
+                              <span className="text-danger">
+                                {q.failed} failed
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </>
+                  )}
+                  {Object.keys(helperStatus.queues).length === 0 && (
+                    <p className="text-[10px] text-text-muted">No shares in queue</p>
+                  )}
+                </div>
+              )}
+              {connStatus === "ok" && !helperStatus && (
+                <div className="border-t border-border-subtle pt-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-text-secondary">Helper server</span>
+                    <span className="text-[11px] text-text-muted italic">disabled</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </details>
         </div>
       </div>
     </div>
@@ -1484,6 +1536,266 @@ function base64ToHex(b64: string): string {
   return Array.from(bytes, (c) =>
     c.charCodeAt(0).toString(16).padStart(2, "0")
   ).join("");
+}
+
+/* ── Vote status view ────────────────────────────────────────── */
+
+function VoteStatusView() {
+  const [rounds, setRounds] = useState<chainApi.ChainRound[]>([]);
+  const [summaries, setSummaries] = useState<Record<string, chainApi.VoteSummaryResponse>>({});
+  const [summaryErrors, setSummaryErrors] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const fetchAll = async () => {
+    setLoading(true);
+    setError("");
+    setSummaryErrors({});
+    try {
+      const resp = await chainApi.listRounds();
+      const allRounds = resp.rounds ?? [];
+      setRounds(allRounds);
+
+      // Fetch vote summary for each round in parallel.
+      const entries = await Promise.all(
+        allRounds.map(async (r) => {
+          const id = r.vote_round_id ?? "";
+          if (!id) return null;
+          try {
+            const hex = base64ToHex(id);
+            const summary = await chainApi.getVoteSummary(hex);
+            return { id, summary, error: null };
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(`VoteSummary failed for ${id.slice(0, 12)}:`, msg);
+            return { id, summary: null, error: msg };
+          }
+        })
+      );
+      const map: Record<string, chainApi.VoteSummaryResponse> = {};
+      const errs: Record<string, string> = {};
+      for (const entry of entries) {
+        if (!entry) continue;
+        if (entry.summary) map[entry.id] = entry.summary;
+        if (entry.error) errs[entry.id] = entry.error;
+      }
+      setSummaries(map);
+      setSummaryErrors(errs);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchAll();
+  }, []);
+
+  return (
+    <div className="flex-1 overflow-y-auto">
+      <div className="max-w-2xl mx-auto px-6 py-12">
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-accent/15 flex items-center justify-center">
+              <BarChart3 size={22} className="text-accent" />
+            </div>
+            <div>
+              <h1 className="text-lg font-bold text-text-primary">
+                Vote status
+              </h1>
+              <p className="text-[11px] text-text-muted">
+                Live proposal results from the Zally chain
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={fetchAll}
+            className="p-2 hover:bg-surface-3 rounded-lg text-text-muted hover:text-text-secondary cursor-pointer"
+            title="Refresh"
+          >
+            <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
+          </button>
+        </div>
+
+        {error && (
+          <div className="flex items-center gap-2 bg-danger/10 border border-danger/30 rounded-lg p-3 mb-4">
+            <AlertCircle size={14} className="text-danger shrink-0" />
+            <p className="text-[11px] text-danger">{error}</p>
+          </div>
+        )}
+
+        {!loading && !error && rounds.length === 0 && (
+          <div className="text-center py-12">
+            <p className="text-xs text-text-muted">
+              No voting rounds found on the chain.
+            </p>
+          </div>
+        )}
+
+        <div className="space-y-6">
+          {rounds.map((round) => {
+            const roundId = round.vote_round_id ?? "";
+            const summary = summaries[roundId];
+            const statusKey = summary?.status ?? round.status ?? "";
+            const isFinalized =
+              Number(statusKey) === 3 ||
+              statusKey === "SESSION_STATUS_FINALIZED";
+            const isActive =
+              Number(statusKey) === 1 ||
+              statusKey === "SESSION_STATUS_ACTIVE";
+            const statusInfo = STATUS_MAP[statusKey] ?? {
+              label: String(statusKey || "Unknown"),
+              color: "bg-surface-3 text-text-muted",
+            };
+
+            const endTimeRaw = summary?.vote_end_time ?? round.vote_end_time;
+            const endTimeSec = typeof endTimeRaw === "number" ? endTimeRaw : parseInt(String(endTimeRaw ?? "0"), 10);
+            const endDate =
+              endTimeSec > 0
+                ? new Date(endTimeSec * 1000)
+                : null;
+            const isExpired = endDate ? endDate.getTime() < Date.now() : false;
+
+            return (
+              <div
+                key={roundId}
+                className="bg-surface-1 border border-border-subtle rounded-xl overflow-hidden"
+              >
+                {/* Round header */}
+                <div className="px-5 py-4 flex items-center justify-between">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <h2 className="text-sm font-semibold text-text-primary truncate">
+                        {summary?.description ||
+                          round.description ||
+                          `Round ${roundId.slice(0, 12)}...`}
+                      </h2>
+                      <span
+                        className={`text-[9px] px-2 py-0.5 rounded-full shrink-0 ${statusInfo.color}`}
+                      >
+                        {statusInfo.label}
+                      </span>
+                    </div>
+                    {endDate && (
+                      <p className="text-[10px] text-text-muted mt-0.5">
+                        {isFinalized
+                          ? `Ended ${endDate.toLocaleDateString()}`
+                          : isExpired
+                            ? `Voting ended ${endDate.toLocaleDateString()} (tallying)`
+                            : `Voting until ${endDate.toLocaleString()}`}
+                      </p>
+                    )}
+                  </div>
+                  {isActive && !isExpired && (
+                    <span className="relative flex h-2.5 w-2.5 shrink-0 ml-3">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75" />
+                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-success" />
+                    </span>
+                  )}
+                </div>
+
+                {/* Proposals */}
+                {summary?.proposals && summary.proposals.length > 0 && (
+                  <div className="px-5 pb-4 space-y-3">
+                    {summary.proposals.map((prop) => (
+                      <div
+                        key={prop.id}
+                        className="bg-surface-2 rounded-lg p-3"
+                      >
+                        <div className="flex items-center gap-2 mb-2">
+                          <span className="text-[10px] font-bold text-text-muted bg-surface-3 rounded px-1.5 py-0.5">
+                            {String(prop.id ?? 0).padStart(2, "0")}
+                          </span>
+                          <span className="text-xs font-semibold text-text-primary">
+                            {prop.title || "Untitled"}
+                          </span>
+                        </div>
+
+                        {/* Option bars */}
+                        <div className="space-y-1.5">
+                          {(prop.options ?? []).map((opt) => {
+                            const count = Number(opt.ballot_count ?? 0);
+                            const total = isFinalized
+                              ? Number(opt.total_value ?? 0)
+                              : null;
+
+                            // Compute bar width relative to max in this proposal.
+                            const allCounts = (prop.options ?? []).map((o) =>
+                              isFinalized
+                                ? Number(o.total_value ?? 0)
+                                : Number(o.ballot_count ?? 0)
+                            );
+                            const maxCount = Math.max(1, ...allCounts);
+                            const barValue =
+                              isFinalized && total !== null ? total : count;
+                            const pct = (barValue / maxCount) * 100;
+
+                            return (
+                              <div key={opt.index} className="space-y-0.5">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[11px] text-text-secondary">
+                                    {opt.label ?? `Option ${opt.index}`}
+                                  </span>
+                                  <span className="text-[11px] font-mono text-text-primary">
+                                    {isFinalized && total !== null
+                                      ? total.toLocaleString()
+                                      : `${count} ballot${count !== 1 ? "s" : ""}`}
+                                  </span>
+                                </div>
+                                <div className="h-1.5 bg-surface-3 rounded-full overflow-hidden">
+                                  <div
+                                    className={`h-full rounded-full transition-all duration-500 ${
+                                      isFinalized
+                                        ? "bg-accent"
+                                        : "bg-accent/60"
+                                    }`}
+                                    style={{
+                                      width: `${Math.max(barValue > 0 ? 2 : 0, pct)}%`,
+                                    }}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Fallback: show basic proposal list from round data when summary unavailable */}
+                {!summary && !loading && round.proposals && round.proposals.length > 0 && (
+                  <div className="px-5 pb-4 space-y-3">
+                    {summaryErrors[roundId] && (
+                      <p className="text-[10px] text-warning">
+                        Summary unavailable: {summaryErrors[roundId]}
+                      </p>
+                    )}
+                    {round.proposals.map((p) => (
+                      <div
+                        key={p.id}
+                        className="bg-surface-2 rounded-lg p-3"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-bold text-text-muted bg-surface-3 rounded px-1.5 py-0.5">
+                            {String(p.id).padStart(2, "0")}
+                          </span>
+                          <span className="text-xs text-text-primary">
+                            {p.title || "Untitled"}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /* ── Preview page ────────────────────────────────────────────── */

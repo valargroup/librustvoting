@@ -92,6 +92,28 @@ export interface TallyResult {
   total_value?: string;
 }
 
+export interface VoteSummaryOptionResponse {
+  index?: number;
+  label?: string;
+  ballot_count?: number | string; // uint64: encoding/json serializes as number
+  total_value?: number | string;  // uint64: encoding/json serializes as number
+}
+
+export interface VoteSummaryProposalResponse {
+  id?: number;
+  title?: string;
+  description?: string;
+  options?: VoteSummaryOptionResponse[];
+}
+
+export interface VoteSummaryResponse {
+  vote_round_id?: string; // base64
+  status?: string | number;
+  description?: string;
+  vote_end_time?: number | string; // uint64: encoding/json serializes as number
+  proposals?: VoteSummaryProposalResponse[];
+}
+
 export interface BroadcastResult {
   tx_hash: string;
   code: number;
@@ -166,6 +188,14 @@ export async function getTallyResults(
 ): Promise<{ results: TallyResult[] | null }> {
   return fetchJson<{ results: TallyResult[] | null }>(
     `/zally/v1/tally-results/${roundIdHex}`
+  );
+}
+
+export async function getVoteSummary(
+  roundIdHex: string
+): Promise<VoteSummaryResponse> {
+  return fetchJson<VoteSummaryResponse>(
+    `/zally/v1/vote-summary/${roundIdHex}`
   );
 }
 
