@@ -58,23 +58,25 @@ zallyd genesis validate-genesis --home ~/.zallyd
 ## Step 3 — Generate Cryptographic Keys
 
 ```bash
-# Cosmos account key (for signing transactions)
-zallyd keys add validator --keyring-backend test
+zallyd init-validator-keys
+```
 
-# Save the new validator's account address
+This generates a Cosmos account key (keyring name `validator`, backend `test`), a Pallas keypair, and an EA keypair in one step. Use `--key-name`, `--keyring-backend`, or `--home` to override defaults.
+
+After running, save the printed address:
+
+```bash
 NEW_VAL_ADDR=$(zallyd keys show validator -a --keyring-backend test)
 echo "New validator address: $NEW_VAL_ADDR"
-
-# Pallas keypair (required for ceremony registration)
-zallyd pallas-keygen
-
-# EA keypair (required for PrepareProposal auto-ack/tally)
-zallyd ea-keygen
 ```
 
 ## Step 4 — Configure config.toml
 
-Edit `$NEW_HOME/config/config.toml`:
+```
+HOME="~/.zallyd"
+```
+
+Edit `$HOME/config/config.toml`:
 
 ```bash
 # Set persistent peer to the genesis validator
@@ -83,14 +85,14 @@ sed -i 's|persistent_peers = ""|persistent_peers = "daf4ff4836a8210006b59a3ad1c1
 
 ## Step 5 — Configure app.toml
 
-Append the vote module config to `$NEW_HOME/config/app.toml`:
+Append the vote module config to `$HOME/config/app.toml`:
 
 ```bash
-cat >> $NEW_HOME/config/app.toml <<EOF
+cat >> $HOME/config/app.toml <<EOF
 
 [vote]
-ea_sk_path = "$NEW_HOME/ea.sk"
-pallas_sk_path = "$NEW_HOME/pallas.sk"
+ea_sk_path = "$HOME/ea.sk"
+pallas_sk_path = "$HOME/pallas.sk"
 comet_rpc = "http://localhost:26257"   # adjust to the new node's RPC port
 EOF
 ```
@@ -98,8 +100,8 @@ EOF
 Also enable the REST API if needed:
 
 ```bash
-sed -i '/\[api\]/,/\[.*\]/ s/enable = false/enable = true/' $NEW_HOME/config/app.toml
-sed -i 's|address = "tcp://localhost:1317"|address = "tcp://0.0.0.0:1518"|' $NEW_HOME/config/app.toml
+sed -i '/\[api\]/,/\[.*\]/ s/enable = false/enable = true/' $HOME/config/app.toml
+sed -i 's|address = "tcp://localhost:1317"|address = "tcp://0.0.0.0:1518"|' $HOME/config/app.toml
 ```
 
 ## Step 6 — Fund the New Validator Account
@@ -125,7 +127,7 @@ zallyd tx bank send validator $NEW_VAL_ADDR 20000000stake \
 zallyd start
 
 # Monitor sync status
-watch -n2 'zallyd status --home $NEW_HOME 2>/dev/null | python3 -c "import sys,json; s=json.load(sys.stdin)[\"sync_info\"]; print(\"catching_up:\", s[\"catching_up\"], \"height:\", s[\"latest_block_height\"])"'
+watch -n2 'zallyd status --home $HOME 2>/dev/null | python3 -c "import sys,json; s=json.load(sys.stdin)[\"sync_info\"]; print(\"catching_up:\", s[\"catching_up\"], \"height:\", s[\"latest_block_height\"])"'
 ```
 
 Wait until `catching_up: False` before proceeding.
