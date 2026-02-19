@@ -2,13 +2,17 @@
 SDK_DIR     = sdk
 INGEST_DIR  = nullifier-ingest
 
+# Optional upper bound for nullifier ingestion (must be a multiple of 10).
+# Pass as: make up SYNC_HEIGHT=2500000
+SYNC_HEIGHT ?=
+
 .PHONY: install install-ffi init start clean build fmt lint \
 	test test-unit test-integration test-api test-api-restart test-api-reinit test-e2e \
 	fixtures-ts circuits circuits-test fixtures \
 	test-halo2 test-halo2-ante test-redpallas test-redpallas-ante test-all-ffi \
 	ingest ingest-bootstrap ingest-status ingest-test ingest-proof ingest-clean ingest-serve \
 	ingest-test-integration \
-	up
+	up down
 
 install:
 	$(MAKE) -C $(SDK_DIR) install
@@ -87,8 +91,8 @@ test-all-ffi:
 ingest-bootstrap: ## Download nullifier bootstrap files if not already present
 	$(MAKE) -C $(INGEST_DIR) bootstrap
 
-ingest: ## Ingest Orchard nullifiers from chain into flat binary files (incremental)
-	$(MAKE) -C $(INGEST_DIR) ingest
+ingest: ## Ingest Orchard nullifiers up to SYNC_HEIGHT (or chain tip if unset)
+	$(MAKE) -C $(INGEST_DIR) ingest SYNC_HEIGHT=$(SYNC_HEIGHT)
 
 ingest-status: ## Show nullifier count, last synced height, file sizes
 	$(MAKE) -C $(INGEST_DIR) status
@@ -110,8 +114,30 @@ ingest-test-integration: ## Run IMT ↔ delegation-circuit ZK integration test
 
 # ── Full Stack ───────────────────────────────────────────────────────
 
+down: ## Stop all running zallyd, query-server, and ingest-nfs processes
+	@KILLED=""; \
+	pkill zallyd       2>/dev/null && KILLED="$$KILLED zallyd"       || true; \
+	pkill query-server 2>/dev/null && KILLED="$$KILLED query-server" || true; \
+	pkill ingest-nfs   2>/dev/null && KILLED="$$KILLED ingest-nfs"   || true; \
+	if [ -n "$$KILLED" ]; then \
+		printf '\033[32mStopped:%s\033[0m\n' "$$KILLED"; \
+	else \
+		echo "No running processes found."; \
+	fi
+
 up: ## Init SDK, bootstrap+ingest nullifiers, then run ingest-serve and start in parallel
+	@PROCS=""; \
+	pgrep zallyd       > /dev/null 2>&1 && PROCS="$$PROCS zallyd"; \
+	pgrep query-server > /dev/null 2>&1 && PROCS="$$PROCS query-server"; \
+	pgrep ingest-nfs   > /dev/null 2>&1 && PROCS="$$PROCS ingest-nfs"; \
+	if [ -n "$$PROCS" ]; then \
+		printf '\033[31mERROR: the following processes are already running:%s\n' "$$PROCS"; \
+		printf 'Stop them first before running "make up".\033[0m\n'; \
+		exit 1; \
+	fi
 	$(MAKE) init
 	$(MAKE) ingest-bootstrap
 	$(MAKE) ingest
-	$(MAKE) ingest-serve & $(MAKE) start
+	@nohup $(MAKE) ingest-serve > ingest-serve.log 2>&1 & \
+	nohup $(MAKE) start > zallyd.log 2>&1 & \
+	printf '\033[32mStarted: ingest-serve → ingest-serve.log | zallyd → zallyd.log\033[0m\n'

@@ -1,3 +1,7 @@
+# make up log files
+ingest-serve.log
+zallyd.log
+
 # Go binary
 sdk/zallyd
 sdk/create-val-tx

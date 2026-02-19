@@ -39,7 +39,17 @@ This runs the full setup sequence:
 
 1. **`make init`** — builds the Rust circuits, installs the `zallyd` binary with real Halo2 + RedPallas verification, and initialises a single-validator chain (wipes existing chain data).
 2. **`make ingest`** — incrementally fetches Orchard nullifiers from `https://zec.rocks:443` into local flat binary files (`nullifiers.bin`, `nullifiers.checkpoint`, `nullifiers.tree`).
-3. **`make ingest-serve`** and **`make start`** run in parallel — the nullifier exclusion proof query server (default port `3000`) and the chain node start concurrently.
+3. **`make ingest-serve`** and **`make start`** run in parallel — the nullifier exclusion proof query server (default port `3000`) and the chain node start concurrently. Both processes are detached and their output is written to `ingest-serve.log` and `zallyd.log`.
+
+`make up` will refuse to start if `zallyd`, `query-server`, or `ingest-nfs` are already running. Use `make down` first to stop them.
+
+### Stopping the stack
+
+```sh
+make down
+```
+
+Kills any running `zallyd`, `query-server`, and `ingest-nfs` processes and prints a confirmation of what was stopped.
 
 ### Step-by-step
 

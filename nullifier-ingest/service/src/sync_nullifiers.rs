@@ -89,13 +89,28 @@ pub async fn sync(
         .await?;
     let chain_tip = latest.into_inner().height;
 
+    let start = resume_height(dir)?;
+    let existing = file_store::nullifier_count(dir)?;
+
+    // Determine the effective sync target.
+    //
+    // If max_height is set but already lies below the current checkpoint (i.e.
+    // we have synced past the requested height), we cannot rewind.  Instead we
+    // advance to the next multiple-of-10 block height above the checkpoint so
+    // there is always a clean forward stopping point.
     let target = match max_height {
+        Some(h) if h < start => {
+            let next_multiple = ((start / 10) + 1) * 10;
+            eprintln!(
+                "SYNC_HEIGHT {} is below current checkpoint {}; \
+                 advancing target to next multiple of 10: {}",
+                h, start, next_multiple
+            );
+            std::cmp::min(next_multiple, chain_tip)
+        }
         Some(h) => std::cmp::min(h, chain_tip),
         None => chain_tip,
     };
-
-    let start = resume_height(dir)?;
-    let existing = file_store::nullifier_count(dir)?;
 
     if start > NU5_ACTIVATION_HEIGHT {
         eprintln!(

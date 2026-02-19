@@ -26,6 +26,18 @@ DATA_DIR      ?= .
 LWD_URL       ?= https://zec.rocks:443
 PORT          ?= 3000
 BOOTSTRAP_URL ?= https://vote.fra1.digitaloceanspaces.com
+SYNC_HEIGHT   ?=
+
+# Validate SYNC_HEIGHT and build the MAX_HEIGHT env fragment for the ingest binary.
+# If unset, ingest runs to chain tip.  If set, it must be a multiple of 10.
+ifdef SYNC_HEIGHT
+  ifneq ($(shell expr $(SYNC_HEIGHT) % 10),0)
+    $(error SYNC_HEIGHT must be a multiple of 10, got $(SYNC_HEIGHT))
+  endif
+  _MAX_HEIGHT_ENV := MAX_HEIGHT=$(SYNC_HEIGHT)
+else
+  _MAX_HEIGHT_ENV :=
+endif
 
 # ── Targets ──────────────────────────────────────────────────────────
 
@@ -50,11 +62,11 @@ bootstrap: ## Download nullifier files from bootstrap URL if not present in DATA
 		echo "Bootstrap: nullifier files already present in $(DATA_DIR), skipping."; \
 	fi
 
-ingest: ## Ingest nullifiers incrementally (tree sidecar kept as-is)
-	cd $(SERVICE_DIR) && DATA_DIR=$(DATA_DIR) LWD_URL=$(LWD_URL) cargo run --release --bin ingest-nfs
+ingest: ## Ingest nullifiers incrementally up to SYNC_HEIGHT (or chain tip if unset)
+	cd $(SERVICE_DIR) && DATA_DIR=$(DATA_DIR) LWD_URL=$(LWD_URL) $(_MAX_HEIGHT_ENV) cargo run --release --bin ingest-nfs
 
-ingest-resync: ## Ingest nullifiers and delete stale tree sidecar so server rebuilds
-	cd $(SERVICE_DIR) && DATA_DIR=$(DATA_DIR) LWD_URL=$(LWD_URL) INVALIDATE_TREE=1 cargo run --release --bin ingest-nfs
+ingest-resync: ## Ingest nullifiers up to SYNC_HEIGHT and delete stale tree sidecar so server rebuilds
+	cd $(SERVICE_DIR) && DATA_DIR=$(DATA_DIR) LWD_URL=$(LWD_URL) INVALIDATE_TREE=1 $(_MAX_HEIGHT_ENV) cargo run --release --bin ingest-nfs
 
 test-proof: ## Run exclusion proof verification against ingested data
 	cd $(SERVICE_DIR) && DATA_DIR=$(DATA_DIR) cargo run --release --bin test-non-inclusion
