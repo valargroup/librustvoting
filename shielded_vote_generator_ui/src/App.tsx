@@ -21,7 +21,7 @@ import * as cosmosTx from "./api/cosmosTx";
 import { useWallet } from "./hooks/useWallet";
 import type { UseWallet } from "./hooks/useWallet";
 
-type Section = "about" | "rounds" | "builder" | "json" | "downloads" | "preview" | "settings" | "chain-rounds" | "vote-status";
+type Section = "about" | "rounds" | "builder" | "json" | "downloads" | "preview" | "settings" | "vote-status";
 
 function App() {
   const store = useStore();
@@ -335,9 +335,6 @@ function App() {
           </div>
         )}
 
-        {/* On-chain rounds */}
-        {section === "chain-rounds" && <ChainRoundsView />}
-
         {/* Vote status */}
         {section === "vote-status" && <VoteStatusView />}
 
@@ -597,9 +594,8 @@ function useNullifierStatus() {
       });
   }, []);
 
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on mount
+  useEffect(() => { refresh(); }, [refresh]);
 
   return { data, loading, error, refresh };
 }
@@ -1326,231 +1322,21 @@ function PublishModal({
   );
 }
 
-/* ── On-chain rounds view ────────────────────────────────────── */
-
 const STATUS_MAP: Record<string | number, { label: string; color: string }> = {
   SESSION_STATUS_ACTIVE: { label: "Active", color: "bg-success/20 text-success" },
   SESSION_STATUS_TALLYING: { label: "Tallying", color: "bg-warning/20 text-warning" },
-  SESSION_STATUS_FINALIZED: { label: "Finalized", color: "bg-accent-dim/40 text-accent-glow" },
+  SESSION_STATUS_FINALIZED: { label: "Finalized", color: "bg-success/20 text-success" },
   1: { label: "Active", color: "bg-success/20 text-success" },
   2: { label: "Tallying", color: "bg-warning/20 text-warning" },
-  3: { label: "Finalized", color: "bg-accent-dim/40 text-accent-glow" },
+  3: { label: "Finalized", color: "bg-success/20 text-success" },
 };
 
-function ChainRoundsView() {
-  const [rounds, setRounds] = useState<chainApi.ChainRound[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [tallyResults, setTallyResults] = useState<Record<string, chainApi.TallyResult[]>>({});
 
-  const fetchRounds = async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const resp = await chainApi.listRounds();
-      setRounds(resp.rounds ?? []);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchRounds();
-  }, []);
-
-  const handleExpand = async (roundIdB64: string) => {
-    if (expandedId === roundIdB64) {
-      setExpandedId(null);
-      return;
-    }
-    setExpandedId(roundIdB64);
-
-    // Fetch tally results if finalized and not yet loaded.
-    const round = rounds.find((r) => r.vote_round_id === roundIdB64);
-    const isFinalized = Number(round?.status) === 3 || round?.status === "SESSION_STATUS_FINALIZED";
-    if (isFinalized && !tallyResults[roundIdB64]) {
-      try {
-        const hex = base64ToHex(roundIdB64);
-        const resp = await chainApi.getTallyResults(hex);
-        if (resp.results) {
-          setTallyResults((prev) => ({ ...prev, [roundIdB64]: resp.results! }));
-        }
-      } catch {
-        // Ignore tally fetch errors silently
-      }
-    }
-  };
-
-  return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="max-w-2xl mx-auto px-6 py-12">
-        <div className="flex items-center justify-between mb-6">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-accent/15 flex items-center justify-center">
-              <Server size={22} className="text-accent" />
-            </div>
-            <div>
-              <h1 className="text-lg font-bold text-text-primary">
-                On-chain rounds
-              </h1>
-              <p className="text-[11px] text-text-muted">
-                Voting rounds on the Zally chain
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={fetchRounds}
-            className="p-2 hover:bg-surface-3 rounded-lg text-text-muted hover:text-text-secondary cursor-pointer"
-            title="Refresh"
-          >
-            <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
-          </button>
-        </div>
-
-        {error && (
-          <div className="flex items-center gap-2 bg-danger/10 border border-danger/30 rounded-lg p-3 mb-4">
-            <AlertCircle size={14} className="text-danger shrink-0" />
-            <p className="text-[11px] text-danger">{error}</p>
-          </div>
-        )}
-
-        {!loading && !error && rounds.length === 0 && (
-          <div className="text-center py-12">
-            <p className="text-xs text-text-muted">
-              No voting rounds found on the chain.
-            </p>
-          </div>
-        )}
-
-        <div className="space-y-3">
-          {rounds.map((round) => {
-            const roundId = round.vote_round_id ?? "";
-            const statusInfo = STATUS_MAP[round.status ?? ""] ?? {
-              label: String(round.status ?? "Unknown"),
-              color: "bg-surface-3 text-text-muted",
-            };
-            const isExpanded = expandedId === roundId;
-
-            return (
-              <div
-                key={roundId}
-                className="bg-surface-1 border border-border-subtle rounded-xl overflow-hidden"
-              >
-                <button
-                  onClick={() => handleExpand(roundId)}
-                  className="w-full flex items-center justify-between px-5 py-4 text-left cursor-pointer hover:bg-surface-2/50 transition-colors"
-                >
-                  <div className="min-w-0">
-                    <p className="text-xs font-semibold text-text-primary truncate">
-                      {round.description || `Round ${roundId.slice(0, 12)}...`}
-                    </p>
-                    <p className="text-[10px] text-text-muted mt-0.5">
-                      {round.proposals?.length ?? 0} proposal
-                      {(round.proposals?.length ?? 0) !== 1 ? "s" : ""}
-                      {round.creator && (
-                        <span className="ml-2">
-                          by {round.creator.slice(0, 12)}...
-                        </span>
-                      )}
-                    </p>
-                  </div>
-                  <span
-                    className={`text-[9px] px-2 py-0.5 rounded-full shrink-0 ml-3 ${statusInfo.color}`}
-                  >
-                    {statusInfo.label}
-                  </span>
-                </button>
-
-                {isExpanded && (
-                  <div className="px-5 pb-4 border-t border-border-subtle pt-3 space-y-3">
-                    <div className="space-y-1.5">
-                      <SettingsStubRow
-                        label="Round ID"
-                        value={roundId.length > 24 ? roundId.slice(0, 24) + "..." : roundId}
-                      />
-                      {round.snapshot_height && (
-                        <SettingsStubRow
-                          label="Snapshot height"
-                          value={round.snapshot_height}
-                        />
-                      )}
-                      {round.vote_end_time && round.vote_end_time !== "0" && (
-                        <SettingsStubRow
-                          label="Vote end time"
-                          value={new Date(
-                            parseInt(round.vote_end_time) * 1000
-                          ).toLocaleString()}
-                        />
-                      )}
-                    </div>
-
-                    {round.proposals && round.proposals.length > 0 && (
-                      <div>
-                        <p className="text-[10px] uppercase tracking-wider text-text-muted mb-1.5">
-                          Proposals
-                        </p>
-                        <div className="space-y-1.5">
-                          {round.proposals.map((p) => (
-                            <div
-                              key={p.id}
-                              className="flex items-start gap-2 px-3 py-2 bg-surface-2 rounded-lg"
-                            >
-                              <span className="text-[10px] font-bold text-text-muted bg-surface-3 rounded px-1.5 py-0.5 shrink-0">
-                                {String(p.id).padStart(2, "0")}
-                              </span>
-                              <div className="min-w-0">
-                                <p className="text-xs text-text-primary">
-                                  {p.title}
-                                </p>
-                                {p.description && (
-                                  <p className="text-[10px] text-text-muted mt-0.5 line-clamp-2">
-                                    {p.description}
-                                  </p>
-                                )}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Tally results */}
-                    {tallyResults[roundId] &&
-                      tallyResults[roundId].length > 0 && (
-                        <div>
-                          <p className="text-[10px] uppercase tracking-wider text-text-muted mb-1.5">
-                            Tally results
-                          </p>
-                          <div className="space-y-1">
-                            {tallyResults[roundId].map((tr, i) => (
-                              <div
-                                key={i}
-                                className="flex items-center justify-between px-3 py-1.5 bg-surface-2 rounded-lg text-[11px]"
-                              >
-                                <span className="text-text-secondary">
-                                  Proposal {tr.proposal_id}, Decision{" "}
-                                  {tr.vote_decision}
-                                </span>
-                                <span className="text-text-primary font-mono">
-                                  {tr.total_value ?? 0}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
+const BALLOT_DIVISOR = 12_500_000; // zatoshi per ballot
+function ballotsToZEC(ballots: number): string {
+  const zatoshi = ballots * BALLOT_DIVISOR;
+  const zec = zatoshi / 1e8;
+  return `${zec.toFixed(2)} ZEC`;
 }
 
 function base64ToHex(b64: string): string {
@@ -1688,7 +1474,7 @@ function VoteStatusView() {
         )}
 
         <div className="space-y-6">
-          {rounds.map((round) => {
+          {rounds.map((round, roundIdx) => {
             const roundId = round.vote_round_id ?? "";
             const summary = summaries[roundId];
             const statusKey = summary?.status ?? round.status ?? "";
@@ -1724,13 +1510,11 @@ function VoteStatusView() {
                 className="bg-surface-1 border border-border-subtle rounded-xl overflow-hidden"
               >
                 {/* Round header */}
-                <div className="px-5 py-4 flex items-center justify-between">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <h2 className="text-sm font-semibold text-text-primary truncate">
-                        {summary?.description ||
-                          round.description ||
-                          `Round ${roundIdHex.slice(0, 16)}...`}
+                <div className="px-5 py-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <h2 className="text-sm font-semibold text-text-primary">
+                        Round {roundIdx + 1}
                       </h2>
                       <span
                         className={`text-[9px] px-2 py-0.5 rounded-full shrink-0 ${statusInfo.color}`}
@@ -1738,21 +1522,26 @@ function VoteStatusView() {
                         {statusInfo.label}
                       </span>
                     </div>
-                    {endDate && (
-                      <p className="text-[10px] text-text-muted mt-0.5">
-                        {isFinalized
-                          ? `Ended ${endDate.toLocaleDateString()}`
-                          : isExpired
-                            ? `Voting ended ${endDate.toLocaleDateString()} (tallying)`
-                            : `Voting until ${endDate.toLocaleString()}`}
-                      </p>
+                    {isActive && !isExpired && (
+                      <span className="relative flex h-2.5 w-2.5 shrink-0 ml-3">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75" />
+                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-success" />
+                      </span>
                     )}
                   </div>
-                  {isActive && !isExpired && (
-                    <span className="relative flex h-2.5 w-2.5 shrink-0 ml-3">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-success opacity-75" />
-                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-success" />
-                    </span>
+                  {round.description && (
+                    <p className="text-[11px] text-text-secondary mt-1 leading-relaxed">
+                      {round.description}
+                    </p>
+                  )}
+                  {endDate && (
+                    <p className="text-[10px] text-text-muted mt-1">
+                      {isFinalized
+                        ? `Ended ${endDate.toLocaleDateString()}`
+                        : isExpired
+                          ? `Voting ended ${endDate.toLocaleDateString()} (tallying)`
+                          : `Voting until ${endDate.toLocaleString()}`}
+                    </p>
                   )}
                 </div>
 
@@ -1784,69 +1573,145 @@ function VoteStatusView() {
                 {/* Proposals */}
                 {summary?.proposals && summary.proposals.length > 0 && (
                   <div className="px-5 pb-4 space-y-3">
-                    {summary.proposals.map((prop) => (
-                      <div
-                        key={prop.id}
-                        className="bg-surface-2 rounded-lg p-3"
-                      >
-                        <div className="flex items-center gap-2 mb-2">
-                          <span className="text-[10px] font-bold text-text-muted bg-surface-3 rounded px-1.5 py-0.5">
-                            {String(prop.id ?? 0).padStart(2, "0")}
-                          </span>
-                          <span className="text-xs font-semibold text-text-primary">
-                            {prop.title || "Untitled"}
-                          </span>
-                        </div>
+                    {summary.proposals.map((prop) => {
+                      const options = prop.options ?? [];
 
-                        {/* Option bars */}
-                        <div className="space-y-1.5">
-                          {(prop.options ?? []).map((opt) => {
-                            const count = Number(opt.ballot_count ?? 0);
-                            const total = isFinalized
-                              ? Number(opt.total_value ?? 0)
-                              : null;
+                      // Finalized: use total_value for bars & winner.
+                      // Active: use ballot_count (shares) — no ZEC conversion possible.
+                      // Detect winners (may be multiple if tied).
+                      const winnerIndices: Set<number> = new Set();
+                      const isTied = (() => {
+                        if (!isFinalized) return false;
+                        const maxVal = Math.max(
+                          ...options.map((o) => Number(o.total_value ?? 0)),
+                          0
+                        );
+                        if (maxVal <= 0) return false;
+                        for (const o of options) {
+                          if (Number(o.total_value ?? 0) === maxVal) {
+                            winnerIndices.add(o.index ?? 0);
+                          }
+                        }
+                        return winnerIndices.size > 1;
+                      })();
 
-                            // Compute bar width relative to max in this proposal.
-                            const allCounts = (prop.options ?? []).map((o) =>
-                              isFinalized
-                                ? Number(o.total_value ?? 0)
-                                : Number(o.ballot_count ?? 0)
-                            );
-                            const maxCount = Math.max(1, ...allCounts);
-                            const barValue =
-                              isFinalized && total !== null ? total : count;
-                            const pct = (barValue / maxCount) * 100;
+                      const totalValue = isFinalized
+                        ? options.reduce((sum, o) => sum + Number(o.total_value ?? 0), 0)
+                        : null;
+                      const totalShares = options.reduce(
+                        (sum, o) => sum + Number(o.ballot_count ?? 0),
+                        0
+                      );
 
-                            return (
-                              <div key={opt.index} className="space-y-0.5">
-                                <div className="flex items-center justify-between">
-                                  <span className="text-[11px] text-text-secondary">
-                                    {opt.label ?? `Option ${opt.index}`}
-                                  </span>
-                                  <span className="text-[11px] font-mono text-text-primary">
-                                    {isFinalized && total !== null
-                                      ? total.toLocaleString()
-                                      : `${count} ballot${count !== 1 ? "s" : ""}`}
-                                  </span>
+                      return (
+                        <div
+                          key={prop.id}
+                          className="bg-surface-2 rounded-lg p-3"
+                        >
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className="text-[10px] font-bold text-text-muted bg-surface-3 rounded px-1.5 py-0.5">
+                              {String(prop.id ?? 0).padStart(2, "0")}
+                            </span>
+                            <span className="text-xs font-semibold text-text-primary">
+                              {prop.title || "Untitled"}
+                            </span>
+                          </div>
+
+                          {/* Winner banner — only when finalized */}
+                          {isFinalized && winnerIndices.size > 0 && (
+                            <div className="flex items-center gap-1.5 mb-2 px-2 py-1 bg-accent/10 rounded-md">
+                              <span className="text-accent text-xs">{isTied ? "⚖" : "✓"}</span>
+                              <span className="text-[11px] font-semibold text-accent">
+                                {isTied ? "Tie: " : "Winner: "}
+                                {options
+                                  .filter((o) => winnerIndices.has(o.index ?? 0))
+                                  .map((o) => o.label ?? `Option ${o.index}`)
+                                  .join(", ")}
+                              </span>
+                            </div>
+                          )}
+
+                          {/* Option bars */}
+                          <div className="space-y-3">
+                            {options.map((opt) => {
+                              const shares = Number(opt.ballot_count ?? 0);
+                              const value = Number(opt.total_value ?? 0);
+                              const barValue = isFinalized ? value : shares;
+
+                              // Compute bar width relative to max in this proposal.
+                              const allValues = options.map((o) =>
+                                isFinalized
+                                  ? Number(o.total_value ?? 0)
+                                  : Number(o.ballot_count ?? 0)
+                              );
+                              const maxVal = Math.max(1, ...allValues);
+                              const pct = (barValue / maxVal) * 100;
+                              const isWinner = winnerIndices.has(opt.index ?? 0);
+
+                              return (
+                                <div key={opt.index} className="space-y-0.5">
+                                  <div className="flex items-center justify-between">
+                                    <span
+                                      className={`text-[11px] ${
+                                        isWinner
+                                          ? "font-semibold text-text-primary"
+                                          : "text-text-secondary"
+                                      }`}
+                                    >
+                                      {isWinner && (isTied ? "⚖ " : "✓ ")}
+                                      {opt.label ?? `Option ${opt.index}`}
+                                    </span>
+                                    <span className="text-[11px] font-mono text-text-primary">
+                                      {isFinalized ? (
+                                        <>
+                                          {value.toLocaleString()}{" "}
+                                          <span className="text-text-muted">
+                                            ({ballotsToZEC(value)})
+                                          </span>
+                                        </>
+                                      ) : (
+                                        <>
+                                          {shares} share{shares !== 1 ? "s" : ""}
+                                        </>
+                                      )}
+                                    </span>
+                                  </div>
+                                  <div className="h-1.5 bg-surface-3 rounded-full overflow-hidden">
+                                    <div
+                                      className={`h-full rounded-full transition-all duration-500 ${
+                                        isWinner
+                                          ? "bg-accent"
+                                          : isFinalized
+                                            ? "bg-accent/70"
+                                            : "bg-accent/60"
+                                      }`}
+                                      style={{
+                                        width: `${Math.max(barValue > 0 ? 2 : 0, pct)}%`,
+                                      }}
+                                    />
+                                  </div>
                                 </div>
-                                <div className="h-1.5 bg-surface-3 rounded-full overflow-hidden">
-                                  <div
-                                    className={`h-full rounded-full transition-all duration-500 ${
-                                      isFinalized
-                                        ? "bg-accent"
-                                        : "bg-accent/60"
-                                    }`}
-                                    style={{
-                                      width: `${Math.max(barValue > 0 ? 2 : 0, pct)}%`,
-                                    }}
-                                  />
-                                </div>
-                              </div>
-                            );
-                          })}
+                              );
+                            })}
+                          </div>
+
+                          {/* Total */}
+                          {isFinalized && totalValue !== null && totalValue > 0 ? (
+                            <div className="mt-2 pt-2 border-t border-border-subtle">
+                              <span className="text-[10px] text-text-muted">
+                                Total: {totalValue.toLocaleString()} ({ballotsToZEC(totalValue)})
+                              </span>
+                            </div>
+                          ) : totalShares > 0 ? (
+                            <div className="mt-2 pt-2 border-t border-border-subtle">
+                              <span className="text-[10px] text-text-muted">
+                                Total: {totalShares} share{totalShares !== 1 ? "s" : ""}
+                              </span>
+                            </div>
+                          ) : null}
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
 

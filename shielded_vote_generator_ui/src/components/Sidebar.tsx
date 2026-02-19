@@ -10,7 +10,6 @@ import {
   Shield,
   Info,
   Settings,
-  Server,
   BarChart3,
   Trash2,
 } from "lucide-react";
@@ -56,7 +55,6 @@ const NAV_ITEMS: NavItem[] = [
 ];
 
 const RESULTS_ITEMS: NavItem[] = [
-  { label: "On-chain rounds", icon: <Server size={15} />, section: "chain-rounds" },
   { label: "Vote status", icon: <BarChart3 size={15} />, section: "vote-status" },
   { label: "Raw JSON", icon: <Code2 size={15} />, section: "json" },
   { label: "Downloads", icon: <Download size={15} />, section: "downloads" },

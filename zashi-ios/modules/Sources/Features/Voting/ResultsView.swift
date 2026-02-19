@@ -4,6 +4,14 @@ import Generated
 import UIComponents
 import VotingModels
 
+private let tallyValueMultiplier: UInt64 = 12_500_000 // zatoshi per tally unit
+
+private func tallyToZEC(_ value: UInt64) -> String {
+    let zatoshi = value * tallyValueMultiplier
+    let zec = Double(zatoshi) / 100_000_000.0
+    return String(format: "%.2f ZEC", zec)
+}
+
 struct ResultsView: View {
     @Environment(\.colorScheme) var colorScheme
 
@@ -116,8 +124,15 @@ struct ResultsView: View {
     @ViewBuilder
     private func proposalResultCard(proposal: Proposal, index: Int) -> some View {
         let tally = store.tallyResults[proposal.id]
-        let entries = tally?.entries ?? []
+        let rawEntries = tally?.entries ?? []
+        // Backfill missing options (Support=0, Oppose=1) so they always display.
+        let knownDecisions = Set(rawEntries.map(\.decision))
+        let backfilled: [TallyResult.Entry] = [0, 1].compactMap { d in
+            knownDecisions.contains(UInt32(d)) ? nil : TallyResult.Entry(decision: UInt32(d), amount: 0)
+        }
+        let entries = (rawEntries + backfilled).sorted(by: { $0.decision < $1.decision })
         let totalAmount = entries.reduce(UInt64(0)) { $0 + $1.amount }
+        let winningEntry = totalAmount > 0 ? entries.max(by: { $0.amount < $1.amount }) : nil
 
         VStack(alignment: .leading, spacing: 10) {
             // Header: number badge + title
@@ -134,14 +149,31 @@ struct ResultsView: View {
                     .lineLimit(2)
             }
 
+            // Winner highlight
+            if let winner = winningEntry, totalAmount > 0 {
+                let winnerLabel = optionLabel(for: winner.decision, proposal: proposal)
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundStyle(colorForDecision(winner.decision))
+                    Text("Winner: \(winnerLabel)")
+                        .zFont(.semiBold, size: 14, style: Design.Text.primary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(colorForDecision(winner.decision).opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+
             // Result bars — use option labels from proposal.options when available
             ForEach(entries.sorted(by: { $0.decision < $1.decision }), id: \.decision) { entry in
                 let label = optionLabel(for: entry.decision, proposal: proposal)
+                let isWinner = entry.decision == winningEntry?.decision
                 resultBar(
                     label: label,
                     amount: entry.amount,
                     total: totalAmount,
-                    color: colorForDecision(entry.decision)
+                    color: colorForDecision(entry.decision),
+                    isWinner: isWinner
                 )
             }
 
@@ -152,7 +184,7 @@ struct ResultsView: View {
 
             // Total
             if totalAmount > 0 {
-                Text("Total: \(totalAmount) ballots")
+                Text("Total: \(totalAmount) (\(tallyToZEC(totalAmount)))")
                     .zFont(.medium, size: 12, style: Design.Text.tertiary)
             }
         }
@@ -168,24 +200,34 @@ struct ResultsView: View {
     // MARK: - Result Bar
 
     @ViewBuilder
-    private func resultBar(label: String, amount: UInt64, total: UInt64, color: Color) -> some View {
+    private func resultBar(label: String, amount: UInt64, total: UInt64, color: Color, isWinner: Bool) -> some View {
         let ratio = total > 0 ? Double(amount) / Double(total) : 0
 
-        HStack(spacing: 8) {
-            Text(label)
-                .zFont(.medium, size: 13, style: Design.Text.secondary)
-                .frame(width: 60, alignment: .leading)
+        VStack(spacing: 4) {
+            HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    if isWinner {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(color)
+                    }
+                    Text(label)
+                        .zFont(isWinner ? .semiBold : .medium, size: 13, style: Design.Text.secondary)
+                }
+                .frame(width: 80, alignment: .leading)
 
-            GeometryReader { geo in
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(color.opacity(0.7))
-                    .frame(width: geo.size.width * ratio)
+                GeometryReader { geo in
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(color.opacity(isWinner ? 0.9 : 0.5))
+                        .frame(width: geo.size.width * ratio)
+                }
+                .frame(height: 8)
+
+                Text(tallyToZEC(amount))
+                    .zFont(.medium, size: 12, style: Design.Text.primary)
+                    .frame(width: 80, alignment: .trailing)
             }
-            .frame(height: 8)
 
-            Text("\(amount)")
-                .zFont(.medium, size: 13, style: Design.Text.primary)
-                .frame(width: 50, alignment: .trailing)
         }
     }
 
