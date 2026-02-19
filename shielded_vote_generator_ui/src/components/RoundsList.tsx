@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Search, MoreHorizontal, Copy, Archive, Trash2 } from "lucide-react";
+import { Search, MoreHorizontal, Copy, Trash2 } from "lucide-react";
 import { StatusPill } from "./StatusPill";
 import type { VotingRound, RoundStatus } from "../types";
 
@@ -20,7 +20,6 @@ interface RoundsListProps {
   onFilterChange: (f: RoundStatus | "all") => void;
   onSelectRound: (id: string) => void;
   onDuplicate: (id: string) => void;
-  onArchive: (id: string) => void;
   onDelete: (id: string) => void;
 }
 
@@ -37,7 +36,6 @@ export function RoundsList({
   onFilterChange,
   onSelectRound,
   onDuplicate,
-  onArchive,
   onDelete,
 }: RoundsListProps) {
   const [search, setSearch] = useState("");
@@ -127,12 +125,6 @@ export function RoundsList({
                             className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-text-secondary hover:bg-surface-3 hover:text-text-primary cursor-pointer"
                           >
                             <Copy size={12} /> Duplicate
-                          </button>
-                          <button
-                            onClick={() => { onArchive(round.id); setMenuOpen(null); }}
-                            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-text-secondary hover:bg-surface-3 hover:text-text-primary cursor-pointer"
-                          >
-                            <Archive size={12} /> Archive
                           </button>
                           {round.status === "draft" && (
                             <>

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Eye, Code2, MoreHorizontal, Copy, Archive, Trash2, Check } from "lucide-react";
+import { Eye, Code2, MoreHorizontal, Copy, Trash2, Check } from "lucide-react";
 import { StatusPill } from "./StatusPill";
 import type { VotingRound } from "../types";
 
@@ -10,7 +10,6 @@ interface TopBarProps {
   onPublish: () => void;
   onPreview: () => void;
   onDuplicate: () => void;
-  onArchive: () => void;
   onDelete: () => void;
   onNavigate: (section: string) => void;
   isReadonly?: boolean;
@@ -23,7 +22,6 @@ export function TopBar({
   onPublish,
   onPreview,
   onDuplicate,
-  onArchive,
   onDelete,
   onNavigate,
   isReadonly = false,
@@ -142,12 +140,6 @@ export function TopBar({
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-text-secondary hover:bg-surface-3 hover:text-text-primary cursor-pointer"
               >
                 <Copy size={12} /> Duplicate
-              </button>
-              <button
-                onClick={() => { onArchive(); setMenuOpen(false); }}
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-text-secondary hover:bg-surface-3 hover:text-text-primary cursor-pointer"
-              >
-                <Archive size={12} /> Archive
               </button>
               <button
                 onClick={() => { onDelete(); setMenuOpen(false); }}

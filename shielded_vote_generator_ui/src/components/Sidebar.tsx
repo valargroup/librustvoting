@@ -5,11 +5,13 @@ import {
   Clock,
   FileText,
   Archive,
+  Code2,
   Shield,
   Info,
   Settings,
   BarChart3,
   Trash2,
+  Users,
 } from "lucide-react";
 import type { VotingRound, RoundStatus } from "../types";
 
@@ -49,9 +51,12 @@ const NAV_ITEMS: NavItem[] = [
   { label: "All rounds", icon: <LayoutList size={15} />, filter: "all" },
   { label: "In progress", icon: <Clock size={15} />, filter: "in_progress" },
   { label: "Drafts", icon: <FileText size={15} />, filter: "draft" },
-  { label: "Archived", icon: <Archive size={15} />, filter: "archived" },
 ];
 
+const RESULTS_ITEMS: NavItem[] = [
+  { label: "Validators", icon: <Users size={15} />, section: "validators" },
+  { label: "Raw JSON", icon: <Code2 size={15} />, section: "json" },
+];
 
 interface SidebarProps {
   rounds: VotingRound[];
@@ -164,6 +169,20 @@ export function Sidebar({
           </button>
         ))}
 
+        {RESULTS_ITEMS.map((item) => (
+          <button
+            key={item.label}
+            onClick={() => onNavigate(item.section!)}
+            className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-xs transition-colors cursor-pointer ${
+              currentSection === item.section
+                ? "bg-surface-3 text-text-primary"
+                : "text-text-secondary hover:bg-surface-2 hover:text-text-primary"
+            }`}
+          >
+            {item.icon}
+            {item.label}
+          </button>
+        ))}
 
         {/* Recent rounds */}
         <p className="text-[10px] uppercase tracking-wider text-text-muted px-2 mt-4 mb-1">
@@ -196,7 +215,7 @@ export function Sidebar({
                       {round.name}
                     </span>
                     <span
-                      className={`shrink-0 text-[9px] px-1.5 py-0.5 rounded-full ${STATUS_COLORS[round.status]}`}
+                      className={`shrink-0 text-[9px] w-[62px] text-center py-1 leading-none rounded-full ${STATUS_COLORS[round.status]}`}
                     >
                       {STATUS_LABELS[round.status]}
                     </span>
@@ -218,7 +237,7 @@ export function Sidebar({
                       onDeleteRound(round.id);
                     }}
                     title="Delete round"
-                    className="opacity-0 group-hover:opacity-100 shrink-0 flex items-center justify-center px-2 text-text-muted hover:text-danger transition-opacity cursor-pointer"
+                    className="absolute right-1 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 flex items-center justify-center p-1.5 text-text-muted hover:text-danger transition-opacity cursor-pointer"
                   >
                     <Trash2 size={12} />
                   </button>

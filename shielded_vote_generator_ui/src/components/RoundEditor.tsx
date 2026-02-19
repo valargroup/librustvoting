@@ -131,9 +131,16 @@ export function RoundEditor({ round, onUpdateName, onUpdateSettings, isReadonly 
   }, []);
 
   // Auto-fetch NH on mount so the mismatch warning is shown immediately.
+  // Also pre-fill snapshot height if empty.
   useEffect(() => {
     fetchNh();
   }, [fetchNh]);
+
+  useEffect(() => {
+    if (nhHeight != null && !round.settings.snapshotHeight && !isReadonly) {
+      onUpdateSettings({ snapshotHeight: String(nhHeight) });
+    }
+  }, [nhHeight, round.settings.snapshotHeight, isReadonly, onUpdateSettings]);
 
   const handleUseNhHeight = useCallback(() => {
     if (nhHeight != null) {
@@ -253,14 +260,14 @@ export function RoundEditor({ round, onUpdateName, onUpdateSettings, isReadonly 
 
           {/* NH mismatch warning — blocks submission */}
           {nhMismatch && (
-            <div className="flex items-start gap-2 mt-2 px-2.5 py-2 bg-warning/10 border border-warning/40 rounded-md">
-              <AlertTriangle size={12} className="text-warning shrink-0 mt-0.5" />
+            <div className="flex items-start gap-2 mt-2 px-2.5 py-2 bg-danger/10 border border-danger/40 rounded-md">
+              <AlertTriangle size={12} className="text-danger shrink-0 mt-0.5" />
               <div className="min-w-0">
-                <p className="text-[10px] text-warning font-semibold leading-snug">
+                <p className="text-[10px] text-danger font-semibold leading-snug">
                   Snapshot height doesn't match NH
                 </p>
-                <p className="text-[10px] text-text-secondary leading-snug mt-0.5">
-                  Ensure that your nullifier service snapshot is synced to the selected height.
+                <p className="text-[10px] text-danger/80 leading-snug mt-0.5">
+                  The nullifier service will need to regenerate its snapshot for height {snapshotHeightNum.toLocaleString()}. This takes approximately 10 minutes — you will have to wait before publishing.
                 </p>
                 <p className="text-[10px] text-text-muted mt-1">
                   Current NH:{" "}
