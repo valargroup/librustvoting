@@ -72,11 +72,7 @@ echo "New validator address: $NEW_VAL_ADDR"
 
 ## Step 4 — Configure config.toml
 
-```
-HOME="~/.zallyd"
-```
-
-Edit `$HOME/config/config.toml`:
+Edit `~/.zallyd/config/config.toml`:
 
 ```bash
 # Set persistent peer to the genesis validator
@@ -85,23 +81,23 @@ sed -i 's|persistent_peers = ""|persistent_peers = "daf4ff4836a8210006b59a3ad1c1
 
 ## Step 5 — Configure app.toml
 
-Append the vote module config to `$HOME/config/app.toml`:
+Append the vote module config to `~/.zallyd/config/app.toml`:
 
 ```bash
-cat >> $HOME/config/app.toml <<EOF
+cat >> ~/.zallyd/config/app.toml <<EOF
 
 [vote]
-ea_sk_path = "$HOME/ea.sk"
-pallas_sk_path = "$HOME/pallas.sk"
-comet_rpc = "http://localhost:26257"   # adjust to the new node's RPC port
+ea_sk_path = "$HOME/.zallyd/ea.sk"
+pallas_sk_path = "$HOME/.zallyd/pallas.sk"
+comet_rpc = "http://localhost:26657"
 EOF
 ```
 
 Also enable the REST API if needed:
 
 ```bash
-sed -i '/\[api\]/,/\[.*\]/ s/enable = false/enable = true/' $HOME/config/app.toml
-sed -i 's|address = "tcp://localhost:1317"|address = "tcp://0.0.0.0:1518"|' $HOME/config/app.toml
+sed -i '/\[api\]/,/\[.*\]/ s/enable = false/enable = true/' ~/.zallyd/config/app.toml
+sed -i 's|address = "tcp://localhost:1317"|address = "tcp://0.0.0.0:1518"|' ~/.zallyd/config/app.toml
 ```
 
 ## Step 6 — Fund the New Validator Account
