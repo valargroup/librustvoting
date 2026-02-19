@@ -12,7 +12,7 @@ SYNC_HEIGHT ?=
 	test-halo2 test-halo2-ante test-redpallas test-redpallas-ante test-all-ffi \
 	ingest ingest-bootstrap ingest-status ingest-test ingest-proof ingest-clean ingest-serve \
 	ingest-test-integration \
-	up down
+	up down status
 
 install:
 	$(MAKE) -C $(SDK_DIR) install
@@ -96,6 +96,19 @@ ingest: ## Ingest Orchard nullifiers up to SYNC_HEIGHT (or chain tip if unset)
 
 ingest-status: ## Show nullifier count, last synced height, file sizes
 	$(MAKE) -C $(INGEST_DIR) status
+
+status: ## Show chain node status and nullifier ingestion status
+	@echo "=== Chain Node ==="
+	@$(HOME)/go/bin/zallyd status --home $(HOME)/.zallyd 2>/dev/null \
+		| python3 -c "import sys,json; d=json.load(sys.stdin); s=d.get('sync_info',{}); \
+		  print('  moniker    :', d.get('node_info',{}).get('moniker','?')); \
+		  print('  block      :', s.get('latest_block_height','?')); \
+		  print('  syncing    :', s.get('catching_up','?')); \
+		  print('  latest time:', s.get('latest_block_time','?'))" \
+		|| echo "  (node not running)"
+	@echo ""
+	@echo "=== Nullifier Ingest ==="
+	@$(MAKE) -s -C $(INGEST_DIR) status
 
 ingest-test: ## Run nullifier-tree unit tests
 	$(MAKE) -C $(INGEST_DIR) test

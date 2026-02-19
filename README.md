@@ -51,6 +51,17 @@ make down
 
 Kills any running `zallyd`, `query-server`, and `ingest-nfs` processes and prints a confirmation of what was stopped.
 
+### Checking status
+
+```sh
+make status
+```
+
+Prints a combined status summary:
+
+- **Chain Node** — moniker, current block height, syncing flag, and latest block time. Shows `(node not running)` if `zallyd` is not up.
+- **Nullifier Ingest** — nullifier count, last synced height, and sizes of the data files.
+
 ### Step-by-step
 
 ```sh
