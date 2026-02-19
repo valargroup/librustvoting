@@ -683,6 +683,30 @@ fn parse_broadcast_stdout(
     Ok((200, result))
 }
 
+/// Returns the bech32 account address for a key in the test keyring.
+///
+/// Runs `zallyd keys show <name> -a --keyring-backend test --home <home>`.
+pub fn key_account_address(key_name: &str, home_dir: &str) -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("zallyd")
+        .args([
+            "keys", "show",
+            key_name,
+            "-a",
+            "--keyring-backend", "test",
+            "--home", home_dir,
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+    let addr = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if addr.is_empty() { None } else { Some(addr) }
+}
+
 /// Import a hex-encoded secp256k1 private key into the zallyd test keyring.
 ///
 /// Runs `zallyd keys import-hex <name> <hex> --keyring-backend test --home <home>`.

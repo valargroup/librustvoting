@@ -151,7 +151,7 @@ fn ceremony_lifecycle_multi_validator() {
 
     // ---- Phase 3: Reinitialize ----
     log_step("Phase 3", "broadcasting MsgReInitializeElectionAuthority...");
-    let mut msg = reinitialize_ea_payload(&validators[0].operator_address);
+    let mut msg = reinitialize_ea_payload(&validators[0].account_address);
     msg["@type"] = serde_json::json!("/zvote.v1.MsgReInitializeElectionAuthority");
     let config = default_cosmos_tx_config();
     let (http_status, json) =
