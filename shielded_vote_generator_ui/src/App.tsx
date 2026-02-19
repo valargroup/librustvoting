@@ -189,6 +189,7 @@ function App() {
         onCreateRound={handleCreateRound}
         onImportJson={handleImportJson}
         onNavigate={handleNavigate}
+        onDeleteRound={store.deleteRound}
         currentSection={section}
       />
 
