@@ -263,6 +263,16 @@ async fn main() -> Result<()> {
         .parse()
         .expect("PORT must be a valid u16");
 
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    // Bind the socket before loading the tree so we fail fast if the port is
+    // already in use, rather than wasting minutes on tree initialization only
+    // to crash at the end.
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", addr, e))?;
+    listener.set_nonblocking(true)?;
+    eprintln!("Socket bound on {} (tree loading…)", addr);
+
     // Load tree: prefer full-tree file > ranges file > flat nullifier data.
     // After a flat-file build, the full tree is saved as a sidecar so
     // subsequent restarts skip all hashing.
@@ -333,10 +343,9 @@ async fn main() -> Result<()> {
         .layer(cors)
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     eprintln!("Listening on {}", addr);
 
-    axum::Server::bind(&addr)
+    axum::Server::from_tcp(listener)?
         .serve(app.into_make_service())
         .await?;
 
