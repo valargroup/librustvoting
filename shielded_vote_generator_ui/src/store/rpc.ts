@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback } from "react";
 
 const RPC_STORAGE_KEY = "shielded-vote-rpc";
 const BLOCK_TIME_SECONDS = 75;
-const ANCHOR_INTERVAL = 10;
 
 export interface LightwalletdEndpoint {
   label: string;
@@ -33,7 +32,7 @@ export function setStoredRpc(url: string) {
   localStorage.setItem(RPC_STORAGE_KEY, url);
 }
 
-export { ANCHOR_INTERVAL, BLOCK_TIME_SECONDS };
+export { BLOCK_TIME_SECONDS };
 
 export interface ChainInfo {
   latestHeight: number | null;
@@ -52,11 +51,6 @@ export function estimateTimestamp(
   const blockDiff = targetHeight - latestHeight;
   const secondsDiff = blockDiff * BLOCK_TIME_SECONDS;
   return new Date((latestTimestamp + secondsDiff) * 1000);
-}
-
-// Snap a height value to the nearest anchor interval multiple.
-export function snapToAnchorInterval(height: number): number {
-  return Math.round(height / ANCHOR_INTERVAL) * ANCHOR_INTERVAL;
 }
 
 // Fetch latest block info from the Blockchair REST API.

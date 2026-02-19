@@ -11,15 +11,11 @@ const SOURCE_KEY = "zally-wallet-source";
 const DEFAULT_RPC_URL = "http://localhost:26657";
 
 function resolveUrls(): { restUrl: string; rpcUrl: string } {
-  const chainUrl = chainApi.getChainUrl();
-  const isDev =
-    typeof window !== "undefined" && window.location.port === "5173";
-
-  // In dev mode with default localhost config, use the Vite proxy origin for
-  // REST (so relative /cosmos/* paths work) and the direct RPC port for Keplr.
-  const restUrl = isDev && chainUrl === "http://localhost:1318"
+  // In dev mode always use the Vite proxy origin for REST so /cosmos/* paths
+  // are forwarded server-side, regardless of any stored chain URL.
+  const restUrl = import.meta.env.DEV
     ? window.location.origin
-    : chainUrl;
+    : chainApi.getChainUrl();
 
   return { restUrl, rpcUrl: DEFAULT_RPC_URL };
 }

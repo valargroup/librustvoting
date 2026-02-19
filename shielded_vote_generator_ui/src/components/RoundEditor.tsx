@@ -1,11 +1,9 @@
 import { useState } from "react";
-import { Settings2, X, Clock, AlertTriangle, RefreshCw } from "lucide-react";
+import { Settings2, X, Clock, RefreshCw } from "lucide-react";
 import type { VotingRound, RoundSettings } from "../types";
 import {
   useChainInfo,
   estimateTimestamp,
-  snapToAnchorInterval,
-  ANCHOR_INTERVAL,
 } from "../store/rpc";
 
 interface RoundEditorProps {
@@ -103,8 +101,6 @@ export function RoundEditor({ round, onUpdateName, onUpdateSettings }: RoundEdit
 
   const snapshotHeight = parseInt(round.settings.snapshotHeight, 10);
   const isValidHeight = !isNaN(snapshotHeight) && snapshotHeight > 0;
-  const isAnchorAligned = isValidHeight && snapshotHeight % ANCHOR_INTERVAL === 0;
-  const nearestAnchor = isValidHeight ? snapToAnchorInterval(snapshotHeight) : 0;
 
   // Estimated timestamp for the snapshot height
   const estimatedDate =
@@ -164,33 +160,11 @@ export function RoundEditor({ round, onUpdateName, onUpdateSettings }: RoundEdit
               onUpdateSettings({ snapshotHeight: val });
             }}
             placeholder="e.g. 2800000"
-            className={`w-full px-3 py-2 bg-surface-2 border rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none font-mono ${
-              isValidHeight && !isAnchorAligned
-                ? "border-warning/50 focus:border-warning"
-                : "border-border-subtle focus:border-accent/50"
-            }`}
+            className="w-full px-3 py-2 bg-surface-2 border border-border-subtle rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent/50 font-mono"
           />
 
-          {/* Anchor interval warning + snap button */}
-          {isValidHeight && !isAnchorAligned && (
-            <div className="flex items-center gap-2 mt-1.5 px-2.5 py-1.5 bg-warning/10 border border-warning/20 rounded-md">
-              <AlertTriangle size={12} className="text-warning shrink-0" />
-              <p className="text-[10px] text-warning flex-1">
-                Must be a multiple of {ANCHOR_INTERVAL.toLocaleString()}
-              </p>
-              <button
-                onClick={() =>
-                  onUpdateSettings({ snapshotHeight: String(nearestAnchor) })
-                }
-                className="text-[10px] text-accent-glow hover:underline cursor-pointer shrink-0"
-              >
-                Snap to {nearestAnchor.toLocaleString()}
-              </button>
-            </div>
-          )}
-
           {/* Estimated timestamp */}
-          {estimatedDate && isAnchorAligned && (
+          {estimatedDate && (
             <div className="flex items-center gap-2 mt-1.5 px-2.5 py-1.5 bg-surface-2 border border-border-subtle rounded-md">
               <Clock size={12} className="text-accent shrink-0" />
               <div className="min-w-0">
@@ -213,7 +187,6 @@ export function RoundEditor({ round, onUpdateName, onUpdateSettings }: RoundEdit
 
           <p className="text-[10px] text-text-muted mt-1">
             The block height at which balances are captured for vote weighting.
-            Must be a multiple of {ANCHOR_INTERVAL.toLocaleString()}.
           </p>
         </div>
 

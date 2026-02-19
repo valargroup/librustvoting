@@ -17,18 +17,13 @@ export function setChainUrl(url: string) {
 // directly so that changing the URL at runtime actually takes effect (the Vite
 // proxy target is static and won't follow runtime changes).
 function apiBase(): string {
-  const explicit = localStorage.getItem(CHAIN_URL_KEY);
-  if (explicit) {
-    return explicit;
-  }
-  // No explicit override — use the Vite dev proxy when available.
-  if (
-    typeof window !== "undefined" &&
-    window.location.port === "5173"
-  ) {
+  // In dev mode always use the Vite proxy (relative paths). The proxy
+  // forwards /zally/* and /cosmos/* server-side to the chain, so a stored
+  // "localhost:1318" from the Settings UI would be wrong for remote browsers.
+  if (import.meta.env.DEV) {
     return "";
   }
-  return DEFAULT_CHAIN_URL;
+  return localStorage.getItem(CHAIN_URL_KEY) || DEFAULT_CHAIN_URL;
 }
 
 /** Return the resolved API base URL for use by other modules (e.g. cosmosTx). */
