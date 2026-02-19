@@ -19,7 +19,7 @@ import {
 } from "./store/rpc";
 import * as chainApi from "./api/chain";
 import * as cosmosTx from "./api/cosmosTx";
-import { useWallet } from "./hooks/useWallet";
+import { useWallet, DEFAULT_DEV_KEY } from "./hooks/useWallet";
 import type { UseWallet } from "./hooks/useWallet";
 
 type Section = "about" | "rounds" | "builder" | "json" | "downloads" | "preview" | "settings" | "vote-status" | "validators";
@@ -49,10 +49,6 @@ function App() {
     store.createRound();
     setSection("builder");
   }, [store]);
-
-  const handleImportJson = useCallback(() => {
-    importRef.current?.click();
-  }, []);
 
   const handleFileImport = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -805,7 +801,7 @@ function SettingsPage({ wallet }: { wallet: UseWallet }) {
   const [chainDetailsOpen, setChainDetailsOpen] = useState(false);
 
   // Dev private key connection (collapsible section)
-  const [devKey, setDevKey] = useState("");
+  const [devKey, setDevKey] = useState(DEFAULT_DEV_KEY);
   const [devKeyVisible, setDevKeyVisible] = useState(false);
 
   // Set VoteManager flow
@@ -1421,7 +1417,7 @@ function PublishModal({
   onConfirm: () => void;
   onClose: () => void;
 }) {
-  const [devKey, setDevKey] = useState("");
+  const [devKey, setDevKey] = useState(DEFAULT_DEV_KEY);
   const [devKeyVisible, setDevKeyVisible] = useState(false);
   const walletConnected = !!wallet.address;
 
