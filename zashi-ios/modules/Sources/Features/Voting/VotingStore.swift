@@ -66,6 +66,8 @@ public struct Voting {
             case ineligible
             case tallying
             case results
+            case error(String)
+            case walletSyncing
         }
 
         public struct PendingVote: Equatable {
@@ -124,6 +126,9 @@ public struct Voting {
 
         /// Reason the user can't participate (set when navigating to .ineligible).
         public var ineligibilityReason: IneligibilityReason?
+
+        /// Wallet sync progress info for the walletSyncing screen.
+        public var walletScannedHeight: UInt64 = 0
 
         /// Per-proposal share confirmation tracking (proposalId → confirmed count 0-4).
         public var shareConfirmations: [UInt32: Int] = [:]
@@ -257,6 +262,7 @@ public struct Voting {
         case noActiveRound
         case votingWeightLoaded(UInt64, [NoteInfo])
         case initializeFailed(String)
+        case walletNotSynced(scannedHeight: UInt64, snapshotHeight: UInt64)
         case hotkeyLoaded(String)
 
         // DB state stream (single source of truth)
@@ -343,6 +349,7 @@ public struct Voting {
             // MARK: - Initialization
 
             case .initialize:
+                state.screenStack = [.loading]
                 return .run { [votingAPI] send in
                     // 1. Fetch service config (local override → CDN → deployed dev server fallback)
                     let config = try await votingAPI.fetchServiceConfig()
@@ -358,7 +365,7 @@ public struct Voting {
                 let walletDbPath = databaseFiles.dataDbURLFor(network).path
                 let networkId: UInt32 = network.networkType == .mainnet ? 0 : 1
                 let isKeystoneUser = state.isKeystoneUser
-                return .run { [votingAPI, votingCrypto, mnemonic, walletStorage] send in
+                return .run { [votingAPI, votingCrypto, mnemonic, walletStorage, sdkSynchronizer] send in
                     // 2. Configure API client URLs
                     await votingAPI.configureURLs(config)
 
@@ -397,6 +404,14 @@ public struct Voting {
 
                     let snapshotHeight = session.snapshotHeight
                     let roundId = session.voteRoundId.hexString
+
+                    // 5. Check wallet sync progress before querying notes
+                    let walletScannedHeight = UInt64(sdkSynchronizer.latestState().latestBlockHeight)
+                    if walletScannedHeight < snapshotHeight {
+                        print("[Voting] Wallet scanned to \(walletScannedHeight), snapshot at \(snapshotHeight) — not synced yet")
+                        await send(.walletNotSynced(scannedHeight: walletScannedHeight, snapshotHeight: snapshotHeight))
+                        return
+                    }
 
                     let notes = try await votingCrypto.getWalletNotes(
                         walletDbPath, snapshotHeight, networkId
@@ -471,6 +486,12 @@ public struct Voting {
 
             case .initializeFailed(let error):
                 print("[Voting] Initialization error: \(error)")
+                state.screenStack = [.error(error)]
+                return .none
+
+            case .walletNotSynced(let scannedHeight, _):
+                state.walletScannedHeight = scannedHeight
+                state.screenStack = [.walletSyncing]
                 return .none
 
             case .hotkeyLoaded(let address):

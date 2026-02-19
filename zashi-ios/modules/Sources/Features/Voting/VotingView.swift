@@ -39,6 +39,8 @@ public struct VotingView: View {
         case .ineligible: return "ineligible"
         case .tallying: return "tallying"
         case .results: return "results"
+        case .error: return "error"
+        case .walletSyncing: return "walletSyncing"
         }
     }
 
@@ -65,6 +67,10 @@ public struct VotingView: View {
             TallyingView(store: store)
         case .results:
             ResultsView(store: store)
+        case .error(let message):
+            VotingErrorView(store: store, errorMessage: message)
+        case .walletSyncing:
+            WalletSyncingView(store: store)
         }
     }
 }
