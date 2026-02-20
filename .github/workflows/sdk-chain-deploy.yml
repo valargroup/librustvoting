@@ -288,8 +288,8 @@ jobs:
             StrictHostKeyChecking no
           EOF
 
-      # - name: Run ceremony bootstrap
-      #   run: |
-      #     ZALLY_REMOTE_HOME=/opt/zally-chain/.zallyd-val1 \
-      #     ZALLY_NODE_URL=tcp://localhost:26157 \
-      #     ./scripts/remote-ceremony.sh ceremony-remote
+      - name: Run ceremony bootstrap
+        run: |
+          ZALLY_REMOTE_HOME=/opt/zally-chain/.zallyd-val1 \
+          ZALLY_NODE_URL=tcp://localhost:26157 \
+          ./scripts/remote-ceremony.sh ceremony-remote
