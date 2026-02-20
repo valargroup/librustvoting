@@ -24,10 +24,30 @@ import type { UseWallet } from "./hooks/useWallet";
 
 type Section = "about" | "rounds" | "builder" | "json" | "downloads" | "preview" | "settings" | "vote-status" | "validators";
 
+const SECTION_PATHS: Record<Section, string> = {
+  about: "/",
+  rounds: "/rounds",
+  builder: "/builder",
+  json: "/json",
+  downloads: "/downloads",
+  preview: "/preview",
+  settings: "/settings",
+  "vote-status": "/vote-status",
+  validators: "/validators",
+};
+
+const PATH_TO_SECTION: Record<string, Section> = Object.fromEntries(
+  Object.entries(SECTION_PATHS).map(([s, p]) => [p, s as Section])
+) as Record<string, Section>;
+
+function sectionFromPath(): Section {
+  return PATH_TO_SECTION[window.location.pathname] ?? "about";
+}
+
 function App() {
   const store = useStore();
   const wallet = useWallet();
-  const [section, setSection] = useState<Section>("about");
+  const [section, setSectionState] = useState<Section>(sectionFromPath);
   const [filter, setFilter] = useState<RoundStatus | "all">("all");
   const importRef = useRef<HTMLInputElement>(null);
   const [publishModal, setPublishModal] = useState<string | null>(null); // round id
@@ -35,6 +55,22 @@ function App() {
   const [publishResult, setPublishResult] = useState<string>("");
   const [publishError, setPublishError] = useState("");
   const [expectedRoundCount, setExpectedRoundCount] = useState<number | null>(null);
+
+  // Sync section ↔ URL path, keeping nav instant (no full reload).
+  const setSection = useCallback((s: Section) => {
+    setSectionState(s);
+    const path = SECTION_PATHS[s];
+    if (window.location.pathname !== path) {
+      window.history.pushState(null, "", path);
+    }
+  }, []);
+
+  // Handle browser back/forward buttons.
+  useEffect(() => {
+    const onPopState = () => setSectionState(sectionFromPath());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
 
   const handleSelectRound = useCallback(
     (id: string) => {
@@ -175,7 +211,7 @@ function App() {
     (s: string) => {
       setSection(s as Section);
     },
-    []
+    [setSection]
   );
 
   const sampleRound = store.rounds.find((r) => r.name.includes("(SAMPLE)"));
