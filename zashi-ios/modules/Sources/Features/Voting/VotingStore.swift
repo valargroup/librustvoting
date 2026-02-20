@@ -311,6 +311,7 @@ public struct Voting {
     let cancelStateStreamId = UUID()
     let cancelStatusPollingId = UUID()
     let cancelSharePollingId = UUID()
+    let cancelPipelineId = UUID()
 
     public enum Action: Equatable {
         // Navigation
@@ -407,7 +408,8 @@ public struct Voting {
                 return .merge(
                     .cancel(id: cancelStateStreamId),
                     .cancel(id: cancelStatusPollingId),
-                    .cancel(id: cancelSharePollingId)
+                    .cancel(id: cancelSharePollingId),
+                    .cancel(id: cancelPipelineId)
                 )
 
             case .goBack:
@@ -442,6 +444,7 @@ public struct Voting {
                     .cancel(id: cancelStateStreamId),
                     .cancel(id: cancelStatusPollingId),
                     .cancel(id: cancelSharePollingId),
+                    .cancel(id: cancelPipelineId),
                     .run { [votingAPI] send in
                         let allRounds = try await votingAPI.fetchAllRounds()
                         await send(.allRoundsLoaded(allRounds))
@@ -577,6 +580,7 @@ public struct Voting {
                     print("[Voting] Active round pipeline failed: \(error)")
                     await send(.initializeFailed(error.localizedDescription))
                 }
+                .cancellable(id: cancelPipelineId, cancelInFlight: true)
 
             case .activeSessionLoaded(let session):
                 state.activeSession = session

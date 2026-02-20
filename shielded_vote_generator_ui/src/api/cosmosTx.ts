@@ -268,6 +268,45 @@ async function broadcastTxRest(
   };
 }
 
+/**
+ * Poll the chain until a TX is included in a block, confirming it actually landed.
+ * BROADCAST_MODE_SYNC only guarantees the TX passed CheckTx — the TX can still
+ * be dropped from the mempool or fail during DeliverTx. This function queries
+ * the TX by hash until it appears on chain or the timeout expires.
+ */
+async function confirmTx(
+  apiBase: string,
+  txHash: string,
+  timeoutMs = 15_000,
+  intervalMs = 2_000,
+): Promise<BroadcastResult> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, intervalMs));
+    try {
+      const resp = await fetch(`${apiBase}/cosmos/tx/v1beta1/txs/${txHash}`);
+      if (!resp.ok) continue; // TX not indexed yet
+      const data = await resp.json();
+      const txResp = data.tx_response ?? {};
+      const code = txResp.code ?? -1;
+      if (code !== 0) {
+        return {
+          tx_hash: txHash,
+          code,
+          log: txResp.raw_log ?? `Transaction failed during block execution (code ${code})`,
+        };
+      }
+      return { tx_hash: txHash, code: 0, log: "" };
+    } catch {
+      // Network error — retry
+    }
+  }
+  throw new Error(
+    `Transaction ${txHash} was not confirmed within ${timeoutMs / 1000}s. ` +
+    `It may still land — check the chain explorer.`
+  );
+}
+
 // ── Signing ─────────────────────────────────────────────────────
 
 interface SignAndBroadcastOptions {
@@ -316,7 +355,11 @@ async function signAndBroadcast({
   });
   const txBytes = TxRaw.encode(txRaw).finish();
 
-  return broadcastTxRest(apiBase, txBytes);
+  const broadcastResult = await broadcastTxRest(apiBase, txBytes);
+  // If CheckTx failed, return immediately — no point polling
+  if (broadcastResult.code !== 0) return broadcastResult;
+  // Poll until the TX is included in a block (DeliverTx confirmation)
+  return confirmTx(apiBase, broadcastResult.tx_hash);
 }
 
 // ── Stub byte fields ────────────────────────────────────────────
@@ -328,10 +371,34 @@ function filledBytes(byte: number, len: number): Uint8Array {
   return arr;
 }
 
-const STUB_PROPOSALS_HASH     = filledBytes(0xbb, 32);
 const STUB_VK_ZKP1            = filledBytes(0xf1, 64);
 const STUB_VK_ZKP2            = filledBytes(0xf2, 64);
 const STUB_VK_ZKP3            = filledBytes(0xf3, 64);
+
+/** Compute a SHA-256 hash of the serialized proposals for use as proposals_hash.
+ *  This ensures each round with different proposals gets a unique vote_round_id
+ *  (the chain derives round ID from snapshot_height, blockhash, proposals_hash,
+ *  vote_end_time, nullifier_imt_root, and nc_root). */
+async function computeProposalsHash(
+  proposals: Array<{
+    id: number;
+    title: string;
+    description: string;
+    options: Array<{ index: number; label: string }>;
+  }>,
+): Promise<Uint8Array> {
+  const canonical = JSON.stringify(
+    proposals.map((p) => ({
+      id: p.id,
+      title: p.title,
+      description: p.description,
+      options: p.options.map((o) => ({ index: o.index, label: o.label })),
+    })),
+  );
+  const encoded = new TextEncoder().encode(canonical);
+  const digest = await crypto.subtle.digest("SHA-256", encoded);
+  return new Uint8Array(digest);
+}
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -426,7 +493,10 @@ export async function createVotingSession(
   const [account] = await signer.getAccounts();
 
   // Fetch real snapshot data (nc_root, nullifier_imt_root, blockhash).
-  const snapshot = await fetchSnapshotData(apiBase, params.snapshotHeight);
+  const [snapshot, proposalsHash] = await Promise.all([
+    fetchSnapshotData(apiBase, params.snapshotHeight),
+    computeProposalsHash(params.proposals),
+  ]);
 
   return signAndBroadcast({
     apiBase,
@@ -438,7 +508,7 @@ export async function createVotingSession(
           creator: account.address,
           snapshotHeight: params.snapshotHeight,
           snapshotBlockhash: snapshot.snapshotBlockhash,
-          proposalsHash: STUB_PROPOSALS_HASH,
+          proposalsHash,
           voteEndTime: params.voteEndTime,
           nullifierImtRoot: snapshot.nullifierImtRoot,
           ncRoot: snapshot.ncRoot,
