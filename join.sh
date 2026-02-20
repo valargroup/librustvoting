@@ -62,17 +62,23 @@ fi
 echo ""
 echo "=== Downloading binaries ==="
 
-RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")
-TARBALL_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .browser_download_url')
+# Build auth header if GITHUB_TOKEN is set (required for private repos).
+AUTH_HEADER=""
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
+fi
+
+RELEASE_JSON=$(curl -fsSL ${AUTH_HEADER:+-H "$AUTH_HEADER"} "https://api.github.com/repos/${REPO}/releases/latest")
+ASSET_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .url')
 VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
 
-if [ -z "$TARBALL_URL" ] || [ "$TARBALL_URL" = "null" ]; then
+if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
   echo "ERROR: No release tarball found. Check https://github.com/${REPO}/releases"
   exit 1
 fi
 
 echo "Version: ${VERSION}"
-curl -fsSL -o /tmp/zally-release.tar.gz "$TARBALL_URL"
+curl -fsSL ${AUTH_HEADER:+-H "$AUTH_HEADER"} -H "Accept: application/octet-stream" -o /tmp/zally-release.tar.gz "$ASSET_URL"
 
 # Extract just the binaries we need.
 TARBALL_DIR="zally-${VERSION}-linux-amd64"
