@@ -122,10 +122,20 @@ jobs:
             nullifier-ingest/service/target/release/query-server
             nullifier-ingest/service/target/release/ingest-nfs
 
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-sdk, build-ingest]
+    steps:
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
   release:
     name: Package and release (${{ matrix.platform }})
     runs-on: ubuntu-latest
-    needs: [build-sdk, build-ingest]
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -190,7 +200,6 @@ jobs:
           # Create tarball
           tar czf "${DIR}.tar.gz" "${DIR}"
           echo "TARBALL=${DIR}.tar.gz" >> "$GITHUB_ENV"
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v4
@@ -199,11 +208,9 @@ jobs:
           path: ${{ env.TARBALL }}
 
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ env.TARBALL }}
-          # Only generate release notes once to avoid duplication across parallel jobs
-          generate_release_notes: ${{ matrix.platform == 'linux-amd64' }}
+        run: gh release upload "${GITHUB_REF_NAME}" "${TARBALL}" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   distribute:
     name: Distribute to server
