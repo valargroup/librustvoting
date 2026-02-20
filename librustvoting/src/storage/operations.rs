@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ff::PrimeField;
 
 use crate::storage::queries;
@@ -308,8 +310,59 @@ impl VotingDb {
             params.snapshot_height,
             network_id,
         )?;
+        // Witnesses are persisted keyed by note position and loaded sorted by position.
+        // Proof generation, however, consumes notes in `full_notes` order, so we must
+        // re-align witnesses by note commitment to avoid mismatched note/path pairs.
+        let witness_count = witnesses.len();
+        if witness_count != full_notes.len() {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "witness count ({}) does not match note count ({}) for round {}",
+                    witness_count,
+                    full_notes.len(),
+                    round_id
+                ),
+            });
+        }
+
+        let mut witnesses_by_commitment: HashMap<Vec<u8>, WitnessData> =
+            HashMap::with_capacity(witness_count);
+        for w in witnesses {
+            if witnesses_by_commitment
+                .insert(w.note_commitment.clone(), w)
+                .is_some()
+            {
+                return Err(VotingError::Internal {
+                    message: "duplicate witness note_commitment in cache".to_string(),
+                });
+            }
+        }
+
+        let mut ordered_witnesses = Vec::with_capacity(full_notes.len());
+        for (i, n) in full_notes.iter().enumerate() {
+            let w = witnesses_by_commitment
+                .remove(&n.commitment)
+                .ok_or_else(|| VotingError::Internal {
+                    message: format!(
+                        "missing witness for note[{i}] commitment {}",
+                        hex::encode(&n.commitment)
+                    ),
+                })?;
+            ordered_witnesses.push(w);
+        }
+        if !witnesses_by_commitment.is_empty() {
+            return Err(VotingError::Internal {
+                message: "extra cached witnesses not matched to selected notes".to_string(),
+            });
+        }
+
         let db_elapsed = db_start.elapsed();
-        eprintln!("[ZKP1] DB queries: {:.2}s ({} notes, {} witnesses)", db_elapsed.as_secs_f64(), full_notes.len(), witnesses.len());
+        eprintln!(
+            "[ZKP1] DB queries: {:.2}s ({} notes, {} witnesses)",
+            db_elapsed.as_secs_f64(),
+            full_notes.len(),
+            witness_count
+        );
 
         // Phase 2: Fetch IMT exclusion proofs
         let imt_start = std::time::Instant::now();
@@ -360,7 +413,7 @@ impl VotingDb {
             &alpha,
             &van_comm_rand,
             &vote_round_id_bytes,
-            &witnesses,
+            &ordered_witnesses,
             &imt_proofs,
             imt_server_url,
             network_id,
