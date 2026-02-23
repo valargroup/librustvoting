@@ -575,6 +575,7 @@ fn api_imt_proof_verifies_in_delegation_circuit() {
         van_comm_rand,
         &api,
         &mut rng,
+        None,
     )
     .expect("build_delegation_bundle should succeed");
 
@@ -620,6 +621,7 @@ fn four_notes_api_imt_proof_verifies_in_delegation_circuit() {
         van_comm_rand,
         &api,
         &mut rng,
+        None,
     )
     .expect("build_delegation_bundle should succeed");
 

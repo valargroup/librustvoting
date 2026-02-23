@@ -192,6 +192,7 @@ fn build_test_bundle(values: &[u64]) -> DelegationBundle {
         van_comm_rand,
         &imt,
         &mut rng,
+        None,
     )
     .unwrap()
 }
