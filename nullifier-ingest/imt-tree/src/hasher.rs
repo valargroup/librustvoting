@@ -11,7 +11,7 @@ use pasta_curves::Fp;
 /// producing identical results to the canonical `poseidon::Hash` API.
 ///
 /// Correctness is verified by `test_poseidon_hasher_equivalence`.
-pub(crate) struct PoseidonHasher {
+pub struct PoseidonHasher {
     round_constants: Vec<[Fp; 3]>,
     mds: [[Fp; 3]; 3],
     /// `ConstantLength<2>` capacity element: `L * 2^64` where `L = 2`.
@@ -20,7 +20,7 @@ pub(crate) struct PoseidonHasher {
 
 impl PoseidonHasher {
     /// Create a new hasher, computing round constants and MDS matrix once.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let (round_constants, mds, _) = P128Pow5T3::constants();
         // ConstantLength<L> encodes capacity as L * 2^64 (with output length 1).
         let initial_capacity = Fp::from_u128(2u128 << 64);
@@ -45,7 +45,7 @@ impl PoseidonHasher {
     /// This equivalence is proven by the `orchard_spec_equivalence` test in
     /// halo2_gadgets and validated locally by `test_poseidon_hasher_equivalence`.
     #[inline]
-    pub(crate) fn hash(&self, left: Fp, right: Fp) -> Fp {
+    pub fn hash(&self, left: Fp, right: Fp) -> Fp {
         let mut state = [left, right, self.initial_capacity];
         self.permute(&mut state);
         state[0]

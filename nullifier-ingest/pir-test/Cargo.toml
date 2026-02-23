@@ -1,0 +1,17 @@
+[package]
+name = "pir-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pir-export = { path = "../pir-export" }
+pir-client = { path = "../pir-client" }
+imt-tree = { path = "../imt-tree" }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+ff = "0.13"
+pasta_curves = "0.5"
+rayon = "1"
+rand = "0.8"
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
