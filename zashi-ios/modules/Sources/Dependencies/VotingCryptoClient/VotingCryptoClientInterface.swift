@@ -49,17 +49,6 @@ public struct VotingCryptoClient {
 
     // --- Crypto operations ---
     public var generateHotkey: @Sendable (_ roundId: String, _ seed: [UInt8]) async throws -> VotingHotkey
-    /// High-level boundary for sign-action generation:
-    /// derives delegation inputs from seeds and constructs a valid delegation action.
-    public var buildDelegationSignAction: @Sendable (
-        _ roundId: String,
-        _ bundleIndex: UInt32,
-        _ notes: [NoteInfo],
-        _ senderSeed: [UInt8],
-        _ hotkeySeed: [UInt8],
-        _ networkId: UInt32,
-        _ accountIndex: UInt32
-    ) async throws -> DelegationAction
     /// Build a governance-specific PCZT for Keystone signing.
     /// The PCZT's single Orchard action IS the governance dummy action, so Keystone's
     /// SpendAuth signature will be over the governance-bound ZIP-244 sighash.
@@ -86,6 +75,8 @@ public struct VotingCryptoClient {
     /// Build and prove the real delegation ZKP (#1). Long-running.
     /// Loads data from voting DB and wallet DB, fetches IMT proofs from server,
     /// generates a real Halo2 proof, and reports progress.
+    /// Requires `buildGovernancePczt` to have been called first for this bundle —
+    /// it stores the delegation data (alpha, secrets, sighash) needed by the prover.
     public var buildAndProveDelegation: @Sendable (
         _ roundId: String,
         _ bundleIndex: UInt32,
@@ -98,19 +89,6 @@ public struct VotingCryptoClient {
         _ imtServerUrl: String
     ) -> AsyncThrowingStream<ProofEvent, Error>
         = { _, _, _, _, _, _, _, _, _ in AsyncThrowingStream { $0.finish() } }
-    /// Build and prove delegation for Keystone — skips `constructDelegationAction`
-    /// to preserve the alpha stored by `buildGovernancePczt`.
-    public var buildAndProveDelegationKeystone: @Sendable (
-        _ roundId: String,
-        _ bundleIndex: UInt32,
-        _ bundleNotes: [NoteInfo],
-        _ walletDbPath: String,
-        _ hotkeySeed: [UInt8],
-        _ networkId: UInt32,
-        _ accountIndex: UInt32,
-        _ imtServerUrl: String
-    ) -> AsyncThrowingStream<ProofEvent, Error>
-        = { _, _, _, _, _, _, _, _ in AsyncThrowingStream { $0.finish() } }
     /// Extract Orchard FVK bytes from a UFVK string.
     public var extractOrchardFvkFromUfvk: @Sendable (_ ufvkStr: String, _ networkId: UInt32) throws -> Data
     public var decomposeWeight: @Sendable (_ weight: UInt64) -> [UInt64] = { _ in [] }

@@ -184,54 +184,6 @@ extension VotingCryptoClient: DependencyKey {
                     address: hotkey.address
                 )
             },
-            buildDelegationSignAction: { roundId, bundleIndex, notes, senderSeed, hotkeySeed, networkId, accountIndex in
-                let db = try await dbActor.database()
-                let ffiHotkey = try db.generateHotkey(roundId: roundId, seed: Data(hotkeySeed))
-                let hotkey = VotingModels.VotingHotkey(
-                    secretKey: ffiHotkey.secretKey,
-                    publicKey: ffiHotkey.publicKey,
-                    address: ffiHotkey.address
-                )
-                let ffiInputs = try ZcashVotingFFI.generateDelegationInputs(
-                    senderSeed: Data(senderSeed),
-                    hotkeySeed: Data(hotkeySeed),
-                    networkId: networkId,
-                    accountIndex: accountIndex
-                )
-                guard hotkey.publicKey == ffiInputs.hotkeyPublicKey,
-                      hotkey.address == ffiInputs.hotkeyAddress
-                else {
-                    throw VotingCryptoError.hotkeySeedBindingMismatch
-                }
-                let ffiNotes = notes.map { $0.toFFI() }
-                let result = try db.constructDelegationAction(
-                    roundId: roundId,
-                    bundleIndex: bundleIndex,
-                    notes: ffiNotes,
-                    fvkBytes: ffiInputs.fvkBytes,
-                    gDNewX: ffiInputs.gDNewX,
-                    pkDNewX: ffiInputs.pkDNewX,
-                    hotkeyRawAddress: ffiInputs.hotkeyRawAddress,
-                    // Diversifier index for the voting hotkey receiver must stay at 0.
-                    addressIndex: 0
-                )
-                return DelegationAction(
-                    actionBytes: result.actionBytes,
-                    rk: result.rk,
-                    govNullifiers: result.govNullifiers,
-                    van: result.van,
-                    vanCommRand: result.vanCommRand,
-                    dummyNullifiers: result.dummyNullifiers,
-                    rhoSigned: result.rhoSigned,
-                    paddedCmx: result.paddedCmx,
-                    nfSigned: result.nfSigned,
-                    cmxNew: result.cmxNew,
-                    alpha: result.alpha,
-                    rseedSigned: result.rseedSigned,
-                    rseedOutput: result.rseedOutput,
-                    spendAuthSig: nil
-                )
-            },
             buildGovernancePczt: { roundId, bundleIndex, notes, senderSeed, hotkeySeed, networkId, accountIndex, roundName, orchardFvkOverride, keystoneSeedFingerprintOverride in
                 let db = try await dbActor.database()
                 _ = try db.generateHotkey(roundId: roundId, seed: Data(hotkeySeed))
@@ -316,59 +268,16 @@ extension VotingCryptoClient: DependencyKey {
                         do {
                             let db = try await dbActor.database()
                             let reporter = StreamProgressReporter(continuation)
-                            // Derive hotkey raw address from seeds
+                            // Derive hotkey raw address from seeds.
+                            // buildGovernancePczt already stored the delegation data
+                            // (alpha, secrets, sighash) in the DB — we just need the
+                            // hotkey address for the prover.
                             let ffiInputs = try ZcashVotingFFI.generateDelegationInputs(
                                 senderSeed: Data(senderSeed),
                                 hotkeySeed: Data(hotkeySeed),
                                 networkId: networkId,
                                 accountIndex: accountIndex
                             )
-                            // Construct delegation action for this bundle's notes
-                            let ffiNotes = bundleNotes.map { $0.toFFI() }
-                            _ = try db.constructDelegationAction(
-                                roundId: roundId,
-                                bundleIndex: bundleIndex,
-                                notes: ffiNotes,
-                                fvkBytes: ffiInputs.fvkBytes,
-                                gDNewX: ffiInputs.gDNewX,
-                                pkDNewX: ffiInputs.pkDNewX,
-                                hotkeyRawAddress: ffiInputs.hotkeyRawAddress,
-                                addressIndex: accountIndex
-                            )
-                            let result = try db.buildAndProveDelegation(
-                                roundId: roundId,
-                                bundleIndex: bundleIndex,
-                                walletDbPath: walletDbPath,
-                                hotkeyRawAddress: ffiInputs.hotkeyRawAddress,
-                                imtServerUrl: imtServerUrl,
-                                networkId: networkId,
-                                progress: reporter
-                            )
-                            publishState(db: db, roundId: roundId)
-                            continuation.yield(.completed(result.proof))
-                            continuation.finish()
-                        } catch {
-                            continuation.finish(throwing: error)
-                        }
-                    }
-                }
-            },
-            buildAndProveDelegationKeystone: { roundId, bundleIndex, bundleNotes, walletDbPath, hotkeySeed, networkId, accountIndex, imtServerUrl in
-                AsyncThrowingStream { continuation in
-                    Task.detached {
-                        do {
-                            let db = try await dbActor.database()
-                            let reporter = StreamProgressReporter(continuation)
-                            // Derive hotkey raw address from seed (same as non-Keystone)
-                            let ffiInputs = try ZcashVotingFFI.generateDelegationInputs(
-                                senderSeed: Data(hotkeySeed),
-                                hotkeySeed: Data(hotkeySeed),
-                                networkId: networkId,
-                                accountIndex: accountIndex
-                            )
-                            // Skip constructDelegationAction — alpha from buildGovernancePczt
-                            // is the correct one. Calling constructDelegationAction would
-                            // generate a new alpha that overwrites the PCZT's alpha in the DB.
                             let result = try db.buildAndProveDelegation(
                                 roundId: roundId,
                                 bundleIndex: bundleIndex,

@@ -1162,13 +1162,25 @@ public struct Voting {
                             return
                         }
 
-                        // Non-Keystone path: iterate bundles, build and prove delegation for each
+                        // Non-Keystone path: iterate bundles, build PCZT + prove delegation for each.
+                        // buildGovernancePczt stores delegation data (alpha, padded note secrets,
+                        // ZIP-244 sighash) in the DB, then buildAndProveDelegation uses it for
+                        // the ZKP with deterministic randomness (ZCA-74 fix).
                         let noteChunks = cachedNotes.smartBundles().bundles
                         let bundleCount = UInt32(noteChunks.count)
 
                         for bundleIndex: UInt32 in 0..<bundleCount {
                             let bundleNotes = noteChunks[Int(bundleIndex)]
                             print("[Voting] Delegation bundle \(bundleIndex + 1)/\(bundleCount) (\(bundleNotes.count) notes)")
+
+                            // Build governance PCZT — stores delegation data + ZIP-244 sighash
+                            // in the DB. Same path as Keystone, but no FVK override needed
+                            // since the app holds the spending key.
+                            _ = try await votingCrypto.buildGovernancePczt(
+                                roundId, bundleIndex, bundleNotes, senderSeed, hotkeySeed,
+                                networkId, accountIndex, roundName,
+                                nil, nil  // no orchardFvkOverride, no keystoneSeedFingerprint
+                            )
 
                             for try await event in votingCrypto.buildAndProveDelegation(
                                 roundId, bundleIndex, bundleNotes, walletDbPath, senderSeed, hotkeySeed,
@@ -1297,12 +1309,13 @@ public struct Voting {
                     let noteChunks = cachedNotes.smartBundles().bundles
                     let bundleNotes = noteChunks[Int(keystoneBundleIndex)]
 
+                    let senderPhrase2 = try walletStorage.exportWallet().seedPhrase.value()
+                    let senderSeed = try mnemonic.toSeed(senderPhrase2)
                     print("[Voting] Keystone: proving bundle \(keystoneBundleIndex + 1)/\(bundleCount)")
-                    // Use Keystone-specific prover that skips constructDelegationAction
-                    // to preserve the alpha stored by buildGovernancePczt (Bug 2 fix).
-                    for try await event in votingCrypto.buildAndProveDelegationKeystone(
+                    // buildGovernancePczt already stored the delegation data — just prove.
+                    for try await event in votingCrypto.buildAndProveDelegation(
                         roundId, keystoneBundleIndex, bundleNotes, walletDbPath,
-                        hotkeySeed, networkId, accountIndex, imtServerUrl
+                        senderSeed, hotkeySeed, networkId, accountIndex, imtServerUrl
                     ) {
                         switch event {
                         case .progress(let p):
