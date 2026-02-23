@@ -142,15 +142,21 @@ export function RoundEditor({ round, onUpdateName, onUpdateSettings, isReadonly 
     }
   }, [nhHeight, round.settings.snapshotHeight, isReadonly, onUpdateSettings]);
 
-  const handleUseNhHeight = useCallback(() => {
-    if (nhHeight != null) {
-      onUpdateSettings({ snapshotHeight: String(nhHeight) });
-    } else {
-      fetchNh().then(() => {
-        // nhHeight will be set via state; user can click again if needed.
-      });
+  const handleUseNhHeight = useCallback(async () => {
+    setNhLoading(true);
+    setNhError(null);
+    try {
+      const status = await getNullifierStatus();
+      const height = status.latest_height;
+      if (height == null) throw new Error("NH unavailable");
+      setNhHeight(height);
+      onUpdateSettings({ snapshotHeight: String(height) });
+    } catch (err) {
+      setNhError(err instanceof Error ? err.message : "Failed to fetch");
+    } finally {
+      setNhLoading(false);
     }
-  }, [nhHeight, fetchNh, onUpdateSettings]);
+  }, [onUpdateSettings]);
 
   const snapshotHeightNum = parseInt(round.settings.snapshotHeight, 10);
   const nhMismatch =

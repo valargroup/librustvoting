@@ -155,26 +155,27 @@ function App() {
       return;
     }
 
-    const snapshotHeight = parseInt(round.settings.snapshotHeight, 10) || 0;
+    let snapshotHeight = parseInt(round.settings.snapshotHeight, 10) || 0;
     if (snapshotHeight === 0) {
       setPublishStatus("error");
       setPublishError("Snapshot height must be set to a non-zero value in Round Settings.");
       return;
     }
 
-    // Block submission if snapshot height doesn't match the nullifier service NH.
+    // Verify the snapshot height against the nullifier service. If they differ,
+    // auto-update to the current NH so the user doesn't hit a race condition
+    // (NH can advance between "Use NH" click and publish confirmation).
     try {
       const nhStatus = await chainApi.getNullifierStatus();
       const nhHeight = nhStatus.latest_height;
       if (nhHeight != null && nhHeight !== snapshotHeight) {
-        setPublishStatus("error");
-        setPublishError(
-          `Snapshot height ${snapshotHeight.toLocaleString()} doesn't match NH (Nullifier Service Snapshot Height: ${nhHeight.toLocaleString()}). Ensure that your nullifier service snapshot is synced to the selected height.`
-        );
-        return;
+        snapshotHeight = nhHeight;
+        store.updateRound(round.id, {
+          settings: { ...round.settings, snapshotHeight: String(nhHeight) },
+        });
       }
     } catch {
-      // If the nullifier service is unreachable, proceed with a warning — don't hard-block.
+      // If the nullifier service is unreachable, proceed with the user-set height.
     }
 
     if (!round.settings.endTime) {
