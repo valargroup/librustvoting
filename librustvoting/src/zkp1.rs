@@ -304,7 +304,7 @@ fn parse_merkle_path(witness: &WitnessData) -> Result<MerklePath, VotingError> {
 ///
 /// # Arguments
 ///
-/// - `full_notes`: 1–4 wallet notes (from `get_wallet_notes_at_snapshot`).
+/// - `full_notes`: 1–5 wallet notes (from `get_wallet_notes_at_snapshot`).
 /// - `hotkey_raw_address`: 43-byte raw Orchard address of the voting hotkey.
 /// - `alpha_bytes`: 32-byte spend auth randomizer scalar.
 /// - `van_comm_rand_bytes`: 32-byte governance commitment blinding factor.
@@ -328,9 +328,9 @@ pub fn build_and_prove_delegation(
     progress: &dyn ProofProgressReporter,
 ) -> Result<DelegationProofResult, VotingError> {
     let n = full_notes.len();
-    if n == 0 || n > 4 {
+    if n == 0 || n > 5 {
         return Err(VotingError::InvalidInput {
-            message: format!("expected 1–4 notes, got {n}"),
+            message: format!("expected 1–5 notes, got {n}"),
         });
     }
     if merkle_witnesses.len() != n {
@@ -733,7 +733,7 @@ mod tests {
             &reporter,
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("1–4 notes"));
+        assert!(result.unwrap_err().to_string().contains("1–5 notes"));
     }
 
     /// Real Halo2 delegation proof end-to-end test.
@@ -742,7 +742,7 @@ mod tests {
     /// non-membership proofs, serializes everything into byte-level types, and calls
     /// `build_and_prove_delegation()` to generate a real Halo2 proof.
     ///
-    /// Uses 4 notes to avoid padding (no IMT server needed for padded notes).
+    /// Uses 5 notes to avoid padding (no IMT server needed for padded notes).
     /// Long-running due to keygen + proof generation.
     ///
     /// Run with: `cargo test -p librustvoting test_real_delegation_proof -- --ignored --nocapture`
@@ -776,9 +776,9 @@ mod tests {
         let hotkey_addr = hotkey_fvk.address_at(0u32, Scope::External);
         let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
 
-        // 3. Create 4 notes (fills all 4 slots → no padding → no IMT server needed)
+        // 3. Create 5 notes (fills all 5 slots → no padding → no IMT server needed)
         let mut rng = OsRng;
-        let note_values = [4_000_000u64, 4_000_000, 3_000_000, 2_000_000]; // 13M total >= 12.5M min
+        let note_values = [4_000_000u64, 4_000_000, 3_000_000, 2_000_000, 1_000_000]; // 14M total >= 12.5M min
         let address = fvk.address_at(0u32, Scope::External);
 
         let mut notes = Vec::new();
@@ -800,33 +800,46 @@ mod tests {
         );
         println!("Building Merkle tree...");
 
-        // 4. Build Merkle tree (4 leaves in a 32-level tree)
+        // 4. Build Merkle tree (5 leaves in a 32-level tree)
+        // Layout: 8-leaf subtree with 5 real leaves and 3 empty padding leaves.
         let empty_leaf = MerkleHashOrchard::empty_leaf();
-        let mut leaves = [empty_leaf; 4];
+        let mut leaves = [empty_leaf; 8];
         for (i, note) in notes.iter().enumerate() {
             let cmx = ExtractedNoteCommitment::from(note.commitment());
             leaves[i] = MerkleHashOrchard::from_cmx(&cmx);
         }
 
+        // Level 0 pairs
         let l1_0 = MerkleHashOrchard::combine(Level::from(0), &leaves[0], &leaves[1]);
         let l1_1 = MerkleHashOrchard::combine(Level::from(0), &leaves[2], &leaves[3]);
+        let l1_2 = MerkleHashOrchard::combine(Level::from(0), &leaves[4], &leaves[5]);
+        let l1_3 = MerkleHashOrchard::combine(Level::from(0), &leaves[6], &leaves[7]);
+        // Level 1 pairs
         let l2_0 = MerkleHashOrchard::combine(Level::from(1), &l1_0, &l1_1);
+        let l2_1 = MerkleHashOrchard::combine(Level::from(1), &l1_2, &l1_3);
+        // Level 2
+        let l3_0 = MerkleHashOrchard::combine(Level::from(2), &l2_0, &l2_1);
 
-        let mut current = l2_0;
-        for level in 2..TEST_TREE_DEPTH {
+        let mut current = l3_0;
+        for level in 3..TEST_TREE_DEPTH {
             let sibling = MerkleHashOrchard::empty_root(Level::from(level as u8));
             current = MerkleHashOrchard::combine(Level::from(level as u8), &current, &sibling);
         }
         let nc_root_bytes = current.to_bytes().to_vec();
 
         // Build auth paths for each note
-        let l1 = [l1_0, l1_1];
+        let l1 = [l1_0, l1_1, l1_2, l1_3];
+        let l2 = [l2_0, l2_1];
         let mut merkle_witnesses = Vec::new();
         for (i, note) in notes.iter().enumerate() {
             let mut auth_path_hashes = [MerkleHashOrchard::empty_leaf(); TEST_TREE_DEPTH];
+            // Level 0 sibling: XOR bit 0
             auth_path_hashes[0] = leaves[i ^ 1];
-            auth_path_hashes[1] = l1[1 - (i >> 1)];
-            for level in 2..TEST_TREE_DEPTH {
+            // Level 1 sibling: XOR bit 1
+            auth_path_hashes[1] = l1[(i >> 1) ^ 1];
+            // Level 2 sibling: XOR bit 2
+            auth_path_hashes[2] = l2[(i >> 2) ^ 1];
+            for level in 3..TEST_TREE_DEPTH {
                 auth_path_hashes[level] = MerkleHashOrchard::empty_root(Level::from(level as u8));
             }
 
@@ -897,7 +910,7 @@ mod tests {
             &vote_round_id.to_repr(),
             &merkle_witnesses,
             &imt_proof_jsons,
-            "http://unused", // 4 notes = no padding, no server calls
+            "http://unused", // 5 notes = no padding, no server calls
             0,               // mainnet
             &reporter,
         )
@@ -920,8 +933,8 @@ mod tests {
         assert_eq!(result.cmx_new.len(), 32, "cmx_new should be 32 bytes");
         assert_eq!(
             result.gov_nullifiers.len(),
-            4,
-            "should have 4 gov nullifiers"
+            5,
+            "should have 5 gov nullifiers"
         );
         for (i, gn) in result.gov_nullifiers.iter().enumerate() {
             assert_eq!(gn.len(), 32, "gov_nullifier[{i}] should be 32 bytes");

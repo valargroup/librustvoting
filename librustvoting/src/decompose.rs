@@ -1,8 +1,8 @@
-/// Decompose voting weight into exactly 4 shares.
+/// Decompose voting weight into exactly 5 shares.
 ///
-/// Per the protocol spec (§3.3.1), votes are split into exactly 4 shares
+/// Per the protocol spec (§3.3.1), votes are split into exactly 5 shares
 /// that are each encrypted as El Gamal ciphertexts. We first do a binary
-/// decomposition, then distribute the resulting powers-of-2 across 4 buckets
+/// decomposition, then distribute the resulting powers-of-2 across 5 buckets
 /// using round-robin assignment, summing within each bucket.
 ///
 /// Returns empty vec for weight=0.
@@ -24,16 +24,16 @@ pub fn decompose_weight(weight: u64) -> Vec<u64> {
         bit_position += 1;
     }
 
-    // If 4 or fewer bits set, pad with zeros to exactly 4
-    if bits.len() <= 4 {
-        bits.resize(4, 0);
+    // If 5 or fewer bits set, pad with zeros to exactly 5
+    if bits.len() <= 5 {
+        bits.resize(5, 0);
         return bits;
     }
 
-    // More than 4 bits set: distribute round-robin into 4 buckets
-    let mut shares = vec![0u64; 4];
+    // More than 5 bits set: distribute round-robin into 5 buckets
+    let mut shares = vec![0u64; 5];
     for (i, &value) in bits.iter().enumerate() {
-        shares[i % 4] += value;
+        shares[i % 5] += value;
     }
 
     shares
@@ -51,33 +51,33 @@ mod tests {
     #[test]
     fn test_power_of_two() {
         let shares = decompose_weight(1);
-        assert_eq!(shares.len(), 4);
+        assert_eq!(shares.len(), 5);
         assert_eq!(shares.iter().sum::<u64>(), 1);
     }
 
     #[test]
     fn test_composite() {
-        // 5 = 1 + 4 → [1, 4, 0, 0]
+        // 5 = 1 + 4 → [1, 4, 0, 0, 0]
         let shares = decompose_weight(5);
-        assert_eq!(shares.len(), 4);
+        assert_eq!(shares.len(), 5);
         assert_eq!(shares.iter().sum::<u64>(), 5);
     }
 
     #[test]
-    fn test_four_bits() {
-        // 15 = 1 + 2 + 4 + 8 → exactly 4 shares
-        let shares = decompose_weight(15);
-        assert_eq!(shares, vec![1, 2, 4, 8]);
+    fn test_five_bits() {
+        // 31 = 1 + 2 + 4 + 8 + 16 → exactly 5 shares
+        let shares = decompose_weight(31);
+        assert_eq!(shares, vec![1, 2, 4, 8, 16]);
     }
 
     #[test]
-    fn test_more_than_four_bits() {
-        // 31 = 1 + 2 + 4 + 8 + 16 → 5 bits, bucketed into 4
-        let shares = decompose_weight(31);
-        assert_eq!(shares.len(), 4);
-        assert_eq!(shares.iter().sum::<u64>(), 31);
-        // Round-robin: bucket[0]=1+16=17, bucket[1]=2, bucket[2]=4, bucket[3]=8
-        assert_eq!(shares, vec![17, 2, 4, 8]);
+    fn test_more_than_five_bits() {
+        // 63 = 1 + 2 + 4 + 8 + 16 + 32 → 6 bits, bucketed into 5
+        let shares = decompose_weight(63);
+        assert_eq!(shares.len(), 5);
+        assert_eq!(shares.iter().sum::<u64>(), 63);
+        // Round-robin: bucket[0]=1+32=33, bucket[1]=2, bucket[2]=4, bucket[3]=8, bucket[4]=16
+        assert_eq!(shares, vec![33, 2, 4, 8, 16]);
     }
 
     #[test]
@@ -85,7 +85,7 @@ mod tests {
         // 142.50 ZEC = 14_250_000_000 zatoshi
         let weight = 14_250_000_000u64;
         let shares = decompose_weight(weight);
-        assert_eq!(shares.len(), 4);
+        assert_eq!(shares.len(), 5);
         assert_eq!(shares.iter().sum::<u64>(), weight);
     }
 
@@ -94,7 +94,7 @@ mod tests {
         // The balance from the simulator: 101768753
         let weight = 101_768_753u64;
         let shares = decompose_weight(weight);
-        assert_eq!(shares.len(), 4);
+        assert_eq!(shares.len(), 5);
         assert_eq!(shares.iter().sum::<u64>(), weight);
     }
 
@@ -102,7 +102,7 @@ mod tests {
     fn test_large_value() {
         let weight = u64::MAX;
         let shares = decompose_weight(weight);
-        assert_eq!(shares.len(), 4);
+        assert_eq!(shares.len(), 5);
         assert_eq!(shares.iter().sum::<u64>(), weight);
     }
 }

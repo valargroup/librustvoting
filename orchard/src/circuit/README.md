@@ -135,7 +135,7 @@ constrain pk_d_signed     constrain vpk_pk_d
 
 ## El Gamal gadget
 
-Shared circuit gadget that proves **El Gamal encryption integrity** for the vote proof (ZKP #2, condition 11). For each of the 4 vote shares, it constrains that the witnessed ciphertext x-coordinates are correct: C1_i = [r_i]*G, C2_i = [v_i]*G + [r_i]*ea_pk, with G = SpendAuthG and ea_pk from public inputs.
+Shared circuit gadget that proves **El Gamal encryption integrity** for the vote proof (ZKP #2, condition 11). For each of the 5 vote shares, it constrains that the witnessed ciphertext x-coordinates are correct: C1_i = [r_i]*G, C2_i = [v_i]*G + [r_i]*ea_pk, with G = SpendAuthG and ea_pk from public inputs.
 
 ### Why it exists
 

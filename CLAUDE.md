@@ -94,6 +94,10 @@ If the IMT query server returns HTTP 502 with a height mismatch, the tree sideca
 
 Before creating a voting round, the EA key ceremony must be in CONFIRMED status. Run `make ceremony` from `sdk/` after `make up`. Check status: `curl -s http://localhost:1318/zally/v1/ceremony`.
 
+## Protocol Documentation
+
+When modifying circuit logic (in `orchard/`, `librustvoting/`, or `sdk/circuits/`), the corresponding documentation in the Obsidian gitbook (the `shielded_vote_book` repository) must also be updated. The book is served live and describes the circuit structure — any protocol change that affects conditions, public inputs, witness fields, or hash parameters must be reflected there.
+
 ## Code Change Guidelines
 
 **Never consider backwards compatibility** unless explicitly told to do so. Feel free to rename functions, change APIs, delete unused code, and refactor without worrying about breaking existing consumers. This is a research codebase where clean code matters more than stability.

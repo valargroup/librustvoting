@@ -30,9 +30,9 @@ pub struct ShareRevealBundle {
 ///
 /// - `merkle_auth_path`: The 24 sibling hashes from the vote commitment tree.
 /// - `merkle_position`: Leaf position in the vote commitment tree.
-/// - `all_enc_c1_x`: X-coordinates of C1 for all 4 encrypted shares.
-/// - `all_enc_c2_x`: X-coordinates of C2 for all 4 encrypted shares.
-/// - `share_index`: Which of the 4 shares is being revealed (0..3).
+/// - `all_enc_c1_x`: X-coordinates of C1 for all 5 encrypted shares.
+/// - `all_enc_c2_x`: X-coordinates of C2 for all 5 encrypted shares.
+/// - `share_index`: Which of the 5 shares is being revealed (0..4).
 /// - `proposal_id`: Proposal identifier (as a field element).
 /// - `vote_decision`: The voter's choice (as a field element).
 /// - `voting_round_id`: Voting round identifier (as a field element).
@@ -40,14 +40,14 @@ pub struct ShareRevealBundle {
 pub fn build_share_reveal(
     merkle_auth_path: [pallas::Base; VOTE_COMM_TREE_DEPTH],
     merkle_position: u32,
-    all_enc_c1_x: [pallas::Base; 4],
-    all_enc_c2_x: [pallas::Base; 4],
+    all_enc_c1_x: [pallas::Base; 5],
+    all_enc_c2_x: [pallas::Base; 5],
     share_index: u32,
     proposal_id: pallas::Base,
     vote_decision: pallas::Base,
     voting_round_id: pallas::Base,
 ) -> ShareRevealBundle {
-    // Compute shares_hash = Poseidon(c1_0, c2_0, c1_1, c2_1, c1_2, c2_2, c1_3, c2_3).
+    // Compute shares_hash = Poseidon(c1_0, c2_0, c1_1, c2_1, c1_2, c2_2, c1_3, c2_3, c1_4, c2_4).
     let shares_hash = compute_shares_hash(all_enc_c1_x, all_enc_c2_x);
 
     // Compute vote_commitment = Poseidon(DOMAIN_VC, shares_hash, proposal_id, vote_decision).
@@ -119,17 +119,18 @@ mod tests {
         let g = pallas::Point::from(spend_auth_g_affine());
         let ea_pk = g * ea_sk;
 
-        // Encrypt 4 shares.
-        let shares: [u64; 4] = [1_000, 2_000, 3_000, 4_000];
-        let randomness: [pallas::Base; 4] = [
+        // Encrypt 5 shares.
+        let shares: [u64; 5] = [1_000, 2_000, 3_000, 2_500, 1_500];
+        let randomness: [pallas::Base; 5] = [
             pallas::Base::from(101u64),
             pallas::Base::from(202u64),
             pallas::Base::from(303u64),
             pallas::Base::from(404u64),
+            pallas::Base::from(505u64),
         ];
-        let mut c1_x = [pallas::Base::zero(); 4];
-        let mut c2_x = [pallas::Base::zero(); 4];
-        for i in 0..4 {
+        let mut c1_x = [pallas::Base::zero(); 5];
+        let mut c2_x = [pallas::Base::zero(); 5];
+        for i in 0..5 {
             let (c1, c2) = elgamal_encrypt(pallas::Base::from(shares[i]), randomness[i], ea_pk);
             c1_x[i] = c1;
             c2_x[i] = c2;

@@ -8,7 +8,7 @@ use crate::types::{validate_32_bytes, EncryptedShare, VotingError};
 /// Encrypt each share under `ea_pk` using additively homomorphic El Gamal
 /// on the Pallas curve with **SpendAuthG** as the generator.
 ///
-/// Protocol requires exactly 4 shares (§3.3.1).
+/// Protocol requires exactly 5 shares (§3.3.1).
 ///
 /// For each share value `v` with randomness `r`:
 /// - C1 = r * G
@@ -26,9 +26,9 @@ pub fn encrypt_shares(shares: &[u64], ea_pk: &[u8]) -> Result<Vec<EncryptedShare
         });
     }
 
-    if shares.len() > 4 {
+    if shares.len() > 5 {
         return Err(VotingError::InvalidInput {
-            message: format!("at most 4 shares supported, got {}", shares.len()),
+            message: format!("at most 5 shares supported, got {}", shares.len()),
         });
     }
 
@@ -182,18 +182,18 @@ mod tests {
 
     #[test]
     fn test_shares_hash_consistency() {
-        // Encrypt 4 shares, compute shares_hash, verify against circuit helper.
+        // Encrypt 5 shares, compute shares_hash, verify against circuit helper.
         let (_, pk) = keygen();
         let pk_bytes = pk.to_bytes().to_vec();
 
-        let result = encrypt_shares(&[1, 4, 8, 16], &pk_bytes).unwrap();
-        assert_eq!(result.len(), 4);
+        let result = encrypt_shares(&[1, 4, 8, 16, 32], &pk_bytes).unwrap();
+        assert_eq!(result.len(), 5);
 
         // Extract x-coordinates from compressed ciphertexts.
         // Compressed encoding = x-coord with sign bit in the high bit of byte 31.
         // Clear the sign bit to recover the raw x-coordinate as pallas::Base.
-        let mut c1_x = [pallas::Base::zero(); 4];
-        let mut c2_x = [pallas::Base::zero(); 4];
+        let mut c1_x = [pallas::Base::zero(); 5];
+        let mut c2_x = [pallas::Base::zero(); 5];
         for (i, share) in result.iter().enumerate() {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&share.c1);
@@ -239,7 +239,7 @@ mod tests {
         let (_, pk) = keygen();
         let pk_bytes = pk.to_bytes().to_vec();
 
-        let result = encrypt_shares(&[1, 4, 8, 16], &pk_bytes).unwrap();
+        let result = encrypt_shares(&[1, 4, 8, 16, 32], &pk_bytes).unwrap();
         for share in &result {
             assert_eq!(share.c1.len(), 32, "c1 must be 32 bytes");
             assert_eq!(share.c2.len(), 32, "c2 must be 32 bytes");
@@ -248,10 +248,10 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypt_shares_rejects_more_than_4() {
+    fn test_encrypt_shares_rejects_more_than_5() {
         let (_, pk) = keygen();
         let pk_bytes = pk.to_bytes().to_vec();
-        assert!(encrypt_shares(&[1, 2, 4, 8, 16], &pk_bytes).is_err());
+        assert!(encrypt_shares(&[1, 2, 4, 8, 16, 32], &pk_bytes).is_err());
     }
 
     #[test]

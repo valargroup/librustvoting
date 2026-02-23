@@ -65,7 +65,7 @@ impl VotingDb {
 
     // --- Bundles ---
 
-    /// Split notes into value-aware bundles of up to 4 and insert bundle rows.
+    /// Split notes into value-aware bundles of up to 5 and insert bundle rows.
     /// Returns (bundle_count, eligible_weight) — only bundles meeting the BALLOT_DIVISOR
     /// threshold are created. Notes in sub-threshold bundles are dropped.
     pub fn setup_bundles(&self, round_id: &str, notes: &[NoteInfo]) -> Result<(u32, u64), VotingError> {
@@ -316,7 +316,7 @@ impl VotingDb {
     /// - Vote round params (stored by `init_round`)
     ///
     /// Fetches IMT exclusion proofs from the IMT server for each note's nullifier.
-    /// For padded notes (< 4 real notes), the prover fetches proofs internally.
+    /// For padded notes (< 5 real notes), the prover fetches proofs internally.
     ///
     /// Stores the proof result and advances phase to `DelegationProved`.
     pub fn build_and_prove_delegation(
@@ -688,7 +688,7 @@ impl VotingDb {
         // Must match Go's ComputeDelegationSighash.
         const SIGHASH_DOMAIN: &[u8] = b"ZALLY_DELEGATION_SIGHASH_V0";
         let mut canonical =
-            Vec::with_capacity(SIGHASH_DOMAIN.len() + 32 + 32 + 32 + 32 + 64 + 32 + 4 * 32);
+            Vec::with_capacity(SIGHASH_DOMAIN.len() + 32 + 32 + 32 + 32 + 64 + 32 + 5 * 32);
         canonical.extend_from_slice(SIGHASH_DOMAIN);
         extend_padded32(&mut canonical, &vote_round_id_bytes);
         canonical.extend_from_slice(&data.rk);
@@ -696,7 +696,7 @@ impl VotingDb {
         canonical.extend_from_slice(&data.cmx_new);
         extend_padded64(&mut canonical, &enc_memo);
         extend_padded32(&mut canonical, &data.gov_comm);
-        for i in 0..4 {
+        for i in 0..5 {
             if i < data.gov_nullifiers.len() {
                 canonical.extend_from_slice(&data.gov_nullifiers[i]);
             } else {
@@ -800,7 +800,7 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        // 5 notes each 13M — sequential fill: 4+1, both above threshold
+        // 5 notes each 13M — all fit in 1 bundle (capacity 5)
         let notes: Vec<NoteInfo> = (0..5)
             .map(|i| NoteInfo {
                 commitment: vec![0x01; 32],
@@ -816,10 +816,10 @@ mod tests {
             .collect();
 
         let (count, eligible) = db.setup_bundles(ROUND_ID, &notes).unwrap();
-        assert_eq!(count, 2);
-        // Quantized: bundle 0 (39M → 37.5M) + bundle 1 (26M → 25M) = 62.5M
+        assert_eq!(count, 1);
+        // Quantized: bundle 0 (65M → 5×12.5M=62.5M) = 62.5M
         assert_eq!(eligible, 62_500_000);
-        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 2);
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 1);
     }
 
     #[test]
@@ -879,7 +879,7 @@ mod tests {
             .unwrap();
         assert_eq!(action.rk.len(), 32);
         assert_ne!(action.rk, vec![0xDE; 32]);
-        assert_eq!(action.gov_nullifiers.len(), 4);
+        assert_eq!(action.gov_nullifiers.len(), 5);
         assert_eq!(action.van.len(), 32);
         assert_eq!(action.van_comm_rand.len(), 32);
 
@@ -887,8 +887,8 @@ mod tests {
         assert_eq!(action.rho_signed.len(), 32);
         assert_ne!(action.rho_signed, vec![0u8; 32]);
 
-        // padded_cmx: 3 padded notes (1 real + 3 padded = 4)
-        assert_eq!(action.padded_cmx.len(), 3);
+        // padded_cmx: 4 padded notes (1 real + 4 padded = 5)
+        assert_eq!(action.padded_cmx.len(), 4);
         for cmx in &action.padded_cmx {
             assert_eq!(cmx.len(), 32);
         }
@@ -1045,7 +1045,7 @@ mod tests {
         db.mark_vote_submitted(ROUND_ID, 0, 0).unwrap();
     }
 
-    /// Multi-bundle test: 5 notes → 2 bundles, independent delegation + vote storage per bundle.
+    /// Multi-bundle test: 6 notes → 2 bundles (5+1), independent delegation + vote storage per bundle.
     #[test]
     fn test_multi_bundle_delegation_and_voting() {
         use orchard::keys::{FullViewingKey, SpendingKey};
@@ -1054,8 +1054,8 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        // Create 5 notes with distinct positions and unique nullifiers
-        let notes: Vec<NoteInfo> = (0..5)
+        // Create 6 notes with distinct positions and unique nullifiers
+        let notes: Vec<NoteInfo> = (0..6)
             .map(|i| NoteInfo {
                 commitment: vec![0x01; 32],
                 nullifier: {
@@ -1073,21 +1073,21 @@ mod tests {
             })
             .collect();
 
-        // Setup bundles: 5 equal-value notes → sequential fill packs first 4, then 1
-        // Sorted by value DESC (all equal) then position ASC: [0,1,2,3,4]
-        // Bundle 0 = [0,1,2,3], bundle 1 = [4]
+        // Setup bundles: 6 equal-value notes → sequential fill packs first 5, then 1
+        // Sorted by value DESC (all equal) then position ASC: [0,1,2,3,4,5]
+        // Bundle 0 = [0,1,2,3,4], bundle 1 = [5]
         let (bundle_count, eligible) = db.setup_bundles(ROUND_ID, &notes).unwrap();
         assert_eq!(bundle_count, 2);
-        // Quantized: bundle 0 (52M → 4×12.5M=50M) + bundle 1 (13M → 1×12.5M=12.5M) = 62.5M
-        assert_eq!(eligible, 62_500_000);
+        // Quantized: bundle 0 (65M → 5×12.5M=62.5M) + bundle 1 (13M → 1×12.5M=12.5M) = 75M
+        assert_eq!(eligible, 75_000_000);
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 2);
 
         // Verify note positions per bundle (sequential fill)
         let conn = db.conn();
         let positions_0 = queries::load_bundle_note_positions(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(positions_0, vec![0, 1, 2, 3]);
+        assert_eq!(positions_0, vec![0, 1, 2, 3, 4]);
         let positions_1 = queries::load_bundle_note_positions(&conn, ROUND_ID, 1).unwrap();
-        assert_eq!(positions_1, vec![4]);
+        assert_eq!(positions_1, vec![5]);
         drop(conn);
 
         // Derive keys for construct_delegation_action
@@ -1122,7 +1122,7 @@ mod tests {
             // Each bundle should have valid delegation data
             assert_eq!(action.rk.len(), 32);
             assert_eq!(action.van.len(), 32);
-            assert_eq!(action.gov_nullifiers.len(), 4);
+            assert_eq!(action.gov_nullifiers.len(), 5);
 
             // Verify data persisted per bundle
             let conn = db.conn();

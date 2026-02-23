@@ -59,7 +59,7 @@ pub fn delegation_proving_key(
 ///
 /// Returns the serialized proof bytes. The caller must have constructed
 /// a valid `Circuit` (with all witnesses populated) and a matching
-/// `Instance` (12 public inputs).
+/// `Instance` (13 public inputs).
 ///
 /// **Expensive**: K=14 proof generation takes ~30-60 seconds in release mode.
 pub fn create_delegation_proof(circuit: Circuit, instance: &Instance) -> Vec<u8> {
@@ -86,7 +86,7 @@ pub fn create_delegation_proof(circuit: Circuit, instance: &Instance) -> Vec<u8>
 // ================================================================
 
 /// Verify a delegation circuit proof given serialized proof bytes and
-/// the 12 public inputs.
+/// the 13 public inputs.
 ///
 /// Returns `Ok(())` if verification succeeds, or an error message.
 pub fn verify_delegation_proof(
@@ -108,7 +108,7 @@ pub fn verify_delegation_proof(
 /// Verify a delegation circuit proof from raw field-element bytes.
 ///
 /// This is the lower-level entry point used by the FFI layer. It takes
-/// the proof bytes and a flat array of 12 × 32-byte LE-encoded Pallas
+/// the proof bytes and a flat array of 13 × 32-byte LE-encoded Pallas
 /// base field elements (the public inputs in canonical order).
 ///
 /// Returns `Ok(())` if verification succeeds, or an error message.
@@ -118,9 +118,9 @@ pub fn verify_delegation_proof_raw(
 ) -> Result<(), String> {
     use pasta_curves::group::ff::PrimeField;
 
-    if public_inputs_bytes.len() != 12 * 32 {
+    if public_inputs_bytes.len() != 13 * 32 {
         return Err(format!(
-            "expected 384 bytes (12 × 32) for public inputs, got {}",
+            "expected 416 bytes (13 × 32) for public inputs, got {}",
             public_inputs_bytes.len()
         ));
     }
@@ -128,8 +128,8 @@ pub fn verify_delegation_proof_raw(
     // Deserialize each 32-byte chunk as a Pallas Fp element.
     // Note: the delegation circuit's public inputs live on the Vesta
     // scalar field, which is the same as the Pallas base field.
-    let mut public_inputs: Vec<vesta::Scalar> = Vec::with_capacity(12);
-    for i in 0..12 {
+    let mut public_inputs: Vec<vesta::Scalar> = Vec::with_capacity(13);
+    for i in 0..13 {
         let start = i * 32;
         let mut repr = [0u8; 32];
         repr.copy_from_slice(&public_inputs_bytes[start..start + 32]);

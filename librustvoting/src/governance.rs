@@ -148,14 +148,15 @@ pub fn construct_van(
 
 /// Compute constrained rho (spec §1.3.4.1, condition 3).
 ///
-/// `rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)`
+/// `rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, cmx_5, van_comm, vote_round_id)`
 ///
-/// ConstantLength<6>, matching `orchard/src/delegation/circuit.rs:rho_binding_hash`.
+/// ConstantLength<7>, matching `orchard/src/delegation/circuit.rs:rho_binding_hash`.
 pub fn compute_rho_binding(
     cmx_1: &[u8],
     cmx_2: &[u8],
     cmx_3: &[u8],
     cmx_4: &[u8],
+    cmx_5: &[u8],
     van_comm: &[u8],
     vote_round_id: &[u8],
 ) -> Result<Vec<u8>, VotingError> {
@@ -163,12 +164,13 @@ pub fn compute_rho_binding(
     let c2 = bytes_to_fp(cmx_2)?;
     let c3 = bytes_to_fp(cmx_3)?;
     let c4 = bytes_to_fp(cmx_4)?;
+    let c5 = bytes_to_fp(cmx_5)?;
     let gc = bytes_to_fp(van_comm)?;
     // TODO: Once we move vote round to a field element we can use bytes_to_fp directly.
     let vri = bytes_to_fp_wide(vote_round_id)?;
 
-    let rho = poseidon::Hash::<_, P128Pow5T3, ConstantLength<6>, 3, 2>::init()
-        .hash([c1, c2, c3, c4, gc, vri]);
+    let rho = poseidon::Hash::<_, P128Pow5T3, ConstantLength<7>, 3, 2>::init()
+        .hash([c1, c2, c3, c4, c5, gc, vri]);
 
     Ok(fp_to_bytes(rho))
 }
@@ -326,11 +328,12 @@ mod tests {
         let cmx2 = [0x02u8; 32];
         let cmx3 = [0x03u8; 32];
         let cmx4 = [0x04u8; 32];
+        let cmx5 = [0x0Au8; 32];
         let gov = [0x05u8; 32];
         let vri = [0x06u8; 32];
 
-        let r1 = compute_rho_binding(&cmx1, &cmx2, &cmx3, &cmx4, &gov, &vri).unwrap();
-        let r2 = compute_rho_binding(&cmx1, &cmx2, &cmx3, &cmx4, &gov, &vri).unwrap();
+        let r1 = compute_rho_binding(&cmx1, &cmx2, &cmx3, &cmx4, &cmx5, &gov, &vri).unwrap();
+        let r2 = compute_rho_binding(&cmx1, &cmx2, &cmx3, &cmx4, &cmx5, &gov, &vri).unwrap();
 
         assert_eq!(r1.len(), 32);
         assert_eq!(r1, r2, "rho_binding must be deterministic");
@@ -342,21 +345,24 @@ mod tests {
         let cmx2 = [0x02u8; 32];
         let cmx3 = [0x03u8; 32];
         let cmx4 = [0x04u8; 32];
+        let cmx5 = [0x0Au8; 32];
         let gov = [0x05u8; 32];
         let vri = [0x06u8; 32];
 
-        let base = compute_rho_binding(&cmx1, &cmx2, &cmx3, &cmx4, &gov, &vri).unwrap();
+        let base = compute_rho_binding(&cmx1, &cmx2, &cmx3, &cmx4, &cmx5, &gov, &vri).unwrap();
 
         // Changing any cmx should change the output
-        let alt1 = compute_rho_binding(&[0x11u8; 32], &cmx2, &cmx3, &cmx4, &gov, &vri).unwrap();
-        let alt2 = compute_rho_binding(&cmx1, &[0x12u8; 32], &cmx3, &cmx4, &gov, &vri).unwrap();
-        let alt3 = compute_rho_binding(&cmx1, &cmx2, &[0x13u8; 32], &cmx4, &gov, &vri).unwrap();
-        let alt4 = compute_rho_binding(&cmx1, &cmx2, &cmx3, &[0x14u8; 32], &gov, &vri).unwrap();
+        let alt1 = compute_rho_binding(&[0x11u8; 32], &cmx2, &cmx3, &cmx4, &cmx5, &gov, &vri).unwrap();
+        let alt2 = compute_rho_binding(&cmx1, &[0x12u8; 32], &cmx3, &cmx4, &cmx5, &gov, &vri).unwrap();
+        let alt3 = compute_rho_binding(&cmx1, &cmx2, &[0x13u8; 32], &cmx4, &cmx5, &gov, &vri).unwrap();
+        let alt4 = compute_rho_binding(&cmx1, &cmx2, &cmx3, &[0x14u8; 32], &cmx5, &gov, &vri).unwrap();
+        let alt5 = compute_rho_binding(&cmx1, &cmx2, &cmx3, &cmx4, &[0x15u8; 32], &gov, &vri).unwrap();
 
         assert_ne!(base, alt1, "changing cmx_1 must change rho");
         assert_ne!(base, alt2, "changing cmx_2 must change rho");
         assert_ne!(base, alt3, "changing cmx_3 must change rho");
         assert_ne!(base, alt4, "changing cmx_4 must change rho");
+        assert_ne!(base, alt5, "changing cmx_5 must change rho");
     }
 
     #[test]
@@ -365,22 +371,22 @@ mod tests {
         let cmx2 = [0x02u8; 32];
         let cmx3 = [0x03u8; 32];
         let cmx4 = [0x04u8; 32];
+        let cmx5 = [0x0Au8; 32];
         let gov = [0x05u8; 32];
         let vri = [0x06u8; 32];
 
-        let result = compute_rho_binding(&cmx1, &cmx2, &cmx3, &cmx4, &gov, &vri).unwrap();
+        let result = compute_rho_binding(&cmx1, &cmx2, &cmx3, &cmx4, &cmx5, &gov, &vri).unwrap();
 
         // This is a regression test: if the hash changes, the formula has diverged.
-        // Capture the actual value on first successful run.
-        assert_eq!(result.len(), 32);
-        assert_ne!(result, vec![0u8; 32], "rho_binding must not be zero");
-        // Known-answer: captured from first successful run.
-        let expected =
-            hex::decode("37e1cdff84e15fd576c3d52bf7b33769f29a591969ec964a0e098df031e3d422")
-                .unwrap();
         assert_eq!(
-            result, expected,
-            "rho_binding known-answer mismatch — formula may have diverged"
+            result,
+            vec![
+                0x36, 0xfe, 0x8d, 0x03, 0x0e, 0xb6, 0xe2, 0xe6,
+                0x89, 0xc3, 0x31, 0x1a, 0x9f, 0x45, 0x17, 0xb8,
+                0x31, 0xb5, 0x46, 0xe6, 0xbc, 0x2f, 0x4e, 0xe2,
+                0x62, 0x7c, 0x86, 0xbe, 0x7a, 0x80, 0x67, 0x1e,
+            ],
+            "rho_binding known-answer regression"
         );
     }
 }

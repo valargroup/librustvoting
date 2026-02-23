@@ -116,7 +116,7 @@ fn make_dummy_note(
 ///
 /// Field order:
 /// nf_signed || rk || cmx_new || van_comm || gov_null_1 || gov_null_2 ||
-/// gov_null_3 || gov_null_4 || vote_round_id.
+/// gov_null_3 || gov_null_4 || gov_null_5 || vote_round_id.
 ///
 /// TODO: This format might change when we standardize what the cosmos chain expects.
 fn encode_delegation_action_bytes(
@@ -128,16 +128,16 @@ fn encode_delegation_action_bytes(
     vote_round_id: &[u8; 32],
 ) -> Result<Vec<u8>, VotingError> {
     crate::types::validate_32_bytes(van_comm, "van_comm")?;
-    if gov_nullifiers.len() != 4 {
+    if gov_nullifiers.len() != 5 {
         return Err(VotingError::InvalidInput {
             message: format!(
-                "gov_nullifiers must have exactly 4 entries, got {}",
+                "gov_nullifiers must have exactly 5 entries, got {}",
                 gov_nullifiers.len()
             ),
         });
     }
 
-    let mut out = Vec::with_capacity(32 * 9);
+    let mut out = Vec::with_capacity(32 * 10);
     out.extend_from_slice(nf_signed);
     out.extend_from_slice(rk);
     out.extend_from_slice(cmx_new);
@@ -152,7 +152,7 @@ fn encode_delegation_action_bytes(
 
 /// Construct the delegation action for Keystone signing.
 ///
-/// Computes real governance nullifiers (padded to 4), VAN, constrained rho (§1.3.4.1),
+/// Computes real governance nullifiers (padded to 5), VAN, constrained rho (§1.3.4.1),
 /// signed note + output note (§1.3.4.2, §1.3.6), and rk.
 ///
 /// - `fvk_bytes`: 96-byte orchard FullViewingKey (ak[32] || nk[32] || rivk[32])
@@ -230,7 +230,7 @@ pub fn construct_delegation_action(
     let mut rng = rand::thread_rng();
 
     // Compute real gov nullifiers for each input note
-    let mut gov_nullifiers: Vec<Vec<u8>> = Vec::with_capacity(4);
+    let mut gov_nullifiers: Vec<Vec<u8>> = Vec::with_capacity(5);
     for note in notes {
         let gov_null = governance::derive_gov_nullifier(nk_bytes, &vri_32, &note.nullifier)?;
         gov_nullifiers.push(gov_null);
@@ -242,8 +242,8 @@ pub fn construct_delegation_action(
     let mut dummy_nullifiers: Vec<Vec<u8>> = Vec::new();
     let n_real = notes.len();
 
-    if n_real < 4 {
-        for i in n_real..4 {
+    if n_real < 5 {
+        for i in n_real..5 {
             // Derive a unique address for each padded note from the sender's FVK
             let pad_addr = fvk.address_at(1000u32 + i as u32, Scope::External);
 
@@ -286,24 +286,25 @@ pub fn construct_delegation_action(
         &van_comm_rand,
     )?;
 
-    // Collect all 4 cmx values: real from NoteInfo.commitment, padded from above
-    let mut all_cmx: Vec<Vec<u8>> = Vec::with_capacity(4);
+    // Collect all 5 cmx values: real from NoteInfo.commitment, padded from above
+    let mut all_cmx: Vec<Vec<u8>> = Vec::with_capacity(5);
     for note in notes {
         all_cmx.push(note.commitment.clone());
     }
     all_cmx.extend(padded_cmx.iter().cloned());
-    if all_cmx.len() != 4 {
+    if all_cmx.len() != 5 {
         return Err(VotingError::Internal {
-            message: format!("expected 4 cmx values, got {}", all_cmx.len()),
+            message: format!("expected 5 cmx values, got {}", all_cmx.len()),
         });
     }
 
-    // Compute rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
+    // Compute rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, cmx_5, van_comm, vote_round_id)
     let rho_signed = governance::compute_rho_binding(
         &all_cmx[0],
         &all_cmx[1],
         &all_cmx[2],
         &all_cmx[3],
+        &all_cmx[4],
         &van,
         &vri_32,
     )?;
@@ -388,7 +389,7 @@ pub fn construct_delegation_action(
 /// Keystone when it runs the Signer role.
 ///
 /// Parameters:
-/// - `notes`: 1-4 input notes for governance nullifier derivation
+/// - `notes`: 1-5 input notes for governance nullifier derivation
 /// - `params`: voting round parameters (round ID, snapshot height, etc.)
 /// - `fvk_bytes`: 96-byte orchard FullViewingKey (ak[32] || nk[32] || rivk[32])
 /// - `hotkey_raw_address`: 43-byte hotkey raw orchard address
@@ -455,7 +456,7 @@ pub fn build_governance_pczt(
     let mut rng = rand::thread_rng();
 
     // --- Compute governance nullifiers (same as construct_delegation_action) ---
-    let mut gov_nullifiers: Vec<Vec<u8>> = Vec::with_capacity(4);
+    let mut gov_nullifiers: Vec<Vec<u8>> = Vec::with_capacity(5);
     for note in notes {
         let gov_null = governance::derive_gov_nullifier(nk_bytes, &vri_32, &note.nullifier)?;
         gov_nullifiers.push(gov_null);
@@ -465,8 +466,8 @@ pub fn build_governance_pczt(
     let mut padded_cmx: Vec<Vec<u8>> = Vec::new();
     let mut dummy_nullifiers: Vec<Vec<u8>> = Vec::new();
     let n_real = notes.len();
-    if n_real < 4 {
-        for i in n_real..4 {
+    if n_real < 5 {
+        for i in n_real..5 {
             let pad_addr = fvk.address_at(1000u32 + i as u32, Scope::External);
             let rho = random_rho(&mut rng);
             let (pad_note, _) = make_dummy_note(pad_addr, rho, &mut rng)?;
@@ -501,15 +502,15 @@ pub fn build_governance_pczt(
         &van_comm_rand,
     )?;
 
-    // Collect all 4 cmx values
-    let mut all_cmx: Vec<Vec<u8>> = Vec::with_capacity(4);
+    // Collect all 5 cmx values
+    let mut all_cmx: Vec<Vec<u8>> = Vec::with_capacity(5);
     for note in notes {
         all_cmx.push(note.commitment.clone());
     }
     all_cmx.extend(padded_cmx.iter().cloned());
-    if all_cmx.len() != 4 {
+    if all_cmx.len() != 5 {
         return Err(VotingError::Internal {
-            message: format!("expected 4 cmx values, got {}", all_cmx.len()),
+            message: format!("expected 5 cmx values, got {}", all_cmx.len()),
         });
     }
 
@@ -519,6 +520,7 @@ pub fn build_governance_pczt(
         &all_cmx[1],
         &all_cmx[2],
         &all_cmx[3],
+        &all_cmx[4],
         &van,
         &vri_32,
     )?;
@@ -870,8 +872,8 @@ mod tests {
         assert_eq!(result.rseed_output.len(), 32);
         assert_ne!(result.rseed_output, vec![0u8; 32]);
 
-        // Gov nullifiers always padded to 4
-        assert_eq!(result.gov_nullifiers.len(), 4);
+        // Gov nullifiers always padded to 5
+        assert_eq!(result.gov_nullifiers.len(), 5);
         for gnull in &result.gov_nullifiers {
             assert_eq!(gnull.len(), 32);
         }
@@ -890,16 +892,16 @@ mod tests {
         assert_eq!(result.rho_signed.len(), 32);
         assert_ne!(result.rho_signed, vec![0u8; 32]);
 
-        // padded_cmx: 3 padded notes (1 real + 3 padded = 4)
-        assert_eq!(result.padded_cmx.len(), 3);
+        // padded_cmx: 4 padded notes (1 real + 4 padded = 5)
+        assert_eq!(result.padded_cmx.len(), 4);
         for cmx in &result.padded_cmx {
             assert_eq!(cmx.len(), 32);
         }
     }
 
     #[test]
-    fn test_construct_delegation_action_four_notes() {
-        let notes: Vec<NoteInfo> = (0..4)
+    fn test_construct_delegation_action_five_notes() {
+        let notes: Vec<NoteInfo> = (0..5)
             .map(|i| NoteInfo {
                 commitment: vec![i as u8 + 1; 32],
                 nullifier: vec![i as u8 + 0x10; 32],
@@ -923,11 +925,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.gov_nullifiers.len(), 4);
-        // All 4 should be real (no padding needed).
+        assert_eq!(result.gov_nullifiers.len(), 5);
+        // All 5 should be real (no padding needed).
         // They should all be different since inputs differ.
-        for i in 0..4 {
-            for j in (i + 1)..4 {
+        for i in 0..5 {
+            for j in (i + 1)..5 {
                 assert_ne!(
                     result.gov_nullifiers[i], result.gov_nullifiers[j],
                     "gov nullifiers {} and {} should differ",
@@ -939,7 +941,7 @@ mod tests {
         // No padding needed — padded_cmx should be empty
         assert!(result.padded_cmx.is_empty());
 
-        // rho_signed still computed from the 4 real cmx values
+        // rho_signed still computed from the 5 real cmx values
         assert_eq!(result.rho_signed.len(), 32);
         assert_ne!(result.rho_signed, vec![0u8; 32]);
     }
@@ -988,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_construct_delegation_action_too_many_notes() {
-        let notes: Vec<NoteInfo> = (0..5).map(|_| mock_note()).collect();
+        let notes: Vec<NoteInfo> = (0..6).map(|_| mock_note()).collect();
         let result = construct_delegation_action(
             &notes,
             &mock_params(),
@@ -1038,7 +1040,7 @@ mod tests {
     fn test_rho_changes_with_different_notes() {
         // Use small byte values that are guaranteed valid Pallas field elements
         // (values with the high byte < 0x40 are always in range).
-        let notes_a: Vec<NoteInfo> = (0..4)
+        let notes_a: Vec<NoteInfo> = (0..5)
             .map(|i| {
                 let mut commitment = vec![0u8; 32];
                 commitment[0] = i as u8 + 0x10;
@@ -1058,7 +1060,7 @@ mod tests {
             })
             .collect();
 
-        let notes_b: Vec<NoteInfo> = (0..4)
+        let notes_b: Vec<NoteInfo> = (0..5)
             .map(|i| {
                 let mut commitment = vec![0u8; 32];
                 commitment[0] = i as u8 + 0x30;
@@ -1234,6 +1236,7 @@ mod tests {
             vec![0x06; 32],
             vec![0x07; 32],
             vec![0x08; 32],
+            vec![0x0A; 32],
         ];
         let vote_round_id = [0x09; 32];
 
@@ -1247,7 +1250,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(encoded.len(), 32 * 9);
+        assert_eq!(encoded.len(), 32 * 10);
         assert_eq!(&encoded[0..32], &nf_signed);
         assert_eq!(&encoded[32..64], &rk);
         assert_eq!(&encoded[64..96], &cmx_new);
@@ -1256,7 +1259,8 @@ mod tests {
         assert_eq!(&encoded[160..192], &gov_nullifiers[1]);
         assert_eq!(&encoded[192..224], &gov_nullifiers[2]);
         assert_eq!(&encoded[224..256], &gov_nullifiers[3]);
-        assert_eq!(&encoded[256..288], &vote_round_id);
+        assert_eq!(&encoded[256..288], &gov_nullifiers[4]);
+        assert_eq!(&encoded[288..320], &vote_round_id);
     }
 
     #[test]
@@ -1266,7 +1270,7 @@ mod tests {
             &[0x02; 32],
             &[0x03; 32],
             &[0x04; 32],
-            &vec![vec![0x05; 32]; 3],
+            &vec![vec![0x05; 32]; 4],
             &[0x06; 32],
         );
         assert!(encoded.is_err());
@@ -1360,8 +1364,8 @@ mod tests {
         assert_eq!(result.cmx_new.len(), 32);
         assert_ne!(result.cmx_new, vec![0u8; 32]);
 
-        // Gov nullifiers padded to 4
-        assert_eq!(result.gov_nullifiers.len(), 4);
+        // Gov nullifiers padded to 5
+        assert_eq!(result.gov_nullifiers.len(), 5);
         for gn in &result.gov_nullifiers {
             assert_eq!(gn.len(), 32);
         }
@@ -1376,8 +1380,8 @@ mod tests {
         assert_eq!(result.rho_signed.len(), 32);
         assert_ne!(result.rho_signed, vec![0u8; 32]);
 
-        // 3 padded cmx (1 real + 3 padded = 4)
-        assert_eq!(result.padded_cmx.len(), 3);
+        // 4 padded cmx (1 real + 4 padded = 5)
+        assert_eq!(result.padded_cmx.len(), 4);
 
         // rseed values are 32 bytes each
         assert_eq!(result.rseed_signed.len(), 32);
@@ -1385,8 +1389,8 @@ mod tests {
         assert_eq!(result.rseed_output.len(), 32);
         assert_ne!(result.rseed_output, vec![0u8; 32]);
 
-        // action_bytes is 9 * 32 = 288 bytes
-        assert_eq!(result.action_bytes.len(), 288);
+        // action_bytes is 10 * 32 = 320 bytes
+        assert_eq!(result.action_bytes.len(), 320);
 
         // action_index is 0 or 1 (2 actions total: 1 real + 1 dummy padding)
         assert!(result.action_index <= 1);
@@ -1397,8 +1401,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_governance_pczt_four_notes() {
-        let notes: Vec<NoteInfo> = (0..4)
+    fn test_build_governance_pczt_five_notes() {
+        let notes: Vec<NoteInfo> = (0..5)
             .map(|i| NoteInfo {
                 commitment: vec![i as u8 + 1; 32],
                 nullifier: vec![i as u8 + 0x10; 32],
@@ -1425,13 +1429,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.gov_nullifiers.len(), 4);
+        assert_eq!(result.gov_nullifiers.len(), 5);
         assert!(result.padded_cmx.is_empty());
         assert!(result.dummy_nullifiers.is_empty());
 
         // Gov nullifiers should all differ
-        for i in 0..4 {
-            for j in (i + 1)..4 {
+        for i in 0..5 {
+            for j in (i + 1)..5 {
                 assert_ne!(result.gov_nullifiers[i], result.gov_nullifiers[j]);
             }
         }

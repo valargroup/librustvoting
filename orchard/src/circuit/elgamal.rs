@@ -1,6 +1,6 @@
 //! El Gamal encryption integrity gadget for vote proof (ZKP #2).
 //!
-//! Proves that four ciphertext pairs (enc_share_c1_x[i], enc_share_c2_x[i]) are
+//! Proves that five ciphertext pairs (enc_share_c1_x[i], enc_share_c2_x[i]) are
 //! valid El Gamal encryptions of the corresponding plaintext shares under the
 //! election authority public key: C1_i = [r_i]*G, C2_i = [v_i]*G + [r_i]*ea_pk.
 //!
@@ -88,7 +88,7 @@ pub fn elgamal_encrypt(
 /// Caller must assign:
 /// - `g_x_const`, `g_y_const`: SpendAuthG coordinates (advice-from-constant).
 /// - `ea_pk_x_cell`, `ea_pk_y_cell`: ea_pk coordinates (advice-from-instance).
-/// - `r_cells`: four advice cells holding the El Gamal randomness values.
+/// - `r_cells`: five advice cells holding the El Gamal randomness values.
 /// - `share_cells`, `enc_c1_cells`, `enc_c2_cells`: share values and
 ///   ciphertext x-coordinates (already witnessed).
 ///
@@ -103,12 +103,12 @@ pub(in crate::circuit) fn prove_elgamal_encryptions(
     ea_pk: halo2_proofs::circuit::Value<pallas::Affine>,
     ea_pk_x_cell: AssignedCell<pallas::Base, pallas::Base>,
     ea_pk_y_cell: AssignedCell<pallas::Base, pallas::Base>,
-    share_cells: [AssignedCell<pallas::Base, pallas::Base>; 4],
-    r_cells: [AssignedCell<pallas::Base, pallas::Base>; 4],
-    enc_c1_cells: [AssignedCell<pallas::Base, pallas::Base>; 4],
-    enc_c2_cells: [AssignedCell<pallas::Base, pallas::Base>; 4],
+    share_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
+    r_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
+    enc_c1_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
+    enc_c2_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
 ) -> Result<(), Error> {
-    for i in 0..4 {
+    for i in 0..5 {
         // --- C1_i = [r_i] * G ---
 
         let g_c1 = NonIdentityPoint::new(

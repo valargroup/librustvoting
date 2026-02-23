@@ -3,7 +3,7 @@
 Proves that a registered voter is casting a valid vote, without revealing which VAN they hold. The structure follows the delegation circuit's pattern (ZKP 1). Numbering matches Gov Steps V1 (ZKP #2): 12 conditions total; all conditions 1–12 are fully constrained in-circuit (condition 4 enforces spend authority `r_vpk = vsk.ak + [alpha_v]*G` in-circuit; the vote signature is verified out-of-circuit under `r_vpk`).
 
 **Public inputs:** 11 field elements.
-**Current K:** 14 (16,384 rows) — accommodates conditions 1–4 and 5–12, including 12 variable-base ECC scalar multiplications (condition 11), ~31 Poseidon hashes, and the 10-bit lookup table.
+**Current K:** 14 (16,384 rows) — accommodates conditions 1–4 and 5–12, including 15 variable-base ECC scalar multiplications (condition 11), ~31 Poseidon hashes, and the 10-bit lookup table.
 
 ## Inputs
 
@@ -34,10 +34,10 @@ Proves that a registered voter is casting a valid vote, without revealing which 
    * **vsk_nk**: nullifier deriving key derived from `vsk`. Shared between condition 3 (CommitIvk `nk` input) and condition 5 (VAN nullifier keying).
 
 - Private (vote commitment — conditions 8–12)
-   * **shares_1..4**: the voting share vector (each in `[0, 2^24)`).
-   * **enc_share_c1_x[0..3]**: x-coordinates of C1_i = r_i * G (El Gamal first component, via ExtractP).
-   * **enc_share_c2_x[0..3]**: x-coordinates of C2_i = shares_i * G + r_i * ea_pk (El Gamal second component, via ExtractP).
-   * **share_randomness[0..3]**: El Gamal encryption randomness per share (base field elements, converted to scalars via `ScalarVar::from_base` in-circuit).
+   * **shares_1..5**: the voting share vector (each in `[0, 2^24)`).
+   * **enc_share_c1_x[0..4]**: x-coordinates of C1_i = r_i * G (El Gamal first component, via ExtractP).
+   * **enc_share_c2_x[0..4]**: x-coordinates of C2_i = shares_i * G + r_i * ea_pk (El Gamal second component, via ExtractP).
+   * **share_randomness[0..4]**: El Gamal encryption randomness per share (base field elements, converted to scalars via `ScalarVar::from_base` in-circuit).
    * **ea_pk**: election authority public key as a Pallas affine point (witnessed as `NonIdentityPoint`, constrained to public inputs at offsets 7–8).
    * **vote_decision**: the voter's choice.
 
@@ -45,7 +45,7 @@ Proves that a registered voter is casting a valid vote, without revealing which 
    * **voting_round_id cell**: copied from the instance column, used in condition 2 Poseidon hash and condition 5 inner hash.
    * **domain_van_nullifier cell**: constant encoding of `"vote authority spend"` (condition 5).
    * **proposal_authority_new**: derived as `proposal_authority_old - (1 << proposal_id)` (condition 6).
-   * **shares_hash**: Poseidon hash of 8 enc_share x-coordinates (condition 10). Internal wire consumed by condition 12.
+   * **shares_hash**: Poseidon hash of 10 enc_share x-coordinates (condition 10). Internal wire consumed by condition 12.
    * **SpendAuthG x, y constants**: coordinates of the El Gamal generator (condition 11). Baked into the verification key via `assign_advice_from_constant`.
    * **ea_pk_x, ea_pk_y cells**: copied from the instance column (condition 11). Each ea_pk `NonIdentityPoint` witness is constrained to match these cells.
    * **DOMAIN_VC constant**: `1`. Domain separation tag for Vote Commitments (condition 12). Baked into the verification key.
@@ -232,19 +232,20 @@ Where:
 Purpose: voting shares decomposition is consistent with the total delegated weight.
 
 ```
-sum(share_0, share_1, share_2, share_3) = total_note_value
+sum(share_0, share_1, share_2, share_3, share_4) = total_note_value
 ```
 
 Where:
-- **share_0..share_3**: the 4 plaintext voting shares (private witnesses). Each share represents a portion of the voter's delegated weight allocated to one of the 4 vote options. These cells will also be used by condition 9 (range check) and condition 11 (El Gamal encryption inputs).
+- **share_0..share_4**: the 5 plaintext voting shares (private witnesses). Each share represents a portion of the voter's delegated weight allocated to one of the 5 vote options. These cells will also be used by condition 9 (range check) and condition 11 (El Gamal encryption inputs).
 - **total_note_value**: the voter's total delegated weight. Cell-equality-linked to the same witness cell used in condition 2 (VAN integrity), binding the shares decomposition to the authenticated VAN.
 
-**Structure:** Three chained `AddChip` additions (3 rows):
+**Structure:** Four chained `AddChip` additions (4 rows):
 - `partial_1 = share_0 + share_1`
 - `partial_2 = partial_1 + share_2`
-- `shares_sum = partial_2 + share_3`
+- `partial_3 = partial_2 + share_3`
+- `shares_sum = partial_3 + share_4`
 
-**Constraint:** `constrain_equal(shares_sum, total_note_value)` — the sum of all 4 shares must exactly equal the voter's total delegated weight. This prevents the voter from creating or destroying voting power during the share decomposition.
+**Constraint:** `constrain_equal(shares_sum, total_note_value)` — the sum of all 5 shares must exactly equal the voter's total delegated weight. This prevents the voter from creating or destroying voting power during the share decomposition.
 
 **Constructions:** `AddChip` (reused from condition 6).
 
@@ -257,11 +258,11 @@ Each share_i in [0, 2^30)
 ```
 
 Where:
-- **share_0..share_3**: the 4 plaintext voting shares from condition 8. Each share must fit in a bounded range to prevent overflow when shares are used in El Gamal encryption (condition 11) and accumulated homomorphically during tally.
+- **share_0..share_4**: the 5 plaintext voting shares from condition 8. Each share must fit in a bounded range to prevent overflow when shares are used in El Gamal encryption (condition 11) and accumulated homomorphically during tally.
 
-**Bound:** The protocol spec targets `[0, 2^24)`, but halo2_gadgets v0.3's `short_range_check` is `pub(crate)` (private to the gadget crate), so the exact 24-bit decomposition (2 × 10-bit + 4-bit short check) is unavailable. We use the next 10-bit-aligned bound: `[0, 2^30)` via 3 × 10-bit words with strict mode. 30 bits (~1B per share) is secure: max sum of 4 shares ≈ 4B, well within the Pallas field, and the homomorphic tally accumulates over far fewer voters than 2^30.
+**Bound:** The protocol spec targets `[0, 2^24)`, but halo2_gadgets v0.3's `short_range_check` is `pub(crate)` (private to the gadget crate), so the exact 24-bit decomposition (2 × 10-bit + 4-bit short check) is unavailable. We use the next 10-bit-aligned bound: `[0, 2^30)` via 3 × 10-bit words with strict mode. 30 bits (~1B per share) is secure: max sum of 5 shares ≈ 5B, well within the Pallas field, and the homomorphic tally accumulates over far fewer voters than 2^30.
 
-**Structure:** For each share, one `copy_check` call (4 calls total, ~16 rows):
+**Structure:** For each share, one `copy_check` call (5 calls total, ~20 rows):
 - `copy_check(share_i, 3, true)` — decomposes the share into 3 × 10-bit lookup words. Each word is range-checked via the 10-bit lookup table. The `true` (strict) flag constrains the final running sum `z_3` to equal 0, enforcing `share < 2^30`.
 
 If a share exceeds `2^30` or is a wrapped large field element (e.g. `p - k` from underflow), the 3-word decomposition produces a non-zero `z_3`, which fails the strict check.
@@ -272,19 +273,19 @@ If a share exceeds `2^30` or is a wrapped large field element (e.g. `p - k` from
 
 ## Condition 10: Shares Hash Integrity ✅
 
-Purpose: commit to the 4 El Gamal ciphertext pairs so they can be verified in conditions 11 and 12 without re-witnessing.
+Purpose: commit to the 5 El Gamal ciphertext pairs so they can be verified in conditions 11 and 12 without re-witnessing.
 
 ```
-shares_hash = Poseidon(c1_0_x, c2_0_x, c1_1_x, c2_1_x, c1_2_x, c2_2_x, c1_3_x, c2_3_x)
+shares_hash = Poseidon(c1_0_x, c2_0_x, c1_1_x, c2_1_x, c1_2_x, c2_2_x, c1_3_x, c2_3_x, c1_4_x, c2_4_x)
 ```
 
 Where:
 - **c1_i_x**: x-coordinate of `C1_i = r_i * G` (the El Gamal randomness point for share `i`), extracted via `ExtractP`. Private witness field `enc_share_c1_x[i]`.
 - **c2_i_x**: x-coordinate of `C2_i = shares_i * G + r_i * ea_pk` (the El Gamal ciphertext point for share `i`), extracted via `ExtractP`. Private witness field `enc_share_c2_x[i]`.
 
-The 8 x-coordinates are interleaved per share — `(c1_0, c2_0, c1_1, c2_1, ...)` — for locality. This matches the order used in ZKP 3 (vote reveal proof), where the server recomputes `shares_hash` from the 4 ciphertexts in the witness.
+The 10 x-coordinates are interleaved per share — `(c1_0, c2_0, c1_1, c2_1, ...)` — for locality. This matches the order used in ZKP 3 (vote reveal proof), where the server recomputes `shares_hash` from the 5 ciphertexts in the witness.
 
-**Function:** `Poseidon` with `ConstantLength<8>`. Uses `Pow5Chip` / `P128Pow5T3` with rate 2 (4 absorption rounds for 8 inputs, ~5 permutations, ~320 rows).
+**Function:** `Poseidon` with `ConstantLength<10>`. Uses `Pow5Chip` / `P128Pow5T3` with rate 2 (5 absorption rounds for 10 inputs, ~6 permutations, ~400 rows).
 
 **Constraint:** The circuit computes the Poseidon hash over all 8 witness values. The resulting `shares_hash` cell is an internal wire — it is not directly bound to any public input. Instead, condition 12 consumes it as an input to `H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`, which IS bound to `VOTE_COMMITMENT`.
 
@@ -301,7 +302,7 @@ The 8 x-coordinates are interleaved per share — `(c1_0, c2_0, c1_1, c2_1, ...)
 Purpose: each ciphertext is a valid El Gamal encryption of the corresponding plaintext share under the election authority's public key. Implemented by the shared **`circuit::elgamal::prove_elgamal_encryptions`** gadget.
 
 ```
-For each share i (0..3):
+For each share i (0..4):
     C1_i = [r_i] * G                        (randomness point)
     C2_i = [v_i] * G + [r_i] * ea_pk        (ciphertext point)
     ExtractP(C1_i) == enc_share_c1_x[i]      (link to condition 10)
@@ -315,7 +316,7 @@ Where:
 - **ea_pk**: election authority public key (Pallas curve point, public input at offsets 7–8). Witnessed as a `NonIdentityPoint` (on-curve constraint included). Both x and y coordinates are constrained to match the instance column cells, preventing a prover from using a different or negated key.
 - **enc_share_c1_x[i]**, **enc_share_c2_x[i]**: the x-coordinate cells from condition 10's witness region. These are the same cells that were hashed into `shares_hash` by condition 10's Poseidon hash. Condition 11 constrains the ECC computation output to match them via `constrain_equal`, creating a binding between the Poseidon hash (condition 10) and the actual El Gamal encryption.
 
-**Structure:** For each of the 4 shares (iterated in a loop):
+**Structure:** For each of the 5 shares (iterated in a loop):
 1. Witness G as `NonIdentityPoint`, constrain x/y to SpendAuthG constants
 2. `ScalarVar::from_base(r_i)` → variable-base mul → C1 point
 3. `constrain_equal(ExtractP(C1), enc_c1_x[i])`
@@ -326,7 +327,7 @@ Where:
 8. `vG.add(rP)` → C2 point
 9. `constrain_equal(ExtractP(C2), enc_c2_x[i])`
 
-Total: 12 variable-base scalar multiplications (~6,000 rows), 4 point additions, 12 `NonIdentityPoint` witnesses (8× G + 4× ea_pk), 8 coordinate `constrain_equal` constraints. This is why K was bumped from 12 to 14.
+Total: 15 variable-base scalar multiplications (~7,500 rows), 5 point additions, 15 `NonIdentityPoint` witnesses (10× G + 5× ea_pk), 10 coordinate `constrain_equal` constraints. This is why K was bumped from 12 to 14.
 
 **Scalar field handling:** All scalars (r_i, v_i) are base field elements converted via `ScalarVar::from_base`. This avoids cross-field consistency issues between `pallas::Base` and `pallas::Scalar`. For shares (< 2^30, guaranteed by condition 9), the integer representation is identical in both fields. For randomness, the probability of a base element exceeding the scalar field modulus is ≈ 2^{-254}.
 
@@ -349,7 +350,7 @@ vote_commitment = Poseidon(DOMAIN_VC, shares_hash, proposal_id, vote_decision)
 
 Where:
 - **DOMAIN_VC**: `1`. Domain separation tag for Vote Commitments (vs `DOMAIN_VAN = 0`). Assigned via `assign_advice_from_constant` so the value is baked into the verification key. Prevents a vote commitment from ever colliding with a VAN in the shared vote commitment tree.
-- **shares_hash**: the Poseidon hash of all 8 enc_share x-coordinates, computed in condition 10. This is a purely internal wire (not a public input) — it flows from condition 10's output cell directly into condition 12's Poseidon input, ensuring the vote commitment is bound to the actual El Gamal ciphertexts without re-hashing.
+- **shares_hash**: the Poseidon hash of all 10 enc_share x-coordinates, computed in condition 10. This is a purely internal wire (not a public input) — it flows from condition 10's output cell directly into condition 12's Poseidon input, ensuring the vote commitment is bound to the actual El Gamal ciphertexts without re-hashing.
 - **proposal_id**: which proposal this vote is for (public input at offset 5). Copied from the instance column via `assign_advice_from_instance`. The verifier checks it matches a valid proposal in the voting window.
 - **vote_decision**: the voter's choice (private witness). Hidden inside the vote commitment — only revealed in ZKP #3 when individual shares are opened. The decision value is opaque to the circuit; its semantic meaning is defined by the application layer.
 
@@ -360,7 +361,7 @@ Where:
 **Data flow (conditions 8–12):**
 ```
 shares (8: sum, 9: range) ──┐
-                             ├─ enc_shares (11: El Gamal) ──→ shares_hash (10: Poseidon<8>)
+                             ├─ enc_shares (11: El Gamal) ──→ shares_hash (10: Poseidon<10>)
 randomness ──────────────────┘                                       │
                                                                      ├─ vote_commitment (12: Poseidon<4>) ──→ VOTE_COMMITMENT
 proposal_id ─────────────────────────────────────────────────────────┤

@@ -509,7 +509,7 @@ fn voting_flow_librustvoting_path() {
             vc_position, // vc_tree_position
         )
         .expect("VotingDb::build_share_payloads");
-    assert_eq!(payloads.len(), 4, "should have 4 share payloads");
+    assert_eq!(payloads.len(), 5, "should have 5 share payloads");
     for (i, p) in payloads.iter().enumerate() {
         assert_eq!(p.shares_hash, bundle.shares_hash);
         assert_eq!(p.proposal_id, 1);
@@ -523,7 +523,7 @@ fn voting_flow_librustvoting_path() {
     let helper_url = helper_server_url();
     log_step(
         "Step 10",
-        &format!("sending 4 share payloads to helper server at {}", helper_url),
+        &format!("sending 5 share payloads to helper server at {}", helper_url),
     );
 
     let all_enc: Vec<(&[u8], &[u8], u32)> = payloads[0]

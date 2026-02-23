@@ -1,7 +1,7 @@
 //! Multi-note delegation bundle builder.
 //!
 //! Orchestrates the creation of a complete delegation proof:
-//! a single merged circuit proving all 15 conditions for up to 4 notes.
+//! a single merged circuit proving all 15 conditions for up to 5 notes.
 //! Handles padding unused note slots with zero-value notes that still carry
 //! valid IMT non-membership proofs against the real tree root.
 
@@ -44,14 +44,14 @@ pub struct RealNoteInput {
 pub struct DelegationBundle {
     /// The merged delegation circuit.
     pub circuit: circuit::Circuit,
-    /// Public inputs (12 field elements).
+    /// Public inputs (13 field elements).
     pub instance: circuit::Instance,
 }
 
 /// Errors from delegation bundle construction.
 #[derive(Clone, Debug)]
 pub enum DelegationBuildError {
-    /// Must have 1–4 real notes.
+    /// Must have 1–5 real notes.
     InvalidNoteCount(usize),
     /// IMT proof fetch failed for a padded note nullifier.
     ImtFetchFailed(super::imt::ImtError),
@@ -67,7 +67,7 @@ impl std::fmt::Display for DelegationBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DelegationBuildError::InvalidNoteCount(n) => {
-                write!(f, "invalid note count: {} (expected 1–4)", n)
+                write!(f, "invalid note count: {} (expected 1–5)", n)
             }
             DelegationBuildError::ImtFetchFailed(e) => {
                 write!(f, "IMT proof fetch failed: {e}")
@@ -76,11 +76,11 @@ impl std::fmt::Display for DelegationBuildError {
     }
 }
 
-/// Build a complete delegation bundle with 1–4 real notes and padding.
+/// Build a complete delegation bundle with 1–5 real notes and padding.
 ///
 /// # Arguments
 ///
-/// - `real_notes`: 1–4 real notes with their keys, Merkle paths, and IMT proofs.
+/// - `real_notes`: 1–5 real notes with their keys, Merkle paths, and IMT proofs.
 /// - `fvk`: The delegator's full viewing key (shared across all real notes).
 /// - `alpha`: Spend auth randomizer for the keystone signature.
 /// - `output_recipient`: Address of the voting hotkey (output note recipient).
@@ -101,9 +101,9 @@ pub fn build_delegation_bundle(
     imt_provider: &impl ImtProvider,
     rng: &mut impl RngCore,
 ) -> Result<DelegationBundle, DelegationBuildError> {
-    // The circuit supports 1–4 real notes; reject empty or oversized bundles.
+    // The circuit supports 1–5 real notes; reject empty or oversized bundles.
     let n_real = real_notes.len();
-    if n_real == 0 || n_real > 4 {
+    if n_real == 0 || n_real > 5 {
         return Err(DelegationBuildError::InvalidNoteCount(n_real));
     }
 
@@ -115,10 +115,10 @@ pub fn build_delegation_bundle(
     let ak: SpendValidatingKey = fvk.clone().into();
 
     // Collect per-note data.
-    let mut note_slots = Vec::with_capacity(4);
-    let mut cmx_values = Vec::with_capacity(4);
-    let mut v_values = Vec::with_capacity(4);
-    let mut gov_nulls = Vec::with_capacity(4);
+    let mut note_slots = Vec::with_capacity(5);
+    let mut cmx_values = Vec::with_capacity(5);
+    let mut v_values = Vec::with_capacity(5);
+    let mut gov_nulls = Vec::with_capacity(5);
 
     // Process real notes: derive psi/rcm from rseed, compute the note commitment,
     // real nullifier, and gov nullifier, then pack everything into a NoteSlotWitness.
@@ -163,11 +163,11 @@ pub fn build_delegation_bundle(
         gov_nulls.push(gov_null);
     }
 
-    // Pad remaining slots to 4 with zero-value dummy notes (§1.3.5).
+    // Pad remaining slots to 5 with zero-value dummy notes (§1.3.5).
     // Padded notes use random rho/psi/rcm, v=0, and is_note_real=false.
     // The circuit still runs all constraints uniformly; condition 10 (Merkle path)
     // and condition 15 (v=0) are gated by is_note_real.
-    for i in n_real..4 {
+    for i in n_real..5 {
         // Use a high diversifier index to avoid collision with real notes.
         let pad_addr = fvk.address_at((1000 + i) as u32, Scope::External);
         let (_, _, dummy) = Note::dummy(&mut *rng, None);
@@ -219,7 +219,7 @@ pub fn build_delegation_bundle(
         gov_nulls.push(gov_null);
     }
 
-    let notes: [NoteSlotWitness; 4] = note_slots.try_into().unwrap_or_else(|_| unreachable!());
+    let notes: [NoteSlotWitness; 5] = note_slots.try_into().unwrap_or_else(|_| unreachable!());
 
     // Condition 8: ballot scaling.
     // num_ballots = floor(v_total / BALLOT_DIVISOR)
@@ -250,13 +250,14 @@ pub fn build_delegation_bundle(
     let van_comm = van_commitment_hash(g_d_new_x, pk_d_new_x, num_ballots_field, vote_round_id, van_comm_rand);
 
     // Condition 3: rho binding.
-    // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
+    // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, cmx_5, van_comm, vote_round_id)
     // Binds the keystone note to the exact notes being delegated.
     let rho = rho_binding_hash(
         cmx_values[0],
         cmx_values[1],
         cmx_values[2],
         cmx_values[3],
+        cmx_values[4],
         van_comm,
         vote_round_id,
     );
@@ -308,7 +309,7 @@ pub fn build_delegation_bundle(
         vote_round_id,
         nc_root,
         nf_imt_root,
-        [gov_nulls[0], gov_nulls[1], gov_nulls[2], gov_nulls[3]],
+        [gov_nulls[0], gov_nulls[1], gov_nulls[2], gov_nulls[3], gov_nulls[4]],
     );
 
     Ok(DelegationBundle { circuit, instance })
@@ -338,7 +339,7 @@ mod tests {
     /// Merged circuit K value.
     const K: u32 = 14;
 
-    /// Helper: create 1–4 real note inputs with a shared Merkle tree and anchor.
+    /// Helper: create 1–5 real note inputs with a shared Merkle tree and anchor.
     ///
     /// Notes are placed at positions 0..n in the commitment tree. Returns
     /// `(inputs, nc_root)` where `nc_root` is the shared anchor.
@@ -351,7 +352,7 @@ mod tests {
         rng: &mut impl RngCore,
     ) -> (Vec<RealNoteInput>, pallas::Base) {
         let n = values.len();
-        assert!(n >= 1 && n <= 4);
+        assert!(n >= 1 && n <= 5);
         assert_eq!(n, scopes.len());
 
         // Create notes.
@@ -369,35 +370,41 @@ mod tests {
             notes.push(note);
         }
 
-        // Extract leaf hashes, padding to 4 with empty leaves.
+        // Extract leaf hashes, padding to 8 with empty leaves.
         let empty_leaf = MerkleHashOrchard::empty_leaf();
-        let mut leaves = [empty_leaf; 4];
+        let mut leaves = [empty_leaf; 8];
         for (i, note) in notes.iter().enumerate() {
             let cmx = ExtractedNoteCommitment::from(note.commitment());
             leaves[i] = MerkleHashOrchard::from_cmx(&cmx);
         }
 
-        // Build the bottom two levels of the shared tree.
+        // Build the bottom three levels of the shared tree (8-leaf tree).
         let l1_0 = MerkleHashOrchard::combine(Level::from(0), &leaves[0], &leaves[1]);
         let l1_1 = MerkleHashOrchard::combine(Level::from(0), &leaves[2], &leaves[3]);
+        let l1_2 = MerkleHashOrchard::combine(Level::from(0), &leaves[4], &leaves[5]);
+        let l1_3 = MerkleHashOrchard::combine(Level::from(0), &leaves[6], &leaves[7]);
         let l2_0 = MerkleHashOrchard::combine(Level::from(1), &l1_0, &l1_1);
+        let l2_1 = MerkleHashOrchard::combine(Level::from(1), &l1_2, &l1_3);
+        let l3_0 = MerkleHashOrchard::combine(Level::from(2), &l2_0, &l2_1);
 
         // Hash up through the remaining levels with empty subtree siblings.
-        let mut current = l2_0;
-        for level in 2..MERKLE_DEPTH_ORCHARD {
+        let mut current = l3_0;
+        for level in 3..MERKLE_DEPTH_ORCHARD {
             let sibling = MerkleHashOrchard::empty_root(Level::from(level as u8));
             current = MerkleHashOrchard::combine(Level::from(level as u8), &current, &sibling);
         }
         let nc_root = current.inner();
 
         // Build Merkle paths and RealNoteInputs.
-        let l1 = [l1_0, l1_1];
+        let l1 = [l1_0, l1_1, l1_2, l1_3];
+        let l2 = [l2_0, l2_1];
         let mut inputs = Vec::with_capacity(n);
         for (i, note) in notes.into_iter().enumerate() {
             let mut auth_path = [MerkleHashOrchard::empty_leaf(); MERKLE_DEPTH_ORCHARD];
             auth_path[0] = leaves[i ^ 1];
-            auth_path[1] = l1[1 - (i >> 1)];
-            for level in 2..MERKLE_DEPTH_ORCHARD {
+            auth_path[1] = l1[(i >> 1) ^ 1];
+            auth_path[2] = l2[1 - (i >> 2)];
+            for level in 3..MERKLE_DEPTH_ORCHARD {
                 auth_path[level] = MerkleHashOrchard::empty_root(Level::from(level as u8));
             }
             let merkle_path = MerklePath::from_parts(i as u32, auth_path);
@@ -547,7 +554,16 @@ mod tests {
     }
 
     #[test]
-    fn test_five_notes_error() {
+    fn test_five_real_notes() {
+        // 2,500,000 x 5 = 12,500,000 → num_ballots = 1, remainder = 0.
+        build_and_verify(
+            &[2_500_000, 2_500_000, 2_500_000, 2_500_000, 2_500_000],
+            &[Scope::External, Scope::External, Scope::External, Scope::External, Scope::External],
+        );
+    }
+
+    #[test]
+    fn test_six_notes_error() {
         let mut rng = OsRng;
         let sk = SpendingKey::random(&mut rng);
         let fvk: FullViewingKey = (&sk).into();
@@ -556,12 +572,12 @@ mod tests {
 
         let (inputs, _) = make_real_note_inputs(
             &fvk,
-            &[3_000_000, 3_000_000, 3_000_000, 3_000_000],
-            &[Scope::External, Scope::External, Scope::External, Scope::External],
+            &[3_000_000, 3_000_000, 3_000_000, 3_000_000, 3_000_000],
+            &[Scope::External, Scope::External, Scope::External, Scope::External, Scope::External],
             &imt,
             &mut rng,
         );
-        // Add a 5th note by extending.
+        // Add a 6th note by extending.
         let mut inputs = inputs;
         let (extra, _) = make_real_note_inputs(&fvk, &[3_000_000], &[Scope::External], &imt, &mut rng);
         inputs.extend(extra);
@@ -580,7 +596,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(DelegationBuildError::InvalidNoteCount(5))
+            Err(DelegationBuildError::InvalidNoteCount(6))
         ));
     }
 

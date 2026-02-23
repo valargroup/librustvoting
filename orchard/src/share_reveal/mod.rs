@@ -6,7 +6,7 @@
 //! The circuit verifies 5 conditions:
 //! - **Condition 1**: VC Membership (Poseidon Merkle path).
 //! - **Condition 2**: Vote Commitment Integrity (ConstantLength<4> Poseidon).
-//! - **Condition 3**: Shares Hash Integrity (ConstantLength<8> Poseidon).
+//! - **Condition 3**: Shares Hash Integrity (ConstantLength<10> Poseidon).
 //! - **Condition 4**: Share Membership (custom mux gate).
 //! - **Condition 5**: Share Nullifier Integrity (4-layer Poseidon chain with
 //!   `voting_round_id` binding).

@@ -177,14 +177,14 @@ public struct Voting {
         /// Wallet sync progress info for the walletSyncing screen.
         public var walletScannedHeight: UInt64 = 0
 
-        /// Per-proposal share confirmation tracking (proposalId → confirmed count 0-4).
+        /// Per-proposal share confirmation tracking (proposalId → confirmed count 0-5).
         public var shareConfirmations: [UInt32: Int] = [:]
         public var isPollingShareConfirmations: Bool = false
 
         /// Cached wallet notes from the snapshot query, used by delegation proof.
         public var walletNotes: [NoteInfo] = []
 
-        /// Number of note bundles (groups of up to 4 notes). Set by setupBundles.
+        /// Number of note bundles (groups of up to 5 notes). Set by setupBundles.
         public var bundleCount: UInt32 = 0
 
         /// Hotkey address derived from keychain mnemonic, shown on delegation signing screen.
@@ -823,7 +823,7 @@ public struct Voting {
                             dataFromHex(roundIdHex), proposalId
                         )
                         let totalShares = tally.entries.reduce(0) { $0 + Int($1.amount) }
-                        await send(.shareConfirmationsUpdated(proposalId, min(totalShares, 4)))
+                        await send(.shareConfirmationsUpdated(proposalId, min(totalShares, 5)))
                     }
                 } catch: { error, _ in
                     print("[Voting] Share confirmation polling error: \(error)")
@@ -832,7 +832,7 @@ public struct Voting {
 
             case .shareConfirmationsUpdated(let proposalId, let count):
                 state.shareConfirmations[proposalId] = count
-                if count >= 4 {
+                if count >= 5 {
                     state.isPollingShareConfirmations = false
                     return .cancel(id: cancelSharePollingId)
                 }
@@ -883,7 +883,7 @@ public struct Voting {
                         return
                     }
 
-                    // Setup bundles (value-aware split into groups of up to 4)
+                    // Setup bundles (value-aware split into groups of up to 5)
                     let setupResult = try await votingCrypto.setupBundles(roundId, notes)
                     let bundleCount = setupResult.bundleCount
                     print("[Voting] Setup \(bundleCount) bundle(s) for \(notes.count) notes (eligible weight: \(setupResult.eligibleWeight))")
@@ -1599,7 +1599,7 @@ private extension Array where Element == NoteInfo {
     ///
     /// Algorithm mirrors the Rust `chunk_notes` for client-side use:
     /// 1. Sort notes by value DESC, then position ASC as tiebreaker
-    /// 2. Fill bundles sequentially to capacity (4 notes each)
+    /// 2. Fill bundles sequentially to capacity (5 notes each)
     /// 3. Drop bundles with total < ballotDivisor
     /// 4. Re-sort notes within each surviving bundle by position
     /// 5. Sort surviving bundles by their minimum note position
@@ -1614,12 +1614,12 @@ private extension Array where Element == NoteInfo {
             return lhs.position < rhs.position
         }
 
-        // Step 2: Fill bundles sequentially to capacity (4 notes each)
+        // Step 2: Fill bundles sequentially to capacity (5 notes each)
         var bundleNotes: [[NoteInfo]] = []
         var bundleTotals: [UInt64] = []
 
         for note in sorted {
-            if bundleNotes.isEmpty || bundleNotes.last!.count >= 4 {
+            if bundleNotes.isEmpty || bundleNotes.last!.count >= 5 {
                 bundleNotes.append([])
                 bundleTotals.append(0)
             }

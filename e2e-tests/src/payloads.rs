@@ -295,7 +295,7 @@ pub fn helper_share_payload(
     enc_share_c2: &[u8],
     share_index: u32,
     tree_position: u64,
-    all_enc_shares: &[(&[u8], &[u8], u32)], // (c1, c2, share_index) for each of 4 shares
+    all_enc_shares: &[(&[u8], &[u8], u32)], // (c1, c2, share_index) for each of 5 shares
 ) -> Value {
     let all_shares_json: Vec<Value> = all_enc_shares
         .iter()

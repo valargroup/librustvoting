@@ -9,9 +9,9 @@
 //! - **Condition 2**: Vote Commitment Integrity — `vote_commitment =
 //!   Poseidon(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`.
 //! - **Condition 3**: Shares Hash Integrity — `shares_hash =
-//!   Poseidon(c1_0, c2_0, c1_1, c2_1, c1_2, c2_2, c1_3, c2_3)`.
+//!   Poseidon(c1_0, c2_0, c1_1, c2_1, c1_2, c2_2, c1_3, c2_3, c1_4, c2_4)`.
 //! - **Condition 4**: Share Membership — `(enc_share_c1_x, enc_share_c2_x)`
-//!   is the `share_index`-th pair from the 4 encrypted shares.
+//!   is the `share_index`-th pair from the 5 encrypted shares.
 //! - **Condition 5**: Share Nullifier Integrity — `share_nullifier` is
 //!   correctly derived via a 4-layer Poseidon chain that includes
 //!   `voting_round_id` to prevent cross-round replay.
@@ -148,8 +148,8 @@ pub struct Config {
     /// Selector for the share multiplexer gate (condition 4).
     ///
     /// Fires on a 2-row block:
-    ///   Row 0: sel_0..sel_3, c1_0..c1_3, selected_c1, share_index
-    ///   Row 1: (unused),     c2_0..c2_3, selected_c2
+    ///   Row 0: sel_0..sel_4 (advices[0..5]), c1_0..c1_3 (advices[5..9]), share_index (advices[9])
+    ///   Row 1: c1_4 (advices[0]), c2_0..c2_4 (advices[1..6]), selected_c1 (advices[7]), selected_c2 (advices[8])
     q_share_mux: Selector,
 }
 
@@ -177,17 +177,17 @@ pub struct Circuit {
     pub(crate) vote_comm_tree_position: Value<u32>,
 
     // === Condition 2: Vote Commitment Integrity ===
-    /// Preimage component: hash of all 4 encrypted shares.
+    /// Preimage component: hash of all 5 encrypted shares.
     pub(crate) shares_hash: Value<pallas::Base>,
 
     // === Condition 3: Shares Hash Integrity ===
     /// X-coordinates of C1_i = r_i * G for each share (via ExtractP).
-    pub(crate) enc_share_c1_x: [Value<pallas::Base>; 4],
+    pub(crate) enc_share_c1_x: [Value<pallas::Base>; 5],
     /// X-coordinates of C2_i = shares_i * G + r_i * ea_pk for each share.
-    pub(crate) enc_share_c2_x: [Value<pallas::Base>; 4],
+    pub(crate) enc_share_c2_x: [Value<pallas::Base>; 5],
 
     // === Condition 4: Share Membership ===
-    /// Which of the 4 shares is being revealed (0..3).
+    /// Which of the 5 shares is being revealed (0..4).
     pub(crate) share_index: Value<pallas::Base>,
 
     // === Condition 5: Share Nullifier Integrity ===
@@ -288,28 +288,32 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         meta.create_gate("share multiplexer", |meta| {
             let q = meta.query_selector(q_share_mux);
 
-            // Row 0
+            // Row 0: sel_0..sel_4 (advices[0..5]), c1_0..c1_3 (advices[5..8]), share_index (advices[9])
             let sel_0 = meta.query_advice(advices[0], Rotation::cur());
             let sel_1 = meta.query_advice(advices[1], Rotation::cur());
             let sel_2 = meta.query_advice(advices[2], Rotation::cur());
             let sel_3 = meta.query_advice(advices[3], Rotation::cur());
-            let c1_0 = meta.query_advice(advices[4], Rotation::cur());
-            let c1_1 = meta.query_advice(advices[5], Rotation::cur());
-            let c1_2 = meta.query_advice(advices[6], Rotation::cur());
-            let c1_3 = meta.query_advice(advices[7], Rotation::cur());
-            let selected_c1 = meta.query_advice(advices[8], Rotation::cur());
+            let sel_4 = meta.query_advice(advices[4], Rotation::cur());
+            let c1_0 = meta.query_advice(advices[5], Rotation::cur());
+            let c1_1 = meta.query_advice(advices[6], Rotation::cur());
+            let c1_2 = meta.query_advice(advices[7], Rotation::cur());
+            let c1_3 = meta.query_advice(advices[8], Rotation::cur());
             let share_index = meta.query_advice(advices[9], Rotation::cur());
 
-            // Row 1
-            let c2_0 = meta.query_advice(advices[4], Rotation::next());
-            let c2_1 = meta.query_advice(advices[5], Rotation::next());
-            let c2_2 = meta.query_advice(advices[6], Rotation::next());
-            let c2_3 = meta.query_advice(advices[7], Rotation::next());
+            // Row 1: c1_4 (advices[0]), c2_0..c2_4 (advices[1..6]), selected_c1 (advices[7]), selected_c2 (advices[8])
+            let c1_4 = meta.query_advice(advices[0], Rotation::next());
+            let c2_0 = meta.query_advice(advices[1], Rotation::next());
+            let c2_1 = meta.query_advice(advices[2], Rotation::next());
+            let c2_2 = meta.query_advice(advices[3], Rotation::next());
+            let c2_3 = meta.query_advice(advices[4], Rotation::next());
+            let c2_4 = meta.query_advice(advices[5], Rotation::next());
+            let selected_c1 = meta.query_advice(advices[7], Rotation::next());
             let selected_c2 = meta.query_advice(advices[8], Rotation::next());
 
             let one = Expression::Constant(pallas::Base::one());
             let two = Expression::Constant(pallas::Base::from(2));
             let three = Expression::Constant(pallas::Base::from(3));
+            let four = Expression::Constant(pallas::Base::from(4));
 
             Constraints::with_selector(
                 q,
@@ -319,6 +323,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                     ("bool sel_1", bool_check(sel_1.clone())),
                     ("bool sel_2", bool_check(sel_2.clone())),
                     ("bool sel_3", bool_check(sel_3.clone())),
+                    ("bool sel_4", bool_check(sel_4.clone())),
                     // Index matching: sel_i * (share_index - i) == 0.
                     (
                         "sel_0 * share_index",
@@ -334,12 +339,16 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                     ),
                     (
                         "sel_3 * (share_index - 3)",
-                        sel_3.clone() * (share_index - three),
+                        sel_3.clone() * (share_index.clone() - three),
+                    ),
+                    (
+                        "sel_4 * (share_index - 4)",
+                        sel_4.clone() * (share_index - four),
                     ),
                     // Exactly one selection bit is 1.
                     (
                         "sum sel == 1",
-                        sel_0.clone() + sel_1.clone() + sel_2.clone() + sel_3.clone() - one,
+                        sel_0.clone() + sel_1.clone() + sel_2.clone() + sel_3.clone() + sel_4.clone() - one,
                     ),
                     // C1 multiplexer.
                     (
@@ -348,12 +357,18 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                             - sel_0.clone() * c1_0
                             - sel_1.clone() * c1_1
                             - sel_2.clone() * c1_2
-                            - sel_3.clone() * c1_3,
+                            - sel_3.clone() * c1_3
+                            - sel_4.clone() * c1_4,
                     ),
                     // C2 multiplexer.
                     (
                         "c2 mux",
-                        selected_c2 - sel_0 * c2_0 - sel_1 * c2_1 - sel_2 * c2_2 - sel_3 * c2_3,
+                        selected_c2
+                            - sel_0 * c2_0
+                            - sel_1 * c2_1
+                            - sel_2 * c2_2
+                            - sel_3 * c2_3
+                            - sel_4 * c2_4,
                     ),
                 ],
             )
@@ -430,12 +445,12 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         )?;
 
         // ---------------------------------------------------------------
-        // Witness all 8 encrypted share x-coordinates.
+        // Witness all 10 encrypted share x-coordinates.
         // ---------------------------------------------------------------
 
-        let enc_c1: [AssignedCell<pallas::Base, pallas::Base>; 4] = {
-            let mut cells = Vec::with_capacity(4);
-            for i in 0..4 {
+        let enc_c1: [AssignedCell<pallas::Base, pallas::Base>; 5] = {
+            let mut cells = Vec::with_capacity(5);
+            for i in 0..5 {
                 cells.push(assign_free_advice(
                     layouter.namespace(|| alloc::format!("witness enc_share_c1_x[{i}]")),
                     config.advices[0],
@@ -444,9 +459,9 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             }
             cells.try_into().unwrap()
         };
-        let enc_c2: [AssignedCell<pallas::Base, pallas::Base>; 4] = {
-            let mut cells = Vec::with_capacity(4);
-            for i in 0..4 {
+        let enc_c2: [AssignedCell<pallas::Base, pallas::Base>; 5] = {
+            let mut cells = Vec::with_capacity(5);
+            for i in 0..5 {
                 cells.push(assign_free_advice(
                     layouter.namespace(|| alloc::format!("witness enc_share_c2_x[{i}]")),
                     config.advices[0],
@@ -457,32 +472,34 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         };
 
         // Clone for condition 4 (condition 3's Poseidon consumes them).
-        let enc_c1_cond4: [AssignedCell<pallas::Base, pallas::Base>; 4] =
+        let enc_c1_cond4: [AssignedCell<pallas::Base, pallas::Base>; 5] =
             core::array::from_fn(|i| enc_c1[i].clone());
-        let enc_c2_cond4: [AssignedCell<pallas::Base, pallas::Base>; 4] =
+        let enc_c2_cond4: [AssignedCell<pallas::Base, pallas::Base>; 5] =
             core::array::from_fn(|i| enc_c2[i].clone());
 
         // ---------------------------------------------------------------
         // Condition 3: Shares Hash Integrity.
         //
         // shares_hash = Poseidon(c1_0, c2_0, c1_1, c2_1,
-        //                        c1_2, c2_2, c1_3, c2_3)
+        //                        c1_2, c2_2, c1_3, c2_3,
+        //                        c1_4, c2_4)
         //
         // Same hash order as vote_proof::shares_hash and ZKP #2
-        // condition 9.
+        // condition 10.
         // ---------------------------------------------------------------
 
         let derived_shares_hash = {
-            let [c1_0, c1_1, c1_2, c1_3] = enc_c1;
-            let [c2_0, c2_1, c2_2, c2_3] = enc_c2;
+            let [c1_0, c1_1, c1_2, c1_3, c1_4] = enc_c1;
+            let [c2_0, c2_1, c2_2, c2_3, c2_4] = enc_c2;
             let message = [
                 c1_0, c2_0, c1_1, c2_1, c1_2, c2_2, c1_3, c2_3,
+                c1_4, c2_4,
             ];
             let hasher = PoseidonHash::<
                 pallas::Base,
                 _,
                 poseidon::P128Pow5T3,
-                ConstantLength<8>,
+                ConstantLength<10>,
                 3, // WIDTH
                 2, // RATE
             >::init(
@@ -678,7 +695,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
         // Condition 4: Share Membership.
         //
-        // The q_share_mux gate multiplexes the 4 encrypted share pairs
+        // The q_share_mux gate multiplexes the 5 encrypted share pairs
         // and constrains the selected pair to equal the public inputs
         // ENC_SHARE_C1_X and ENC_SHARE_C2_X.
         // ---------------------------------------------------------------
@@ -689,7 +706,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 config.q_share_mux.enable(&mut region, 0)?;
 
                 // Compute selection bits from share_index value.
-                let sel_values: [Value<pallas::Base>; 4] = core::array::from_fn(|i| {
+                let sel_values: [Value<pallas::Base>; 5] = core::array::from_fn(|i| {
                     self.share_index.map(|idx| {
                         if idx == pallas::Base::from(i as u64) {
                             pallas::Base::one()
@@ -699,52 +716,37 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                     })
                 });
 
-                // Row 0: sel_0..sel_3, c1_0..c1_3, selected_c1, share_index
+                // Row 0: sel_0..sel_4 (advices[0..5]), c1_0..c1_3 (advices[5..8]), share_index (advices[9])
 
                 region.assign_advice(|| "sel_0", config.advices[0], 0, || sel_values[0])?;
                 region.assign_advice(|| "sel_1", config.advices[1], 0, || sel_values[1])?;
                 region.assign_advice(|| "sel_2", config.advices[2], 0, || sel_values[2])?;
                 region.assign_advice(|| "sel_3", config.advices[3], 0, || sel_values[3])?;
+                region.assign_advice(|| "sel_4", config.advices[4], 0, || sel_values[4])?;
 
                 enc_c1_cond4[0].copy_advice(
                     || "c1_0",
                     &mut region,
-                    config.advices[4],
+                    config.advices[5],
                     0,
                 )?;
                 enc_c1_cond4[1].copy_advice(
                     || "c1_1",
                     &mut region,
-                    config.advices[5],
+                    config.advices[6],
                     0,
                 )?;
                 enc_c1_cond4[2].copy_advice(
                     || "c1_2",
                     &mut region,
-                    config.advices[6],
+                    config.advices[7],
                     0,
                 )?;
                 enc_c1_cond4[3].copy_advice(
                     || "c1_3",
                     &mut region,
-                    config.advices[7],
-                    0,
-                )?;
-
-                // Compute selected_c1 = Σ sel_i * c1_i.
-                let selected_c1_val = sel_values[0]
-                    .zip(self.enc_share_c1_x[0])
-                    .zip(sel_values[1].zip(self.enc_share_c1_x[1]))
-                    .zip(sel_values[2].zip(self.enc_share_c1_x[2]))
-                    .zip(sel_values[3].zip(self.enc_share_c1_x[3]))
-                    .map(|((((s0, c0), (s1, c1)), (s2, c2)), (s3, c3))| {
-                        s0 * c0 + s1 * c1 + s2 * c2 + s3 * c3
-                    });
-                let selected_c1 = region.assign_advice(
-                    || "selected_c1",
                     config.advices[8],
                     0,
-                    || selected_c1_val,
                 )?;
 
                 share_index.copy_advice(
@@ -754,31 +756,60 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                     0,
                 )?;
 
-                // Row 1: c2_0..c2_3, selected_c2
+                // Row 1: c1_4 (advices[0]), c2_0..c2_4 (advices[1..6]), selected_c1 (advices[7]), selected_c2 (advices[8])
 
+                enc_c1_cond4[4].copy_advice(
+                    || "c1_4",
+                    &mut region,
+                    config.advices[0],
+                    1,
+                )?;
                 enc_c2_cond4[0].copy_advice(
                     || "c2_0",
                     &mut region,
-                    config.advices[4],
+                    config.advices[1],
                     1,
                 )?;
                 enc_c2_cond4[1].copy_advice(
                     || "c2_1",
                     &mut region,
-                    config.advices[5],
+                    config.advices[2],
                     1,
                 )?;
                 enc_c2_cond4[2].copy_advice(
                     || "c2_2",
                     &mut region,
-                    config.advices[6],
+                    config.advices[3],
                     1,
                 )?;
                 enc_c2_cond4[3].copy_advice(
                     || "c2_3",
                     &mut region,
+                    config.advices[4],
+                    1,
+                )?;
+                enc_c2_cond4[4].copy_advice(
+                    || "c2_4",
+                    &mut region,
+                    config.advices[5],
+                    1,
+                )?;
+
+                // Compute selected_c1 = Σ sel_i * c1_i.
+                let selected_c1_val = sel_values[0]
+                    .zip(self.enc_share_c1_x[0])
+                    .zip(sel_values[1].zip(self.enc_share_c1_x[1]))
+                    .zip(sel_values[2].zip(self.enc_share_c1_x[2]))
+                    .zip(sel_values[3].zip(self.enc_share_c1_x[3]))
+                    .zip(sel_values[4].zip(self.enc_share_c1_x[4]))
+                    .map(|(((((s0, c0), (s1, c1)), (s2, c2)), (s3, c3)), (s4, c4))| {
+                        s0 * c0 + s1 * c1 + s2 * c2 + s3 * c3 + s4 * c4
+                    });
+                let selected_c1 = region.assign_advice(
+                    || "selected_c1",
                     config.advices[7],
                     1,
+                    || selected_c1_val,
                 )?;
 
                 // Compute selected_c2 = Σ sel_i * c2_i.
@@ -787,8 +818,9 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                     .zip(sel_values[1].zip(self.enc_share_c2_x[1]))
                     .zip(sel_values[2].zip(self.enc_share_c2_x[2]))
                     .zip(sel_values[3].zip(self.enc_share_c2_x[3]))
-                    .map(|((((s0, c0), (s1, c1)), (s2, c2)), (s3, c3))| {
-                        s0 * c0 + s1 * c1 + s2 * c2 + s3 * c3
+                    .zip(sel_values[4].zip(self.enc_share_c2_x[4]))
+                    .map(|(((((s0, c0), (s1, c1)), (s2, c2)), (s3, c3)), (s4, c4))| {
+                        s0 * c0 + s1 * c1 + s2 * c2 + s3 * c3 + s4 * c4
                     });
                 let selected_c2 = region.assign_advice(
                     || "selected_c2",
@@ -980,22 +1012,23 @@ mod tests {
         (ea_sk, ea_pk, ea_pk_affine)
     }
 
-    /// Computes real El Gamal encryptions for 4 shares.
+    /// Computes real El Gamal encryptions for 5 shares.
     ///
     /// Returns `(c1_x, c2_x, shares_hash_value)`.
     fn encrypt_shares(
-        shares: [u64; 4],
+        shares: [u64; 5],
         ea_pk: pallas::Point,
-    ) -> ([pallas::Base; 4], [pallas::Base; 4], pallas::Base) {
-        let mut c1_x = [pallas::Base::zero(); 4];
-        let mut c2_x = [pallas::Base::zero(); 4];
-        let randomness: [pallas::Base; 4] = [
+    ) -> ([pallas::Base; 5], [pallas::Base; 5], pallas::Base) {
+        let mut c1_x = [pallas::Base::zero(); 5];
+        let mut c2_x = [pallas::Base::zero(); 5];
+        let randomness: [pallas::Base; 5] = [
             pallas::Base::from(101u64),
             pallas::Base::from(202u64),
             pallas::Base::from(303u64),
             pallas::Base::from(404u64),
+            pallas::Base::from(505u64),
         ];
-        for i in 0..4 {
+        for i in 0..5 {
             let (c1, c2) = elgamal_encrypt(
                 pallas::Base::from(shares[i]),
                 randomness[i],
@@ -1020,9 +1053,9 @@ mod tests {
         let vote_decision = pallas::Base::from(1u64);
         let voting_round_id = pallas::Base::from(999u64);
 
-        // Encrypt 4 shares.
+        // Encrypt 5 shares.
         let (_ea_sk, ea_pk_point, _ea_pk_affine) = generate_ea_keypair();
-        let shares_u64: [u64; 4] = [1_000, 2_000, 3_000, 4_000];
+        let shares_u64: [u64; 5] = [1_000, 2_000, 3_000, 2_500, 1_500];
         let (enc_c1_x, enc_c2_x, shares_hash_val) =
             encrypt_shares(shares_u64, ea_pk_point);
 

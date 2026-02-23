@@ -4,19 +4,19 @@
 //!
 //! - **Condition 1**: Signed note commitment integrity.
 //! - **Condition 2**: Nullifier integrity.
-//! - **Condition 3**: Rho binding — keystone rho = Poseidon(cmx_1..4, van_comm, vote_round_id).
+//! - **Condition 3**: Rho binding — keystone rho = Poseidon(cmx_1..5, van_comm, vote_round_id).
 //! - **Condition 4**: Spend authority.
 //! - **Condition 5**: CommitIvk & diversified address integrity.
 //! - **Condition 6**: Output note commitment integrity.
 //! - **Condition 7**: Governance commitment integrity (hashes `num_ballots`).
 //! - **Condition 8**: Ballot scaling (`num_ballots = floor(v_total / 12,500,000)`).
-//! - **Condition 9** (×4): Note commitment integrity.
-//! - **Condition 10** (×4): Merkle path validity.
-//! - **Condition 11** (×4): Diversified address integrity.
-//! - **Condition 12** (×4): Private nullifier derivation.
-//! - **Condition 13** (×4): IMT non-membership.
-//! - **Condition 14** (×4): Governance nullifier publication.
-//! - **Condition 15** (×4): Padded-note zero-value enforcement.
+//! - **Condition 9** (×5): Note commitment integrity.
+//! - **Condition 10** (×5): Merkle path validity.
+//! - **Condition 11** (×5): Diversified address integrity.
+//! - **Condition 12** (×5): Private nullifier derivation.
+//! - **Condition 13** (×5): IMT non-membership.
+//! - **Condition 14** (×5): Governance nullifier publication.
+//! - **Condition 15** (×5): Padded-note zero-value enforcement.
 
 use alloc::vec::Vec;
 use group::{Curve, GroupEncoding};
@@ -86,13 +86,13 @@ use crate::constants::MERKLE_DEPTH_ORCHARD;
 
 /// Circuit size (2^K rows).
 ///
-/// K=14 (16,384 rows) fits all 15 conditions including 4 per-note slots
+/// K=14 (16,384 rows) fits all 15 conditions including 5 per-note slots
 /// with Sinsemilla NoteCommit, Merkle paths, IMT non-membership, and
 /// ECC operations.
 pub const K: u32 = 14;
 
 // ================================================================
-// Public input offsets (12 field elements).
+// Public input offsets (13 field elements).
 // ================================================================
 
 /// Public input offset for the derived nullifier.
@@ -116,9 +116,10 @@ const GOV_NULL_1: usize = 8;
 const GOV_NULL_2: usize = 9;
 const GOV_NULL_3: usize = 10;
 const GOV_NULL_4: usize = 11;
+const GOV_NULL_5: usize = 12;
 
 /// Gov null offsets indexed by note slot.
-const GOV_NULL_OFFSETS: [usize; 4] = [GOV_NULL_1, GOV_NULL_2, GOV_NULL_3, GOV_NULL_4];
+const GOV_NULL_OFFSETS: [usize; 5] = [GOV_NULL_1, GOV_NULL_2, GOV_NULL_3, GOV_NULL_4, GOV_NULL_5];
 
 /// Maximum proposal authority — the default for a fresh delegation.
 ///
@@ -137,11 +138,12 @@ pub(crate) fn rho_binding_hash(
     cmx_2: pallas::Base,
     cmx_3: pallas::Base,
     cmx_4: pallas::Base,
+    cmx_5: pallas::Base,
     van_comm: pallas::Base,
     vote_round_id: pallas::Base,
 ) -> pallas::Base {
-    poseidon::Hash::<_, poseidon::P128Pow5T3, ConstantLength<6>, 3, 2>::init()
-        .hash([cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id])
+    poseidon::Hash::<_, poseidon::P128Pow5T3, ConstantLength<7>, 3, 2>::init()
+        .hash([cmx_1, cmx_2, cmx_3, cmx_4, cmx_5, van_comm, vote_round_id])
 }
 
 /// Ballot divisor for converting raw zatoshi balance to ballot count.
@@ -354,7 +356,7 @@ pub struct Circuit {
     psi_new: Value<pallas::Base>,
     rcm_new: Value<NoteCommitTrapdoor>,
     // Per-note slots (conditions 9–15).
-    notes: [NoteSlotWitness; 4],
+    notes: [NoteSlotWitness; 5],
     // Gov commitment blinding factor (condition 7).
     van_comm_rand: Value<pallas::Base>,
     // Condition 8 (ballot scaling) witnesses.
@@ -398,8 +400,8 @@ impl Circuit {
         self
     }
 
-    /// Sets the four per-note slot witnesses (conditions 9–15).
-    pub fn with_notes(mut self, notes: [NoteSlotWitness; 4]) -> Self {
+    /// Sets the five per-note slot witnesses (conditions 9–15).
+    pub fn with_notes(mut self, notes: [NoteSlotWitness; 5]) -> Self {
         self.notes = notes;
         self
     }
@@ -489,7 +491,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
         // Per-note custom gates (conditions 10, 13, 15).
         // q_per_note is a selector that activates these constraints only on rows
-        // where note data is assigned. Each of the (up to 4) input notes gets one
+        // where note data is assigned. Each of the (up to 5) input notes gets one
         // such row; on all other rows the selector is 0 and the gate is inactive.
         let q_per_note = meta.selector();
         meta.create_gate("Per-note checks", |meta| {
@@ -882,7 +884,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
 
         // Rho binding (condition 3).
-        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
+        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, cmx_5, van_comm, vote_round_id)
         // Binds the signed note to the exact notes being delegated, the governance
         // commitment, and the round, making the keystone signature non-replayable.
         //
@@ -956,7 +958,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // Conditions 9–15: prove ownership and unspentness of each delegated note.
         // ---------------------------------------------------------------
 
-        // For each of the 4 note slots, synthesize_note_slot proves:
+        // For each of the 5 note slots, synthesize_note_slot proves:
         //   - I know the note's contents and it has a valid commitment (cond 9)
         //   - The commitment exists in the mainchain note tree (cond 10)
         //   - The note belongs to my key (cond 11)
@@ -969,11 +971,11 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         //   v_i        — summed into v_total (conditions 7 and 8)
         //   gov_null_i — exposed as public input
 
-        let mut cmx_cells = Vec::with_capacity(4);
-        let mut v_cells = Vec::with_capacity(4);
-        let mut gov_null_cells = Vec::with_capacity(4);
+        let mut cmx_cells = Vec::with_capacity(5);
+        let mut v_cells = Vec::with_capacity(5);
+        let mut gov_null_cells = Vec::with_capacity(5);
 
-        for i in 0..4 {
+        for i in 0..5 {
             let (cmx_i, v_i, gov_null_i) = synthesize_note_slot(
                 &config,
                 &mut layouter,
@@ -995,22 +997,23 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
         // ---------------------------------------------------------------
         // Condition 3: Rho binding.
-        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
+        // rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, cmx_5, van_comm, vote_round_id)
         // ---------------------------------------------------------------
 
-        // The keystone note's rho is deterministically derived from the 4 note
+        // The keystone note's rho is deterministically derived from the 5 note
         // commitments, the gov commitment, and the vote round. This binds the
         // keystone signature to the exact set of notes being delegated — replaying
         // the signature with different notes would produce a different rho, which
         // would change the nullifier (cond 2) and break the proof.
         {
-            // Hash the 6 inputs: 4 note commitment x-coords (from cond 9),
+            // Hash the 7 inputs: 5 note commitment x-coords (from cond 9),
             // van_comm (public input), and vote_round_id (public input).
             let poseidon_message = [
                 cmx_cells[0].clone(),
                 cmx_cells[1].clone(),
                 cmx_cells[2].clone(),
                 cmx_cells[3].clone(),
+                cmx_cells[4].clone(),
                 van_comm_cell.clone(),
                 vote_round_id_cell.clone(),
             ];
@@ -1018,7 +1021,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 pallas::Base,
                 _,
                 poseidon::P128Pow5T3,
-                ConstantLength<6>,
+                ConstantLength<7>,
                 3,
                 2,
             >::init(
@@ -1026,7 +1029,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 layouter.namespace(|| "rho binding Poseidon init"),
             )?;
             let derived_rho = poseidon_hasher.hash(
-                layouter.namespace(|| "Poseidon(cmx_1..4, van_comm, vote_round_id)"),
+                layouter.namespace(|| "Poseidon(cmx_1..5, van_comm, vote_round_id)"),
                 poseidon_message,
             )?;
 
@@ -1127,10 +1130,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         };
 
         // ---------------------------------------------------------------
-        // Compute v_total = v_1 + v_2 + v_3 + v_4 (used by conditions 7 & 8).
+        // Compute v_total = v_1 + v_2 + v_3 + v_4 + v_5 (used by conditions 7 & 8).
         // ---------------------------------------------------------------
 
-        // v_total = v_1 + v_2 + v_3 + v_4  (three AddChip additions)
+        // v_total = v_1 + v_2 + v_3 + v_4 + v_5  (four AddChip additions)
         let add_chip = config.add_chip();
         let sum_12 =
             add_chip.add(layouter.namespace(|| "v_1 + v_2"), &v_cells[0], &v_cells[1])?;
@@ -1139,10 +1142,15 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             &sum_12,
             &v_cells[2],
         )?;
-        let v_total = add_chip.add(
+        let sum_1234 = add_chip.add(
             layouter.namespace(|| "(v_1 + v_2 + v_3) + v_4"),
             &sum_123,
             &v_cells[3],
+        )?;
+        let v_total = add_chip.add(
+            layouter.namespace(|| "(v_1 + v_2 + v_3 + v_4) + v_5"),
+            &sum_1234,
+            &v_cells[4],
         )?;
 
         // ---------------------------------------------------------------
@@ -1671,7 +1679,7 @@ fn synthesize_note_slot(
 // Instance
 // ================================================================
 
-/// Public inputs to the delegation circuit (12 field elements).
+/// Public inputs to the delegation circuit (13 field elements).
 ///
 /// These are the values posted to the vote chain (§2.4) that both the prover
 /// and verifier agree on. The verifier checks the proof against these values
@@ -1692,8 +1700,8 @@ pub struct Instance {
     pub nc_root: pallas::Base,
     /// The nullifier IMT root.
     pub nf_imt_root: pallas::Base,
-    /// Per-note governance nullifiers (4 slots).
-    pub gov_null: [pallas::Base; 4],
+    /// Per-note governance nullifiers (5 slots).
+    pub gov_null: [pallas::Base; 5],
 }
 
 impl Instance {
@@ -1706,7 +1714,7 @@ impl Instance {
         vote_round_id: pallas::Base,
         nc_root: pallas::Base,
         nf_imt_root: pallas::Base,
-        gov_null: [pallas::Base; 4],
+        gov_null: [pallas::Base; 5],
     ) -> Self {
         Instance {
             nf_signed,
@@ -1749,6 +1757,7 @@ impl Instance {
             self.gov_null[1],
             self.gov_null[2],
             self.gov_null[3],
+            self.gov_null[4],
         ]
     }
 }
@@ -1817,7 +1826,7 @@ mod tests {
         instance: Instance,
     }
 
-    /// Build a valid merged circuit with 1 real note + 3 padded notes.
+    /// Build a valid merged circuit with 1 real note + 4 padded notes.
     fn make_test_data() -> TestData {
         let mut rng = OsRng;
 
@@ -1881,14 +1890,14 @@ mod tests {
 
         let slot_0 = make_note_slot(&real_note, &auth_path_0, 0u32, &imt_0, true, false);
 
-        // Padded notes (slots 1-3): zero-value notes with addresses from the real ivk.
+        // Padded notes (slots 1-4): zero-value notes with addresses from the real ivk.
         let mut note_slots = vec![slot_0];
         let mut cmx_values = vec![cmx_real];
         let mut gov_nulls = vec![gov_null_0];
 
         let dummy_auth_path = [MerkleHashOrchard::empty_leaf(); MERKLE_DEPTH_ORCHARD];
 
-        for i in 1..4u32 {
+        for i in 1..5u32 {
             // Use fvk.address_at() so pk_d = [ivk] * g_d with the REAL ivk.
             let pad_addr = fvk.address_at(100 + i, Scope::External);
             let (_, _, dummy) = Note::dummy(&mut rng, None);
@@ -1916,7 +1925,7 @@ mod tests {
             gov_nulls.push(pad_gov_null);
         }
 
-        let notes: [NoteSlotWitness; 4] = note_slots.try_into().unwrap();
+        let notes: [NoteSlotWitness; 5] = note_slots.try_into().unwrap();
 
         // Values: real note = 13M, padded = 0.
         // Ballot scaling: 13,000,000 / 12,500,000 = 1 ballot, remainder = 500,000.
@@ -1948,6 +1957,7 @@ mod tests {
             cmx_values[1],
             cmx_values[2],
             cmx_values[3],
+            cmx_values[4],
             van_comm,
             vote_round_id,
         );
@@ -1991,7 +2001,7 @@ mod tests {
             vote_round_id,
             nc_root,
             nf_imt_root,
-            [gov_nulls[0], gov_nulls[1], gov_nulls[2], gov_nulls[3]],
+            [gov_nulls[0], gov_nulls[1], gov_nulls[2], gov_nulls[3], gov_nulls[4]],
         );
 
         TestData { circuit, instance }
@@ -2094,7 +2104,7 @@ mod tests {
     fn instance_to_halo2_roundtrip() {
         let t = make_test_data();
         let pi = t.instance.to_halo2_instance();
-        assert_eq!(pi.len(), 12, "Expected exactly 12 public inputs");
+        assert_eq!(pi.len(), 13, "Expected exactly 13 public inputs");
         assert_eq!(pi[NF_SIGNED], t.instance.nf_signed.0);
         assert_eq!(pi[CMX_NEW], t.instance.cmx_new);
         assert_eq!(pi[VAN_COMM], t.instance.van_comm);

@@ -254,7 +254,7 @@ pub fn build_delegation_bundle_for_test(
     // Must match sdk/x/vote/types/sighash.go ComputeDelegationSighash.
     const SIGHASH_DOMAIN: &[u8] = b"ZALLY_DELEGATION_SIGHASH_V0";
     let mut canonical =
-        Vec::with_capacity(SIGHASH_DOMAIN.len() + 32 + 32 + 32 + 32 + 64 + 32 + 4 * 32);
+        Vec::with_capacity(SIGHASH_DOMAIN.len() + 32 + 32 + 32 + 32 + 64 + 32 + 5 * 32);
     canonical.extend_from_slice(SIGHASH_DOMAIN);
     extend_padded32(&mut canonical, vote_round_id_repr.as_ref());
     canonical.extend_from_slice(&rk_bytes);
@@ -262,7 +262,7 @@ pub fn build_delegation_bundle_for_test(
     canonical.extend_from_slice(cmx_new_bytes.as_ref());
     extend_padded64(&mut canonical, &enc_memo);
     extend_padded32(&mut canonical, van_cmx_bytes.as_ref());
-    for i in 0..4 {
+    for i in 0..5 {
         if i < gov_null_bytes.len() {
             canonical.extend_from_slice(&gov_null_bytes[i]);
         } else {

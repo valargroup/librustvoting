@@ -59,10 +59,10 @@ The resolved config is also stored in `VotingStore.State.serviceConfig` so the s
 
 ## Share distribution
 
-When multiple vote servers are configured, encrypted shares are distributed across them instead of all going to one server. With N servers and 4 shares:
+When multiple vote servers are configured, encrypted shares are distributed across them instead of all going to one server. With N servers and 5 shares:
 
-- N >= 4: one share per server (shuffled)
-- 1 < N < 4: round-robin
+- N >= 5: one share per server (shuffled)
+- 1 < N < 5: round-robin
 - N == 1: all shares to that server
 
 ## Config deployment
