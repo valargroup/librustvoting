@@ -563,8 +563,6 @@ public protocol VotingDatabaseProtocol: AnyObject, Sendable {
 
     func clearRound(roundId: String) throws
 
-    func constructDelegationAction(roundId: String, bundleIndex: UInt32, notes: [NoteInfo], fvkBytes: Data, gDNewX: Data, pkDNewX: Data, hotkeyRawAddress: Data, addressIndex: UInt32) throws  -> DelegationAction
-
     func encryptShares(roundId: String, shares: [UInt64]) throws  -> [EncryptedShare]
 
     func generateHotkey(roundId: String, seed: Data) throws  -> VotingHotkey
@@ -778,21 +776,6 @@ open func clearRound(roundId: String)throws   {try rustCallWithError(FfiConverte
         FfiConverterString.lower(roundId),$0
     )
 }
-}
-
-open func constructDelegationAction(roundId: String, bundleIndex: UInt32, notes: [NoteInfo], fvkBytes: Data, gDNewX: Data, pkDNewX: Data, hotkeyRawAddress: Data, addressIndex: UInt32)throws  -> DelegationAction  {
-    return try  FfiConverterTypeDelegationAction_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
-    uniffi_zcash_voting_ffi_fn_method_votingdatabase_construct_delegation_action(self.uniffiClonePointer(),
-        FfiConverterString.lower(roundId),
-        FfiConverterUInt32.lower(bundleIndex),
-        FfiConverterSequenceTypeNoteInfo.lower(notes),
-        FfiConverterData.lower(fvkBytes),
-        FfiConverterData.lower(gDNewX),
-        FfiConverterData.lower(pkDNewX),
-        FfiConverterData.lower(hotkeyRawAddress),
-        FfiConverterUInt32.lower(addressIndex),$0
-    )
-})
 }
 
 open func encryptShares(roundId: String, shares: [UInt64])throws  -> [EncryptedShare]  {
@@ -1228,172 +1211,6 @@ public func FfiConverterTypeCastVoteSignature_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeCastVoteSignature_lower(_ value: CastVoteSignature) -> RustBuffer {
     return FfiConverterTypeCastVoteSignature.lower(value)
-}
-
-
-public struct DelegationAction {
-    public var actionBytes: Data
-    public var rk: Data
-    public var govNullifiers: [Data]
-    public var van: Data
-    public var vanCommRand: Data
-    public var dummyNullifiers: [Data]
-    public var rhoSigned: Data
-    public var paddedCmx: [Data]
-    public var nfSigned: Data
-    public var cmxNew: Data
-    public var alpha: Data
-    public var spendAuthSig: Data?
-    public var rseedSigned: Data
-    public var rseedOutput: Data
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(actionBytes: Data, rk: Data, govNullifiers: [Data], van: Data, vanCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], nfSigned: Data, cmxNew: Data, alpha: Data, spendAuthSig: Data?, rseedSigned: Data, rseedOutput: Data) {
-        self.actionBytes = actionBytes
-        self.rk = rk
-        self.govNullifiers = govNullifiers
-        self.van = van
-        self.vanCommRand = vanCommRand
-        self.dummyNullifiers = dummyNullifiers
-        self.rhoSigned = rhoSigned
-        self.paddedCmx = paddedCmx
-        self.nfSigned = nfSigned
-        self.cmxNew = cmxNew
-        self.alpha = alpha
-        self.spendAuthSig = spendAuthSig
-        self.rseedSigned = rseedSigned
-        self.rseedOutput = rseedOutput
-    }
-}
-
-#if compiler(>=6)
-extension DelegationAction: Sendable {}
-#endif
-
-
-extension DelegationAction: Equatable, Hashable {
-    public static func ==(lhs: DelegationAction, rhs: DelegationAction) -> Bool {
-        if lhs.actionBytes != rhs.actionBytes {
-            return false
-        }
-        if lhs.rk != rhs.rk {
-            return false
-        }
-        if lhs.govNullifiers != rhs.govNullifiers {
-            return false
-        }
-        if lhs.van != rhs.van {
-            return false
-        }
-        if lhs.vanCommRand != rhs.vanCommRand {
-            return false
-        }
-        if lhs.dummyNullifiers != rhs.dummyNullifiers {
-            return false
-        }
-        if lhs.rhoSigned != rhs.rhoSigned {
-            return false
-        }
-        if lhs.paddedCmx != rhs.paddedCmx {
-            return false
-        }
-        if lhs.nfSigned != rhs.nfSigned {
-            return false
-        }
-        if lhs.cmxNew != rhs.cmxNew {
-            return false
-        }
-        if lhs.alpha != rhs.alpha {
-            return false
-        }
-        if lhs.spendAuthSig != rhs.spendAuthSig {
-            return false
-        }
-        if lhs.rseedSigned != rhs.rseedSigned {
-            return false
-        }
-        if lhs.rseedOutput != rhs.rseedOutput {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(actionBytes)
-        hasher.combine(rk)
-        hasher.combine(govNullifiers)
-        hasher.combine(van)
-        hasher.combine(vanCommRand)
-        hasher.combine(dummyNullifiers)
-        hasher.combine(rhoSigned)
-        hasher.combine(paddedCmx)
-        hasher.combine(nfSigned)
-        hasher.combine(cmxNew)
-        hasher.combine(alpha)
-        hasher.combine(spendAuthSig)
-        hasher.combine(rseedSigned)
-        hasher.combine(rseedOutput)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeDelegationAction: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DelegationAction {
-        return
-            try DelegationAction(
-                actionBytes: FfiConverterData.read(from: &buf),
-                rk: FfiConverterData.read(from: &buf),
-                govNullifiers: FfiConverterSequenceData.read(from: &buf),
-                van: FfiConverterData.read(from: &buf),
-                vanCommRand: FfiConverterData.read(from: &buf),
-                dummyNullifiers: FfiConverterSequenceData.read(from: &buf),
-                rhoSigned: FfiConverterData.read(from: &buf),
-                paddedCmx: FfiConverterSequenceData.read(from: &buf),
-                nfSigned: FfiConverterData.read(from: &buf),
-                cmxNew: FfiConverterData.read(from: &buf),
-                alpha: FfiConverterData.read(from: &buf),
-                spendAuthSig: FfiConverterOptionData.read(from: &buf),
-                rseedSigned: FfiConverterData.read(from: &buf),
-                rseedOutput: FfiConverterData.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: DelegationAction, into buf: inout [UInt8]) {
-        FfiConverterData.write(value.actionBytes, into: &buf)
-        FfiConverterData.write(value.rk, into: &buf)
-        FfiConverterSequenceData.write(value.govNullifiers, into: &buf)
-        FfiConverterData.write(value.van, into: &buf)
-        FfiConverterData.write(value.vanCommRand, into: &buf)
-        FfiConverterSequenceData.write(value.dummyNullifiers, into: &buf)
-        FfiConverterData.write(value.rhoSigned, into: &buf)
-        FfiConverterSequenceData.write(value.paddedCmx, into: &buf)
-        FfiConverterData.write(value.nfSigned, into: &buf)
-        FfiConverterData.write(value.cmxNew, into: &buf)
-        FfiConverterData.write(value.alpha, into: &buf)
-        FfiConverterOptionData.write(value.spendAuthSig, into: &buf)
-        FfiConverterData.write(value.rseedSigned, into: &buf)
-        FfiConverterData.write(value.rseedOutput, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeDelegationAction_lift(_ buf: RustBuffer) throws -> DelegationAction {
-    return try FfiConverterTypeDelegationAction.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeDelegationAction_lower(_ value: DelegationAction) -> RustBuffer {
-    return FfiConverterTypeDelegationAction.lower(value)
 }
 
 
@@ -1883,10 +1700,12 @@ public struct GovernancePczt {
     public var rseedOutput: Data
     public var actionBytes: Data
     public var actionIndex: UInt32
+    public var paddedNoteSecrets: [[Data]]
+    public var pcztSighash: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(pcztBytes: Data, rk: Data, alpha: Data, nfSigned: Data, cmxNew: Data, govNullifiers: [Data], van: Data, vanCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], rseedSigned: Data, rseedOutput: Data, actionBytes: Data, actionIndex: UInt32) {
+    public init(pcztBytes: Data, rk: Data, alpha: Data, nfSigned: Data, cmxNew: Data, govNullifiers: [Data], van: Data, vanCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], rseedSigned: Data, rseedOutput: Data, actionBytes: Data, actionIndex: UInt32, paddedNoteSecrets: [[Data]], pcztSighash: Data) {
         self.pcztBytes = pcztBytes
         self.rk = rk
         self.alpha = alpha
@@ -1902,6 +1721,8 @@ public struct GovernancePczt {
         self.rseedOutput = rseedOutput
         self.actionBytes = actionBytes
         self.actionIndex = actionIndex
+        self.paddedNoteSecrets = paddedNoteSecrets
+        self.pcztSighash = pcztSighash
     }
 }
 
@@ -1957,6 +1778,12 @@ extension GovernancePczt: Equatable, Hashable {
         if lhs.actionIndex != rhs.actionIndex {
             return false
         }
+        if lhs.paddedNoteSecrets != rhs.paddedNoteSecrets {
+            return false
+        }
+        if lhs.pcztSighash != rhs.pcztSighash {
+            return false
+        }
         return true
     }
 
@@ -1976,6 +1803,8 @@ extension GovernancePczt: Equatable, Hashable {
         hasher.combine(rseedOutput)
         hasher.combine(actionBytes)
         hasher.combine(actionIndex)
+        hasher.combine(paddedNoteSecrets)
+        hasher.combine(pcztSighash)
     }
 }
 
@@ -2002,7 +1831,9 @@ public struct FfiConverterTypeGovernancePczt: FfiConverterRustBuffer {
                 rseedSigned: FfiConverterData.read(from: &buf),
                 rseedOutput: FfiConverterData.read(from: &buf),
                 actionBytes: FfiConverterData.read(from: &buf),
-                actionIndex: FfiConverterUInt32.read(from: &buf)
+                actionIndex: FfiConverterUInt32.read(from: &buf),
+                paddedNoteSecrets: FfiConverterSequenceSequenceData.read(from: &buf),
+                pcztSighash: FfiConverterData.read(from: &buf)
         )
     }
 
@@ -2022,6 +1853,8 @@ public struct FfiConverterTypeGovernancePczt: FfiConverterRustBuffer {
         FfiConverterData.write(value.rseedOutput, into: &buf)
         FfiConverterData.write(value.actionBytes, into: &buf)
         FfiConverterUInt32.write(value.actionIndex, into: &buf)
+        FfiConverterSequenceSequenceData.write(value.paddedNoteSecrets, into: &buf)
+        FfiConverterData.write(value.pcztSighash, into: &buf)
     }
 }
 
@@ -2362,7 +2195,7 @@ public struct SharePayload {
     public var encShare: EncryptedShare
     public var treePosition: UInt64
     /**
-     * All 4 encrypted shares (needed for ZKP #3 shares_hash witness).
+     * All 5 encrypted shares (needed for ZKP #3 shares_hash witness).
      * TODO: This is a temp hack
      */
     public var allEncShares: [EncryptedShare]
@@ -2371,7 +2204,7 @@ public struct SharePayload {
     // declare one manually.
     public init(sharesHash: Data, proposalId: UInt32, voteDecision: UInt32, encShare: EncryptedShare, treePosition: UInt64,
         /**
-         * All 4 encrypted shares (needed for ZKP #3 shares_hash witness).
+         * All 5 encrypted shares (needed for ZKP #3 shares_hash witness).
          * TODO: This is a temp hack
          */allEncShares: [EncryptedShare]) {
         self.sharesHash = sharesHash
@@ -2575,7 +2408,7 @@ public struct VoteCommitmentBundle {
     public var proposalId: UInt32
     public var proof: Data
     /**
-     * Encrypted shares generated by the ZKP #2 builder (4 shares).
+     * Encrypted shares generated by the ZKP #2 builder (5 shares).
      */
     public var encShares: [EncryptedShare]
     /**
@@ -2603,7 +2436,7 @@ public struct VoteCommitmentBundle {
     // declare one manually.
     public init(vanNullifier: Data, voteAuthorityNoteNew: Data, voteCommitment: Data, proposalId: UInt32, proof: Data,
         /**
-         * Encrypted shares generated by the ZKP #2 builder (4 shares).
+         * Encrypted shares generated by the ZKP #2 builder (5 shares).
          */encShares: [EncryptedShare],
         /**
          * Tree anchor height used for the proof.
@@ -3443,30 +3276,6 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
-    typealias SwiftType = Data?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterData.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterData.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterSequenceUInt64: FfiConverterRustBuffer {
     typealias SwiftType = [UInt64]
 
@@ -3663,6 +3472,31 @@ fileprivate struct FfiConverterSequenceTypeWitnessData: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [[Data]]
+
+    public static func write(_ value: [[Data]], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterSequenceData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [[Data]] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [[Data]]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterSequenceData.read(from: &buf))
+        }
+        return seq
+    }
+}
 public func buildGovernancePczt(notes: [NoteInfo], params: VotingRoundParams, fvkBytes: Data, hotkeyRawAddress: Data, consensusBranchId: UInt32, coinType: UInt32, seedFingerprint: Data, accountIndex: UInt32, roundName: String)throws  -> GovernancePczt  {
     return try  FfiConverterTypeGovernancePczt_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_func_build_governance_pczt(
@@ -3711,18 +3545,6 @@ public func buildVoteCommitment(hotkeySeed: Data, networkId: UInt32, addressInde
         FfiConverterUInt32.lower(vanPosition),
         FfiConverterUInt32.lower(anchorHeight),
         FfiConverterUInt64.lower(proposalAuthority),$0
-    )
-})
-}
-public func constructDelegationAction(notes: [NoteInfo], params: VotingRoundParams, fvkBytes: Data, gDNewX: Data, pkDNewX: Data, hotkeyRawAddress: Data)throws  -> DelegationAction  {
-    return try  FfiConverterTypeDelegationAction_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
-    uniffi_zcash_voting_ffi_fn_func_construct_delegation_action(
-        FfiConverterSequenceTypeNoteInfo.lower(notes),
-        FfiConverterTypeVotingRoundParams_lower(params),
-        FfiConverterData.lower(fvkBytes),
-        FfiConverterData.lower(gDNewX),
-        FfiConverterData.lower(pkDNewX),
-        FfiConverterData.lower(hotkeyRawAddress),$0
     )
 })
 }
@@ -3894,9 +3716,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_func_build_vote_commitment() != 57877) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_func_construct_delegation_action() != 58555) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_zcash_voting_ffi_checksum_func_decompose_weight() != 39624) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3949,9 +3768,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_clear_round() != 15915) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_construct_delegation_action() != 52251) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_encrypt_shares() != 46668) {
