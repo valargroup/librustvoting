@@ -1,9 +1,9 @@
 //! IMT (Indexed Merkle Tree) utilities for the delegation proof system.
 //!
 //! Provides out-of-circuit helpers for building and verifying Poseidon-based
-//! Indexed Merkle Tree non-membership proofs using the (low, high) leaf model.
-//! Each leaf stores a (low, high) pair defining an interval; the leaf hash is
-//! Poseidon(low, high), then a standard Merkle path authenticates the leaf.
+//! Indexed Merkle Tree non-membership proofs using the (low, width) leaf model.
+//! Each leaf stores a (low, width) pair where width = high - low; the leaf hash
+//! is Poseidon(low, width), then a standard Merkle path authenticates the leaf.
 //! A non-membership proof shows that a nullifier falls within the interval.
 //! Used by the delegation circuit and builder.
 
@@ -49,10 +49,10 @@ pub(crate) fn gov_null_hash(
     ])
 }
 
-/// IMT non-membership proof data ((low, high) leaf model).
+/// IMT non-membership proof data ((low, width) leaf model).
 ///
-/// Each leaf stores an explicit (low, high) pair defining an interval.
-/// The leaf hash is `Poseidon(low, high)`, followed by a standard
+/// Each leaf stores a (low, width) pair where width = high - low.
+/// The leaf hash is `Poseidon(low, width)`, followed by a standard
 /// 29-level Merkle path to the root.
 #[derive(Clone, Debug)]
 pub struct ImtProofData {
@@ -60,8 +60,8 @@ pub struct ImtProofData {
     pub root: pallas::Base,
     /// Interval start (low bound of the bracketing leaf).
     pub low: pallas::Base,
-    /// Interval end (high bound of the bracketing leaf).
-    pub high: pallas::Base,
+    /// Interval width (`high - low`, pre-computed during tree construction).
+    pub width: pallas::Base,
     /// Position of the leaf in the tree.
     pub leaf_pos: u32,
     /// Sibling hashes along the 29-level Merkle path (pure siblings).
@@ -101,7 +101,7 @@ use ff::Field;
 
 /// Precomputed empty subtree hashes for the IMT (Poseidon-based).
 ///
-/// `empty[0] = Poseidon(0, 0)` (hash of an empty (low=0, high=0) leaf),
+/// `empty[0] = Poseidon(0, 0)` (hash of an empty (low=0, width=0) leaf),
 /// `empty[i] = Poseidon(empty[i-1], empty[i-1])` for i >= 1.
 pub fn empty_imt_hashes() -> Vec<pallas::Base> {
     let empty_leaf = poseidon_hash_2(pallas::Base::zero(), pallas::Base::zero());
@@ -113,32 +113,33 @@ pub fn empty_imt_hashes() -> Vec<pallas::Base> {
     hashes
 }
 
-/// IMT provider with evenly-spaced brackets ((low, high) leaf model).
+/// IMT provider with evenly-spaced brackets ((low, width) leaf model).
 ///
 /// Creates 17 brackets at intervals of 2^250, covering the entire Pallas field
 /// (p ~= 16.something x 2^250). Each bracket k has low = k*step + 1 and
-/// high = (k+1)*step - 1, stored as (low, high) leaves at positions 0..16 in
-/// a 32-leaf subtree. Any hash-derived nullifier will fall within one bracket.
+/// width = (k+1)*step - 1 - low, stored as (low, width) leaves at positions
+/// 0..16 in a 32-leaf subtree. Any hash-derived nullifier will fall within one
+/// bracket.
 ///
 /// Used for proof generation (fixture generators) and testing.
 #[derive(Debug)]
 pub struct SpacedLeafImtProvider {
     /// The root of the IMT.
     root: pallas::Base,
-    /// Bracket data: `(low, high)` for each of the 17 brackets.
+    /// Bracket data: `(low, width)` for each of the 17 brackets.
     leaves: Vec<(pallas::Base, pallas::Base)>,
     /// Bottom 5 levels of the 32-leaf subtree.
-    /// `subtree_levels[0]` has 32 leaf hashes Poseidon(low, high),
+    /// `subtree_levels[0]` has 32 leaf hashes Poseidon(low, width),
     /// `subtree_levels[5]` has 1 subtree root.
     subtree_levels: Vec<Vec<pallas::Base>>,
 }
 
 impl SpacedLeafImtProvider {
-    /// Create a new spaced-leaf IMT provider ((low, high) leaf model).
+    /// Create a new spaced-leaf IMT provider ((low, width) leaf model).
     ///
     /// Builds 17 brackets at positions 0..16 in a 32-leaf subtree:
-    /// - Bracket k (k=0..15): low = k*step+1, high = (k+1)*step-1
-    /// - Bracket 16: low = 16*step+1, high = p-1
+    /// - Bracket k (k=0..15): low = k*step+1, width = (k+1)*step-1 - low
+    /// - Bracket 16: low = 16*step+1, width = (p-1) - low
     pub fn new() -> Self {
         let step = pallas::Base::from(2u64).pow([250, 0, 0, 0]);
         let empty = empty_imt_hashes();
@@ -152,14 +153,15 @@ impl SpacedLeafImtProvider {
             } else {
                 -pallas::Base::one() // p - 1
             };
-            leaves.push((low, high));
+            let width = high - low;
+            leaves.push((low, width));
         }
 
-        // Build 32-leaf subtree. Each leaf is Poseidon(low, high).
+        // Build 32-leaf subtree. Each leaf is Poseidon(low, width).
         let empty_leaf_hash = poseidon_hash_2(pallas::Base::zero(), pallas::Base::zero());
         let mut level0 = vec![empty_leaf_hash; 32];
-        for (k, (low, high)) in leaves.iter().enumerate() {
-            level0[k] = poseidon_hash_2(*low, *high);
+        for (k, (low, width)) in leaves.iter().enumerate() {
+            level0[k] = poseidon_hash_2(*low, *width);
         }
 
         let mut subtree_levels = vec![level0];
@@ -198,7 +200,7 @@ impl ImtProvider for SpacedLeafImtProvider {
         let k = (repr.as_ref()[31] >> 2) as usize;
         let k = k.min(16); // clamp to valid range
 
-        let (low, high) = self.leaves[k];
+        let (low, width) = self.leaves[k];
         let leaf_pos = k as u32;
 
         let empty = empty_imt_hashes();
@@ -222,7 +224,7 @@ impl ImtProvider for SpacedLeafImtProvider {
         Ok(ImtProofData {
             root: self.root,
             low,
-            high,
+            width,
             leaf_pos,
             path,
         })

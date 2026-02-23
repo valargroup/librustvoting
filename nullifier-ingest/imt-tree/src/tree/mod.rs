@@ -24,24 +24,27 @@ mod tests;
 /// needs capacity for ~2^28 leaves: `log2(256 << 20) + 1 = 29`.
 pub const TREE_DEPTH: usize = 29;
 
-/// A gap range `[low, high]` representing an inclusive interval between two
-/// adjacent on-chain nullifiers. Each leaf in the Merkle tree commits to one
-/// range via `hash(low, high)`.
+/// A gap range `[low, width]` representing an interval between two adjacent
+/// on-chain nullifiers. `low` is the interval start and `width = high - low`
+/// where `high` is the inclusive upper bound. Each leaf in the Merkle tree
+/// commits to one range via `hash(low, width)`.
 ///
 /// **Exclusion proof**: to prove a value `x` is not a nullifier, the prover
-/// reveals a range `[low, high]` where `low <= x <= high` plus a Merkle path
-/// proving that range is committed in the tree.
+/// reveals a range `[low, width]` where `x - low <= width` plus a Merkle path
+/// proving that range is committed in the tree. Field subtraction handles the
+/// lower bound check: if `x < low`, the result wraps to a value larger than
+/// any valid width.
 ///
 /// Every on-chain nullifier `n` acts as a boundary between two adjacent ranges:
-/// the range before it has `high = n - 1` and the range after has `low = n + 1`.
+/// the range before it has upper bound `n - 1` and the range after has `low = n + 1`.
 /// Because the bounds are `n +/- 1`, the nullifier `n` itself falls outside every
-/// range -- so `low <= x <= high` can only succeed for non-nullifier values.
+/// range -- so the membership check can only succeed for non-nullifier values.
 ///
 /// Example with sorted nullifiers `[n1, n2]`:
 /// ```text
-///   Range 0: [0,    n1-1]   <- gap before n1
-///   Range 1: [n1+1, n2-1]   <- gap between n1 and n2
-///   Range 2: [n2+1, MAX ]   <- gap after n2
+///   Range 0: [0,    n1-1-0]       <- gap before n1
+///   Range 1: [n1+1, n2-1-(n1+1)]  <- gap between n1 and n2
+///   Range 2: [n2+1, MAX-(n2+1)]   <- gap after n2
 /// ```
 /// `n1` is the boundary of ranges 0 and 1; `n2` is the boundary of ranges 1
 /// and 2. Neither `n1` nor `n2` is contained in any range.
@@ -53,7 +56,7 @@ pub const TREE_DEPTH: usize = 29;
 /// (n + 1)` leaf slots are empty.
 ///
 /// Empty slots are filled with `hash(0, 0)` -- the commitment of an
-/// empty (low=0, high=0) leaf. At each level of the tree, the empty hash is
+/// empty (low=0, width=0) leaf. At each level of the tree, the empty hash is
 /// computed by self-hashing the level below:
 /// `empty[0] = hash(0, 0)`, `empty[i+1] = hash(empty[i], empty[i])`. Any
 /// subtree consisting entirely of empty leaves collapses to the empty hash for
@@ -67,36 +70,39 @@ pub type Range = [Fp; 2];
 
 /// Build gap ranges from a sorted nullifier set.
 ///
-/// For each consecutive pair of nullifiers, the gap `[prev, nf - 1]` is emitted.
-/// A final range `[last_nf + 1, Fp::MAX]` closes the space.
+/// For each consecutive pair of nullifiers, the gap `[low, width]` is emitted
+/// where `width = high - low` (inclusive upper bound minus lower bound).
+/// A final range `[last_nf + 1, Fp::MAX - (last_nf + 1)]` closes the space.
 pub fn build_nf_ranges(nfs: impl IntoIterator<Item = Fp>) -> Vec<Range> {
     let mut prev = Fp::zero();
     let mut ranges = vec![];
     for r in nfs {
         if prev < r {
-            ranges.push([prev, r - Fp::one()]);
+            let high = r - Fp::one();
+            ranges.push([prev, high - prev]);
         }
         prev = r + Fp::one();
     }
     if prev != Fp::zero() {
-        ranges.push([prev, Fp::one().neg()]);
+        let high = Fp::one().neg();
+        ranges.push([prev, high - prev]);
     }
     ranges
 }
 
-/// Hash each `(low, high)` range pair into a single leaf commitment.
+/// Hash each `(low, width)` range pair into a single leaf commitment.
 pub fn commit_ranges(ranges: &[Range]) -> Vec<Fp> {
     ranges
         .par_iter()
-        .map_init(PoseidonHasher::new, |hasher, [low, high]| {
-            hasher.hash(*low, *high)
+        .map_init(PoseidonHasher::new, |hasher, [low, width]| {
+            hasher.hash(*low, *width)
         })
         .collect()
 }
 
 /// Pre-compute the empty subtree hash at each tree level.
 ///
-/// `empty[0] = hash(0, 0)` -- the hash of an empty (low=0, high=0) leaf.
+/// `empty[0] = hash(0, 0)` -- the hash of an empty (low=0, width=0) leaf.
 /// `empty[i]` is the hash of a fully-empty subtree of height `i`, computed as
 /// `hash(empty[i-1], empty[i-1])`.
 ///
@@ -168,8 +174,12 @@ fn build_levels(mut leaves: Vec<Fp>, empty: &[Fp; TREE_DEPTH]) -> (Fp, Vec<Vec<F
 
 /// Find the gap-range index that contains `value`.
 ///
-/// Returns `Some(i)` where `ranges[i]` is `[low, high]` (inclusive),
+/// Returns `Some(i)` where `ranges[i]` is `[low, width]`,
 /// or `None` if the value is an existing nullifier.
+///
+/// Membership check: `value - low <= width` (field subtraction). If `value < low`
+/// the result wraps to a huge value > width, so this single comparison covers
+/// both bounds.
 ///
 /// Uses binary search (`partition_point`) on the sorted, non-overlapping
 /// ranges for O(log n) lookup instead of a linear scan.
@@ -181,8 +191,11 @@ pub fn find_range_for_value(ranges: &[Range], value: Fp) -> Option<usize> {
         return None;
     }
     let idx = i - 1;
-    let [low, high] = ranges[idx];
-    if value >= low && value <= high {
+    let [low, width] = ranges[idx];
+    // value - low <= width: if value < low, field subtraction wraps to a huge
+    // value that exceeds any valid width, so the check fails correctly.
+    let offset = value - low;
+    if offset <= width {
         Some(idx)
     } else {
         None
@@ -196,9 +209,9 @@ pub fn save_tree(path: &Path, ranges: &[Range]) -> Result<()> {
     let mut f = std::fs::File::create(path)?;
     let count = ranges.len() as u64;
     f.write_all(&count.to_le_bytes())?;
-    for [low, high] in ranges {
+    for [low, width] in ranges {
         f.write_all(&low.to_repr())?;
-        f.write_all(&high.to_repr())?;
+        f.write_all(&width.to_repr())?;
     }
     Ok(())
 }
@@ -222,8 +235,8 @@ pub fn load_tree(path: &Path) -> Result<Vec<Range>> {
         .par_chunks_exact(64)
         .map(|chunk| {
             let low = Fp::from_repr(chunk[..32].try_into().unwrap()).unwrap();
-            let high = Fp::from_repr(chunk[32..64].try_into().unwrap()).unwrap();
-            [low, high]
+            let width = Fp::from_repr(chunk[32..64].try_into().unwrap()).unwrap();
+            [low, width]
         })
         .collect();
     eprintln!(
@@ -263,9 +276,9 @@ pub fn save_full_tree(
     // Ranges
     let range_count = ranges.len() as u64;
     f.write_all(&range_count.to_le_bytes())?;
-    for [low, high] in ranges {
+    for [low, width] in ranges {
         f.write_all(&low.to_repr())?;
-        f.write_all(&high.to_repr())?;
+        f.write_all(&width.to_repr())?;
     }
 
     // Levels
@@ -330,8 +343,8 @@ pub fn load_full_tree(path: &Path) -> Result<(Vec<Range>, Vec<Vec<Fp>>, Fp, Opti
         .par_chunks_exact(64)
         .map(|chunk| {
             let low = Fp::from_repr(chunk[..32].try_into().unwrap()).unwrap();
-            let high = Fp::from_repr(chunk[32..64].try_into().unwrap()).unwrap();
-            [low, high]
+            let width = Fp::from_repr(chunk[32..64].try_into().unwrap()).unwrap();
+            [low, width]
         })
         .collect();
 

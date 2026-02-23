@@ -49,7 +49,7 @@ use orchard::{
 struct ImtProofJson {
     root: String,
     low: String,
-    high: String,
+    width: String,
     leaf_pos: u32,
     path: Vec<String>,
 }
@@ -97,7 +97,7 @@ fn fp_hex(fp: &pallas::Base) -> String {
 fn parse_proof(json: &ImtProofJson) -> ImtProofData {
     let root = hex_to_fp(&json.root);
     let low = hex_to_fp(&json.low);
-    let high = hex_to_fp(&json.high);
+    let width = hex_to_fp(&json.width);
     let path_vec: Vec<pallas::Base> = json.path.iter().map(|h| hex_to_fp(h)).collect();
 
     assert_eq!(
@@ -113,7 +113,7 @@ fn parse_proof(json: &ImtProofJson) -> ImtProofData {
     ImtProofData {
         root,
         low,
-        high,
+        width,
         leaf_pos: json.leaf_pos,
         path,
     }
@@ -223,21 +223,23 @@ async fn exclusion_proof_verifies_offchain() {
         proof.path.len()
     );
 
-    // 6. The value falls within the claimed range.
+    // 6. The value falls within the claimed range (low, width model).
+    // value - low <= width (field subtraction).
+    let offset = test_value - proof.low;
     assert!(
-        test_value >= proof.low && test_value <= proof.high,
-        "test value {} should be in range [{}, {}]",
+        offset <= proof.width,
+        "test value {} should be in range [low={}, width={}]",
         fp_hex(&test_value),
         fp_hex(&proof.low),
-        fp_hex(&proof.high),
+        fp_hex(&proof.width),
     );
 
-    // 7. The leaf commitment is correct: hash(low, high).
-    let expected_leaf = poseidon_hash(proof.low, proof.high);
-    let actual_leaf = poseidon_hash(proof.low, proof.high);
+    // 7. The leaf commitment is correct: hash(low, width).
+    let expected_leaf = poseidon_hash(proof.low, proof.width);
+    let actual_leaf = poseidon_hash(proof.low, proof.width);
     assert_eq!(
         actual_leaf, expected_leaf,
-        "leaf should equal poseidon_hash(low, high)"
+        "leaf should equal poseidon_hash(low, width)"
     );
 
     // 8. Full off-chain verification via ImtProofData::verify().
@@ -247,10 +249,10 @@ async fn exclusion_proof_verifies_offchain() {
     );
 
     eprintln!(
-        "Verified: value={}, range=[{}, {}], pos={}, root={}",
+        "Verified: value={}, low={}, width={}, pos={}, root={}",
         fp_hex(&test_value),
         fp_hex(&proof.low),
-        fp_hex(&proof.high),
+        fp_hex(&proof.width),
         proof.leaf_pos,
         fp_hex(&proof.root),
     );
@@ -312,8 +314,8 @@ async fn manual_merkle_path_recomputation() {
 
     let proof = fetch_exclusion_proof(&client, test_value).await;
 
-    // Recompute leaf from range bounds.
-    let leaf = poseidon_hash(proof.low, proof.high);
+    // Recompute leaf from range (low, width).
+    let leaf = poseidon_hash(proof.low, proof.width);
 
     // Walk the auth path manually.
     let mut current = leaf;
@@ -457,7 +459,7 @@ impl ImtProvider for ApiImtProvider {
         Ok(OrchardImtProofData {
             root: proof.root,
             low: proof.low,
-            high: proof.high,
+            width: proof.width,
             leaf_pos: proof.leaf_pos,
             path: proof.path,
         })

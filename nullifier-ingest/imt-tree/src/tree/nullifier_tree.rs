@@ -105,21 +105,22 @@ impl NullifierTree {
     ///
     /// The delegation circuit's `q_interval` gate range-checks interval
     /// widths to 250 bits. If any range exceeds this bound, proofs built
-    /// from this tree will silently fail the circuit check. This method
-    /// performs one subtraction per range -- cheap and definitive.
+    /// from this tree will silently fail the circuit check.
+    ///
+    /// In the `(low, width)` leaf model, `width` is stored directly in
+    /// `range[1]`, so no subtraction is needed.
     ///
     /// Called automatically by [`build_sentinel_tree`]; you only need to
     /// call this directly if you are loading a tree from an untrusted source.
     pub fn verify_range_widths(&self) -> Result<()> {
-        for (i, &[low, high]) in self.ranges.iter().enumerate() {
-            let width = high - low;
+        for (i, &[low, width]) in self.ranges.iter().enumerate() {
             // A value fits in 250 bits iff its big-endian byte 31 (the MSB
             // of the little-endian repr) has its top two bits clear (< 0x04).
             // Equivalently: the 256-bit repr must be < 2^250.
             let repr = width.to_repr();
             anyhow::ensure!(
                 repr.as_ref()[31] < 0x04,
-                "range {i} has width >= 2^250: low={low:?}, high={high:?}"
+                "range {i} has width >= 2^250: low={low:?}, width={width:?}"
             );
         }
         Ok(())
@@ -156,11 +157,11 @@ impl NullifierTree {
             };
             pos >>= 1;
         }
-        let [low, high] = self.ranges[idx];
+        let [low, width] = self.ranges[idx];
         Some(ImtProofData {
             root: self.root,
             low,
-            high,
+            width,
             leaf_pos: idx as u32,
             path,
         })

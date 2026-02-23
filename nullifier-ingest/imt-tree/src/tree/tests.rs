@@ -8,8 +8,8 @@ fn fp(v: u64) -> Fp {
 }
 
 // 4 nullifiers: 10, 20, 30, 40
-// Expected 5 gap ranges:
-//   [0, 9]    [11, 19]    [21, 29]    [31, 39]    [41, MAX]
+// Expected 5 gap ranges (low, width):
+//   [0, 9]    [11, 8]    [21, 8]    [31, 8]    [41, MAX-41]
 
 fn four_nullifiers() -> Vec<Fp> {
     vec![fp(10), fp(20), fp(30), fp(40)]
@@ -20,13 +20,13 @@ fn test_build_ranges_from_4_nullifiers() {
     let ranges = build_nf_ranges(four_nullifiers());
     assert_eq!(ranges.len(), 5);
 
-    assert_eq!(ranges[0], [fp(0), fp(9)]);
-    assert_eq!(ranges[1], [fp(11), fp(19)]);
-    assert_eq!(ranges[2], [fp(21), fp(29)]);
-    assert_eq!(ranges[3], [fp(31), fp(39)]);
-    // Last range: [41, Fp::MAX]
+    assert_eq!(ranges[0], [fp(0), fp(9)]);       // width = 9 - 0 = 9
+    assert_eq!(ranges[1], [fp(11), fp(8)]);      // width = 19 - 11 = 8
+    assert_eq!(ranges[2], [fp(21), fp(8)]);      // width = 29 - 21 = 8
+    assert_eq!(ranges[3], [fp(31), fp(8)]);      // width = 39 - 31 = 8
+    // Last range: [41, MAX - 41]
     assert_eq!(ranges[4][0], fp(41));
-    assert_eq!(ranges[4][1], Fp::one().neg());
+    assert_eq!(ranges[4][1], Fp::one().neg() - fp(41));
 }
 
 #[test]
@@ -88,11 +88,10 @@ fn test_exclusion_proof_end_to_end() {
     // Prove that 15 is not a nullifier
     let value = fp(15);
     let proof = tree.prove(value).expect("should produce proof");
-    assert_eq!(proof.leaf_pos, 1); // range [11, 19]
+    assert_eq!(proof.leaf_pos, 1); // range [11, width=8] (high=19)
 
     assert_eq!(proof.low, fp(11));
-    assert_eq!(proof.high, fp(19));
-    assert!(value >= proof.low && value <= proof.high);
+    assert_eq!(proof.width, fp(8));   // width = 19 - 11 = 8
     assert!(proof.verify(value));
 }
 
@@ -299,9 +298,10 @@ fn test_find_range_binary_search_large_set() {
             i + 1
         );
         let idx = result.unwrap();
-        let [low, high] = ranges[idx];
+        let [low, width] = ranges[idx];
+        let offset = mid - low;
         assert!(
-            mid >= low && mid <= high,
+            offset <= width,
             "value not within returned range at index {}",
             idx
         );
@@ -311,8 +311,9 @@ fn test_find_range_binary_search_large_set() {
 #[test]
 fn test_find_range_agrees_with_linear_scan() {
     fn linear_find(ranges: &[Range], value: Fp) -> Option<usize> {
-        for (i, [low, high]) in ranges.iter().enumerate() {
-            if value >= *low && value <= *high {
+        for (i, [low, width]) in ranges.iter().enumerate() {
+            let offset = value - *low;
+            if offset <= *width {
                 return Some(i);
             }
         }
@@ -341,9 +342,9 @@ fn test_single_nullifier_tree() {
     assert_eq!(tree.len(), 2);
 
     let ranges = tree.ranges();
-    assert_eq!(ranges[0], [fp(0), fp(99)]);
+    assert_eq!(ranges[0], [fp(0), fp(99)]);       // width = 99 - 0 = 99
     assert_eq!(ranges[1][0], fp(101));
-    assert_eq!(ranges[1][1], Fp::one().neg());
+    assert_eq!(ranges[1][1], Fp::one().neg() - fp(101)); // width = MAX - 101
 
     let proof_low = tree.prove(fp(50)).unwrap();
     assert_eq!(proof_low.leaf_pos, 0);
@@ -361,7 +362,7 @@ fn test_consecutive_nullifiers_collapse_gap() {
     let tree = NullifierTree::build(vec![fp(5), fp(6), fp(7)]);
 
     assert_eq!(tree.len(), 2);
-    assert_eq!(tree.ranges()[0], [fp(0), fp(4)]);
+    assert_eq!(tree.ranges()[0], [fp(0), fp(4)]);   // width = 4 - 0 = 4
     assert_eq!(tree.ranges()[1][0], fp(8));
 
     assert!(tree.prove(fp(2)).unwrap().verify(fp(2)));
@@ -377,7 +378,7 @@ fn test_adjacent_nullifiers_differ_by_one() {
     let tree = NullifierTree::build(vec![fp(5), fp(6)]);
 
     assert_eq!(tree.len(), 2);
-    assert_eq!(tree.ranges()[0], [fp(0), fp(4)]);
+    assert_eq!(tree.ranges()[0], [fp(0), fp(4)]);   // width = 4 - 0 = 4
     assert_eq!(tree.ranges()[1][0], fp(7));
 
     assert!(tree.prove(fp(4)).unwrap().verify(fp(4)));
@@ -391,7 +392,7 @@ fn test_nullifier_at_zero() {
     let tree = NullifierTree::build(vec![Fp::zero()]);
     assert_eq!(tree.len(), 1);
     assert_eq!(tree.ranges()[0][0], fp(1));
-    assert_eq!(tree.ranges()[0][1], Fp::one().neg());
+    assert_eq!(tree.ranges()[0][1], Fp::one().neg() - fp(1)); // width = MAX - 1
 
     assert!(tree.prove(Fp::zero()).is_none());
     assert!(tree.prove(fp(1)).unwrap().verify(fp(1)));
@@ -455,15 +456,14 @@ fn test_sentinel_tree_all_ranges_under_2_250() {
 
     let two_250 = Fp::from(2u64).pow([250, 0, 0, 0]);
 
-    for (i, [low, high]) in tree.ranges().iter().enumerate() {
-        let width = *high - *low;
+    for (i, [low, width]) in tree.ranges().iter().enumerate() {
         let max_width = two_250 - Fp::one();
-        let check = max_width - width;
+        let check = max_width - *width;
         let repr = check.to_repr();
         assert!(
             repr.as_ref()[31] < 0x40,
-            "range {} has width >= 2^250: low={:?}, high={:?}",
-            i, low, high
+            "range {} has width >= 2^250: low={:?}, width={:?}",
+            i, low, width
         );
     }
 }

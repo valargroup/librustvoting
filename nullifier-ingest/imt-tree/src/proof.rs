@@ -8,7 +8,7 @@ use crate::tree::TREE_DEPTH;
 /// Each field maps directly to a circuit witness:
 ///
 /// - `root`: public input, checked against the IMT root in the instance column
-/// - `low`, `high`: witnessed interval bounds, hashed to the leaf commitment
+/// - `low`, `width`: witnessed interval `(low, width)` pair, hashed to the leaf commitment
 /// - `leaf_pos`: position bits determine swap ordering at each Merkle level
 /// - `path`: sibling hashes for the 29-level Merkle authentication path
 #[derive(Clone, Debug)]
@@ -17,8 +17,8 @@ pub struct ImtProofData {
     pub root: Fp,
     /// Interval start (low bound of the bracketing leaf).
     pub low: Fp,
-    /// Interval end (high bound of the bracketing leaf).
-    pub high: Fp,
+    /// Interval width (`high - low`, pre-computed during tree construction).
+    pub width: Fp,
     /// Position of the leaf in the tree.
     pub leaf_pos: u32,
     /// Sibling hashes along the 29-level Merkle path (pure siblings).
@@ -28,14 +28,17 @@ pub struct ImtProofData {
 impl ImtProofData {
     /// Verify this proof out-of-circuit.
     ///
-    /// Checks that `value` falls within `[low, high]` and that the Merkle
-    /// path recomputes to `root`.
+    /// Checks that `value` falls within `[low, low + width]` and that the
+    /// Merkle path recomputes to `root`.
     pub fn verify(&self, value: Fp) -> bool {
-        if value < self.low || value > self.high {
+        // value - low <= width: if value < low, field subtraction wraps to a
+        // huge value that exceeds any valid width, so the check fails correctly.
+        let offset = value - self.low;
+        if offset > self.width {
             return false;
         }
         let hasher = PoseidonHasher::new();
-        let leaf = hasher.hash(self.low, self.high);
+        let leaf = hasher.hash(self.low, self.width);
         let mut current = leaf;
         let mut pos = self.leaf_pos;
         for sibling in self.path.iter() {
@@ -141,17 +144,17 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_rejects_swapped_range_bounds() {
+    fn test_verify_rejects_swapped_range_fields() {
         let tree = NullifierTree::build(four_nullifiers());
         let value = fp(15);
         let mut proof = tree.prove(value).unwrap();
 
-        let (low, high) = (proof.low, proof.high);
-        proof.low = high;
-        proof.high = low;
+        let (low, width) = (proof.low, proof.width);
+        proof.low = width;
+        proof.width = low;
         assert!(
             !proof.verify(value),
-            "swapped range bounds should fail verification"
+            "swapped range fields should fail verification"
         );
     }
 }

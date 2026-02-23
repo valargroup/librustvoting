@@ -91,7 +91,7 @@ fn parse_imt_proof_json(json_bytes: &[u8]) -> Result<ImtProofData, VotingError> 
 
     let root = hex_to_fp(&json.root)?;
     let low = hex_to_fp(&json.low)?;
-    let high = hex_to_fp(&json.high)?;
+    let width = hex_to_fp(&json.width)?;
 
     if json.path.len() != IMT_DEPTH {
         return Err(VotingError::InvalidInput {
@@ -111,7 +111,7 @@ fn parse_imt_proof_json(json_bytes: &[u8]) -> Result<ImtProofData, VotingError> 
     Ok(ImtProofData {
         root,
         low,
-        high,
+        width,
         leaf_pos: json.leaf_pos,
         path,
     })
@@ -612,14 +612,15 @@ mod tests {
                 } else {
                     -pallas::Base::one() // p - 1
                 };
-                leaves.push((low, high));
+                let width = high - low;
+                leaves.push((low, width));
             }
 
-            // Build 32-leaf subtree. Each leaf is Poseidon(low, high).
+            // Build 32-leaf subtree. Each leaf is Poseidon(low, width).
             let empty_leaf_hash = poseidon2(pallas::Base::zero(), pallas::Base::zero());
             let mut level0 = vec![empty_leaf_hash; 32];
-            for (k, (low, high)) in leaves.iter().enumerate() {
-                level0[k] = poseidon2(*low, *high);
+            for (k, (low, width)) in leaves.iter().enumerate() {
+                level0[k] = poseidon2(*low, *width);
             }
 
             let mut subtree_levels = vec![level0];
@@ -650,7 +651,7 @@ mod tests {
             // Determine bracket: k = nf >> 250. In LE repr, bit 250 is bit 2 of byte 31.
             let repr: [u8; 32] = nf.to_repr();
             let k = ((repr[31] >> 2) as usize).min(16);
-            let (low, high) = self.leaves[k];
+            let (low, width) = self.leaves[k];
 
             let empties = empty_imt_hashes();
 
@@ -673,7 +674,7 @@ mod tests {
             let json = serde_json::json!({
                 "root": fp_to_hex(self.root),
                 "low": fp_to_hex(low),
-                "high": fp_to_hex(high),
+                "width": fp_to_hex(width),
                 "leaf_pos": k as u32,
                 "path": path.iter().map(|p| fp_to_hex(*p)).collect::<Vec<_>>(),
             });
@@ -689,7 +690,7 @@ mod tests {
         let json = serde_json::json!({
             "root": &zero_hex,
             "low": &zero_hex,
-            "high": &zero_hex,
+            "width": &zero_hex,
             "leaf_pos": 0u32,
             "path": path,
         });
@@ -706,7 +707,7 @@ mod tests {
         let json = serde_json::json!({
             "root": &zero_hex,
             "low": &zero_hex,
-            "high": &zero_hex,
+            "width": &zero_hex,
             "leaf_pos": 0u32,
             "path": path,
         });
