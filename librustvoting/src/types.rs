@@ -210,8 +210,8 @@ pub struct ImtProofJson {
     pub root: String,
     /// Low bound of the bracketing leaf (hex).
     pub low: String,
-    /// High bound of the bracketing leaf (hex).
-    pub high: String,
+    /// Interval width (`high - low`, pre-computed in tree) (hex).
+    pub width: String,
     /// Position of the leaf in the tree.
     pub leaf_pos: u32,
     /// Sibling hashes along the 29-level Merkle path (hex strings).

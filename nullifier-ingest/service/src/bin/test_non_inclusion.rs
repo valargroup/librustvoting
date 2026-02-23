@@ -45,11 +45,11 @@ fn main() -> Result<()> {
         .expect("BUG: Fp::zero() was not found in any gap range — unexpected");
 
     println!(
-        "  Found in range: [0x{}..0x{}]",
+        "  Found in range: low=0x{}, width=0x{}",
         hex::encode(proof.low.to_repr()),
-        hex::encode(proof.high.to_repr())
+        hex::encode(proof.width.to_repr())
     );
-    assert!(test_value >= proof.low && test_value <= proof.high);
+    assert!(test_value - proof.low <= proof.width);
     assert!(
         proof.verify(test_value),
         "Exclusion proof did not verify"
@@ -94,7 +94,7 @@ fn main() -> Result<()> {
         .prove(test_value_2)
         .expect("BUG: test value in middle of a gap range was not found");
 
-    assert!(test_value_2 >= proof2.low && test_value_2 <= proof2.high);
+    assert!(test_value_2 - proof2.low <= proof2.width);
     assert!(
         proof2.verify(test_value_2),
         "Exclusion proof did not verify for range {}",

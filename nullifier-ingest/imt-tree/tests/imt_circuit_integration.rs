@@ -41,7 +41,7 @@ impl ImtProvider for NullifierTreeAdapter<'_> {
         Ok(OrchardImtProofData {
             root: proof.root,
             low: proof.low,
-            high: proof.high,
+            width: proof.width,
             leaf_pos: proof.leaf_pos,
             path: proof.path,
         })

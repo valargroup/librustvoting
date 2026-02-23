@@ -47,7 +47,7 @@ A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384
    * **pos**: leaf position in the note commitment tree.
    * **is_note_real**: boolean flag — 1 for real notes, 0 for padded notes.
    * **imt_low**: the interval start (low bound of the bracketing leaf).
-   * **imt_high**: the interval end (high bound of the bracketing leaf).
+   * **imt_width**: the interval width (`high - low`, pre-computed during tree construction).
    * **imt_leaf_pos**: position of the leaf in the IMT.
    * **imt_path**: Poseidon-based IMT Merkle authentication path (29 pure siblings).
 
@@ -302,11 +302,11 @@ Same `DeriveNullifier` construction as condition 2, but applied to each delegate
 
 ## 13. IMT Non-Membership (x4)
 
-Purpose: prove the note's nullifier has NOT been spent, using a Poseidon-based Indexed Merkle Tree with a (low, high) leaf model. Each leaf stores an explicit interval `[low, high]`.
+Purpose: prove the note's nullifier has NOT been spent, using a Poseidon-based Indexed Merkle Tree with a (low, width) leaf model. Each leaf stores `(low, width)` where `width = high - low` is pre-computed during tree construction.
 
 **Approach:**
 
-1. **Leaf hash**: `leaf_hash = Poseidon(low, high)` — authenticates both interval bounds via the Merkle root.
+1. **Leaf hash**: `leaf_hash = Poseidon(low, width)` — authenticates both interval bounds via the Merkle root.
 
 2. **Merkle path** (29 levels, starting from `leaf_hash`): At each level, a `q_imt_swap` gate conditionally swaps `(current, sibling)` into `(left, right)` based on the position bit, then `Poseidon(left, right)` computes the parent. The swap gate constrains:
    - `left = current + pos_bit * (sibling - current)`
@@ -315,14 +315,13 @@ Purpose: prove the note's nullifier has NOT been spent, using a Poseidon-based I
 
 3. **Root check**: The `q_per_note` gate constrains `imt_root = nf_imt_root` (the public input).
 
-4. **Interval check** (`q_interval` gate): Proves `low <= real_nf <= high` (fully inclusive):
-   - `y = high - low` (interval width)
+4. **Interval check** (`q_interval` gate): Proves `low <= real_nf <= low + width` using 2 constraints:
    - `x = real_nf - low` (offset into interval)
-   - `x_shifted = 2^250 - y + x - 1` (shifted for upper bound check)
+   - `x_shifted = 2^250 - width + x - 1` (shifted for upper bound check)
    - `x` is range-checked to `[0, 2^250)` → `real_nf >= low`
-   - `x_shifted` is range-checked to `[0, 2^250)` → `real_nf <= high`
+   - `x_shifted` is range-checked to `[0, 2^250)` → `real_nf <= low + width`
 
-**Leaf authentication**: `high` is authenticated via `Poseidon(low, high) → Merkle root` — a forged `high` produces the wrong root. No parity constraint needed; if the prover swaps (low, high), the interval check fails because `nf - low` wraps to a large field element.
+**Leaf authentication**: `width` is authenticated via `Poseidon(low, width) → Merkle root` — a forged `width` produces the wrong root.
 
 **250-bit range bound assumption:** The 250-bit range check constrains bracket intervals to `< 2^250`. Since the Pallas field has order `p ≈ 2^254.9`, the IMT operator must pre-populate sentinel leaves at intervals of at most `2^250` to ensure every nullifier falls within a valid bracket. With ~17 evenly-spaced brackets (at multiples of `2^250`), the entire field is covered. The `SpacedLeafImtProvider` implements this strategy.
 

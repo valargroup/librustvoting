@@ -32,7 +32,7 @@ fn fp_hex(fp: &Fp) -> String {
 struct ImtProofJson {
     root: String,
     low: String,
-    high: String,
+    width: String,
     leaf_pos: u32,
     path: Vec<String>,
 }
@@ -133,7 +133,7 @@ async fn exclusion_proof(
             let json = ImtProofJson {
                 root: fp_hex(&proof.root),
                 low: fp_hex(&proof.low),
-                high: fp_hex(&proof.high),
+                width: fp_hex(&proof.width),
                 leaf_pos: proof.leaf_pos,
                 path: proof.path.iter().map(fp_hex).collect(),
             };
