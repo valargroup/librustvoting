@@ -51,7 +51,7 @@
 
 use alloc::vec::Vec;
 
-use ff::PrimeField;
+use ff::{Field, PrimeField};
 use halo2_proofs::{
     circuit::{floor_planner, AssignedCell, Layouter, Value},
     plonk::{
@@ -345,6 +345,13 @@ pub struct Config {
     q_cond5_bits: Selector,
     /// Selector for condition 6 last bit row: run_sel = 1 and run_selected = 1.
     q_cond5_selected_one: Selector,
+    /// Witness column for proposal_id⁻¹ on the cond6 lookup row.
+    ///
+    /// Used in the `proposal_id != 0` gate:
+    /// `q_cond5 * (1 - proposal_id * proposal_id_inv) = 0`.
+    /// Placed in advices[2] on row 0 of the cond6 region, which is otherwise
+    /// unused on that row (sel_i occupies advices[2] only on rows 1–16).
+    proposal_id_inv: Column<Advice>,
 }
 
 impl Config {
@@ -701,6 +708,23 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             ]
         });
 
+        // Condition 6 (defense-in-depth): proposal_id must be non-zero.
+        //
+        // Zero is the dummy/sentinel value for an unset proposal_id; the range
+        // check alone does not exclude it. This gate closes that gap by requiring
+        // a valid field inverse, which exists if and only if proposal_id ≠ 0.
+        //
+        // Gate: q_cond5 * (1 - proposal_id * proposal_id_inv) = 0
+        // advices[2] on row 0 of the cond6 region is otherwise unused (sel_i
+        // occupies advices[2] only on rows 1–16 where q_cond5 = 0).
+        meta.create_gate("proposal_id != 0", |meta| {
+            let q = meta.query_selector(q_cond5);
+            let proposal_id = meta.query_advice(advices[0], Rotation::cur());
+            let proposal_id_inv = meta.query_advice(advices[2], Rotation::cur());
+            let one = Expression::Constant(pallas::Base::one());
+            vec![("proposal_id * inv = 1", q * (one - proposal_id * proposal_id_inv))]
+        });
+
         // Condition 6 (Proposal Authority Decrement) bit-decomposition gates.
         // Row 1: init (index=0, two_pow_i=1, running sums from first bit).
         let q_cond5_init = meta.selector();
@@ -858,6 +882,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             q_cond5_init,
             q_cond5_bits,
             q_cond5_selected_one,
+            proposal_id_inv: advices[2],
         }
     }
 
@@ -1320,6 +1345,19 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                         config.advices[1],
                         0,
                         || self.one_shifted,
+                    )?;
+                    // Witness proposal_id⁻¹ for the `proposal_id != 0` gate.
+                    // If proposal_id = 0 the inverse does not exist and the gate
+                    // will reject the proof; the fallback zero is irrelevant.
+                    region.assign_advice(
+                        || "proposal_id_inv",
+                        config.proposal_id_inv,
+                        0,
+                        || {
+                            proposal_id_cell.value().map(|pid| {
+                                Option::from(pid.invert()).unwrap_or(pallas::Base::zero())
+                            })
+                        },
                     )?;
                     region.assign_advice_from_constant(
                         || "run_sel init",
@@ -2824,8 +2862,11 @@ mod tests {
     /// Proposal authority with only bit 0 set (value 1): vote on proposal 0, new = 0.
     #[test]
     fn proposal_authority_decrement_minimum_valid() {
+        // proposal_id = 0 is now forbidden (sentinel value); use the next smallest valid id.
+        // Authority = 2 = 0b0010 has exactly bit 1 set, so proposal_id = 1 is valid.
+        // After decrement: proposal_authority_new = 0 (minimum possible outcome).
         let (circuit, instance) =
-            make_test_data_with_authority_and_proposal(pallas::Base::one(), 0);
+            make_test_data_with_authority_and_proposal(pallas::Base::from(2u64), 1);
 
         let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
@@ -2840,6 +2881,18 @@ mod tests {
         let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
 
         assert!(prover.verify().is_err());
+    }
+
+    /// proposal_id = 0 is the dummy sentinel value and must be rejected (Cond 6, gate).
+    #[test]
+    fn proposal_id_zero_fails() {
+        // Authority = 1 = 0b0001 has bit 0 set, so this is otherwise a structurally
+        // valid decrement — the only reason it must fail is the non-zero gate.
+        let (circuit, instance) =
+            make_test_data_with_authority_and_proposal(pallas::Base::one(), 0);
+
+        let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
+        assert!(prover.verify().is_err(), "proposal_id = 0 must be rejected");
     }
 
     /// Full authority (65535), proposal_id 1 → new = 65533 (e2e scenario).
@@ -2951,7 +3004,8 @@ mod tests {
         let total_note_value = pallas::Base::from(10_000u64);
         let voting_round_id = pallas::Base::random(&mut rng);
         let proposal_authority_old = pallas::Base::from(5u64); // bits 0 and 2 set
-        let proposal_id = 0u64;
+        // proposal_id = 0 is now forbidden (sentinel); use proposal_id = 2 (bit 2 is set in 5).
+        let proposal_id = 2u64;
         let van_comm_rand = pallas::Base::random(&mut rng);
 
         let vote_authority_note_old = van_integrity_hash(
@@ -3091,7 +3145,8 @@ mod tests {
 
         let voting_round_id = pallas::Base::random(&mut rng);
         let proposal_authority_old = pallas::Base::from(5u64); // bits 0 and 2 set
-        let proposal_id = 0u64;
+        // proposal_id = 0 is now forbidden (sentinel); use proposal_id = 2 (bit 2 is set in 5).
+        let proposal_id = 2u64;
         let van_comm_rand = pallas::Base::random(&mut rng);
 
         let vote_authority_note_old = van_integrity_hash(
