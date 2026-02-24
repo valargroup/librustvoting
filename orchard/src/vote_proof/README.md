@@ -174,18 +174,17 @@ Where:
 Purpose: derive a nullifier that prevents double-voting without revealing the VAN.
 
 ```
-step1          = Poseidon(voting_round_id, vote_authority_note_old)
-step2          = Poseidon("vote authority spend", step1)
-van_nullifier  = Poseidon(vsk_nk, step2)
+van_nullifier = Poseidon(vsk_nk, domain_van_nullifier, voting_round_id, vote_authority_note_old)
 ```
 
-Three-layer `ConstantLength<2>` chain matching ZKP 1 condition 14's governance nullifier pattern:
+Single `ConstantLength<4>` call matching ZKP 1 condition 14's governance nullifier pattern (`gov_null = Poseidon(nk, domain_tag, vote_round_id, real_nf)`):
 
-- **Step 1** `Poseidon(voting_round_id, vote_authority_note_old)` — scope to this round and VAN. Both cells are reused from condition 2 via cell equality (not re-witnessed), binding conditions 2 and 5 together.
-- **Step 2** `Poseidon("vote authority spend", step1)` — domain separation. The tag is encoded as a Pallas field element from its UTF-8 bytes (see `domain_van_nullifier()`), assigned via `assign_advice_from_constant` so the value is baked into the verification key.
-- **Step 3** `Poseidon(vsk_nk, step2)` — key with the nullifier deriving key. `vsk_nk` is a private witness derived from `vsk` out-of-circuit. Different from `vsk` itself: `vsk` is a scalar used for ECC in condition 3, while `vsk_nk` is a base field element.
+- **`vsk_nk`**: nullifier deriving key (private witness, base field element). The same cell is shared with condition 3 (CommitIvk), binding the nullifier to the authenticated key hierarchy.
+- **`domain_van_nullifier`**: `"vote authority spend"` (20 bytes) zero-padded to 32 and interpreted as a little-endian Pallas field element. Assigned via `assign_advice_from_constant` so the value is baked into the verification key, providing domain separation from other Poseidon uses in the protocol.
+- **`voting_round_id`**: cell-equality-linked to condition 2's instance copy, scoping the nullifier to this round.
+- **`vote_authority_note_old`**: cell-equality-linked to condition 2's derived VAN hash, binding conditions 2 and 5 together.
 
-**Structure:** Three chained `ConstantLength<2>` Poseidon hashes (3 permutations, 192 rows). Each step has a clear semantic role: scoping, domain separation, keying. This uniform structure matches ZKP 1 condition 14.
+**Structure:** Single `ConstantLength<4>` Poseidon hash (2 permutations at rate 2, ~130 rows). This is the same flat 4-input structure used by ZKP 1 condition 14 (`gov_null_hash` in `delegation/imt.rs`).
 
 **Constraint:** The circuit computes the nested hash and enforces `constrain_instance(result, VAN_NULLIFIER)` — binding the derived value to the public input at offset 0. This is the first `constrain_instance` call in the circuit.
 

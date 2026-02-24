@@ -126,6 +126,25 @@ When reporting a finding, use:
 
 Severities: CRITICAL (soundness break), HIGH (privacy leak or exploitable weakness), MEDIUM (defense-in-depth gap), LOW (code quality / spec divergence), INFO (observation).
 
+## Known Architecture: Ante Handler Is the ZKP Enforcement Point
+
+**Do NOT flag the absence of inline ZKP calls in `msg_server.go` as a vulnerability.** This is the intended design.
+
+All vote transactions (`MsgDelegateVote`, `MsgCastVote`, `MsgRevealShare`) are delivered exclusively via `VoteTxWrapper`. The ante handler in `sdk/app/ante.go` routes every `VoteTxWrapper` through `voteante.ValidateVoteTx` (`sdk/x/vote/ante/validate.go`), which performs:
+
+- RedPallas signature verification
+- Full ZKP verification (`ZKPVerifier.VerifyDelegation`, `VerifyVoteCommitment`, `VerifyVoteShare`)
+- Nullifier uniqueness checks
+
+This runs on **both CheckTx and FinalizeBlock** before the msg_server handlers are ever called. The msg_server handlers (`DelegateVote`, `CastVote`, `RevealShare`) only perform stateful mutations (nullifier recording, tree appends) and rely on ante having already rejected invalid proofs.
+
+There is no bypass path:
+- Vote messages are not routable via the Cosmos governance module
+- The keeper mutation methods are internal and not callable from governance proposals
+- `FinalizeBlock` also runs the ante handler before dispatching to msg_server
+
+**Any audit finding of the form "msg_server.go executes state mutations without inline ZKP verification" is a FALSE POSITIVE for this codebase.** The correct finding to look for instead is whether the ZKP verifier itself is correctly instantiated (i.e., not using `MockVerifier` in production) and whether the ante handler is correctly wired in `app.go`.
+
 ## Workflow
 
 1. Read the spec (`README.md` in the circuit directory) to understand intent
