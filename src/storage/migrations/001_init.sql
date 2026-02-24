@@ -28,6 +28,8 @@ CREATE TABLE bundles (
     van_leaf_position   INTEGER,
     rk                  BLOB,
     gov_nullifiers_blob BLOB,
+    padded_note_secrets BLOB,
+    pczt_sighash        BLOB,
     PRIMARY KEY (round_id, bundle_index)
 );
 
