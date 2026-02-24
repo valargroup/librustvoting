@@ -5,9 +5,9 @@
 //! election authority public key: C1_i = [r_i]*G, C2_i = [v_i]*G + [r_i]*ea_pk.
 //!
 //! Used by the vote proof circuit (Condition 11: Encryption Integrity). The
-//! caller assigns SpendAuthG constants, ea_pk instance cells, share and
-//! randomness cells, and the witnessed enc_share x-coordinates; this gadget
-//! constrains the ECC computation to match those cells.
+//! caller assigns ea_pk instance cells, share and randomness cells, and the
+//! witnessed enc_share x-coordinates; this gadget constrains the ECC
+//! computation to match those cells. G = SpendAuthG is fixed-base (no witness).
 //!
 //! Also provides out-of-circuit helpers: `spend_auth_g_affine`, `base_to_scalar`,
 //! and `elgamal_encrypt` for the builder and tests.
@@ -19,10 +19,10 @@ use halo2_proofs::{
 use pasta_curves::arithmetic::CurveAffine;
 use pasta_curves::pallas;
 
-use crate::constants::OrchardFixedBases;
+use crate::constants::{OrchardBaseFieldBases, OrchardFixedBases};
 use halo2_gadgets::ecc::{
     chip::EccChip,
-    NonIdentityPoint, ScalarVar,
+    FixedPointBaseField, NonIdentityPoint, ScalarVar,
 };
 
 // ================================================================
@@ -85,8 +85,12 @@ pub fn elgamal_encrypt(
 /// El Gamal encryption of share_cells[i] under randomness r_cells[i] and
 /// public key ea_pk: C1_i = [r_i]*G, C2_i = [v_i]*G + [r_i]*ea_pk.
 ///
+/// G = SpendAuthG is handled via `FixedPointBaseField` (fixed-base scalar
+/// multiplication using the precomputed lookup tables already loaded by the
+/// circuit). This eliminates the per-iteration `NonIdentityPoint::new` witness
+/// and `constrain_equal` dance that the variable-base path required.
+///
 /// Caller must assign:
-/// - `g_x_const`, `g_y_const`: SpendAuthG coordinates (advice-from-constant).
 /// - `ea_pk_x_cell`, `ea_pk_y_cell`: ea_pk coordinates (advice-from-instance).
 /// - `r_cells`: five advice cells holding the El Gamal randomness values.
 /// - `share_cells`, `enc_c1_cells`, `enc_c2_cells`: share values and
@@ -97,9 +101,6 @@ pub(in crate::circuit) fn prove_elgamal_encryptions(
     ecc_chip: EccChip<OrchardFixedBases>,
     mut layouter: impl Layouter<pallas::Base>,
     namespace: &str,
-    g_affine: pallas::Affine,
-    g_x_const: AssignedCell<pallas::Base, pallas::Base>,
-    g_y_const: AssignedCell<pallas::Base, pallas::Base>,
     ea_pk: halo2_proofs::circuit::Value<pallas::Affine>,
     ea_pk_x_cell: AssignedCell<pallas::Base, pallas::Base>,
     ea_pk_y_cell: AssignedCell<pallas::Base, pallas::Base>,
@@ -110,34 +111,16 @@ pub(in crate::circuit) fn prove_elgamal_encryptions(
 ) -> Result<(), Error> {
     for i in 0..5 {
         // --- C1_i = [r_i] * G ---
-
-        let g_c1 = NonIdentityPoint::new(
+        //
+        // SpendAuthG is a FixedPointBaseField base: no NonIdentityPoint witness
+        // needed, the generator is baked into the lookup table.
+        let c1_point = FixedPointBaseField::from_inner(
             ecc_chip.clone(),
-            layouter.namespace(|| alloc::format!("{namespace} G for C1[{i}]")),
-            halo2_proofs::circuit::Value::known(g_affine),
-        )?;
-        layouter.assign_region(
-            || alloc::format!("{namespace} constrain G_c1[{i}] x"),
-            |mut region| {
-                region.constrain_equal(g_c1.inner().x().cell(), g_x_const.cell())
-            },
-        )?;
-        layouter.assign_region(
-            || alloc::format!("{namespace} constrain G_c1[{i}] y"),
-            |mut region| {
-                region.constrain_equal(g_c1.inner().y().cell(), g_y_const.cell())
-            },
-        )?;
-
-        let r_i_scalar_c1 = ScalarVar::from_base(
-            ecc_chip.clone(),
-            layouter.namespace(|| alloc::format!("{namespace} r[{i}] to ScalarVar (C1)")),
-            &r_cells[i],
-        )?;
-
-        let (c1_point, _) = g_c1.mul(
+            OrchardBaseFieldBases::SpendAuthGBase,
+        )
+        .mul(
             layouter.namespace(|| alloc::format!("{namespace} [r_{i}] * G")),
-            r_i_scalar_c1,
+            r_cells[i].clone(),
         )?;
 
         let c1_x = c1_point.extract_p().inner().clone();
@@ -148,32 +131,13 @@ pub(in crate::circuit) fn prove_elgamal_encryptions(
 
         // --- C2_i = [v_i] * G + [r_i] * ea_pk ---
 
-        let g_v = NonIdentityPoint::new(
+        let v_g_point = FixedPointBaseField::from_inner(
             ecc_chip.clone(),
-            layouter.namespace(|| alloc::format!("{namespace} G for vG[{i}]")),
-            halo2_proofs::circuit::Value::known(g_affine),
-        )?;
-        layouter.assign_region(
-            || alloc::format!("{namespace} constrain G_v[{i}] x"),
-            |mut region| {
-                region.constrain_equal(g_v.inner().x().cell(), g_x_const.cell())
-            },
-        )?;
-        layouter.assign_region(
-            || alloc::format!("{namespace} constrain G_v[{i}] y"),
-            |mut region| {
-                region.constrain_equal(g_v.inner().y().cell(), g_y_const.cell())
-            },
-        )?;
-
-        let v_i_scalar = ScalarVar::from_base(
-            ecc_chip.clone(),
-            layouter.namespace(|| alloc::format!("{namespace} share[{i}] to ScalarVar")),
-            &share_cells[i],
-        )?;
-        let (v_g_point, _) = g_v.mul(
+            OrchardBaseFieldBases::SpendAuthGBase,
+        )
+        .mul(
             layouter.namespace(|| alloc::format!("{namespace} [v_{i}] * G")),
-            v_i_scalar,
+            share_cells[i].clone(),
         )?;
 
         let ea_pk_point = NonIdentityPoint::new(
@@ -200,14 +164,14 @@ pub(in crate::circuit) fn prove_elgamal_encryptions(
             },
         )?;
 
-        let r_i_scalar_c2 = ScalarVar::from_base(
+        let r_i_scalar = ScalarVar::from_base(
             ecc_chip.clone(),
-            layouter.namespace(|| alloc::format!("{namespace} r[{i}] to ScalarVar (C2)")),
+            layouter.namespace(|| alloc::format!("{namespace} r[{i}] to ScalarVar")),
             &r_cells[i],
         )?;
         let (r_ea_pk_point, _) = ea_pk_point.mul(
             layouter.namespace(|| alloc::format!("{namespace} [r_{i}] * ea_pk")),
-            r_i_scalar_c2,
+            r_i_scalar,
         )?;
 
         let c2_point = v_g_point.add(

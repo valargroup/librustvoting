@@ -74,7 +74,7 @@ use halo2_gadgets::{
     utilities::{bool_check, lookup_range_check::LookupRangeCheckConfig},
 };
 use crate::circuit::address_ownership::{prove_address_ownership, spend_auth_g_mul};
-use crate::circuit::elgamal::{prove_elgamal_encryptions, spend_auth_g_affine};
+use crate::circuit::elgamal::prove_elgamal_encryptions;
 use crate::circuit::commit_ivk::{CommitIvkChip, CommitIvkConfig};
 use crate::circuit::gadget::{add_chip::{AddChip, AddConfig}, AddInstruction};
 use crate::constants::{
@@ -1408,27 +1408,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // circuit::elgamal::prove_elgamal_encryptions gadget.
         // ---------------------------------------------------------------
         {
-            let g_affine = spend_auth_g_affine();
-            let g_x_val = *g_affine.coordinates().unwrap().x();
-            let g_y_val = *g_affine.coordinates().unwrap().y();
-
-            let g_x_const = layouter.assign_region(
-                || "SpendAuthG x constant",
-                |mut region| {
-                    region.assign_advice_from_constant(
-                        || "g_x", config.advices[0], 0, g_x_val,
-                    )
-                },
-            )?;
-            let g_y_const = layouter.assign_region(
-                || "SpendAuthG y constant",
-                |mut region| {
-                    region.assign_advice_from_constant(
-                        || "g_y", config.advices[0], 0, g_y_val,
-                    )
-                },
-            )?;
-
             let ea_pk_x_cell = layouter.assign_region(
                 || "copy ea_pk_x from instance",
                 |mut region| {
@@ -1501,9 +1480,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 ecc_chip.clone(),
                 layouter.namespace(|| "cond11 El Gamal"),
                 "cond11",
-                g_affine,
-                g_x_const,
-                g_y_const,
                 self.ea_pk,
                 ea_pk_x_cell,
                 ea_pk_y_cell,

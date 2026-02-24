@@ -5,8 +5,8 @@ use pasta_curves::pallas;
 
 use super::{commit_ivk::CommitIvkChip, note_commit::NoteCommitChip};
 use crate::constants::{
-    NullifierK, OrchardCommitDomains, OrchardFixedBases, OrchardFixedBasesFull, OrchardHashDomains,
-    ValueCommitV,
+    OrchardBaseFieldBases, OrchardCommitDomains, OrchardFixedBases, OrchardFixedBasesFull,
+    OrchardHashDomains, ValueCommitV,
 };
 use halo2_gadgets::{
     ecc::{
@@ -211,7 +211,7 @@ pub(in crate::circuit) fn derive_nullifier<
     // `product` = [poseidon_hash(nk, rho) + psi] NullifierK.
     //
     let product = {
-        let nullifier_k = FixedPointBaseField::from_inner(ecc_chip, NullifierK);
+        let nullifier_k = FixedPointBaseField::from_inner(ecc_chip, OrchardBaseFieldBases::NullifierK);
         nullifier_k.mul(
             layouter.namespace(|| "[poseidon_output + psi] NullifierK"),
             scalar,

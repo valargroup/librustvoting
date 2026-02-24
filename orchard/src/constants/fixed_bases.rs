@@ -54,12 +54,26 @@ pub const NUM_WINDOWS: usize =
 pub const NUM_WINDOWS_SHORT: usize =
     (L_VALUE + FIXED_BASE_WINDOW_SIZE - 1) / FIXED_BASE_WINDOW_SIZE;
 
+/// Fixed bases used in scalar mul where the scalar is a base field element.
+///
+/// The ECC chip's `FixedPoints::Base` associated type must be a single type,
+/// so both `NullifierK` and `SpendAuthGBase` are wrapped in this enum.
+/// `SpendAuthGBase` reuses the same generator and U/Z tables as
+/// `OrchardFixedBasesFull::SpendAuthG` (same 85-window structure over the
+/// 255-bit pallas base field), allowing `FixedPointBaseField::mul` to accept
+/// an `AssignedCell` directly — no variable-base NonIdentityPoint witness needed.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OrchardBaseFieldBases {
+    NullifierK,
+    SpendAuthGBase,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 // A sum type for both full-width and short bases. This enables us to use the
 // shared functionality of full-width and short fixed-base scalar multiplication.
 pub enum OrchardFixedBases {
     Full(OrchardFixedBasesFull),
-    NullifierK,
+    Base(OrchardBaseFieldBases),
     ValueCommitV,
 }
 
@@ -77,7 +91,13 @@ impl From<ValueCommitV> for OrchardFixedBases {
 
 impl From<NullifierK> for OrchardFixedBases {
     fn from(_nullifier_k: NullifierK) -> Self {
-        Self::NullifierK
+        Self::Base(OrchardBaseFieldBases::NullifierK)
+    }
+}
+
+impl From<OrchardBaseFieldBases> for OrchardFixedBases {
+    fn from(b: OrchardBaseFieldBases) -> Self {
+        Self::Base(b)
     }
 }
 
@@ -101,7 +121,7 @@ pub struct ValueCommitV;
 #[cfg(feature = "circuit")]
 impl FixedPoints<pallas::Affine> for OrchardFixedBases {
     type FullScalar = OrchardFixedBasesFull;
-    type Base = NullifierK;
+    type Base = OrchardBaseFieldBases;
     type ShortScalar = ValueCommitV;
 }
 
@@ -151,6 +171,36 @@ impl FixedPoint<pallas::Affine> for NullifierK {
 
     fn z(&self) -> Vec<u64> {
         nullifier_k::Z.to_vec()
+    }
+}
+
+#[cfg(feature = "circuit")]
+impl FixedPoint<pallas::Affine> for OrchardBaseFieldBases {
+    type FixedScalarKind = BaseFieldElem;
+
+    fn generator(&self) -> pallas::Affine {
+        match self {
+            Self::NullifierK => nullifier_k::generator(),
+            Self::SpendAuthGBase => spend_auth_g::generator(),
+        }
+    }
+
+    fn u(&self) -> Vec<[[u8; 32]; H]> {
+        match self {
+            Self::NullifierK => nullifier_k::U.to_vec(),
+            // SpendAuthG's full-scalar U/Z tables have the same 85-window
+            // structure as the base-field-element variant (pallas::Base and
+            // pallas::Scalar are both 255-bit); the precomputed values depend
+            // only on the generator and window layout, not the scalar kind.
+            Self::SpendAuthGBase => spend_auth_g::U.to_vec(),
+        }
+    }
+
+    fn z(&self) -> Vec<u64> {
+        match self {
+            Self::NullifierK => nullifier_k::Z.to_vec(),
+            Self::SpendAuthGBase => spend_auth_g::Z.to_vec(),
+        }
     }
 }
 
