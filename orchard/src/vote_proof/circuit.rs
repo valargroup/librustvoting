@@ -675,7 +675,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             )
         });
 
-        // Condition 6: (proposal_id, one_shifted) lookup table for
+        // Condition 6:
+        // "Prove you had permission to vote on this proposal and prove you have relaxed
+        // exactly that permission"
+        // (proposal_id, one_shifted) lookup table for
         // one_shifted = 2^proposal_id. When q_cond5 = 0 the lookup input
         // is (0, 1) so it passes. It passes because 2^0 = 1.
         // When q_cond5 = 1, we enforce (proposal_id,
@@ -710,16 +713,47 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
         meta.create_gate("cond6 init: index=0, two_pow_i=1, running sums", |meta| {
             let q = meta.query_selector(q_cond5_init);
+            // The public proposal index being voted on
+            // Copied to every row so the selector constraint (proposal_id - index) * sel_i = 0 can be checked locally
             let proposal_id = meta.query_advice(advices[0], Rotation::cur());
+            // The i-th bit of proposal_authority_old
+            // The actual bit-decomposition — must be boolean
             let b_i = meta.query_advice(advices[1], Rotation::cur());
+            // 1 if i == proposal_id, else 0
+            // The one-hot "which bit are we clearing?" marker
             let sel_i = meta.query_advice(advices[2], Rotation::cur());
+            // b_i * (1 - sel_i) — the bit after clearing
+            // The cleared version; must equal b_i everywhere except the selected position
             let b_new_i = meta.query_advice(advices[3], Rotation::cur());
+            // ∑ sel_i
+            // At the end, must equal exactly 1 — proves exactly one bit position was selected
             let run_sel = meta.query_advice(advices[4], Rotation::cur());
+            // ∑ sel_i * b_i
+            // At the end, must equal 1 — proves the selected bit was actually set (voter had authority)
             let run_selected = meta.query_advice(advices[5], Rotation::cur());
+            // ∑ b_i * 2^i
+            // At the end, must equal proposal_authority_old — proves the decomposition was honest
             let run_old = meta.query_advice(advices[6], Rotation::cur());
+            // ∑ b_new_i * 2^i
+            // At the end, must equal proposal_authority_new — proves only one bit was cleared
             let run_new = meta.query_advice(advices[7], Rotation::cur());
+            
+            // advices[8] = two_pow_i
+            // 	2^i for this row
+            // The positional weight; used to recompose both old and new values from bits
             let two_pow_i = meta.query_advice(advices[8], Rotation::cur());
+            // advices[9] = index
+            // The row counter i
+            // Needed to prove sel_i is only set at the right position, and that two_pow_i doubles correctly each row
             let index = meta.query_advice(advices[9], Rotation::cur());
+            
+            // Previous running sums.
+            // Since this is row 0 of the condition, the prover sets the previous
+            // values to 0 (i.e. zero padding row)
+            // This achieves initialization without needing a special-cased constraint
+            // like run_sel = sel_i - it reuses the same recurrence formula as other
+            // q_cond5_bits rows. The init and recurrence gates are structurally identical
+            // except the init gate also enforces index = 0 and two_pow_i = 1.
             let run_sel_prev = meta.query_advice(advices[4], Rotation::prev());
             let run_selected_prev = meta.query_advice(advices[5], Rotation::prev());
             let run_old_prev = meta.query_advice(advices[6], Rotation::prev());
@@ -728,15 +762,30 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             Constraints::with_selector(
                 q,
                 [
+                    // The value 2^i = 1
                     ("two_pow_i = 1", two_pow_i.clone() - one_expr.clone()),
+                    // Current row = 0
                     ("index = 0", index.clone() - zero.clone()),
+                    // Running sum increments by sel_i
                     ("run_sel", run_sel - run_sel_prev - sel_i.clone()),
+                    // run_selected increments by sel_i
                     ("run_selected", run_selected - run_selected_prev - sel_i.clone() * b_i.clone()),
+                    // run_old - run_old_prev - b_i * 2^i = 0
+                    // accumulates the old value bit by bit
                     ("run_old", run_old - run_old_prev - b_i.clone() * two_pow_i.clone()),
+                    // run_new - run_new_prev - b_new_i * 2^i = 0
+                    // same for new value
                     ("run_new", run_new - run_new_prev - b_new_i.clone() * two_pow_i),
+                    // (proposal_id - index) * sel_i = 0
+                    // can only be 1 when index == proposal_id (gate-enforced locality)
                     ("(proposal_id - index)*sel_i", (proposal_id - index) * sel_i.clone()),
+                    // b_new_i - b_i + b_i * sel_i = 0
+                    // rearranges to b_new_i = b_i * (1 - sel_i)
+                    // new bit equals old bit, except zero it out when selected
                     ("b_new_i = b_i*(1-sel_i)", b_new_i - b_i.clone() + b_i.clone() * sel_i.clone()),
+                    // enforce b_i in {0, 1}
                     ("bool b_i", bool_check(b_i)),
+                    // enforce sel_i in {0, 1}
                     ("bool sel_i", bool_check(sel_i)),
                 ],
             )
