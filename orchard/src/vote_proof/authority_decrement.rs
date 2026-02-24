@@ -3,16 +3,117 @@
 //! Proves that a voter held a permission bit for a specific proposal and
 //! produces the decremented authority value with that bit cleared.
 //!
-//! ## Layout (18 rows)
+//! ## Cell Layout (18 rows x 10 advice columns)
 //!
 //! ```text
-//! Row 0 : q_cond_6 = 1 — lookup row: (proposal_id, one_shifted) in table;
-//!                         proposal_id_inv witness for non-zero gate;
-//!                         running sums seeded to zero.
-//! Row 1 : q_cond_6_init = 1 — first bit (i=0): enforces index=0, two_pow_i=1.
-//! Rows 2–16: q_cond_6_bits = 1 — bits i=1..15: recurrence (index++, two_pow_i*=2).
-//! Row 16 : q_cond_6_selected_one = 1 (also has q_cond_6_bits) — final check: run_sel=1, run_selected=1.
-//! Row 17 : proposal_authority_new, run_old_final, run_new_final are placed here for equality.
+//!                        | a[0]          | a[1]         | a[2]       | a[3]      | a[4]         | a[5]         | a[6]        | a[7]        | a[8]   | a[9] |
+//! -----------------------+---------------+--------------+------------+-----------+--------------+--------------+-------------+-------------+--------+------+
+//! Row  0  q_cond_6=1     | proposal_id   | one_shifted  | pid_inv    |     -     | 0 (seed)     | 0 (seed)     | 0 (seed)    | 0 (seed)    |   -    |  -   |
+//! -----------------------+---------------+--------------+------------+-----------+--------------+--------------+-------------+-------------+--------+------+
+//! Row  1  init=1         | proposal_id   | b_0          | sel_0      | b_new_0   | rsel[0]      | rseld[0]     | rold[0]     | rnew[0]     |   1    |  0   |
+//! Row  2  bits=1         | proposal_id   | b_1          | sel_1      | b_new_1   | rsel[1]      | rseld[1]     | rold[1]     | rnew[1]     |   2    |  1   |
+//!   ...     ...          |   ...         |  ...         |  ...       |  ...      |   ...        |   ...        |   ...       |   ...       |  ...   | ...  |
+//! Row 16  bits=1         | proposal_id   | b_15         | sel_15     | b_new_15  | rsel=1       | rseld=1      | rold[15]    | rnew[15]    | 32768  |  15  |
+//!         sel_one=1      |               |              |            |           |              |              |             |             |        |      |
+//! -----------------------+---------------+--------------+------------+-----------+--------------+--------------+-------------+-------------+--------+------+
+//! Row 17                 | auth_new      |      -       |     -      |     -     |      -       |      -       | rold_fin    | rnew_fin    |   -    |  -   |
+//! -----------------------+---------------+--------------+------------+-----------+--------------+--------------+-------------+-------------+--------+------+
+//!
+//! Abbreviations:
+//!   b_i       = i-th bit of the old authority value (authority old). b_i ∈ {0, 1}
+//!   sel_i     = one-hot selector bit that marks which bit position corresponds to proposal_id.
+//!   b_new_i   = i-th bit of the new (decremented) authority value — it's b_i with the selected permission bit cleared.
+//!   pid_inv   = proposal_id^-1              advices[2] repurposed on row 0 only
+//!   rsel[i]   = Sum sel_j        (j=0..i)   running sum of one-hot selector
+//!   rseld[i]  = Sum sel_j*b_j   (j=0..i)   running sum of selected bit
+//!   rold[i]   = Sum b_j*2^j     (j=0..i)   running recomposition of authority_old
+//!   rnew[i]   = Sum b_new_j*2^j (j=0..i)   running recomposition of authority_new
+//!   auth_new  = proposal_authority_new
+//! 
+//!
+//! ## Constraints and Invariants
+//!
+//! Row 0 — lookup + non-zero gate (q_cond_6 = 1):
+//!   (1)  (proposal_id, one_shifted) in table {(0,1),(1,2),...,(15,32768)}
+//!          => proposal_id in [0,15] and one_shifted = 2^proposal_id
+//!   (2)  proposal_id * pid_inv = 1
+//!          => proposal_id != 0  (sentinel guard; lookup alone allows zero)
+//!   (3)  rsel = rseld = rold = rnew = 0  (seeded as constants)
+//!
+//! Row 1 — init gate (q_cond_6_init = 1):
+//!   (4)  index    = 0
+//!   (5)  two_pow_i = 1     (= 2^0)
+//!   + shared constraints below
+//!
+//! Rows 2-16 — recurrence gate (q_cond_6_bits = 1):
+//!   (6)  index    = index_prev + 1
+//!   (7)  two_pow_i = 2 * two_pow_i_prev
+//!   + shared constraints below
+//!
+//! Shared constraints (rows 1-16, enforced on every bit row):
+//!   (8)  b_i in {0, 1}
+//!   (9)  sel_i in {0, 1}
+//!   (10) (proposal_id - index) * sel_i = 0
+//!          => sel_i may only be 1 when index == proposal_id (one-hot)
+//!   (11) b_new_i = b_i * (1 - sel_i)
+//!          => b_new_i equals b_i everywhere except it is forced to 0 at the
+//!             selected index, clearing that permission bit
+//!   (12) rsel[i]  = rsel[i-1]  + sel_i
+//!   (13) rseld[i] = rseld[i-1] + sel_i * b_i
+//!   (14) rold[i]  = rold[i-1]  + b_i * two_pow_i
+//!   (15) rnew[i]  = rnew[i-1]  + b_new_i * two_pow_i
+//!
+//! Row 16 — terminal gate (q_cond_6_selected_one = 1):
+//!   (16) rsel = 1   => exactly one sel_i was set across all 16 rows
+//!   (17) rseld = 1  => the bit at the selected position was 1
+//!                      (voter actually held the permission)
+//!
+//! Post-region equality constraints:
+//!   (18) rold_fin = proposal_authority_old
+//!          => the bit decomposition is consistent with the claimed old value
+//!   (19) rnew_fin = proposal_authority_new
+//!          => the recomposed new value is exported and bound to the circuit output
+//!
+//! Together (1)+(16) prove proposal_id is a valid index in [1,15].
+//! Together (10)+(16) prove sel_i is a one-hot vector with the single 1 at position proposal_id.
+//! Together (11)+(17) prove the old authority had that bit set.
+//! Together (14)+(15)+(18)+(19) prove auth_new = auth_old - 2^proposal_id.
+//!
+//! ## Worked Example
+//!
+//! Inputs:  authority_old = 13 = 0b0000_0000_0000_1101  (permission bits 0, 2, 3 are set)
+//!          proposal_id   = 2   →  one_shifted = 4 = 2^2
+//! Output:  authority_new = 9  = 0b0000_0000_0000_1001  (bit 2 cleared)
+//!
+//! Column headers match the cell layout above.
+//! Note: on row 0 the a[1] and a[2] slots are repurposed for one_shifted and pid_inv respectively;
+//! they revert to b_i / sel_i from row 1 onward.
+//!
+//!  Row | gate           | a[0]  | a[1]  | a[2]  | a[3]  | a[4]  | a[5]  | a[6]  | a[7]  | a[8]  | a[9]
+//!      |                |  pid  | b_i   | sel_i |b_new_i| rsel  | rseld | rold  | rnew  |  2^i  | idx
+//! -----+----------------+-------+-------+-------+-------+-------+-------+-------+-------+-------+-----
+//!    0 | q_cond_6       |   2   |  4†   | 2⁻¹†  |   -   |  0*   |  0*   |  0*   |  0*   |   -   |  -
+//! -----+----------------+-------+-------+-------+-------+-------+-------+-------+-------+-------+-----
+//!    1 | init           |   2   |   1   |   0   |   1   |   0   |   0   |   1   |   1   |   1   |  0
+//!    2 | bits           |   2   |   0   |   0   |   0   |   0   |   0   |   1   |   1   |   2   |  1
+//!    3 | bits  ◄ sel=1  |   2   |   1   |   1   |   0   |   1   |   1   |   5   |   1   |   4   |  2
+//!    4 | bits           |   2   |   1   |   0   |   1   |   1   |   1   |  13   |   9   |   8   |  3
+//!  5-15| bits (b_i=0)   |   2   |   0   |   0   |   0   |   1   |   1   |  13   |   9   |  ...  | ...
+//!   16 | bits + sel_one |   2   |   0   |   0   |   0   |   1   |   1   |  13   |   9   | 32768 | 15
+//! -----+----------------+-------+-------+-------+-------+-------+-------+-------+-------+-------+-----
+//!   17 |                |   9   |   -   |   -   |   -   |   -   |   -   |  13   |   9   |   -   |  -
+//!
+//! (* seeded as field-constant 0)
+//! († on row 0, a[1] = one_shifted = 4 and a[2] = pid_inv = 2⁻¹ mod p)
+//!
+//! Accumulator trace:
+//!   Row 1 (i=0): b=1, sel=0  → b_new=1·(1-0)=1,  rold=0+1·1=1,    rnew=0+1·1=1
+//!   Row 2 (i=1): b=0, sel=0  → b_new=0,           rold=1+0·2=1,    rnew=1+0·2=1
+//!   Row 3 (i=2): b=1, sel=1  → b_new=1·(1-1)=0,  rold=1+1·4=5,    rnew=1+0·4=1   ← bit 2 cleared
+//!   Row 4 (i=3): b=1, sel=0  → b_new=1,           rold=5+1·8=13,   rnew=1+1·8=9
+//!   Rows 5-16:   b=0 for all remaining bits      → rold stays 13,  rnew stays 9
+//!   Row 16:      rsel=1 ✓  (exactly one selector fired),  rseld=1 ✓  (that bit was 1 in old authority)
+//!   Row 17:      rold_fin=13 == authority_old ✓,  rnew_fin=9 == authority_new ✓
 //! ```
 
 use alloc::vec::Vec;
@@ -54,7 +155,7 @@ pub struct AuthorityDecrementConfig {
     pub(super) q_cond_6_bits: Selector,
     /// Selector for the last bit row (i=15): enforces `run_sel=1, run_selected=1`.
     pub(super) q_cond_6_selected_one: Selector,
-    /// Advice column that holds `proposal_id⁻¹` on row 0.
+    /// Advice column that holds `proposal_id^-1` on row 0.
     ///
     /// Used by the `proposal_id != 0` gate:
     /// `q_cond_6 * (1 - proposal_id * proposal_id_inv) = 0`.
@@ -70,33 +171,33 @@ pub struct AuthorityDecrementConfig {
 
 /// Queried advice cells for one row of the bit-decomposition region.
 struct Cond6Row {
-    /// `advices[0]` cur — proposal index copied to every row.
+    /// `advices[0]` cur - proposal index copied to every row.
     proposal_id: Expression<pallas::Base>,
-    /// `advices[1]` cur — i-th bit of `proposal_authority_old`. Must be boolean.
+    /// `advices[1]` cur - i-th bit of `proposal_authority_old`. Must be boolean.
     b_i: Expression<pallas::Base>,
-    /// `advices[2]` cur — one-hot selector: 1 iff `i == proposal_id`.
+    /// `advices[2]` cur - one-hot selector: 1 iff `i == proposal_id`.
     sel_i: Expression<pallas::Base>,
-    /// `advices[3]` cur — `b_i * (1 - sel_i)`: bit after clearing.
+    /// `advices[3]` cur - `b_i * (1 - sel_i)`: bit after clearing.
     b_new_i: Expression<pallas::Base>,
-    /// `advices[4]` cur — running `∑ sel_i`, must equal 1 at last row.
+    /// `advices[4]` cur - running `∑ sel_i`, must equal 1 at last row.
     run_sel: Expression<pallas::Base>,
     /// `advices[4]` prev
     run_sel_prev: Expression<pallas::Base>,
-    /// `advices[5]` cur — running `∑ sel_i * b_i`, must equal 1 at last row.
+    /// `advices[5]` cur - running `∑ sel_i * b_i`, must equal 1 at last row.
     run_selected: Expression<pallas::Base>,
     /// `advices[5]` prev
     run_selected_prev: Expression<pallas::Base>,
-    /// `advices[6]` cur — running `∑ b_i * 2^i`, equals `proposal_authority_old` at last row.
+    /// `advices[6]` cur - running `∑ b_i * 2^i`, equals `proposal_authority_old` at last row.
     run_old: Expression<pallas::Base>,
     /// `advices[6]` prev
     run_old_prev: Expression<pallas::Base>,
-    /// `advices[7]` cur — running `∑ b_new_i * 2^i`, equals `proposal_authority_new` at last row.
+    /// `advices[7]` cur - running `∑ b_new_i * 2^i`, equals `proposal_authority_new` at last row.
     run_new: Expression<pallas::Base>,
     /// `advices[7]` prev
     run_new_prev: Expression<pallas::Base>,
-    /// `advices[8]` cur — positional weight `2^i`.
+    /// `advices[8]` cur - positional weight `2^i`.
     two_pow_i: Expression<pallas::Base>,
-    /// `advices[9]` cur — row counter `i`.
+    /// `advices[9]` cur - row counter `i`.
     index: Expression<pallas::Base>,
 }
 
@@ -316,10 +417,10 @@ impl AuthorityDecrementChip {
     ///
     /// # Arguments
     ///
-    /// - `proposal_id` — cell already assigned by the caller (e.g. from the
+    /// - `proposal_id` - cell already assigned by the caller (e.g. from the
     ///   instance column). The chip copies it into every bit row.
-    /// - `proposal_authority_old` — private witness cell.
-    /// - `one_shifted` — `2^proposal_id` (private witness value; the lookup
+    /// - `proposal_authority_old` - private witness cell.
+    /// - `one_shifted` - `2^proposal_id` (private witness value; the lookup
     ///   constrains it against `proposal_id`).
     ///
     /// # Returns
@@ -353,7 +454,7 @@ impl AuthorityDecrementChip {
                         0,
                         || one_shifted,
                     )?;
-                    // Witness proposal_id⁻¹ for the `proposal_id != 0` gate.
+                    // Witness proposal_id^-1 for the `proposal_id != 0` gate.
                     // If proposal_id = 0 the inverse does not exist and the gate
                     // will reject the proof; the fallback zero is irrelevant.
                     region.assign_advice(
@@ -492,11 +593,17 @@ impl AuthorityDecrementChip {
                             || Value::known(pallas::Base::from(i as u64)),
                         )?;
 
+
+                        // Choose the appropriate selector based on row.
                         if i == 0 {
                             config.q_cond_6_init.enable(&mut region, row)?;
                         } else {
                             config.q_cond_6_bits.enable(&mut region, row)?;
                         }
+
+                        // For the last row, we enforce the recurrence step from above
+                        // and also the terminal gate below, constraining that exactly one sel_i
+                        // was set and that the bit and the selected location was 1.
                         if i == MAX_PROPOSAL_ID - 1 {
                             config.q_cond_6_selected_one.enable(&mut region, row)?;
                         }
@@ -525,6 +632,15 @@ impl AuthorityDecrementChip {
                         || run_new_prev,
                     )?;
 
+                    // Note: proposal_authority_new_cell and run_new_cell
+                    // are expected to be equal in a valid proof.
+                    // proposal_authority_new_cell is compted from proposal_authority_old and one_shifted (both given by prover as private witnesses)
+                    // * This proves the prover knowns some old - shift but nothing about the bits.
+                    // run_new_cell is computed through bit_recomposition
+                    // * This proves some bit decomposition was performed
+                    // Together (constrained further below), we prove that the arithmetic result
+                    // must equal the bit-recomposition result, which in turn means the bit decomposition
+                    // is a valid decomposition of proposal_authority_old with exactly the  bit at proposal_id cleared.
                     Ok((
                         proposal_authority_new_cell,
                         run_old_cell,
@@ -552,6 +668,10 @@ impl AuthorityDecrementChip {
                 region.constrain_equal(a.cell(), b.cell())
             },
         )?;
+
+        // Constrain equality:
+        //  * proposal_authority_new (computed as old - shift)
+        // * run_new_final (computed from bit decomposition)
         layouter.assign_region(
             || "cond6 new authority equality",
             |mut region| {
