@@ -356,34 +356,35 @@ impl VotingDb {
                     message: format!("PIR server connect failed: {e}"),
                 }
             })?;
-        let mut imt_proofs = Vec::new();
-        for (i, note) in full_notes.iter().enumerate() {
-            let nf_bytes: [u8; 32] =
-                note.nullifier.as_slice().try_into().map_err(|_| {
-                    VotingError::Internal {
-                        message: format!(
-                            "note[{i}] nullifier must be 32 bytes, got {}",
-                            note.nullifier.len()
-                        ),
-                    }
-                })?;
-            let nf: pasta_curves::pallas::Base =
+        let nullifiers: Vec<pasta_curves::pallas::Base> = full_notes
+            .iter()
+            .enumerate()
+            .map(|(i, note)| {
+                let nf_bytes: [u8; 32] =
+                    note.nullifier.as_slice().try_into().map_err(|_| {
+                        VotingError::Internal {
+                            message: format!(
+                                "note[{i}] nullifier must be 32 bytes, got {}",
+                                note.nullifier.len()
+                            ),
+                        }
+                    })?;
                 Option::from(pasta_curves::pallas::Base::from_repr(nf_bytes)).ok_or_else(|| {
                     VotingError::Internal {
                         message: format!("note[{i}] nullifier is not a valid field element"),
                     }
-                })?;
-            let note_start = std::time::Instant::now();
-            let pir_proof = pir_client.fetch_proof(nf).map_err(|e| VotingError::Internal {
-                message: format!("PIR fetch failed for note[{i}]: {e}"),
-            })?;
-            eprintln!(
-                "[ZKP1] Note {}: PIR proof in {:.2}s",
-                i,
-                note_start.elapsed().as_secs_f64()
-            );
-            imt_proofs.push(crate::zkp1::convert_pir_proof(pir_proof));
-        }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let imt_proofs: Vec<_> = pir_client
+            .fetch_proofs(&nullifiers)
+            .map_err(|e| VotingError::Internal {
+                message: format!("PIR parallel fetch failed: {e}"),
+            })?
+            .into_iter()
+            .map(crate::zkp1::convert_pir_proof)
+            .collect();
         let pir_elapsed = pir_start.elapsed();
         eprintln!(
             "[ZKP1] PIR fetch total: {:.2}s for {} proofs",

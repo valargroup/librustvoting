@@ -1,33 +1,36 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
-use tokio::sync::Mutex;
 
 use pir_export::PirMetadata;
 use pir_server::{
-    HealthInfo, RootInfo, TierServer, YpirScenario, TIER1_ROW_BYTES, TIER1_ROWS, TIER2_ROW_BYTES,
-    TIER2_ROWS,
+    HealthInfo, QueryTiming, RootInfo, TierServer, YpirScenario, TIER1_ROWS, TIER1_ROW_BYTES,
+    TIER2_ROWS, TIER2_ROW_BYTES,
 };
+use tracing::{info, warn};
 
 struct AppState {
     tier0_data: Vec<u8>,
     tier1_data: &'static [u8],
     tier2_data: &'static [u8],
-    tier1: Mutex<TierServer<'static>>,
-    tier2: Mutex<TierServer<'static>>,
+    tier1: TierServer<'static>,
+    tier2: TierServer<'static>,
     tier1_scenario: YpirScenario,
     tier2_scenario: YpirScenario,
     tier1_hint: Vec<u8>,
     tier2_hint: Vec<u8>,
     metadata: PirMetadata,
+    next_req_id: AtomicU64,
+    inflight_requests: AtomicUsize,
 }
 
 #[tokio::main]
@@ -52,14 +55,30 @@ async fn main() -> Result<()> {
     eprintln!("  Tier 0: {} bytes", tier0_data.len());
 
     let tier1_data = std::fs::read(data_dir.join("tier1.bin"))?;
-    eprintln!("  Tier 1: {} bytes ({} rows)", tier1_data.len(), tier1_data.len() / TIER1_ROW_BYTES);
-    anyhow::ensure!(tier1_data.len() == TIER1_ROWS * TIER1_ROW_BYTES,
-        "tier1.bin size mismatch: got {} bytes, expected {}", tier1_data.len(), TIER1_ROWS * TIER1_ROW_BYTES);
+    eprintln!(
+        "  Tier 1: {} bytes ({} rows)",
+        tier1_data.len(),
+        tier1_data.len() / TIER1_ROW_BYTES
+    );
+    anyhow::ensure!(
+        tier1_data.len() == TIER1_ROWS * TIER1_ROW_BYTES,
+        "tier1.bin size mismatch: got {} bytes, expected {}",
+        tier1_data.len(),
+        TIER1_ROWS * TIER1_ROW_BYTES
+    );
 
     let tier2_data = std::fs::read(data_dir.join("tier2.bin"))?;
-    eprintln!("  Tier 2: {} bytes ({} rows)", tier2_data.len(), tier2_data.len() / TIER2_ROW_BYTES);
-    anyhow::ensure!(tier2_data.len() == TIER2_ROWS * TIER2_ROW_BYTES,
-        "tier2.bin size mismatch: got {} bytes, expected {}", tier2_data.len(), TIER2_ROWS * TIER2_ROW_BYTES);
+    eprintln!(
+        "  Tier 2: {} bytes ({} rows)",
+        tier2_data.len(),
+        tier2_data.len() / TIER2_ROW_BYTES
+    );
+    anyhow::ensure!(
+        tier2_data.len() == TIER2_ROWS * TIER2_ROW_BYTES,
+        "tier2.bin size mismatch: got {} bytes, expected {}",
+        tier2_data.len(),
+        TIER2_ROWS * TIER2_ROW_BYTES
+    );
 
     let metadata: PirMetadata =
         serde_json::from_str(&std::fs::read_to_string(data_dir.join("pir_root.json"))?)?;
@@ -86,22 +105,21 @@ async fn main() -> Result<()> {
     let tier2_hint = tier2_server.hint_bytes();
     eprintln!("  Tier 2 YPIR ready (hint: {} bytes)", tier2_hint.len());
 
-    eprintln!(
-        "Server ready in {:.1}s",
-        t_total.elapsed().as_secs_f64()
-    );
+    eprintln!("Server ready in {:.1}s", t_total.elapsed().as_secs_f64());
 
     let state = Arc::new(AppState {
         tier0_data,
         tier1_data: tier1_data_static,
         tier2_data: tier2_data_static,
-        tier1: Mutex::new(tier1_server),
-        tier2: Mutex::new(tier2_server),
+        tier1: tier1_server,
+        tier2: tier2_server,
         tier1_scenario,
         tier2_scenario,
         tier1_hint,
         tier2_hint,
         metadata,
+        next_req_id: AtomicU64::new(0),
+        inflight_requests: AtomicUsize::new(0),
     });
 
     let app = Router::new()
@@ -158,52 +176,153 @@ async fn get_hint_tier2(State(state): State<Arc<AppState>>) -> impl IntoResponse
     )
 }
 
-async fn post_tier1_query(
-    State(state): State<Arc<AppState>>,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn post_tier1_query(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let inflight = state.inflight_requests.fetch_add(1, Ordering::Relaxed) + 1;
+    let _inflight_guard = InflightGuard::new(&state.inflight_requests);
     let t0 = Instant::now();
-    eprintln!("Tier 1 query: received {} bytes", body.len());
-    let mut server = state.tier1.lock().await;
-    match server.answer_query(&body) {
-        Ok(response) => {
-            eprintln!("Tier 1 query: answered in {:.1}ms, response {} bytes",
-                t0.elapsed().as_secs_f64() * 1000.0, response.len());
-            (
+    info!(
+        req_id,
+        tier = "tier1",
+        body_bytes = body.len(),
+        inflight_requests = inflight,
+        "pir_request_started"
+    );
+    match state.tier1.answer_query(&body) {
+        Ok(answer) => {
+            let handler_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let mut response = (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                response,
-            ).into_response()
+                answer.response,
+            )
+                .into_response();
+            write_timing_headers(response.headers_mut(), req_id, answer.timing);
+            info!(
+                req_id,
+                tier = "tier1",
+                status = 200,
+                handler_ms = format!("{handler_ms:.3}"),
+                validate_ms = format!("{:.3}", answer.timing.validate_ms),
+                decode_copy_ms = format!("{:.3}", answer.timing.decode_copy_ms),
+                compute_ms = format!("{:.3}", answer.timing.online_compute_ms),
+                server_total_ms = format!("{:.3}", answer.timing.total_ms),
+                response_bytes = answer.timing.response_bytes,
+                "pir_request_finished"
+            );
+            response
         }
         Err(e) => {
-            eprintln!("Tier 1 query: malformed request: {e}");
+            warn!(
+                req_id,
+                tier = "tier1",
+                status = 400,
+                handler_ms = format!("{:.3}", t0.elapsed().as_secs_f64() * 1000.0),
+                error = %e,
+                "pir_request_failed"
+            );
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
     }
 }
 
-async fn post_tier2_query(
-    State(state): State<Arc<AppState>>,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn post_tier2_query(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let inflight = state.inflight_requests.fetch_add(1, Ordering::Relaxed) + 1;
+    let _inflight_guard = InflightGuard::new(&state.inflight_requests);
     let t0 = Instant::now();
-    eprintln!("Tier 2 query: received {} bytes", body.len());
-    let mut server = state.tier2.lock().await;
-    match server.answer_query(&body) {
-        Ok(response) => {
-            eprintln!("Tier 2 query: answered in {:.1}ms, response {} bytes",
-                t0.elapsed().as_secs_f64() * 1000.0, response.len());
-            (
+    info!(
+        req_id,
+        tier = "tier2",
+        body_bytes = body.len(),
+        inflight_requests = inflight,
+        "pir_request_started"
+    );
+    match state.tier2.answer_query(&body) {
+        Ok(answer) => {
+            let handler_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let mut response = (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                response,
-            ).into_response()
+                answer.response,
+            )
+                .into_response();
+            write_timing_headers(response.headers_mut(), req_id, answer.timing);
+            info!(
+                req_id,
+                tier = "tier2",
+                status = 200,
+                handler_ms = format!("{handler_ms:.3}"),
+                validate_ms = format!("{:.3}", answer.timing.validate_ms),
+                decode_copy_ms = format!("{:.3}", answer.timing.decode_copy_ms),
+                compute_ms = format!("{:.3}", answer.timing.online_compute_ms),
+                server_total_ms = format!("{:.3}", answer.timing.total_ms),
+                response_bytes = answer.timing.response_bytes,
+                "pir_request_finished"
+            );
+            response
         }
         Err(e) => {
-            eprintln!("Tier 2 query: malformed request: {e}");
+            warn!(
+                req_id,
+                tier = "tier2",
+                status = 400,
+                handler_ms = format!("{:.3}", t0.elapsed().as_secs_f64() * 1000.0),
+                error = %e,
+                "pir_request_failed"
+            );
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
     }
+}
+
+struct InflightGuard<'a> {
+    inflight: &'a AtomicUsize,
+}
+
+impl<'a> InflightGuard<'a> {
+    fn new(inflight: &'a AtomicUsize) -> Self {
+        Self { inflight }
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn write_timing_headers(headers: &mut axum::http::HeaderMap, req_id: u64, timing: QueryTiming) {
+    // Expose server-side stage timing so the client can split RTT into server vs network/queue.
+    headers.insert(
+        "x-pir-req-id",
+        HeaderValue::from_str(&req_id.to_string()).expect("req_id header must be valid"),
+    );
+    headers.insert(
+        "x-pir-server-total-ms",
+        HeaderValue::from_str(&format!("{:.3}", timing.total_ms))
+            .expect("timing header must be valid"),
+    );
+    headers.insert(
+        "x-pir-server-validate-ms",
+        HeaderValue::from_str(&format!("{:.3}", timing.validate_ms))
+            .expect("timing header must be valid"),
+    );
+    headers.insert(
+        "x-pir-server-decode-copy-ms",
+        HeaderValue::from_str(&format!("{:.3}", timing.decode_copy_ms))
+            .expect("timing header must be valid"),
+    );
+    headers.insert(
+        "x-pir-server-compute-ms",
+        HeaderValue::from_str(&format!("{:.3}", timing.online_compute_ms))
+            .expect("timing header must be valid"),
+    );
+    headers.insert(
+        "x-pir-server-response-bytes",
+        HeaderValue::from_str(&timing.response_bytes.to_string())
+            .expect("response size header must be valid"),
+    );
 }
 
 async fn get_tier1_row(

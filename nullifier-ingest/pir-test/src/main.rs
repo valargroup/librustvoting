@@ -56,6 +56,10 @@ enum Command {
         /// Number of proofs to generate and verify.
         #[arg(long, default_value = "5")]
         num_proofs: usize,
+
+        /// If set, fetch all proofs in a single parallel PIR request batch.
+        #[arg(long, default_value_t = false)]
+        parallel: bool,
     },
 
     /// Verify PIR proofs match existing NullifierTree::prove().
@@ -83,9 +87,10 @@ fn main() -> Result<()> {
             url,
             nullifiers,
             num_proofs,
+            parallel,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(run_server(url, nullifiers, num_proofs))
+            rt.block_on(run_server(url, nullifiers, num_proofs, parallel))
         }
         Command::Compare {
             nullifiers,
@@ -102,9 +107,7 @@ fn run_small() -> Result<()> {
 
     // Generate 1000 random nullifiers
     let mut rng = rand::thread_rng();
-    let nfs: Vec<Fp> = (0..1000)
-        .map(|_| Fp::random(&mut rng))
-        .collect();
+    let nfs: Vec<Fp> = (0..1000).map(|_| Fp::random(&mut rng)).collect();
 
     run_local_inner(&nfs, 10)?;
 
@@ -270,7 +273,12 @@ fn run_local_inner(raw_nfs: &[Fp], num_proofs: usize) -> Result<()> {
 
 // ── Server mode ──────────────────────────────────────────────────────────────
 
-async fn run_server(url: String, nullifiers_path: PathBuf, num_proofs: usize) -> Result<()> {
+async fn run_server(
+    url: String,
+    nullifiers_path: PathBuf,
+    num_proofs: usize,
+    parallel: bool,
+) -> Result<()> {
     eprintln!("=== PIR Test: server ({}) ===\n", url);
 
     let nfs = load_nullifiers(&nullifiers_path)?;
@@ -300,29 +308,54 @@ async fn run_server(url: String, nullifiers_path: PathBuf, num_proofs: usize) ->
         })
         .collect();
 
-    let mut passed = 0;
-    let mut failed = 0;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
 
-    for (i, &value) in test_values.iter().enumerate() {
+    if parallel {
         let t0 = Instant::now();
-        match client.fetch_proof(value).await {
-            Ok(proof) => {
-                if proof.verify(value) {
-                    passed += 1;
-                    eprintln!(
-                        "  Proof {}/{}: PASS ({:.1}ms)",
-                        i + 1,
-                        num_proofs,
-                        t0.elapsed().as_secs_f64() * 1000.0,
-                    );
-                } else {
-                    failed += 1;
-                    eprintln!("  Proof {}/{}: FAIL (verify false)", i + 1, num_proofs);
-                }
-            }
-            Err(e) => {
+        let proofs = client.fetch_proofs(&test_values).await?;
+        anyhow::ensure!(
+            proofs.len() == test_values.len(),
+            "parallel fetch returned {} proofs for {} queries",
+            proofs.len(),
+            test_values.len()
+        );
+        for (i, (&value, proof)) in test_values.iter().zip(proofs.iter()).enumerate() {
+            if proof.verify(value) {
+                passed += 1;
+            } else {
                 failed += 1;
-                eprintln!("  Proof {}/{}: ERROR: {}", i + 1, num_proofs, e);
+                eprintln!("  Proof {}/{}: FAIL (verify false)", i + 1, num_proofs);
+            }
+        }
+        eprintln!(
+            "  Parallel batch: {}/{} valid ({:.1}ms total)",
+            passed,
+            num_proofs,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    } else {
+        for (i, &value) in test_values.iter().enumerate() {
+            let t0 = Instant::now();
+            match client.fetch_proof(value).await {
+                Ok(proof) => {
+                    if proof.verify(value) {
+                        passed += 1;
+                        eprintln!(
+                            "  Proof {}/{}: PASS ({:.1}ms)",
+                            i + 1,
+                            num_proofs,
+                            t0.elapsed().as_secs_f64() * 1000.0,
+                        );
+                    } else {
+                        failed += 1;
+                        eprintln!("  Proof {}/{}: FAIL (verify false)", i + 1, num_proofs);
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("  Proof {}/{}: ERROR: {}", i + 1, num_proofs, e);
+                }
             }
         }
     }
@@ -386,12 +419,26 @@ fn run_compare(nullifiers_path: PathBuf, num_proofs: usize) -> Result<()> {
     }
 
     // Export tier data
-    let tier0_data =
-        pir_export::tier0::export(&pir_tree.root26, &pir_tree.levels, &pir_tree.ranges, &pir_tree.empty_hashes);
+    let tier0_data = pir_export::tier0::export(
+        &pir_tree.root26,
+        &pir_tree.levels,
+        &pir_tree.ranges,
+        &pir_tree.empty_hashes,
+    );
     let mut tier1_data = Vec::new();
-    pir_export::tier1::export(&pir_tree.levels, &pir_tree.ranges, &pir_tree.empty_hashes, &mut tier1_data)?;
+    pir_export::tier1::export(
+        &pir_tree.levels,
+        &pir_tree.ranges,
+        &pir_tree.empty_hashes,
+        &mut tier1_data,
+    )?;
     let mut tier2_data = Vec::new();
-    pir_export::tier2::export(&pir_tree.levels, &pir_tree.ranges, &pir_tree.empty_hashes, &mut tier2_data)?;
+    pir_export::tier2::export(
+        &pir_tree.levels,
+        &pir_tree.ranges,
+        &pir_tree.empty_hashes,
+        &mut tier2_data,
+    )?;
 
     // Pick random values and compare proofs
     let mut rng = rand::thread_rng();
@@ -455,7 +502,11 @@ fn run_compare(nullifiers_path: PathBuf, num_proofs: usize) -> Result<()> {
                 }
             }
             (None, _) => {
-                eprintln!("  Compare {}/{}: depth-29 prove returned None", i + 1, num_proofs);
+                eprintln!(
+                    "  Compare {}/{}: depth-29 prove returned None",
+                    i + 1,
+                    num_proofs
+                );
                 mismatched += 1;
             }
             (_, Err(e)) => {
@@ -465,7 +516,10 @@ fn run_compare(nullifiers_path: PathBuf, num_proofs: usize) -> Result<()> {
         }
     }
 
-    eprintln!("\n  Summary: {} matched, {} mismatched", matched, mismatched);
+    eprintln!(
+        "\n  Summary: {} matched, {} mismatched",
+        matched, mismatched
+    );
     if mismatched > 0 {
         anyhow::bail!("{} comparisons failed", mismatched);
     }

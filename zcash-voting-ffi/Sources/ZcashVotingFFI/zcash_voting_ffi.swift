@@ -542,8 +542,8 @@ public protocol VotingDatabaseProtocol: AnyObject, Sendable {
     /**
      * Build and prove the real delegation ZKP (#1). Long-running.
      *
-     * Loads all required data from the voting DB and wallet DB, fetches IMT
-     * exclusion proofs from the PIR server, generates a real Halo2 proof,
+     * Loads all required data from the voting DB and wallet DB, fetches nullifier
+     * exclusion proofs via PIR, generates a real Halo2 proof,
      * and advances the round phase to DelegationProved.
      *
      * - `round_id`: Voting round hex identifier.
@@ -698,8 +698,8 @@ public static func `open`(path: String)throws  -> VotingDatabase  {
     /**
      * Build and prove the real delegation ZKP (#1). Long-running.
      *
-     * Loads all required data from the voting DB and wallet DB, fetches IMT
-     * exclusion proofs from the PIR server, generates a real Halo2 proof,
+     * Loads all required data from the voting DB and wallet DB, fetches nullifier
+     * exclusion proofs via PIR, generates a real Halo2 proof,
      * and advances the round phase to DelegationProved.
      *
      * - `round_id`: Voting round hex identifier.
@@ -3755,7 +3755,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_func_voting_ffi_version() != 33187) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_build_and_prove_delegation() != 51840) {
+    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_build_and_prove_delegation() != 56007) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_build_governance_pczt() != 33405) {

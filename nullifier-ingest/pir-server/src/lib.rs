@@ -4,10 +4,10 @@
 //! that both the HTTP server (`main.rs`) and the test harness (`pir-test`)
 //! can use.
 
-use std::io::Cursor;
-use std::time::Instant;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
+use std::time::Instant;
 
 use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 
@@ -92,6 +92,23 @@ pub struct TierServer<'a> {
     scenario: YpirScenario,
 }
 
+/// Per-request timing breakdown for a single PIR query.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryTiming {
+    pub validate_ms: f64,
+    pub decode_copy_ms: f64,
+    pub online_compute_ms: f64,
+    pub total_ms: f64,
+    pub response_bytes: usize,
+}
+
+/// Server answer payload paired with its timing breakdown.
+#[derive(Debug)]
+pub struct QueryAnswer {
+    pub response: Vec<u8>,
+    pub timing: QueryTiming,
+}
+
 impl<'a> TierServer<'a> {
     /// Initialize a YPIR+SP server from raw tier data.
     ///
@@ -100,9 +117,10 @@ impl<'a> TierServer<'a> {
     pub fn new(data: &'a [u8], scenario: YpirScenario) -> Self {
         let t0 = Instant::now();
         // Leak params so they live as long as 'a (process lifetime).
-        let params: &'a _ = Box::leak(Box::new(
-            params_for_scenario_simplepir(scenario.num_items as u64, scenario.item_size_bits as u64),
-        ));
+        let params: &'a _ = Box::leak(Box::new(params_for_scenario_simplepir(
+            scenario.num_items as u64,
+            scenario.item_size_bits as u64,
+        )));
 
         eprintln!(
             "  YPIR server init: {} items × {} bits",
@@ -147,24 +165,44 @@ impl<'a> TierServer<'a> {
     /// `[8 bytes: packed_query_row byte length as LE u64][packed_query_row bytes][pub_params bytes]`
     ///
     /// Returns the serialized response as LE u64 bytes.
-    pub fn answer_query(&mut self, query_bytes: &[u8]) -> Result<Vec<u8>> {
+    pub fn answer_query(&self, query_bytes: &[u8]) -> Result<QueryAnswer> {
+        let total_start = Instant::now();
+
         // Validate length-prefixed format: [8: pqr_byte_len][pqr][pub_params]
-        anyhow::ensure!(query_bytes.len() >= 8, "query too short: {} bytes", query_bytes.len());
-        let pqr_byte_len =
-            u64::from_le_bytes(query_bytes[..8].try_into().unwrap()) as usize;
+        let validate_start = Instant::now();
+        anyhow::ensure!(
+            query_bytes.len() >= 8,
+            "query too short: {} bytes",
+            query_bytes.len()
+        );
+        let pqr_byte_len = u64::from_le_bytes(query_bytes[..8].try_into().unwrap()) as usize;
         let payload_len = query_bytes.len() - 8; // safe: checked >= 8
-        anyhow::ensure!(pqr_byte_len % 8 == 0, "pqr_byte_len {} not a multiple of 8", pqr_byte_len);
-        anyhow::ensure!(pqr_byte_len <= payload_len,
-            "pqr_byte_len {} exceeds payload ({})", pqr_byte_len, payload_len);
+        anyhow::ensure!(
+            pqr_byte_len % 8 == 0,
+            "pqr_byte_len {} not a multiple of 8",
+            pqr_byte_len
+        );
+        anyhow::ensure!(
+            pqr_byte_len <= payload_len,
+            "pqr_byte_len {} exceeds payload ({})",
+            pqr_byte_len,
+            payload_len
+        );
         let remaining = payload_len - pqr_byte_len; // safe: checked above
         anyhow::ensure!(pqr_byte_len > 0, "pqr section is empty");
         anyhow::ensure!(remaining > 0, "pub_params section is empty");
-        anyhow::ensure!(remaining % 8 == 0, "pub_params section {} bytes not a multiple of 8", remaining);
+        anyhow::ensure!(
+            remaining % 8 == 0,
+            "pub_params section {} bytes not a multiple of 8",
+            remaining
+        );
+        let validate_ms = validate_start.elapsed().as_secs_f64() * 1000.0;
 
         let pqr_u64_len = pqr_byte_len / 8;
         let pp_u64_len = remaining / 8;
 
         // Copy into 64-byte aligned memory for AVX-512 operations.
+        let decode_start = Instant::now();
         let mut pqr = Aligned64::new(pqr_u64_len);
         for (i, chunk) in query_bytes[8..8 + pqr_byte_len].chunks_exact(8).enumerate() {
             pqr.as_mut_slice()[i] = u64::from_le_bytes(chunk.try_into().unwrap());
@@ -174,14 +212,29 @@ impl<'a> TierServer<'a> {
         for (i, chunk) in query_bytes[8 + pqr_byte_len..].chunks_exact(8).enumerate() {
             pub_params.as_mut_slice()[i] = u64::from_le_bytes(chunk.try_into().unwrap());
         }
+        let decode_copy_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         // Run the YPIR online computation (returns Vec<u8> directly)
-        Ok(self.server.perform_online_computation_simplepir(
+        let compute_start = Instant::now();
+        let response = self.server.perform_online_computation_simplepir(
             pqr.as_slice(),
             &self.offline,
             &[pub_params.as_slice()],
             None,
-        ))
+        );
+        let online_compute_ms = compute_start.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+
+        Ok(QueryAnswer {
+            timing: QueryTiming {
+                validate_ms,
+                decode_copy_ms,
+                online_compute_ms,
+                total_ms,
+                response_bytes: response.len(),
+            },
+            response,
+        })
     }
 
     pub fn scenario(&self) -> &YpirScenario {
