@@ -22,6 +22,7 @@
 
 pub mod builder;
 pub mod circuit;
+pub(crate) mod authority_decrement;
 pub mod prove;
 
 pub use crate::circuit::elgamal::{base_to_scalar, elgamal_encrypt, spend_auth_g_affine};

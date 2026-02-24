@@ -51,11 +51,11 @@
 
 use alloc::vec::Vec;
 
-use ff::{Field, PrimeField};
+
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Value, floor_planner},
     plonk::{
-        self, Advice, Column, ConstraintSystem, Constraints, Expression, Fixed, Instance as InstanceColumn, Selector, TableColumn, VirtualCells
+        self, Advice, Column, ConstraintSystem, Constraints, Fixed, Instance as InstanceColumn, Selector
     },
     poly::Rotation,
 };
@@ -81,6 +81,7 @@ use crate::constants::{
     OrchardCommitDomains, OrchardFixedBases, OrchardHashDomains,
 };
 use crate::circuit::van_integrity;
+use super::authority_decrement::{AuthorityDecrementChip, AuthorityDecrementConfig};
 
 // ================================================================
 // Constants
@@ -329,28 +330,8 @@ pub struct Config {
     /// Uses advices[0..5]: pos_bit, current, sibling, left, right.
     /// Identical to the delegation circuit's `q_imt_swap` gate.
     q_merkle_swap: Selector,
-    /// Selector for condition 6 (Proposal Authority Decrement) lookup row.
-    /// When 1, the (proposal_id, one_shifted) lookup is enforced; when 0,
-    /// the lookup input is (0, 1) so it passes without constraining.
-    q_cond_6: Selector,
-    /// Lookup table column for proposal_id in (proposal_id, 2^proposal_id).
-    /// Table rows: (0, 1), (1, 2), (2, 4), ..., (15, 32768).
-    table_proposal_id: TableColumn,
-    /// Lookup table column for one_shifted = 2^proposal_id.
-    table_one_shifted: TableColumn,
-    /// Selector for condition 6 init row (index=0, two_pow_i=1).
-    q_cond_6_init: Selector,
-    /// Selector for condition 6 bit rows 2..17 (recurrence).
-    q_cond_6_bits: Selector,
-    /// Selector for condition 6 last bit row: run_sel = 1 and run_selected = 1.
-    q_cond_6_selected_one: Selector,
-    /// Witness column for proposal_id⁻¹ on the cond6 lookup row.
-    ///
-    /// Used in the `proposal_id != 0` gate:
-    /// `q_cond_6 * (1 - proposal_id * proposal_id_inv) = 0`.
-    /// Placed in advices[2] on row 0 of the cond6 region, which is otherwise
-    /// unused on that row (sel_i occupies advices[2] only on rows 1–16).
-    proposal_id_inv: Column<Advice>,
+    /// Configuration for condition 6 (Proposal Authority Decrement).
+    authority_decrement: AuthorityDecrementConfig,
 }
 
 impl Config {
@@ -432,6 +413,7 @@ pub struct Circuit {
     pub(crate) vpk_pk_d: Value<pallas::Affine>,
     /// The voter's total delegated weight.
     pub(crate) total_note_value: Value<pallas::Base>,
+    // Condition 6:
     /// Remaining proposal authority bitmask in the old VAN.
     pub(crate) proposal_authority_old: Value<pallas::Base>,
     /// Blinding randomness for the VAN commitment.
@@ -458,7 +440,13 @@ pub struct Circuit {
     pub(crate) vsk_nk: Value<pallas::Base>,
 
     // Condition 6 (Proposal Authority Decrement): one_shifted = 2^proposal_id.
-    /// Cleared bit value: one_shifted = 2^proposal_id (witness; lookup constrains it).
+    /// `2^proposal_id`, supplied as a private witness and constrained by a lookup.
+    ///
+    /// Field arithmetic cannot express variable-exponent exponentiation as a
+    /// polynomial gate, so the prover witnesses `one_shifted` directly. The lookup
+    /// table `(0,1), (1,2), ..., (15,32768)` then proves `one_shifted == 2^proposal_id`.
+    /// The bit-decomposition region uses this value to compute
+    /// `proposal_authority_new = proposal_authority_old - one_shifted`.
     pub(crate) one_shifted: Value<pallas::Base>,
 
     // === Vote commitment construction (conditions 8–12) ===
@@ -555,104 +543,6 @@ fn assign_free_advice(
     )
 }
 
-/// Queried advice cells for one row of the cond6 bit-decomposition region.
-///
-/// Both the init gate (index=0) and the recurrence gate (index>0) read the same
-/// 14 columns. The two extra `.prev()` reads that are unique to the recurrence gate
-/// (`two_pow_i_prev`, `index_prev`) are queried inline inside that gate.
-struct Cond6Row {
-    /// advices[0] cur — proposal index; copied to every row so the locality
-    /// constraint `(proposal_id - index) * sel_i = 0` can be checked locally.
-    proposal_id: Expression<pallas::Base>,
-    /// advices[1] cur — i-th bit of `proposal_authority_old`
-    /// must be boolean.
-    b_i: Expression<pallas::Base>,
-    /// advices[2] cur — 1 if `i == proposal_id`, else 0
-    /// the one-hot selector.
-    sel_i: Expression<pallas::Base>,
-    /// advices[3] cur — `b_i * (1 - sel_i)`
-    /// the bit after clearing.
-    b_new_i: Expression<pallas::Base>,
-    /// advices[4] cur — running `∑ sel_i`
-    /// must equal 1 at the last row.
-    run_sel: Expression<pallas::Base>,
-    /// advices[4] prev
-    run_sel_prev: Expression<pallas::Base>,
-    /// advices[5] cur — running `∑ sel_i * b_i`
-    /// must equal 1 at the last row.
-    run_selected: Expression<pallas::Base>,
-    /// advices[5] prev
-    run_selected_prev: Expression<pallas::Base>,
-    /// advices[6] cur — running `∑ b_i * 2^i`
-    /// must equal `proposal_authority_old` at the last row.
-    run_old: Expression<pallas::Base>,
-    /// advices[6] prev
-    run_old_prev: Expression<pallas::Base>,
-    /// advices[7] cur — running `∑ b_new_i * 2^i`
-    /// must equal `proposal_authority_new` at the last row.
-    run_new: Expression<pallas::Base>,
-    /// advices[7] prev
-    run_new_prev: Expression<pallas::Base>,
-    /// advices[8] cur — positional weight `2^i`
-    /// used to recompose old and new values from bits.
-    two_pow_i: Expression<pallas::Base>,
-    /// advices[9] cur — row counter `i`
-    /// proves `sel_i` is at the right position
-    /// and that `two_pow_i` doubles correctly each row.
-    index: Expression<pallas::Base>,
-}
-
-fn query_cond6_row(
-    meta: &mut VirtualCells<pallas::Base>,
-    advices: &[Column<Advice>],
-) -> Cond6Row {
-    Cond6Row {
-        proposal_id:       meta.query_advice(advices[0], Rotation::cur()),
-        b_i:               meta.query_advice(advices[1], Rotation::cur()),
-        sel_i:             meta.query_advice(advices[2], Rotation::cur()),
-        b_new_i:           meta.query_advice(advices[3], Rotation::cur()),
-        run_sel:           meta.query_advice(advices[4], Rotation::cur()),
-        run_sel_prev:      meta.query_advice(advices[4], Rotation::prev()),
-        run_selected:      meta.query_advice(advices[5], Rotation::cur()),
-        run_selected_prev: meta.query_advice(advices[5], Rotation::prev()),
-        run_old:           meta.query_advice(advices[6], Rotation::cur()),
-        run_old_prev:      meta.query_advice(advices[6], Rotation::prev()),
-        run_new:           meta.query_advice(advices[7], Rotation::cur()),
-        run_new_prev:      meta.query_advice(advices[7], Rotation::prev()),
-        two_pow_i:         meta.query_advice(advices[8], Rotation::cur()),
-        index:             meta.query_advice(advices[9], Rotation::cur()),
-    }
-}
-
-/// The 8 constraints shared by both cond6 gates (init and recurrence).
-fn cond6_shared_constraints(
-    r: &Cond6Row,
-) -> Vec<(&'static str, Expression<pallas::Base>)> {
-    vec![
-        // run_sel increments by sel_i each row
-        ("run_sel",
-            r.run_sel.clone() - r.run_sel_prev.clone() - r.sel_i.clone()),
-        // run_selected increments by sel_i * b_i each row
-        ("run_selected",
-            r.run_selected.clone() - r.run_selected_prev.clone() - r.sel_i.clone() * r.b_i.clone()),
-        // run_old accumulates the old value bit by bit
-        ("run_old",
-            r.run_old.clone() - r.run_old_prev.clone() - r.b_i.clone() * r.two_pow_i.clone()),
-        // run_new accumulates the new value bit by bit
-        ("run_new",
-            r.run_new.clone() - r.run_new_prev.clone() - r.b_new_i.clone() * r.two_pow_i.clone()),
-        // (proposal_id - index) * sel_i = 0: sel_i can only be 1 at the selected position
-        ("(proposal_id - index)*sel_i",
-            (r.proposal_id.clone() - r.index.clone()) * r.sel_i.clone()),
-        // b_new_i = b_i * (1 - sel_i): new bit equals old bit, except zero it out when selected
-        ("b_new_i = b_i*(1-sel_i)",
-            r.b_new_i.clone() - r.b_i.clone() + r.b_i.clone() * r.sel_i.clone()),
-        // enforce b_i in {0, 1}
-        ("bool b_i",  bool_check(r.b_i.clone())),
-        // enforce sel_i in {0, 1}
-        ("bool sel_i", bool_check(r.sel_i.clone())),
-    ]
-}
 
 impl plonk::Circuit<pallas::Base> for Circuit {
     type Config = Config;
@@ -780,100 +670,8 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             )
         });
 
-        // Condition 6:
-        // "Prove you had permission to vote on this proposal and prove you have relaxed
-        // exactly that permission"
-        // (proposal_id, one_shifted) lookup table for
-        // one_shifted = 2^proposal_id. When q_cond_6 = 0 the lookup input
-        // is (0, 1) so it passes. It passes because 2^0 = 1.
-        // When q_cond_6 = 1, we enforce (proposal_id,
-        // one_shifted) in {(0,1), (1,2), ..., (15, 32768)}.
-        // Must be complex_selector because we use it in (one - q) in the lookup.
-        let q_cond_6 = meta.complex_selector();
-        let table_proposal_id = meta.lookup_table_column();
-        let table_one_shifted = meta.lookup_table_column();
-        meta.lookup(|meta| {
-            let q = meta.query_selector(q_cond_6);
-            let proposal_id = meta.query_advice(advices[0], Rotation::cur());
-            let one_shifted = meta.query_advice(advices[1], Rotation::cur());
-            // When q=0: (0, 1); when q=1: (proposal_id, one_shifted).
-            let input_0 = q.clone() * proposal_id;
-            let one = Expression::Constant(pallas::Base::one());
-            let input_1 = q.clone() * one_shifted + (one.clone() - q);
-            vec![
-                (input_0, table_proposal_id),
-                (input_1, table_one_shifted),
-            ]
-        });
-
-        // Condition 6 (defense-in-depth): proposal_id must be non-zero.
-        //
-        // Zero is the dummy/sentinel value for an unset proposal_id; the range
-        // check alone does not exclude it. This gate closes that gap by requiring
-        // a valid field inverse, which exists if and only if proposal_id ≠ 0.
-        //
-        // Gate: q_cond_6 * (1 - proposal_id * proposal_id_inv) = 0
-        // advices[2] on row 0 of the cond6 region is otherwise unused (sel_i
-        // occupies advices[2] only on rows 1–16 where q_cond_6 = 0).
-        meta.create_gate("proposal_id != 0", |meta| {
-            let q = meta.query_selector(q_cond_6);
-            let proposal_id = meta.query_advice(advices[0], Rotation::cur());
-            let proposal_id_inv = meta.query_advice(advices[2], Rotation::cur());
-            let one = Expression::Constant(pallas::Base::one());
-            vec![("proposal_id * inv = 1", q * (one - proposal_id * proposal_id_inv))]
-        });
-
-        // Condition 6 (Proposal Authority Decrement) bit-decomposition gates.
-        // Row 1: init (index=0, two_pow_i=1, running sums from first bit).
-        let q_cond_6_init = meta.selector();
-        // Rows 2..17: recurrence (index++, two_pow_i *= 2, running sums).
-        let q_cond_6_bits = meta.selector();
-
-        let zero = Expression::Constant(pallas::Base::zero());
-        let one_expr = Expression::Constant(pallas::Base::one());
-        let two_expr = Expression::Constant(pallas::Base::from(2u64));
-
-        // The init gate enforces index=0 and two_pow_i=1 in addition to the shared running-sum
-        // recurrence. The prover fills the zero-padding row above with zeros so the same
-        // recurrence formula (increment by delta) handles initialization without a special case.
-        meta.create_gate("cond6 init: index=0, two_pow_i=1, running sums", |meta| {
-            let q = meta.query_selector(q_cond_6_init);
-            let r = query_cond6_row(meta, &advices);
-            let mut constraints = vec![
-                ("two_pow_i = 1", r.two_pow_i.clone() - one_expr.clone()),
-                ("index = 0",     r.index.clone() - zero.clone()),
-            ];
-            constraints.extend(cond6_shared_constraints(&r));
-            Constraints::with_selector(q, constraints)
-        });
-
-        meta.create_gate("cond6 bits: index++, two_pow_i*=2, running sums", |meta| {
-            let q = meta.query_selector(q_cond_6_bits);
-            let r = query_cond6_row(meta, &advices);
-            let two_pow_i_prev = meta.query_advice(advices[8], Rotation::prev());
-            let index_prev     = meta.query_advice(advices[9], Rotation::prev());
-            let mut constraints = vec![
-                ("two_pow_i = 2*prev", r.two_pow_i.clone() - two_expr.clone() * two_pow_i_prev),
-                ("index = prev+1",     r.index.clone() - index_prev - one_expr.clone()),
-            ];
-            constraints.extend(cond6_shared_constraints(&r));
-            Constraints::with_selector(q, constraints)
-        });
-
-        // At the last bit row (row 16): run_sel = 1 (exactly one selector active) and run_selected = 1 (that bit was set).
-        let q_cond_6_selected_one = meta.selector();
-        meta.create_gate("cond6 run_sel = 1 and run_selected = 1", |meta| {
-            let q = meta.query_selector(q_cond_6_selected_one);
-            let run_sel = meta.query_advice(advices[4], Rotation::cur());
-            let run_selected = meta.query_advice(advices[5], Rotation::cur());
-            Constraints::with_selector(
-                q,
-                [
-                    ("run_sel = 1", run_sel - one_expr.clone()),
-                    ("run_selected = 1", run_selected - one_expr),
-                ],
-            )
-        });
+        // Condition 6: Proposal Authority Decrement.
+        let authority_decrement = AuthorityDecrementChip::configure(meta, advices);
 
         Config {
             primary,
@@ -885,13 +683,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             commit_ivk_config,
             range_check,
             q_merkle_swap,
-            q_cond_6,
-            table_proposal_id,
-            table_one_shifted,
-            q_cond_6_init,
-            q_cond_6_bits,
-            q_cond_6_selected_one,
-            proposal_id_inv: advices[2],
+            authority_decrement,
         }
     }
 
@@ -911,27 +703,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         SinsemillaChip::load(config.sinsemilla_config.clone(), &mut layouter)?;
 
         // Load (proposal_id, 2^proposal_id) lookup table for condition 6.
-        // Rows: (0, 1), (1, 2), (2, 4), ..., (15, 32768).
-        layouter.assign_table(
-            || "proposal_id one_shifted table",
-            |mut table| {
-                for i in 0..MAX_PROPOSAL_ID {
-                    table.assign_cell(
-                        || "table proposal_id",
-                        config.table_proposal_id,
-                        i,
-                        || Value::known(pallas::Base::from(i as u64)),
-                    )?;
-                    table.assign_cell(
-                        || "table one_shifted",
-                        config.table_one_shifted,
-                        i,
-                        || Value::known(pallas::Base::from(1u64 << i)),
-                    )?;
-                }
-                Ok(())
-            },
-        )?;
+        AuthorityDecrementChip::load_table(&config.authority_decrement, &mut layouter)?;
 
 
         // Construct the ECC chip (used in conditions 3 and 10).
@@ -1034,7 +806,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // reused in later conditions:
         // - vote_authority_note_old: also used in condition 1 (Merkle leaf).
         // - voting_round_id: also used in condition 5 (VAN nullifier).
-        // - vpk_g_d, vpk_pk_d, total_note_value, voting_round_id, proposal_authority_old,
+        // - vpk_g_d, vpk_pk_d, total_note_value, voting_round_id,
         //   van_comm_rand, domain_van: also used in condition 7 (new VAN integrity).
         // - total_note_value: also used in condition 8 (shares sum check).
         // - vsk_nk: also used in condition 5 (VAN nullifier).
@@ -1046,7 +818,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         let total_note_value_cond6 = total_note_value.clone();
         let total_note_value_cond7 = total_note_value.clone();
         let voting_round_id_cond6 = voting_round_id.clone();
-        let _proposal_authority_old_cond6 = proposal_authority_old.clone();
         let van_comm_rand_cond6 = van_comm_rand.clone();
         let vsk_nk_cond4 = vsk_nk.clone();
 
@@ -1334,244 +1105,26 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // No diff/gap range check; decomposition proves [0, 2^16).
         // ---------------------------------------------------------------
 
-        let (proposal_id, proposal_authority_new, run_old_final, run_new_final) =
-            layouter.assign_region(
-                || "cond6 proposal authority decrement",
-                |mut region| {
-                    let proposal_authority_old_val = self.proposal_authority_old;
-
-                    // Row 0: (proposal_id, one_shifted) for lookup; init running sums to 0.
-                    config.q_cond_6.enable(&mut region, 0)?;
-                    let proposal_id_cell = region.assign_advice_from_instance(
-                        || "proposal_id",
-                        config.primary,
-                        PROPOSAL_ID,
-                        config.advices[0],
-                        0,
-                    )?;
-                    let _one_shifted_cell = region.assign_advice(
-                        || "one_shifted",
-                        config.advices[1],
-                        0,
-                        || self.one_shifted,
-                    )?;
-                    // Witness proposal_id⁻¹ for the `proposal_id != 0` gate.
-                    // If proposal_id = 0 the inverse does not exist and the gate
-                    // will reject the proof; the fallback zero is irrelevant.
-                    region.assign_advice(
-                        || "proposal_id_inv",
-                        config.proposal_id_inv,
-                        0,
-                        || {
-                            proposal_id_cell.value().map(|pid| {
-                                Option::from(pid.invert()).unwrap_or(pallas::Base::zero())
-                            })
-                        },
-                    )?;
-                    region.assign_advice_from_constant(
-                        || "run_sel init",
-                        config.advices[4],
-                        0,
-                        pallas::Base::zero(),
-                    )?;
-                    region.assign_advice_from_constant(
-                        || "run_selected init",
-                        config.advices[5],
-                        0,
-                        pallas::Base::zero(),
-                    )?;
-                    region.assign_advice_from_constant(
-                        || "run_old init",
-                        config.advices[6],
-                        0,
-                        pallas::Base::zero(),
-                    )?;
-                    region.assign_advice_from_constant(
-                        || "run_new init",
-                        config.advices[7],
-                        0,
-                        pallas::Base::zero(),
-                    )?;
-
-                    // Rows 1..17: bits, selectors, running sums.
-                    let zero_val = Value::known(pallas::Base::zero());
-                    let mut run_old_prev = zero_val;
-                    let mut run_new_prev = zero_val;
-                    let mut run_sel_prev = zero_val;
-                    let mut run_selected_prev = zero_val;
-
-                    for i in 0..MAX_PROPOSAL_ID {
-                        let row = 1 + i;
-                        let proposal_id_base = proposal_id_cell.value().copied();
-                        let b_i_val = proposal_authority_old_val.map(|b| {
-                            let r = b.to_repr();
-                            let arr = r.as_ref();
-                            let low = u64::from_le_bytes(arr[0..8].try_into().unwrap()) & 0xFFFF;
-                            let bit = (low >> i) & 1;
-                            pallas::Base::from(bit)
-                        });
-                        let sel_i_val = proposal_id_base.map(|pid| {
-                            let r = pid.to_repr();
-                            let arr = r.as_ref();
-                            let pid_u64 = u64::from_le_bytes(arr[0..8].try_into().unwrap());
-                            pallas::Base::from(if pid_u64 == i as u64 { 1u64 } else { 0 })
-                        });
-                        let b_new_i_val = b_i_val.zip(sel_i_val)
-                            .map(|(b, s)| b - b * s);
-                        let two_pow_i_val = Value::known(pallas::Base::from(1u64 << i));
-                        run_sel_prev = run_sel_prev.zip(sel_i_val).map(|(r, s)| r + s);
-                        run_selected_prev = run_selected_prev
-                            .zip(sel_i_val)
-                            .zip(b_i_val)
-                            .map(|((r, s), b)| r + s * b);
-                        run_old_prev = run_old_prev
-                            .zip(b_i_val)
-                            .zip(two_pow_i_val)
-                            .map(|((r, b), t)| r + b * t);
-                        run_new_prev = run_new_prev
-                            .zip(b_new_i_val)
-                            .zip(two_pow_i_val)
-                            .map(|((r, b), t)| r + b * t);
-
-                        proposal_id_cell.copy_advice(
-                            || format!("proposal_id copy {}", i),
-                            &mut region,
-                            config.advices[0],
-                            row,
-                        )?;
-                        region.assign_advice(
-                            || format!("b_{}", i),
-                            config.advices[1],
-                            row,
-                            || b_i_val,
-                        )?;
-                        region.assign_advice(
-                            || format!("sel_{}", i),
-                            config.advices[2],
-                            row,
-                            || sel_i_val,
-                        )?;
-                        region.assign_advice(
-                            || format!("b_new_{}", i),
-                            config.advices[3],
-                            row,
-                            || b_new_i_val,
-                        )?;
-                        region.assign_advice(
-                            || format!("run_sel {}", i),
-                            config.advices[4],
-                            row,
-                            || run_sel_prev,
-                        )?;
-                        region.assign_advice(
-                            || format!("run_selected {}", i),
-                            config.advices[5],
-                            row,
-                            || run_selected_prev,
-                        )?;
-                        region.assign_advice(
-                            || format!("run_old {}", i),
-                            config.advices[6],
-                            row,
-                            || run_old_prev,
-                        )?;
-                        region.assign_advice(
-                            || format!("run_new {}", i),
-                            config.advices[7],
-                            row,
-                            || run_new_prev,
-                        )?;
-                        region.assign_advice(
-                            || format!("two_pow_i {}", i),
-                            config.advices[8],
-                            row,
-                            || two_pow_i_val,
-                        )?;
-                        region.assign_advice(
-                            || format!("index {}", i),
-                            config.advices[9],
-                            row,
-                            || Value::known(pallas::Base::from(i as u64)),
-                        )?;
-
-                        if i == 0 {
-                            config.q_cond_6_init.enable(&mut region, row)?;
-                        } else {
-                            config.q_cond_6_bits.enable(&mut region, row)?;
-                        }
-                        if i == MAX_PROPOSAL_ID - 1 {
-                            config.q_cond_6_selected_one.enable(&mut region, row)?;
-                        }
-                    }
-
-                    // proposal_authority_new = recomposed value (same as old - one_shifted when spec is satisfied).
-                    let proposal_authority_new_val = self.proposal_authority_old
-                        .zip(self.one_shifted)
-                        .map(|(old, shift)| old - shift);
-                    let proposal_authority_new_cell = region.assign_advice(
-                        || "proposal_authority_new",
-                        config.advices[0],
-                        17,
-                        || proposal_authority_new_val,
-                    )?;
-                    let run_old_cell = region.assign_advice(
-                        || "run_old final",
-                        config.advices[6],
-                        17,
-                        || run_old_prev,
-                    )?;
-                    let run_new_cell = region.assign_advice(
-                        || "run_new final",
-                        config.advices[7],
-                        17,
-                        || run_new_prev,
-                    )?;
-
-                    Ok((
-                        proposal_id_cell,
-                        proposal_authority_new_cell,
-                        run_old_cell,
-                        run_new_cell,
-                    ))
-                },
-            )?;
-
-        // Constrain recomposed run_old == proposal_authority_old, run_new == proposal_authority_new.
-        layouter.assign_region(
-            || "cond6 authority equality",
+        // Copy proposal_id from the public instance into an advice cell.
+        let proposal_id = layouter.assign_region(
+            || "copy proposal_id from instance",
             |mut region| {
-                let a = proposal_authority_old.copy_advice(
-                    || "copy proposal_authority_old",
-                    &mut region,
+                region.assign_advice_from_instance(
+                    || "proposal_id",
+                    config.primary,
+                    PROPOSAL_ID,
                     config.advices[0],
                     0,
-                )?;
-                let b = run_old_final.copy_advice(
-                    || "copy run_old",
-                    &mut region,
-                    config.advices[1],
-                    0,
-                )?;
-                region.constrain_equal(a.cell(), b.cell())
+                )
             },
         )?;
-        layouter.assign_region(
-            || "cond6 new authority equality",
-            |mut region| {
-                let a = proposal_authority_new.copy_advice(
-                    || "copy proposal_authority_new",
-                    &mut region,
-                    config.advices[0],
-                    0,
-                )?;
-                let b = run_new_final.copy_advice(
-                    || "copy run_new",
-                    &mut region,
-                    config.advices[1],
-                    0,
-                )?;
-                region.constrain_equal(a.cell(), b.cell())
-            },
+
+        let proposal_authority_new = AuthorityDecrementChip::assign(
+            &config.authority_decrement,
+            &mut layouter,
+            proposal_id.clone(),
+            proposal_authority_old,
+            self.one_shifted,
         )?;
 
         // ---------------------------------------------------------------
