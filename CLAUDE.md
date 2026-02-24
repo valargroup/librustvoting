@@ -90,6 +90,10 @@ If the IMT query server returns HTTP 502 with a height mismatch, the tree sideca
 - **`make install-ffi`** builds `zallyd` **with** halo2 and redpallas build tags. This is required for the helper server to run. **Always use `make install-ffi`** when rebuilding `zallyd` for local testing.
 - `make init` already calls `install-ffi`, so a fresh `make up` is fine. The issue arises when you manually run `make install` to pick up a Go code change — this silently downgrades the binary.
 
+### GOBIN and version managers (mise, asdf, etc.)
+
+The Makefiles set `export GOBIN := $(HOME)/go/bin` so that `go install` puts the binary in `~/go/bin`, matching the `PATH` they export. If you use a Go version manager like mise that overrides `GOBIN` to its own directory, the Makefile's explicit `GOBIN` takes precedence, preventing stale binaries in `~/go/bin` from shadowing the freshly built one.
+
 ### Ceremony requirement
 
 Before creating a voting round, the EA key ceremony must be in CONFIRMED status. Run `make ceremony` from `sdk/` after `make up`. Check status: `curl -s http://localhost:1318/zally/v1/ceremony`.

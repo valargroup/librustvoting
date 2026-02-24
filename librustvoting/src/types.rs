@@ -135,6 +135,12 @@ pub struct GovernancePczt {
     /// Index of the real governance action within the PCZT's Orchard bundle.
     /// (Actions are padded/shuffled by the Builder.)
     pub action_index: usize,
+    /// Padded note secrets: N_padded * 64 bytes (32 rho + 32 rseed per padded note).
+    /// Needed to thread Phase 1 randomness to Phase 2 (ZCA-74 fix).
+    pub padded_note_secrets: Vec<(Vec<u8>, Vec<u8>)>,
+    /// ZIP-244 sighash extracted from the PCZT (32 bytes).
+    /// Both Keystone and non-Keystone paths sign this.
+    pub pczt_sighash: Vec<u8>,
 }
 
 /// El Gamal ciphertext of a voting share.

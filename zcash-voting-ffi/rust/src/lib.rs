@@ -165,24 +165,6 @@ pub struct VotingRoundParams {
 }
 
 #[derive(Clone, uniffi::Record)]
-pub struct DelegationAction {
-    pub action_bytes: Vec<u8>,
-    pub rk: Vec<u8>,
-    pub gov_nullifiers: Vec<Vec<u8>>,
-    pub van: Vec<u8>,
-    pub van_comm_rand: Vec<u8>,
-    pub dummy_nullifiers: Vec<Vec<u8>>,
-    pub rho_signed: Vec<u8>,
-    pub padded_cmx: Vec<Vec<u8>>,
-    pub nf_signed: Vec<u8>,
-    pub cmx_new: Vec<u8>,
-    pub alpha: Vec<u8>,
-    pub spend_auth_sig: Option<Vec<u8>>,
-    pub rseed_signed: Vec<u8>,
-    pub rseed_output: Vec<u8>,
-}
-
-#[derive(Clone, uniffi::Record)]
 pub struct GovernancePczt {
     pub pczt_bytes: Vec<u8>,
     pub rk: Vec<u8>,
@@ -199,6 +181,8 @@ pub struct GovernancePczt {
     pub rseed_output: Vec<u8>,
     pub action_bytes: Vec<u8>,
     pub action_index: u32,
+    pub padded_note_secrets: Vec<Vec<Vec<u8>>>,
+    pub pczt_sighash: Vec<u8>,
 }
 
 impl From<voting::GovernancePczt> for GovernancePczt {
@@ -219,6 +203,12 @@ impl From<voting::GovernancePczt> for GovernancePczt {
             rseed_output: g.rseed_output,
             action_bytes: g.action_bytes,
             action_index: g.action_index as u32,
+            padded_note_secrets: g
+                .padded_note_secrets
+                .into_iter()
+                .map(|(rho, rseed)| vec![rho, rseed])
+                .collect(),
+            pczt_sighash: g.pczt_sighash,
         }
     }
 }
@@ -462,48 +452,6 @@ impl From<VotingRoundParams> for voting::VotingRoundParams {
     }
 }
 
-impl From<voting::DelegationAction> for DelegationAction {
-    fn from(a: voting::DelegationAction) -> Self {
-        Self {
-            action_bytes: a.action_bytes,
-            rk: a.rk,
-            gov_nullifiers: a.gov_nullifiers,
-            van: a.van,
-            van_comm_rand: a.van_comm_rand,
-            dummy_nullifiers: a.dummy_nullifiers,
-            rho_signed: a.rho_signed,
-            padded_cmx: a.padded_cmx,
-            nf_signed: a.nf_signed,
-            cmx_new: a.cmx_new,
-            alpha: a.alpha,
-            spend_auth_sig: a.spend_auth_sig,
-            rseed_signed: a.rseed_signed,
-            rseed_output: a.rseed_output,
-        }
-    }
-}
-
-impl From<DelegationAction> for voting::DelegationAction {
-    fn from(a: DelegationAction) -> Self {
-        Self {
-            action_bytes: a.action_bytes,
-            rk: a.rk,
-            gov_nullifiers: a.gov_nullifiers,
-            van: a.van,
-            van_comm_rand: a.van_comm_rand,
-            dummy_nullifiers: a.dummy_nullifiers,
-            rho_signed: a.rho_signed,
-            padded_cmx: a.padded_cmx,
-            nf_signed: a.nf_signed,
-            cmx_new: a.cmx_new,
-            alpha: a.alpha,
-            spend_auth_sig: a.spend_auth_sig,
-            rseed_signed: a.rseed_signed,
-            rseed_output: a.rseed_output,
-        }
-    }
-}
-
 impl From<voting::EncryptedShare> for EncryptedShare {
     fn from(s: voting::EncryptedShare) -> Self {
         Self {
@@ -717,33 +665,6 @@ impl VotingDatabase {
         Ok(self.db.get_bundle_count(&round_id)?)
     }
 
-    pub fn construct_delegation_action(
-        &self,
-        round_id: String,
-        bundle_index: u32,
-        notes: Vec<NoteInfo>,
-        fvk_bytes: Vec<u8>,
-        g_d_new_x: Vec<u8>,
-        pk_d_new_x: Vec<u8>,
-        hotkey_raw_address: Vec<u8>,
-        address_index: u32,
-    ) -> Result<DelegationAction, VotingError> {
-        let core_notes: Vec<voting::NoteInfo> = notes.into_iter().map(Into::into).collect();
-        Ok(self
-            .db
-            .construct_delegation_action(
-                &round_id,
-                bundle_index,
-                &core_notes,
-                &fvk_bytes,
-                &g_d_new_x,
-                &pk_d_new_x,
-                &hotkey_raw_address,
-                address_index,
-            )?
-            .into())
-    }
-
     pub fn build_governance_pczt(
         &self,
         round_id: String,
@@ -924,6 +845,28 @@ impl VotingDatabase {
             .collect())
     }
 
+    /// Reconstruct the delegation TX payload using a Keystone-provided signature.
+    ///
+    /// Unlike `get_delegation_submission`, this does NOT derive `ask` from a seed.
+    /// It uses the externally-provided Keystone signature and the ZIP-244 sighash.
+    pub fn get_delegation_submission_with_keystone_sig(
+        &self,
+        round_id: String,
+        bundle_index: u32,
+        keystone_sig: Vec<u8>,
+        keystone_sighash: Vec<u8>,
+    ) -> Result<DelegationSubmission, VotingError> {
+        Ok(self
+            .db
+            .get_delegation_submission_with_keystone_sig(
+                &round_id,
+                bundle_index,
+                &keystone_sig,
+                &keystone_sighash,
+            )?
+            .into())
+    }
+
     /// Reconstruct the full chain-ready delegation TX payload from DB + seed.
     ///
     /// After `build_and_prove_delegation` completes, call this to get the signed
@@ -1062,27 +1005,6 @@ pub fn encrypt_shares(
 }
 
 #[uniffi::export]
-pub fn construct_delegation_action(
-    notes: Vec<NoteInfo>,
-    params: VotingRoundParams,
-    fvk_bytes: Vec<u8>,
-    g_d_new_x: Vec<u8>,
-    pk_d_new_x: Vec<u8>,
-    hotkey_raw_address: Vec<u8>,
-) -> Result<DelegationAction, VotingError> {
-    let core_notes: Vec<voting::NoteInfo> = notes.into_iter().map(Into::into).collect();
-    Ok(voting::action::construct_delegation_action(
-        &core_notes,
-        &params.into(),
-        &fvk_bytes,
-        &g_d_new_x,
-        &pk_d_new_x,
-        &hotkey_raw_address,
-    )?
-    .into())
-}
-
-#[uniffi::export]
 pub fn build_governance_pczt(
     notes: Vec<NoteInfo>,
     params: VotingRoundParams,
@@ -1145,7 +1067,7 @@ pub fn generate_delegation_inputs(
         message: format!("account_index must be < 2^31, got {}", account_index),
     })?;
 
-    // Derive the sender Orchard FVK bytes consumed by construct_delegation_action.
+    // Derive the sender Orchard FVK bytes consumed by build_governance_pczt.
     // These bytes include nk (middle 32 bytes), which is used for gov nullifier derivation.
     let sender_usk = match network_id {
         0 => UnifiedSpendingKey::from_seed(&MAIN_NETWORK, &sender_seed, account),
@@ -1239,6 +1161,103 @@ pub fn generate_note_witness(
 #[uniffi::export]
 pub fn verify_witness(witness: WitnessData) -> Result<bool, VotingError> {
     Ok(voting::witness::verify_witness(&witness.into())?)
+}
+
+/// Extract the ZIP-244 shielded sighash from finalized PCZT bytes.
+///
+/// Returns the 32-byte sighash that Keystone signs internally. Used to construct
+/// the delegation submission with the correct sighash for chain verification.
+#[uniffi::export]
+pub fn extract_pczt_sighash(pczt_bytes: Vec<u8>) -> Result<Vec<u8>, VotingError> {
+    Ok(voting::action::extract_pczt_sighash(&pczt_bytes)?.to_vec())
+}
+
+/// Derive delegation inputs using an explicit FVK instead of deriving from sender seed.
+///
+/// For Keystone accounts, the notes carry the Keystone's UFVK in the wallet DB.
+/// This function uses the provided FVK bytes directly (from the note's `ufvk_str`)
+/// instead of deriving from a seed, ensuring the prover and PCZT builder use the
+/// same `ak`.
+#[uniffi::export]
+pub fn generate_delegation_inputs_with_fvk(
+    fvk_bytes: Vec<u8>,
+    hotkey_seed: Vec<u8>,
+    network_id: u32,
+    account_index: u32,
+    seed_fingerprint: Vec<u8>,
+) -> Result<DelegationInputs, VotingError> {
+    if fvk_bytes.len() != 96 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "fvk_bytes must be 96 bytes, got {}",
+                fvk_bytes.len()
+            ),
+        });
+    }
+    if hotkey_seed.len() < 32 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "hotkey_seed must be at least 32 bytes, got {}",
+                hotkey_seed.len()
+            ),
+        });
+    }
+    if seed_fingerprint.len() != 32 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "seed_fingerprint must be 32 bytes, got {}",
+                seed_fingerprint.len()
+            ),
+        });
+    }
+
+    let account = AccountId::try_from(account_index).map_err(|_| VotingError::InvalidInput {
+        message: format!("account_index must be < 2^31, got {}", account_index),
+    })?;
+
+    // Derive hotkey-side Orchard material
+    let hotkey_usk = match network_id {
+        0 => UnifiedSpendingKey::from_seed(&MAIN_NETWORK, &hotkey_seed, account),
+        1 => UnifiedSpendingKey::from_seed(&TEST_NETWORK, &hotkey_seed, account),
+        _ => {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "invalid network_id {}, expected 0 (mainnet) or 1 (testnet)",
+                    network_id
+                ),
+            });
+        }
+    }
+    .map_err(|e| VotingError::InvalidInput {
+        message: format!("failed to derive hotkey UnifiedSpendingKey: {}", e),
+    })?;
+    let hotkey_ufvk = hotkey_usk.to_unified_full_viewing_key();
+    let hotkey_orchard_fvk = hotkey_ufvk
+        .orchard()
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: "hotkey UFVK is missing Orchard component".to_string(),
+        })?;
+
+    let app_hotkey = voting::hotkey::generate_hotkey(&hotkey_seed)?;
+    let hotkey_addr = hotkey_orchard_fvk.address_at(0u32, Scope::External);
+    let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
+
+    let hotkey_addr_43: [u8; 43] = hotkey_raw_address
+        .as_slice()
+        .try_into()
+        .expect("address serialization must be 43 bytes");
+    let (g_d_new_x, pk_d_new_x) =
+        voting::action::derive_hotkey_x_coords_from_raw_address(&hotkey_addr_43)?;
+
+    Ok(DelegationInputs {
+        fvk_bytes,
+        g_d_new_x: g_d_new_x.to_vec(),
+        pk_d_new_x: pk_d_new_x.to_vec(),
+        hotkey_raw_address,
+        hotkey_public_key: app_hotkey.public_key,
+        hotkey_address: app_hotkey.address,
+        seed_fingerprint,
+    })
 }
 
 #[uniffi::export]
@@ -1351,6 +1370,39 @@ pub fn sign_cast_vote(
         &alpha_v,
     )?
     .into())
+}
+
+/// Extract the 96-byte Orchard FVK from a UFVK string.
+///
+/// Decodes a Bech32-encoded Unified Full Viewing Key string and returns the
+/// raw 96-byte Orchard component (ak[32] || nk[32] || rivk[32]).
+/// Used for Keystone accounts where the FVK must come from the note's UFVK
+/// rather than being derived from the app's seed.
+#[uniffi::export]
+pub fn extract_orchard_fvk_from_ufvk(
+    ufvk_str: String,
+    network_id: u32,
+) -> Result<Vec<u8>, VotingError> {
+    use zcash_keys::keys::UnifiedFullViewingKey;
+    let ufvk = match network_id {
+        0 => UnifiedFullViewingKey::decode(&MAIN_NETWORK, &ufvk_str),
+        1 => UnifiedFullViewingKey::decode(&TEST_NETWORK, &ufvk_str),
+        _ => {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "invalid network_id {}, expected 0 (mainnet) or 1 (testnet)",
+                    network_id
+                ),
+            });
+        }
+    }
+    .map_err(|e| VotingError::InvalidInput {
+        message: format!("failed to decode UFVK string: {}", e),
+    })?;
+    let orchard_fvk = ufvk.orchard().ok_or_else(|| VotingError::InvalidInput {
+        message: "UFVK has no Orchard component".to_string(),
+    })?;
+    Ok(orchard_fvk.to_bytes().to_vec())
 }
 
 /// Extract the Orchard note commitment tree root from a protobuf-encoded TreeState.

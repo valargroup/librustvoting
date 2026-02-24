@@ -5,26 +5,10 @@ use ff::PrimeField;
 use crate::storage::queries;
 use crate::storage::{RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb};
 use crate::types::{
-    DelegationAction, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
+    DelegationProofResult, DelegationSubmissionData, EncryptedShare,
     GovernancePczt, NoteInfo, ProofProgressReporter, SharePayload, VoteCommitmentBundle,
     VotingError, VotingHotkey, VotingRoundParams, WitnessData,
 };
-
-/// Append exactly 32 bytes to `out` from `b` (pad with zeros if shorter).
-fn extend_padded32(out: &mut Vec<u8>, b: &[u8]) {
-    let mut buf = [0u8; 32];
-    let n = b.len().min(32);
-    buf[..n].copy_from_slice(&b[..n]);
-    out.extend_from_slice(&buf);
-}
-
-/// Append exactly 64 bytes to `out` from `b` (pad with zeros if shorter).
-fn extend_padded64(out: &mut Vec<u8>, b: &[u8]) {
-    let mut buf = [0u8; 64];
-    let n = b.len().min(64);
-    buf[..n].copy_from_slice(&b[..n]);
-    out.extend_from_slice(&buf);
-}
 
 impl VotingDb {
     // --- Round management ---
@@ -121,63 +105,6 @@ impl VotingDb {
         crate::hotkey::generate_hotkey(seed)
     }
 
-    /// Construct the delegation action for Keystone signing.
-    /// Loads round params from db. Notes come from caller (not stored yet).
-    /// Computes real governance nullifiers, VAN, signed note, output note, and rk.
-    /// Persists delegation data (van_comm_rand, dummy_nullifiers, rho_signed, etc.) to DB.
-    ///
-    /// - `fvk_bytes`: 96-byte orchard FullViewingKey (ak[32] || nk[32] || rivk[32])
-    /// - `g_d_new_x`: 32-byte x-coordinate of hotkey diversified generator (for VAN)
-    /// - `pk_d_new_x`: 32-byte x-coordinate of hotkey transmission key (for VAN)
-    /// - `hotkey_raw_address`: 43-byte hotkey raw orchard address (for output note)
-    pub fn construct_delegation_action(
-        &self,
-        round_id: &str,
-        bundle_index: u32,
-        notes: &[NoteInfo],
-        fvk_bytes: &[u8],
-        g_d_new_x: &[u8],
-        pk_d_new_x: &[u8],
-        hotkey_raw_address: &[u8],
-        address_index: u32,
-    ) -> Result<DelegationAction, VotingError> {
-        let conn = self.conn();
-        let params = queries::load_round_params(&conn, round_id)?;
-        let action = crate::action::construct_delegation_action(
-            notes,
-            &params,
-            fvk_bytes,
-            g_d_new_x,
-            pk_d_new_x,
-            hotkey_raw_address,
-        )?;
-        // Compute total note value from input notes
-        let total_note_value: u64 = notes
-            .iter()
-            .try_fold(0u64, |acc, n| acc.checked_add(n.value))
-            .ok_or_else(|| VotingError::InvalidInput {
-                message: "total note weight overflows u64".to_string(),
-            })?;
-        queries::store_delegation_data(
-            &conn,
-            round_id,
-            bundle_index,
-            &action.van_comm_rand,
-            &action.dummy_nullifiers,
-            &action.rho_signed,
-            &action.padded_cmx,
-            &action.nf_signed,
-            &action.cmx_new,
-            &action.alpha,
-            &action.rseed_signed,
-            &action.rseed_output,
-            &action.van,
-            total_note_value,
-            address_index,
-        )?;
-        Ok(action)
-    }
-
     /// Build a governance-specific PCZT for Keystone signing.
     /// Loads round params from db. Notes come from caller.
     /// Computes governance values and builds a PCZT whose single Orchard action
@@ -223,7 +150,8 @@ impl VotingDb {
             .ok_or_else(|| VotingError::InvalidInput {
                 message: "total note weight overflows u64".to_string(),
             })?;
-        // Persist the same delegation data fields as construct_delegation_action
+        // Persist delegation data fields
+        // plus padded_note_secrets and pczt_sighash for ZCA-74 randomness threading.
         queries::store_delegation_data(
             &conn,
             round_id,
@@ -240,6 +168,8 @@ impl VotingDb {
             &result.van,
             total_note_value,
             address_index,
+            &result.padded_note_secrets,
+            &result.pczt_sighash,
         )?;
         Ok(result)
     }
@@ -338,6 +268,12 @@ impl VotingDb {
         let alpha = queries::load_alpha(&conn, round_id, bundle_index)?;
         let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, bundle_index)?;
         let witnesses = queries::load_witnesses(&conn, round_id, bundle_index)?;
+
+        // Load Phase 1 randomness for ZCA-74 fix: ensures Phase 2 produces
+        // the same nf_signed/cmx_new that Phase 1 committed to in the PCZT.
+        let rseed_signed = queries::load_rseed_signed(&conn, round_id, bundle_index)?;
+        let rseed_output = queries::load_rseed_output(&conn, round_id, bundle_index)?;
+        let padded_secrets = queries::load_padded_note_secrets(&conn, round_id, bundle_index)?;
 
         // Load note positions for this bundle, then fetch all wallet notes and filter
         let bundle_positions: std::collections::HashSet<u64> =
@@ -459,6 +395,37 @@ impl VotingDb {
                 message: format!("invalid vote_round_id hex '{}': {e}", params.vote_round_id),
             })?;
 
+        // Construct PrecomputedRandomness from Phase 1 values (ZCA-74 fix).
+        // If padded_note_secrets is empty (e.g. test data with no PCZT),
+        // we fall back to None and the builder will sample fresh randomness.
+        let precomputed = if !padded_secrets.is_empty() || !rseed_signed.is_empty() {
+            use orchard::delegation::builder::PaddedNoteData;
+            let padded_notes: Vec<PaddedNoteData> = padded_secrets
+                .iter()
+                .map(|(rho, rseed)| {
+                    let mut rho_arr = [0u8; 32];
+                    let mut rseed_arr = [0u8; 32];
+                    rho_arr.copy_from_slice(rho);
+                    rseed_arr.copy_from_slice(rseed);
+                    PaddedNoteData {
+                        rho: rho_arr,
+                        rseed: rseed_arr,
+                    }
+                })
+                .collect();
+            let mut rseed_signed_arr = [0u8; 32];
+            rseed_signed_arr.copy_from_slice(&rseed_signed);
+            let mut rseed_output_arr = [0u8; 32];
+            rseed_output_arr.copy_from_slice(&rseed_output);
+            Some(orchard::delegation::builder::PrecomputedRandomness {
+                padded_notes,
+                rseed_signed: rseed_signed_arr,
+                rseed_output: rseed_output_arr,
+            })
+        } else {
+            None
+        };
+
         let result = crate::zkp1::build_and_prove_delegation(
             &full_notes,
             hotkey_raw_address,
@@ -470,6 +437,7 @@ impl VotingDb {
             imt_server_url,
             network_id,
             progress,
+            precomputed.as_ref(),
         )?;
         let prove_elapsed = prove_start.elapsed();
         eprintln!(
@@ -480,8 +448,8 @@ impl VotingDb {
         // Store proof bytes for debugging/recovery
         queries::store_proof(&conn, round_id, bundle_index, &result.proof)?;
         // Persist prover's public inputs — needed later for delegation TX submission.
-        // Overwrites nf_signed/cmx_new from constructDelegationAction since the prover
-        // generates its own random rseeds for the signed/output notes.
+        // With PrecomputedRandomness (ZCA-74 fix), nf_signed/cmx_new should match
+        // Phase 1 values. We still store them to be explicit and support the legacy path.
         queries::store_proof_result_fields(
             &conn,
             round_id,
@@ -639,8 +607,9 @@ impl VotingDb {
     ///
     /// After `build_and_prove_delegation` completes, all proof artifacts (proof, rk,
     /// gov_nullifiers, nf_signed, cmx_new, gov_comm, alpha) are persisted in the DB.
-    /// This method loads them, derives the sender's SpendingKey from seed, computes the
-    /// canonical sighash, signs it, and returns everything the chain needs.
+    /// This method loads them, derives the sender's SpendingKey from seed, loads the
+    /// ZIP-244 sighash (stored during PCZT construction), signs it, and returns
+    /// everything the chain needs.
     pub fn get_delegation_submission(
         &self,
         round_id: &str,
@@ -651,7 +620,19 @@ impl VotingDb {
     ) -> Result<DelegationSubmissionData, VotingError> {
         let conn = self.conn();
         let data = queries::load_delegation_submission_data(&conn, round_id, bundle_index)?;
+        let sighash_vec = queries::load_pczt_sighash(&conn, round_id, bundle_index)?;
         drop(conn);
+
+        let sighash: [u8; 32] =
+            sighash_vec
+                .as_slice()
+                .try_into()
+                .map_err(|_| VotingError::Internal {
+                    message: format!(
+                        "pczt_sighash must be 32 bytes, got {}",
+                        sighash_vec.len()
+                    ),
+                })?;
 
         // Derive sender SpendingKey from seed via ZIP-32 (same as delegation)
         let sk = crate::zkp2::derive_spending_key(sender_seed, network_id)?;
@@ -675,39 +656,10 @@ impl VotingDb {
         // Compute rsk = ask.randomize(alpha)
         let rsk = ask.randomize(&alpha);
 
-        // Decode vote_round_id from hex string to bytes
-        let vote_round_id_bytes =
-            hex::decode(&data.vote_round_id).map_err(|e| VotingError::Internal {
-                message: format!("invalid vote_round_id hex: {e}"),
-            })?;
-
         // enc_memo = [0x05; 64] (mock, matches e2e test and chain expectations)
         let enc_memo = [0x05u8; 64];
 
-        // Canonical sighash: Blake2b-256(domain || vote_round_id || rk || nf_signed || cmx_new || enc_memo || gov_comm || gov_nullifiers)
-        // Must match Go's ComputeDelegationSighash.
-        const SIGHASH_DOMAIN: &[u8] = b"ZALLY_DELEGATION_SIGHASH_V0";
-        let mut canonical =
-            Vec::with_capacity(SIGHASH_DOMAIN.len() + 32 + 32 + 32 + 32 + 64 + 32 + 5 * 32);
-        canonical.extend_from_slice(SIGHASH_DOMAIN);
-        extend_padded32(&mut canonical, &vote_round_id_bytes);
-        canonical.extend_from_slice(&data.rk);
-        extend_padded32(&mut canonical, &data.nf_signed);
-        canonical.extend_from_slice(&data.cmx_new);
-        extend_padded64(&mut canonical, &enc_memo);
-        extend_padded32(&mut canonical, &data.gov_comm);
-        for i in 0..5 {
-            if i < data.gov_nullifiers.len() {
-                canonical.extend_from_slice(&data.gov_nullifiers[i]);
-            } else {
-                canonical.extend_from_slice(&[0u8; 32]);
-            }
-        }
-        let sighash_full = blake2b_simd::Params::new().hash_length(32).hash(&canonical);
-        let mut sighash = [0u8; 32];
-        sighash.copy_from_slice(sighash_full.as_bytes());
-
-        // Sign
+        // Sign the ZIP-244 sighash (extracted from PCZT during Phase 1)
         let mut rng = rand::rngs::OsRng;
         let sig = rsk.sign(&mut rng, &sighash);
         let sig_bytes: [u8; 64] = (&sig).into();
@@ -723,6 +675,56 @@ impl VotingDb {
             vote_round_id: data.vote_round_id,
             spend_auth_sig: sig_bytes.to_vec(),
             sighash: sighash.to_vec(),
+            enc_memo: enc_memo.to_vec(),
+        })
+    }
+
+    /// Reconstruct the delegation TX payload using a Keystone-provided signature.
+    ///
+    /// Unlike `get_delegation_submission`, this does NOT derive `ask` from a seed
+    /// or re-sign. Instead, it uses the externally-provided Keystone signature
+    /// and the ZIP-244 sighash that Keystone signed.
+    pub fn get_delegation_submission_with_keystone_sig(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        keystone_sig: &[u8],
+        keystone_sighash: &[u8],
+    ) -> Result<DelegationSubmissionData, VotingError> {
+        if keystone_sig.len() != 64 {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "keystone_sig must be 64 bytes, got {}",
+                    keystone_sig.len()
+                ),
+            });
+        }
+        if keystone_sighash.len() != 32 {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "keystone_sighash must be 32 bytes, got {}",
+                    keystone_sighash.len()
+                ),
+            });
+        }
+
+        let conn = self.conn();
+        let data = queries::load_delegation_submission_data(&conn, round_id, bundle_index)?;
+
+        // enc_memo = [0x05; 64] (mock, matches e2e test and chain expectations)
+        let enc_memo = [0x05u8; 64];
+
+        Ok(DelegationSubmissionData {
+            proof: data.proof,
+            rk: data.rk,
+            nf_signed: data.nf_signed,
+            cmx_new: data.cmx_new,
+            gov_comm: data.gov_comm,
+            gov_nullifiers: data.gov_nullifiers,
+            alpha: data.alpha,
+            vote_round_id: data.vote_round_id,
+            spend_auth_sig: keystone_sig.to_vec(),
+            sighash: keystone_sighash.to_vec(),
             enc_memo: enc_memo.to_vec(),
         })
     }
@@ -743,7 +745,7 @@ impl VotingDb {
 mod tests {
     use super::*;
 
-    // 64 hex chars = 32 bytes when decoded. Required because construct_delegation_action
+    // 64 hex chars = 32 bytes when decoded. Required because build_governance_pczt
     // hex-decodes vote_round_id and validates it as exactly 32 bytes (a Pallas field element).
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
@@ -823,115 +825,6 @@ mod tests {
     }
 
     #[test]
-    fn test_construct_delegation_action() {
-        use orchard::keys::{FullViewingKey, SpendingKey};
-        use zip32::Scope;
-
-        let db = test_db();
-        db.init_round(&test_params(), None).unwrap();
-
-        let note = NoteInfo {
-            commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
-            value: 15_000_000,
-            position: 42,
-            diversifier: vec![0; 11],
-            rho: vec![0; 32],
-            rseed: vec![0; 32],
-            scope: 0,
-            ufvk_str: String::new(),
-        };
-
-        // Setup bundle first (single note above threshold → 1 bundle)
-        db.setup_bundles(ROUND_ID, &[note.clone()]).unwrap();
-
-        // Derive valid FVK and hotkey address from deterministic spending keys
-        let sk = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
-        let fvk = FullViewingKey::from(&sk);
-        let fvk_bytes = fvk.to_bytes().to_vec();
-
-        let hotkey_sk = SpendingKey::from_bytes([0x43; 32]).expect("valid spending key");
-        let hotkey_fvk = FullViewingKey::from(&hotkey_sk);
-        let hotkey_addr = hotkey_fvk.address_at(0u32, Scope::External);
-        let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
-
-        let hotkey_addr_43: [u8; 43] = hotkey_raw_address
-            .as_slice()
-            .try_into()
-            .expect("hotkey raw address must be 43 bytes");
-        let (g_d_x, pk_d_x) =
-            crate::action::derive_hotkey_x_coords_from_raw_address(&hotkey_addr_43)
-                .expect("hotkey raw address should decode");
-        let g_d = g_d_x.to_vec();
-        let pk_d = pk_d_x.to_vec();
-
-        let action = db
-            .construct_delegation_action(
-                ROUND_ID,
-                0, // bundle_index
-                &[note],
-                &fvk_bytes,
-                &g_d,
-                &pk_d,
-                &hotkey_raw_address,
-                0u32, // address_index
-            )
-            .unwrap();
-        assert_eq!(action.rk.len(), 32);
-        assert_ne!(action.rk, vec![0xDE; 32]);
-        assert_eq!(action.gov_nullifiers.len(), 5);
-        assert_eq!(action.van.len(), 32);
-        assert_eq!(action.van_comm_rand.len(), 32);
-
-        // rho_signed is 32 bytes, non-zero
-        assert_eq!(action.rho_signed.len(), 32);
-        assert_ne!(action.rho_signed, vec![0u8; 32]);
-
-        // padded_cmx: 4 padded notes (1 real + 4 padded = 5)
-        assert_eq!(action.padded_cmx.len(), 4);
-        for cmx in &action.padded_cmx {
-            assert_eq!(cmx.len(), 32);
-        }
-
-        // New fields: nf_signed, cmx_new, alpha
-        assert_eq!(action.nf_signed.len(), 32);
-        assert_ne!(action.nf_signed, vec![0u8; 32]);
-        assert_eq!(action.cmx_new.len(), 32);
-        assert_ne!(action.cmx_new, vec![0u8; 32]);
-        assert_eq!(action.alpha.len(), 32);
-        assert_ne!(action.alpha, vec![0u8; 32]);
-        assert_eq!(action.rseed_signed.len(), 32);
-        assert_ne!(action.rseed_signed, vec![0u8; 32]);
-        assert_eq!(action.rseed_output.len(), 32);
-        assert_ne!(action.rseed_output, vec![0u8; 32]);
-
-        // Verify delegation secrets were persisted in bundles table
-        let conn = db.conn();
-        let stored_rand = queries::load_van_comm_rand(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(stored_rand, action.van_comm_rand);
-        let stored_dummies = queries::load_dummy_nullifiers(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(stored_dummies, action.dummy_nullifiers);
-
-        // Verify rho_signed and padded_cmx round-trip through DB
-        let stored_rho = queries::load_rho_signed(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(stored_rho, action.rho_signed);
-        let stored_padded = queries::load_padded_cmx(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(stored_padded, action.padded_cmx);
-
-        // Verify new fields round-trip through DB
-        let stored_nf = queries::load_nf_signed(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(stored_nf, action.nf_signed);
-        let stored_cmx = queries::load_cmx_new(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(stored_cmx, action.cmx_new);
-        let stored_alpha = queries::load_alpha(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(stored_alpha, action.alpha);
-        let stored_rseed_signed = queries::load_rseed_signed(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(stored_rseed_signed, action.rseed_signed);
-        let stored_rseed_output = queries::load_rseed_output(&conn, ROUND_ID, 0).unwrap();
-        assert_eq!(stored_rseed_output, action.rseed_output);
-    }
-
-    #[test]
     fn test_store_and_load_tree_state() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
@@ -955,71 +848,6 @@ mod tests {
         assert_eq!(shares[1].plaintext_value, 4);
     }
 
-    #[test]
-    fn test_zkp2_inputs_round_trip() {
-        // Verify that delegation data persisted for ZKP #2 can be loaded back.
-        // The real vote proof generation is too expensive for a unit test (~30-60s);
-        // the e2e test exercises the full path.
-        use orchard::keys::{FullViewingKey, SpendingKey};
-        use zip32::Scope;
-
-        let db = test_db();
-        db.init_round(&test_params(), None).unwrap();
-
-        let note = NoteInfo {
-            commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
-            value: 13_000_000, // must be >= 12_500_000 (BALLOT_DIVISOR) to produce at least 1 ballot
-            position: 42,
-            diversifier: vec![0; 11],
-            rho: vec![0; 32],
-            rseed: vec![0; 32],
-            scope: 0,
-            ufvk_str: String::new(),
-        };
-
-        // Setup bundle first (single note above threshold)
-        db.setup_bundles(ROUND_ID, &[note.clone()]).unwrap();
-
-        let sk = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
-        let fvk = FullViewingKey::from(&sk);
-        let fvk_bytes = fvk.to_bytes().to_vec();
-        let hotkey_sk = SpendingKey::from_bytes([0x43; 32]).expect("valid spending key");
-        let hotkey_fvk = FullViewingKey::from(&hotkey_sk);
-        let hotkey_addr = hotkey_fvk.address_at(0u32, Scope::External);
-        let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
-        let hotkey_addr_43: [u8; 43] = hotkey_raw_address.as_slice().try_into().unwrap();
-        let (g_d_x, pk_d_x) =
-            crate::action::derive_hotkey_x_coords_from_raw_address(&hotkey_addr_43).unwrap();
-
-        db.construct_delegation_action(
-            ROUND_ID,
-            0, // bundle_index
-            &[note],
-            &fvk_bytes,
-            &g_d_x.to_vec(),
-            &pk_d_x.to_vec(),
-            &hotkey_raw_address,
-            0u32,
-        )
-        .unwrap();
-
-        // Verify ZKP2 inputs can be loaded
-        {
-            let conn = db.conn();
-            let zkp2 = queries::load_zkp2_inputs(&conn, ROUND_ID, 0).unwrap();
-            assert_eq!(zkp2.total_note_value, 13_000_000);
-            assert_eq!(zkp2.address_index, 0);
-            assert_eq!(zkp2.gov_comm_rand.len(), 32);
-            assert_eq!(zkp2.ea_pk.len(), 32);
-            assert_eq!(zkp2.voting_round_id, ROUND_ID);
-        }
-
-        // Verify VAN position can be stored and loaded
-        db.store_van_position(ROUND_ID, 0, 42).unwrap();
-        let pos = queries::load_van_position(&db.conn(), ROUND_ID, 0).unwrap();
-        assert_eq!(pos, 42);
-    }
 
     #[test]
     fn test_mark_vote_submitted() {
@@ -1090,7 +918,7 @@ mod tests {
         assert_eq!(positions_1, vec![5]);
         drop(conn);
 
-        // Derive keys for construct_delegation_action
+        // Derive keys for build_governance_pczt
         let sk = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
         let fvk = FullViewingKey::from(&sk);
         let fvk_bytes = fvk.to_bytes().to_vec();
@@ -1098,38 +926,40 @@ mod tests {
         let hotkey_fvk = FullViewingKey::from(&hotkey_sk);
         let hotkey_addr = hotkey_fvk.address_at(0u32, Scope::External);
         let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
-        let hotkey_addr_43: [u8; 43] = hotkey_raw_address.as_slice().try_into().unwrap();
-        let (g_d_x, pk_d_x) =
-            crate::action::derive_hotkey_x_coords_from_raw_address(&hotkey_addr_43).unwrap();
+        let seed_fingerprint = [0x42u8; 32];
 
-        // Construct delegation for each bundle independently
+        // Build governance PCZT for each bundle independently
         let chunk_result = crate::types::chunk_notes(&notes);
 
         for (i, chunk) in chunk_result.bundles.iter().enumerate() {
-            let action = db
-                .construct_delegation_action(
+            let result = db
+                .build_governance_pczt(
                     ROUND_ID,
                     i as u32,
                     chunk,
                     &fvk_bytes,
-                    &g_d_x.to_vec(),
-                    &pk_d_x.to_vec(),
                     &hotkey_raw_address,
-                    0u32,
+                    0xC8E71055, // NU6 consensus branch ID
+                    1,          // testnet coin type
+                    &seed_fingerprint,
+                    0,          // account_index
+                    "test-round",
+                    0,          // address_index
                 )
                 .unwrap();
 
             // Each bundle should have valid delegation data
-            assert_eq!(action.rk.len(), 32);
-            assert_eq!(action.van.len(), 32);
-            assert_eq!(action.gov_nullifiers.len(), 5);
+            assert_eq!(result.rk.len(), 32);
+            assert_eq!(result.van.len(), 32);
+            assert_eq!(result.gov_nullifiers.len(), 5);
+            assert_eq!(result.pczt_sighash.len(), 32);
 
             // Verify data persisted per bundle
             let conn = db.conn();
             let stored_rand = queries::load_van_comm_rand(&conn, ROUND_ID, i as u32).unwrap();
-            assert_eq!(stored_rand, action.van_comm_rand);
+            assert_eq!(stored_rand, result.van_comm_rand);
             let stored_alpha = queries::load_alpha(&conn, ROUND_ID, i as u32).unwrap();
-            assert_eq!(stored_alpha, action.alpha);
+            assert_eq!(stored_alpha, result.alpha);
 
             // ZKP2 inputs loadable per bundle
             let zkp2 = queries::load_zkp2_inputs(&conn, ROUND_ID, i as u32).unwrap();
@@ -1190,4 +1020,5 @@ mod tests {
         assert!(db.list_rounds().unwrap().is_empty());
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 0);
     }
+
 }

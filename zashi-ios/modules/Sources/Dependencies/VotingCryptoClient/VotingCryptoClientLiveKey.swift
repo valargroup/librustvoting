@@ -184,62 +184,32 @@ extension VotingCryptoClient: DependencyKey {
                     address: hotkey.address
                 )
             },
-            buildDelegationSignAction: { roundId, bundleIndex, notes, senderSeed, hotkeySeed, networkId, accountIndex in
-                let db = try await dbActor.database()
-                let ffiHotkey = try db.generateHotkey(roundId: roundId, seed: Data(hotkeySeed))
-                let hotkey = VotingModels.VotingHotkey(
-                    secretKey: ffiHotkey.secretKey,
-                    publicKey: ffiHotkey.publicKey,
-                    address: ffiHotkey.address
-                )
-                let ffiInputs = try ZcashVotingFFI.generateDelegationInputs(
-                    senderSeed: Data(senderSeed),
-                    hotkeySeed: Data(hotkeySeed),
-                    networkId: networkId,
-                    accountIndex: accountIndex
-                )
-                guard hotkey.publicKey == ffiInputs.hotkeyPublicKey,
-                      hotkey.address == ffiInputs.hotkeyAddress
-                else {
-                    throw VotingCryptoError.hotkeySeedBindingMismatch
-                }
-                let ffiNotes = notes.map { $0.toFFI() }
-                let result = try db.constructDelegationAction(
-                    roundId: roundId,
-                    bundleIndex: bundleIndex,
-                    notes: ffiNotes,
-                    fvkBytes: ffiInputs.fvkBytes,
-                    gDNewX: ffiInputs.gDNewX,
-                    pkDNewX: ffiInputs.pkDNewX,
-                    hotkeyRawAddress: ffiInputs.hotkeyRawAddress,
-                    addressIndex: 1
-                )
-                return DelegationAction(
-                    actionBytes: result.actionBytes,
-                    rk: result.rk,
-                    govNullifiers: result.govNullifiers,
-                    van: result.van,
-                    vanCommRand: result.vanCommRand,
-                    dummyNullifiers: result.dummyNullifiers,
-                    rhoSigned: result.rhoSigned,
-                    paddedCmx: result.paddedCmx,
-                    nfSigned: result.nfSigned,
-                    cmxNew: result.cmxNew,
-                    alpha: result.alpha,
-                    rseedSigned: result.rseedSigned,
-                    rseedOutput: result.rseedOutput,
-                    spendAuthSig: nil
-                )
-            },
-            buildGovernancePczt: { roundId, bundleIndex, notes, senderSeed, hotkeySeed, networkId, accountIndex, roundName in
+            buildGovernancePczt: { roundId, bundleIndex, notes, senderSeed, hotkeySeed, networkId, accountIndex, roundName, orchardFvkOverride, keystoneSeedFingerprintOverride in
                 let db = try await dbActor.database()
                 _ = try db.generateHotkey(roundId: roundId, seed: Data(hotkeySeed))
-                let ffiInputs = try ZcashVotingFFI.generateDelegationInputs(
-                    senderSeed: Data(senderSeed),
-                    hotkeySeed: Data(hotkeySeed),
-                    networkId: networkId,
-                    accountIndex: accountIndex
-                )
+                let ffiInputs: ZcashVotingFFI.DelegationInputs
+                let actualFvkBytes: Data
+                if let orchardFvkOverride {
+                    guard let keystoneSeedFingerprintOverride else {
+                        throw VotingCryptoError.invalidKeystoneMetadata
+                    }
+                    ffiInputs = try ZcashVotingFFI.generateDelegationInputsWithFvk(
+                        fvkBytes: orchardFvkOverride,
+                        hotkeySeed: Data(hotkeySeed),
+                        networkId: networkId,
+                        accountIndex: accountIndex,
+                        seedFingerprint: keystoneSeedFingerprintOverride
+                    )
+                    actualFvkBytes = orchardFvkOverride
+                } else {
+                    ffiInputs = try ZcashVotingFFI.generateDelegationInputs(
+                        senderSeed: Data(senderSeed),
+                        hotkeySeed: Data(hotkeySeed),
+                        networkId: networkId,
+                        accountIndex: accountIndex
+                    )
+                    actualFvkBytes = ffiInputs.fvkBytes
+                }
                 let ffiNotes = notes.map { $0.toFFI() }
                 // NU6 consensus branch ID; coin_type 133 = mainnet, 1 = testnet
                 let consensusBranchId: UInt32 = 0xC8E7_1055
@@ -249,14 +219,15 @@ extension VotingCryptoClient: DependencyKey {
                     roundId: roundId,
                     bundleIndex: bundleIndex,
                     notes: ffiNotes,
-                    fvkBytes: ffiInputs.fvkBytes,
+                    fvkBytes: actualFvkBytes,
                     hotkeyRawAddress: ffiInputs.hotkeyRawAddress,
                     consensusBranchId: consensusBranchId,
                     coinType: coinType,
                     seedFingerprint: ffiInputs.seedFingerprint,
                     accountIndex: accountIndex,
                     roundName: roundName,
-                    addressIndex: 1
+                    // Diversifier index for the voting hotkey receiver must stay at 0.
+                    addressIndex: 0
                 )
                 publishState(db: db, roundId: roundId)
                 return GovernancePcztResult(
@@ -288,30 +259,24 @@ extension VotingCryptoClient: DependencyKey {
                 )
                 return sigBytes
             },
+            extractPcztSighash: { pcztBytes in
+                try ZcashVotingFFI.extractPcztSighash(pcztBytes: pcztBytes)
+            },
             buildAndProveDelegation: { roundId, bundleIndex, bundleNotes, walletDbPath, senderSeed, hotkeySeed, networkId, accountIndex, imtServerUrl in
                 AsyncThrowingStream { continuation in
                     Task.detached {
                         do {
                             let db = try await dbActor.database()
                             let reporter = StreamProgressReporter(continuation)
-                            // Derive hotkey raw address from seeds
+                            // Derive hotkey raw address from seeds.
+                            // buildGovernancePczt already stored the delegation data
+                            // (alpha, secrets, sighash) in the DB — we just need the
+                            // hotkey address for the prover.
                             let ffiInputs = try ZcashVotingFFI.generateDelegationInputs(
                                 senderSeed: Data(senderSeed),
                                 hotkeySeed: Data(hotkeySeed),
                                 networkId: networkId,
                                 accountIndex: accountIndex
-                            )
-                            // Construct delegation action for this bundle's notes
-                            let ffiNotes = bundleNotes.map { $0.toFFI() }
-                            _ = try db.constructDelegationAction(
-                                roundId: roundId,
-                                bundleIndex: bundleIndex,
-                                notes: ffiNotes,
-                                fvkBytes: ffiInputs.fvkBytes,
-                                gDNewX: ffiInputs.gDNewX,
-                                pkDNewX: ffiInputs.pkDNewX,
-                                hotkeyRawAddress: ffiInputs.hotkeyRawAddress,
-                                addressIndex: accountIndex
                             )
                             let result = try db.buildAndProveDelegation(
                                 roundId: roundId,
@@ -330,6 +295,9 @@ extension VotingCryptoClient: DependencyKey {
                         }
                     }
                 }
+            },
+            extractOrchardFvkFromUfvk: { ufvkStr, networkId in
+                try ZcashVotingFFI.extractOrchardFvkFromUfvk(ufvkStr: ufvkStr, networkId: networkId)
             },
             decomposeWeight: { weight in
                 ZcashVotingFFI.decomposeWeight(weight: weight)
@@ -476,6 +444,28 @@ extension VotingCryptoClient: DependencyKey {
                     sighash: ffi.sighash
                 )
             },
+            getDelegationSubmissionWithKeystoneSig: { roundId, bundleIndex, keystoneSig, keystoneSighash in
+                let db = try await dbActor.database()
+                let ffi = try db.getDelegationSubmissionWithKeystoneSig(
+                    roundId: roundId,
+                    bundleIndex: bundleIndex,
+                    keystoneSig: keystoneSig,
+                    keystoneSighash: keystoneSighash
+                )
+                let voteRoundIdBytes = Data(hexString: ffi.voteRoundId)
+                return DelegationRegistration(
+                    rk: ffi.rk,
+                    spendAuthSig: ffi.spendAuthSig,
+                    signedNoteNullifier: ffi.nfSigned,
+                    cmxNew: ffi.cmxNew,
+                    encMemo: ffi.encMemo,
+                    vanCmx: ffi.govComm,
+                    govNullifiers: ffi.govNullifiers,
+                    proof: ffi.proof,
+                    voteRoundId: voteRoundIdBytes,
+                    sighash: ffi.sighash
+                )
+            },
             storeVanPosition: { roundId, bundleIndex, position in
                 let db = try await dbActor.database()
                 try db.storeVanPosition(roundId: roundId, bundleIndex: bundleIndex, position: position)
@@ -550,6 +540,7 @@ enum VotingCryptoError: LocalizedError {
     case databaseNotOpen
     case hotkeySeedBindingMismatch
     case invalidSpendAuthSignatureLength(Int)
+    case invalidKeystoneMetadata
 
     var errorDescription: String? {
         switch self {
@@ -561,6 +552,8 @@ enum VotingCryptoError: LocalizedError {
             return "Hotkey derivation mismatch while building delegation sign action."
         case .invalidSpendAuthSignatureLength(let actual):
             return "SpendAuthSig must be 64 bytes, got \(actual)."
+        case .invalidKeystoneMetadata:
+            return "Missing or invalid Keystone signing metadata."
         }
     }
 }

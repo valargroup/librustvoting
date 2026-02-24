@@ -224,6 +224,8 @@ fn voting_flow_librustvoting_path() {
             &delegation_bundle.van_cmx,
             vote_proof_data.total_note_value,
             1, // address_index (matches delegation output_recipient = fvk.address_at(1, External))
+            &[], // padded_note_secrets (not needed for ZKP #2 test)
+            &[0u8; 32], // pczt_sighash
         )
         .expect("store_delegation_data");
     }

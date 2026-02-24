@@ -2,7 +2,8 @@
 SDK_DIR     = sdk
 INGEST_DIR  = nullifier-ingest
 
-export PATH := /usr/local/go/bin:$(HOME)/go/bin:$(PATH)
+export GOBIN := $(HOME)/go/bin
+export PATH := /usr/local/go/bin:$(GOBIN):$(PATH)
 
 # Optional upper bound for nullifier ingestion (must be a multiple of 10).
 # Pass as: make up SYNC_HEIGHT=2500000

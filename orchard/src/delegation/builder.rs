@@ -13,7 +13,7 @@ use rand::RngCore;
 
 use crate::{
     keys::{FullViewingKey, Scope, SpendValidatingKey},
-    note::{commitment::ExtractedNoteCommitment, nullifier::Nullifier, Note, Rho},
+    note::{commitment::ExtractedNoteCommitment, nullifier::Nullifier, Note, RandomSeed, Rho},
     spec::NonIdentityPallasPoint,
     tree::MerklePath,
     value::NoteValue,
@@ -23,6 +23,28 @@ use super::{
     circuit::{self, van_commitment_hash, rho_binding_hash, NoteSlotWitness},
     imt::{gov_null_hash, ImtProofData, ImtProvider},
 };
+
+/// Rho and rseed for a single padded note, captured during Phase 1 (PCZT construction).
+#[derive(Clone, Debug)]
+pub struct PaddedNoteData {
+    /// Rho bytes (32 bytes, LE encoding of pallas::Base).
+    pub rho: [u8; 32],
+    /// Random seed bytes (32 bytes).
+    pub rseed: [u8; 32],
+}
+
+/// Randomness captured during Phase 1 (PCZT construction) that must be reused
+/// in Phase 2 (ZK proving) so the prover commits to the same nf_signed/cmx_new
+/// that the signer committed to via the ZIP-244 sighash.
+#[derive(Clone, Debug)]
+pub struct PrecomputedRandomness {
+    /// Rho + rseed for each padded note (0–3 entries).
+    pub padded_notes: Vec<PaddedNoteData>,
+    /// Rseed for the signed (keystone) note.
+    pub rseed_signed: [u8; 32],
+    /// Rseed for the output note.
+    pub rseed_output: [u8; 32],
+}
 
 /// Input for a single real note in the delegation.
 #[derive(Debug)]
@@ -89,6 +111,8 @@ impl std::fmt::Display for DelegationBuildError {
 /// - `van_comm_rand`: Blinding factor for the governance commitment.
 /// - `imt_provider`: Provider for padded-note IMT non-membership proofs.
 /// - `rng`: Random number generator.
+/// - `precomputed`: If `Some`, reuse Phase 1 randomness for padded/signed/output notes
+///   (ZCA-74 fix). If `None`, sample fresh randomness (backward compat for tests).
 #[allow(clippy::too_many_arguments)]
 pub fn build_delegation_bundle(
     real_notes: Vec<RealNoteInput>,
@@ -100,6 +124,7 @@ pub fn build_delegation_bundle(
     van_comm_rand: pallas::Base,
     imt_provider: &impl ImtProvider,
     rng: &mut impl RngCore,
+    precomputed: Option<&PrecomputedRandomness>,
 ) -> Result<DelegationBundle, DelegationBuildError> {
     // The circuit supports 1–5 real notes; reject empty or oversized bundles.
     let n_real = real_notes.len();
@@ -170,13 +195,26 @@ pub fn build_delegation_bundle(
     for i in n_real..5 {
         // Use a high diversifier index to avoid collision with real notes.
         let pad_addr = fvk.address_at((1000 + i) as u32, Scope::External);
-        let (_, _, dummy) = Note::dummy(&mut *rng, None);
-        let pad_note = Note::new(
-            pad_addr,
-            NoteValue::zero(),
-            Rho::from_nf_old(dummy.nullifier(fvk)),
-            &mut *rng,
-        );
+        let pad_idx = i - n_real; // index into precomputed.padded_notes
+
+        let pad_note = if let Some(pre) = precomputed {
+            // ZCA-74: reuse Phase 1 randomness so the prover commits to the same values.
+            assert!(pad_idx < pre.padded_notes.len(),
+                "precomputed.padded_notes has {} entries but need index {}",
+                pre.padded_notes.len(), pad_idx);
+            let pd = &pre.padded_notes[pad_idx];
+            let rho = Rho::from_bytes(&pd.rho).expect("precomputed rho must be valid");
+            let rseed = RandomSeed::from_bytes(pd.rseed, &rho).expect("precomputed rseed must be valid");
+            Note::from_parts(pad_addr, NoteValue::zero(), rho, rseed).expect("precomputed note must be valid")
+        } else {
+            let (_, _, dummy) = Note::dummy(&mut *rng, None);
+            Note::new(
+                pad_addr,
+                NoteValue::zero(),
+                Rho::from_nf_old(dummy.nullifier(fvk)),
+                &mut *rng,
+            )
+        };
 
         let rho = pad_note.rho();
         let psi = pad_note.rseed().psi(&rho);
@@ -265,24 +303,40 @@ pub fn build_delegation_bundle(
     // Construct the keystone (signed) note (§1.3.4).
     // This is a zero-value dummy note whose rho is bound to the delegation via condition 3.
     let sender_address = fvk.address_at(0u32, Scope::External);
-    let signed_note = Note::new(
-        sender_address,
-        NoteValue::zero(),
-        Rho::from_nf_old(Nullifier(rho)),
-        &mut *rng,
-    );
+    let signed_rho = Rho::from_nf_old(Nullifier(rho));
+    let signed_note = if let Some(pre) = precomputed {
+        let rseed = RandomSeed::from_bytes(pre.rseed_signed, &signed_rho)
+            .expect("precomputed rseed_signed must be valid");
+        Note::from_parts(sender_address, NoteValue::zero(), signed_rho, rseed)
+            .expect("precomputed signed note must be valid")
+    } else {
+        Note::new(
+            sender_address,
+            NoteValue::zero(),
+            signed_rho,
+            &mut *rng,
+        )
+    };
 
     // Condition 2: nullifier integrity — nf_signed is a public input.
     let nf_signed = signed_note.nullifier(fvk);
 
     // Condition 6: output note commitment integrity.
     // The output note is sent to the voting hotkey address with rho = nf_signed.
-    let output_note = Note::new(
-        output_recipient,
-        NoteValue::zero(),
-        Rho::from_nf_old(nf_signed),
-        &mut *rng,
-    );
+    let output_rho = Rho::from_nf_old(nf_signed);
+    let output_note = if let Some(pre) = precomputed {
+        let rseed = RandomSeed::from_bytes(pre.rseed_output, &output_rho)
+            .expect("precomputed rseed_output must be valid");
+        Note::from_parts(output_recipient, NoteValue::zero(), output_rho, rseed)
+            .expect("precomputed output note must be valid")
+    } else {
+        Note::new(
+            output_recipient,
+            NoteValue::zero(),
+            output_rho,
+            &mut *rng,
+        )
+    };
     let cmx_new = ExtractedNoteCommitment::from(output_note.commitment()).inner();
 
     // Condition 4: spend authority — rk is the randomized spend key.
@@ -449,6 +503,7 @@ mod tests {
             van_comm_rand,
             &imt,
             &mut rng,
+            None,
         )
         .unwrap();
 
@@ -510,6 +565,7 @@ mod tests {
             van_comm_rand,
             &imt,
             &mut rng,
+            None,
         )
         .unwrap();
 
@@ -545,6 +601,7 @@ mod tests {
             pallas::Base::random(&mut rng),
             &imt,
             &mut rng,
+            None,
         );
 
         assert!(matches!(
@@ -592,6 +649,7 @@ mod tests {
             pallas::Base::random(&mut rng),
             &imt,
             &mut rng,
+            None,
         );
 
         assert!(matches!(

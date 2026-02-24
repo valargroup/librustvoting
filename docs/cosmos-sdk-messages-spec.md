@@ -344,7 +344,7 @@ Current client implementation uses a custom domain-separated Blake2b-256 sighash
 
 References:
 
-- `librustvoting/src/action.rs` (`encode_delegation_action_bytes`, `construct_delegation_action`)
+- `librustvoting/src/action.rs` (`encode_delegation_action_bytes`, `build_governance_pczt`)
 
 #### Public Inputs to ZKP #1 Verifier
 

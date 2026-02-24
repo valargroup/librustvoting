@@ -155,26 +155,27 @@ function App() {
       return;
     }
 
-    const snapshotHeight = parseInt(round.settings.snapshotHeight, 10) || 0;
+    let snapshotHeight = parseInt(round.settings.snapshotHeight, 10) || 0;
     if (snapshotHeight === 0) {
       setPublishStatus("error");
       setPublishError("Snapshot height must be set to a non-zero value in Round Settings.");
       return;
     }
 
-    // Block submission if snapshot height doesn't match the nullifier service NH.
+    // Verify the snapshot height against the nullifier service. If they differ,
+    // auto-update to the current NH so the user doesn't hit a race condition
+    // (NH can advance between "Use NH" click and publish confirmation).
     try {
       const nhStatus = await chainApi.getNullifierStatus();
       const nhHeight = nhStatus.latest_height;
       if (nhHeight != null && nhHeight !== snapshotHeight) {
-        setPublishStatus("error");
-        setPublishError(
-          `Snapshot height ${snapshotHeight.toLocaleString()} doesn't match NH (Nullifier Service Snapshot Height: ${nhHeight.toLocaleString()}). Ensure that your nullifier service snapshot is synced to the selected height.`
-        );
-        return;
+        snapshotHeight = nhHeight;
+        store.updateRound(round.id, {
+          settings: { ...round.settings, snapshotHeight: String(nhHeight) },
+        });
       }
     } catch {
-      // If the nullifier service is unreachable, proceed with a warning — don't hard-block.
+      // If the nullifier service is unreachable, proceed with the user-set height.
     }
 
     if (!round.settings.endTime) {
@@ -233,7 +234,10 @@ function App() {
     [setSection]
   );
 
-  const sampleRound = store.rounds.find((r) => r.name.includes("(SAMPLE)"));
+  const handleCreateSampleRound = useCallback(() => {
+    store.createSampleRound();
+    setSection("builder");
+  }, [store]);
 
   return (
     <div className="flex h-screen overflow-hidden bg-surface-0">
@@ -262,11 +266,7 @@ function App() {
         {section === "about" && (
           <AboutPage
             onCreateRound={handleCreateRound}
-            onOpenSample={
-              sampleRound
-                ? () => handleSelectRound(sampleRound.id)
-                : undefined
-            }
+            onOpenSample={handleCreateSampleRound}
           />
         )}
 
@@ -681,7 +681,7 @@ function AboutPage({
   onOpenSample,
 }: {
   onCreateRound: () => void;
-  onOpenSample?: () => void;
+  onOpenSample: () => void;
 }) {
   return (
     <div className="flex-1 overflow-y-auto">
@@ -716,25 +716,23 @@ function AboutPage({
           Getting started
         </h2>
         <div className="space-y-3 mb-8">
-          {onOpenSample && (
-            <button
-              onClick={onOpenSample}
-              className="w-full flex items-start gap-3 bg-surface-1 border border-border-subtle hover:border-accent/30 rounded-xl p-4 text-left transition-colors cursor-pointer group"
-            >
-              <div className="w-8 h-8 rounded-lg bg-accent/10 flex items-center justify-center shrink-0 mt-0.5">
-                <FileText size={16} className="text-accent" />
-              </div>
-              <div>
-                <p className="text-xs font-semibold text-text-primary group-hover:text-accent-glow transition-colors">
-                  Open the sample round
-                </p>
-                <p className="text-[11px] text-text-muted mt-0.5">
-                  Explore a pre-loaded draft based on NU7 Sentiment Polling
-                  with 11 proposals to see how the builder works.
-                </p>
-              </div>
-            </button>
-          )}
+          <button
+            onClick={onOpenSample}
+            className="w-full flex items-start gap-3 bg-surface-1 border border-border-subtle hover:border-accent/30 rounded-xl p-4 text-left transition-colors cursor-pointer group"
+          >
+            <div className="w-8 h-8 rounded-lg bg-accent/10 flex items-center justify-center shrink-0 mt-0.5">
+              <FileText size={16} className="text-accent" />
+            </div>
+            <div>
+              <p className="text-xs font-semibold text-text-primary group-hover:text-accent-glow transition-colors">
+                Start from a sample round
+              </p>
+              <p className="text-[11px] text-text-muted mt-0.5">
+                Create a new draft pre-loaded with 3 sample NU7 proposals
+                to see how the builder works.
+              </p>
+            </div>
+          </button>
 
           <button
             onClick={onCreateRound}

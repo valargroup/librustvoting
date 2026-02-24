@@ -189,6 +189,7 @@ fn imt_proof_from_nullifier_tree_verifies_in_circuit() {
         van_comm_rand,
         &adapter,
         &mut rng,
+        None,
     )
     .expect("build_delegation_bundle should succeed");
 
@@ -242,6 +243,7 @@ fn four_notes_with_nullifier_tree_verify_in_circuit() {
         van_comm_rand,
         &adapter,
         &mut rng,
+        None,
     )
     .expect("build_delegation_bundle should succeed");
 

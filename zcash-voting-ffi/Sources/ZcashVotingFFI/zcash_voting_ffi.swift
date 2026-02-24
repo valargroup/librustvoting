@@ -563,8 +563,6 @@ public protocol VotingDatabaseProtocol: AnyObject, Sendable {
 
     func clearRound(roundId: String) throws
 
-    func constructDelegationAction(roundId: String, bundleIndex: UInt32, notes: [NoteInfo], fvkBytes: Data, gDNewX: Data, pkDNewX: Data, hotkeyRawAddress: Data, addressIndex: UInt32) throws  -> DelegationAction
-
     func encryptShares(roundId: String, shares: [UInt64]) throws  -> [EncryptedShare]
 
     func generateHotkey(roundId: String, seed: Data) throws  -> VotingHotkey
@@ -595,6 +593,14 @@ public protocol VotingDatabaseProtocol: AnyObject, Sendable {
      * seed, computes the canonical sighash, and signs it.
      */
     func getDelegationSubmission(roundId: String, bundleIndex: UInt32, senderSeed: Data, networkId: UInt32, accountIndex: UInt32) throws  -> DelegationSubmission
+
+    /**
+     * Reconstruct the delegation TX payload using a Keystone-provided signature.
+     *
+     * Unlike `get_delegation_submission`, this does NOT derive `ask` from a seed.
+     * It uses the externally-provided Keystone signature and the ZIP-244 sighash.
+     */
+    func getDelegationSubmissionWithKeystoneSig(roundId: String, bundleIndex: UInt32, keystoneSig: Data, keystoneSighash: Data) throws  -> DelegationSubmission
 
     func getRoundState(roundId: String) throws  -> RoundState
 
@@ -772,21 +778,6 @@ open func clearRound(roundId: String)throws   {try rustCallWithError(FfiConverte
 }
 }
 
-open func constructDelegationAction(roundId: String, bundleIndex: UInt32, notes: [NoteInfo], fvkBytes: Data, gDNewX: Data, pkDNewX: Data, hotkeyRawAddress: Data, addressIndex: UInt32)throws  -> DelegationAction  {
-    return try  FfiConverterTypeDelegationAction_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
-    uniffi_zcash_voting_ffi_fn_method_votingdatabase_construct_delegation_action(self.uniffiClonePointer(),
-        FfiConverterString.lower(roundId),
-        FfiConverterUInt32.lower(bundleIndex),
-        FfiConverterSequenceTypeNoteInfo.lower(notes),
-        FfiConverterData.lower(fvkBytes),
-        FfiConverterData.lower(gDNewX),
-        FfiConverterData.lower(pkDNewX),
-        FfiConverterData.lower(hotkeyRawAddress),
-        FfiConverterUInt32.lower(addressIndex),$0
-    )
-})
-}
-
 open func encryptShares(roundId: String, shares: [UInt64])throws  -> [EncryptedShare]  {
     return try  FfiConverterSequenceTypeEncryptedShare.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_method_votingdatabase_encrypt_shares(self.uniffiClonePointer(),
@@ -861,6 +852,23 @@ open func getDelegationSubmission(roundId: String, bundleIndex: UInt32, senderSe
         FfiConverterData.lower(senderSeed),
         FfiConverterUInt32.lower(networkId),
         FfiConverterUInt32.lower(accountIndex),$0
+    )
+})
+}
+
+    /**
+     * Reconstruct the delegation TX payload using a Keystone-provided signature.
+     *
+     * Unlike `get_delegation_submission`, this does NOT derive `ask` from a seed.
+     * It uses the externally-provided Keystone signature and the ZIP-244 sighash.
+     */
+open func getDelegationSubmissionWithKeystoneSig(roundId: String, bundleIndex: UInt32, keystoneSig: Data, keystoneSighash: Data)throws  -> DelegationSubmission  {
+    return try  FfiConverterTypeDelegationSubmission_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
+    uniffi_zcash_voting_ffi_fn_method_votingdatabase_get_delegation_submission_with_keystone_sig(self.uniffiClonePointer(),
+        FfiConverterString.lower(roundId),
+        FfiConverterUInt32.lower(bundleIndex),
+        FfiConverterData.lower(keystoneSig),
+        FfiConverterData.lower(keystoneSighash),$0
     )
 })
 }
@@ -1203,172 +1211,6 @@ public func FfiConverterTypeCastVoteSignature_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeCastVoteSignature_lower(_ value: CastVoteSignature) -> RustBuffer {
     return FfiConverterTypeCastVoteSignature.lower(value)
-}
-
-
-public struct DelegationAction {
-    public var actionBytes: Data
-    public var rk: Data
-    public var govNullifiers: [Data]
-    public var van: Data
-    public var vanCommRand: Data
-    public var dummyNullifiers: [Data]
-    public var rhoSigned: Data
-    public var paddedCmx: [Data]
-    public var nfSigned: Data
-    public var cmxNew: Data
-    public var alpha: Data
-    public var spendAuthSig: Data?
-    public var rseedSigned: Data
-    public var rseedOutput: Data
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(actionBytes: Data, rk: Data, govNullifiers: [Data], van: Data, vanCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], nfSigned: Data, cmxNew: Data, alpha: Data, spendAuthSig: Data?, rseedSigned: Data, rseedOutput: Data) {
-        self.actionBytes = actionBytes
-        self.rk = rk
-        self.govNullifiers = govNullifiers
-        self.van = van
-        self.vanCommRand = vanCommRand
-        self.dummyNullifiers = dummyNullifiers
-        self.rhoSigned = rhoSigned
-        self.paddedCmx = paddedCmx
-        self.nfSigned = nfSigned
-        self.cmxNew = cmxNew
-        self.alpha = alpha
-        self.spendAuthSig = spendAuthSig
-        self.rseedSigned = rseedSigned
-        self.rseedOutput = rseedOutput
-    }
-}
-
-#if compiler(>=6)
-extension DelegationAction: Sendable {}
-#endif
-
-
-extension DelegationAction: Equatable, Hashable {
-    public static func ==(lhs: DelegationAction, rhs: DelegationAction) -> Bool {
-        if lhs.actionBytes != rhs.actionBytes {
-            return false
-        }
-        if lhs.rk != rhs.rk {
-            return false
-        }
-        if lhs.govNullifiers != rhs.govNullifiers {
-            return false
-        }
-        if lhs.van != rhs.van {
-            return false
-        }
-        if lhs.vanCommRand != rhs.vanCommRand {
-            return false
-        }
-        if lhs.dummyNullifiers != rhs.dummyNullifiers {
-            return false
-        }
-        if lhs.rhoSigned != rhs.rhoSigned {
-            return false
-        }
-        if lhs.paddedCmx != rhs.paddedCmx {
-            return false
-        }
-        if lhs.nfSigned != rhs.nfSigned {
-            return false
-        }
-        if lhs.cmxNew != rhs.cmxNew {
-            return false
-        }
-        if lhs.alpha != rhs.alpha {
-            return false
-        }
-        if lhs.spendAuthSig != rhs.spendAuthSig {
-            return false
-        }
-        if lhs.rseedSigned != rhs.rseedSigned {
-            return false
-        }
-        if lhs.rseedOutput != rhs.rseedOutput {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(actionBytes)
-        hasher.combine(rk)
-        hasher.combine(govNullifiers)
-        hasher.combine(van)
-        hasher.combine(vanCommRand)
-        hasher.combine(dummyNullifiers)
-        hasher.combine(rhoSigned)
-        hasher.combine(paddedCmx)
-        hasher.combine(nfSigned)
-        hasher.combine(cmxNew)
-        hasher.combine(alpha)
-        hasher.combine(spendAuthSig)
-        hasher.combine(rseedSigned)
-        hasher.combine(rseedOutput)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeDelegationAction: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DelegationAction {
-        return
-            try DelegationAction(
-                actionBytes: FfiConverterData.read(from: &buf),
-                rk: FfiConverterData.read(from: &buf),
-                govNullifiers: FfiConverterSequenceData.read(from: &buf),
-                van: FfiConverterData.read(from: &buf),
-                vanCommRand: FfiConverterData.read(from: &buf),
-                dummyNullifiers: FfiConverterSequenceData.read(from: &buf),
-                rhoSigned: FfiConverterData.read(from: &buf),
-                paddedCmx: FfiConverterSequenceData.read(from: &buf),
-                nfSigned: FfiConverterData.read(from: &buf),
-                cmxNew: FfiConverterData.read(from: &buf),
-                alpha: FfiConverterData.read(from: &buf),
-                spendAuthSig: FfiConverterOptionData.read(from: &buf),
-                rseedSigned: FfiConverterData.read(from: &buf),
-                rseedOutput: FfiConverterData.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: DelegationAction, into buf: inout [UInt8]) {
-        FfiConverterData.write(value.actionBytes, into: &buf)
-        FfiConverterData.write(value.rk, into: &buf)
-        FfiConverterSequenceData.write(value.govNullifiers, into: &buf)
-        FfiConverterData.write(value.van, into: &buf)
-        FfiConverterData.write(value.vanCommRand, into: &buf)
-        FfiConverterSequenceData.write(value.dummyNullifiers, into: &buf)
-        FfiConverterData.write(value.rhoSigned, into: &buf)
-        FfiConverterSequenceData.write(value.paddedCmx, into: &buf)
-        FfiConverterData.write(value.nfSigned, into: &buf)
-        FfiConverterData.write(value.cmxNew, into: &buf)
-        FfiConverterData.write(value.alpha, into: &buf)
-        FfiConverterOptionData.write(value.spendAuthSig, into: &buf)
-        FfiConverterData.write(value.rseedSigned, into: &buf)
-        FfiConverterData.write(value.rseedOutput, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeDelegationAction_lift(_ buf: RustBuffer) throws -> DelegationAction {
-    return try FfiConverterTypeDelegationAction.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeDelegationAction_lower(_ value: DelegationAction) -> RustBuffer {
-    return FfiConverterTypeDelegationAction.lower(value)
 }
 
 
@@ -1858,10 +1700,12 @@ public struct GovernancePczt {
     public var rseedOutput: Data
     public var actionBytes: Data
     public var actionIndex: UInt32
+    public var paddedNoteSecrets: [[Data]]
+    public var pcztSighash: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(pcztBytes: Data, rk: Data, alpha: Data, nfSigned: Data, cmxNew: Data, govNullifiers: [Data], van: Data, vanCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], rseedSigned: Data, rseedOutput: Data, actionBytes: Data, actionIndex: UInt32) {
+    public init(pcztBytes: Data, rk: Data, alpha: Data, nfSigned: Data, cmxNew: Data, govNullifiers: [Data], van: Data, vanCommRand: Data, dummyNullifiers: [Data], rhoSigned: Data, paddedCmx: [Data], rseedSigned: Data, rseedOutput: Data, actionBytes: Data, actionIndex: UInt32, paddedNoteSecrets: [[Data]], pcztSighash: Data) {
         self.pcztBytes = pcztBytes
         self.rk = rk
         self.alpha = alpha
@@ -1877,6 +1721,8 @@ public struct GovernancePczt {
         self.rseedOutput = rseedOutput
         self.actionBytes = actionBytes
         self.actionIndex = actionIndex
+        self.paddedNoteSecrets = paddedNoteSecrets
+        self.pcztSighash = pcztSighash
     }
 }
 
@@ -1932,6 +1778,12 @@ extension GovernancePczt: Equatable, Hashable {
         if lhs.actionIndex != rhs.actionIndex {
             return false
         }
+        if lhs.paddedNoteSecrets != rhs.paddedNoteSecrets {
+            return false
+        }
+        if lhs.pcztSighash != rhs.pcztSighash {
+            return false
+        }
         return true
     }
 
@@ -1951,6 +1803,8 @@ extension GovernancePczt: Equatable, Hashable {
         hasher.combine(rseedOutput)
         hasher.combine(actionBytes)
         hasher.combine(actionIndex)
+        hasher.combine(paddedNoteSecrets)
+        hasher.combine(pcztSighash)
     }
 }
 
@@ -1977,7 +1831,9 @@ public struct FfiConverterTypeGovernancePczt: FfiConverterRustBuffer {
                 rseedSigned: FfiConverterData.read(from: &buf),
                 rseedOutput: FfiConverterData.read(from: &buf),
                 actionBytes: FfiConverterData.read(from: &buf),
-                actionIndex: FfiConverterUInt32.read(from: &buf)
+                actionIndex: FfiConverterUInt32.read(from: &buf),
+                paddedNoteSecrets: FfiConverterSequenceSequenceData.read(from: &buf),
+                pcztSighash: FfiConverterData.read(from: &buf)
         )
     }
 
@@ -1997,6 +1853,8 @@ public struct FfiConverterTypeGovernancePczt: FfiConverterRustBuffer {
         FfiConverterData.write(value.rseedOutput, into: &buf)
         FfiConverterData.write(value.actionBytes, into: &buf)
         FfiConverterUInt32.write(value.actionIndex, into: &buf)
+        FfiConverterSequenceSequenceData.write(value.paddedNoteSecrets, into: &buf)
+        FfiConverterData.write(value.pcztSighash, into: &buf)
     }
 }
 
@@ -3418,30 +3276,6 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
-    typealias SwiftType = Data?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterData.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterData.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterSequenceUInt64: FfiConverterRustBuffer {
     typealias SwiftType = [UInt64]
 
@@ -3638,6 +3472,31 @@ fileprivate struct FfiConverterSequenceTypeWitnessData: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [[Data]]
+
+    public static func write(_ value: [[Data]], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterSequenceData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [[Data]] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [[Data]]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterSequenceData.read(from: &buf))
+        }
+        return seq
+    }
+}
 public func buildGovernancePczt(notes: [NoteInfo], params: VotingRoundParams, fvkBytes: Data, hotkeyRawAddress: Data, consensusBranchId: UInt32, coinType: UInt32, seedFingerprint: Data, accountIndex: UInt32, roundName: String)throws  -> GovernancePczt  {
     return try  FfiConverterTypeGovernancePczt_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_func_build_governance_pczt(
@@ -3689,18 +3548,6 @@ public func buildVoteCommitment(hotkeySeed: Data, networkId: UInt32, addressInde
     )
 })
 }
-public func constructDelegationAction(notes: [NoteInfo], params: VotingRoundParams, fvkBytes: Data, gDNewX: Data, pkDNewX: Data, hotkeyRawAddress: Data)throws  -> DelegationAction  {
-    return try  FfiConverterTypeDelegationAction_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
-    uniffi_zcash_voting_ffi_fn_func_construct_delegation_action(
-        FfiConverterSequenceTypeNoteInfo.lower(notes),
-        FfiConverterTypeVotingRoundParams_lower(params),
-        FfiConverterData.lower(fvkBytes),
-        FfiConverterData.lower(gDNewX),
-        FfiConverterData.lower(pkDNewX),
-        FfiConverterData.lower(hotkeyRawAddress),$0
-    )
-})
-}
 public func decomposeWeight(weight: UInt64) -> [UInt64]  {
     return try!  FfiConverterSequenceUInt64.lift(try! rustCall() {
     uniffi_zcash_voting_ffi_fn_func_decompose_weight(
@@ -3727,6 +3574,35 @@ public func extractNcRoot(treeStateBytes: Data)throws  -> Data  {
     )
 })
 }
+/**
+ * Extract the 96-byte Orchard FVK from a UFVK string.
+ *
+ * Decodes a Bech32-encoded Unified Full Viewing Key string and returns the
+ * raw 96-byte Orchard component (ak[32] || nk[32] || rivk[32]).
+ * Used for Keystone accounts where the FVK must come from the note's UFVK
+ * rather than being derived from the app's seed.
+ */
+public func extractOrchardFvkFromUfvk(ufvkStr: String, networkId: UInt32)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
+    uniffi_zcash_voting_ffi_fn_func_extract_orchard_fvk_from_ufvk(
+        FfiConverterString.lower(ufvkStr),
+        FfiConverterUInt32.lower(networkId),$0
+    )
+})
+}
+/**
+ * Extract the ZIP-244 shielded sighash from finalized PCZT bytes.
+ *
+ * Returns the 32-byte sighash that Keystone signs internally. Used to construct
+ * the delegation submission with the correct sighash for chain verification.
+ */
+public func extractPcztSighash(pcztBytes: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
+    uniffi_zcash_voting_ffi_fn_func_extract_pczt_sighash(
+        FfiConverterData.lower(pcztBytes),$0
+    )
+})
+}
 public func extractSpendAuthSig(signedPcztBytes: Data, actionIndex: UInt32)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_func_extract_spend_auth_sig(
@@ -3742,6 +3618,25 @@ public func generateDelegationInputs(senderSeed: Data, hotkeySeed: Data, network
         FfiConverterData.lower(hotkeySeed),
         FfiConverterUInt32.lower(networkId),
         FfiConverterUInt32.lower(accountIndex),$0
+    )
+})
+}
+/**
+ * Derive delegation inputs using an explicit FVK instead of deriving from sender seed.
+ *
+ * For Keystone accounts, the notes carry the Keystone's UFVK in the wallet DB.
+ * This function uses the provided FVK bytes directly (from the note's `ufvk_str`)
+ * instead of deriving from a seed, ensuring the prover and PCZT builder use the
+ * same `ak`.
+ */
+public func generateDelegationInputsWithFvk(fvkBytes: Data, hotkeySeed: Data, networkId: UInt32, accountIndex: UInt32, seedFingerprint: Data)throws  -> DelegationInputs  {
+    return try  FfiConverterTypeDelegationInputs_lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
+    uniffi_zcash_voting_ffi_fn_func_generate_delegation_inputs_with_fvk(
+        FfiConverterData.lower(fvkBytes),
+        FfiConverterData.lower(hotkeySeed),
+        FfiConverterUInt32.lower(networkId),
+        FfiConverterUInt32.lower(accountIndex),
+        FfiConverterData.lower(seedFingerprint),$0
     )
 })
 }
@@ -3821,9 +3716,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_func_build_vote_commitment() != 57877) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_func_construct_delegation_action() != 58555) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_zcash_voting_ffi_checksum_func_decompose_weight() != 39624) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3833,10 +3725,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_func_extract_nc_root() != 12696) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_zcash_voting_ffi_checksum_func_extract_orchard_fvk_from_ufvk() != 5903) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zcash_voting_ffi_checksum_func_extract_pczt_sighash() != 42430) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_zcash_voting_ffi_checksum_func_extract_spend_auth_sig() != 27072) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_func_generate_delegation_inputs() != 38782) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zcash_voting_ffi_checksum_func_generate_delegation_inputs_with_fvk() != 43650) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_func_generate_hotkey() != 8015) {
@@ -3869,9 +3770,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_clear_round() != 15915) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_construct_delegation_action() != 52251) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_encrypt_shares() != 46668) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3888,6 +3786,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_get_delegation_submission() != 39403) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_get_delegation_submission_with_keystone_sig() != 20622) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_get_round_state() != 4975) {

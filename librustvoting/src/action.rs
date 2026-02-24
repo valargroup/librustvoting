@@ -6,7 +6,7 @@ use rand::RngCore;
 use subtle::CtOption;
 
 use orchard::builder::{Builder, BundleType};
-use orchard::keys::{FullViewingKey, SpendValidatingKey};
+use orchard::keys::FullViewingKey;
 use orchard::note::{ExtractedNoteCommitment, RandomSeed, Rho};
 use orchard::pczt::Zip32Derivation;
 use orchard::tree::{MerkleHashOrchard, MerklePath};
@@ -19,7 +19,7 @@ const MERKLE_DEPTH: usize = 32;
 
 use crate::governance;
 use crate::types::{
-    validate_notes, validate_round_params, DelegationAction, GovernancePczt, NoteInfo, VotingError,
+    validate_notes, validate_round_params, GovernancePczt, NoteInfo, VotingError,
     VotingRoundParams,
 };
 
@@ -150,237 +150,6 @@ fn encode_delegation_action_bytes(
     Ok(out)
 }
 
-/// Construct the delegation action for Keystone signing.
-///
-/// Computes real governance nullifiers (padded to 5), VAN, constrained rho (§1.3.4.1),
-/// signed note + output note (§1.3.4.2, §1.3.6), and rk.
-///
-/// - `fvk_bytes`: 96-byte orchard FullViewingKey (ak[32] || nk[32] || rivk[32])
-/// - `g_d_new_x`: 32-byte x-coordinate of hotkey diversified generator (for VAN)
-/// - `pk_d_new_x`: 32-byte x-coordinate of hotkey transmission key (for VAN)
-/// - `hotkey_raw_address`: 43-byte hotkey raw orchard address (for output note)
-pub fn construct_delegation_action(
-    notes: &[NoteInfo],
-    params: &VotingRoundParams,
-    fvk_bytes: &[u8],
-    g_d_new_x: &[u8],
-    pk_d_new_x: &[u8],
-    hotkey_raw_address: &[u8],
-) -> Result<DelegationAction, VotingError> {
-    validate_notes(notes)?;
-    validate_round_params(params)?;
-    crate::types::validate_32_bytes(g_d_new_x, "g_d_new_x")?;
-    crate::types::validate_32_bytes(pk_d_new_x, "pk_d_new_x")?;
-
-    // Parse FVK from 96 bytes: ak[32] || nk[32] || rivk[32]
-    let fvk_96: [u8; 96] = fvk_bytes
-        .try_into()
-        .map_err(|_| VotingError::InvalidInput {
-            message: format!("fvk_bytes must be 96 bytes, got {}", fvk_bytes.len()),
-        })?;
-    let fvk = FullViewingKey::from_bytes(&fvk_96).ok_or_else(|| VotingError::InvalidInput {
-        message: "fvk_bytes is not a valid orchard FullViewingKey".to_string(),
-    })?;
-    // nk bytes for gov nullifier derivation (middle 32 bytes of FVK serialization)
-    let nk_bytes = &fvk_bytes[32..64];
-
-    // Parse hotkey raw address (43 bytes: 11-byte diversifier + 32-byte pk_d)
-    let addr_43: [u8; 43] =
-        hotkey_raw_address
-            .try_into()
-            .map_err(|_| VotingError::InvalidInput {
-                message: format!(
-                    "hotkey_raw_address must be 43 bytes, got {}",
-                    hotkey_raw_address.len()
-                ),
-            })?;
-    let hotkey_addr: Address = Address::from_raw_address_bytes(&addr_43)
-        .into_option()
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: "hotkey_raw_address is not a valid orchard address".to_string(),
-        })?;
-
-    // Enforce VAN hotkey coordinates match the output note hotkey address.
-    // This aligns with Gov Steps §1.3.6 / ZKP #1 conditions 6 & 7.
-    let (derived_g_d_new_x, derived_pk_d_new_x) =
-        derive_hotkey_x_coords_from_raw_address(&addr_43)?;
-    if g_d_new_x != derived_g_d_new_x.as_slice() {
-        return Err(VotingError::InvalidInput {
-            message: "g_d_new_x does not match hotkey_raw_address diversifier".to_string(),
-        });
-    }
-    if pk_d_new_x != derived_pk_d_new_x.as_slice() {
-        return Err(VotingError::InvalidInput {
-            message: "pk_d_new_x does not match hotkey_raw_address pk_d".to_string(),
-        });
-    }
-
-    // Convert vote_round_id from hex string to exactly 32 bytes.
-    // Rejecting non-32-byte values prevents silent truncation/padding collisions.
-    let vote_round_id_bytes =
-        hex::decode(&params.vote_round_id).map_err(|e| VotingError::InvalidInput {
-            message: format!("vote_round_id is not valid hex: {}", e),
-        })?;
-    crate::types::validate_32_bytes(&vote_round_id_bytes, "vote_round_id (decoded hex)")?;
-    // Safe: validate_32_bytes already ensures exactly 32 bytes.
-    let vri_32: [u8; 32] = vote_round_id_bytes
-        .try_into()
-        .expect("validated as 32 bytes above");
-
-    let mut rng = rand::thread_rng();
-
-    // Compute real gov nullifiers for each input note
-    let mut gov_nullifiers: Vec<Vec<u8>> = Vec::with_capacity(5);
-    for note in notes {
-        let gov_null = governance::derive_gov_nullifier(nk_bytes, &vri_32, &note.nullifier)?;
-        gov_nullifiers.push(gov_null);
-    }
-
-    // --- Padded note generation using orchard Note API ---
-    // Use the sender's FVK for padded notes (spec §1.3.5: same ivk as real notes).
-    let mut padded_cmx: Vec<Vec<u8>> = Vec::new();
-    let mut dummy_nullifiers: Vec<Vec<u8>> = Vec::new();
-    let n_real = notes.len();
-
-    if n_real < 5 {
-        for i in n_real..5 {
-            // Derive a unique address for each padded note from the sender's FVK
-            let pad_addr = fvk.address_at(1000u32 + i as u32, Scope::External);
-
-            // Generate a random Rho (represents the "previous nullifier" for this padded note)
-            let rho = random_rho(&mut rng);
-
-            // Construct the padded note with value=1 zatoshi
-            let (pad_note, _) = make_dummy_note(pad_addr, rho, &mut rng)?;
-
-            let cmx: ExtractedNoteCommitment = pad_note.commitment().into();
-            let real_nf = pad_note.nullifier(&fvk);
-
-            let gov_null =
-                governance::derive_gov_nullifier(nk_bytes, &vri_32, &real_nf.to_bytes())?;
-
-            padded_cmx.push(cmx.to_bytes().to_vec());
-            gov_nullifiers.push(gov_null);
-            dummy_nullifiers.push(real_nf.to_bytes().to_vec());
-        }
-    }
-
-    // Compute per-bundle weight from note values (checked to prevent silent overflow)
-    let total_weight: u64 = notes
-        .iter()
-        .try_fold(0u64, |acc, n| acc.checked_add(n.value))
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: "total note weight overflows u64".to_string(),
-        })?;
-
-    // Sample van_comm_rand as a proper random field element
-    let van_comm_rand_fp = pallas::Base::random(&mut rng);
-    let van_comm_rand: [u8; 32] = van_comm_rand_fp.to_repr();
-
-    // Compute real VAN
-    let van = governance::construct_van(
-        &derived_g_d_new_x,
-        &derived_pk_d_new_x,
-        total_weight,
-        &vri_32,
-        &van_comm_rand,
-    )?;
-
-    // Collect all 5 cmx values: real from NoteInfo.commitment, padded from above
-    let mut all_cmx: Vec<Vec<u8>> = Vec::with_capacity(5);
-    for note in notes {
-        all_cmx.push(note.commitment.clone());
-    }
-    all_cmx.extend(padded_cmx.iter().cloned());
-    if all_cmx.len() != 5 {
-        return Err(VotingError::Internal {
-            message: format!("expected 5 cmx values, got {}", all_cmx.len()),
-        });
-    }
-
-    // Compute rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, cmx_5, van_comm, vote_round_id)
-    let rho_signed = governance::compute_rho_binding(
-        &all_cmx[0],
-        &all_cmx[1],
-        &all_cmx[2],
-        &all_cmx[3],
-        &all_cmx[4],
-        &van,
-        &vri_32,
-    )?;
-
-    // --- Signed note construction (§1.3.4.2) ---
-    // Parse rho_signed as Rho for note construction
-    let rho_signed_32: [u8; 32] = rho_signed
-        .clone()
-        .try_into()
-        .expect("rho_signed is 32 bytes from compute_rho_binding");
-    let rho_for_note: Rho = Rho::from_bytes(&rho_signed_32)
-        .into_option()
-        .ok_or_else(|| VotingError::Internal {
-            message: "rho_signed is not a valid Pallas field element for Rho".to_string(),
-        })?;
-
-    // Sender address from FVK (diversifier index 0)
-    let sender_address = fvk.address_at(0u32, Scope::External);
-
-    // Build signed note: v=1 zatoshi, address from sender, rho = rho_signed (§1.3.4.2)
-    let (signed_note, rseed_signed_bytes) = make_dummy_note(sender_address, rho_for_note, &mut rng)?;
-
-    // Derive nullifier (§1.3.4.2: DeriveNullifier_nk(rho_signed, psi_signed, cm_signed))
-    let nf_signed = signed_note.nullifier(&fvk);
-    let nf_signed_bytes: [u8; 32] = nf_signed.to_bytes();
-
-    // --- Output note construction (§1.3.6) ---
-    // Rho for output note = nf_signed (standard Orchard chaining).
-    // Construct Rho from the nullifier bytes (nf_signed is already a valid field element).
-    let rho_output: Rho = Rho::from_bytes(&nf_signed_bytes)
-        .into_option()
-        .ok_or_else(|| VotingError::Internal {
-            message: "nf_signed is not a valid Pallas field element for Rho".to_string(),
-        })?;
-
-    // Output note: to hotkey address, v=1 zatoshi, rho = nf_signed
-    let (output_note, rseed_output_bytes) = make_dummy_note(hotkey_addr, rho_output, &mut rng)?;
-    let cmx_new: ExtractedNoteCommitment = output_note.commitment().into();
-    let cmx_new_bytes: [u8; 32] = cmx_new.to_bytes();
-
-    // --- Compute rk (§1.3.6) ---
-    // Extract ak from FVK for spend auth randomization
-    let ak: SpendValidatingKey = fvk.clone().into();
-    let alpha = pallas::Scalar::random(&mut rng);
-    let rk_vk = ak.randomize(&alpha);
-    let rk_bytes: [u8; 32] = (&rk_vk).into();
-    let alpha_bytes: [u8; 32] = alpha.to_repr();
-
-    // --- Compute action_bytes ---
-    let action_bytes = encode_delegation_action_bytes(
-        &nf_signed_bytes,
-        &rk_bytes,
-        &cmx_new_bytes,
-        &van,
-        &gov_nullifiers,
-        &vri_32,
-    )?;
-
-    Ok(DelegationAction {
-        action_bytes,
-        rk: rk_bytes.to_vec(),
-        gov_nullifiers,
-        van,
-        van_comm_rand: van_comm_rand.to_vec(),
-        dummy_nullifiers,
-        rho_signed,
-        padded_cmx,
-        nf_signed: nf_signed_bytes.to_vec(),
-        cmx_new: cmx_new_bytes.to_vec(),
-        alpha: alpha_bytes.to_vec(),
-        spend_auth_sig: None,
-        rseed_signed: rseed_signed_bytes.to_vec(),
-        rseed_output: rseed_output_bytes.to_vec(),
-    })
-}
-
 /// Build a governance-specific PCZT for Keystone signing.
 ///
 /// Constructs a PCZT whose single real Orchard action is the governance dummy action
@@ -455,22 +224,23 @@ pub fn build_governance_pczt(
 
     let mut rng = rand::thread_rng();
 
-    // --- Compute governance nullifiers (same as construct_delegation_action) ---
+    // --- Compute governance nullifiers ---
     let mut gov_nullifiers: Vec<Vec<u8>> = Vec::with_capacity(5);
     for note in notes {
         let gov_null = governance::derive_gov_nullifier(nk_bytes, &vri_32, &note.nullifier)?;
         gov_nullifiers.push(gov_null);
     }
 
-    // Padded note generation
+    // Padded note generation (also collect rho+rseed for ZCA-74 randomness threading)
     let mut padded_cmx: Vec<Vec<u8>> = Vec::new();
     let mut dummy_nullifiers: Vec<Vec<u8>> = Vec::new();
+    let mut padded_note_secrets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let n_real = notes.len();
     if n_real < 5 {
         for i in n_real..5 {
             let pad_addr = fvk.address_at(1000u32 + i as u32, Scope::External);
             let rho = random_rho(&mut rng);
-            let (pad_note, _) = make_dummy_note(pad_addr, rho, &mut rng)?;
+            let (pad_note, rseed_bytes) = make_dummy_note(pad_addr, rho, &mut rng)?;
             let cmx: ExtractedNoteCommitment = pad_note.commitment().into();
             let real_nf = pad_note.nullifier(&fvk);
             let gov_null =
@@ -478,6 +248,9 @@ pub fn build_governance_pczt(
             padded_cmx.push(cmx.to_bytes().to_vec());
             gov_nullifiers.push(gov_null);
             dummy_nullifiers.push(real_nf.to_bytes().to_vec());
+            // Store rho + rseed for this padded note so Phase 2 can reconstruct it
+            let rho_bytes: [u8; 32] = rho.to_bytes();
+            padded_note_secrets.push((rho_bytes.to_vec(), rseed_bytes.to_vec()));
         }
     }
 
@@ -693,6 +466,10 @@ pub fn build_governance_pczt(
 
     let pczt_bytes = pczt.serialize();
 
+    // --- Extract ZIP-244 sighash ---
+    // This is the sighash that Keystone signs; the non-Keystone path also uses it.
+    let pczt_sighash = extract_pczt_sighash(&pczt_bytes)?;
+
     // --- Encode canonical action bytes for cosmos chain ---
     let action_bytes = encode_delegation_action_bytes(
         &nf_signed_bytes,
@@ -719,7 +496,24 @@ pub fn build_governance_pczt(
         rseed_output: rseed_output_bytes.to_vec(),
         action_bytes,
         action_index: spend_idx,
+        padded_note_secrets,
+        pczt_sighash: pczt_sighash.to_vec(),
     })
+}
+
+/// Extract the ZIP-244 shielded sighash from finalized PCZT bytes.
+///
+/// Creates a Signer from the PCZT to compute the v5 signature hash, then
+/// returns it. This is the sighash that Keystone signs internally.
+pub fn extract_pczt_sighash(pczt_bytes: &[u8]) -> Result<[u8; 32], VotingError> {
+    let pczt = pczt::Pczt::parse(pczt_bytes).map_err(|e| VotingError::Internal {
+        message: format!("Failed to parse PCZT: {:?}", e),
+    })?;
+    let signer =
+        pczt::roles::signer::Signer::new(pczt).map_err(|e| VotingError::Internal {
+            message: format!("Failed to create Signer from PCZT: {:?}", e),
+        })?;
+    Ok(signer.shielded_sighash())
 }
 
 /// Extract the spend_auth_sig from a signed PCZT.
@@ -816,415 +610,6 @@ mod tests {
         addr.to_raw_address_bytes().to_vec()
     }
 
-    fn mock_g_d() -> Vec<u8> {
-        let addr_43: [u8; 43] = mock_hotkey_address()
-            .try_into()
-            .expect("mock hotkey address is 43 bytes");
-        let (g_d_x, _) =
-            derive_hotkey_x_coords_from_raw_address(&addr_43).expect("valid mock hotkey address");
-        g_d_x.to_vec()
-    }
-
-    fn mock_pk_d() -> Vec<u8> {
-        let addr_43: [u8; 43] = mock_hotkey_address()
-            .try_into()
-            .expect("mock hotkey address is 43 bytes");
-        let (_, pk_d_x) =
-            derive_hotkey_x_coords_from_raw_address(&addr_43).expect("valid mock hotkey address");
-        pk_d_x.to_vec()
-    }
-
-    #[test]
-    fn test_construct_delegation_action_one_note() {
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        // rk is 32 bytes and NOT the old stub pattern
-        assert_eq!(result.rk.len(), 32);
-        assert_ne!(result.rk, vec![0xDE; 32]);
-
-        // action_bytes is non-empty and NOT the old stub pattern
-        assert!(!result.action_bytes.is_empty());
-        assert_ne!(result.action_bytes, vec![0xDA; 128]);
-
-        // nf_signed is 32 bytes, non-zero
-        assert_eq!(result.nf_signed.len(), 32);
-        assert_ne!(result.nf_signed, vec![0u8; 32]);
-
-        // cmx_new is 32 bytes, non-zero
-        assert_eq!(result.cmx_new.len(), 32);
-        assert_ne!(result.cmx_new, vec![0u8; 32]);
-
-        // alpha is 32 bytes, non-zero
-        assert_eq!(result.alpha.len(), 32);
-        assert_ne!(result.alpha, vec![0u8; 32]);
-
-        // rseed values are 32 bytes each and non-zero
-        assert_eq!(result.rseed_signed.len(), 32);
-        assert_ne!(result.rseed_signed, vec![0u8; 32]);
-        assert_eq!(result.rseed_output.len(), 32);
-        assert_ne!(result.rseed_output, vec![0u8; 32]);
-
-        // Gov nullifiers always padded to 5
-        assert_eq!(result.gov_nullifiers.len(), 5);
-        for gnull in &result.gov_nullifiers {
-            assert_eq!(gnull.len(), 32);
-        }
-
-        // VAN is 32 bytes
-        assert_eq!(result.van.len(), 32);
-        assert_ne!(result.van, vec![0xBB; 32]);
-
-        // van_comm_rand is 32 bytes
-        assert_eq!(result.van_comm_rand.len(), 32);
-
-        // First gov nullifier is real (deterministic for same inputs)
-        assert_ne!(result.gov_nullifiers[0], vec![0xAA; 32]);
-
-        // rho_signed is 32 bytes and non-zero
-        assert_eq!(result.rho_signed.len(), 32);
-        assert_ne!(result.rho_signed, vec![0u8; 32]);
-
-        // padded_cmx: 4 padded notes (1 real + 4 padded = 5)
-        assert_eq!(result.padded_cmx.len(), 4);
-        for cmx in &result.padded_cmx {
-            assert_eq!(cmx.len(), 32);
-        }
-    }
-
-    #[test]
-    fn test_construct_delegation_action_five_notes() {
-        let notes: Vec<NoteInfo> = (0..5)
-            .map(|i| NoteInfo {
-                commitment: vec![i as u8 + 1; 32],
-                nullifier: vec![i as u8 + 0x10; 32],
-                value: 13_000_000,
-                position: i as u64,
-                diversifier: vec![0; 11],
-                rho: vec![0; 32],
-                rseed: vec![0; 32],
-                scope: 0,
-                ufvk_str: String::new(),
-            })
-            .collect();
-
-        let result = construct_delegation_action(
-            &notes,
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        assert_eq!(result.gov_nullifiers.len(), 5);
-        // All 5 should be real (no padding needed).
-        // They should all be different since inputs differ.
-        for i in 0..5 {
-            for j in (i + 1)..5 {
-                assert_ne!(
-                    result.gov_nullifiers[i], result.gov_nullifiers[j],
-                    "gov nullifiers {} and {} should differ",
-                    i, j
-                );
-            }
-        }
-
-        // No padding needed — padded_cmx should be empty
-        assert!(result.padded_cmx.is_empty());
-
-        // rho_signed still computed from the 5 real cmx values
-        assert_eq!(result.rho_signed.len(), 32);
-        assert_ne!(result.rho_signed, vec![0u8; 32]);
-    }
-
-    #[test]
-    fn test_construct_delegation_action_deterministic_gov_nullifiers() {
-        let result1 = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        let result2 = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        // First gov nullifier (real) should be deterministic
-        assert_eq!(result1.gov_nullifiers[0], result2.gov_nullifiers[0]);
-
-        // VAN will differ because van_comm_rand is randomly sampled each time
-        // (this is expected)
-    }
-
-    #[test]
-    fn test_construct_delegation_action_no_notes() {
-        let result = construct_delegation_action(
-            &[],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_construct_delegation_action_too_many_notes() {
-        let notes: Vec<NoteInfo> = (0..6).map(|_| mock_note()).collect();
-        let result = construct_delegation_action(
-            &notes,
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_construct_delegation_action_rejects_short_vote_round_id() {
-        let mut params = mock_params();
-        // 31 bytes (62 hex chars)
-        params.vote_round_id = "01".repeat(31);
-
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &params,
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_construct_delegation_action_rejects_long_vote_round_id() {
-        let mut params = mock_params();
-        // 33 bytes (66 hex chars)
-        params.vote_round_id = "01".repeat(33);
-
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &params,
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rho_changes_with_different_notes() {
-        // Use small byte values that are guaranteed valid Pallas field elements
-        // (values with the high byte < 0x40 are always in range).
-        let notes_a: Vec<NoteInfo> = (0..5)
-            .map(|i| {
-                let mut commitment = vec![0u8; 32];
-                commitment[0] = i as u8 + 0x10;
-                let mut nullifier = vec![0u8; 32];
-                nullifier[0] = i as u8 + 0x20;
-                NoteInfo {
-                    commitment,
-                    nullifier,
-                    value: 13_000_000,
-                    position: i as u64,
-                    diversifier: vec![0; 11],
-                    rho: vec![0; 32],
-                    rseed: vec![0; 32],
-                    scope: 0,
-                    ufvk_str: String::new(),
-                }
-            })
-            .collect();
-
-        let notes_b: Vec<NoteInfo> = (0..5)
-            .map(|i| {
-                let mut commitment = vec![0u8; 32];
-                commitment[0] = i as u8 + 0x30;
-                let mut nullifier = vec![0u8; 32];
-                nullifier[0] = i as u8 + 0x40;
-                NoteInfo {
-                    commitment,
-                    nullifier,
-                    value: 13_000_000,
-                    position: i as u64,
-                    diversifier: vec![0; 11],
-                    rho: vec![0; 32],
-                    rseed: vec![0; 32],
-                    scope: 0,
-                    ufvk_str: String::new(),
-                }
-            })
-            .collect();
-
-        let result_a = construct_delegation_action(
-            &notes_a,
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        let result_b = construct_delegation_action(
-            &notes_b,
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        // Different note commitments should produce different rho
-        // (VAN also differs due to random van_comm_rand, reinforcing the difference)
-        assert_ne!(
-            result_a.rho_signed, result_b.rho_signed,
-            "different note sets must produce different rho_signed"
-        );
-    }
-
-    #[test]
-    fn test_rk_changes_with_different_alpha() {
-        // Two calls should produce different rk because alpha is randomized each time
-        let result1 = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        let result2 = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        // rk should differ between calls (different random alpha)
-        assert_ne!(
-            result1.rk, result2.rk,
-            "rk should differ due to random alpha"
-        );
-        assert_ne!(
-            result1.alpha, result2.alpha,
-            "alpha should differ between calls"
-        );
-    }
-
-    #[test]
-    fn test_nf_signed_is_nonzero() {
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        assert_eq!(result.nf_signed.len(), 32);
-        assert_ne!(result.nf_signed, vec![0u8; 32]);
-        assert_eq!(result.cmx_new.len(), 32);
-        assert_ne!(result.cmx_new, vec![0u8; 32]);
-    }
-
-    #[test]
-    fn test_rejects_invalid_fvk() {
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &vec![0x00; 96],
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rejects_wrong_length_fvk() {
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &vec![0x42; 32],
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rejects_mismatched_pk_d_x() {
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &vec![0xAA; 32],
-            &mock_hotkey_address(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rejects_mismatched_g_d_x() {
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &vec![0xBB; 32],
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rejects_wrong_length_hotkey_address() {
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &vec![0x42; 32],
-        );
-        assert!(result.is_err());
-    }
-
     #[test]
     fn test_action_bytes_canonical_encoding_order() {
         let nf_signed = [0x01; 32];
@@ -1274,47 +659,6 @@ mod tests {
             &[0x06; 32],
         );
         assert!(encoded.is_err());
-    }
-
-    #[test]
-    fn test_constructed_action_bytes_match_canonical_encoding() {
-        let result = construct_delegation_action(
-            &[mock_note()],
-            &mock_params(),
-            &mock_fvk_bytes(),
-            &mock_g_d(),
-            &mock_pk_d(),
-            &mock_hotkey_address(),
-        )
-        .unwrap();
-
-        let nf_signed: [u8; 32] = result
-            .nf_signed
-            .clone()
-            .try_into()
-            .expect("nf_signed should be 32 bytes");
-        let rk: [u8; 32] = result.rk.clone().try_into().expect("rk should be 32 bytes");
-        let cmx_new: [u8; 32] = result
-            .cmx_new
-            .clone()
-            .try_into()
-            .expect("cmx_new should be 32 bytes");
-        let vote_round_id: [u8; 32] = hex::decode(&mock_params().vote_round_id)
-            .unwrap()
-            .try_into()
-            .expect("vote_round_id should be 32 bytes");
-
-        let expected = encode_delegation_action_bytes(
-            &nf_signed,
-            &rk,
-            &cmx_new,
-            &result.van,
-            &result.gov_nullifiers,
-            &vote_round_id,
-        )
-        .unwrap();
-
-        assert_eq!(result.action_bytes, expected);
     }
 
     // --- build_governance_pczt tests ---

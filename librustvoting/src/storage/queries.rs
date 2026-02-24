@@ -262,7 +262,7 @@ pub fn load_bundle_note_positions(
 
 // --- Delegation Secrets ---
 //
-// After construct_delegation_action computes the VAN (governance commitment),
+// After build_governance_pczt computes the VAN (governance commitment),
 // we persist two values needed for later proof steps:
 //   - van_comm_rand: the 32-byte blinding factor used in the VAN Poseidon hash.
 //     Needed again in ZKP #2 (vote commitment) to reconstruct the VAN as a witness.
@@ -289,6 +289,8 @@ pub fn store_delegation_data(
     gov_comm: &[u8],
     total_note_value: u64,
     address_index: u32,
+    padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
+    pczt_sighash: &[u8],
 ) -> Result<(), VotingError> {
     // Serialize dummy nullifiers as a flat byte blob: [nf0 (32 bytes) | nf1 | nf2 | ...].
     // Length 0 means no padding was needed (all 5 notes were real).
@@ -301,13 +303,20 @@ pub fn store_delegation_data(
     // Same flat-blob encoding for padded cmx values.
     let padded_blob: Vec<u8> = padded_cmx.iter().flat_map(|c| c.iter().copied()).collect();
 
+    // Serialize padded_note_secrets as flat blob: N * 64 bytes (rho[32] || rseed[32] per entry).
+    let secrets_blob: Vec<u8> = padded_note_secrets
+        .iter()
+        .flat_map(|(rho, rseed)| rho.iter().copied().chain(rseed.iter().copied()))
+        .collect();
+
     let rows = conn
         .execute(
             "UPDATE bundles SET van_comm_rand = :rand, dummy_nullifiers = :dummies, \
              rho_signed = :rho, padded_note_data = :padded, nf_signed = :nf_signed, \
              cmx_new = :cmx_new, alpha = :alpha, rseed_signed = :rseed_signed, \
              rseed_output = :rseed_output, gov_comm = :gov_comm, \
-             total_note_value = :total_note_value, address_index = :address_index \
+             total_note_value = :total_note_value, address_index = :address_index, \
+             padded_note_secrets = :secrets, pczt_sighash = :sighash \
              WHERE round_id = :round_id AND bundle_index = :bundle_index",
             named_params! {
                 ":rand": van_comm_rand,
@@ -322,6 +331,8 @@ pub fn store_delegation_data(
                 ":gov_comm": gov_comm,
                 ":total_note_value": total_note_value as i64,
                 ":address_index": address_index as i64,
+                ":secrets": secrets_blob,
+                ":sighash": pczt_sighash,
                 ":round_id": round_id,
                 ":bundle_index": bundle_index as i64,
             },
@@ -397,6 +408,53 @@ pub fn load_rseed_output(conn: &Connection, round_id: &str, bundle_index: u32) -
     )
     .map_err(|e| VotingError::InvalidInput {
         message: format!("no rseed_output for round={}, bundle={} ({})", round_id, bundle_index, e),
+    })
+}
+
+/// Load padded note secrets (rho + rseed pairs) for Phase 2 randomness threading.
+/// Returns Vec of (rho[32], rseed[32]) pairs. Deserializes from flat 64-byte-per-entry blob.
+pub fn load_padded_note_secrets(
+    conn: &Connection,
+    round_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, VotingError> {
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT padded_note_secrets FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
+            named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+            |row| row.get(0),
+        )
+        .map_err(|e| VotingError::InvalidInput {
+            message: format!("no padded_note_secrets for round={}, bundle={} ({})", round_id, bundle_index, e),
+        })?;
+
+    if blob.len() % 64 != 0 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "corrupt padded_note_secrets blob: length {} is not a multiple of 64",
+                blob.len()
+            ),
+        });
+    }
+    Ok(blob
+        .chunks_exact(64)
+        .map(|c| (c[..32].to_vec(), c[32..].to_vec()))
+        .collect())
+}
+
+/// Load the ZIP-244 sighash extracted from the PCZT (32 bytes).
+pub fn load_pczt_sighash(
+    conn: &Connection,
+    round_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<u8>, VotingError> {
+    conn.query_row(
+        "SELECT pczt_sighash FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        |row| row.get(0),
+    )
+    .map_err(|e| VotingError::InvalidInput {
+        message: format!("no pczt_sighash for round={}, bundle={} ({})", round_id, bundle_index, e),
     })
 }
 
