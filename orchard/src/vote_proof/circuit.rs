@@ -116,7 +116,10 @@ pub use van_integrity::DOMAIN_VAN;
 /// `DOMAIN_VC = 1` for Vote Commitments, `DOMAIN_VAN = 0` for VANs.
 pub const DOMAIN_VC: u64 = 1;
 
-/// Maximum number of proposals (0-indexed); proposal_id is in [0, MAX_PROPOSAL_ID).
+/// Maximum proposal_id bit index (exclusive upper bound). `proposal_id` is in `[1, MAX_PROPOSAL_ID)`,
+/// i.e. valid values are 1–15. Bit 0 is permanently reserved as the sentinel/unset value and is
+/// rejected by the non-zero gate in `AuthorityDecrementChip` (`q_cond_6`). This means a voting
+/// round supports at most 15 proposals, not 16.
 /// Spec: "The number of proposals for a polling session must be <= 16."
 pub const MAX_PROPOSAL_ID: usize = 16;
 
