@@ -143,9 +143,9 @@ The vote proof must bind the Poseidon hash of enc_share x-coordinates (condition
 
 ### API
 
-**`prove_elgamal_encryptions(ecc_chip, layouter, namespace, g_affine, g_x_const, g_y_const, ea_pk, ea_pk_x_cell, ea_pk_y_cell, share_cells, r_cells, enc_c1_cells, enc_c2_cells) -> Result<(), Error>`**
+**`prove_elgamal_encryptions(ecc_chip, layouter, namespace, ea_pk, ea_pk_loc, share_cells, r_cells, enc_c1_cells, enc_c2_cells) -> Result<(), Error>`**
 
-Per share i: constrains C1_i = [r_i]*G and C2_i = [v_i]*G + [r_i]*ea_pk, and `constrain_equal(ExtractP(C1_i), enc_c1_cells[i])` and similarly for C2. Caller must assign SpendAuthG constants (g_x_const, g_y_const), ea_pk instance cells, and the four r_i and share/enc_share cells before calling.
+Per share i: constrains C1_i = [r_i]*G and C2_i = [v_i]*G + [r_i]*ea_pk, and `constrain_equal(ExtractP(C1_i), enc_c1_cells[i])` and similarly for C2. The gadget owns all ea_pk scaffolding: it witnesses the point internally and calls `layouter.constrain_instance` using the `EaPkInstanceLoc` descriptor (instance column + x/y row offsets). The caller supplies the four varying arrays and `ea_pk` as a `Value<Affine>`.
 
 **Out-of-circuit (same module):** `spend_auth_g_affine()`, `base_to_scalar(b)`, `elgamal_encrypt(share_value, randomness, ea_pk)` — used by the vote proof builder and tests.
 
@@ -155,4 +155,4 @@ Per share i: constrains C1_i = [r_i]*G and C2_i = [v_i]*G + [r_i]*ea_pk, and `co
 
 ### Usage
 
-- **Vote proof:** `orchard/src/vote_proof/circuit.rs` — condition 11 assigns G constants, ea_pk from instance, r_0..r_3, then calls `prove_elgamal_encryptions`.
+- **Vote proof:** `orchard/src/vote_proof/circuit.rs` — condition 11 witnesses r_0..r_4, then calls `prove_elgamal_encryptions` with `EaPkInstanceLoc { instance: config.primary, x_row: EA_PK_X, y_row: EA_PK_Y }`. The gadget handles ea_pk witnessing and instance-pinning internally.

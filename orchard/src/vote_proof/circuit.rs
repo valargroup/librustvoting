@@ -59,7 +59,7 @@ use halo2_proofs::{
     },
     poly::Rotation,
 };
-use pasta_curves::{arithmetic::CurveAffine, pallas, vesta};
+use pasta_curves::{pallas, vesta};
 
 use halo2_gadgets::{
     ecc::{
@@ -74,7 +74,7 @@ use halo2_gadgets::{
     utilities::{bool_check, lookup_range_check::LookupRangeCheckConfig},
 };
 use crate::circuit::address_ownership::{prove_address_ownership, spend_auth_g_mul};
-use crate::circuit::elgamal::prove_elgamal_encryptions;
+use crate::circuit::elgamal::{EaPkInstanceLoc, prove_elgamal_encryptions};
 use crate::circuit::commit_ivk::{CommitIvkChip, CommitIvkConfig};
 use crate::circuit::gadget::{add_chip::{AddChip, AddConfig}, AddInstruction};
 use crate::constants::{
@@ -1408,31 +1408,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // circuit::elgamal::prove_elgamal_encryptions gadget.
         // ---------------------------------------------------------------
         {
-            let ea_pk_x_cell = layouter.assign_region(
-                || "copy ea_pk_x from instance",
-                |mut region| {
-                    region.assign_advice_from_instance(
-                        || "ea_pk_x",
-                        config.primary,
-                        EA_PK_X,
-                        config.advices[0],
-                        0,
-                    )
-                },
-            )?;
-            let ea_pk_y_cell = layouter.assign_region(
-                || "copy ea_pk_y from instance",
-                |mut region| {
-                    region.assign_advice_from_instance(
-                        || "ea_pk_y",
-                        config.primary,
-                        EA_PK_Y,
-                        config.advices[0],
-                        0,
-                    )
-                },
-            )?;
-
             let r_0 = assign_free_advice(
                 layouter.namespace(|| "witness r[0]"),
                 config.advices[0],
@@ -1481,8 +1456,11 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 layouter.namespace(|| "cond11 El Gamal"),
                 "cond11",
                 self.ea_pk,
-                ea_pk_x_cell,
-                ea_pk_y_cell,
+                EaPkInstanceLoc {
+                    instance: config.primary,
+                    x_row: EA_PK_X,
+                    y_row: EA_PK_Y,
+                },
                 share_cells,
                 r_cells,
                 enc_c1_cells,

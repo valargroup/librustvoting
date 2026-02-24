@@ -14,7 +14,7 @@
 
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter},
-    plonk::Error,
+    plonk::{Column, Error, Instance as InstanceColumn},
 };
 use pasta_curves::arithmetic::CurveAffine;
 use pasta_curves::pallas;
@@ -24,6 +24,24 @@ use halo2_gadgets::ecc::{
     chip::EccChip,
     FixedPointBaseField, NonIdentityPoint, ScalarVar,
 };
+
+// ================================================================
+// Instance-location descriptor
+// ================================================================
+
+/// Describes where ea_pk lives in the public-input (instance) column.
+///
+/// The gadget uses this to call `layouter.constrain_instance` directly
+/// on the witnessed NonIdentityPoint cells, removing the need for the
+/// caller to pre-allocate advice-from-instance cells and pass them down.
+pub(in crate::circuit) struct EaPkInstanceLoc {
+    /// The instance column that holds the public inputs.
+    pub instance: Column<InstanceColumn>,
+    /// Row of the ea_pk x-coordinate in the instance column.
+    pub x_row: usize,
+    /// Row of the ea_pk y-coordinate in the instance column.
+    pub y_row: usize,
+}
 
 // ================================================================
 // Out-of-circuit helpers
@@ -91,45 +109,40 @@ pub fn elgamal_encrypt(
 /// circuit). This eliminates the per-iteration `NonIdentityPoint::new` witness
 /// and `constrain_equal` dance that the variable-base path required.
 ///
-/// Caller must assign:
-/// - `ea_pk_x_cell`, `ea_pk_y_cell`: ea_pk coordinates (advice-from-instance).
-/// - `r_cells`: five advice cells holding the El Gamal randomness values.
-/// - `share_cells`, `enc_c1_cells`, `enc_c2_cells`: share values and
-///   ciphertext x-coordinates (already witnessed).
-///
-#[allow(clippy::too_many_arguments)]
+/// The gadget owns all ea_pk scaffolding: it witnesses the point internally and
+/// calls `layouter.constrain_instance` to pin the witness to the public input
+/// column described by `ea_pk_loc`. The caller need only supply the four varying
+/// arrays and the ea_pk value.
 pub(in crate::circuit) fn prove_elgamal_encryptions(
     ecc_chip: EccChip<OrchardFixedBases>,
     mut layouter: impl Layouter<pallas::Base>,
     namespace: &str,
     ea_pk: halo2_proofs::circuit::Value<pallas::Affine>,
-    ea_pk_x_cell: AssignedCell<pallas::Base, pallas::Base>,
-    ea_pk_y_cell: AssignedCell<pallas::Base, pallas::Base>,
+    ea_pk_loc: EaPkInstanceLoc,
     share_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
     r_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
     enc_c1_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
     enc_c2_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
 ) -> Result<(), Error> {
-    // Witness ea_pk once and constrain its coordinates to the caller-supplied
-    // instance cells. NonIdentityPoint is Copy, so the value is cheaply copied
-    // into each iteration's mul() call without re-witnessing or adding extra
-    // constrain_equal regions.
+    // Witness ea_pk once. NonIdentityPoint is Copy, so the value is cheaply
+    // copied into each iteration's mul() call without re-witnessing.
     let ea_pk_point = NonIdentityPoint::new(
         ecc_chip.clone(),
         layouter.namespace(|| alloc::format!("{namespace} ea_pk witness")),
         ea_pk,
     )?;
-    layouter.assign_region(
-        || alloc::format!("{namespace} constrain ea_pk x"),
-        |mut region| {
-            region.constrain_equal(ea_pk_point.inner().x().cell(), ea_pk_x_cell.cell())
-        },
+    // Pin the witness directly to the public-input column. This replaces the
+    // previous assign_advice_from_instance + constrain_equal pattern that
+    // required the caller to pre-allocate two separate AssignedCells.
+    layouter.constrain_instance(
+        ea_pk_point.inner().x().cell(),
+        ea_pk_loc.instance,
+        ea_pk_loc.x_row,
     )?;
-    layouter.assign_region(
-        || alloc::format!("{namespace} constrain ea_pk y"),
-        |mut region| {
-            region.constrain_equal(ea_pk_point.inner().y().cell(), ea_pk_y_cell.cell())
-        },
+    layouter.constrain_instance(
+        ea_pk_point.inner().y().cell(),
+        ea_pk_loc.instance,
+        ea_pk_loc.y_row,
     )?;
 
     // SpendAuthG fixed-base descriptor — constructed once, cloned per iteration.
