@@ -8,8 +8,9 @@
 //!   to `vote_comm_tree_root`.
 //! - **Condition 2**: Vote Commitment Integrity — `vote_commitment =
 //!   Poseidon(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`.
-//! - **Condition 3**: Shares Hash Integrity — `shares_hash =
-//!   Poseidon(c1_0, c2_0, c1_1, c2_1, c1_2, c2_2, c1_3, c2_3, c1_4, c2_4)`.
+//! - **Condition 3**: Shares Hash Integrity — `share_comm_i =
+//!   Poseidon(blind_i, c1_i_x, c2_i_x)` for each share, then `shares_hash =
+//!   Poseidon(share_comm_0, share_comm_1, share_comm_2, share_comm_3, share_comm_4)`.
 //! - **Condition 4**: Share Membership — `(enc_share_c1_x, enc_share_c2_x)`
 //!   is the `share_index`-th pair from the 5 encrypted shares.
 //! - **Condition 5**: Share Nullifier Integrity — `share_nullifier` is
