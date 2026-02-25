@@ -47,42 +47,41 @@ There are two xcframework build targets in `zcash-voting-ffi/`:
 
 After modifying the FFI public API, you **must** run `make dev` and commit the regenerated Swift file and xcframework binaries alongside the Rust changes.
 
-## Local IMT (Nullifier Ingest) Service
+## Nullifier Ingest (`nf-server`)
 
-The IMT service lives in `nullifier-ingest/`. Data files (`nullifiers.bin`, `nullifiers.checkpoint`, `nullifiers.tree`) are stored at the `nullifier-ingest/` root, not in `nullifier-ingest/service/`.
+The unified `nf-server` binary lives in `nullifier-ingest/nf-server/` and has three subcommands: `ingest`, `export`, and `serve`. The `serve` subcommand requires `--features serve` (enabled automatically by `make serve`). For production AVX-512 acceleration, the deploy workflow additionally enables `--features avx512`.
+
+Data files (`nullifiers.bin`, `nullifiers.checkpoint`) are stored at the `nullifier-ingest/` root, not in subdirectories.
 
 ### Common operations (run from `nullifier-ingest/`):
 
 - **Check status:** `make status`
 - **Ingest to a specific height:** `make ingest SYNC_HEIGHT=<height>` (must be a multiple of 10)
 - **Ingest to chain tip:** `make ingest`
-- **Start query server:** `make serve` (runs on port 3000)
+- **Export PIR tier files:** `make export-nf`
+- **Start PIR server:** `make serve` (runs on port 3000)
 - **Bootstrap from CDN:** `make bootstrap` (downloads pre-built snapshot files if not present)
 
 ### Key notes:
 
 - `SYNC_HEIGHT` must be a **multiple of 10**
-- After ingesting new blocks, you **must delete the stale tree sidecar** before restarting the server, otherwise the server loads the old tree and returns height mismatches (HTTP 502). The full sequence is:
-  1. `make ingest SYNC_HEIGHT=<height>`
-  2. `rm nullifiers.tree`
-  3. `make serve` (rebuilds the tree from `.bin` on startup, ~3–5 min for 50M nullifiers)
-- Alternatively, use `make ingest-resync SYNC_HEIGHT=<height>` which deletes the tree sidecar automatically after ingestion
+- The full pipeline is **ingest → export → serve**. After re-ingesting nullifiers, you must re-export before the server sees the new data: `make ingest-resync SYNC_HEIGHT=<height>` (deletes stale sidecar/tier files), then `make export-nf`, then `make serve`
 - `eprintln!` from Rust code shows up in the Xcode debug console when testing the iOS app
 
 ## Local Chain Setup
 
-Starting all services for local development: `make up` from the repo root. This starts the chain (`zallyd`), bootstraps nullifiers, and runs the IMT query server.
+Starting all services for local development: `make up` from the repo root. This starts the chain (`zallyd`), bootstraps + ingests nullifiers, exports PIR tier files, and starts the PIR server.
 
 ### Full local setup sequence
 
 The correct sequence to start everything from scratch:
 
-1. `make up` (from repo root) — inits chain, bootstraps + ingests nullifiers, starts zallyd + IMT query server
+1. `make up` (from repo root) — inits chain, bootstraps + ingests nullifiers, exports PIR tier files, starts zallyd + PIR server
 2. `make ceremony` (from `sdk/`) — runs EA key ceremony (required before creating voting rounds)
 3. `npm run dev` (from `shielded_vote_generator_ui/`) — starts admin UI on port 5173
 4. Rebuild iOS app in Xcode and run
 
-If the IMT query server returns HTTP 502 with a height mismatch, the tree sidecar is stale. Fix: `pkill query-server && rm nullifier-ingest/nullifiers.tree && make ingest-serve`. The `make up` target now deletes the stale tree automatically, but manual `make ingest` followed by `make ingest-serve` still requires the manual `rm`.
+To override the PIR server URL: `ZALLY_PIR_URL=http://host:port make start`
 
 ### Important: `make install-ffi` vs `make install`
 

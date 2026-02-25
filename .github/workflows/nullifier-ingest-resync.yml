@@ -1,6 +1,6 @@
-# Manually trigger an incremental nullifier resync on the deploy host.
-# SSHes into the remote and runs ingest-nfs with INVALIDATE_TREE=1 so the
-# next query-server restart rebuilds the Merkle tree from the updated flat file.
+# Manually trigger a nullifier resync on the deploy host.
+# Runs the full ingest → export → restart pipeline so the PIR server
+# picks up the new data.
 # Requires repository secrets: DEPLOY_HOST, DEPLOY_USER, SSH_PASSWORD.
 
 name: Resync nullifier snapshot
@@ -21,7 +21,7 @@ env:
 
 jobs:
   resync:
-    name: Ingest resync
+    name: Ingest, export, restart
     runs-on: ubuntu-latest
     steps:
       - name: Round max_height down to nearest multiple of 10
@@ -34,17 +34,21 @@ jobs:
           ROUNDED=$(( (MAX_HEIGHT / 10) * 10 ))
           echo "value=$ROUNDED" >> "$GITHUB_OUTPUT"
 
-      - name: Run ingest-resync via SSH
+      - name: Ingest, export, and restart service
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          command_timeout: 30m
+          command_timeout: 60m
           script: |
             cd /opt/nullifier-ingest && \
-              DATA_DIR=/opt/nullifier-ingest \
-              LWD_URL=https://zec.rocks:443 \
-              INVALIDATE_TREE=1 \
-              MAX_HEIGHT=${{ steps.round_height.outputs.value }} \
-              ./ingest-nfs
+              ./nf-server ingest \
+                --data-dir /opt/nullifier-ingest \
+                --lwd-url https://zec.rocks:443 \
+                --invalidate \
+                --max-height ${{ steps.round_height.outputs.value }} && \
+              ./nf-server export \
+                --data-dir /opt/nullifier-ingest \
+                --output-dir /opt/nullifier-ingest/pir-data && \
+              sudo systemctl restart nullifier-query-server

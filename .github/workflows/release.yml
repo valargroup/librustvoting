@@ -2,7 +2,7 @@
 #
 # Tarball layout:
 #   zally-<version>-<platform>/
-#     bin/zallyd, create-val-tx, query-server, ingest-nfs
+#     bin/zallyd, create-val-tx, nf-server
 #     systemd/zallyd-val{1,2,3}.service, nullifier-query-server.service  (Linux only)
 #     scripts/init_multi_ci.sh
 #     config/Caddyfile
@@ -108,7 +108,7 @@ jobs:
             sdk/create-val-tx
 
   build-ingest:
-    name: Build nullifier-ingest (${{ matrix.platform }})
+    name: Build nf-server (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -139,34 +139,34 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            nullifier-ingest/nf-server/target
             nullifier-ingest/imt-tree/target
             nullifier-ingest/service/target
+            nullifier-ingest/pir-export/target
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.platform }}-nullifier-ingest-${{ hashFiles('nullifier-ingest/service/Cargo.lock', 'nullifier-ingest/imt-tree/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.platform }}-nf-server-${{ hashFiles('nullifier-ingest/nf-server/Cargo.lock', 'nullifier-ingest/service/Cargo.lock', 'nullifier-ingest/imt-tree/Cargo.lock', 'nullifier-ingest/pir-export/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.platform }}-nullifier-ingest-
+            ${{ runner.os }}-${{ matrix.platform }}-nf-server-
 
-      - name: Build release binaries
-        working-directory: nullifier-ingest
+      - name: Build release binary
+        working-directory: nullifier-ingest/nf-server
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cd service && cargo build --release --target ${{ matrix.rust_target }}
-            # Copy cross-compiled binaries to the expected release location
+            # Cross-compile without serve: YPIR's C++ build uses -march=native
+            # which fails when host and target arch differ.
+            cargo build --release --target ${{ matrix.rust_target }}
             mkdir -p target/release
-            cp target/${{ matrix.rust_target }}/release/query-server target/release/
-            cp target/${{ matrix.rust_target }}/release/ingest-nfs target/release/
+            cp target/${{ matrix.rust_target }}/release/nf-server target/release/
           else
-            make build
+            cargo build --release --features serve
           fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ingest-binaries-${{ matrix.platform }}
-          path: |
-            nullifier-ingest/service/target/release/query-server
-            nullifier-ingest/service/target/release/ingest-nfs
+          path: nullifier-ingest/nf-server/target/release/nf-server
 
   create-release:
     name: Create GitHub Release
@@ -218,8 +218,7 @@ jobs:
 
           # Binaries (artifact downloads flatten the common path prefix)
           cp sdk-binaries/zallyd sdk-binaries/create-val-tx "${DIR}/bin/"
-          cp ingest-binaries/query-server "${DIR}/bin/"
-          cp ingest-binaries/ingest-nfs "${DIR}/bin/"
+          cp ingest-binaries/nf-server "${DIR}/bin/"
           chmod +x "${DIR}/bin/"*
 
           # Systemd service files — Linux only, transform paths for /opt/zally layout
@@ -235,7 +234,7 @@ jobs:
             # Nullifier query server service — remap paths to /opt/zally layout
             sed -e 's|WorkingDirectory=/opt/nullifier-ingest|WorkingDirectory=/opt/zally/nullifier-data|' \
                 -e 's|DATA_DIR=/opt/nullifier-ingest|DATA_DIR=/opt/zally/nullifier-data|' \
-                -e 's|ExecStart=/opt/nullifier-ingest/query-server|ExecStart=/opt/zally/bin/query-server|' \
+                -e 's|ExecStart=/opt/nullifier-ingest/nf-server|ExecStart=/opt/zally/bin/nf-server|' \
                 nullifier-ingest/docs/nullifier-query-server.service > "${DIR}/systemd/nullifier-query-server.service"
           fi
 

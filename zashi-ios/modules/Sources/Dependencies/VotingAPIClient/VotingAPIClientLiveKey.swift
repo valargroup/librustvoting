@@ -14,7 +14,7 @@ actor ZallyAPIConfigStore {
     /// All vote server URLs from CDN config (used for share distribution).
     var voteServerURLs: [String] = ["https://46-101-255-48.sslip.io"]
     /// Primary PIR server URL.
-    var pirServerURL = "http://157.180.63.235:3001"
+    var pirServerURL = "http://157.180.63.235:3000"
 
     func configure(from config: VotingServiceConfig) {
         if let first = config.voteServers.first {

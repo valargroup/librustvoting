@@ -45,7 +45,7 @@ enum Command {
 
     /// Test against a running pir-server instance.
     Server {
-        /// Server URL (e.g., http://157.180.63.235:3001).
+        /// Server URL (e.g., http://157.180.63.235:3000).
         #[arg(long)]
         url: String,
 

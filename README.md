@@ -9,14 +9,14 @@ Zally is a shielded voting protocol built on a Cosmos SDK chain. Votes are zero-
 | [SETUP_GENESIS.md](SETUP_GENESIS.md) | Bootstrap the genesis validator — build the binary, initialise the chain, open P2P, and record the node identity |
 | [SETUP_JOIN.md](SETUP_JOIN.md) | Add a new validator — sync a post-genesis node, fund it, and submit `MsgCreateValidatorWithPallasKey` |
 | [SETUP_CEREMONY.md](SETUP_CEREMONY.md) | Run the EA key ceremony — register Pallas keys, deal the encrypted EA secret key to all validators, and confirm |
-| [SETUP_NULLIFIER_SERVICE.md](SETUP_NULLIFIER_SERVICE.md) | Set up the nullifier service — install deps, bootstrap the snapshot, and start the exclusion proof query server |
+| [SETUP_NULLIFIER_SERVICE.md](SETUP_NULLIFIER_SERVICE.md) | Set up the nullifier service — install deps, bootstrap the snapshot, and start the PIR server |
 
 ## Architecture
 
 | Component | Language | Description |
 |---|---|---|
 | `sdk/` | Go + Rust (CGo) | Cosmos SDK chain (`zallyd`) with vote module, ante handlers, and ZK verification |
-| `nullifier-ingest/` | Rust | Ingests Orchard nullifiers from a lightwallet server into flat binary files and serves exclusion proofs |
+| `nullifier-ingest/` | Rust | Ingests Orchard nullifiers from a lightwallet server, exports PIR tier files, and serves them via `nf-server` |
 | `shielded_vote_generator_ui/` | TypeScript / React | UI for constructing and submitting shielded votes |
 | `zcash-voting-ffi/` | Rust + Swift | iOS FFI bindings for the voting circuits |
 | `e2e-tests/` | Rust | End-to-end API tests against a running chain |
@@ -47,10 +47,11 @@ make up
 This runs the full setup sequence:
 
 1. **`make init`** — builds the Rust circuits, installs the `zallyd` binary with real Halo2 + RedPallas verification, and initialises a single-validator chain (wipes existing chain data).
-2. **`make ingest`** — incrementally fetches Orchard nullifiers from `https://zec.rocks:443` into local flat binary files (`nullifiers.bin`, `nullifiers.checkpoint`, `nullifiers.tree`).
-3. **`make ingest-serve`** and **`make start`** run in parallel — the nullifier exclusion proof query server (default port `3000`) and the chain node start concurrently. Both processes are detached and their output is written to `ingest-serve.log` and `zallyd.log`.
+2. **`make ingest`** — incrementally fetches Orchard nullifiers from `https://zec.rocks:443` into local flat binary files (`nullifiers.bin`, `nullifiers.checkpoint`).
+3. **`make export-nf`** — builds the PIR tree and exports tier files (`tier0.bin`, `tier1.bin`, `tier2.bin`, `pir_root.json`).
+4. **`make ingest-serve`** and **`make start`** run in parallel — the PIR server (default port `3000`) and the chain node start concurrently. Both processes are detached and their output is written to `ingest-serve.log` and `zallyd.log`.
 
-`make up` will refuse to start if `zallyd`, `query-server`, or `ingest-nfs` are already running. Use `make down` first to stop them.
+`make up` will refuse to start if `zallyd` or `nf-server` are already running. Use `make down` first to stop them.
 
 ### Stopping the stack
 
@@ -58,7 +59,7 @@ This runs the full setup sequence:
 make down
 ```
 
-Kills any running `zallyd`, `query-server`, and `ingest-nfs` processes and prints a confirmation of what was stopped.
+Kills any running `zallyd` and `nf-server` processes and prints a confirmation of what was stopped.
 
 ### Checking status
 
@@ -83,7 +84,10 @@ make start
 # 3. Ingest nullifiers (separate terminal; incremental, safe to re-run)
 make ingest
 
-# 4. Start the nullifier query server (separate terminal)
+# 4. Export PIR tier files
+make -C nullifier-ingest export-nf
+
+# 5. Start the PIR server (separate terminal)
 make ingest-serve
 ```
 
@@ -94,8 +98,9 @@ The nullifier ingest targets accept environment variable overrides:
 | Variable | Default | Description |
 |---|---|---|
 | `LWD_URL` | `https://zec.rocks:443` | Lightwallet server to fetch nullifiers from |
-| `DATA_DIR` | `nullifier-ingest/service` | Directory for `nullifiers.bin` / `.checkpoint` / `.tree` |
-| `PORT` | `3000` | Port for the exclusion proof query server |
+| `DATA_DIR` | `.` (nullifier-ingest root) | Directory for `nullifiers.bin` / `.checkpoint` |
+| `PIR_DATA_DIR` | `./pir-data` | Directory for PIR tier files (`tier0.bin`, `tier1.bin`, `tier2.bin`, `pir_root.json`) |
+| `PORT` | `3000` | Port for the PIR server |
 
 Example:
 

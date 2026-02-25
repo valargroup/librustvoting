@@ -28,32 +28,34 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache Rust build
         uses: actions/cache@v4
         with:
           path: |
+            nullifier-ingest/nf-server/target
             nullifier-ingest/imt-tree/target
             nullifier-ingest/service/target
+            nullifier-ingest/pir-server/target
+            nullifier-ingest/pir-export/target
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-nullifier-ingest-${{ hashFiles('nullifier-ingest/service/Cargo.lock', 'nullifier-ingest/imt-tree/Cargo.lock') }}
+          key: ${{ runner.os }}-nf-server-${{ hashFiles('nullifier-ingest/nf-server/Cargo.lock', 'nullifier-ingest/pir-server/Cargo.lock', 'nullifier-ingest/pir-export/Cargo.lock', 'nullifier-ingest/service/Cargo.lock', 'nullifier-ingest/imt-tree/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-nullifier-ingest-
+            ${{ runner.os }}-nf-server-
 
-      - name: Build release binaries
-        run: make build
+      - name: Build release binary
+        run: cd nf-server && cargo build --release --features serve,avx512
         working-directory: nullifier-ingest
 
-      - name: Upload binaries and config
+      - name: Upload binary and config
         uses: actions/upload-artifact@v4
         with:
-          name: nullifier-ingest-binaries
+          name: nf-server-binaries
           path: |
-            nullifier-ingest/service/target/release/query-server
-            nullifier-ingest/service/target/release/ingest-nfs
+            nullifier-ingest/nf-server/target/release/nf-server
             nullifier-ingest/docs/nullifier-query-server.service
             sdk/deploy/Caddyfile
 
@@ -65,12 +67,11 @@ jobs:
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
-          name: nullifier-ingest-binaries
+          name: nf-server-binaries
 
       - name: Flatten artifacts
         run: |
-          mv nullifier-ingest/service/target/release/query-server .
-          mv nullifier-ingest/service/target/release/ingest-nfs .
+          mv nullifier-ingest/nf-server/target/release/nf-server .
           mv nullifier-ingest/docs/nullifier-query-server.service .
           mv sdk/deploy/Caddyfile .
 
@@ -80,7 +81,7 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          source: "query-server,ingest-nfs,nullifier-query-server.service,Caddyfile"
+          source: "nf-server,nullifier-query-server.service,Caddyfile"
           target: ${{ env.DEPLOY_PATH }}
 
       - name: Install config and restart services
@@ -90,7 +91,7 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
           script: |
-            sudo chmod +x /opt/nullifier-ingest/query-server /opt/nullifier-ingest/ingest-nfs
+            sudo chmod +x /opt/nullifier-ingest/nf-server
             sudo cp /opt/nullifier-ingest/nullifier-query-server.service /etc/systemd/system/nullifier-query-server.service
             sudo systemctl daemon-reload
             sudo systemctl enable nullifier-query-server

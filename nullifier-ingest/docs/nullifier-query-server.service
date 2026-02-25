@@ -1,15 +1,12 @@
 [Unit]
-Description=Nullifier ingest query server
+Description=Nullifier PIR server (nf-server)
 After=network.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/opt/nullifier-ingest
-Environment="DATA_DIR=/opt/nullifier-ingest"
-Environment="PORT=3000"
-Environment="LWD_URL=https://zec.rocks:443"
-ExecStart=/opt/nullifier-ingest/query-server
+ExecStart=/opt/nullifier-ingest/nf-server serve --pir-data-dir /opt/nullifier-ingest/pir-data --port 3000
 Restart=on-failure
 
 [Install]

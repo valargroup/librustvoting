@@ -120,7 +120,7 @@ ingest-test: ## Run nullifier-tree unit tests
 ingest-proof: ## Run exclusion proof verification against ingested data
 	$(MAKE) -C $(INGEST_DIR) test-proof
 
-ingest-serve: ## Start the nullifier exclusion proof query server
+ingest-serve: ## Start the nullifier PIR server
 	$(MAKE) -C $(INGEST_DIR) serve
 
 ingest-clean: ## Remove nullifier build artifacts and database
@@ -147,11 +147,10 @@ ceremony-prod: ## Run ceremony.sh with production chain env vars; pass command v
 
 # ── Full Stack ───────────────────────────────────────────────────────
 
-down: ## Stop all running zallyd, query-server, and ingest-nfs processes
+down: ## Stop all running zallyd and nf-server processes
 	@KILLED=""; \
 	pkill zallyd       2>/dev/null && KILLED="$$KILLED zallyd"       || true; \
-	pkill query-server 2>/dev/null && KILLED="$$KILLED query-server" || true; \
-	pkill ingest-nfs   2>/dev/null && KILLED="$$KILLED ingest-nfs"   || true; \
+	pkill nf-server    2>/dev/null && KILLED="$$KILLED nf-server"    || true; \
 	if [ -n "$$KILLED" ]; then \
 		printf '\033[32mStopped:%s\033[0m\n' "$$KILLED"; \
 	else \
@@ -161,8 +160,7 @@ down: ## Stop all running zallyd, query-server, and ingest-nfs processes
 up: ## Init SDK, bootstrap+ingest nullifiers, then run ingest-serve and start in parallel
 	@PROCS=""; \
 	pgrep zallyd       > /dev/null 2>&1 && PROCS="$$PROCS zallyd"; \
-	pgrep query-server > /dev/null 2>&1 && PROCS="$$PROCS query-server"; \
-	pgrep ingest-nfs   > /dev/null 2>&1 && PROCS="$$PROCS ingest-nfs"; \
+	pgrep nf-server    > /dev/null 2>&1 && PROCS="$$PROCS nf-server"; \
 	if [ -n "$$PROCS" ]; then \
 		printf '\033[31mERROR: the following processes are already running:%s\n' "$$PROCS"; \
 		printf 'Stop them first before running "make up".\033[0m\n'; \
@@ -171,7 +169,7 @@ up: ## Init SDK, bootstrap+ingest nullifiers, then run ingest-serve and start in
 	$(MAKE) init
 	$(MAKE) ingest-bootstrap
 	$(MAKE) ingest
-	@rm -f $(INGEST_DIR)/nullifiers.tree
+	$(MAKE) -C $(INGEST_DIR) export-nf
 	@nohup $(MAKE) ingest-serve > ingest-serve.log 2>&1 & \
 	nohup $(MAKE) start > zallyd.log 2>&1 & \
 	printf '\033[32mStarted: ingest-serve → ingest-serve.log | zallyd → zallyd.log\033[0m\n'

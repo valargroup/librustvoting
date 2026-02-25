@@ -3,9 +3,13 @@ name = "pir-server"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+avx512 = ["ypir/explicit_avx512"]
+
 [dependencies]
 pir-export = { path = "../pir-export" }
-ypir = { git = "https://github.com/menonsamir/ypir.git", branch = "artifact", default-features = false, features = ["server", "explicit_avx512"] }
+ypir = { git = "https://github.com/menonsamir/ypir.git", branch = "artifact", default-features = false, features = ["server"] }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1.0"

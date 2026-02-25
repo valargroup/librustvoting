@@ -1,25 +1,24 @@
 # nullifier-ingest
-# Top-level Makefile — delegates to imt-tree and service subcrates
+# Top-level Makefile — delegates to nf-server (unified binary) and subcrates
 #
 # Storage: flat binary files (no SQLite).
 #
 #   nullifiers.bin         – append-only raw 32-byte nullifier blobs
 #   nullifiers.checkpoint  – 16-byte (height LE, offset LE) crash-recovery marker
-#   nullifiers.tree        – cached full Merkle tree (optional sidecar)
+#   pir-data/              – PIR tier files (tier0.bin, tier1.bin, tier2.bin, pir_root.json)
 #
-# Incremental vs full-resync
-# ──────────────────────────
-# `make ingest` is incremental — it resumes from the checkpoint and appends
-# new nullifiers. The tree sidecar is left untouched, so the running server
-# continues to serve the old tree until restarted.
+# Pipeline: ingest → export → serve
+# ──────────────────────────────────
+# `make ingest` syncs nullifiers from lightwalletd into nullifiers.bin.
+# `make export-nf` builds the PIR tree and exports tier files.
+# `make serve` starts the PIR HTTP server.
 #
-# `make ingest-resync` also ingests incrementally, but deletes the tree
-# sidecar afterwards (INVALIDATE_TREE=1). The next `make serve` will rebuild
-# the Merkle tree from the full flat file. This is a sequential-read + parallel
-# Fp::from_repr, so even 50M nullifiers (~1.6 GB) rebuilds in seconds.
+# `make ingest-resync` ingests and deletes stale sidecar/tier files
+# (--invalidate) so the next export rebuilds from the updated data.
 
 IMT_DIR     := imt-tree
 SERVICE_DIR := service
+NF_DIR      := nf-server
 
 # ── Configuration (override with env vars) ───────────────────────────
 DATA_DIR      ?= .
@@ -27,27 +26,32 @@ LWD_URL       ?= https://zec.rocks:443
 PORT          ?= 3000
 BOOTSTRAP_URL ?= https://vote.fra1.digitaloceanspaces.com
 SYNC_HEIGHT   ?=
+PIR_DATA_DIR  ?= $(DATA_DIR)/pir-data
 
-# Validate SYNC_HEIGHT and build the MAX_HEIGHT env fragment for the ingest binary.
+# Validate SYNC_HEIGHT and build --max-height flag for the ingest subcommand.
 # If unset, ingest runs to chain tip.  If set, it must be a multiple of 10.
 ifdef SYNC_HEIGHT
   ifneq ($(shell expr $(SYNC_HEIGHT) % 10),0)
     $(error SYNC_HEIGHT must be a multiple of 10, got $(SYNC_HEIGHT))
   endif
-  _MAX_HEIGHT_ENV := MAX_HEIGHT=$(SYNC_HEIGHT)
+  _MAX_HEIGHT_FLAG := --max-height $(SYNC_HEIGHT)
 else
-  _MAX_HEIGHT_ENV :=
+  _MAX_HEIGHT_FLAG :=
 endif
 
 # ── Targets ──────────────────────────────────────────────────────────
 
-.PHONY: ingest ingest-resync bootstrap test-proof build test test-integration clean status serve serve-deploy help
+.PHONY: build-nf ingest ingest-resync export-nf serve bootstrap test-proof build test test-integration clean status help
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
-build: ## Build all binaries (release)
+build-nf: ## Build nf-server binary (release, nightly)
+	cd $(NF_DIR) && cargo build --release
+
+build: ## Build nf-server and service binaries (release)
+	cd $(NF_DIR) && cargo build --release
 	cd $(SERVICE_DIR) && cargo build --release
 
 bootstrap: ## Download nullifier files from bootstrap URL if not present in DATA_DIR
@@ -63,22 +67,19 @@ bootstrap: ## Download nullifier files from bootstrap URL if not present in DATA
 	fi
 
 ingest: ## Ingest nullifiers incrementally up to SYNC_HEIGHT (or chain tip if unset)
-	cd $(SERVICE_DIR) && DATA_DIR=../$(DATA_DIR) LWD_URL=$(LWD_URL) $(_MAX_HEIGHT_ENV) cargo run --release --bin ingest-nfs
+	cd $(NF_DIR) && cargo run --release -- ingest --data-dir ../$(DATA_DIR) --lwd-url $(LWD_URL) $(_MAX_HEIGHT_FLAG)
 
-ingest-resync: ## Ingest nullifiers up to SYNC_HEIGHT and delete stale tree sidecar so server rebuilds
-	cd $(SERVICE_DIR) && DATA_DIR=../$(DATA_DIR) LWD_URL=$(LWD_URL) INVALIDATE_TREE=1 $(_MAX_HEIGHT_ENV) cargo run --release --bin ingest-nfs
+ingest-resync: ## Ingest nullifiers up to SYNC_HEIGHT and invalidate stale sidecar/tier files
+	cd $(NF_DIR) && cargo run --release -- ingest --data-dir ../$(DATA_DIR) --lwd-url $(LWD_URL) --invalidate $(_MAX_HEIGHT_FLAG)
+
+export-nf: ## Build PIR tree and export tier files from nullifiers.bin
+	cd $(NF_DIR) && cargo run --release -- export --data-dir ../$(DATA_DIR) --output-dir ../$(PIR_DATA_DIR)
+
+serve: ## Start the PIR HTTP server
+	cd $(NF_DIR) && cargo run --release --features serve -- serve --pir-data-dir ../$(PIR_DATA_DIR) --port $(PORT)
 
 test-proof: ## Run exclusion proof verification against ingested data
 	cd $(SERVICE_DIR) && DATA_DIR=../$(DATA_DIR) cargo run --release --bin test-non-inclusion
-
-serve: ## Start the exclusion proof query server
-	cd $(SERVICE_DIR) && DATA_DIR=../$(DATA_DIR) PORT=$(PORT) LWD_URL=$(LWD_URL) cargo run --release --bin query-server
-
-# Same binary and env as CI deploy; use for local testing before pushing.
-DEPLOY_DIR ?= nullifier-service
-serve-deploy: build ## Build release and run query-server from DEPLOY_DIR
-	@mkdir -p $(DEPLOY_DIR)
-	cd $(SERVICE_DIR) && DATA_DIR=../$(DEPLOY_DIR) PORT=$(PORT) ./target/release/query-server
 
 test: ## Run unit tests for all subcrates
 	cd $(IMT_DIR) && cargo test --lib
@@ -116,4 +117,5 @@ status: ## Show ingestion progress (nullifier count + last synced height)
 clean: ## Remove built artifacts and data files
 	cd $(IMT_DIR) && cargo clean
 	cd $(SERVICE_DIR) && cargo clean
+	cd $(NF_DIR) && cargo clean
 	rm -f $(DATA_DIR)/nullifiers.bin $(DATA_DIR)/nullifiers.checkpoint $(DATA_DIR)/nullifiers.tree
