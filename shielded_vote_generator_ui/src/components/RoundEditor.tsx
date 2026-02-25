@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
-import { X, Clock, RefreshCw, AlertTriangle, ExternalLink, Loader2 } from "lucide-react";
+import { X, Clock, AlertTriangle, ExternalLink, Loader2 } from "lucide-react";
 import type { VotingRound, RoundSettings } from "../types";
 import {
   useChainInfo,
