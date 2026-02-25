@@ -564,6 +564,31 @@ fn assign_free_advice(
     )
 }
 
+/// In-circuit Poseidon hash for one share commitment: `Poseidon(blind, c1_x, c2_x)`.
+///
+/// Uses the same parameters as the out-of-circuit [`share_commitment`] (P128Pow5T3,
+/// ConstantLength<3>, width 3, rate 2) so that native and in-circuit hashes match.
+fn hash_share_commitment_in_circuit(
+    chip: PoseidonChip<pallas::Base, 3, 2>,
+    mut layouter: impl Layouter<pallas::Base>,
+    blind: AssignedCell<pallas::Base, pallas::Base>,
+    enc_c1: AssignedCell<pallas::Base, pallas::Base>,
+    enc_c2: AssignedCell<pallas::Base, pallas::Base>,
+    index: usize,
+) -> Result<AssignedCell<pallas::Base, pallas::Base>, plonk::Error> {
+    let hasher = PoseidonHash::<
+        pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<3>, 3, 2,
+    >::init(
+        chip,
+        layouter.namespace(|| alloc::format!("share_comm_{index} Poseidon init")),
+    )?;
+    hasher.hash(
+        layouter.namespace(|| {
+            alloc::format!("share_comm_{index} = Poseidon(blind_{index}, c1_{index}, c2_{index})")
+        }),
+        [blind, enc_c1, enc_c2],
+    )
+}
 
 impl plonk::Circuit<pallas::Base> for Circuit {
     type Config = Config;
@@ -1284,32 +1309,19 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
 
         // Witness the 5 blind factors and 10 El Gamal ciphertext x-coordinates.
-        let blind_0 = assign_free_advice(
-            layouter.namespace(|| "witness share_blind[0]"),
-            config.advices[0],
-            self.share_blinds[0],
-        )?;
-        let blind_1 = assign_free_advice(
-            layouter.namespace(|| "witness share_blind[1]"),
-            config.advices[0],
-            self.share_blinds[1],
-        )?;
-        let blind_2 = assign_free_advice(
-            layouter.namespace(|| "witness share_blind[2]"),
-            config.advices[0],
-            self.share_blinds[2],
-        )?;
-        let blind_3 = assign_free_advice(
-            layouter.namespace(|| "witness share_blind[3]"),
-            config.advices[0],
-            self.share_blinds[3],
-        )?;
-        let blind_4 = assign_free_advice(
-            layouter.namespace(|| "witness share_blind[4]"),
-            config.advices[0],
-            self.share_blinds[4],
-        )?;
+        let blinds: [AssignedCell<pallas::Base, pallas::Base>; 5] = (0..5)
+            .map(|i| {
+                assign_free_advice(
+                    layouter.namespace(|| alloc::format!("witness share_blind[{i}]")),
+                    config.advices[0],
+                    self.share_blinds[i],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .expect("always 5 elements");
 
+        // Witness the 5 El Gamal c1 ciphertext x-coordinates.
         let enc_c1: [_; 5] = (0..5)
             .map(|i| assign_free_advice(
                 layouter.namespace(|| alloc::format!("witness enc_c1_x[{i}]")),
@@ -1319,6 +1331,8 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .expect("always 5 elements");
+
+        // Witness the 5 El Gamal c2 ciphertext x-coordinates.
         let enc_c2: [_; 5] = (0..5)
             .map(|i| assign_free_advice(
                 layouter.namespace(|| alloc::format!("witness enc_c2_x[{i}]")),
@@ -1329,79 +1343,25 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             .try_into()
             .expect("always 5 elements");
 
-        // Clone for Condition 11 before the per-share Poseidon hashes consume the originals.
-        let enc_c1_cond11 = enc_c1.clone();
-        let enc_c2_cond11 = enc_c2.clone();
-
-        // Destructure into individual cells for the per-share Poseidon inputs below.
-        let [enc_c1_0, enc_c1_1, enc_c1_2, enc_c1_3, enc_c1_4] = enc_c1;
-        let [enc_c2_0, enc_c2_1, enc_c2_2, enc_c2_3, enc_c2_4] = enc_c2;
-
-        // Compute per-share blinded commitments:
-        // share_comm_i = Poseidon(blind_i, c1_i, c2_i)
-        let share_comm_0 = {
-            let hasher = PoseidonHash::<
-                pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<3>, 3, 2,
-            >::init(
-                config.poseidon_chip(),
-                layouter.namespace(|| "share_comm_0 Poseidon init"),
-            )?;
-            hasher.hash(
-                layouter.namespace(|| "share_comm_0 = Poseidon(blind_0, c1_0, c2_0)"),
-                [blind_0, enc_c1_0, enc_c2_0],
-            )?
-        };
-        let share_comm_1 = {
-            let hasher = PoseidonHash::<
-                pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<3>, 3, 2,
-            >::init(
-                config.poseidon_chip(),
-                layouter.namespace(|| "share_comm_1 Poseidon init"),
-            )?;
-            hasher.hash(
-                layouter.namespace(|| "share_comm_1 = Poseidon(blind_1, c1_1, c2_1)"),
-                [blind_1, enc_c1_1, enc_c2_1],
-            )?
-        };
-        let share_comm_2 = {
-            let hasher = PoseidonHash::<
-                pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<3>, 3, 2,
-            >::init(
-                config.poseidon_chip(),
-                layouter.namespace(|| "share_comm_2 Poseidon init"),
-            )?;
-            hasher.hash(
-                layouter.namespace(|| "share_comm_2 = Poseidon(blind_2, c1_2, c2_2)"),
-                [blind_2, enc_c1_2, enc_c2_2],
-            )?
-        };
-        let share_comm_3 = {
-            let hasher = PoseidonHash::<
-                pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<3>, 3, 2,
-            >::init(
-                config.poseidon_chip(),
-                layouter.namespace(|| "share_comm_3 Poseidon init"),
-            )?;
-            hasher.hash(
-                layouter.namespace(|| "share_comm_3 = Poseidon(blind_3, c1_3, c2_3)"),
-                [blind_3, enc_c1_3, enc_c2_3],
-            )?
-        };
-        let share_comm_4 = {
-            let hasher = PoseidonHash::<
-                pallas::Base, _, poseidon::P128Pow5T3, ConstantLength<3>, 3, 2,
-            >::init(
-                config.poseidon_chip(),
-                layouter.namespace(|| "share_comm_4 Poseidon init"),
-            )?;
-            hasher.hash(
-                layouter.namespace(|| "share_comm_4 = Poseidon(blind_4, c1_4, c2_4)"),
-                [blind_4, enc_c1_4, enc_c2_4],
-            )?
-        };
+        // Compute per-share blinded commitments: share_comm_i = Poseidon(blind_i, c1_i, c2_i)
+        let share_comm: [AssignedCell<pallas::Base, pallas::Base>; 5] = (0..5)
+            .map(|i| {
+                hash_share_commitment_in_circuit(
+                    config.poseidon_chip(),
+                    layouter.namespace(|| alloc::format!("share_comm_{i}")),
+                    blinds[i].clone(),
+                    enc_c1[i].clone(),
+                    enc_c2[i].clone(),
+                    i,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .expect("always 5 elements");
 
         // Compute shares_hash = Poseidon(share_comm_0, ..., share_comm_4).
         // The result is used by condition 12 (vote commitment integrity).
+        let [share_comm_0, share_comm_1, share_comm_2, share_comm_3, share_comm_4] = share_comm;
         let shares_hash = {
             let hasher = PoseidonHash::<
                 pallas::Base,
@@ -1419,6 +1379,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 [share_comm_0, share_comm_1, share_comm_2, share_comm_3, share_comm_4],
             )?
         };
+
+        // Clone for Condition 11 before the per-share Poseidon hashes use the cells.
+        let enc_c1_cond11 = enc_c1.clone();
+        let enc_c2_cond11 = enc_c2.clone();
 
         // ---------------------------------------------------------------
         // Condition 11: Encryption Integrity.
@@ -2842,6 +2806,139 @@ mod tests {
             core::array::from_fn(|_| pallas::Base::random(&mut rng));
         let h5 = shares_hash(blinds_alt, c1_x, c2_x);
         assert_ne!(h1, h5);
+    }
+
+    /// Verifies the out-of-circuit share_commitment helper is deterministic
+    /// and that input order matters (Poseidon(blind, c1, c2) ≠ Poseidon(blind, c2, c1)).
+    #[test]
+    fn share_commitment_deterministic() {
+        let mut rng = OsRng;
+        let blind = pallas::Base::random(&mut rng);
+        let c1_x = pallas::Base::random(&mut rng);
+        let c2_x = pallas::Base::random(&mut rng);
+
+        let h1 = share_commitment(blind, c1_x, c2_x);
+        let h2 = share_commitment(blind, c1_x, c2_x);
+        assert_eq!(h1, h2);
+
+        // Swapping c1 and c2 changes the hash.
+        let h3 = share_commitment(blind, c2_x, c1_x);
+        assert_ne!(h1, h3);
+
+        // Different blind changes the hash.
+        let blind_alt = pallas::Base::random(&mut rng);
+        let h4 = share_commitment(blind_alt, c1_x, c2_x);
+        assert_ne!(h1, h4);
+    }
+
+    /// Minimal circuit that computes one share commitment in-circuit and constrains
+    /// the result to the instance column. Used to verify the in-circuit hash matches
+    /// the native share_commitment.
+    #[derive(Clone, Default)]
+    struct ShareCommitmentTestCircuit {
+        blind: pallas::Base,
+        c1_x: pallas::Base,
+        c2_x: pallas::Base,
+    }
+
+    #[derive(Clone)]
+    struct ShareCommitmentTestConfig {
+        primary: Column<InstanceColumn>,
+        advices: [Column<Advice>; 5],
+        poseidon_config: PoseidonConfig<pallas::Base, 3, 2>,
+    }
+
+    impl plonk::Circuit<pallas::Base> for ShareCommitmentTestCircuit {
+        type Config = ShareCommitmentTestConfig;
+        type FloorPlanner = floor_planner::V1;
+
+        fn without_witnesses(&self) -> Self {
+            Self::default()
+        }
+
+        fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
+            let primary = meta.instance_column();
+            meta.enable_equality(primary);
+            let advices: [Column<Advice>; 5] = core::array::from_fn(|_| meta.advice_column());
+            for col in &advices {
+                meta.enable_equality(*col);
+            }
+            let fixed: [Column<Fixed>; 6] = core::array::from_fn(|_| meta.fixed_column());
+            let constants = meta.fixed_column();
+            meta.enable_constant(constants);
+            let rc_a = fixed[0..3].try_into().unwrap();
+            let rc_b = fixed[3..6].try_into().unwrap();
+            let poseidon_config = PoseidonChip::configure::<poseidon::P128Pow5T3>(
+                meta,
+                advices[1..4].try_into().unwrap(),
+                advices[4],
+                rc_a,
+                rc_b,
+            );
+            ShareCommitmentTestConfig {
+                primary,
+                advices,
+                poseidon_config,
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<pallas::Base>,
+        ) -> Result<(), plonk::Error> {
+            let blind_cell = assign_free_advice(
+                layouter.namespace(|| "blind"),
+                config.advices[0],
+                Value::known(self.blind),
+            )?;
+            let c1_cell = assign_free_advice(
+                layouter.namespace(|| "c1_x"),
+                config.advices[0],
+                Value::known(self.c1_x),
+            )?;
+            let c2_cell = assign_free_advice(
+                layouter.namespace(|| "c2_x"),
+                config.advices[0],
+                Value::known(self.c2_x),
+            )?;
+            let chip = PoseidonChip::construct(config.poseidon_config.clone());
+            let result = hash_share_commitment_in_circuit(
+                chip,
+                layouter.namespace(|| "share_comm"),
+                blind_cell,
+                c1_cell,
+                c2_cell,
+                0,
+            )?;
+            layouter.constrain_instance(result.cell(), config.primary, 0)?;
+            Ok(())
+        }
+    }
+
+    /// Verifies that the in-circuit share commitment hash matches the native
+    /// share_commitment(blind, c1_x, c2_x). The test builds a minimal circuit
+    /// that computes the hash and constrains it to the instance column, then
+    /// runs MockProver with the native hash as the public input.
+    #[test]
+    fn hash_share_commitment_in_circuit_matches_native() {
+        let mut rng = OsRng;
+        let blind = pallas::Base::random(&mut rng);
+        let c1_x = pallas::Base::random(&mut rng);
+        let c2_x = pallas::Base::random(&mut rng);
+
+        let expected = share_commitment(blind, c1_x, c2_x);
+        let circuit = ShareCommitmentTestCircuit {
+            blind,
+            c1_x,
+            c2_x,
+        };
+        let instance = vec![vec![expected]];
+        // K=10 (1024 rows) is enough for one Poseidon(3) region.
+        const TEST_K: u32 = 10;
+        let prover =
+            MockProver::run(TEST_K, &circuit, instance).expect("MockProver::run failed");
+        assert_eq!(prover.verify(), Ok(()));
     }
 
     // ================================================================
