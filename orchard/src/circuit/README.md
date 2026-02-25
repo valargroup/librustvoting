@@ -143,7 +143,7 @@ The vote proof must bind the Poseidon hash of enc_share x-coordinates (condition
 
 ### API
 
-**`prove_elgamal_encryptions(ecc_chip, layouter, namespace, ea_pk, ea_pk_loc, share_cells, r_cells, enc_c1_cells, enc_c2_cells) -> Result<(), Error>`**
+**`prove_elgamal_encryptions(ecc_chip, layouter, namespace, ea_pk, ea_pk_loc, advice_col, share_cells, r_cells, enc_c1_cells, enc_c2_cells) -> Result<(), Error>`**
 
 Per share i: constrains C1_i = [r_i]*G and C2_i = [v_i]*G + [r_i]*ea_pk, and `constrain_equal(ExtractP(C1_i), enc_c1_cells[i])` and similarly for C2. The gadget owns all ea_pk scaffolding: it witnesses the point internally and calls `layouter.constrain_instance` using the `EaPkInstanceLoc` descriptor (instance column + x/y row offsets). The caller supplies the four varying arrays and `ea_pk` as a `Value<Affine>`.
 
@@ -155,4 +155,4 @@ Per share i: constrains C1_i = [r_i]*G and C2_i = [v_i]*G + [r_i]*ea_pk, and `co
 
 ### Usage
 
-- **Vote proof:** `orchard/src/vote_proof/circuit.rs` — condition 11 witnesses r_0..r_4, then calls `prove_elgamal_encryptions` with `EaPkInstanceLoc { instance: config.primary, x_row: EA_PK_X, y_row: EA_PK_Y }`. The gadget handles ea_pk witnessing and instance-pinning internally.
+- **Vote proof:** `orchard/src/vote_proof/circuit.rs` — condition 11 witnesses r_0..r_4, then calls `prove_elgamal_encryptions` with `EaPkInstanceLoc { instance: config.primary, x_row: EA_PK_X, y_row: EA_PK_Y }` and `config.advices[0]`. The gadget handles ea_pk witnessing, instance-pinning, and sign-cell constant assignment internally.

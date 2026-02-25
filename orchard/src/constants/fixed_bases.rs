@@ -68,13 +68,28 @@ pub enum OrchardBaseFieldBases {
     SpendAuthGBase,
 }
 
+/// Fixed bases used in scalar mul where the scalar is a short (64-bit) signed value.
+///
+/// `FixedPoints::ShortScalar` must be a single type, so both `ValueCommitV`
+/// and `SpendAuthGShort` are wrapped in this enum. `SpendAuthGShort` uses the
+/// same generator as `SpendAuthG` but with 22-window precomputed tables, enabling
+/// `FixedPointShort::mul` for vote-share values bounded to 30 bits by condition 9.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum OrchardShortScalarBases {
+    /// Value commitment generator for Orchard (original short base).
+    ValueCommitV,
+    /// SpendAuthG with short (22-window) tables, used for [v_i]*G in ElGamal
+    /// encryption where v_i is range-checked to 30 bits by condition 9.
+    SpendAuthGShort,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 // A sum type for both full-width and short bases. This enables us to use the
 // shared functionality of full-width and short fixed-base scalar multiplication.
 pub enum OrchardFixedBases {
     Full(OrchardFixedBasesFull),
     Base(OrchardBaseFieldBases),
-    ValueCommitV,
+    Short(OrchardShortScalarBases),
 }
 
 impl From<OrchardFixedBasesFull> for OrchardFixedBases {
@@ -85,7 +100,7 @@ impl From<OrchardFixedBasesFull> for OrchardFixedBases {
 
 impl From<ValueCommitV> for OrchardFixedBases {
     fn from(_value_commit_v: ValueCommitV) -> Self {
-        Self::ValueCommitV
+        Self::Short(OrchardShortScalarBases::ValueCommitV)
     }
 }
 
@@ -98,6 +113,12 @@ impl From<NullifierK> for OrchardFixedBases {
 impl From<OrchardBaseFieldBases> for OrchardFixedBases {
     fn from(b: OrchardBaseFieldBases) -> Self {
         Self::Base(b)
+    }
+}
+
+impl From<OrchardShortScalarBases> for OrchardFixedBases {
+    fn from(b: OrchardShortScalarBases) -> Self {
+        Self::Short(b)
     }
 }
 
@@ -122,7 +143,7 @@ pub struct ValueCommitV;
 impl FixedPoints<pallas::Affine> for OrchardFixedBases {
     type FullScalar = OrchardFixedBasesFull;
     type Base = OrchardBaseFieldBases;
-    type ShortScalar = ValueCommitV;
+    type ShortScalar = OrchardShortScalarBases;
 }
 
 #[cfg(feature = "circuit")]
@@ -221,6 +242,32 @@ impl FixedPoint<pallas::Affine> for ValueCommitV {
     }
 }
 
+#[cfg(feature = "circuit")]
+impl FixedPoint<pallas::Affine> for OrchardShortScalarBases {
+    type FixedScalarKind = ShortScalar;
+
+    fn generator(&self) -> pallas::Affine {
+        match self {
+            Self::ValueCommitV => value_commit_v::generator(),
+            Self::SpendAuthGShort => spend_auth_g::generator(),
+        }
+    }
+
+    fn u(&self) -> Vec<[[u8; 32]; H]> {
+        match self {
+            Self::ValueCommitV => value_commit_v::U_SHORT.to_vec(),
+            Self::SpendAuthGShort => spend_auth_g::U_SHORT.to_vec(),
+        }
+    }
+
+    fn z(&self) -> Vec<u64> {
+        match self {
+            Self::ValueCommitV => value_commit_v::Z_SHORT.to_vec(),
+            Self::SpendAuthGShort => spend_auth_g::Z_SHORT.to_vec(),
+        }
+    }
+}
+
 #[cfg(all(test, feature = "circuit"))]
 mod tests {
     use super::*;
@@ -231,7 +278,6 @@ mod tests {
     /// same 85-window structure); this test makes the dispatch wiring explicit.
     #[test]
     fn spend_auth_g_base_field_routes_correctly() {
-        use halo2_gadgets::ecc::FixedPoint as _;
 
         let full = OrchardFixedBasesFull::SpendAuthG;
         let base = OrchardBaseFieldBases::SpendAuthGBase;
@@ -257,7 +303,6 @@ mod tests {
     /// NullifierK generator and tables (regression guard for the enum refactor).
     #[test]
     fn nullifier_k_base_field_routes_correctly() {
-        use halo2_gadgets::ecc::FixedPoint as _;
 
         let base = OrchardBaseFieldBases::NullifierK;
 
@@ -276,5 +321,49 @@ mod tests {
             nullifier_k::Z.to_vec(),
             "OrchardBaseFieldBases::NullifierK Z tables must match"
         );
+    }
+
+    /// Ensures that `OrchardShortScalarBases::SpendAuthGShort` routes to the
+    /// SpendAuthG generator and the 22-window short tables.
+    #[test]
+    fn spend_auth_g_short_routes_correctly() {
+
+        let short = OrchardShortScalarBases::SpendAuthGShort;
+        let full = OrchardFixedBasesFull::SpendAuthG;
+
+        assert_eq!(
+            short.generator(),
+            full.generator(),
+            "SpendAuthGShort must share the SpendAuthG generator"
+        );
+        assert_eq!(
+            short.u().len(),
+            NUM_WINDOWS_SHORT,
+            "SpendAuthGShort U table must have NUM_WINDOWS_SHORT entries"
+        );
+        assert_eq!(
+            short.z().len(),
+            NUM_WINDOWS_SHORT,
+            "SpendAuthGShort Z table must have NUM_WINDOWS_SHORT entries"
+        );
+        // Short tables must differ from the full 85-window tables.
+        assert_ne!(
+            short.u(),
+            full.u()[..NUM_WINDOWS_SHORT].to_vec(),
+            "SpendAuthGShort U table must use the short-scalar window structure"
+        );
+    }
+
+    /// Ensures that `OrchardShortScalarBases::ValueCommitV` still routes to
+    /// the ValueCommitV generator and tables (regression guard for the enum change).
+    #[test]
+    fn value_commit_v_short_routes_correctly() {
+
+        let short = OrchardShortScalarBases::ValueCommitV;
+        let legacy = ValueCommitV;
+
+        assert_eq!(short.generator(), legacy.generator());
+        assert_eq!(short.u(), legacy.u());
+        assert_eq!(short.z(), legacy.z());
     }
 }

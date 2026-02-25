@@ -337,7 +337,7 @@ Total: 10 fixed-base scalar multiplications, 5 variable-base scalar multiplicati
 
 **Out-of-circuit helpers:** In `circuit::elgamal`: `elgamal_encrypt()` computes the same El Gamal encryption outside the circuit; `spend_auth_g_affine()` returns the SpendAuthG generator; `base_to_scalar()` converts base field elements to scalars.
 
-**Constructions:** Shared `circuit::elgamal::prove_elgamal_encryptions`; `EccChip`, `FixedPointBaseField`, `NonIdentityPoint`, `ScalarVar`, `Point::add`, `Point::extract_p`.
+**Constructions:** Shared `circuit::elgamal::prove_elgamal_encryptions`; `EccChip`, `FixedPointBaseField` (for C1 [r_i]*G, 85 windows), `FixedPointShort` (for C2 [v_i]*G, 22 windows), `NonIdentityPoint`, `ScalarVar`, `Point::add`, `Point::extract_p`.
 
 ## Condition 12: Vote Commitment Integrity ✅
 
