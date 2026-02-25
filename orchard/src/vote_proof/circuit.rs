@@ -1298,70 +1298,32 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             self.share_blinds[4],
         )?;
 
-        let enc_c1_0 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c1_x[0]"),
-            config.advices[0],
-            self.enc_share_c1_x[0],
-        )?;
-        let enc_c2_0 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c2_x[0]"),
-            config.advices[0],
-            self.enc_share_c2_x[0],
-        )?;
-        let enc_c1_1 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c1_x[1]"),
-            config.advices[0],
-            self.enc_share_c1_x[1],
-        )?;
-        let enc_c2_1 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c2_x[1]"),
-            config.advices[0],
-            self.enc_share_c2_x[1],
-        )?;
-        let enc_c1_2 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c1_x[2]"),
-            config.advices[0],
-            self.enc_share_c1_x[2],
-        )?;
-        let enc_c2_2 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c2_x[2]"),
-            config.advices[0],
-            self.enc_share_c2_x[2],
-        )?;
-        let enc_c1_3 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c1_x[3]"),
-            config.advices[0],
-            self.enc_share_c1_x[3],
-        )?;
-        let enc_c2_3 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c2_x[3]"),
-            config.advices[0],
-            self.enc_share_c2_x[3],
-        )?;
-        let enc_c1_4 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c1_x[4]"),
-            config.advices[0],
-            self.enc_share_c1_x[4],
-        )?;
-        let enc_c2_4 = assign_free_advice(
-            layouter.namespace(|| "witness enc_share_c2_x[4]"),
-            config.advices[0],
-            self.enc_share_c2_x[4],
-        )?;
+        let enc_c1: [_; 5] = (0..5)
+            .map(|i| assign_free_advice(
+                layouter.namespace(|| alloc::format!("witness enc_c1_x[{i}]")),
+                config.advices[0],
+                self.enc_share_c1_x[i],
+            ))
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .expect("always 5 elements");
+        let enc_c2: [_; 5] = (0..5)
+            .map(|i| assign_free_advice(
+                layouter.namespace(|| alloc::format!("witness enc_c2_x[{i}]")),
+                config.advices[0],
+                self.enc_share_c2_x[i],
+            ))
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .expect("always 5 elements");
 
-        // Clone enc_share cells before the Poseidon hash (which consumes
-        // them). These clones are used by condition 11 to constrain that
-        // the hashed x-coordinates match the computed El Gamal ciphertexts.
-        let enc_c1_0_cond10 = enc_c1_0.clone();
-        let enc_c2_0_cond10 = enc_c2_0.clone();
-        let enc_c1_1_cond10 = enc_c1_1.clone();
-        let enc_c2_1_cond10 = enc_c2_1.clone();
-        let enc_c1_2_cond10 = enc_c1_2.clone();
-        let enc_c2_2_cond10 = enc_c2_2.clone();
-        let enc_c1_3_cond10 = enc_c1_3.clone();
-        let enc_c2_3_cond10 = enc_c2_3.clone();
-        let enc_c1_4_cond10 = enc_c1_4.clone();
-        let enc_c2_4_cond10 = enc_c2_4.clone();
+        // Clone for Condition 11 before the per-share Poseidon hashes consume the originals.
+        let enc_c1_cond11 = enc_c1.clone();
+        let enc_c2_cond11 = enc_c2.clone();
+
+        // Destructure into individual cells for the per-share Poseidon inputs below.
+        let [enc_c1_0, enc_c1_1, enc_c1_2, enc_c1_3, enc_c1_4] = enc_c1;
+        let [enc_c2_0, enc_c2_1, enc_c2_2, enc_c2_3, enc_c2_4] = enc_c2;
 
         // Compute per-share blinded commitments:
         // share_comm_i = Poseidon(blind_i, c1_i, c2_i)
@@ -1465,17 +1427,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 .try_into()
                 .expect("always 5 elements");
 
-            let enc_c1_cells = [
-                enc_c1_0_cond10, enc_c1_1_cond10,
-                enc_c1_2_cond10, enc_c1_3_cond10,
-                enc_c1_4_cond10,
-            ];
-            let enc_c2_cells = [
-                enc_c2_0_cond10, enc_c2_1_cond10,
-                enc_c2_2_cond10, enc_c2_3_cond10,
-                enc_c2_4_cond10,
-            ];
-
             prove_elgamal_encryptions(
                 ecc_chip.clone(),
                 layouter.namespace(|| "cond11 El Gamal"),
@@ -1488,8 +1439,8 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 },
                 share_cells,
                 r_cells,
-                enc_c1_cells,
-                enc_c2_cells,
+                enc_c1_cond11,
+                enc_c2_cond11,
             )?;
         }
 
