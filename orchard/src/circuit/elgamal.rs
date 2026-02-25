@@ -5,9 +5,10 @@
 //! election authority public key: C1_i = [r_i]*G, C2_i = [v_i]*G + [r_i]*ea_pk.
 //!
 //! Used by the vote proof circuit (Condition 11: Encryption Integrity). The
-//! caller assigns ea_pk instance cells, share and randomness cells, and the
-//! witnessed enc_share x-coordinates; this gadget constrains the ECC
-//! computation to match those cells. G = SpendAuthG is fixed-base (no witness).
+//! caller passes share cells, randomness cells, and enc_share x-coordinate cells;
+//! this gadget owns all ea_pk scaffolding (witnesses ea_pk once as a
+//! `NonIdentityPoint` and pins it to the instance column via `constrain_instance`)
+//! and handles G via `FixedPointBaseField` (no advice-from-constant cells needed).
 //!
 //! Also provides out-of-circuit helpers: `spend_auth_g_affine`, `base_to_scalar`,
 //! and `elgamal_encrypt` for the builder and tests.
@@ -106,8 +107,7 @@ pub fn elgamal_encrypt(
 ///
 /// G = SpendAuthG is handled via `FixedPointBaseField` (fixed-base scalar
 /// multiplication using the precomputed lookup tables already loaded by the
-/// circuit). This eliminates the per-iteration `NonIdentityPoint::new` witness
-/// and `constrain_equal` dance that the variable-base path required.
+/// circuit).
 ///
 /// The gadget owns all ea_pk scaffolding: it witnesses the point internally and
 /// calls `layouter.constrain_instance` to pin the witness to the public input

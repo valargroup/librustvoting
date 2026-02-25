@@ -1180,55 +1180,39 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // Then constrains sum == total_note_value (from condition 2).
         // ---------------------------------------------------------------
 
-        // Witness the 5 plaintext shares. These cells will also be used
+        // Witness the 5 plaintext shares. These cells are also used
         // by condition 9 (range check) and condition 11 (El Gamal
-        // encryption inputs) when those conditions are implemented.
-        let share_0 = assign_free_advice(
-            layouter.namespace(|| "witness share_0"),
-            config.advices[0],
-            self.shares[0],
-        )?;
-        let share_1 = assign_free_advice(
-            layouter.namespace(|| "witness share_1"),
-            config.advices[0],
-            self.shares[1],
-        )?;
-        let share_2 = assign_free_advice(
-            layouter.namespace(|| "witness share_2"),
-            config.advices[0],
-            self.shares[2],
-        )?;
-        let share_3 = assign_free_advice(
-            layouter.namespace(|| "witness share_3"),
-            config.advices[0],
-            self.shares[3],
-        )?;
-        let share_4 = assign_free_advice(
-            layouter.namespace(|| "witness share_4"),
-            config.advices[0],
-            self.shares[4],
-        )?;
+        // encryption inputs).
+        let share_cells: [_; 5] = (0..5usize)
+            .map(|i| assign_free_advice(
+                layouter.namespace(|| alloc::format!("witness share_{i}")),
+                config.advices[0],
+                self.shares[i],
+            ))
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .expect("always 5 elements");
 
         // Chain 4 additions: share_0 + share_1 + share_2 + share_3 + share_4.
         let partial_1 = config.add_chip().add(
             layouter.namespace(|| "share_0 + share_1"),
-            &share_0,
-            &share_1,
+            &share_cells[0],
+            &share_cells[1],
         )?;
         let partial_2 = config.add_chip().add(
             layouter.namespace(|| "partial_1 + share_2"),
             &partial_1,
-            &share_2,
+            &share_cells[2],
         )?;
         let partial_3 = config.add_chip().add(
             layouter.namespace(|| "partial_2 + share_3"),
             &partial_2,
-            &share_3,
+            &share_cells[3],
         )?;
         let shares_sum = config.add_chip().add(
             layouter.namespace(|| "partial_3 + share_4"),
             &partial_3,
-            &share_4,
+            &share_cells[4],
         )?;
 
         // Constrain: shares_sum == total_note_value.
@@ -1262,36 +1246,14 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
         // Share cells are cloned because copy_check takes ownership;
         // the originals remain available for condition 11 (El Gamal).
-        config.range_check_config().copy_check(
-            layouter.namespace(|| "share_0 < 2^30"),
-            share_0.clone(),
-            3,    // num_words: 3 × 10 = 30 bits
-            true, // strict: running sum terminates at 0
-        )?;
-        config.range_check_config().copy_check(
-            layouter.namespace(|| "share_1 < 2^30"),
-            share_1.clone(),
-            3,
-            true,
-        )?;
-        config.range_check_config().copy_check(
-            layouter.namespace(|| "share_2 < 2^30"),
-            share_2.clone(),
-            3,
-            true,
-        )?;
-        config.range_check_config().copy_check(
-            layouter.namespace(|| "share_3 < 2^30"),
-            share_3.clone(),
-            3,
-            true,
-        )?;
-        config.range_check_config().copy_check(
-            layouter.namespace(|| "share_4 < 2^30"),
-            share_4.clone(),
-            3,
-            true,
-        )?;
+        for (i, cell) in share_cells.iter().enumerate() {
+            config.range_check_config().copy_check(
+                layouter.namespace(|| alloc::format!("share_{i} < 2^30")),
+                cell.clone(),
+                3,    // num_words: 3 × 10 = 30 bits
+                true, // strict: running sum terminates at 0
+            )?;
+        }
 
         // ---------------------------------------------------------------
         // Condition 10: Shares Hash Integrity (blinded commitments).
@@ -1493,32 +1455,15 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // circuit::elgamal::prove_elgamal_encryptions gadget.
         // ---------------------------------------------------------------
         {
-            let r_0 = assign_free_advice(
-                layouter.namespace(|| "witness r[0]"),
-                config.advices[0],
-                self.share_randomness[0],
-            )?;
-            let r_1 = assign_free_advice(
-                layouter.namespace(|| "witness r[1]"),
-                config.advices[0],
-                self.share_randomness[1],
-            )?;
-            let r_2 = assign_free_advice(
-                layouter.namespace(|| "witness r[2]"),
-                config.advices[0],
-                self.share_randomness[2],
-            )?;
-            let r_3 = assign_free_advice(
-                layouter.namespace(|| "witness r[3]"),
-                config.advices[0],
-                self.share_randomness[3],
-            )?;
-            let r_4 = assign_free_advice(
-                layouter.namespace(|| "witness r[4]"),
-                config.advices[0],
-                self.share_randomness[4],
-            )?;
-            let r_cells = [r_0, r_1, r_2, r_3, r_4];
+            let r_cells: [_; 5] = (0..5usize)
+                .map(|i| assign_free_advice(
+                    layouter.namespace(|| alloc::format!("witness r[{i}]")),
+                    config.advices[0],
+                    self.share_randomness[i],
+                ))
+                .collect::<Result<Vec<_>, _>>()?
+                .try_into()
+                .expect("always 5 elements");
 
             let enc_c1_cells = [
                 enc_c1_0_cond10, enc_c1_1_cond10,
@@ -1529,11 +1474,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 enc_c2_0_cond10, enc_c2_1_cond10,
                 enc_c2_2_cond10, enc_c2_3_cond10,
                 enc_c2_4_cond10,
-            ];
-            let share_cells = [
-                share_0.clone(), share_1.clone(),
-                share_2.clone(), share_3.clone(),
-                share_4.clone(),
             ];
 
             prove_elgamal_encryptions(

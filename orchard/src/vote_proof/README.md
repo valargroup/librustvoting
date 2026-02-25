@@ -309,35 +309,35 @@ For each share i (0..4):
 ```
 
 Where:
-- **G**: SpendAuthG, the El Gamal generator. Both x and y coordinates are assigned via `assign_advice_from_constant`, baking them into the verification key. Each NonIdentityPoint witness of G is constrained to match these constants, preventing a malicious prover from using a different (or negated) generator.
-- **r_i**: El Gamal randomness for share `i` (private witness, `pallas::Base`). Converted to `ScalarVar` via `ScalarVar::from_base` for variable-base ECC multiplication. The same cell is cloned and used for both `[r_i] * G` (C1) and `[r_i] * ea_pk` (C2), ensuring the same randomness binds both ciphertext components.
-- **v_i**: plaintext share value from conditions 8/9. Cell-equality-linked to the same cells used in `AddChip` (condition 8) and range check (condition 9). Converted to `ScalarVar` via `ScalarVar::from_base` for ECC multiplication.
-- **ea_pk**: election authority public key (Pallas curve point, public input at offsets 7–8). Witnessed as a `NonIdentityPoint` (on-curve constraint included). Both x and y coordinates are constrained to match the instance column cells, preventing a prover from using a different or negated key.
+- **G**: SpendAuthG, the El Gamal generator. Handled via `FixedPointBaseField::from_inner(ecc_chip, SpendAuthGBase)`, which routes scalar multiplication through the precomputed fixed-base lookup tables already loaded by the circuit. No `NonIdentityPoint` witness or advice-from-constant assignment is needed — the generator is structurally baked into the proving key via the lookup tables, preventing a malicious prover from substituting a different base point.
+- **r_i**: El Gamal randomness for share `i` (private witness, `pallas::Base`). Used as the input to `spend_auth_g_base.clone().mul(r_cells[i])` for C1 and as `ScalarVar::from_base(r_cells[i])` for the variable-base `ea_pk` multiplication in C2. The same advice cell is cloned for both calls, ensuring the same randomness binds both ciphertext components.
+- **v_i**: plaintext share value from conditions 8/9. Cell-equality-linked to the same cells used in `AddChip` (condition 8) and range check (condition 9). Used as the input to `spend_auth_g_base.clone().mul(share_cells[i])` for the `[v_i]*G` component of C2.
+- **ea_pk**: election authority public key (Pallas curve point, public input at offsets 7–8). Witnessed once as a `NonIdentityPoint` (on-curve constraint included). Its x and y advice cells are immediately pinned to the instance column via `layouter.constrain_instance`, preventing a prover from using a different or negated key. The same `NonIdentityPoint` is reused (cloned) across all 5 iterations — no re-witnessing.
 - **enc_share_c1_x[i]**, **enc_share_c2_x[i]**: the x-coordinate cells from condition 10's witness region. These are the same cells that were hashed into `shares_hash` by condition 10's Poseidon hash. Condition 11 constrains the ECC computation output to match them via `constrain_equal`, creating a binding between the Poseidon hash (condition 10) and the actual El Gamal encryption.
 
-**Structure:** For each of the 5 shares (iterated in a loop):
-1. Witness G as `NonIdentityPoint`, constrain x/y to SpendAuthG constants
-2. `ScalarVar::from_base(r_i)` → variable-base mul → C1 point
-3. `constrain_equal(ExtractP(C1), enc_c1_x[i])`
-4. Witness G again as `NonIdentityPoint` (consumed by mul), constrain x/y
-5. `ScalarVar::from_base(share[i])` → variable-base mul → vG point
-6. Witness ea_pk as `NonIdentityPoint`, constrain x/y to public inputs
-7. `ScalarVar::from_base(r_i clone)` → variable-base mul → rP point
-8. `vG.add(rP)` → C2 point
-9. `constrain_equal(ExtractP(C2), enc_c2_x[i])`
+**Structure:**
+1. Witness ea_pk once as `NonIdentityPoint`; `constrain_instance` x and y to public inputs (rows `EA_PK_X`, `EA_PK_Y`)
+2. Construct `FixedPointBaseField` descriptor once (hoisted above loop)
+3. For each share i (0..4):
+   a. `spend_auth_g_base.clone().mul(r_cells[i])` → C1 point (fixed-base)
+   b. `constrain_equal(ExtractP(C1), enc_c1_x[i])`
+   c. `spend_auth_g_base.clone().mul(share_cells[i])` → vG point (fixed-base)
+   d. `ScalarVar::from_base(r_cells[i])` → `ea_pk.mul(r_i_scalar)` → rP point (variable-base)
+   e. `vG.add(rP)` → C2 point
+   f. `constrain_equal(ExtractP(C2), enc_c2_x[i])`
 
-Total: 15 variable-base scalar multiplications (~7,500 rows), 5 point additions, 15 `NonIdentityPoint` witnesses (10× G + 5× ea_pk), 10 coordinate `constrain_equal` constraints. This is why K was bumped from 12 to 14.
+Total: 10 fixed-base scalar multiplications, 5 variable-base scalar multiplications (ea_pk), 5 point additions, 1 `NonIdentityPoint` witness (ea_pk, reused), 10 `constrain_equal` constraints.
 
-**Scalar field handling:** All scalars (r_i, v_i) are base field elements converted via `ScalarVar::from_base`. This avoids cross-field consistency issues between `pallas::Base` and `pallas::Scalar`. For shares (< 2^30, guaranteed by condition 9), the integer representation is identical in both fields. For randomness, the probability of a base element exceeding the scalar field modulus is ≈ 2^{-254}.
+**Scalar field handling:** All scalars (r_i, v_i) are base field elements. For the fixed-base path (`[r_i]*G`, `[v_i]*G`), the advice cell is passed directly as a `BaseFieldElem` input to `FixedPointBaseField::mul`. For the variable-base path (`[r_i]*ea_pk`), `ScalarVar::from_base` decomposes the cell into a running-sum `ScalarVar`. For shares (< 2^30, guaranteed by condition 9), the integer representation is identical in both fields. For randomness, the probability of a base element exceeding the scalar field modulus is ≈ 2^{-254}.
 
 **Security properties:**
-- **Generator binding:** Each G witness is constrained to SpendAuthG's constant coordinates (both x and y), preventing the prover from using a negated generator. Using −G for v*G would produce C2 = −v*G + r*ea_pk, which decrypts to −v instead of v, corrupting the tally.
-- **ea_pk binding:** Both ea_pk coordinates are public inputs, so the verifier checks them against the published round parameter. This prevents the prover from encrypting under a different key.
-- **Randomness binding:** The same r_i cell (via clone) is used for both C1 and C2 computations. Cell equality ensures both `ScalarVar::from_base` calls decompose the same value.
+- **Generator binding:** G = SpendAuthG is structurally fixed via the `FixedPointBaseField` lookup tables loaded into the proving key. A prover cannot substitute −G or any other base point because the table entries are committed to during setup.
+- **ea_pk binding:** Witnessed once as `NonIdentityPoint` and immediately pinned to the instance column (both x and y). The verifier checks the instance against the published round parameter.
+- **Randomness binding:** The same `r_cells[i]` advice cell is cloned for both the C1 fixed-base mul and the C2 variable-base mul. Cell equality ensures both paths decompose the same value.
 
 **Out-of-circuit helpers:** In `circuit::elgamal`: `elgamal_encrypt()` computes the same El Gamal encryption outside the circuit; `spend_auth_g_affine()` returns the SpendAuthG generator; `base_to_scalar()` converts base field elements to scalars.
 
-**Constructions:** Shared `circuit::elgamal::prove_elgamal_encryptions`; `EccChip`, `NonIdentityPoint`, `ScalarVar`, `Point::add`, `Point::extract_p`.
+**Constructions:** Shared `circuit::elgamal::prove_elgamal_encryptions`; `EccChip`, `FixedPointBaseField`, `NonIdentityPoint`, `ScalarVar`, `Point::add`, `Point::extract_p`.
 
 ## Condition 12: Vote Commitment Integrity ✅
 
