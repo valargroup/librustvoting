@@ -90,7 +90,8 @@ Run `mise tasks` for the full list. Key namespaces: `build:*`, `chain:*`, `multi
 | **nullifier:\*** | |
 | `nullifier:bootstrap` | Download nullifier snapshot from DO Spaces |
 | `nullifier:ingest` | Sync nullifiers to SYNC_HEIGHT or chain tip |
-| `nullifier:serve` | Build and start query server (port 3000) |
+| `nullifier:export` | Build PIR tree and export tier files |
+| `nullifier:serve` | Start PIR server (port 3000) |
 | `nullifier:status` | Show nullifier ingestion progress |
 | `nullifier:clean` | Remove nullifier data + build artifacts |
 | **test:\*** | |

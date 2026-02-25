@@ -67,23 +67,25 @@ mise test           # end-to-end tests against running chain
 - **`build:*`** — `build`, `build:quick`, `build:install`, `build:circuits`, `build:ui`
 - **`chain:*`** — `chain:init`, `chain:start`, `chain:clean`, `chain:ceremony`
 - **`multi:*`** — `multi:init`, `multi:stop`, `multi:status`, `multi:clean`
-- **`nullifier:*`** — `nullifier:bootstrap`, `nullifier:ingest`, `nullifier:serve`, `nullifier:status`, `nullifier:clean`
+- **`nullifier:*`** — `nullifier:bootstrap`, `nullifier:ingest`, `nullifier:export`, `nullifier:serve`, `nullifier:status`, `nullifier:clean`
 - **`test:*`** — `test:unit`, `test:integration`, `test:helper`, `test:go`, `test:circuits`, `test:ffi`, `test:nullifier`, `test:proof`
 - **Flat** — `fmt`, `lint`, `fixtures`, `proto`, `validator:join`
 
 ### Full local sequence
 
-1. `mise start` — inits chain, bootstraps + ingests nullifiers, starts zallyd + IMT query server
+1. `mise start` — inits chain, bootstraps + ingests + exports nullifiers, starts zallyd + PIR server
 2. `mise ui` (separate terminal) — starts admin UI on port 5173
 3. Create and publish a round in the admin UI → ceremony runs automatically (PENDING → ACTIVE)
 4. Rebuild iOS app in Xcode and run
 
-### Nullifier ingest details
+### Nullifier ingest (`nf-server`)
 
-The IMT service lives in `nullifier-ingest/`. Data files are stored at the `nullifier-ingest/` root. For manual operations use `make -C nullifier-ingest`:
+The unified `nf-server` binary lives in `nullifier-ingest/nf-server/` and has three subcommands: `ingest`, `export`, and `serve`. The `serve` subcommand requires `--features serve` (enabled automatically by `make serve`). For production AVX-512 acceleration, the deploy workflow additionally enables `--features avx512`.
+
+Data files (`nullifiers.bin`, `nullifiers.checkpoint`) are stored at the `nullifier-ingest/` root. PIR tier files go in `nullifier-ingest/pir-data/`. For manual operations use `make -C nullifier-ingest`:
 
 - `SYNC_HEIGHT` must be a **multiple of 10**
-- If the IMT query server returns HTTP 502, the tree sidecar is stale. Fix: `mise stop && rm nullifier-ingest/nullifiers.tree && mise start`
+- The full pipeline is **ingest → export → serve**. After re-ingesting nullifiers, you must re-export before the server sees the new data: `make ingest-resync` (deletes stale tier files), then `make export-nf`, then `make serve`
 - `eprintln!` from Rust code shows up in the Xcode debug console when testing the iOS app
 
 ### Important: `make -C sdk install-ffi` vs `make -C sdk install`

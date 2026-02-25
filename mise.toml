@@ -19,9 +19,8 @@ run = '''
 #!/usr/bin/env bash
 set -e
 PROCS=""
-pgrep zallyd       > /dev/null 2>&1 && PROCS="$PROCS zallyd"
-pgrep query-server > /dev/null 2>&1 && PROCS="$PROCS query-server"
-pgrep ingest-nfs   > /dev/null 2>&1 && PROCS="$PROCS ingest-nfs"
+pgrep zallyd    > /dev/null 2>&1 && PROCS="$PROCS zallyd"
+pgrep nf-server > /dev/null 2>&1 && PROCS="$PROCS nf-server"
 if [ -n "$PROCS" ]; then
     printf '\033[33mAlready running:%s\033[0m\n' "$PROCS"
     exit 0
@@ -29,10 +28,10 @@ fi
 make -C sdk init
 make -C nullifier-ingest bootstrap
 make -C nullifier-ingest ingest
-rm -f nullifier-ingest/nullifiers.tree
-nohup make -C nullifier-ingest serve > ingest-serve.log 2>&1 &
+make -C nullifier-ingest export-nf
+nohup make -C nullifier-ingest serve > nf-serve.log 2>&1 &
 nohup make -C sdk start > zallyd.log 2>&1 &
-printf '\033[32mStarted: ingest-serve → ingest-serve.log | zallyd → zallyd.log\033[0m\n'
+printf '\033[32mStarted: nf-server → nf-serve.log | zallyd → zallyd.log\033[0m\n'
 '''
 
 [tasks.stop]
@@ -40,9 +39,8 @@ description = "Stop all services"
 run = '''
 #!/usr/bin/env bash
 KILLED=""
-pkill zallyd       2>/dev/null && KILLED="$KILLED zallyd"       || true
-pkill query-server 2>/dev/null && KILLED="$KILLED query-server" || true
-pkill ingest-nfs   2>/dev/null && KILLED="$KILLED ingest-nfs"   || true
+pkill zallyd    2>/dev/null && KILLED="$KILLED zallyd"    || true
+pkill nf-server 2>/dev/null && KILLED="$KILLED nf-server" || true
 if [ -n "$KILLED" ]; then
     printf '\033[32mStopped:%s\033[0m\n' "$KILLED"
 else
@@ -83,8 +81,8 @@ else
     printf '\033[31m○ stopped\033[0m\n'
 fi
 
-printf "query-server   "
-if pgrep -x query-server > /dev/null 2>&1; then
+printf "nf-server      "
+if pgrep -x nf-server > /dev/null 2>&1; then
     printf '\033[32m● running\033[0m   port 3000\n'
 else
     printf '\033[31m○ stopped\033[0m\n'
@@ -99,6 +97,13 @@ if [ -f "$CP" ]; then
     printf '\033[32m✓ synced\033[0m    height %s  %sM nullifiers\n' "$HEIGHT" "$((COUNT / 1000000))"
 else
     printf '\033[31m✗ no data\033[0m   run: mise start\n'
+fi
+
+printf "pir-data       "
+if [ -f "nullifier-ingest/pir-data/tier0.bin" ]; then
+    printf '\033[32m✓ exported\033[0m\n'
+else
+    printf '\033[31m✗ not exported\033[0m  run: mise run nullifier:export\n'
 fi
 
 # ── Voting rounds (only if chain is up) ──────────────────────────
@@ -137,8 +142,9 @@ printf '\033[2m'
 echo "Chain data     ~/.zallyd/"
 echo "Chain log      ./zallyd.log"
 echo "EA keys        ~/.zallyd/ea_sk.*"
-echo "Nullifier data ./nullifier-ingest/nullifiers.{bin,checkpoint,tree}"
-echo "Ingest log     ./ingest-serve.log"
+echo "Nullifier data ./nullifier-ingest/nullifiers.{bin,checkpoint}"
+echo "PIR data       ./nullifier-ingest/pir-data/"
+echo "nf-server log  ./nf-serve.log"
 echo "Admin UI       ./shielded_vote_generator_ui/"
 printf '\033[0m'
 '''
@@ -223,8 +229,12 @@ run = "make -C nullifier-ingest bootstrap"
 description = "Sync nullifiers to SYNC_HEIGHT or chain tip"
 run = "make -C nullifier-ingest ingest SYNC_HEIGHT=${SYNC_HEIGHT:-}"
 
+[tasks."nullifier:export"]
+description = "Build PIR tree and export tier files"
+run = "make -C nullifier-ingest export-nf"
+
 [tasks."nullifier:serve"]
-description = "Build and start query server (port 3000)"
+description = "Start PIR server (port 3000)"
 run = "make -C nullifier-ingest serve"
 
 [tasks."nullifier:status"]
