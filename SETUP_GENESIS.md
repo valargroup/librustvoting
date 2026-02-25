@@ -13,6 +13,21 @@ After completing these steps the genesis node will be reachable at:
 
 ## Step 0 — Prerequisites
 
+Install [mise](https://mise.jdx.dev) and a C compiler:
+
+```bash
+curl https://mise.run | sh       # install mise
+xcode-select --install           # macOS — or: apt install build-essential (Linux)
+```
+
+Then from the repo root:
+
+```bash
+mise install   # pins Go 1.24.0, Rust stable, Node 22
+```
+
+<details><summary>Without mise (manual install)</summary>
+
 ```bash
 # Go 1.24.1+ (1.24.0 has a known loader incompatibility)
 # Download from https://go.dev/dl/ and add to PATH:
@@ -27,21 +42,32 @@ source "$HOME/.cargo/env"
 apt install -y build-essential
 ```
 
+</details>
+
 ## Step 1 — Clone and Install the Binary
 
 The `zallyd` binary must be built with the `halo2` and `redpallas` FFI tags, which requires the Rust circuits to be compiled first.
 
 ```bash
 git clone https://github.com/z-cale/zally
-cd zally/sdk
-make install-ffi   # builds Rust circuits, then: go install -tags "halo2,redpallas"
+cd zally
+mise run build:install   # builds Rust circuits, then: go install -tags "halo2,redpallas"
 ```
 
 This places `zallyd` at `~/go/bin/zallyd`.
 
+<details><summary>Without mise</summary>
+
+```bash
+cd zally/sdk
+make install-ffi
+```
+
+</details>
+
 ## Step 2 — Initialize the Chain
 
-`make init` wipes any existing chain data, then runs `scripts/init.sh` which:
+`mise run chain:init` wipes any existing chain data, then runs `scripts/init.sh` which:
 
 1. Runs `zallyd init validator --chain-id zvote-1`
 2. Creates a `validator` Cosmos key and a `manager` key (deterministic, used by vote-module tests)
@@ -50,13 +76,12 @@ This places `zallyd` at `~/go/bin/zallyd`.
 5. Validates `genesis.json`
 6. Enables the REST API on port `1318` with CORS
 7. Sets `timeout_broadcast_tx_commit = 120s` (required for ZKP verification ≈ 30–60 s)
-8. Generates an EA (Election Authority) ElGamal keypair → `~/.zallyd/ea.sk` / `ea.pk`
-9. Generates a Pallas keypair for ECIES ceremony key distribution → `~/.zallyd/pallas.sk` / `pallas.pk`
+8. Generates a Pallas keypair for ECIES ceremony key distribution → `~/.zallyd/pallas.sk` / `pallas.pk`
+9. Sets `ea_sk_path` as a directory placeholder — the actual EA key is generated per-round by auto-deal
 10. Writes the `[vote]` and `[helper]` sections into `~/.zallyd/config/app.toml`
 
 ```bash
-cd zally/sdk
-make init
+mise run chain:init
 ```
 
 To inspect what was created:
@@ -87,7 +112,7 @@ The RPC port (`26657`) and REST API port (`1318`) do **not** need to be publicly
 
 ```bash
 # Foreground (for initial testing)
-zallyd start --home ~/.zallyd
+mise run chain:start
 
 # Or detached, logging to file
 nohup zallyd start --home ~/.zallyd > ~/.zallyd/node.log 2>&1 &
@@ -103,7 +128,7 @@ watch -n2 'zallyd status --home ~/.zallyd 2>/dev/null | python3 -c \
 
 ## Step 5 — Record the Node Identity
 
-Validators who want to join the chain (see JOIN.md) need the node ID and public IP. Print both now:
+Validators who want to join the chain (see SETUP_JOIN.md) need the node ID and public IP. Print both now:
 
 ```bash
 # Node ID (derived from priv_validator_key.json)
@@ -124,9 +149,21 @@ The EA key ceremony is now **automatic per voting round**. When a round is creat
 To register the genesis validator's Pallas key and create the first round:
 
 ```bash
+mise run chain:ceremony
+```
+
+<details><summary>Without mise</summary>
+
+```bash
 cd sdk && make ceremony
 ```
 
+</details>
+
 ## Useful Commands
 
-- `make clean` - reset the chain home directory
+| Command | Description |
+|---|---|
+| `mise run chain:clean` | Reset the chain home directory |
+| `mise status` | Show service health + voting round state |
+| `mise tasks` | List all available tasks |
