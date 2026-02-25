@@ -246,8 +246,25 @@ else
   done
 
   echo "Registering as validator..."
-  create-val-tx --moniker "\${MONIKER}" --amount 200000stake  --home "\${HOME_DIR}" --rpc-url tcp://localhost:26657
-  echo "Validator registered."
+  if ! create-val-tx --moniker "\${MONIKER}" --amount 200000stake --home "\${HOME_DIR}" --rpc-url tcp://localhost:26657; then
+    echo ""
+    echo "ERROR: create-val-tx exited with a non-zero status." >&2
+    echo "  Check node logs for details: \${LOG_FILE}" >&2
+    exit 1
+  fi
+
+  # Verify the validator actually appeared on-chain rather than assuming success.
+  echo "Verifying registration on-chain (waiting ~6s for block commit)..."
+  sleep 6
+  IS_NOW_VALIDATOR=\$(zallyd query staking validators --home "\${HOME_DIR}" --output json 2>/dev/null \
+    | jq -r ".validators[] | select(.description.moniker == \"\${MONIKER}\") | .operator_address" 2>/dev/null || echo "")
+  if [ -z "\${IS_NOW_VALIDATOR}" ]; then
+    echo ""
+    echo "ERROR: Validator registration failed — '\${MONIKER}' not found in the validator set." >&2
+    echo "  Check node logs for details: \${LOG_FILE}" >&2
+    exit 1
+  fi
+  echo "Validator registered: \${IS_NOW_VALIDATOR}"
 fi
 
 echo ""

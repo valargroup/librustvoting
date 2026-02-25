@@ -232,22 +232,6 @@ else
     sleep 5
   done
 
-  # Verify ceremony is open for registration before attempting to create validator.
-  echo "Checking ceremony state..."
-  REST_API="http://localhost:1318"
-  CEREMONY_STATUS=\$(curl -fsSL "\${REST_API}/zally/v1/ceremony" 2>/dev/null \
-    | jq -r '.ceremony.status // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
-  if [ "\${CEREMONY_STATUS}" != "CEREMONY_STATUS_REGISTERING" ] && \
-     [ "\${CEREMONY_STATUS}" != "REGISTERING" ] && \
-     [ "\${CEREMONY_STATUS}" != "1" ]; then
-    echo ""
-    echo "ERROR: Ceremony is in state '\${CEREMONY_STATUS}', expected REGISTERING." >&2
-    echo "  Validator registration requires the ceremony to be open for registration." >&2
-    echo "  Contact the ceremony coordinator to reset the ceremony." >&2
-    exit 1
-  fi
-  echo "  Ceremony state: \${CEREMONY_STATUS} — OK"
-
   echo "Registering as validator..."
   if ! create-val-tx --moniker "\${MONIKER}" --amount 200000stake --home "\${HOME_DIR}" --rpc-url tcp://localhost:26657; then
     echo ""
