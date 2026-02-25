@@ -1320,6 +1320,8 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .expect("always 5 elements");
+
+        // Witness the 5 El Gamal c1 ciphertext x-coordinates.
         let enc_c1: [_; 5] = (0..5)
             .map(|i| assign_free_advice(
                 layouter.namespace(|| alloc::format!("witness enc_c1_x[{i}]")),
@@ -1329,6 +1331,8 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .expect("always 5 elements");
+
+        // Witness the 5 El Gamal c2 ciphertext x-coordinates.
         let enc_c2: [_; 5] = (0..5)
             .map(|i| assign_free_advice(
                 layouter.namespace(|| alloc::format!("witness enc_c2_x[{i}]")),
@@ -1338,10 +1342,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .expect("always 5 elements");
-
-        // Clone for Condition 11 before the per-share Poseidon hashes use the cells.
-        let enc_c1_cond11 = enc_c1.clone();
-        let enc_c2_cond11 = enc_c2.clone();
 
         // Compute per-share blinded commitments: share_comm_i = Poseidon(blind_i, c1_i, c2_i)
         let share_comm: [AssignedCell<pallas::Base, pallas::Base>; 5] = (0..5)
@@ -1379,6 +1379,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 [share_comm_0, share_comm_1, share_comm_2, share_comm_3, share_comm_4],
             )?
         };
+
+        // Clone for Condition 11 before the per-share Poseidon hashes use the cells.
+        let enc_c1_cond11 = enc_c1.clone();
+        let enc_c2_cond11 = enc_c2.clone();
 
         // ---------------------------------------------------------------
         // Condition 11: Encryption Integrity.
