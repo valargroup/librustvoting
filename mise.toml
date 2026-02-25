@@ -226,8 +226,8 @@ run = "make -C sdk ceremony"
 
 # ── multi:* ─────────────────────────────────────────────────────────
 
-[tasks."multi:init"]
-description = "Initialize a 3-validator chain on localhost"
+[tasks."multi:start"]
+description = "Init + start a 3-validator chain on localhost"
 run = "make -C sdk init-multi"
 
 [tasks."multi:stop"]
@@ -237,6 +237,11 @@ run = "make -C sdk stop-multi"
 [tasks."multi:status"]
 description = "Show running status of all 3 validators"
 run = "make -C sdk status-multi"
+
+[tasks."multi:ui"]
+description = "Admin UI pointed at multi-validator chain (port 1418)"
+dir = "shielded_vote_generator_ui"
+run = "npm install --silent && VITE_CHAIN_URL=http://localhost:1418 npm run dev"
 
 [tasks."multi:clean"]
 description = "Remove all multi-validator data directories"
