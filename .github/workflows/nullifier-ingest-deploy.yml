@@ -49,6 +49,8 @@ jobs:
       - name: Build release binary
         run: cd nf-server && cargo build --release --features serve,avx512
         working-directory: nullifier-ingest
+        env:
+          RUSTFLAGS: "-C target-feature=+avx512f,+avx512bw,+avx512dq,+avx512cd,+avx512vl"
 
       - name: Upload binary and config
         uses: actions/upload-artifact@v4
