@@ -1343,7 +1343,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         let enc_c1_cond11 = enc_c1.clone();
         let enc_c2_cond11 = enc_c2.clone();
 
-        // Compute per-share blinded commitments: share_comm_i = Poseidon(blind_i, c1_i, c2_i).
+        // Compute per-share blinded commitments: share_comm_i = Poseidon(blind_i, c1_i, c2_i)
         let share_comm: [AssignedCell<pallas::Base, pallas::Base>; 5] = (0..5)
             .map(|i| {
                 hash_share_commitment_in_circuit(
