@@ -296,6 +296,7 @@ pub fn helper_share_payload(
     share_index: u32,
     tree_position: u64,
     all_enc_shares: &[(&[u8], &[u8], u32)], // (c1, c2, share_index) for each of 5 shares
+    share_blinds: &[Vec<u8>],               // 5 x 32-byte blind factors
 ) -> Value {
     let all_shares_json: Vec<Value> = all_enc_shares
         .iter()
@@ -306,6 +307,11 @@ pub fn helper_share_payload(
                 "share_index": idx,
             })
         })
+        .collect();
+
+    let blinds_json: Vec<Value> = share_blinds
+        .iter()
+        .map(|b| Value::String(to_base64(b)))
         .collect();
 
     json!({
@@ -321,5 +327,6 @@ pub fn helper_share_payload(
         "tree_position": tree_position,
         "vote_round_id": hex::encode(round_id),
         "all_enc_shares": all_shares_json,
+        "share_blinds": blinds_json,
     })
 }
