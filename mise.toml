@@ -11,7 +11,7 @@ node = "22"
 GOBIN = "{{env.HOME}}/go/bin"
 _.path = ["{{env.HOME}}/go/bin", "/usr/local/go/bin"]
 
-# ── Workflow ───────────────────────────────────────────────────────
+# ── Top-level shortcuts (daily use) ─────────────────────────────────
 
 [tasks.start]
 description = "Init chain + bootstrap nullifiers + start everything"
@@ -51,7 +51,7 @@ fi
 '''
 
 [tasks.status]
-description = "Show status of all services"
+description = "Show status of all services + round state"
 run = '''
 #!/usr/bin/env bash
 API="http://localhost:1318"
@@ -144,10 +144,159 @@ printf '\033[0m'
 '''
 
 [tasks.ui]
-description = "Start admin UI dev server"
+description = "Start admin UI dev server (port 5173)"
 dir = "shielded_vote_generator_ui"
 run = "npm run dev"
 
 [tasks.test]
-description = "End-to-end tests against running chain (requires: mise start)"
+description = "E2E tests against running chain (requires: mise start)"
 run = "cargo test --release --manifest-path e2e-tests/Cargo.toml -- --nocapture --ignored"
+
+# ── build:* ─────────────────────────────────────────────────────────
+
+[tasks."build"]
+description = "Build zallyd with FFI (Halo2 + RedPallas)"
+run = "make -C sdk build-ffi"
+
+[tasks."build:quick"]
+description = "Build zallyd without FFI (Go only, no ZK verification)"
+run = "make -C sdk build"
+
+[tasks."build:install"]
+description = "Install zallyd with FFI to $GOBIN"
+run = "make -C sdk install-ffi"
+
+[tasks."build:circuits"]
+description = "Build Rust circuit static library"
+run = "make -C sdk circuits"
+
+[tasks."build:ui"]
+description = "Build admin UI for production"
+dir = "shielded_vote_generator_ui"
+run = "npm run build"
+
+# ── chain:* ─────────────────────────────────────────────────────────
+
+[tasks."chain:init"]
+description = "Wipe and reinitialize a single-validator chain"
+run = "make -C sdk init"
+
+[tasks."chain:start"]
+description = "Start chain daemon (foreground)"
+run = "make -C sdk start"
+
+[tasks."chain:clean"]
+description = "Remove chain data directory (~/.zallyd)"
+run = "make -C sdk clean"
+confirm = "This will delete ~/.zallyd and the local zallyd binary. Continue?"
+
+[tasks."chain:ceremony"]
+description = "Register Pallas key + create round + wait ACTIVE"
+run = "make -C sdk ceremony"
+
+# ── multi:* ─────────────────────────────────────────────────────────
+
+[tasks."multi:init"]
+description = "Initialize a 3-validator chain on localhost"
+run = "make -C sdk init-multi"
+
+[tasks."multi:stop"]
+description = "Stop all multi-validator processes"
+run = "make -C sdk stop-multi"
+
+[tasks."multi:status"]
+description = "Show running status of all 3 validators"
+run = "make -C sdk status-multi"
+
+[tasks."multi:clean"]
+description = "Remove all multi-validator data directories"
+run = "make -C sdk clean-multi"
+confirm = "This will stop and delete all multi-validator data (~/.zallyd-val1,2,3). Continue?"
+
+# ── nullifier:* ─────────────────────────────────────────────────────
+
+[tasks."nullifier:bootstrap"]
+description = "Download nullifier snapshot from DO Spaces"
+run = "make -C nullifier-ingest bootstrap"
+
+[tasks."nullifier:ingest"]
+description = "Sync nullifiers to SYNC_HEIGHT or chain tip"
+run = "make -C nullifier-ingest ingest SYNC_HEIGHT=${SYNC_HEIGHT:-}"
+
+[tasks."nullifier:serve"]
+description = "Build and start query server (port 3000)"
+run = "make -C nullifier-ingest serve"
+
+[tasks."nullifier:status"]
+description = "Show nullifier ingestion progress"
+run = "make -C nullifier-ingest status"
+
+[tasks."nullifier:clean"]
+description = "Remove nullifier data + build artifacts"
+run = "make -C nullifier-ingest clean"
+confirm = "This will delete nullifier data files and Rust build artifacts. Continue?"
+
+# ── test:* ──────────────────────────────────────────────────────────
+
+[tasks."test:unit"]
+description = "Go unit tests (keeper, validation, codec)"
+run = "make -C sdk test-unit"
+
+[tasks."test:integration"]
+description = "Go ABCI pipeline integration tests"
+run = "make -C sdk test-integration"
+
+[tasks."test:helper"]
+description = "Helper server unit tests (SQLite, API, processor)"
+run = "make -C sdk test-helper"
+
+[tasks."test:go"]
+description = "All Go tests (unit + integration + helper)"
+run = "make -C sdk test"
+
+[tasks."test:circuits"]
+description = "Rust circuit unit tests"
+run = "make -C sdk circuits-test"
+
+[tasks."test:ffi"]
+description = "All FFI-backed tests (Halo2 + RedPallas)"
+run = "make -C sdk test-all-ffi"
+
+[tasks."test:nullifier"]
+description = "Nullifier crate unit tests"
+run = "make -C nullifier-ingest test"
+
+[tasks."test:proof"]
+description = "Verify exclusion proofs against ingested data"
+run = "make -C nullifier-ingest test-proof"
+
+# ── validator:* ─────────────────────────────────────────────────────
+
+[tasks."validator:join"]
+description = "Build from source and join network as validator"
+run = "./join-dev.sh"
+
+# ── Flat utilities ──────────────────────────────────────────────────
+
+[tasks.fmt]
+description = "Format Go code"
+run = "make -C sdk fmt"
+
+[tasks.lint]
+description = "Run Go vet"
+run = "make -C sdk lint"
+
+[tasks.fixtures]
+description = "Regenerate all fixture files"
+run = "make -C sdk fixtures"
+
+[tasks.proto]
+description = "Regenerate protobuf code"
+run = "cd sdk/proto && buf generate"
+
+# ── Hidden (internal/deployment) ────────────────────────────────────
+
+[tasks."deploy:caddy"]
+description = "Install Caddyfile + restart Caddy"
+run = "make -C sdk caddy"
+hide = true
