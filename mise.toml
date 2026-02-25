@@ -33,7 +33,7 @@ make -C nullifier-ingest bootstrap
 make -C nullifier-ingest ingest
 make -C nullifier-ingest export-nf
 nohup make -C nullifier-ingest serve > nf-serve.log 2>&1 &
-nohup make -C sdk start > zallyd.log 2>&1 &
+ZALLY_PIR_URL=http://localhost:3000 nohup make -C sdk start > zallyd.log 2>&1 &
 printf '\033[32mStarted: nf-server → nf-serve.log | zallyd → zallyd.log\033[0m\n'
 '''
 
@@ -196,7 +196,7 @@ run = "make -C sdk init"
 
 [tasks."chain:start"]
 description = "Start chain daemon (foreground)"
-run = "make -C sdk start"
+run = "ZALLY_PIR_URL=${ZALLY_PIR_URL:-http://localhost:3000} make -C sdk start"
 
 [tasks."chain:clean"]
 description = "Remove chain data directory (~/.zallyd)"

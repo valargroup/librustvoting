@@ -1,10 +1,10 @@
 # Voting Service Discovery
 
-How Zashi discovers vote servers and nullifier providers at runtime.
+How Zashi discovers vote servers and PIR servers at runtime.
 
 ## Resolution order
 
-1. **Local override** — `voting-config-local.json` bundled in the app
+1. **Local override** — `voting-config-local.json` bundled in the app (DEBUG builds only)
 2. **CDN** — `https://zally-phi.vercel.app/api/voting-config` (served from Vercel Edge Config)
 3. **Hardcoded fallback** — deployed dev server (`46.101.255.48`)
 
@@ -18,15 +18,17 @@ The first source that succeeds wins. This means a TestFlight build works out of 
   "vote_servers": [
     { "url": "https://46-101-255-48.sslip.io", "label": "Primary" }
   ],
-  "nullifier_providers": [
-    { "url": "https://46-101-255-48.sslip.io/nullifier", "label": "Primary" }
+  "pir_servers": [
+    { "url": "http://157.180.63.235:3000", "label": "PIR Server" }
   ]
 }
 ```
 
+**Important:** The JSON keys must be `vote_servers` and `pir_servers` — these map to `VotingServiceConfig.CodingKeys` in Swift. Using other key names (e.g. `nullifier_providers`) will cause silent decode failure, falling through to CDN/fallback.
+
 `vote_servers` entries each serve the full set of endpoints — both chain API (`/zally/v1/*`) and helper API (`/api/v1/shares`). This is because the SDK and helper server are a single merged binary.
 
-`nullifier_providers` serve `/nullifier/proof/{nullifier_hex}` for IMT non-membership proofs.
+`pir_servers` serve the PIR nullifier exclusion proof protocol (port 3000 by default).
 
 ## Local testing
 
@@ -38,13 +40,13 @@ Create `voting-config-local.json` in the Xcode project (add to the app target so
   "vote_servers": [
     { "url": "http://localhost:1318", "label": "Localhost" }
   ],
-  "nullifier_providers": [
+  "pir_servers": [
     { "url": "http://localhost:3000", "label": "Localhost" }
   ]
 }
 ```
 
-This file is checked before the CDN fetch, so it always takes priority. Don't commit it — it's for local dev only.
+This file is only checked in DEBUG builds and takes priority over CDN. Don't commit it — it's for local dev only.
 
 ## Where the URLs flow
 
@@ -88,7 +90,7 @@ Changes take effect immediately — no git push or redeploy needed. This is usef
      "vote_servers": [
        { "url": "https://46-101-255-48.sslip.io", "label": "Primary" }
      ],
-     "nullifier_providers": [
+     "pir_servers": [
        { "url": "https://46-101-255-48.sslip.io/nullifier", "label": "Primary" }
      ]
    }
