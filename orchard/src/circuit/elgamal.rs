@@ -124,6 +124,14 @@ pub(in crate::circuit) fn prove_elgamal_encryptions(
     enc_c1_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
     enc_c2_cells: [AssignedCell<pallas::Base, pallas::Base>; 5],
 ) -> Result<(), Error> {
+    // Election Authority's public key as a Pallas curve point, wrapped in Value
+    // Reason for ea_pk being both a private witness and a public input.
+    // In halo2, all computation happens in advice (witness) cells — you cannot do arithmetic directly on instance column values.
+    // So ea_pk must be witnessed into advice cells to compute [r_i] * ea_pk.
+    // The constrain_instance calls add equality constraints that bind those advice cells to the public instance column,
+    // giving the verifier a guarantee that the prover used the specific EA key declared publicly.
+    // Witness = makes computation possible. Instance constraint = makes the verifier trust which key was used.
+
     // Witness ea_pk once. NonIdentityPoint is Copy, so the value is cheaply
     // copied into each iteration's mul() call without re-witnessing.
     let ea_pk_point = NonIdentityPoint::new(

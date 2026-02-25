@@ -40,7 +40,7 @@
 //! Vote commitment construction:
 //! - **Condition 8**: Shares Sum Correctness — `sum(shares_1..5) = total_note_value`.
 //!   *(implemented)*
-//! - **Condition 9**: Shares Range — each `shares_j` in `[0, 2^24)`.
+//! - **Condition 9**: Shares Range — each `shares_j` in `[0, 2^30)`.
 //!   *(implemented)*
 //! - **Condition 10**: Shares Hash Integrity — `shares_hash = H(enc_share_1..5)`.
 //!   *(implemented)*
@@ -326,7 +326,7 @@ pub struct Config {
     /// Uses advices[9] as the running-sum column. Each word is 10 bits,
     /// so `num_words` × 10 gives the total bit-width checked.
     /// Used in condition 6 to ensure authority values and diff are in [0, 2^16)
-    /// (16-bit bitmask), and condition 9 to ensure each share is in `[0, 2^24)`.
+    /// (16-bit bitmask), and condition 9 to ensure each share is in `[0, 2^30)`.
     range_check: LookupRangeCheckConfig<pallas::Base, 10>,
     /// Selector for the Merkle conditional swap gate (condition 1).
     ///
@@ -457,7 +457,7 @@ pub struct Circuit {
     // === Vote commitment construction (conditions 8–12) ===
 
     // Condition 8 (Shares Sum): sum(shares_1..5) = total_note_value.
-    // Condition 9 (Shares Range): each share in [0, 2^24).
+    // Condition 9 (Shares Range): each share in [0, 2^30).
     /// Voting share vector (5 shares that sum to total_note_value).
     pub(crate) shares: [Value<pallas::Base>; 5],
 
@@ -1793,7 +1793,7 @@ mod tests {
         let vpk_pk_d_x = *vpk_pk_d_affine.coordinates().unwrap().x();
 
         // total_note_value must be small enough that all 5 shares
-        // fit in [0, 2^24) for condition 9's range check.
+        // fit in [0, 2^30) for condition 9's range check.
         let total_note_value = pallas::Base::from(10_000u64);
         let voting_round_id = pallas::Base::random(&mut rng);
         let van_comm_rand = pallas::Base::random(&mut rng);
@@ -1822,7 +1822,7 @@ mod tests {
         );
 
         // Create shares that sum to total_note_value (conditions 8 + 9).
-        // Each share must be in [0, 2^24) for condition 9's range check.
+        // Each share must be in [0, 2^30) for condition 9's range check.
         let shares_u64: [u64; 5] = [1_000, 2_000, 3_000, 2_500, 1_500]; // sum = 10000
         let s0 = pallas::Base::from(shares_u64[0]);
         let s1 = pallas::Base::from(shares_u64[1]);
