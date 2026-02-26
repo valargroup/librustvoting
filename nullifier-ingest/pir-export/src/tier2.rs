@@ -21,7 +21,6 @@ use std::io::Write;
 
 use anyhow::Result;
 use pasta_curves::Fp;
-use rayon::prelude::*;
 
 use imt_tree::tree::{Range, TREE_DEPTH};
 
@@ -32,27 +31,19 @@ use crate::{
 
 /// Export all Tier 2 rows to a writer.
 ///
-/// Rows are computed in parallel using Rayon, then written sequentially.
-/// ~6 GB RAM for the row buffer — acceptable on the AVX-512 server.
+/// Rows are computed and written one at a time to avoid materializing all rows
+/// in memory (~6 GB if collected).
 pub fn export(
     levels: &[Vec<Fp>],
     ranges: &[Range],
     empty_hashes: &[Fp; TREE_DEPTH],
     writer: &mut impl Write,
 ) -> Result<()> {
-    // Compute all rows in parallel
-    let all_rows: Vec<Vec<u8>> = (0..TIER2_ROWS)
-        .into_par_iter()
-        .map(|s| {
-            let mut buf = vec![0u8; TIER2_ROW_BYTES];
-            write_row(levels, ranges, empty_hashes, s, &mut buf);
-            buf
-        })
-        .collect();
+    let mut buf = vec![0u8; TIER2_ROW_BYTES];
 
-    // Write sequentially
-    for (s, row) in all_rows.iter().enumerate() {
-        writer.write_all(row)?;
+    for s in 0..TIER2_ROWS {
+        write_row(levels, ranges, empty_hashes, s, &mut buf);
+        writer.write_all(&buf)?;
         if s > 0 && s % 100_000 == 0 {
             eprintln!("    Tier 2 progress: {}/{} rows", s, TIER2_ROWS);
         }

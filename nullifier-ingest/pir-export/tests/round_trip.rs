@@ -338,12 +338,8 @@ fn test_subset_export_produces_different_root() {
     }
 }
 
-/// Test that parallel tier export is deterministic: exporting the same tree
+/// Test that tier export is deterministic: exporting the same tree
 /// twice produces byte-identical output.
-///
-/// Since tier1 and tier2 use `rayon::par_iter` for row computation, this
-/// verifies that the parallel collect → sequential write pattern produces
-/// consistent results across runs.
 #[test]
 fn test_parallel_export_deterministic() {
     let raw_nfs: Vec<Fp> = (1u64..=100).map(|i| Fp::from(i * 1013)).collect();

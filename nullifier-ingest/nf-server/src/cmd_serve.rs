@@ -88,6 +88,9 @@ struct ServingState {
 struct AppState {
     phase: RwLock<ServerPhase>,
     serving: RwLock<Option<ServingState>>,
+    /// Prevents concurrent rebuilds. Held for the entire duration of a rebuild task.
+    /// Wrapped in Arc so we can obtain an OwnedMutexGuard that is 'static.
+    rebuild_lock: Arc<tokio::sync::Mutex<()>>,
     data_dir: PathBuf,
     pir_data_dir: PathBuf,
     lwd_urls: Vec<String>,
@@ -187,6 +190,7 @@ pub async fn run(args: Args) -> Result<()> {
     let state = Arc::new(AppState {
         phase: RwLock::new(ServerPhase::Serving),
         serving: RwLock::new(Some(serving)),
+        rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
         data_dir: args.data_dir.clone(),
         pir_data_dir: args.pir_data_dir.clone(),
         lwd_urls,
@@ -313,10 +317,12 @@ async fn post_snapshot_prepare(
             .into_response();
     }
 
-    // Check if already rebuilding
-    {
-        let phase = state.phase.read().await;
-        if let ServerPhase::Rebuilding { .. } = &*phase {
+    // Atomically check if a rebuild is already in progress via try_lock_owned.
+    // OwnedMutexGuard is 'static so it can be moved into the spawned task.
+    let rebuild_guard = match Arc::clone(&state.rebuild_lock).try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let phase = state.phase.read().await;
             return (
                 StatusCode::CONFLICT,
                 axum::Json(serde_json::json!({
@@ -326,7 +332,7 @@ async fn post_snapshot_prepare(
             )
                 .into_response();
         }
-    }
+    };
 
     // Validate height <= chain tip by querying lightwalletd
     {
@@ -374,7 +380,7 @@ async fn post_snapshot_prepare(
         }
     }
 
-    // Set phase to Rebuilding, clear serving state
+    // Set phase to Rebuilding. Old serving state stays intact so queries keep working.
     {
         let mut phase = state.phase.write().await;
         *phase = ServerPhase::Rebuilding {
@@ -383,28 +389,19 @@ async fn post_snapshot_prepare(
             progress_pct: 0,
         };
     }
-    {
-        let mut serving = state.serving.write().await;
-        // Drop old serving state. Wait for inflight requests to drain.
-        let drain_start = Instant::now();
-        while state.inflight_requests.load(Ordering::Relaxed) > 0 {
-            if drain_start.elapsed().as_secs() > 30 {
-                warn!("Timed out waiting for inflight requests to drain");
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-        *serving = None; // Drop old state, free memory
-    }
 
-    // Spawn rebuild in background
+    // Spawn rebuild in background. Move the rebuild_guard into the task so
+    // the mutex is held for the full duration, preventing concurrent rebuilds.
     let state_clone = Arc::clone(&state);
     tokio::task::spawn(async move {
+        let _rebuild_guard = rebuild_guard;
         let result = run_rebuild(state_clone.clone(), height).await;
         if let Err(e) = result {
             let msg = format!("{:?}", e);
             warn!(error = %msg, "rebuild failed");
             let mut phase = state_clone.phase.write().await;
+            // On failure, set phase to Error but leave serving state intact
+            // so queries continue working with the old data.
             *phase = ServerPhase::Error { message: msg };
         }
     });

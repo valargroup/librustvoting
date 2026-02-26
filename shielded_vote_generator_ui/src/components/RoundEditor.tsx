@@ -5,7 +5,7 @@ import {
   useChainInfo,
   estimateTimestamp,
 } from "../store/rpc";
-import { getNullifierStatus, getSnapshotStatus } from "../api/chain";
+import { getSnapshotStatus } from "../api/chain";
 
 interface RoundEditorProps {
   round: VotingRound;
@@ -125,9 +125,8 @@ export function RoundEditor({ round, onUpdateName, onUpdateSettings, onNavigate,
         return false;
       }
       setPirRebuilding(false);
-      const ns = await getNullifierStatus();
-      if (ns.latest_height != null) {
-        onUpdateSettings({ snapshotHeight: String(ns.latest_height) });
+      if (status.height != null) {
+        onUpdateSettings({ snapshotHeight: String(status.height) });
       } else {
         setNhError("PIR server has no checkpoint height");
       }
