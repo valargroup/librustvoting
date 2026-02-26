@@ -117,7 +117,9 @@ export default async function handler(req: Request) {
   let sigValid = false;
   try {
     // secp256k1.verify expects a DER or compact signature. Keplr produces 64-byte compact sigs.
-    sigValid = secp256k1.verify(sigBytes, msgHash, pubKeyBytes);
+    // prehash: false because msgHash is already SHA-256 hashed — noble-curves v2
+    // defaults to prehash: true which would double-hash.
+    sigValid = secp256k1.verify(sigBytes, msgHash, pubKeyBytes, { prehash: false });
   } catch {
     sigValid = false;
   }
