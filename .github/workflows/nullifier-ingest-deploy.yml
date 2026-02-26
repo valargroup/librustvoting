@@ -48,21 +48,22 @@ jobs:
             ${{ runner.os }}-nf-server-v2-nightly-2025-02-25-
 
       - name: Build release binary
-        run: cd nf-server && cargo build --release --features serve,avx512
+        run: cd nf-server && cargo build --release --target x86_64-unknown-linux-gnu --features serve,avx512
         working-directory: nullifier-ingest
         env:
-          # CARGO_ENCODED_RUSTFLAGS applies only to the target crate, not to
-          # build scripts or proc-macros that run on the CI host. Using plain
-          # RUSTFLAGS with AVX-512 features caused SIGILL in proc-macro2's
-          # build script because the GitHub runner CPU lacks AVX-512.
-          CARGO_ENCODED_RUSTFLAGS: "-Ctarget-feature=+avx512f,+avx512bw,+avx512dq,+avx512cd,+avx512vl"
+          # Explicit --target separates host vs target compilation. Build
+          # scripts and proc-macros compile for the host (baseline x86-64),
+          # while target-specific RUSTFLAGS only apply to the actual binary.
+          # Without --target, RUSTFLAGS poison build scripts too → SIGILL on
+          # runners that lack AVX-512.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-feature=+avx512f,+avx512bw,+avx512dq,+avx512cd,+avx512vl"
 
       - name: Upload binary and config
         uses: actions/upload-artifact@v4
         with:
           name: nf-server-binaries
           path: |
-            nullifier-ingest/nf-server/target/release/nf-server
+            nullifier-ingest/nf-server/target/x86_64-unknown-linux-gnu/release/nf-server
             nullifier-ingest/docs/nullifier-query-server.service
 
   deploy:
@@ -77,7 +78,7 @@ jobs:
 
       - name: Flatten artifacts
         run: |
-          mv nullifier-ingest/nf-server/target/release/nf-server .
+          mv nullifier-ingest/nf-server/target/x86_64-unknown-linux-gnu/release/nf-server .
           mv nullifier-ingest/docs/nullifier-query-server.service .
 
       - name: Deploy via SSH
