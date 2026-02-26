@@ -80,6 +80,7 @@ if [ -n "$KILLED" ]; then
 else
     echo "No running processes found."
 fi
+rm -f zashi-ios/secant/Resources/voting-config-local.json
 '''
 
 [tasks.status]
@@ -437,6 +438,7 @@ if [ -n "$KILLED" ]; then
 else
     echo "No running processes found."
 fi
+rm -f zashi-ios/secant/Resources/voting-config-local.json
 '''
 
 [tasks."multi:status"]
