@@ -281,6 +281,16 @@ export async function getValidators(): Promise<{ validators: Validator[]; pagina
   return { validators: all };
 }
 
+export interface PallasKeyEntry {
+  validator_address: string;
+  pallas_pk: string; // base64
+}
+
+export async function getPallasKeys(): Promise<{ validators: PallasKeyEntry[] }> {
+  const resp = await fetchJson<{ validators?: PallasKeyEntry[] }>("/zally/v1/pallas-keys");
+  return { validators: resp.validators ?? [] };
+}
+
 // -- Snapshot management --
 
 export interface SnapshotStatus {
