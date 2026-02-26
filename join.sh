@@ -98,6 +98,32 @@ else
   echo "Platform: ${PLATFORM}"
   curl -fsSL -o /tmp/zally-release.tar.gz "${DO_BASE}/zally-${VERSION}-${PLATFORM}.tar.gz"
 
+  # Verify tarball integrity via SHA-256 checksum.
+  CHECKSUM_URL="${DO_BASE}/zally-${VERSION}-${PLATFORM}.tar.gz.sha256"
+  if curl -fsSL -o /tmp/zally-release.tar.gz.sha256 "${CHECKSUM_URL}" 2>/dev/null; then
+    EXPECTED=$(awk '{print $1}' /tmp/zally-release.tar.gz.sha256)
+    if command -v sha256sum > /dev/null 2>&1; then
+      ACTUAL=$(sha256sum /tmp/zally-release.tar.gz | awk '{print $1}')
+    elif command -v shasum > /dev/null 2>&1; then
+      ACTUAL=$(shasum -a 256 /tmp/zally-release.tar.gz | awk '{print $1}')
+    else
+      echo "WARNING: Neither sha256sum nor shasum found — skipping checksum verification."
+      ACTUAL="$EXPECTED"
+    fi
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+      echo "ERROR: Checksum mismatch!"
+      echo "  Expected: ${EXPECTED}"
+      echo "  Actual:   ${ACTUAL}"
+      echo "  The downloaded tarball may be corrupted or tampered with."
+      rm -f /tmp/zally-release.tar.gz /tmp/zally-release.tar.gz.sha256
+      exit 1
+    fi
+    echo "Checksum verified."
+    rm -f /tmp/zally-release.tar.gz.sha256
+  else
+    echo "WARNING: Checksum file not available — skipping verification."
+  fi
+
   TARBALL_DIR="zally-${VERSION}-${PLATFORM}"
   tar xzf /tmp/zally-release.tar.gz -C /tmp "${TARBALL_DIR}/bin/zallyd" "${TARBALL_DIR}/bin/create-val-tx"
 
