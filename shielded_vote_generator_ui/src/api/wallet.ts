@@ -10,8 +10,8 @@
 import { DirectSecp256k1Wallet } from "@cosmjs/proto-signing";
 import type { OfflineDirectSigner } from "@cosmjs/proto-signing";
 import { fromHex, toBase64 } from "@cosmjs/encoding";
-import { sha256 } from "@noble/hashes/sha256";
-import { secp256k1 } from "@noble/curves/secp256k1";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { secp256k1 } from "@noble/curves/secp256k1.js";
 import type { KeplrChainInfo } from "../types/keplr";
 
 const BECH32_PREFIX = "zvote";
@@ -149,11 +149,11 @@ export function signArbitraryWithKey(
   const signBytes = makeSignArbitraryDoc(signerAddress, data);
   const msgHash = sha256(signBytes);
 
-  const sig = secp256k1.sign(msgHash, privKey);
+  const sig = secp256k1.sign(msgHash, privKey, { prehash: false });
   const pubKey = secp256k1.getPublicKey(privKey, true); // compressed
 
   return {
-    signature: toBase64(sig.toCompactRawBytes()),
+    signature: toBase64(sig),
     pubKey: toBase64(pubKey),
   };
 }
