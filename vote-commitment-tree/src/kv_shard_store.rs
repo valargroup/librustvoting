@@ -599,3 +599,31 @@ impl ShardStore for KvShardStore {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// KvShardStore inherent methods
+// ---------------------------------------------------------------------------
+
+impl KvShardStore {
+    /// Delete all tree-related KV data: every shard, the cap, and every
+    /// checkpoint. Called by the Go keeper before rebuilding on rollback so
+    /// that a fresh [`ShardTree`] does not read stale pre-rollback shard data.
+    ///
+    /// Deleting the cap key is safe even when it does not exist: the Cosmos KV
+    /// store treats deleting a missing key as a no-op.
+    pub fn clear_all(&mut self) -> Result<(), KvError> {
+        self.truncate_shards(0)?;
+        self.cb.delete(&cap_key())?;
+        let prefix = [CHECKPOINT_PREFIX];
+        let mut iter = self.cb.iter(&prefix, false);
+        let mut to_delete = Vec::new();
+        while let Some((key, _)) = iter.next() {
+            to_delete.push(key);
+        }
+        drop(iter);
+        for key in to_delete {
+            self.cb.delete(&key)?;
+        }
+        Ok(())
+    }
+}

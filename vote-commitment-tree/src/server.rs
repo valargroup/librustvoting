@@ -104,6 +104,16 @@ impl std::error::Error for AppendFromKvError {}
 // ---------------------------------------------------------------------------
 
 impl TreeServer {
+    /// Delete all tree-related KV data (shards, cap, checkpoints).
+    ///
+    /// Must be called before rebuilding from scratch on rollback so that the
+    /// new [`ShardTree`] does not read stale pre-rollback shard data. The Go
+    /// keeper calls this on the old handle before closing it and re-creating
+    /// a fresh one at `next_position = 0`.
+    pub fn truncate_kv_data(&mut self) -> Result<(), KvError> {
+        self.inner.store_mut().clear_all()
+    }
+
     /// Create a new KV-backed tree server.
     ///
     /// `next_position` is `CommitmentTreeState.NextIndex` from KV (0 on first
