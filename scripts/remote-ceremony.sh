@@ -12,8 +12,9 @@
 #   ssh-host  SSH host alias or address (e.g. "zally")
 #   key-dir   Local directory to cache key files (default: /tmp/zally-ceremony)
 #
-# The script fetches ea.sk, ea.pk, and pallas.pk from the remote if not
-# already present locally, then runs the ceremony_bootstrap test.
+# The script fetches pallas.pk from the remote if not already present locally,
+# then runs the ceremony_bootstrap test. ea.sk and ea.pk are generated
+# per-round by the auto-deal mechanism and are not pre-fetched.
 set -e
 
 SSH_HOST="${1:?Usage: $0 <ssh-host> [key-dir]}"
@@ -51,7 +52,9 @@ echo ""
 # ---------------------------------------------------------------------------
 mkdir -p "$KEY_DIR"
 
-for keyfile in ea.sk ea.pk pallas.pk; do
+# Only pallas.pk is needed before the ceremony runs; ea.sk and ea.pk are
+# generated per-round by the auto-deal mechanism and do not exist yet.
+for keyfile in pallas.pk; do
     local_path="$KEY_DIR/$keyfile"
     if [ -f "$local_path" ]; then
         echo "Key $keyfile already cached at $local_path"
@@ -74,8 +77,6 @@ export ZALLY_HOME="$REMOTE_HOME"
 # Allow the caller to override the CometBFT RPC endpoint. The default covers
 # the single-validator case; multi-node deployments override via the env.
 export ZALLY_NODE_URL="${ZALLY_NODE_URL:-tcp://localhost:26657}"
-export ZALLY_EA_SK_PATH="$KEY_DIR/ea.sk"
-export ZALLY_EA_PK_PATH="$KEY_DIR/ea.pk"
 export ZALLY_PALLAS_PK_PATH="$KEY_DIR/pallas.pk"
 
 # Resolve the ceremony validator's operator address by moniker so we pin to

@@ -19,7 +19,7 @@ The first source that succeeds wins. This means a TestFlight build works out of 
     { "url": "https://46-101-255-48.sslip.io", "label": "Primary" }
   ],
   "pir_servers": [
-    { "url": "http://157.180.63.235:3000", "label": "PIR Server" }
+    { "url": "https://46-101-255-48.sslip.io/nullifier", "label": "PIR Server" }
   ]
 }
 ```

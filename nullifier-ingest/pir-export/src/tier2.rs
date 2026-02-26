@@ -31,20 +31,19 @@ use crate::{
 
 /// Export all Tier 2 rows to a writer.
 ///
-/// Each row is written as a contiguous block of `TIER2_ROW_BYTES` bytes.
-/// The total output is `TIER2_ROWS × TIER2_ROW_BYTES` bytes (~6 GB).
+/// Rows are computed and written one at a time to avoid materializing all rows
+/// in memory (~6 GB if collected).
 pub fn export(
     levels: &[Vec<Fp>],
     ranges: &[Range],
     empty_hashes: &[Fp; TREE_DEPTH],
     writer: &mut impl Write,
 ) -> Result<()> {
-    let mut row_buf = vec![0u8; TIER2_ROW_BYTES];
+    let mut buf = vec![0u8; TIER2_ROW_BYTES];
 
     for s in 0..TIER2_ROWS {
-        write_row(levels, ranges, empty_hashes, s, &mut row_buf);
-        writer.write_all(&row_buf)?;
-
+        write_row(levels, ranges, empty_hashes, s, &mut buf);
+        writer.write_all(&buf)?;
         if s > 0 && s % 100_000 == 0 {
             eprintln!("    Tier 2 progress: {}/{} rows", s, TIER2_ROWS);
         }

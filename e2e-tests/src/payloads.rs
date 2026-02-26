@@ -265,8 +265,8 @@ pub fn helper_share_payload(
     enc_share_c2: &[u8],
     share_index: u32,
     tree_position: u64,
-    all_enc_shares: &[(&[u8], &[u8], u32)], // (c1, c2, share_index) for each of 5 shares
-    share_blinds: &[Vec<u8>],               // 5 x 32-byte blind factors
+    all_enc_shares: &[(&[u8], &[u8], u32)], // (c1, c2, share_index) for each of 16 shares
+    share_blinds: &[Vec<u8>],               // 16 x 32-byte blind factors
 ) -> Value {
     let all_shares_json: Vec<Value> = all_enc_shares
         .iter()

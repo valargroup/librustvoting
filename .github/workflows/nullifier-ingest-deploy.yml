@@ -30,6 +30,8 @@ jobs:
 
       - name: Set up Rust (nightly)
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-02-25
 
       - name: Cache Rust build
         uses: actions/cache@v4
@@ -42,13 +44,15 @@ jobs:
             nullifier-ingest/pir-export/target
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-nf-server-${{ hashFiles('nullifier-ingest/nf-server/Cargo.lock', 'nullifier-ingest/pir-server/Cargo.lock', 'nullifier-ingest/pir-export/Cargo.lock', 'nullifier-ingest/service/Cargo.lock', 'nullifier-ingest/imt-tree/Cargo.lock') }}
+          key: ${{ runner.os }}-nf-server-v2-nightly-2025-02-25-${{ hashFiles('nullifier-ingest/nf-server/Cargo.lock', 'nullifier-ingest/pir-server/Cargo.lock', 'nullifier-ingest/pir-export/Cargo.lock', 'nullifier-ingest/service/Cargo.lock', 'nullifier-ingest/imt-tree/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-nf-server-
+            ${{ runner.os }}-nf-server-v2-nightly-2025-02-25-
 
       - name: Build release binary
         run: cd nf-server && cargo build --release --features serve,avx512
         working-directory: nullifier-ingest
+        env:
+          RUSTFLAGS: "-C target-feature=+avx512f,+avx512bw,+avx512dq,+avx512cd,+avx512vl"
 
       - name: Upload binary and config
         uses: actions/upload-artifact@v4

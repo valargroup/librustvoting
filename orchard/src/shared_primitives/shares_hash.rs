@@ -13,12 +13,12 @@
 //! that both circuits provably execute the same hash logic.
 
 use halo2_proofs::{
-    circuit::{AssignedCell, Layouter, Value},
+    circuit::{AssignedCell, Layouter},
     plonk,
 };
 use halo2_gadgets::poseidon::{
     primitives::{self as poseidon, ConstantLength},
-    Hash as PoseidonHash, Pow5Chip as PoseidonChip, Pow5Config as PoseidonConfig,
+    Hash as PoseidonHash, Pow5Chip as PoseidonChip,
 };
 use pasta_curves::pallas;
 
