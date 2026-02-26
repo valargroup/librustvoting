@@ -1,13 +1,13 @@
 # Delegation Circuit (ZKP 1)
 
-A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384 rows). The circuit handles the keystone note (conditions 1–8) and four per-note slots (conditions 9–15 ×4) in one proof.
+A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384 rows). The circuit handles the keystone note (conditions 1–8) and five per-note slots (conditions 9–15 ×5) in one proof.
 
-**Public inputs:** 12 field elements.
-**Per-note slots:** 4 (unused slots are padded with zero-value notes).
+**Public inputs:** 13 field elements.
+**Per-note slots:** 5 (unused slots are padded with zero-value notes).
 
 ## Inputs
 
-- Public (12 field elements)
+- Public (13 field elements)
    * **nf_signed** (offset 0): the derived nullifier of the keystone note.
    * **rk** (offsets 1–2): the randomized public key for spend authorization (x, y coordinates).
    * **cmx_new** (offset 3): the extracted note commitment (`ExtractP(cm_new)`) of the output note.
@@ -15,7 +15,7 @@ A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384
    * **vote_round_id** (offset 5): the vote round identifier — prevents cross-round replay.
    * **nc_root** (offset 6): the note commitment tree root (shared anchor for Merkle path verification).
    * **nf_imt_root** (offset 7): the nullifier Indexed Merkle Tree root (for non-membership proofs).
-   * **gov_null_1..4** (offsets 8–11): per-note governance nullifiers, one per note slot.
+   * **gov_null_1..5** (offsets 8–12): per-note governance nullifiers, one per note slot.
 
 - Private (keystone note)
    * **rho_signed** ("rho"): the nullifier of the note that was spent to create the signed note.
@@ -24,7 +24,8 @@ A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384
    * **nk**: nullifier deriving key.
    * **ak**: spend validating key (the long-lived public key for spend authorization).
    * **alpha**: a fresh random scalar used to rerandomize the spend authorization key for each transaction.
-   * **rivk**: the randomness (blinding factor) for the CommitIvk Sinsemilla commitment.
+   * **rivk**: the randomness (blinding factor) for the CommitIvk Sinsemilla commitment (external scope).
+   * **rivk_internal**: the randomness (blinding factor) for the CommitIvk Sinsemilla commitment (internal/change scope).
    * **rcm_signed**: the note commitment trapdoor (randomness).
    * **g_d_signed**: the diversified generator from the note recipient's address.
    * **pk_d_signed**: the diversified transmission key from the note recipient's address.
@@ -35,7 +36,7 @@ A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384
    * **psi_new**: pseudorandom field element for the output note.
    * **rcm_new**: the output note commitment trapdoor.
 
-- Private (per-note slot ×4 — conditions 9–15)
+- Private (per-note slot ×5 — conditions 9–15)
    * **g_d**: diversified generator from the note recipient's address.
    * **pk_d**: diversified transmission key from the note recipient's address.
    * **v**: the note value (in zatoshi).
@@ -46,6 +47,7 @@ A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384
    * **path**: Sinsemilla-based Merkle authentication path (32 siblings).
    * **pos**: leaf position in the note commitment tree.
    * **is_note_real**: boolean flag — 1 for real notes, 0 for padded notes.
+   * **is_internal**: boolean flag — 1 for internal (change) scope notes, 0 for external scope notes.
    * **imt_low**: the interval start (low bound of the bracketing leaf).
    * **imt_width**: the interval width (`high - low`, pre-computed during tree construction).
    * **imt_leaf_pos**: position of the leaf in the IMT.
@@ -54,11 +56,15 @@ A single circuit proving all 15 conditions of the delegation ZKP at K=14 (16,384
 - Private (governance — condition 7)
    * **van_comm_rand**: a random blinding factor for the governance commitment.
 
+- Private (ballot scaling — condition 8)
+   * **num_ballots**: the ballot count `floor(v_total / 12,500,000)`, witnessed as a free advice.
+   * **remainder**: `v_total mod 12,500,000`, witnessed as a free advice.
+
 - Internal wires (not public inputs, not free witnesses)
-   * **ivk**: derived in condition 5 (CommitIvk), shared with condition 11.
-   * **nk**: witnessed once, shared with conditions 2, 12, and 14.
-   * **cmx_1..4**: produced by per-note condition 9, consumed by condition 3.
-   * **v_1..4**: produced by per-note condition 9, consumed by condition 7.
+   * **ivk**: derived in condition 5 (CommitIvk with external `rivk`), shared with condition 11.
+   * **ivk_internal**: derived in condition 5 (CommitIvk with internal `rivk_internal`), shared with condition 11.
+   * **cmx_1..5**: produced by per-note condition 9, consumed by condition 3.
+   * **v_1..5**: produced by per-note condition 9, consumed by conditions 7 and 8.
 
 ## 1. Signed Note Commitment Integrity
 
@@ -119,17 +125,17 @@ DeriveNullifier_nk(rho, psi, cm) = ExtractP(
 Purpose: the signed note's rho is bound to the exact notes being delegated, the governance commitment, and the round. This makes the keystone signature non-replayable and scoped.
 
 ```
-rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)
+rho_signed = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, cmx_5, van_comm, vote_round_id)
 ```
 
 Where:
-- **cmx_1..4**: the extracted note commitments (`ExtractP(cm_i)`) of the four delegated notes. **These are internal wires** — produced by per-note condition 9 (note commitment integrity), not free witnesses. By hashing all four commitments into rho, the keystone signature is bound to the exact set of notes the delegator chose.
+- **cmx_1..5**: the extracted note commitments (`ExtractP(cm_i)`) of the five delegated notes. **These are internal wires** — produced by per-note condition 9 (note commitment integrity), not free witnesses. By hashing all five commitments into rho, the keystone signature is bound to the exact set of notes the delegator chose.
 - **van_comm**: the governance commitment (public input).
 - **vote_round_id**: the vote round identifier (public input).
 
-**Function:** `Poseidon` with `ConstantLength<6>`. Uses `Pow5Chip` / `P128Pow5T3` with rate 2 (3 absorption rounds for 6 inputs).
+**Function:** `Poseidon` with `ConstantLength<7>`. Uses `Pow5Chip` / `P128Pow5T3` with rate 2 (4 absorption rounds for 7 inputs).
 
-**Constraint:** The circuit computes `derived_rho = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, van_comm, vote_round_id)` and enforces strict equality `derived_rho == rho_signed`. Since `rho_signed` is the same value used in both note commitment integrity (condition 1) and nullifier integrity (condition 2), this creates a three-way binding: the nullifier, the note commitment, and the delegation scope are all tied to the same rho.
+**Constraint:** The circuit computes `derived_rho = Poseidon(cmx_1, cmx_2, cmx_3, cmx_4, cmx_5, van_comm, vote_round_id)` and enforces strict equality `derived_rho == rho_signed`. Since `rho_signed` is the same value used in both note commitment integrity (condition 1) and nullifier integrity (condition 2), this creates a three-way binding: the nullifier, the note commitment, and the delegation scope are all tied to the same rho.
 
 **Constructions:** `PoseidonChip`.
 
@@ -146,14 +152,15 @@ Where:
 - **alpha** — fresh randomness. If rk were the same across transactions, an observer could link them to the same spender.
 - **SpendAuthG** — the fixed base generator point on the Pallas curve dedicated to spend authorization.
 
-**Constructions:** Shared `circuit::address_ownership::spend_auth_g_mul` (fixed-base `[alpha]*SpendAuthG`), then `EccChip` add to get rk.
+**Constructions:** Shared `shared_primitives::spend_authority::prove_spend_authority` gadget (which computes fixed-base `[alpha]*SpendAuthG`, adds `ak_P`, and constrains `rk` to the instance), plus `EccChip` operations internally.
 
 ## 5. CommitIvk & Diversified Address Integrity
 
-Purpose: proves the signed note's address belongs to the same key material `(ak, nk)`. Derives `ivk` — reused for every per-note ownership check (condition 11).
+Purpose: proves the signed note's address belongs to the same key material `(ak, nk)`. Derives `ivk` (external) and `ivk_internal` — used by condition 11 for per-note ownership checks with scope selection.
 
 ```
 ivk = CommitIvk_rivk(ExtractP(ak_P), nk)
+ivk_internal = CommitIvk_rivk_internal(ExtractP(ak_P), nk)
 pk_d_signed = [ivk] * g_d_signed
 ```
 
@@ -163,16 +170,17 @@ Without address integrity, the nullifier integrity proves "I know (nk, rho, psi,
 
 The `ivk = ⊥` case is handled internally by `CommitDomain::short_commit`: incomplete addition allows the identity to occur, and synthesis detects this edge case and aborts proof creation. No explicit conditional is needed in the circuit.
 
-**ivk is internal** — it is NOT constrained to a public input. It flows directly to condition 11 (per-note address checks) via cell reuse.
+**Both ivk values are internal wires** — they are NOT constrained to public inputs. They flow directly to condition 11 (per-note address checks) via cell reuse. `ivk_internal` is derived identically to `ivk` but uses `rivk_internal` (the change-scope blinding factor) instead of `rivk`.
 
 Where:
 - **ak_P** — the spend validating key (shared with condition 4). `ExtractP(ak_P)` extracts its x-coordinate.
 - **nk** — the nullifier deriving key (shared with conditions 2, 12, 14).
-- **rivk** — the CommitIvk randomness, extracted from the full viewing key via `fvk.rivk(Scope::External)`.
+- **rivk** — the CommitIvk randomness for external scope, extracted from the full viewing key via `fvk.rivk(Scope::External)`.
+- **rivk_internal** — the CommitIvk randomness for internal (change) scope, extracted via `fvk.rivk(Scope::Internal)`.
 - **g_d_signed** — the diversified generator from the note recipient's address.
 - **pk_d_signed** — the diversified transmission key from the note recipient's address.
 
-**Constructions:** Shared `circuit::address_ownership::prove_address_ownership` (CommitIvk + `[ivk]*g_d` + constrain to pk_d). Uses `CommitIvkChip`, `SinsemillaChip` (config 1), `EccChip` internally.
+**Constructions:** Shared `circuit::address_ownership::prove_address_ownership` (CommitIvk + `[ivk]*g_d` + constrain to pk_d). Uses `CommitIvkChip`, `SinsemillaChip` (config 1), `EccChip` internally. A second `commit_ivk` call derives `ivk_internal`.
 
 ## 6. Output Note Commitment Integrity
 
@@ -198,20 +206,20 @@ Where:
 
 ## 7. Gov Commitment Integrity
 
-Purpose: prove that the governance commitment (a public input) is correctly derived from the domain tag, the output note's diversified address components (`g_d_new_x`, `pk_d_new_x`), the total voting weight, the vote round identifier, a blinding factor, and the proposal authority bitmask. The diversified address binds the VAN to the delegator's key material: `pk_d = [ivk] * g_d` where `ivk` is derived from `(ak, nk)` in condition 5, so the VAN can only be spent by someone who controls the same keys. Binds the delegated weight, address, and authority scope into a single public commitment that ZKP #2 (vote proof) can open. The domain tag provides domain separation from Vote Commitments in the shared vote commitment tree.
+Purpose: prove that the governance commitment (a public input) is correctly derived from the domain tag, the output note's diversified address components (`g_d_new_x`, `pk_d_new_x`), the ballot count, the vote round identifier, a blinding factor, and the proposal authority bitmask. Binds the delegated weight, output address coordinates, and authority scope into a single public commitment that ZKP #2 (vote proof) can open. The output address is hashed as data here; this circuit does not separately enforce output-address ownership against `ivk` in condition 6. The domain tag provides domain separation from Vote Commitments in the shared vote commitment tree.
 
 ```
-van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, v_total, vote_round_id, MAX_PROPOSAL_AUTHORITY)
+van_comm_core = Poseidon(DOMAIN_VAN, g_d_new_x, pk_d_new_x, num_ballots, vote_round_id, MAX_PROPOSAL_AUTHORITY)
 van_comm = Poseidon(van_comm_core, van_comm_rand)
 ```
 
 Where:
-- **DOMAIN_VAN**: `0`. Domain separation tag for Vote Authority Notes (vs `DOMAIN_VC = 1` for Vote Commitments). Assigned via `assign_advice_from_constant` so the value is baked into the verification key.
+- **DOMAIN_VAN**: `0`. Domain separation tag for Vote Authority Notes (vs `DOMAIN_VC = 1` for Vote Commitments). Assigned via `assign_constant` so the value is baked into the verification key.
 - **g_d_new_x**: the x-coordinate of the output note's diversified generator. Reuses the ECC point from condition 6.
 - **pk_d_new_x**: the x-coordinate of the output note's diversified transmission key. Reuses the ECC point from condition 6.
-- **v_total**: the sum `v_1 + v_2 + v_3 + v_4`, computed in-circuit via three `AddChip` additions. **Each `v_i` is an internal wire** — produced by per-note condition 9 (note commitment integrity), not a free witness. The value is bound to the actual note commitment.
+- **num_ballots**: the ballot count `floor(v_total / 12,500,000)`, computed in condition 8. `v_total` is the sum `v_1 + v_2 + v_3 + v_4 + v_5`, computed in-circuit via four `AddChip` additions. **Each `v_i` is an internal wire** — produced by per-note condition 9 (note commitment integrity), not a free witness. The value is bound to the actual note commitment.
 - **vote_round_id**: the vote round identifier (public input, same cell as condition 3).
-- **MAX_PROPOSAL_AUTHORITY**: `2^16 - 1 = 65535`. A 16-bit bitmask authorizing voting on all 16 proposals. Assigned via `assign_advice_from_constant` so the value is baked into the verification key.
+- **MAX_PROPOSAL_AUTHORITY**: `2^16 - 1 = 65535`. A 16-bit bitmask authorizing voting on all 16 proposals. Assigned via `assign_constant` so the value is baked into the verification key.
 - **van_comm_rand**: a random blinding factor. Prevents observers from brute-forcing the address or weight from the public `van_comm`.
 
 **Function layout:** Two Poseidon hashes via the shared `circuit::van_integrity` gadget:
@@ -222,26 +230,27 @@ The same two-layer hash structure is used by ZKP #2 (vote proof, conditions 2 an
 
 **Out-of-circuit helper:** `van_commitment_hash()` delegates to `van_integrity::van_integrity_hash()` with `MAX_PROPOSAL_AUTHORITY` as the proposal authority.
 
-**Constructions:** `van_integrity::van_integrity_poseidon` (shared gadget from `circuit::van_integrity`), `AddChip`.
+**Constructions:** `van_integrity::van_integrity_poseidon` (shared gadget from `circuit::van_integrity`), `AddChip`, `MulChip`.
 
-## 8. Minimum Voting Weight
+## 8. Ballot Scaling
 
-Purpose: prevent dust delegations by enforcing that the total delegated value meets a minimum threshold.
+Purpose: convert the total delegated value into a ballot count via floor-division, simultaneously enforcing a minimum voting weight (at least 1 ballot = 0.125 ZEC).
 
 ```
-v_total >= 12,500,000 zatoshi  (0.125 ZEC)
+num_ballots = floor(v_total / 12,500,000)
 ```
 
-**Approach:** The circuit witnesses `diff = v_total - MIN_WEIGHT`, constrains `diff + MIN_WEIGHT == v_total` via `AddChip`, and range-checks `diff` to `[0, 2^70)` using the `LookupRangeCheckConfig`.
+**Approach:** The circuit witnesses `num_ballots` and `remainder` as free advice, then constrains:
 
-- If `v_total >= MIN_WEIGHT`, then `diff` is a small non-negative integer that fits in 70 bits.
-- If `v_total < MIN_WEIGHT`, then `diff` wraps to ~2^254 (field arithmetic is modular), which fails the range check.
+1. **Euclidean division**: `num_ballots * BALLOT_DIVISOR + remainder == v_total` — via `MulChip` (product) and `AddChip` (sum), then equality constraint against `v_total`.
 
-**Why 70 bits?** 7 words x 10 bits/word = 70 bits. Comfortably covers u64 (64 bits) with 6 bits of headroom for the 4-note sum.
+2. **Remainder range**: `remainder < 2^24` — since 24 is not a multiple of 10 (the lookup table word size), the circuit multiplies by `2^6` and range-checks the shifted value to 30 bits (3 words × 10 bits). If `remainder >= 2^24`, the shifted value `>= 2^30`, failing the check. Since `BALLOT_DIVISOR = 12,500,000 < 2^24`, this suffices.
 
-**Constructions:** `AddChip`, `LookupRangeCheckConfig`.
+3. **Non-zero and upper bound**: `0 < num_ballots <= 2^30` — via `nb_minus_one = num_ballots - 1`, constrained by `nb_minus_one + 1 == num_ballots`, with a 30-bit range check on `nb_minus_one` (3 words × 10 bits, no shift needed). This single check enforces both bounds: if `nb_minus_one < 2^30` then `num_ballots ∈ [1, 2^30]`. If `num_ballots = 0`, `nb_minus_one` wraps to `p - 1 ≈ 2^254`, which fails the range check. `2^30` ballots × 0.125 ZEC ≈ 134M ZEC, well above the 21M ZEC supply.
 
-## 9. Note Commitment Integrity (x4)
+**Constructions:** `MulChip`, `AddChip`, `LookupRangeCheckConfig`.
+
+## 9. Note Commitment Integrity (x5)
 
 Purpose: recompute each note's commitment in-circuit and extract `cmx` and `v` as internal wires for conditions 3 and 7.
 
@@ -250,13 +259,13 @@ NoteCommit_rcm(repr(g_d), repr(pk_d), v, rho, psi) = cm
 cmx = ExtractP(cm)
 ```
 
-The circuit recomputes NoteCommit from the per-note witness data and enforces strict equality against the witnessed `cm`. The resulting `cmx` (x-coordinate of the commitment point) flows to condition 3 (rho binding) and `v` flows to condition 7 (gov commitment) as internal wires — eliminating the need for `cmx_1..4` and `v_1..4` as free witnesses.
+The circuit recomputes NoteCommit from the per-note witness data and enforces strict equality against the witnessed `cm`. The resulting `cmx` (x-coordinate of the commitment point) flows to condition 3 (rho binding) and `v` flows into the shared `v_total` path used by conditions 7 and 8 as internal wires — eliminating the need for `cmx_1..5` and `v_1..5` as free witnesses.
 
-The `v` cell is a `NoteValue` inside NoteCommit. A separate `v_base` cell (as `pallas::Base`) is constrained equal to `v` and returned for the `AddChip` sum in condition 7.
+The `v` cell is a `NoteValue` inside NoteCommit. A separate `v_base` cell (as `pallas::Base`) is constrained equal to `v` and returned for the `AddChip` sum used by conditions 7 and 8.
 
 **Constructions:** `SinsemillaChip` (config 1), `EccChip`, `NoteCommitChip` (signed config, reused from condition 1).
 
-## 10. Merkle Path Validity (x4)
+## 10. Merkle Path Validity (x5)
 
 Purpose: prove that the note's commitment exists in the note commitment tree, gated by `is_note_real`.
 
@@ -271,24 +280,30 @@ For padded notes, the path can be all-zeros; the Merkle computation still runs b
 
 **Constructions:** `MerkleChip` (configs 1+2), `SinsemillaChip` (configs 1+2 via MerkleChip), `q_per_note`.
 
-## 11. Diversified Address Integrity (x4)
+## 11. Diversified Address Integrity (x5)
 
-Purpose: prove each note's address was derived from the shared `ivk` established in condition 5.
+Purpose: prove each note's address was derived from the correct scope-specific `ivk` established in condition 5.
 
 ```
-pk_d = [ivk] * g_d
+selected_ivk = ivk + is_internal * (ivk_internal - ivk)
+pk_d = [selected_ivk] * g_d
 ```
+
+The `q_scope_select` custom gate muxes between `ivk` (external scope) and `ivk_internal` (internal/change scope) based on the per-note `is_internal` flag. External notes use `ivk` derived from `rivk`; internal (change) notes use `ivk_internal` derived from `rivk_internal`. The gate constrains `is_internal` to be boolean.
 
 Where:
-- **ivk** — the internal wire from condition 5. Converted to `ScalarVar` and reused for all 4 note slots.
+- **ivk** — the external-scope internal wire from condition 5.
+- **ivk_internal** — the internal-scope internal wire from condition 5.
+- **is_internal** — per-note boolean flag used directly by the `q_scope_select` gate for the mux.
+- **selected_ivk** — the muxed result, converted to `ScalarVar` for ECC multiplication.
 - **g_d** — the diversified generator from the note's address.
 - **pk_d** — the diversified transmission key from the note's address.
 
-This ensures all four delegated notes belong to the same wallet (same `ivk` derived from `ak` and `nk`).
+This ensures all five delegated notes belong to the same wallet (same key material `(ak, nk)`), while allowing both external and internal (change) notes.
 
-**Constructions:** `EccChip` (ScalarVar, variable-base mul).
+**Constructions:** `q_scope_select`, `EccChip` (ScalarVar, variable-base mul).
 
-## 12. Private Nullifier Derivation (x4)
+## 12. Private Nullifier Derivation (x5)
 
 Purpose: derive each note's true Orchard nullifier in-circuit. This nullifier is NOT published — it feeds into condition 13 (IMT non-membership) and condition 14 (governance nullifier).
 
@@ -300,7 +315,7 @@ Same `DeriveNullifier` construction as condition 2, but applied to each delegate
 
 **Constructions:** `PoseidonChip`, `AddChip`, `EccChip`.
 
-## 13. IMT Non-Membership (x4)
+## 13. IMT Non-Membership (x5)
 
 Purpose: prove the note's nullifier has NOT been spent, using a Poseidon-based Indexed Merkle Tree with a (low, width) leaf model. Each leaf stores `(low, width)` where `width = high - low` is pre-computed during tree construction.
 
@@ -313,7 +328,7 @@ Purpose: prove the note's nullifier has NOT been spent, using a Poseidon-based I
    - `left + right = current + sibling`
    - `bool_check(pos_bit)`
 
-3. **Root check**: The `q_per_note` gate constrains `imt_root = nf_imt_root` (the public input).
+3. **Root check**: The `q_per_note` gate constrains `imt_root = nf_imt_root` (the public input). Unlike the Merkle root check in condition 10, this is **not gated** by `is_note_real` — padded notes must also provide a valid IMT non-membership proof.
 
 4. **Interval check** (`q_interval` gate): Proves `low <= real_nf <= low + width` using 2 constraints:
    - `x = real_nf - low` (offset into interval)
@@ -327,24 +342,25 @@ Purpose: prove the note's nullifier has NOT been spent, using a Poseidon-based I
 
 **Constructions:** `PoseidonChip`, `LookupRangeCheckConfig`, `q_imt_swap`, `q_interval`, `q_per_note`.
 
-## 14. Governance Nullifier Publication (x4)
+## 14. Governance Nullifier Publication (x5)
 
 Purpose: derive a domain-separated governance nullifier that is published as a public input. This prevents double-voting without revealing the note's true Orchard nullifier.
 
 ```
-gov_null = Poseidon(nk, Poseidon(domain_tag, Poseidon(vote_round_id, real_nf)))
+gov_null = Poseidon(nk, domain_tag, vote_round_id, real_nf)
 ```
 
-Three nested Poseidon hashes (each `ConstantLength<2>`):
-1. `intermediate = Poseidon(vote_round_id, real_nf)` — binds to the voting round.
-2. `tagged = Poseidon(domain_tag, intermediate)` — separates from other nullifier domains. `domain_tag` = `"governance authorization"` encoded as a little-endian Pallas field element, assigned via `assign_advice_from_constant` so the value is baked into the verification key.
-3. `gov_null = Poseidon(nk, tagged)` — binds to the nullifier key, making it unforgeable.
+Single Poseidon hash (`ConstantLength<4>`, 2 permutations at rate 2):
+- **nk** — the nullifier deriving key, making the result unforgeable.
+- **domain_tag** — `"governance authorization"` encoded as a little-endian Pallas field element, assigned via `assign_constant` so the value is baked into the verification key. Separates from other nullifier domains.
+- **vote_round_id** — binds to the voting round.
+- **real_nf** — the note's true nullifier from condition 12.
 
-The result is constrained to the public input at offset `GOV_NULL_1..4`.
+The result is constrained to the public input at offset `GOV_NULL_1..5`.
 
 **Constructions:** `PoseidonChip`.
 
-## 15. Padded-Note Zero-Value Enforcement (x4)
+## 15. Padded-Note Zero-Value Enforcement (x5)
 
 Purpose: ensure padded (unused) note slots contribute zero voting weight.
 
@@ -369,7 +385,6 @@ For real notes (`is_note_real = 1`), the constraint is trivially satisfied and `
 
 - **"Why are psi and rcm witnessed, not derived in-circuit?"** — Both are derived from `rseed` using Blake2b out-of-circuit and provided as private inputs. If either is incorrect, the recomputed commitment will not match, and the proof will fail.
 
-- **"Why two Sinsemilla configs (and two NoteCommitChips)?"** — This mirrors the audited Orchard action circuit, which uses two Sinsemilla configs (one for spend-side NoteCommit, one for output-side NoteCommit) with column assignments `advices[..5]` and `advices[5..]`. Each `SinsemillaChip::configure` call creates its own selectors and gates, and each `NoteCommitChip::configure` creates decomposition/canonicity gates tied to the Sinsemilla config it receives — so two Sinsemilla configs require two NoteCommitChips. We replicate this exact layout so the delegation circuit inherits the audited chip wiring without modification. It may be possible to collapse to a single config (condition 9 already runs 4 NoteCommits on config 1 without conflict), but reusing the known-correct pattern avoids the need for a separate audit of the chip interaction.
+- **"Why two Sinsemilla configs (and two NoteCommitChips)?"** — This mirrors the audited Orchard action circuit, which uses two Sinsemilla configs (one for spend-side NoteCommit, one for output-side NoteCommit) with column assignments `advices[..5]` and `advices[5..]`. Each `SinsemillaChip::configure` call creates its own selectors and gates, and each `NoteCommitChip::configure` creates decomposition/canonicity gates tied to the Sinsemilla config it receives — so two Sinsemilla configs require two NoteCommitChips. We replicate this exact layout so the delegation circuit inherits the audited chip wiring without modification. It may be possible to collapse to a single config (condition 9 already runs 5 NoteCommits on config 1 without conflict), but reusing the known-correct pattern avoids the need for a separate audit of the chip interaction.
 
-- **"Why do padded notes use the real ivk?"** — Padded notes must pass condition 11 (`pk_d = [ivk] * g_d`) using the same ivk derived in condition 5. The builder creates padded notes with `fvk.address_at(...)` so their addresses are valid under the real ivk. This is safe because padded notes have `v = 0` (enforced by condition 15) and `is_note_real = 0` (so condition 10 skips the Merkle root check). They contribute nothing to the vote weight but their governance nullifiers are still published (condition 14), which is harmless — the consuming protocol can ignore nullifiers for zero-value notes or treat them as no-ops.
-
+- **"Why do padded notes use the real ivk?"** — Padded notes must pass condition 11 (`pk_d = [selected_ivk] * g_d`) using the same ivk (or ivk_internal) derived in condition 5. The builder creates padded notes with `fvk.address_at(...)` so their addresses are valid under the real ivk. This is safe because padded notes have `v = 0` (enforced by condition 15) and `is_note_real = 0` (so condition 10 skips the Merkle root check). They contribute nothing to the vote weight but their governance nullifiers are still published (condition 14), which is harmless — the consuming protocol can ignore nullifiers for zero-value notes or treat them as no-ops.
