@@ -32,19 +32,19 @@ use crate::{
 
 /// Export all Tier 1 rows to a writer.
 ///
-/// Each row is written as a contiguous block of `TIER1_ROW_BYTES` bytes.
-/// The total output is `TIER1_ROWS × TIER1_ROW_BYTES` bytes.
+/// Rows are computed and written one at a time to avoid materializing all rows
+/// in memory.
 pub fn export(
     levels: &[Vec<Fp>],
     ranges: &[Range],
     empty_hashes: &[Fp; TREE_DEPTH],
     writer: &mut impl Write,
 ) -> Result<()> {
-    let mut row_buf = vec![0u8; TIER1_ROW_BYTES];
+    let mut buf = vec![0u8; TIER1_ROW_BYTES];
 
     for s in 0..TIER1_ROWS {
-        write_row(levels, ranges, empty_hashes, s, &mut row_buf);
-        writer.write_all(&row_buf)?;
+        write_row(levels, ranges, empty_hashes, s, &mut buf);
+        writer.write_all(&buf)?;
     }
 
     Ok(())
