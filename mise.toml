@@ -62,11 +62,21 @@ for i in $(seq 1 15); do
 done
 
 # ── Register Pallas key ─────────────────────────────────────────
-zallyd tx vote register-pallas-key \
-    --from validator --chain-id zvote-1 --keyring-backend test \
-    --home ~/.zallyd -y > /dev/null 2>&1 \
-    && printf '\033[32mPallas key registered ✓\033[0m\n' \
-    || printf '\033[33mPallas key already registered (or registration skipped)\033[0m\n'
+printf 'Registering Pallas key...'
+for i in $(seq 1 10); do
+    if zallyd tx vote register-pallas-key \
+        --from validator --chain-id zvote-1 --keyring-backend test \
+        --home ~/.zallyd -y > /dev/null 2>&1; then
+        printf ' \033[32m✓\033[0m\n'
+        break
+    fi
+    if [ "$i" = "10" ]; then
+        printf ' \033[31mFAILED\033[0m\n'
+        exit 1
+    fi
+    printf '.'
+    sleep 2
+done
 
 # Write iOS local config pointing at single-validator ports
 IOS_CFG="zashi-ios/secant/Resources/voting-config-local.json"
@@ -386,12 +396,21 @@ done
 sleep 5
 
 # ── Register val1 Pallas key ────────────────────────────────────
-zallyd tx vote register-pallas-key \
-    --from validator --chain-id zvote-1 --keyring-backend test \
-    --home "$HOME/.zallyd-val1" --node tcp://localhost:26157 -y > /dev/null 2>&1 \
-    && printf '\033[32mVal1 pallas key registered\033[0m\n' \
-    || printf '\033[33mVal1 pallas key already registered (or skipped)\033[0m\n'
-sleep 3
+printf 'Registering val1 Pallas key...'
+for i in $(seq 1 10); do
+    if zallyd tx vote register-pallas-key \
+        --from validator --chain-id zvote-1 --keyring-backend test \
+        --home "$HOME/.zallyd-val1" --node tcp://localhost:26157 -y > /dev/null 2>&1; then
+        printf ' \033[32m✓\033[0m\n'
+        break
+    fi
+    if [ "$i" = "10" ]; then
+        printf ' \033[31mFAILED\033[0m\n'
+        exit 1
+    fi
+    printf '.'
+    sleep 2
+done
 
 # ── Register val2 + val3 via CreateValidatorWithPallasKey ────────
 SELF_DELEGATION="10000000stake"
