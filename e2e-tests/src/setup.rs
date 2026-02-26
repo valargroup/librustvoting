@@ -179,27 +179,18 @@ pub fn build_delegation_bundle_for_test(
     let nc_root_repr = nc_root.to_repr();
     let nf_imt_root_repr = nf_imt_root.to_repr();
 
-    let mut snapshot_height: u64 = 42_000;
-    let vote_round_id: pallas::Base;
-    loop {
-        let mut data = Vec::with_capacity(8 + 32 + 32 + 8 + 32 + 32);
-        data.extend_from_slice(&snapshot_height.to_be_bytes());
-        data.extend_from_slice(&snapshot_blockhash);
-        data.extend_from_slice(&proposals_hash);
-        data.extend_from_slice(&vote_end_time.to_be_bytes());
-        data.extend_from_slice(nf_imt_root_repr.as_ref());
-        data.extend_from_slice(nc_root_repr.as_ref());
-
-        let hash = Blake2bParams::new().hash_length(32).hash(&data);
-        let mut repr = [0u8; 32];
-        repr.copy_from_slice(hash.as_bytes());
-
-        if let Some(fp) = pallas::Base::from_repr(repr).into() {
-            vote_round_id = fp;
-            break;
-        }
-        snapshot_height += 1;
-    }
+    let snapshot_height: u64 = 42_000;
+    let round_id_fields = SetupRoundFields {
+        snapshot_height,
+        snapshot_blockhash,
+        proposals_hash,
+        vote_end_time,
+        nullifier_imt_root: nf_imt_root_repr,
+        nc_root: nc_root_repr,
+    };
+    let round_id_bytes = crate::payloads::derive_round_id(&round_id_fields);
+    let vote_round_id: pallas::Base = pallas::Base::from_repr(round_id_bytes)
+        .expect("Poseidon output must be canonical Fp");
 
     let bundle = build_delegation_bundle(
         note_inputs,
@@ -263,15 +254,6 @@ pub fn build_delegation_bundle_for_test(
         proof,
     };
 
-    let fields = SetupRoundFields {
-        snapshot_height,
-        snapshot_blockhash,
-        proposals_hash,
-        vote_end_time,
-        nullifier_imt_root: nf_imt_root_repr,
-        nc_root: nc_root_repr,
-    };
-
     let vote_proof_data = VoteProofDelegationData {
         sk,
         van_comm_rand,
@@ -281,7 +263,7 @@ pub fn build_delegation_bundle_for_test(
         cmx_new: bundle.instance.cmx_new,
     };
 
-    Ok((payload, fields, vote_proof_data))
+    Ok((payload, round_id_fields, vote_proof_data))
 }
 
 /// Build a vote commitment tree locally with the single van_cmx leaf from

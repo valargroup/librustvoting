@@ -24,7 +24,7 @@ use e2e_tests::{
     },
     setup::build_delegation_bundle_for_test,
 };
-use ff::{FromUniformBytes, PrimeField};
+use ff::PrimeField;
 use group::{Curve, GroupEncoding};
 use librustvoting::{NoopProgressReporter, VotingRoundParams};
 use orchard::keys::SpendAuthorizingKey;
@@ -348,11 +348,11 @@ fn voting_flow_librustvoting_path() {
             bundle.vote_commitment.as_slice().try_into().unwrap(),
         ))
         .expect("vote_commitment");
-        // vote_round_id is a Blake2b-256 hash — use wide reduction since ~75% of
-        // hash values exceed the Pallas modulus.
-        let mut vri_wide = [0u8; 64];
-        vri_wide[..32].copy_from_slice(&round_id);
-        let vri: pallas::Base = pallas::Base::from_uniform_bytes(&vri_wide);
+        // vote_round_id is now a canonical Pallas Fp element (Poseidon hash output).
+        let vri: pallas::Base = Option::from(pallas::Base::from_repr(
+            round_id.as_slice().try_into().unwrap(),
+        ))
+        .expect("vote_round_id not canonical Fp");
 
         // EA PK coordinates
         let ea_pk_arr: [u8; 32] = ea_pk_bytes.as_slice().try_into().expect("ea_pk 32 bytes");

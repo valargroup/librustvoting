@@ -1,8 +1,8 @@
 //! JSON payload builders and round_id derivation for Zally REST API.
 //!
-//! Matches the chain's deriveRoundID: Blake2b-256(snapshot_height_BE ||
-//! snapshot_blockhash || proposals_hash || vote_end_time_BE ||
-//! nullifier_imt_root || nc_root).
+//! Matches the chain's deriveRoundID: Poseidon hash of 8 Fp elements
+//! derived from (snapshot_height, snapshot_blockhash, proposals_hash,
+//! vote_end_time, nullifier_imt_root, nc_root).
 
 use crate::elgamal::{self, Ciphertext};
 use serde_json::{json, Value};
@@ -32,20 +32,46 @@ fn round_counter_next() -> u64 {
     (now % 1_000_000) + ROUND_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Derive vote_round_id = Blake2b-256(snapshot_height_BE || snapshot_blockhash ||
-/// proposals_hash || vote_end_time_BE || nullifier_imt_root || nc_root).
+/// Derive vote_round_id via Poseidon hash of 8 Fp elements.
+///
+/// Same encoding as the chain's `derive_round_id_poseidon` in `sdk/circuits/src/ffi.rs`:
+///   snapshot_height → Fp::from(u64)
+///   snapshot_blockhash → 2 Fp (lo/hi u128 limbs)
+///   proposals_hash → 2 Fp (lo/hi u128 limbs)
+///   vote_end_time → Fp::from(u64)
+///   nullifier_imt_root → Fp::from_repr() (canonical)
+///   nc_root → Fp::from_repr() (canonical)
 pub fn derive_round_id(fields: &SetupRoundFields) -> [u8; 32] {
-    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
-    hasher.update(&fields.snapshot_height.to_be_bytes());
-    hasher.update(&fields.snapshot_blockhash);
-    hasher.update(&fields.proposals_hash);
-    hasher.update(&fields.vote_end_time.to_be_bytes());
-    hasher.update(&fields.nullifier_imt_root);
-    hasher.update(&fields.nc_root);
-    let hash = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(hash.as_bytes());
-    out
+    use ff::PrimeField;
+    use halo2_gadgets::poseidon::primitives::{self as poseidon, ConstantLength, P128Pow5T3};
+    use pasta_curves::pallas;
+
+    let split = |bytes: &[u8; 32]| -> (pallas::Base, pallas::Base) {
+        let lo = u128::from_le_bytes(bytes[..16].try_into().unwrap());
+        let hi = u128::from_le_bytes(bytes[16..32].try_into().unwrap());
+        (pallas::Base::from_u128(lo), pallas::Base::from_u128(hi))
+    };
+
+    let (bh_lo, bh_hi) = split(&fields.snapshot_blockhash);
+    let (ph_lo, ph_hi) = split(&fields.proposals_hash);
+    let nf_root: pallas::Base =
+        pallas::Base::from_repr(fields.nullifier_imt_root).expect("nullifier_imt_root not canonical Fp");
+    let nc: pallas::Base =
+        pallas::Base::from_repr(fields.nc_root).expect("nc_root not canonical Fp");
+
+    let inputs = [
+        pallas::Base::from(fields.snapshot_height),
+        bh_lo,
+        bh_hi,
+        ph_lo,
+        ph_hi,
+        pallas::Base::from(fields.vote_end_time),
+        nf_root,
+        nc,
+    ];
+
+    let hash = poseidon::Hash::<_, P128Pow5T3, ConstantLength<8>, 3, 2>::init().hash(inputs);
+    hash.to_repr()
 }
 
 fn to_base64(bytes: &[u8]) -> String {
@@ -70,8 +96,8 @@ pub fn create_voting_session_payload(
             snapshot_blockhash: [0xaa; 32],
             proposals_hash: [0xbb; 32],
             vote_end_time: now + expires_in_sec,
-            nullifier_imt_root: [0xcc; 32],
-            nc_root: [0xdd; 32],
+            nullifier_imt_root: [0x01; 32],
+            nc_root: [0x02; 32],
         }
     });
     let round_id = derive_round_id(&fields);

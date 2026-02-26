@@ -114,22 +114,6 @@ fn bytes_to_base(bytes: &[u8], name: &str) -> Result<pallas::Base, VotingError> 
     })
 }
 
-/// Parse a 32-byte hash as a `pallas::Base` via wide reduction.
-///
-/// Blake2b-256 outputs are non-canonical Pallas Fp ~75% of the time
-/// (field modulus byte[31] = 0x40). Zero-extends to 64 bytes and uses
-/// `from_uniform_bytes` for canonical reduction, matching the FFI
-/// verifier's `hash_bytes_to_fp`.
-///
-/// TODO: Once we move vote round to a field element we can delete this.
-fn hash_bytes_to_base(bytes: &[u8], name: &str) -> Result<pallas::Base, VotingError> {
-    use ff::FromUniformBytes;
-    validate_32_bytes(bytes, name)?;
-    let mut wide = [0u8; 64];
-    wide[..32].copy_from_slice(bytes);
-    Ok(pallas::Base::from_uniform_bytes(&wide))
-}
-
 /// Parse a 32-byte LE slice as a `pallas::Scalar`.
 fn bytes_to_scalar(bytes: &[u8], name: &str) -> Result<pallas::Scalar, VotingError> {
     validate_32_bytes(bytes, name)?;
@@ -321,10 +305,7 @@ pub fn build_and_prove_delegation(
     // Parse scalar/field inputs.
     let alpha = bytes_to_scalar(alpha_bytes, "alpha")?;
     let van_comm_rand = bytes_to_base(van_comm_rand_bytes, "van_comm_rand")?;
-    // vote_round_id is a Blake2b-256 hash — use wide reduction for canonical Fp.
-    //
-    // TODO: Once we move vote round to a field element we use bytes_to_base directly.
-    let vote_round_id = hash_bytes_to_base(vote_round_id_bytes, "vote_round_id")?;
+    let vote_round_id = bytes_to_base(vote_round_id_bytes, "vote_round_id")?;
 
     // Parse hotkey address (43-byte raw Orchard address).
     let addr_arr: [u8; 43] =
