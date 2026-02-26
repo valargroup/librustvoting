@@ -130,44 +130,13 @@ jobs:
           key: ${{ runner.os }}-api-go-${{ hashFiles('sdk/go.sum', 'sdk/circuits/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-api-go-
-      - name: Build and install zallyd
-        run: mise run build:install
-        env:
-          GOCACHE: ${{ github.workspace }}/sdk/.cache/go-build
       - name: Pre-build vote-commitment-tree-client
         run: cargo build --release --manifest-path vote-commitment-tree-client/Cargo.toml
-      - name: Initialize chain
-        run: mise run chain:init
-      - name: Start chain in background
-        run: |
-          zallyd start --home ~/.zallyd > sdk/chain.log 2>&1 &
-          echo "Chain PID: $!"
-      - name: Wait for chain readiness
-        run: |
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:1318/cosmos/base/tendermint/v1beta1/blocks/latest > /dev/null 2>&1; then
-              echo "Chain is producing blocks"
-              exit 0
-            fi
-            echo "Waiting for chain to start... ($i/60)"
-            sleep 2
-          done
-          echo "Chain failed to start within 120s"
-          cat sdk/chain.log
-          exit 1
-      - name: Wait for helper server readiness
-        run: |
-          for i in $(seq 1 15); do
-            if curl -sf http://localhost:1318/api/v1/status > /dev/null 2>&1; then
-              echo "Helper server is ready (built into zallyd)"
-              exit 0
-            fi
-            echo "Waiting for helper server... ($i/15)"
-            sleep 1
-          done
-          echo "Helper server failed to start"
-          tail -50 sdk/chain.log
-          exit 1
+      - name: Start chain
+        run: mise run start:chain
+        env:
+          GOCACHE: ${{ github.workspace }}/sdk/.cache/go-build
+          ZALLY_PIR_URL: "disabled"
       - name: Run E2E test (round_activation)
         run: cargo test --release --manifest-path e2e-tests/Cargo.toml --test round_activation -- --nocapture --ignored --test-threads=1
         env:
@@ -183,7 +152,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chain-log
-          path: sdk/chain.log
+          path: zallyd.log
           retention-days: 7
 
   test-multi-validator:

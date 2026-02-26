@@ -15,38 +15,53 @@ _.path = ["{{env.HOME}}/go/bin", "/usr/local/go/bin"]
 
 # ── Top-level shortcuts (daily use) ─────────────────────────────────
 
-[tasks.start]
-description = "Init chain + bootstrap nullifiers + start everything"
+[tasks."start:chain"]
+description = "Build + init + start single-validator chain (no nullifiers/PIR)"
 quiet = true
 run = '''
 #!/usr/bin/env bash
 set -e
-PROCS=""
-pgrep zallyd                   > /dev/null 2>&1 && PROCS="$PROCS zallyd"
-pgrep -f 'nf-server.*serve'   > /dev/null 2>&1 && PROCS="$PROCS nf-server"
-if [ -n "$PROCS" ]; then
-    printf '\033[33mAlready running:%s\033[0m\n' "$PROCS"
+
+if pgrep zallyd > /dev/null 2>&1; then
+    printf '\033[33mAlready running: zallyd\033[0m\n'
     exit 0
 fi
-make -C sdk init
-make -C nullifier-ingest bootstrap
-make -C nullifier-ingest ingest
-make -C nullifier-ingest export-nf
-nohup make -C nullifier-ingest serve > nf-serve.log 2>&1 &
-ZALLY_PIR_URL=http://localhost:3000 nohup make -C sdk start > zallyd.log 2>&1 &
-printf '\033[32mStarted: nf-server → nf-serve.log | zallyd → zallyd.log\033[0m\n'
 
-# Wait for chain to accept transactions, then register the genesis validator's
-# Pallas key so per-round ceremony can proceed when a round is published.
+# ── Build + init ─────────────────────────────────────────────────
+make -C sdk init
+
+# ── Start zallyd ─────────────────────────────────────────────────
+ZALLY_PIR_URL=${ZALLY_PIR_URL:-http://localhost:3000} nohup make -C sdk start > zallyd.log 2>&1 &
+printf '\033[32mStarted zallyd → zallyd.log\033[0m\n'
+
+# ── Wait for chain readiness ────────────────────────────────────
 printf 'Waiting for chain to be ready...'
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
     if zallyd status --home ~/.zallyd 2>/dev/null | grep -q latest_block_height; then
         printf ' \033[32mready\033[0m\n'
         break
     fi
+    if [ "$i" -eq 60 ]; then
+        printf ' \033[31mTIMEOUT\033[0m\n'
+        tail -50 zallyd.log
+        exit 1
+    fi
     printf '.'
     sleep 2
 done
+
+# ── Wait for helper server ──────────────────────────────────────
+printf 'Waiting for helper server...'
+for i in $(seq 1 15); do
+    if curl -sf http://localhost:1318/api/v1/status > /dev/null 2>&1; then
+        printf ' \033[32mready\033[0m\n'
+        break
+    fi
+    printf '.'
+    sleep 1
+done
+
+# ── Register Pallas key ─────────────────────────────────────────
 zallyd tx vote register-pallas-key \
     --from validator --chain-id zvote-1 --keyring-backend test \
     --home ~/.zallyd -y > /dev/null 2>&1 \
@@ -65,6 +80,31 @@ if [ -d "zashi-ios/secant/Resources" ]; then
 EOF
     printf '\033[32miOS config → %s (port 1318)\033[0m\n' "$IOS_CFG"
 fi
+'''
+
+[tasks.start]
+description = "Init chain + bootstrap nullifiers + start everything"
+quiet = true
+run = '''
+#!/usr/bin/env bash
+set -e
+PROCS=""
+pgrep zallyd                   > /dev/null 2>&1 && PROCS="$PROCS zallyd"
+pgrep -f 'nf-server.*serve'   > /dev/null 2>&1 && PROCS="$PROCS nf-server"
+if [ -n "$PROCS" ]; then
+    printf '\033[33mAlready running:%s\033[0m\n' "$PROCS"
+    exit 0
+fi
+
+# ── Nullifier pipeline (independent of chain build) ─────────────
+make -C nullifier-ingest bootstrap
+make -C nullifier-ingest ingest
+make -C nullifier-ingest export-nf
+nohup make -C nullifier-ingest serve > nf-serve.log 2>&1 &
+printf '\033[32mStarted nf-server → nf-serve.log\033[0m\n'
+
+# ── Chain (build + init + start + wait + register) ──────────────
+mise run start:chain
 '''
 
 [tasks.stop]
@@ -310,6 +350,7 @@ fi
 
 # ── Build + init ─────────────────────────────────────────────────
 make -C sdk install-ffi
+(cd sdk && go build -o "$HOME/go/bin/create-val-tx" ./scripts/create-val-tx)
 bash sdk/scripts/init_multi.sh
 
 # ── Start 3 validators ──────────────────────────────────────────
@@ -355,11 +396,11 @@ sleep 3
 # ── Register val2 + val3 via CreateValidatorWithPallasKey ────────
 SELF_DELEGATION="10000000stake"
 for i in 2 3; do
-    (cd sdk && go run ./scripts/create-val-tx \
+    create-val-tx \
         --home "$HOME/.zallyd-val$i" \
         --moniker "val$i" \
         --amount "$SELF_DELEGATION" \
-        --rpc-url tcp://localhost:26157)
+        --rpc-url tcp://localhost:26157
     printf '\033[32mVal%s registered\033[0m\n' "$i"
     sleep 2
 done
@@ -411,6 +452,80 @@ if [ -d "zashi-ios/secant/Resources" ]; then
 EOF
     printf '\033[32miOS config → %s (port 1418)\033[0m\n' "$IOS_CFG"
 fi
+'''
+
+[tasks."multi:restart"]
+description = "Restart existing 3-validator chain (skip build+init)"
+quiet = true
+run = '''
+#!/usr/bin/env bash
+set -e
+PID_FILE="$HOME/.zallyd-multi-pids"
+
+# ── Guard: already running? ──────────────────────────────────────
+if pgrep -f 'zallyd start --home.*val' > /dev/null 2>&1; then
+    printf '\033[33mAlready running: zallyd\033[0m\n'
+    exit 0
+fi
+
+# ── Guard: chain data must exist ─────────────────────────────────
+if [ ! -d "$HOME/.zallyd-val1" ]; then
+    printf '\033[31mNo chain data found. Run: mise run multi:start\033[0m\n'
+    exit 1
+fi
+
+# ── Start 3 validators ──────────────────────────────────────────
+rm -f "$PID_FILE"
+
+ZALLY_PIR_URL=${ZALLY_PIR_URL:-http://localhost:3000} nohup zallyd start --home "$HOME/.zallyd-val1" > sdk/multi-val1.log 2>&1 &
+echo "$!" >> "$PID_FILE"
+printf '\033[32mStarted val1 → sdk/multi-val1.log\033[0m\n'
+
+printf 'Waiting for val1...'
+for i in $(seq 1 30); do
+    if curl -sf "http://127.0.0.1:26157/status" 2>/dev/null | grep -q '"latest_block_height"'; then
+        HEIGHT=$(curl -sf "http://127.0.0.1:26157/status" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['sync_info']['latest_block_height'])" 2>/dev/null || echo "0")
+        if [ "$HEIGHT" != "0" ]; then
+            printf ' \033[32mblock %s\033[0m\n' "$HEIGHT"
+            break
+        fi
+    fi
+    printf '.'
+    sleep 2
+done
+
+for i in 2 3; do
+    home="$HOME/.zallyd-val$i"
+    ZALLY_PIR_URL=${ZALLY_PIR_URL:-http://localhost:3000} nohup zallyd start --home "$home" > "sdk/multi-val$i.log" 2>&1 &
+    echo "$!" >> "$PID_FILE"
+    printf '\033[32mStarted val%s → sdk/multi-val%s.log\033[0m\n' "$i" "$i"
+done
+
+# ── Start nf-server if not running ──────────────────────────────
+if ! pgrep -f 'nf-server.*serve' > /dev/null 2>&1; then
+    if [ -f "nullifier-ingest/pir-data/tier0.bin" ]; then
+        nohup make -C nullifier-ingest serve > nf-serve.log 2>&1 &
+        printf '\033[32mStarted nf-server → nf-serve.log\033[0m\n'
+    fi
+fi
+
+# Write iOS local config pointing at multi-validator ports
+IOS_CFG="zashi-ios/secant/Resources/voting-config-local.json"
+if [ -d "zashi-ios/secant/Resources" ]; then
+    cat > "$IOS_CFG" <<'EOF'
+{
+  "version": 1,
+  "vote_servers": [{ "url": "http://localhost:1418", "label": "Localhost" }],
+  "pir_servers": [{ "url": "http://localhost:3000", "label": "Localhost" }]
+}
+EOF
+    printf '\033[32miOS config → %s (port 1418)\033[0m\n' "$IOS_CFG"
+fi
+
+printf '\n\033[32mMulti-validator chain restarted.\033[0m PIDs in %s\n' "$PID_FILE"
+printf 'Status: mise run multi:status\n'
+printf 'Stop:   mise run multi:stop\n'
 '''
 
 [tasks."multi:stop"]

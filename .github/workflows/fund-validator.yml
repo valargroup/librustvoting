@@ -1,7 +1,7 @@
 # Send stake to a new validator address on the prod chain.
 #
 # Trigger from the GitHub Actions UI: Actions → Fund validator → Run workflow.
-# Enter the new validator's address (zvote1...) and it sends 5 stake from val1.
+# Enter the new validator's address (zvote1...) and it sends 1,100,000stake from val1.
 
 name: Fund validator
 
@@ -29,7 +29,7 @@ jobs:
           password: ${{ secrets.SSH_PASSWORD }}
           script: |
             export PATH="${{ env.DEPLOY_PATH }}:$PATH"
-            echo "Sending 5stake to ${{ inputs.address }}..."
+            echo "Sending 1,100,000stake to ${{ inputs.address }}..."
             RESULT=$(zallyd tx bank send validator "${{ inputs.address }}" 1100000stake \
               --keyring-backend test \
               --chain-id zvote-1 \
