@@ -54,7 +54,7 @@ pub fn build_share_reveal(
 ) -> ShareRevealBundle {
     let shares_hash = shares_hash_from_comms(share_comms);
 
-    let vote_commitment = compute_vote_commitment_hash(shares_hash, proposal_id, vote_decision);
+    let vote_commitment = compute_vote_commitment_hash(voting_round_id, shares_hash, proposal_id, vote_decision);
 
     let vote_comm_tree_root = {
         let mut current = vote_commitment;

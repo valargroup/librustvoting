@@ -59,7 +59,7 @@ pub struct VoteProofBundle {
     /// and must be used for reveal-share payloads.
     pub encrypted_shares: [EncryptedShareOutput; 16],
     /// Poseidon hash of all encrypted share x-coordinates.
-    /// Intermediate value: vote_commitment = H(DOMAIN_VC, shares_hash, proposal_id, vote_decision).
+    /// Intermediate value: vote_commitment = H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision).
     /// Needed by the helper server to verify share payloads.
     pub shares_hash: pallas::Base,
     /// Per-share blind factors for blinded commitments.
@@ -337,7 +337,7 @@ pub fn build_vote_proof_from_delegation(
     let proposal_id_base = pallas::Base::from(proposal_id);
     let vote_decision_base = pallas::Base::from(vote_decision);
     let vote_commitment =
-        vote_commitment_hash(shares_hash_val, proposal_id_base, vote_decision_base);
+        vote_commitment_hash(voting_round_id, shares_hash_val, proposal_id_base, vote_decision_base);
 
     // ---- Vote commitment tree root (from auth path) ----
     // Recompute the root from the leaf + auth path to set as public input.

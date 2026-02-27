@@ -1,7 +1,7 @@
 //! Vote proof ZKP circuit (ZKP #2).
 //!
 //! Proves that a vote is well-formed and authorized with respect to
-//! delegation and the vote commitment tree. The circuit verifies 11
+//! delegation and the vote commitment tree. The circuit verifies 12
 //! conditions; constraint logic is added incrementally.
 //!
 //! Currently implemented:
@@ -14,11 +14,11 @@
 //! - **Condition 8**: Shares Range (LookupRangeCheck, `[0, 2^30)`).
 //! - **Condition 9**: Shares Hash Integrity (Poseidon `ConstantLength<16>` over 16 blinded share commitments, `constrain_instance`).
 //! - **Condition 10**: Encryption Integrity (ECC variable-base mul, `constrain_equal`).
-//! - **Condition 11**: Vote Commitment Integrity (Poseidon `ConstantLength<4>`, `constrain_instance`).
+//! - **Condition 12**: Vote Commitment Integrity (Poseidon `ConstantLength<5>`, `constrain_instance`).
 //!
 //! - **Condition 3**: Spend Authority (CommitIvk chain, `constrain_equal`).
 //!
-//! All 11 conditions are fully constrained.
+//! All 12 conditions are fully constrained.
 
 pub mod builder;
 pub mod circuit;

@@ -411,7 +411,7 @@ message MsgCastVote {
   // New VAN with decremented proposal authority (§3.5)
   FieldElement vote_authority_note_new = 4;
 
-  // Vote commitment: H(DOMAIN_VC, shares_hash, proposal_id, vote_decision) (§3.4)
+  // Vote commitment: H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision) (§3.4)
   FieldElement vote_commitment  = 5;
 
   // Proposal being voted on (0-indexed, §Proposal IDs)

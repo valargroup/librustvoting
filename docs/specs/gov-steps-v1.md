@@ -458,7 +458,7 @@ The user organizes their voting shares into a vector of 4 entries. Each share `v
 
 The vote commitment is then:
 
-`vc = H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`
+`vc = H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)`
 
 This is cheap to prove — just 4 hash preimage checks, no tree circuit.
 
@@ -547,7 +547,7 @@ This ZKP proves that a registered voter is casting a valid vote, without reveali
 - `van_nullifier` — nullifier of the old VAN being spent (prevents double-vote on same proposal)
 - `r_vpk` — randomized voting public key (analogous to `rk` in ZKP #1)
 - `vote_authority_note_new` — the new VAN with decremented proposal authority
-- `vote_commitment` — `H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`
+- `vote_commitment` — `H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)`
 - `vote_comm_tree_root` — root of the vote commitment tree at `vote_commitment_tree_anchor_height` (the tree of all registered VANs)
 - `vote_commitment_tree_anchor_height` — the vote-chain height at which we snapshot the vote commitment tree
 - `proposal_id` — which proposal this vote is for
@@ -600,7 +600,7 @@ Vote commitment construction:
 
 10. **(Encryption Integrity)** Each `enc_share_i = ElGamal(shares_i, r_i, ea_pk)`, i.e. `enc_share_i = (r_i * G, shares_i * G + r_i * ea_pk)`. Proves each ciphertext is a valid El Gamal encryption of the corresponding plaintext share under the election authority's public key. (See §3.4.1, Appendix A)
 
-11. **(Vote Commitment Integrity)** `vote_commitment = H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`. The public vote commitment is correctly constructed from the shares hash and the vote choice.
+11. **(Vote Commitment Integrity)** `vote_commitment = H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)`. The public vote commitment is correctly constructed from the round context, shares hash, and vote choice.
 
 **Out-of-circuit checks:**
 
@@ -648,7 +648,7 @@ We need our clients to be able to have other actors be able to make ZKP's on the
 This requires sending a payload `delegated_voting_share_payload` to a server containing:
 
 - Vote commitment data (so they can open it up inside a ZKP)
-  - `(shares_hash, proposal_id, vote_decision)`
+  - `(voting_round_id, shares_hash, proposal_id, vote_decision)`
 - Position in the tree the vote commitment was created at
 - ONE encrypted share
   - `enc_share_i = (C1_i, C2_i)` — the El Gamal ciphertext
@@ -726,7 +726,7 @@ Vote commitment membership:
 
 1. **(VC Membership)** `(vote_comm_tree_path, vote_comm_tree_position)` is a valid Merkle path from `vote_commitment` to `vote_comm_tree_root`. Proves the vote commitment is registered on the vote chain, without revealing which one. (Analogous to ZKP #2 cond. 1 — VAN Membership)
 
-2. **(Vote Commitment Integrity)** `vote_commitment = H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`. Opens the vote commitment, proving the public `proposal_id` and `vote_decision` match what was committed in Phase 3. (Same structure as ZKP #2 cond. 11 — Vote Commitment Integrity)
+2. **(Vote Commitment Integrity)** `vote_commitment = H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)`. Opens the vote commitment, proving the public `proposal_id` and `vote_decision` match what was committed in Phase 3 and binding the commitment to the round. (Same structure as ZKP #2 cond. 12 — Vote Commitment Integrity)
 
 Share opening:
 

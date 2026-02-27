@@ -12,7 +12,7 @@ Proves that a registered voter is casting a valid vote, without revealing which 
    * **r_vpk_x** (offset 1): x-coordinate of the rerandomized voting key `r_vpk = vsk.ak + [alpha_v]*G` (condition 4).
    * **r_vpk_y** (offset 2): y-coordinate of `r_vpk`. Links to the vote signature verified out-of-circuit.
    * **vote_authority_note_new** (offset 3): the new VAN commitment with decremented proposal authority.
-   * **vote_commitment** (offset 4): the vote commitment hash `H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`.
+   * **vote_commitment** (offset 4): the vote commitment hash `H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)`.
    * **vote_comm_tree_root** (offset 5): root of the Poseidon-based vote commitment tree at anchor height.
    * **vote_comm_tree_anchor_height** (offset 6): the vote-chain height at which the tree is snapshotted.
    * **proposal_id** (offset 7): which proposal this vote is for.
@@ -288,11 +288,11 @@ The blinded share commitments `share_comm_i = Poseidon(blind_i, c1_i_x, c2_i_x)`
 
 **Function:** `Poseidon` with `ConstantLength<16>` over 16 blinded share commitments. Uses `Pow5Chip` / `P128Pow5T3` with rate 2 (8 absorption rounds for 16 inputs, ~9 permutations, ~600 rows).
 
-**Constraint:** The circuit computes the two-level Poseidon hash over all 16 blinded share commitments. The resulting `shares_hash` cell is an internal wire — it is not directly bound to any public input. Instead, condition 12 consumes it as an input to `H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`, which IS bound to `VOTE_COMMITMENT`.
+**Constraint:** The circuit computes the two-level Poseidon hash over all 16 blinded share commitments. The resulting `shares_hash` cell is an internal wire — it is not directly bound to any public input. Instead, condition 12 consumes it as an input to `H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)`, which IS bound to `VOTE_COMMITMENT`.
 
 **Relationship to other conditions:**
 - Condition 11 constrains that the witnessed `(c1_i_x, c2_i_x)` values are valid El Gamal encryptions of the corresponding plaintext shares from conditions 8/9. The enc_share cells are cloned before the Poseidon hash and reused as `constrain_equal` targets in condition 11.
-- Condition 12 chains `shares_hash` into the full vote commitment via `H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`, which is bound to `VOTE_COMMITMENT` at offset 2.
+- Condition 12 chains `shares_hash` into the full vote commitment via `H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)`, which is bound to `VOTE_COMMITMENT` at offset 2.
 
 **Out-of-circuit helper:** `shares_hash()` computes the same Poseidon hash outside the circuit for builder and test use.
 
@@ -346,7 +346,7 @@ Total: 32 fixed-base scalar multiplications, 16 variable-base scalar multiplicat
 Purpose: the public vote commitment is correctly constructed from the shares hash, the proposal choice, and the vote decision. This is the final hash that is posted on-chain, inserted into the vote commitment tree, and later opened by ZKP #3 (vote reveal).
 
 ```
-vote_commitment = Poseidon(DOMAIN_VC, shares_hash, proposal_id, vote_decision)
+vote_commitment = Poseidon(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)
 ```
 
 Where:
@@ -355,7 +355,7 @@ Where:
 - **proposal_id**: which proposal this vote is for (public input at offset 5). Copied from the instance column via `assign_advice_from_instance`. The verifier checks it matches a valid proposal in the voting window.
 - **vote_decision**: the voter's choice (private witness). Hidden inside the vote commitment — only revealed in ZKP #3 when individual shares are opened. The decision value is opaque to the circuit; its semantic meaning is defined by the application layer.
 
-**Function:** `Poseidon` with `ConstantLength<4>`. Uses `Pow5Chip` / `P128Pow5T3` with rate 2 (2 absorption rounds for 4 inputs, ~3 permutations, ~200 rows).
+**Function:** `Poseidon` with `ConstantLength<5>`. Uses `Pow5Chip` / `P128Pow5T3` with rate 2 (3 absorption rounds for 5 inputs).
 
 **Constraint:** The circuit computes the Poseidon hash and enforces `constrain_instance(vote_commitment, VOTE_COMMITMENT)` — binding the derived value to the public input at offset 2. This is the terminal constraint of the vote commitment construction chain: conditions 8–9 validate the plaintext shares, condition 10 hashes the ciphertexts, condition 11 proves the ciphertexts are valid El Gamal encryptions, and condition 12 wraps everything into a single public commitment.
 
@@ -364,7 +364,7 @@ Where:
 shares (8: sum, 9: range) ──┐
                              ├─ enc_shares (11: El Gamal) ──→ shares_hash (10: Poseidon<10>)
 randomness ──────────────────┘                                       │
-                                                                     ├─ vote_commitment (12: Poseidon<4>) ──→ VOTE_COMMITMENT
+                                                                     ├─ vote_commitment (12: Poseidon<5>) ──→ VOTE_COMMITMENT
 proposal_id ─────────────────────────────────────────────────────────┤
 vote_decision ───────────────────────────────────────────────────────┘
 ```

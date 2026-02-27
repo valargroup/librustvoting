@@ -7,7 +7,7 @@
 //! - **Condition 1**: VC Membership — Poseidon Merkle path from `vote_commitment`
 //!   to `vote_comm_tree_root`.
 //! - **Condition 2**: Vote Commitment Integrity — `vote_commitment =
-//!   Poseidon(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`.
+//!   Poseidon(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)`.
 //! - **Condition 3**: Shares Hash Integrity — `shares_hash =
 //!   Poseidon(share_comm_0, ..., share_comm_15)`, where share_comms are
 //!   private witnesses transitively bound to the public tree root.
@@ -454,6 +454,24 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             },
         )?;
 
+        // Copy voting_round_id from instance into advice.
+        // Used in condition 2 (vote commitment integrity) and condition 5
+        // (share nullifier integrity).
+        let voting_round_id = layouter.assign_region(
+            || "copy voting_round_id from instance",
+            |mut region| {
+                region.assign_advice_from_instance(
+                    || "voting_round_id",
+                    config.primary,
+                    VOTING_ROUND_ID,
+                    config.advices[0],
+                    0,
+                )
+            },
+        )?;
+        let voting_round_id_cond2 = voting_round_id.clone();
+        let voting_round_id_cond5 = voting_round_id.clone();
+
         // ---------------------------------------------------------------
         // Witness 16 share_comms as private advice cells.
         //
@@ -624,8 +642,8 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
         // Condition 2: Vote Commitment Integrity.
         //
-        // vote_commitment = Poseidon(DOMAIN_VC, shares_hash,
-        //                            proposal_id, vote_decision)
+        // vote_commitment = Poseidon(DOMAIN_VC, voting_round_id,
+        //                            shares_hash, proposal_id, vote_decision)
         //
         // Same hash as vote_proof::vote_commitment_hash and
         // vote_commitment_tree::vote_commitment_hash.
@@ -645,12 +663,12 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         )?;
 
         let derived_vc = {
-            let message = [domain_vc, shares_hash_cond2, proposal_id, vote_decision];
+            let message = [domain_vc, voting_round_id_cond2, shares_hash_cond2, proposal_id, vote_decision];
             let hasher = PoseidonHash::<
                 pallas::Base,
                 _,
                 poseidon::P128Pow5T3,
-                ConstantLength<4>,
+                ConstantLength<5>,
                 3,
                 2,
             >::init(
@@ -807,20 +825,6 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // Matches helper-server/src/nullifier.rs exactly.
         // ---------------------------------------------------------------
         {
-            // Copy voting_round_id from instance into advice.
-            let voting_round_id = layouter.assign_region(
-                || "cond5: copy voting_round_id from instance",
-                |mut region| {
-                    region.assign_advice_from_instance(
-                        || "voting_round_id",
-                        config.primary,
-                        VOTING_ROUND_ID,
-                        config.advices[0],
-                        0,
-                    )
-                },
-            )?;
-
             // "share spend" domain tag — constant-constrained so the
             // value is baked into the verification key.
             let domain_tag = layouter.assign_region(
@@ -852,7 +856,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 hasher.hash(
                     layouter.namespace(|| "cond5: Poseidon(tag, vc, idx, c1, c2, round_id)"),
                     [domain_tag, vote_commitment_cond5, share_index_cond5,
-                     enc_c1_x_cond5, enc_c2_x_cond5, voting_round_id],
+                     enc_c1_x_cond5, enc_c2_x_cond5, voting_round_id_cond5],
                 )?
             };
 
@@ -1006,7 +1010,7 @@ mod tests {
             encrypt_shares(shares_u64, ea_pk_point);
 
         let vote_commitment =
-            compute_vote_commitment_hash(shares_hash_val, proposal_id, vote_decision);
+            compute_vote_commitment_hash(voting_round_id, shares_hash_val, proposal_id, vote_decision);
 
         let (auth_path, position, vote_comm_tree_root) =
             build_single_leaf_merkle_path(vote_commitment);

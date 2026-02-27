@@ -14,7 +14,7 @@
 //! - **Condition 9**: Shares Range (LookupRangeCheck, `[0, 2^30)`).
 //! - **Condition 10**: Shares Hash Integrity (Poseidon `ConstantLength<16>` over 16 blinded share commitments; output flows to condition 12).
 //! - **Condition 11**: Encryption Integrity (ECC variable-base mul, `constrain_equal`).
-//! - **Condition 12**: Vote Commitment Integrity (Poseidon `ConstantLength<4>`, `constrain_instance`).
+//! - **Condition 12**: Vote Commitment Integrity (Poseidon `ConstantLength<5>`, `constrain_instance`).
 //!
 //! Conditions 1–4 and 5–12 are fully constrained in-circuit.
 //!
@@ -46,8 +46,8 @@
 //!   *(implemented)*
 //! - **Condition 11**: Encryption Integrity — each `enc_share_i = ElGamal(shares_i, r_i, ea_pk)`.
 //!   *(implemented)*
-//! - **Condition 12**: Vote Commitment Integrity — `vote_commitment = H(DOMAIN_VC, shares_hash,
-//!   proposal_id, vote_decision)`. *(implemented)*
+//! - **Condition 12**: Vote Commitment Integrity — `vote_commitment = H(DOMAIN_VC, voting_round_id,
+//!   shares_hash, proposal_id, vote_decision)`. *(implemented)*
 
 use alloc::vec::Vec;
 
@@ -81,9 +81,9 @@ use crate::constants::{
     OrchardCommitDomains, OrchardFixedBases, OrchardHashDomains,
 };
 use crate::circuit::van_integrity;
-use crate::shared_primitives::shares_hash::{
-    compute_shares_hash_in_circuit, hash_share_commitment_in_circuit,
-};
+use crate::shared_primitives::shares_hash::compute_shares_hash_in_circuit;
+#[cfg(test)]
+use crate::shared_primitives::shares_hash::hash_share_commitment_in_circuit;
 use super::authority_decrement::{AuthorityDecrementChip, AuthorityDecrementConfig};
 
 // ================================================================
@@ -261,22 +261,24 @@ pub fn shares_hash(
 ///
 /// Computes:
 /// ```text
-/// Poseidon(DOMAIN_VC, shares_hash, proposal_id, vote_decision)
+/// Poseidon(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)
 /// ```
 ///
 /// This is the final vote commitment that is posted on-chain and
-/// inserted into the vote commitment tree. It binds the encrypted
-/// shares, the proposal choice, and the vote decision into a single
-/// hash with domain separation from VANs.
+/// inserted into the vote commitment tree. It binds the voting round,
+/// encrypted shares, the proposal choice, and the vote decision into a
+/// single hash with domain separation from VANs.
 ///
 /// Used by the builder and tests to compute the expected vote commitment.
 pub fn vote_commitment_hash(
+    voting_round_id: pallas::Base,
     shares_hash: pallas::Base,
     proposal_id: pallas::Base,
     vote_decision: pallas::Base,
 ) -> pallas::Base {
-    poseidon::Hash::<_, poseidon::P128Pow5T3, ConstantLength<4>, 3, 2>::init().hash([
+    poseidon::Hash::<_, poseidon::P128Pow5T3, ConstantLength<5>, 3, 2>::init().hash([
         pallas::Base::from(DOMAIN_VC),
+        voting_round_id,
         shares_hash,
         proposal_id,
         vote_decision,
@@ -759,6 +761,9 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 )
             },
         )?;
+        // Clone for condition 12 (vote commitment integrity) before
+        // condition 2 consumes the original via van_integrity_poseidon.
+        let voting_round_id_cond12 = voting_round_id.clone();
 
         // Witness vpk_g_d as a full non-identity curve point (condition 3 needs
         // the point for variable-base ECC mul; conditions 2/6 need the x-coordinate
@@ -1278,7 +1283,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // it is not bound to the instance column. Condition 11 constrains
         // that each (c1_i_x, c2_i_x) is a valid El Gamal encryption of
         // shares_i. Condition 12 computes the full vote commitment
-        // H(DOMAIN_VC, shares_hash, proposal_id, vote_decision) and
+        // H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision) and
         // binds that value to the VOTE_COMMITMENT public input.
         // ---------------------------------------------------------------
 
@@ -1373,12 +1378,12 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         // ---------------------------------------------------------------
         // Condition 12: Vote Commitment Integrity.
         //
-        // vote_commitment = Poseidon(DOMAIN_VC, shares_hash,
-        //                            proposal_id, vote_decision)
+        // vote_commitment = Poseidon(DOMAIN_VC, voting_round_id,
+        //                            shares_hash, proposal_id, vote_decision)
         //
-        // Binds the encrypted shares (via shares_hash from condition 10),
-        // the proposal choice, and the vote decision into a single
-        // commitment with domain separation from VANs (DOMAIN_VC = 1).
+        // Binds the voting round, encrypted shares (via shares_hash from
+        // condition 10), the proposal choice, and the vote decision into a
+        // single commitment with domain separation from VANs (DOMAIN_VC = 1).
         //
         // This is the value posted on-chain and later inserted into the
         // vote commitment tree. ZKP #3 (vote reveal) will open individual
@@ -1408,16 +1413,16 @@ impl plonk::Circuit<pallas::Base> for Circuit {
             self.vote_decision,
         )?;
 
-        // Compute vote_commitment = Poseidon(DOMAIN_VC, shares_hash,
-        //                                    proposal_id, vote_decision).
+        // Compute vote_commitment = Poseidon(DOMAIN_VC, voting_round_id,
+        //                                    shares_hash, proposal_id, vote_decision).
         // TODO: consider separating into shared with ZKP #3
         let vote_commitment = {
-            let message = [domain_vc, shares_hash, proposal_id, vote_decision];
+            let message = [domain_vc, voting_round_id_cond12, shares_hash, proposal_id, vote_decision];
             let hasher = PoseidonHash::<
                 pallas::Base,
                 _,
                 poseidon::P128Pow5T3,
-                ConstantLength<4>,
+                ConstantLength<5>,
                 3, // WIDTH
                 2, // RATE
             >::init(
@@ -1648,7 +1653,7 @@ mod tests {
 
     /// Sets condition 12 fields on a circuit and returns the vote_commitment.
     ///
-    /// Computes `H(DOMAIN_VC, shares_hash, proposal_id, vote_decision)`
+    /// Computes `H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision)`
     /// and sets `circuit.vote_decision`. Returns the vote_commitment
     /// for use in the Instance. The `proposal_id` must match the
     /// instance's proposal_id so the circuit's condition 12 (which
@@ -1657,11 +1662,12 @@ mod tests {
         circuit: &mut Circuit,
         shares_hash_val: pallas::Base,
         proposal_id: u64,
+        voting_round_id: pallas::Base,
     ) -> pallas::Base {
         let proposal_id_base = pallas::Base::from(proposal_id);
         let vote_decision = pallas::Base::from(TEST_VOTE_DECISION);
         circuit.vote_decision = Value::known(vote_decision);
-        vote_commitment_hash(shares_hash_val, proposal_id_base, vote_decision)
+        vote_commitment_hash(voting_round_id, shares_hash_val, proposal_id_base, vote_decision)
     }
 
     /// Build valid test data for all 11 conditions.
@@ -1775,7 +1781,7 @@ mod tests {
         circuit.ea_pk = Value::known(ea_pk_affine);
 
         // Condition 12: vote commitment from shares_hash + proposal + decision.
-        let vote_commitment = set_condition_11(&mut circuit, shares_hash_val, proposal_id);
+        let vote_commitment = set_condition_11(&mut circuit, shares_hash_val, proposal_id, voting_round_id);
 
         let instance = Instance::from_parts(
             van_nullifier,
@@ -1869,7 +1875,7 @@ mod tests {
         circuit.share_blinds = share_blinds.map(Value::known);
         circuit.share_randomness = randomness.map(Value::known);
         circuit.ea_pk = Value::known(ea_pk_affine);
-        let vc = set_condition_11(&mut circuit, shares_hash_val, TEST_PROPOSAL_ID);
+        let vc = set_condition_11(&mut circuit, shares_hash_val, TEST_PROPOSAL_ID, instance.voting_round_id);
         instance.vote_commitment = vc;
         instance.proposal_id = pallas::Base::from(TEST_PROPOSAL_ID);
         instance.ea_pk_x = *ea_pk_affine.coordinates().unwrap().x();
@@ -1997,7 +2003,7 @@ mod tests {
         circuit.share_blinds = share_blinds.map(Value::known);
         circuit.share_randomness = randomness.map(Value::known);
         circuit.ea_pk = Value::known(ea_pk_affine);
-        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id);
+        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id, voting_round_id);
 
         let instance = Instance::from_parts(
             van_nullifier,
@@ -2094,7 +2100,7 @@ mod tests {
         circuit.share_blinds = share_blinds.map(Value::known);
         circuit.share_randomness = randomness.map(Value::known);
         circuit.ea_pk = Value::known(ea_pk_affine);
-        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id);
+        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id, voting_round_id);
 
         let instance = Instance::from_parts(
             van_nullifier,
@@ -2221,7 +2227,7 @@ mod tests {
         circuit.share_blinds = share_blinds.map(Value::known);
         circuit.share_randomness = randomness.map(Value::known);
         circuit.ea_pk = Value::known(ea_pk_affine);
-        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id);
+        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id, voting_round_id);
 
         let instance = Instance::from_parts(
             van_nullifier,
@@ -2494,7 +2500,7 @@ mod tests {
         circuit.share_blinds = share_blinds.map(Value::known);
         circuit.share_randomness = randomness.map(Value::known);
         circuit.ea_pk = Value::known(ea_pk_affine);
-        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id);
+        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id, voting_round_id);
 
         let instance = Instance::from_parts(
             van_nullifier,
@@ -2618,7 +2624,7 @@ mod tests {
         circuit.share_blinds = share_blinds.map(Value::known);
         circuit.share_randomness = randomness.map(Value::known);
         circuit.ea_pk = Value::known(ea_pk_affine);
-        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id);
+        let vc = set_condition_11(&mut circuit, shares_hash_val, proposal_id, voting_round_id);
 
         let instance = Instance::from_parts(
             van_nullifier,
@@ -3036,17 +3042,22 @@ mod tests {
     fn vote_commitment_hash_deterministic() {
         let mut rng = OsRng;
 
+        let rid = pallas::Base::random(&mut rng);
         let sh = pallas::Base::random(&mut rng);
         let pid = pallas::Base::from(5u64);
         let dec = pallas::Base::from(1u64);
 
-        let h1 = vote_commitment_hash(sh, pid, dec);
-        let h2 = vote_commitment_hash(sh, pid, dec);
+        let h1 = vote_commitment_hash(rid, sh, pid, dec);
+        let h2 = vote_commitment_hash(rid, sh, pid, dec);
         assert_eq!(h1, h2);
 
         // Changing any input changes the hash.
-        let h3 = vote_commitment_hash(sh, pallas::Base::from(6u64), dec);
+        let h3 = vote_commitment_hash(rid, sh, pallas::Base::from(6u64), dec);
         assert_ne!(h1, h3);
+
+        // Changing voting_round_id changes the hash.
+        let h4 = vote_commitment_hash(pallas::Base::from(999u64), sh, pid, dec);
+        assert_ne!(h1, h4);
 
         // DOMAIN_VC ensures separation from VAN hashes.
         // (Different arity prevents confusion, but domain tag adds defense-in-depth.)
