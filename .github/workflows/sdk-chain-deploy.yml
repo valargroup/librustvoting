@@ -178,14 +178,14 @@ jobs:
             ${{ env.DEPLOY_PATH }}/create-val-tx \
               --home "$HOME/.zallyd-val2" \
               --moniker val2 \
-              --amount 10000000stake \
+              --amount 10000000uzvote \
               --rpc-url tcp://localhost:26157
             sleep 2
             # Register val3
             ${{ env.DEPLOY_PATH }}/create-val-tx \
               --home "$HOME/.zallyd-val3" \
               --moniker val3 \
-              --amount 10000000stake \
+              --amount 10000000uzvote \
               --rpc-url tcp://localhost:26157
 
       - name: Verify all services active

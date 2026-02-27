@@ -467,16 +467,16 @@ else
   echo "  (ask the bootstrap operator to fund your address in the admin UI)"
   while true; do
     BALANCE=\$(zallyd query bank balances "\${VALIDATOR_ADDR}" --home "\${HOME_DIR}" --output json 2>/dev/null \
-      | jq -r '.balances[] | select(.denom == "stake") | .amount' 2>/dev/null || echo "")
+      | jq -r '.balances[] | select(.denom == "uzvote") | .amount' 2>/dev/null || echo "")
     if [ -n "\$BALANCE" ] && [ "\$BALANCE" != "0" ]; then
-      echo "  Account funded (\${BALANCE} stake)."
+      echo "  Account funded (\${BALANCE} uzvote)."
       break
     fi
     sleep 5
   done
 
   echo "Registering as validator..."
-  if ! create-val-tx --moniker "\${MONIKER}" --amount 10000000stake --home "\${HOME_DIR}" --rpc-url tcp://localhost:26657; then
+  if ! create-val-tx --moniker "\${MONIKER}" --amount 10000000uzvote --home "\${HOME_DIR}" --rpc-url tcp://localhost:26657; then
     echo ""
     echo "ERROR: create-val-tx exited with a non-zero status." >&2
     echo "  Check node logs for details: \${LOG_FILE}" >&2
@@ -518,23 +518,6 @@ echo "  Moniker:  ${MONIKER}"
 echo "  Home:     ${HOME_DIR}"
 echo "  Address:  ${VALIDATOR_ADDR}"
 echo ""
-# Warn if install dir isn't in the user's shell profile PATH.
-SHELL_PROFILE=""
-if [ -f "$HOME/.zshrc" ]; then
-  SHELL_PROFILE="$HOME/.zshrc"
-elif [ -f "$HOME/.bashrc" ]; then
-  SHELL_PROFILE="$HOME/.bashrc"
-elif [ -f "$HOME/.bash_profile" ]; then
-  SHELL_PROFILE="$HOME/.bash_profile"
-fi
-
-if [ -n "$SHELL_PROFILE" ] && ! grep -q "${INSTALL_DIR}" "$SHELL_PROFILE" 2>/dev/null; then
-  if [ "${INSTALL_DIR}" != "/usr/local/bin" ] && [ "${INSTALL_DIR}" != "/usr/bin" ]; then
-    echo "  NOTE: Add ${INSTALL_DIR} to your PATH permanently:"
-    echo "    echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ${SHELL_PROFILE}"
-    echo ""
-  fi
-fi
 
 echo "=== Next steps ==="
 echo ""
@@ -545,7 +528,7 @@ if [ -n "$VALIDATOR_URL" ]; then
   echo "2. Once approved, start your node (syncs and registers automatically):"
 else
   echo "1. Fund your account. Ask the vote-manager to approve your"
-  echo "   registration in the admin UI, or send stake to:"
+  echo "   registration in the admin UI, or send uzvote to:"
   echo "   ${VALIDATOR_ADDR}"
   echo ""
   echo "2. Once funded, start your node (syncs and registers automatically):"

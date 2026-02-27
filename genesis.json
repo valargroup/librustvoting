@@ -55,7 +55,7 @@
           "address": "zvote1rkhksvtruukn8yzcyfz89yx6qptnrv2gzt4uwd",
           "coins": [
             {
-              "denom": "stake",
+              "denom": "uzvote",
               "amount": "100000000"
             }
           ]
@@ -64,7 +64,7 @@
           "address": "zvote1wgztzelc8tv5pgvgkf20534xqga3a9wuxl3d4k",
           "coins": [
             {
-              "denom": "stake",
+              "denom": "uzvote",
               "amount": "100000000"
             }
           ]
@@ -73,7 +73,7 @@
           "address": "zvote15fjfr6rrs60vu4st6arrd94w5j6z7f6kxr92cg",
           "coins": [
             {
-              "denom": "stake",
+              "denom": "uzvote",
               "amount": "10000000"
             }
           ]
@@ -82,7 +82,7 @@
           "address": "zvote1ecd7g52glmy8ew2cpxyy58rh8pdseyj2ms07m3",
           "coins": [
             {
-              "denom": "stake",
+              "denom": "uzvote",
               "amount": "100000000"
             }
           ]
@@ -90,7 +90,7 @@
       ],
       "supply": [
         {
-          "denom": "stake",
+          "denom": "uzvote",
           "amount": "310000000"
         }
       ],
@@ -144,7 +144,7 @@
                   "key": "6jOK+NSw3dl48lLXu866rEC6VdVkX9FjG5sF9PsnrNA="
                 },
                 "value": {
-                  "denom": "stake",
+                  "denom": "uzvote",
                   "amount": "10000000"
                 }
               }
@@ -192,7 +192,7 @@
         "max_validators": 100,
         "max_entries": 7,
         "historical_entries": 10000,
-        "bond_denom": "stake",
+        "bond_denom": "uzvote",
         "min_commission_rate": "0.000000000000000000"
       },
       "last_total_power": "0",
