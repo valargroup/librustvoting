@@ -1,7 +1,7 @@
 //! Real Halo2 prove/verify for the Share Reveal circuit (ZKP #3).
 //!
 //! Follows the same pattern as `delegation/prove.rs` but for the
-//! 5-condition share reveal circuit at K=14.
+//! 5-condition share reveal circuit at K=11.
 
 use alloc::format;
 use alloc::string::String;
@@ -25,7 +25,7 @@ use super::circuit::{Circuit, Instance, K};
 /// Generate the IPA params (SRS) for the share reveal circuit.
 /// Deterministic for a given `K`.
 ///
-/// **Expensive**: K=14 params generation takes several seconds.
+/// **Expensive**: K=11 params generation takes ~1 second.
 /// Callers should cache the result.
 pub fn share_reveal_params() -> Params<EqAffine> {
     Params::new(K)
@@ -61,7 +61,7 @@ pub fn share_reveal_proving_key(
 /// a valid `Circuit` (with all witnesses populated) and a matching
 /// `Instance` (7 public inputs).
 ///
-/// **Expensive**: K=14 proof generation takes ~30-60 seconds in release mode.
+/// **Expensive**: K=11 proof generation takes ~5-15 seconds in release mode.
 pub fn create_share_reveal_proof(circuit: Circuit, instance: &Instance) -> Vec<u8> {
     let params = share_reveal_params();
     let (pk, _vk) = share_reveal_proving_key(&params);

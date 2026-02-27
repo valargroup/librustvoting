@@ -33,7 +33,7 @@
 //!   S-box, \[6..8\] Poseidon state.
 //! - 8 fixed columns for Poseidon round constants + constants.
 //! - 1 instance column (7 public inputs).
-//! - K = 14 (16,384 rows).
+//! - K = 11 (2,048 rows).
 
 use alloc::vec::Vec;
 
@@ -68,15 +68,14 @@ use crate::shares_hash::{
 
 /// Circuit size (2^K rows).
 ///
-/// K=14 (16,384 rows). `CircuitCost::measure` reports a floor-planner
-/// high-water mark of **1,592 rows** (9.7% of 16,384). The `V1` floor
+/// K=11 (2,048 rows). `CircuitCost::measure` reports a floor-planner
+/// high-water mark of ~1,592 rows (78% of 2,048). The `V1` floor
 /// planner packs non-overlapping regions into the same row range across
-/// different columns. Minimum viable K is 11 (2,048 rows, 22% headroom),
-/// but K=14 is kept for consistency with ZKP #1 and ZKP #2.
+/// different columns.
 ///
 /// Run the `row_budget` test to re-measure after circuit changes:
 ///   `cargo test --features share-reveal row_budget -- --nocapture --ignored`
-pub const K: u32 = 14;
+pub const K: u32 = 11;
 
 // ================================================================
 // Public input offsets (7 field elements).
