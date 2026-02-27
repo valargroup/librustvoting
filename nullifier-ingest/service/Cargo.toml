@@ -18,7 +18,7 @@ tower-http = { version = "0.4", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-orchard = { path = "../../orchard", features = ["delegation"] }
+orchard = { path = "../../orchard" }
 incrementalmerkletree = { version = "0.8.1", features = ["legacy-api"] }
 
 [dev-dependencies]
