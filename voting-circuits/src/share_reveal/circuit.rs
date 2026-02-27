@@ -29,9 +29,8 @@
 //!
 //! ## Column layout
 //!
-//! Uses the same Poseidon configuration as ZKP #2:
-//! - 10 advice columns (advices\[0..5\] general + Merkle swap, \[5\] partial S-box,
-//!   \[6..9\] Poseidon state).
+//! - 9 advice columns: advices\[0..4\] general + Merkle swap, \[5\] Poseidon partial
+//!   S-box, \[6..8\] Poseidon state.
 //! - 8 fixed columns for Poseidon round constants + constants.
 //! - 1 instance column (7 public inputs).
 //! - K = 14 (16,384 rows).
@@ -154,20 +153,20 @@ pub fn share_nullifier_hash(
 pub struct Config {
     /// Public input column (7 field elements).
     primary: Column<InstanceColumn>,
-    /// 10 advice columns for private witness data.
-    advices: [Column<Advice>; 10],
+    /// 9 advice columns for private witness data.
+    advices: [Column<Advice>; 9],
     /// Poseidon hash chip configuration.
     poseidon_config: PoseidonConfig<pallas::Base, 3, 2>,
     /// Selector for the Merkle conditional swap gate (condition 1).
     q_merkle_swap: Selector,
     /// Selector for the share commitment multiplexer gate (condition 4).
     ///
-    /// Fires on a 4-row block (10 advice columns, Rotation 0..3):
-    ///   Row 0: sel_0..sel_9     (advices[0..10])
-    ///   Row 1: sel_10..sel_15   (advices[0..6]),  comm_0..comm_3  (advices[6..10])
-    ///   Row 2: comm_4..comm_13  (advices[0..10])
-    ///   Row 3: comm_14..comm_15 (advices[0..2]),  selected_comm   (advices[2]),
-    ///          share_index      (advices[3])
+    /// Fires on a 4-row block (9 advice columns, Rotation 0..3):
+    ///   Row 0: sel_0..sel_8     (advices[0..9])
+    ///   Row 1: sel_9..sel_15    (advices[0..7]),  comm_0..comm_1  (advices[7..9])
+    ///   Row 2: comm_2..comm_10  (advices[0..9])
+    ///   Row 3: comm_11..comm_15 (advices[0..5]),  selected_comm   (advices[5]),
+    ///          share_index      (advices[6])
     ///
     /// Constraints:
     /// - Each sel_i is boolean.
@@ -254,8 +253,14 @@ impl plonk::Circuit<pallas::Base> for Circuit {
     }
 
     fn configure(meta: &mut ConstraintSystem<pallas::Base>) -> Self::Config {
-        // 10 advice columns, matching ZKP #2 column layout.
-        let advices: [Column<Advice>; 10] = core::array::from_fn(|_| meta.advice_column());
+        // 9 advice columns — the minimum required by the three gadgets in this circuit:
+        //   [0..4]  Merkle conditional swap gate (pos_bit, current, sibling, left, right).
+        //   [5]     Poseidon Pow5T3 partial S-box column (internal to the chip).
+        //   [6..8]  Poseidon width-3 state columns.
+        // The share commitment mux gate (condition 4) reuses all 9 columns across
+        // 4 rows to pack its 16 one-hot selectors + 16 commitments without needing
+        // an additional column.
+        let advices: [Column<Advice>; 9] = core::array::from_fn(|_| meta.advice_column());
         for col in &advices {
             meta.enable_equality(*col);
         }
@@ -275,7 +280,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         meta.enable_constant(lagrange_coeffs[0]);
 
         // Poseidon chip: P128Pow5T3 with width 3, rate 2.
-        // State columns: advices[6..9], partial S-box: advices[5].
+        // State columns: advices[6..8], partial S-box: advices[5].
         let poseidon_config = PoseidonChip::configure::<poseidon::P128Pow5T3>(
             meta,
             advices[6..9].try_into().unwrap(),
@@ -311,12 +316,12 @@ impl plonk::Circuit<pallas::Base> for Circuit {
         });
 
         // Share commitment multiplexer gate (condition 4).
-        // Col →  [0]       [1]       [2]        [3]        [4]        [5]        [6]       [7]       [8]       [9]
-        // ------+---------+---------+----------+----------+----------+----------+---------+---------+---------+---------
-        // Row 0 | sel[0]  | sel[1]  | sel[2]   | sel[3]   | sel[4]   | sel[5]   | sel[6]  | sel[7]  | sel[8]  | sel[9]
-        // Row 1 | sel[10] | sel[11] | sel[12]  | sel[13]  | sel[14]  | sel[15]  | comm[0] | comm[1] | comm[2] | comm[3]
-        // Row 2 | comm[4] | comm[5] | comm[6]  | comm[7]  | comm[8]  | comm[9]  | comm[10]| comm[11]| comm[12]| comm[13]
-        // Row 3 | comm[14]| comm[15]| sel_comm | share_idx| —        | —        | —       | —       | —       | —
+        // Col →  [0]       [1]       [2]        [3]        [4]        [5]        [6]       [7]       [8]
+        // ------+---------+---------+----------+----------+----------+----------+---------+---------+---------
+        // Row 0 | sel[0]  | sel[1]  | sel[2]   | sel[3]   | sel[4]   | sel[5]   | sel[6]  | sel[7]  | sel[8]
+        // Row 1 | sel[9]  | sel[10] | sel[11]  | sel[12]  | sel[13]  | sel[14]  | sel[15] | comm[0] | comm[1]
+        // Row 2 | comm[2] | comm[3] | comm[4]  | comm[5]  | comm[6]  | comm[7]  | comm[8] | comm[9] |comm[10]
+        // Row 3 | comm[11]| comm[12]| comm[13] | comm[14] | comm[15] | sel_comm | share_idx| —      | —
         let q_share_comm_mux = meta.selector();
         meta.create_gate("share commitment multiplexer", |meta| {
             let q = meta.query_selector(q_share_comm_mux);
@@ -331,20 +336,18 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 meta.query_advice(advices[6], Rotation::cur()),
                 meta.query_advice(advices[7], Rotation::cur()),
                 meta.query_advice(advices[8], Rotation::cur()),
-                meta.query_advice(advices[9], Rotation::cur()),
                 meta.query_advice(advices[0], Rotation::next()),
                 meta.query_advice(advices[1], Rotation::next()),
                 meta.query_advice(advices[2], Rotation::next()),
                 meta.query_advice(advices[3], Rotation::next()),
                 meta.query_advice(advices[4], Rotation::next()),
                 meta.query_advice(advices[5], Rotation::next()),
+                meta.query_advice(advices[6], Rotation::next()),
             ];
 
             let comm: [_; 16] = [
-                meta.query_advice(advices[6], Rotation::next()),
                 meta.query_advice(advices[7], Rotation::next()),
                 meta.query_advice(advices[8], Rotation::next()),
-                meta.query_advice(advices[9], Rotation::next()),
                 meta.query_advice(advices[0], Rotation(2)),
                 meta.query_advice(advices[1], Rotation(2)),
                 meta.query_advice(advices[2], Rotation(2)),
@@ -354,13 +357,15 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 meta.query_advice(advices[6], Rotation(2)),
                 meta.query_advice(advices[7], Rotation(2)),
                 meta.query_advice(advices[8], Rotation(2)),
-                meta.query_advice(advices[9], Rotation(2)),
                 meta.query_advice(advices[0], Rotation(3)),
                 meta.query_advice(advices[1], Rotation(3)),
+                meta.query_advice(advices[2], Rotation(3)),
+                meta.query_advice(advices[3], Rotation(3)),
+                meta.query_advice(advices[4], Rotation(3)),
             ];
 
-            let selected_comm = meta.query_advice(advices[2], Rotation(3));
-            let share_index = meta.query_advice(advices[3], Rotation(3));
+            let selected_comm = meta.query_advice(advices[5], Rotation(3));
+            let share_index = meta.query_advice(advices[6], Rotation(3));
 
             let one = Expression::Constant(pallas::Base::one());
 
@@ -604,10 +609,10 @@ impl plonk::Circuit<pallas::Base> for Circuit {
 
                 // Assign the one-hot selector bits into the region. We use assign_advice
                 // (fresh allocation) because sel_values are computed locally and have no
-                // prior cell to copy from. There are 16 bits spread across 10 advice
-                // columns, so they spill from row 0 into the first 6 columns of row 1.
+                // prior cell to copy from. There are 16 bits spread across 9 advice
+                // columns, so they spill from row 0 into the first 7 columns of row 1.
                 // Layout table: (sel_start, count, advice_col_offset, row)
-                for (sel_start, count, col_off, row) in [(0, 10, 0, 0), (10, 6, 0, 1)] {
+                for (sel_start, count, col_off, row) in [(0, 9, 0, 0), (9, 7, 0, 1)] {
                     for i in 0..count {
                         region.assign_advice(
                             || alloc::format!("sel_{}", sel_start + i),
@@ -625,7 +630,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 // the prover from substituting a different value. The 16 commitments
                 // also spill across multiple rows alongside the selector bits above.
                 // Layout table: (comm_start, count, advice_col_offset, row)
-                for (comm_start, count, col_off, row) in [(0, 4, 6, 1), (4, 10, 0, 2), (14, 2, 0, 3)] {
+                for (comm_start, count, col_off, row) in [(0, 2, 7, 1), (2, 9, 0, 2), (11, 5, 0, 3)] {
                     for i in 0..count {
                         share_comms_cond4[comm_start + i].copy_advice(
                             || alloc::format!("comm_{}", comm_start + i),
@@ -644,7 +649,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 });
                 let selected_comm = region.assign_advice(
                     || "selected_comm",
-                    config.advices[2],
+                    config.advices[5],
                     3,
                     || selected_comm_val,
                 )?;
@@ -652,7 +657,7 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 share_index.copy_advice(
                     || "share_index",
                     &mut region,
-                    config.advices[3],
+                    config.advices[6],
                     3,
                 )?;
 
