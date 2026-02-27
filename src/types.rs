@@ -172,7 +172,7 @@ pub struct VoteCommitmentBundle {
     /// Voting round ID (hex string).
     pub vote_round_id: String,
     /// Poseidon hash of encrypted share x-coordinates (32 bytes).
-    /// Intermediate value: vote_commitment = H(DOMAIN_VC, shares_hash, proposal_id, vote_decision).
+    /// Intermediate value: vote_commitment = H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision).
     pub shares_hash: Vec<u8>,
     /// Per-share blind factors (N x 32 bytes, LE pallas::Base repr).
     pub share_blinds: Vec<Vec<u8>>,

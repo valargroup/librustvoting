@@ -589,8 +589,8 @@ mod tests {
                 .to_string(),
             snapshot_height: 100_000,
             ea_pk: vec![0xEA; 32],
-            nc_root: vec![0xCC; 32],
-            nullifier_imt_root: vec![0xDD; 32],
+            nc_root: vec![0x01; 32],
+            nullifier_imt_root: vec![0x02; 32],
         }
     }
 

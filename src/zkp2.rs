@@ -1,4 +1,4 @@
-use ff::{Field, FromUniformBytes, PrimeField};
+use ff::{Field, PrimeField};
 use group::{Curve, GroupEncoding};
 use pasta_curves::pallas;
 
@@ -82,19 +82,17 @@ pub fn build_vote_commitment(
         "gov_comm_rand is not a valid Pallas field element",
     )?;
 
-    // Parse voting_round_id → pallas::Base via wide reduction.
-    // The round ID is a Blake2b-256 hash which is non-canonical ~75% of the time
-    // (value >= Pallas modulus). Zero-extend to 64 bytes for canonical reduction,
-    // matching governance.rs and the chain verifier's hash_bytes_to_fp.
+    // Parse voting_round_id → pallas::Base (canonical Fp).
     let vri_bytes: [u8; 32] = voting_round_id.try_into().map_err(|_| VotingError::InvalidInput {
         message: format!(
             "voting_round_id must be 32 bytes, got {}",
             voting_round_id.len()
         ),
     })?;
-    let mut vri_wide = [0u8; 64];
-    vri_wide[..32].copy_from_slice(&vri_bytes);
-    let vri = pallas::Base::from_uniform_bytes(&vri_wide);
+    let vri = ct_option_to_result(
+        pallas::Base::from_repr(vri_bytes),
+        "voting_round_id is not a canonical Pallas Fp element",
+    )?;
 
     // Parse ea_pk → pallas::Affine (compressed point)
     let ea_pk_bytes: [u8; 32] = ea_pk.try_into().map_err(|_| VotingError::InvalidInput {
