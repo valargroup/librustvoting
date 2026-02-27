@@ -1699,6 +1699,12 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
   const [unjailing, setUnjailing] = useState<string | null>(null); // operator_address being unjailed
   const [unjailResult, setUnjailResult] = useState<{ addr: string; ok: boolean; msg: string } | null>(null);
 
+  // Pending validator registrations.
+  const [pendingRegistrations, setPendingRegistrations] = useState<chainApi.PendingRegistration[]>([]);
+  const [approvingAddr, setApprovingAddr] = useState<string | null>(null);
+  const [approveAmounts, setApproveAmounts] = useState<Record<string, string>>({});
+  const [approveResult, setApproveResult] = useState<{ addr: string; ok: boolean; msg: string } | null>(null);
+
   // Edge Config network management state.
   const [votingConfig, setVotingConfig] = useState<chainApi.VotingConfig | null>(null);
   const [urlInputFor, setUrlInputFor] = useState<string | null>(null); // moniker being edited
@@ -1731,16 +1737,18 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
     setLoading(true);
     setError("");
     try {
-      const [valResp, ceremonyResp, pallasResp, vcResp] = await Promise.all([
+      const [valResp, ceremonyResp, pallasResp, vcResp, pendingResp] = await Promise.all([
         chainApi.getValidators(),
         chainApi.getCeremonyState().catch(() => null),
         chainApi.getPallasKeys().catch(() => ({ validators: [] })),
         chainApi.getVotingConfig().catch(() => null),
+        chainApi.getPendingRegistrations().catch(() => []),
       ]);
       setValidators(valResp.validators ?? []);
       setCeremony(ceremonyResp);
       setPallasKeys(new Set(pallasResp.validators.map((v) => v.validator_address)));
       setVotingConfig(vcResp);
+      setPendingRegistrations(pendingResp);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -1801,6 +1809,52 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
       setNetworkResult({ moniker, ok: false, msg: err instanceof Error ? err.message : String(err) });
     } finally {
       setNetworkUpdating(false);
+    }
+  };
+
+  // Approve a pending registration: sign approval, call edge function, then fund on-chain.
+  const handleApproveRegistration = async (reg: chainApi.PendingRegistration) => {
+    if (!wallet.address || !wallet.signer) return;
+    setApprovingAddr(reg.operator_address);
+    setApproveResult(null);
+    try {
+      // 1. Approve registration (moves URL to vote_servers).
+      const approvePayload = { action: "approve" as const, operator_address: reg.operator_address };
+      const payloadStr = JSON.stringify(approvePayload);
+      const sig = await wallet.signPayload(payloadStr);
+      await chainApi.approveRegistration({
+        payload: approvePayload,
+        signature: sig.signature,
+        pubKey: sig.pubKey,
+        signerAddress: wallet.address,
+      });
+
+      // 2. Fund the validator on-chain.
+      const amount = approveAmounts[reg.operator_address] || "1000000";
+      const base = chainApi.getApiBase();
+      const fundRes = await cosmosTx.fundValidator(base, wallet.signer, reg.operator_address, amount);
+      if (fundRes.code !== 0) {
+        setApproveResult({
+          addr: reg.operator_address,
+          ok: false,
+          msg: `Approved but funding failed: ${fundRes.log || `code ${fundRes.code}`}`,
+        });
+      } else {
+        setApproveResult({
+          addr: reg.operator_address,
+          ok: true,
+          msg: `Approved & funded (tx ${fundRes.tx_hash.slice(0, 12)}…)`,
+        });
+      }
+      fetchValidators(); // refresh
+    } catch (err) {
+      setApproveResult({
+        addr: reg.operator_address,
+        ok: false,
+        msg: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setApprovingAddr(null);
     }
   };
 
@@ -1901,6 +1955,91 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
               to participate in EA key ceremonies.
               {ceremonyValidators.size > 0 && <>{" "}Validators with <span className="text-[9px] px-1 py-0.5 rounded-full bg-accent/15 text-accent font-semibold">EA</span> are participating in the current round{"'"}s ceremony.</>}
             </p>
+          </div>
+        )}
+
+        {/* Pending validator registrations */}
+        {pendingRegistrations.length > 0 && wallet.address && (
+          <div className="mb-6">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-[10px] text-text-muted uppercase tracking-wider">
+                Pending registrations
+              </span>
+              <span className="text-[9px] bg-warning/20 text-warning px-1.5 py-0.5 rounded-full">
+                {pendingRegistrations.length}
+              </span>
+            </div>
+            <div className="space-y-2">
+              {pendingRegistrations.map((reg) => {
+                const submitted = Math.floor(Date.now() / 1000) - reg.timestamp;
+                const hours = Math.floor(submitted / 3600);
+                const days = Math.floor(hours / 24);
+                const timeAgo = days > 0 ? `${days}d ago` : hours > 0 ? `${hours}h ago` : "just now";
+
+                return (
+                  <div
+                    key={reg.operator_address}
+                    className="bg-warning/5 border border-warning/20 rounded-xl p-4"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-semibold text-text-primary truncate">
+                            {reg.moniker}
+                          </span>
+                          <span className="text-[9px] px-2 py-0.5 rounded-full bg-warning/20 text-warning">
+                            Pending
+                          </span>
+                          <span className="text-[9px] text-text-muted">{timeAgo}</span>
+                        </div>
+                        <p className="text-[10px] text-text-muted font-mono mt-1 truncate">
+                          {reg.operator_address}
+                        </p>
+                        <div className="flex items-center gap-1 mt-1">
+                          <Server size={9} className="text-text-muted" />
+                          <span className="text-[10px] text-text-secondary truncate">{reg.url}</span>
+                        </div>
+                      </div>
+                      <div className="shrink-0 flex flex-col items-end gap-1.5">
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="text"
+                            value={approveAmounts[reg.operator_address] ?? "1000000"}
+                            onChange={(e) =>
+                              setApproveAmounts((prev) => ({
+                                ...prev,
+                                [reg.operator_address]: e.target.value,
+                              }))
+                            }
+                            className="w-24 px-1.5 py-0.5 bg-surface-2 border border-border-subtle rounded text-[10px] text-text-primary text-right font-mono focus:outline-none focus:border-accent/50"
+                            placeholder="amount"
+                          />
+                          <span className="text-[9px] text-text-muted">uzvote</span>
+                        </div>
+                        <button
+                          className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-accent/90 hover:bg-accent text-surface-0 text-[10px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                          disabled={approvingAddr === reg.operator_address}
+                          onClick={() => handleApproveRegistration(reg)}
+                        >
+                          {approvingAddr === reg.operator_address ? (
+                            <>
+                              <Loader2 size={10} className="animate-spin" /> Approving…
+                            </>
+                          ) : (
+                            "Approve & Fund"
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                    {approveResult?.addr === reg.operator_address && (
+                      <p className={`text-[10px] mt-2 ${approveResult.ok ? "text-success" : "text-danger"}`}>
+                        {approveResult.msg}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 
