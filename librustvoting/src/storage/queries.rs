@@ -999,6 +999,29 @@ pub fn get_votes(conn: &Connection, round_id: &str) -> Result<Vec<VoteRecord>, V
     Ok(votes)
 }
 
+/// Delete all bundles (and their cascaded witnesses/proofs) with index >= `from_index`.
+/// Used when the user skips remaining Keystone bundles — we remove the unsigned
+/// bundle rows so that `proof_generated` (which counts ALL DB bundles) reflects
+/// only the signed+proven bundles.
+pub fn delete_bundles_from(
+    conn: &Connection,
+    round_id: &str,
+    from_index: u32,
+) -> Result<u64, VotingError> {
+    let rows = conn
+        .execute(
+            "DELETE FROM bundles WHERE round_id = :round_id AND bundle_index >= :from_index",
+            named_params! {
+                ":round_id": round_id,
+                ":from_index": from_index as i64,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to delete bundles from index {}: {}", from_index, e),
+        })?;
+    Ok(rows as u64)
+}
+
 pub fn mark_vote_submitted(
     conn: &Connection,
     round_id: &str,

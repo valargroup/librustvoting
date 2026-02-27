@@ -563,6 +563,12 @@ public protocol VotingDatabaseProtocol: AnyObject, Sendable {
 
     func clearRound(roundId: String) throws
 
+    /**
+     * Delete bundle rows with index >= `keep_count`, removing skipped bundles
+     * so that `proof_generated` only considers signed+proven bundles.
+     */
+    func deleteSkippedBundles(roundId: String, keepCount: UInt32) throws  -> UInt64
+
     func encryptShares(roundId: String, shares: [UInt64]) throws  -> [EncryptedShare]
 
     func generateHotkey(roundId: String, seed: Data) throws  -> VotingHotkey
@@ -606,7 +612,7 @@ public protocol VotingDatabaseProtocol: AnyObject, Sendable {
 
     func getVotes(roundId: String) throws  -> [VoteRecord]
 
-    func getWalletNotes(walletDbPath: String, snapshotHeight: UInt64, networkId: UInt32) throws  -> [NoteInfo]
+    func getWalletNotes(walletDbPath: String, snapshotHeight: UInt64, networkId: UInt32, seedFingerprint: Data?, accountIndex: UInt32?) throws  -> [NoteInfo]
 
     func initRound(params: VotingRoundParams, sessionJson: String?) throws
 
@@ -786,6 +792,19 @@ open func clearRound(roundId: String)throws   {try rustCallWithError(FfiConverte
 }
 }
 
+    /**
+     * Delete bundle rows with index >= `keep_count`, removing skipped bundles
+     * so that `proof_generated` only considers signed+proven bundles.
+     */
+open func deleteSkippedBundles(roundId: String, keepCount: UInt32)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
+    uniffi_zcash_voting_ffi_fn_method_votingdatabase_delete_skipped_bundles(self.uniffiClonePointer(),
+        FfiConverterString.lower(roundId),
+        FfiConverterUInt32.lower(keepCount),$0
+    )
+})
+}
+
 open func encryptShares(roundId: String, shares: [UInt64])throws  -> [EncryptedShare]  {
     return try  FfiConverterSequenceTypeEncryptedShare.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_method_votingdatabase_encrypt_shares(self.uniffiClonePointer(),
@@ -897,12 +916,14 @@ open func getVotes(roundId: String)throws  -> [VoteRecord]  {
 })
 }
 
-open func getWalletNotes(walletDbPath: String, snapshotHeight: UInt64, networkId: UInt32)throws  -> [NoteInfo]  {
+open func getWalletNotes(walletDbPath: String, snapshotHeight: UInt64, networkId: UInt32, seedFingerprint: Data?, accountIndex: UInt32?)throws  -> [NoteInfo]  {
     return try  FfiConverterSequenceTypeNoteInfo.lift(try rustCallWithError(FfiConverterTypeVotingError_lift) {
     uniffi_zcash_voting_ffi_fn_method_votingdatabase_get_wallet_notes(self.uniffiClonePointer(),
         FfiConverterString.lower(walletDbPath),
         FfiConverterUInt64.lower(snapshotHeight),
-        FfiConverterUInt32.lower(networkId),$0
+        FfiConverterUInt32.lower(networkId),
+        FfiConverterOptionData.lower(seedFingerprint),
+        FfiConverterOptionUInt32.lower(accountIndex),$0
     )
 })
 }
@@ -3302,6 +3323,30 @@ public func FfiConverterCallbackInterfaceProofProgressReporter_lower(_ v: ProofP
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
     typealias SwiftType = UInt64?
 
@@ -3342,6 +3387,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = Data?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterData.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -3844,6 +3913,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_clear_round() != 15915) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_delete_skipped_bundles() != 33260) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_encrypt_shares() != 46668) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3871,7 +3943,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_get_votes() != 19701) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_get_wallet_notes() != 19542) {
+    if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_get_wallet_notes() != 27554) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_voting_ffi_checksum_method_votingdatabase_init_round() != 11012) {

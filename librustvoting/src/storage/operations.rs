@@ -80,16 +80,23 @@ impl VotingDb {
 
     /// Query unspent Orchard notes from the Zcash wallet DB at a snapshot height.
     /// The wallet DB is opened read-only at the given path.
+    ///
+    /// When `seed_fingerprint` and `account_index` are provided, only notes
+    /// belonging to that specific account are returned.
     pub fn get_wallet_notes(
         &self,
         wallet_db_path: &str,
         snapshot_height: u64,
         network_id: u32,
+        seed_fingerprint: Option<&[u8]>,
+        account_index: Option<u32>,
     ) -> Result<Vec<NoteInfo>, VotingError> {
         crate::wallet_notes::get_wallet_notes_at_snapshot(
             wallet_db_path,
             snapshot_height,
             network_id,
+            seed_fingerprint,
+            account_index,
         )
     }
 
@@ -280,11 +287,15 @@ impl VotingDb {
             queries::load_bundle_note_positions(&conn, round_id, bundle_index)?
                 .into_iter()
                 .collect();
+        // No account filter needed here — we filter by stored bundle positions below
         let all_notes = crate::wallet_notes::get_wallet_notes_at_snapshot(
             wallet_db_path,
             params.snapshot_height,
             network_id,
+            None,
+            None,
         )?;
+        let total_wallet_notes = all_notes.len();
         let full_notes: Vec<NoteInfo> = all_notes
             .into_iter()
             .filter(|n| bundle_positions.contains(&n.position))
@@ -296,10 +307,15 @@ impl VotingDb {
         if witness_count != full_notes.len() {
             return Err(VotingError::Internal {
                 message: format!(
-                    "witness count ({}) does not match note count ({}) for round {}",
+                    "witness count ({}) does not match note count ({}) for round {} bundle {} \
+                     (bundle_positions={}, wallet_notes={}). \
+                     This can happen if the FFI xcframework was not rebuilt after a Rust change — run `make dev-incr`.",
                     witness_count,
                     full_notes.len(),
-                    round_id
+                    round_id,
+                    bundle_index,
+                    bundle_positions.len(),
+                    total_wallet_notes
                 ),
             });
         }
@@ -734,6 +750,14 @@ impl VotingDb {
             sighash: keystone_sighash.to_vec(),
             enc_memo: enc_memo.to_vec(),
         })
+    }
+
+    /// Delete bundle rows with index >= `keep_count`, so that only the first
+    /// `keep_count` bundles remain. Witnesses and proofs cascade-delete via FK.
+    /// Returns the number of deleted rows.
+    pub fn delete_skipped_bundles(&self, round_id: &str, keep_count: u32) -> Result<u64, VotingError> {
+        let conn = self.conn();
+        queries::delete_bundles_from(&conn, round_id, keep_count)
     }
 
     /// Mark a vote as submitted to the vote chain.

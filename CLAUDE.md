@@ -107,6 +107,10 @@ The EA key ceremony is automatic per voting round. When a round is published, el
 
 When modifying circuit logic (in `orchard/`, `librustvoting/`, or `sdk/circuits/`), the corresponding documentation in the Obsidian gitbook (the `shielded_vote_book` repository) must also be updated. The book is served live and describes the circuit structure — any protocol change that affects conditions, public inputs, witness fields, or hash parameters must be reflected there.
 
+## Claude Code Workflow Rules
+
+- **Never create a voting round automatically.** When restarting the local chain, only build, init, start zallyd, register the Pallas key, and write the iOS config. Do not run `make -C sdk ceremony` or the `round_activation` test — these create a voting round. Only do so if the user explicitly asks.
+
 ## Code Change Guidelines
 
 **Never consider backwards compatibility** unless explicitly told to do so. Feel free to rename functions, change APIs, delete unused code, and refactor without worrying about breaking existing consumers. This is a research codebase where clean code matters more than stability.

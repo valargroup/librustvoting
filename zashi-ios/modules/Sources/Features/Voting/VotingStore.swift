@@ -219,11 +219,22 @@ public struct Voting {
         /// Which bundle the Keystone signing loop is currently processing (0-based).
         public var currentKeystoneBundleIndex: UInt32 = 0
 
+        /// Per-bundle Keystone signature data collected during the multi-bundle signing loop.
+        public struct KeystoneBundleSignature: Equatable {
+            public let sig: Data
+            public let sighash: Data
+            public let rk: Data
+        }
+
+        /// Collected Keystone signatures for each bundle, accumulated during the signing loop.
+        public var keystoneBundleSignatures: [KeystoneBundleSignature] = []
+
         /// Governance PCZT result for Keystone signing flow (contains metadata + pczt_bytes).
         public var pendingGovernancePczt: GovernancePcztResult?
         /// Unsigned delegation PCZT request shown as QR and used for signature extraction.
         public var pendingUnsignedDelegationPczt: Pczt?
         @Presents public var keystoneScan: Scan.State?
+        @Presents public var skipBundlesAlert: AlertState<Action>?
 
         /// Most recent Vote Commitment (VC) bundle built for UI/debug stubs.
         public var lastVoteCommitmentBundle: VoteCommitmentBundle?
@@ -263,6 +274,48 @@ public struct Voting {
         public var votingWeightZECString: String {
             let zec = Double(votingWeight) / 100_000_000.0
             return String(format: "%.2f", zec)
+        }
+
+        /// ZEC value for the current Keystone bundle (or total if single-bundle / non-Keystone).
+        public var currentBundleZECString: String? {
+            guard isKeystoneUser, bundleCount > 1 else { return nil }
+            let bundles = walletNotes.smartBundles().bundles
+            let idx = Int(currentKeystoneBundleIndex)
+            guard idx < bundles.count else { return nil }
+            let weight = bundles[idx].reduce(UInt64(0)) { $0 + $1.value }
+            return String(format: "%.2f", Double(weight) / 100_000_000.0)
+        }
+
+        /// Total ZEC weight already signed across collected Keystone bundle signatures.
+        public var signedBundlesZECString: String {
+            let bundles = walletNotes.smartBundles().bundles
+            let signedWeight = keystoneBundleSignatures.indices.reduce(UInt64(0)) { total, i in
+                guard i < bundles.count else { return total }
+                return total + bundles[i].reduce(UInt64(0)) { $0 + $1.value }
+            }
+            return String(format: "%.2f", Double(signedWeight) / 100_000_000.0)
+        }
+
+        /// Total ZEC weight in unsigned bundles that would be given up by skipping.
+        public var skippedBundlesZECString: String {
+            let bundles = walletNotes.smartBundles().bundles
+            let signedCount = keystoneBundleSignatures.count
+            let skippedWeight = (signedCount..<bundles.count).reduce(UInt64(0)) { total, i in
+                total + bundles[i].reduce(UInt64(0)) { $0 + $1.value }
+            }
+            return String(format: "%.2f", Double(skippedWeight) / 100_000_000.0)
+        }
+
+        /// Raw ZEC weight for the memo — per-bundle for Keystone multi-bundle, total otherwise.
+        public var memoWeightZatoshi: UInt64 {
+            if isKeystoneUser, bundleCount > 1 {
+                let bundles = walletNotes.smartBundles().bundles
+                let idx = Int(currentKeystoneBundleIndex)
+                if idx < bundles.count {
+                    return bundles[idx].reduce(UInt64(0)) { $0 + $1.value }
+                }
+            }
+            return walletNotes.reduce(UInt64(0)) { $0 + $1.value }
         }
 
         public var votedCount: Int {
@@ -381,6 +434,11 @@ public struct Voting {
         case spendAuthSignatureExtracted(Data, Data)
         case spendAuthSignatureExtractionFailed(String)
         case keystoneBundleAdvance
+        case keystoneBundleSignatureStored(State.KeystoneBundleSignature, bundleIndex: UInt32, bundleCount: UInt32)
+        case keystoneAllBundlesSigned
+        case skipRemainingKeystoneBundles
+        case skipBundlesAlert(PresentationAction<Action>)
+        case skipRemainingKeystoneBundlesConfirmed
         case keystoneScan(PresentationAction<Scan.Action>)
 
         // Background ZKP delegation
@@ -591,6 +649,9 @@ public struct Voting {
                 let networkId: UInt32 = network.networkType == .mainnet ? 0 : 1
                 let snapshotHeight = session.snapshotHeight
                 let roundId = session.voteRoundId.hexString
+                // Capture account identity for filtering notes to the selected account
+                let accountSeedFingerprint: [UInt8]? = state.selectedWalletAccount?.seedFingerprint
+                let accountIndex: UInt32? = state.selectedWalletAccount?.zip32AccountIndex.map { UInt32($0.index) }
                 return .run { [votingCrypto, mnemonic, walletStorage, sdkSynchronizer] send in
                     // Check wallet sync progress before querying notes
                     let walletScannedHeight = UInt64(sdkSynchronizer.latestState().latestBlockHeight)
@@ -601,7 +662,8 @@ public struct Voting {
                     }
 
                     let notes = try await votingCrypto.getWalletNotes(
-                        walletDbPath, snapshotHeight, networkId
+                        walletDbPath, snapshotHeight, networkId,
+                        accountSeedFingerprint, accountIndex
                     )
                     let totalWeight = notes.reduce(UInt64(0)) { $0 + $1.value }
                     print("[Voting] Loaded \(notes.count) notes at height \(snapshotHeight), total weight: \(totalWeight)")
@@ -663,10 +725,15 @@ public struct Voting {
                     return .none
                 }
                 // Show proposals immediately while witnesses load in the background.
-                // This avoids a 10–20s blank spinner waiting for the tree state fetch.
+                // For Keystone users that haven't authorized yet, go straight to the
+                // delegation signing screen to avoid a brief flash of the proposal list.
                 // Don't set delegationProofStatus here — verifyWitnesses will set it
                 // only for fresh rounds, avoiding a brief flash for cached rounds.
-                state.screenStack = [.proposalList]
+                if state.isKeystoneUser {
+                    state.screenStack = [.delegationSigning]
+                } else {
+                    state.screenStack = [.proposalList]
+                }
                 return .merge(
                     .publisher {
                         votingCrypto.stateStream()
@@ -1060,6 +1127,7 @@ public struct Voting {
                 state.pendingGovernancePczt = nil
                 state.pendingUnsignedDelegationPczt = nil
                 state.keystoneSigningStatus = .idle
+                state.keystoneBundleSignatures = []
                 return .send(.dismissFlow)
 
             case .retryKeystoneSigning:
@@ -1069,6 +1137,7 @@ public struct Voting {
                 state.keystoneSigningStatus = .idle
                 state.currentKeystoneBundleIndex = 0
                 state.isDelegationProofInFlight = false
+                state.keystoneBundleSignatures = []
                 return .send(.startDelegationProof)
 
             // MARK: - Background ZKP Delegation
@@ -1282,20 +1351,54 @@ public struct Voting {
                 return .none
 
             case .spendAuthSignatureExtracted(let keystoneSig, let signedPczt):
+                guard let rk = state.pendingGovernancePczt?.rk else {
+                    return .send(.delegationProofFailed(
+                        VotingFlowError.missingPendingUnsignedPczt.localizedDescription
+                    ))
+                }
+
+                // Extract ZIP-244 sighash from the signed PCZT synchronously in a
+                // lightweight .run so we can store it alongside the sig.
+                let bundleCount = state.bundleCount
+                let currentIndex = state.currentKeystoneBundleIndex
+                return .run { [votingCrypto] send in
+                    let keystoneSighash = try votingCrypto.extractPcztSighash(signedPczt)
+                    // Store signature for this bundle
+                    await send(.keystoneBundleSignatureStored(
+                        .init(sig: keystoneSig, sighash: keystoneSighash, rk: rk),
+                        bundleIndex: currentIndex,
+                        bundleCount: bundleCount
+                    ))
+                } catch: { error, send in
+                    await send(.spendAuthSignatureExtractionFailed(error.localizedDescription))
+                }
+
+            case .keystoneBundleSignatureStored(let signature, let bundleIndex, let bundleCount):
+                state.keystoneBundleSignatures.append(signature)
+                state.pendingGovernancePczt = nil
+                state.pendingUnsignedDelegationPczt = nil
+
+                if bundleIndex + 1 < bundleCount {
+                    // More bundles to sign — advance index and reset to idle.
+                    // User taps "Confirm with Keystone" to start the next bundle.
+                    state.currentKeystoneBundleIndex += 1
+                    state.isDelegationProofInFlight = false
+                    state.keystoneSigningStatus = .idle
+                    return .none
+                } else {
+                    // All bundles signed — navigate to proposal list and start batch proving
+                    state.keystoneSigningStatus = .idle
+                    state.screenStack = [.proposalList]
+                    state.delegationProofStatus = .generating(progress: 0)
+                    return .send(.keystoneAllBundlesSigned)
+                }
+
+            case .keystoneAllBundlesSigned:
                 guard let activeSession = state.activeSession else {
                     return .send(.delegationProofFailed(
                         VotingFlowError.missingActiveSession.localizedDescription
                     ))
                 }
-
-                // Capture expected rk before clearing state for a local consistency check.
-                let expectedRk = state.pendingGovernancePczt?.rk
-
-                state.pendingGovernancePczt = nil
-                state.pendingUnsignedDelegationPczt = nil
-                state.keystoneSigningStatus = .idle
-                state.screenStack = [.proposalList]
-                state.delegationProofStatus = .generating(progress: 0)
 
                 let roundId = activeSession.voteRoundId.hexString
                 let cachedNotes = state.walletNotes
@@ -1303,87 +1406,123 @@ public struct Voting {
                 let walletDbPath = databaseFiles.dataDbURLFor(network).path
                 let networkId: UInt32 = network.networkType == .mainnet ? 0 : 1
                 let accountIndex: UInt32 = state.selectedWalletAccount.flatMap(\.zip32AccountIndex).map { UInt32($0.index) } ?? 0
-                // PIR server URL from resolved service config
                 let pirServerUrl = state.serviceConfig?.pirServers.first?.url ?? "https://46-101-255-48.sslip.io/nullifier"
-                let keystoneBundleIndex = state.currentKeystoneBundleIndex
-                let bundleCount = state.bundleCount
+                let storedSignatures = state.keystoneBundleSignatures
+                let signedCount = storedSignatures.count
+
                 return .run { [votingCrypto, votingAPI, mnemonic, walletStorage] send in
-                    guard let expectedRk = expectedRk else {
-                        throw VotingFlowError.missingPendingUnsignedPczt
-                    }
+                    let senderPhrase = try walletStorage.exportWallet().seedPhrase.value()
+                    let senderSeed = try mnemonic.toSeed(senderPhrase)
                     let hotkeyPhrase = try walletStorage.exportVotingHotkey().seedPhrase.value()
                     let hotkeySeed = try mnemonic.toSeed(hotkeyPhrase)
-
-                    // Extract ZIP-244 sighash from the signed PCZT — this is what
-                    // Keystone actually signed internally.
-                    let keystoneSighash = try votingCrypto.extractPcztSighash(signedPczt)
-
-                    // Use cached wallet notes for the current bundle
                     let noteChunks = cachedNotes.smartBundles().bundles
-                    let bundleNotes = noteChunks[Int(keystoneBundleIndex)]
 
-                    let senderPhrase2 = try walletStorage.exportWallet().seedPhrase.value()
-                    let senderSeed = try mnemonic.toSeed(senderPhrase2)
-                    print("[Voting] Keystone: proving bundle \(keystoneBundleIndex + 1)/\(bundleCount)")
-                    // buildGovernancePczt already stored the delegation data — just prove.
-                    for try await event in votingCrypto.buildAndProveDelegation(
-                        roundId, keystoneBundleIndex, bundleNotes, walletDbPath,
-                        senderSeed, hotkeySeed, networkId, accountIndex, pirServerUrl
-                    ) {
-                        switch event {
-                        case .progress(let p):
-                            // Scale progress: each bundle contributes 1/bundleCount of total
-                            let overallProgress = (Double(keystoneBundleIndex) + p) / Double(bundleCount)
-                            print("[Voting] ZKP #1 bundle \(keystoneBundleIndex) progress: \(Int(p * 100))%")
-                            await send(.delegationProofProgress(overallProgress))
-                        case .completed(let proof):
-                            print("[Voting] ZKP #1 bundle \(keystoneBundleIndex) COMPLETE — proof size: \(proof.count) bytes")
+                    for (bundleIndex, sig) in storedSignatures.enumerated() {
+                        let bundleNotes = noteChunks[bundleIndex]
+                        let bi = UInt32(bundleIndex)
+                        print("[Voting] Keystone batch: proving bundle \(bundleIndex + 1)/\(signedCount)")
+
+                        // buildGovernancePczt already stored the delegation data — just prove.
+                        for try await event in votingCrypto.buildAndProveDelegation(
+                            roundId, bi, bundleNotes, walletDbPath,
+                            senderSeed, hotkeySeed, networkId, accountIndex, pirServerUrl
+                        ) {
+                            switch event {
+                            case .progress(let p):
+                                let overallProgress = (Double(bundleIndex) + p) / Double(signedCount)
+                                print("[Voting] ZKP #1 bundle \(bi) progress: \(Int(p * 100))%")
+                                await send(.delegationProofProgress(overallProgress))
+                            case .completed(let proof):
+                                print("[Voting] ZKP #1 bundle \(bi) COMPLETE — proof size: \(proof.count) bytes")
+                            }
                         }
+
+                        // Submit delegation TX using the stored Keystone signature
+                        let registration = try await votingCrypto.getDelegationSubmissionWithKeystoneSig(
+                            roundId, bi, sig.sig, sig.sighash
+                        )
+                        if registration.rk != sig.rk ||
+                            registration.spendAuthSig != sig.sig ||
+                            registration.sighash != sig.sighash {
+                            throw VotingFlowError.invalidDelegationSignature
+                        }
+                        print(
+                            """
+                            [Voting] Keystone delegation tuple \
+                            rk=\(Data(registration.rk.prefix(8)).hexString) \
+                            sighash=\(Data(sig.sighash.prefix(8)).hexString) \
+                            sig=\(Data(sig.sig.prefix(8)).hexString)
+                            """
+                        )
+                        let preTree = try await votingAPI.fetchLatestCommitmentTree()
+                        let delegTxResult = try await votingAPI.submitDelegation(registration)
+                        print("[Voting] Delegation TX \(bi) submitted: \(delegTxResult.txHash)")
+
+                        // Poll until the delegation TX lands and the tree grows
+                        let postTree = try await votingAPI.awaitCommitmentTreeGrowth(preTree.nextIndex, 90)
+                        let vanPosition = UInt32(postTree.nextIndex) - 1
+                        try await votingCrypto.storeVanPosition(roundId, bi, vanPosition)
+                        print("[Voting] VAN position stored for bundle \(bi): \(vanPosition)")
                     }
 
-                    // Submit delegation TX using Keystone's signature and ZIP-244 sighash
-                    // instead of re-deriving ask from seed (Bug 1 fix).
-                    let registration = try await votingCrypto.getDelegationSubmissionWithKeystoneSig(
-                        roundId, keystoneBundleIndex, keystoneSig, keystoneSighash
-                    )
-                    if registration.rk != expectedRk ||
-                        registration.spendAuthSig != keystoneSig ||
-                        registration.sighash != keystoneSighash {
-                        throw VotingFlowError.invalidDelegationSignature
-                    }
-                    print(
-                        """
-                        [Voting] Keystone delegation tuple \
-                        rk=\(Data(registration.rk.prefix(8)).hexString) \
-                        sighash=\(Data(keystoneSighash.prefix(8)).hexString) \
-                        sig=\(Data(keystoneSig.prefix(8)).hexString)
-                        """
-                    )
-                    let preTree = try await votingAPI.fetchLatestCommitmentTree()
-                    let delegTxResult = try await votingAPI.submitDelegation(registration)
-                    print("[Voting] Delegation TX \(keystoneBundleIndex) submitted: \(delegTxResult.txHash)")
+                    await send(.delegationProofCompleted)
+                } catch: { error, send in
+                    await send(.delegationProofFailed(error.localizedDescription))
+                }
 
-                    // Poll until the delegation TX lands and the tree grows
-                    let postTree = try await votingAPI.awaitCommitmentTreeGrowth(preTree.nextIndex, 90)
-                    let vanPosition = UInt32(postTree.nextIndex) - 1
-                    try await votingCrypto.storeVanPosition(roundId, keystoneBundleIndex, vanPosition)
-                    print("[Voting] VAN position stored for bundle \(keystoneBundleIndex): \(vanPosition)")
+            case .skipRemainingKeystoneBundles:
+                // Show confirmation alert with locked-in / giving-up amounts.
+                let signedCount = state.keystoneBundleSignatures.count
+                guard signedCount > 0 else { return .none }
+                state.skipBundlesAlert = .confirmSkip(
+                    lockedIn: state.signedBundlesZECString,
+                    givingUp: state.skippedBundlesZECString
+                )
+                return .none
 
-                    // If more bundles remain, advance to next; otherwise complete
-                    if keystoneBundleIndex + 1 < bundleCount {
-                        await send(.keystoneBundleAdvance)
-                    } else {
-                        await send(.delegationProofCompleted)
-                    }
+            case .skipBundlesAlert(.presented(.skipRemainingKeystoneBundlesConfirmed)):
+                state.skipBundlesAlert = nil
+                return .send(.skipRemainingKeystoneBundlesConfirmed)
+
+            case .skipBundlesAlert(.dismiss):
+                state.skipBundlesAlert = nil
+                return .none
+
+            case .skipBundlesAlert:
+                return .none
+
+            case .skipRemainingKeystoneBundlesConfirmed:
+                // User confirmed skip — proceed with only the signed bundles.
+                let signedCount = UInt32(state.keystoneBundleSignatures.count)
+                guard signedCount > 0 else { return .none }
+                state.bundleCount = signedCount
+
+                // Recalculate votingWeight to reflect only signed bundles' weight
+                let bundles = state.walletNotes.smartBundles().bundles
+                let signedWeight = state.keystoneBundleSignatures.indices.reduce(UInt64(0)) { total, i in
+                    guard i < bundles.count else { return total }
+                    return total + bundles[i].reduce(UInt64(0)) { $0 + $1.value }
+                }
+                state.votingWeight = signedWeight
+
+                state.pendingGovernancePczt = nil
+                state.pendingUnsignedDelegationPczt = nil
+                state.keystoneSigningStatus = .idle
+                state.screenStack = [.proposalList]
+                state.delegationProofStatus = .generating(progress: 0)
+
+                // Delete skipped bundles from DB so proof_generated reflects reality
+                let roundId = state.roundId
+                return .run { [votingCrypto] send in
+                    try await votingCrypto.deleteSkippedBundles(roundId, signedCount)
+                    await send(.keystoneAllBundlesSigned)
                 } catch: { error, send in
                     await send(.delegationProofFailed(error.localizedDescription))
                 }
 
             case .keystoneBundleAdvance:
-                // Move to the next bundle and loop back into the Keystone signing flow
-                state.currentKeystoneBundleIndex += 1
-                state.isDelegationProofInFlight = false
-                return .send(.startDelegationProof)
+                // Legacy — no longer used; signing loop is handled by keystoneBundleSignatureStored.
+                return .none
 
             case .spendAuthSignatureExtractionFailed(let error):
                 state.keystoneSigningStatus = .failed(error)
@@ -1397,10 +1536,12 @@ public struct Voting {
                 state.delegationProofStatus = .complete
                 state.isDelegationProofInFlight = false
                 state.currentKeystoneBundleIndex = 0
+                state.keystoneBundleSignatures = []
                 return .none
 
             case .delegationProofFailed(let error):
                 state.currentKeystoneBundleIndex = 0
+                state.keystoneBundleSignatures = []
                 let userMessage: String
                 if error.contains("total_weight must yield at least 1 ballot") {
                     let weightStr = Zatoshi(Int64(state.votingWeight)).decimalString()
@@ -1721,7 +1862,7 @@ private extension Array where Element == NoteInfo {
     /// 2. Fill bundles sequentially to capacity (5 notes each)
     /// 3. Drop bundles with total < ballotDivisor
     /// 4. Re-sort notes within each surviving bundle by position
-    /// 5. Sort surviving bundles by their minimum note position
+    /// 5. Sort surviving bundles by total value DESC (min position as tiebreaker)
     func smartBundles() -> BundleResult {
         guard !isEmpty else {
             return BundleResult(bundles: [], eligibleWeight: 0, droppedCount: 0)
@@ -1749,13 +1890,13 @@ private extension Array where Element == NoteInfo {
 
         // Step 3: Drop bundles with total < ballotDivisor
         let numBundles = bundleNotes.count
-        var surviving: [[NoteInfo]] = []
+        var surviving: [(total: UInt64, notes: [NoteInfo])] = []
         var eligibleWeight: UInt64 = 0
         var survivingNoteCount = 0
 
         for i in 0..<numBundles {
             if bundleTotals[i] >= Self.ballotDivisor {
-                surviving.append(bundleNotes[i])
+                surviving.append((bundleTotals[i], bundleNotes[i]))
                 // Quantize per bundle: VAN weight = floor(total / ballotDivisor) * ballotDivisor
                 eligibleWeight += (bundleTotals[i] / Self.ballotDivisor) * Self.ballotDivisor
                 survivingNoteCount += bundleNotes[i].count
@@ -1765,13 +1906,18 @@ private extension Array where Element == NoteInfo {
 
         // Step 5: Re-sort notes within each surviving bundle by position
         for i in 0..<surviving.count {
-            surviving[i].sort { $0.position < $1.position }
+            surviving[i].notes.sort { $0.position < $1.position }
         }
 
-        // Step 6: Sort surviving bundles by their minimum note position
-        surviving.sort { ($0.first?.position ?? .max) < ($1.first?.position ?? .max) }
+        // Step 6: Sort surviving bundles by total value DESC (min position as tiebreaker).
+        // This ensures bundle 0 is always the most valuable, enabling users to skip
+        // low-value trailing bundles during Keystone signing.
+        surviving.sort { lhs, rhs in
+            if lhs.total != rhs.total { return lhs.total > rhs.total }
+            return (lhs.notes.first?.position ?? .max) < (rhs.notes.first?.position ?? .max)
+        }
 
-        return BundleResult(bundles: surviving, eligibleWeight: eligibleWeight, droppedCount: droppedCount)
+        return BundleResult(bundles: surviving.map(\.notes), eligibleWeight: eligibleWeight, droppedCount: droppedCount)
     }
 }
 
@@ -1787,4 +1933,23 @@ private func dataFromHex(_ hex: String) -> Data {
         idx = next
     }
     return data
+}
+
+// MARK: - Skip Bundles Alert
+
+extension AlertState where Action == Voting.Action {
+    static func confirmSkip(lockedIn: String, givingUp: String) -> AlertState {
+        AlertState {
+            TextState("Skip Remaining Bundles?")
+        } actions: {
+            ButtonState(role: .destructive, action: .skipRemainingKeystoneBundlesConfirmed) {
+                TextState("Skip")
+            }
+            ButtonState(role: .cancel, action: .skipBundlesAlert(.dismiss)) {
+                TextState("Cancel")
+            }
+        } message: {
+            TextState("You will lock in \(lockedIn) ZEC from signed bundles and give up \(givingUp) ZEC. This cannot be undone for this round.")
+        }
+    }
 }

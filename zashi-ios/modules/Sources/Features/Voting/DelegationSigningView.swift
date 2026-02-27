@@ -17,7 +17,6 @@ struct DelegationSigningView: View {
             VStack(spacing: 0) {
                 ScrollView {
                     transactionSummary()
-                    noteVerificationSection()
                 }
                 .padding(.vertical, 1)
 
@@ -33,6 +32,12 @@ struct DelegationSigningView: View {
             store.send(.delegationRejected)
         }
         .navigationBarBackButtonHidden()
+        .alert(
+            store: store.scope(
+                state: \.$skipBundlesAlert,
+                action: \.skipBundlesAlert
+            )
+        )
     }
 
     // MARK: - Transaction Summary (matches SendConfirmation layout)
@@ -48,6 +53,14 @@ struct DelegationSigningView: View {
 
                 Text("\(store.votingWeightZECString) ZEC")
                     .zFont(.semiBold, size: 28, style: Design.Text.primary)
+
+                // Show per-bundle ZEC for Keystone multi-bundle so the user
+                // understands why Keystone displays a smaller amount.
+                if let bundleZec = store.currentBundleZECString {
+                    Text("Bundle \(store.currentKeystoneBundleIndex + 1) of \(store.bundleCount): \(bundleZec) ZEC")
+                        .zFont(.medium, size: 14, style: Design.Text.tertiary)
+                        .padding(.top, 4)
+                }
 
                 Text("Authorize a hotkey to vote on your behalf")
                     .zFont(.medium, size: 14, style: Design.Text.tertiary)
@@ -110,9 +123,10 @@ struct DelegationSigningView: View {
 
     @ViewBuilder
     private func memoSection() -> some View {
-        // Use raw note sum (not quantized votingWeight) to match the Rust-side memo
-        let rawWeight = store.walletNotes.reduce(UInt64(0)) { $0 + $1.value }
-        let zec = Double(rawWeight) / 100_000_000.0
+        // Use raw note sum (not quantized votingWeight) to match the Rust-side memo.
+        // For Keystone multi-bundle, uses only the current bundle's notes so the
+        // memo matches what Keystone displays.
+        let zec = Double(store.memoWeightZatoshi) / 100_000_000.0
         let memoAmount = String(format: "%.8f", zec)
 
         VStack(alignment: .leading, spacing: 6) {
@@ -254,42 +268,42 @@ struct DelegationSigningView: View {
             && store.noteWitnessResults.allSatisfy(\.verified)
 
         if store.isKeystoneUser {
-            switch store.keystoneSigningStatus {
-            case .idle:
-                ZashiButton("Confirm with Keystone") {
-                    store.send(.delegationApproved)
-                }
-                .disabled(!witnessReady)
-                .opacity(witnessReady ? 1.0 : 0.5)
+            VStack(spacing: 8) {
+                switch store.keystoneSigningStatus {
+                case .idle:
+                    ZashiButton("Confirm with Keystone") {
+                        store.send(.delegationApproved)
+                    }
+                    .disabled(!witnessReady)
+                    .opacity(witnessReady ? 1.0 : 0.5)
 
-            case .preparingRequest:
-                ZashiButton("Preparing Keystone request...") { }
-                    .disabled(true)
-                    .opacity(0.5)
+                case .preparingRequest:
+                    ZashiButton("Preparing Keystone request...") { }
+                        .disabled(true)
+                        .opacity(0.5)
 
-            case .awaitingSignature:
-                VStack(spacing: 8) {
+                case .awaitingSignature:
                     ZashiButton("Scan Signed Keystone QR") {
                         store.send(.openKeystoneSignatureScan)
                     }
-                    ZashiButton("Rebuild Keystone Request", type: .ghost) {
-                        store.send(.retryKeystoneSigning)
-                    }
-                }
 
-            case .parsingSignature:
-                ZashiButton("Processing Keystone signature...") { }
-                    .disabled(true)
-                    .opacity(0.5)
+                case .parsingSignature:
+                    ZashiButton("Processing Keystone signature...") { }
+                        .disabled(true)
+                        .opacity(0.5)
 
-            case .failed:
-                VStack(spacing: 8) {
+                case .failed:
                     ZashiButton("Retry Keystone Request") {
                         store.send(.retryKeystoneSigning)
                     }
                     ZashiButton("Scan Signed Keystone QR", type: .ghost) {
                         store.send(.openKeystoneSignatureScan)
                     }
+                }
+
+                // Skip remaining bundles — only shown after at least one bundle is signed
+                if !store.keystoneBundleSignatures.isEmpty && store.bundleCount > 1 {
+                    skipRemainingBundlesButton()
                 }
             }
         } else {
@@ -301,11 +315,28 @@ struct DelegationSigningView: View {
         }
     }
 
+    // MARK: - Skip Remaining Bundles
+
+    @ViewBuilder
+    private func skipRemainingBundlesButton() -> some View {
+        let signed = store.keystoneBundleSignatures.count
+        let remaining = Int(store.bundleCount) - signed
+
+        ZashiButton("Skip Remaining \(remaining) Bundle\(remaining == 1 ? "" : "s")", type: .ghost) {
+            store.send(.skipRemainingKeystoneBundles)
+        }
+    }
+
     // MARK: - Keystone
 
     @ViewBuilder
     private func keystoneSigningSection() -> some View {
         VStack(alignment: .leading, spacing: 10) {
+            if store.bundleCount > 1 {
+                Text("Bundle \(store.currentKeystoneBundleIndex + 1) of \(store.bundleCount)")
+                    .zFont(.semiBold, size: 14, style: Design.Text.primary)
+            }
+
             switch store.keystoneSigningStatus {
             case .idle:
                 Text("Generate the delegation signing request to continue on Keystone.")

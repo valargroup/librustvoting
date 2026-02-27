@@ -114,12 +114,18 @@ extension VotingCryptoClient: DependencyKey {
                 let db = try await dbActor.database()
                 try db.clearRound(roundId: roundId)
             },
-            getWalletNotes: { walletDbPath, snapshotHeight, networkId in
+            deleteSkippedBundles: { roundId, keepCount in
+                let db = try await dbActor.database()
+                _ = try db.deleteSkippedBundles(roundId: roundId, keepCount: keepCount)
+            },
+            getWalletNotes: { walletDbPath, snapshotHeight, networkId, seedFingerprint, accountIndex in
                 let db = try await dbActor.database()
                 let ffiNotes = try db.getWalletNotes(
                     walletDbPath: walletDbPath,
                     snapshotHeight: snapshotHeight,
-                    networkId: networkId
+                    networkId: networkId,
+                    seedFingerprint: seedFingerprint.map { Data($0) },
+                    accountIndex: accountIndex
                 )
                 return ffiNotes.map {
                     NoteInfo(

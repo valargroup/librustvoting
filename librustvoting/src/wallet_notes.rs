@@ -12,6 +12,11 @@ use crate::types::{ct_option_to_result, NoteInfo, VotingError};
 /// Open the Zcash wallet SQLite DB read-only and return all Orchard notes
 /// that were received and unspent at the given snapshot block height.
 ///
+/// When `seed_fingerprint` and `account_index` are provided, only notes
+/// belonging to that specific account are returned. Without these filters,
+/// notes from ALL accounts are returned (legacy behavior used by
+/// `build_and_prove_delegation` which filters by stored bundle positions).
+///
 /// Returns full note data including the raw fields needed to reconstruct
 /// `orchard::Note` objects for the delegation proof, plus the computed
 /// extracted note commitment (cmx).
@@ -19,6 +24,8 @@ pub fn get_wallet_notes_at_snapshot(
     wallet_db_path: &str,
     snapshot_height: u64,
     network_id: u32,
+    seed_fingerprint: Option<&[u8]>,
+    account_index: Option<u32>,
 ) -> Result<Vec<NoteInfo>, VotingError> {
     let network = match network_id {
         0 => Network::MainNetwork,
@@ -40,48 +47,72 @@ pub fn get_wallet_notes_at_snapshot(
         message: format!("failed to open wallet db: {e}"),
     })?;
 
+    // Build the account filter clause when seed_fingerprint + account_index are provided
+    let account_filter = if seed_fingerprint.is_some() && account_index.is_some() {
+        " AND accounts.hd_seed_fingerprint = :seed_fp AND accounts.hd_account_index = :account_idx"
+    } else {
+        ""
+    };
+
+    let sql = format!(
+        "SELECT rn.diversifier, rn.value, rn.rho, rn.rseed, rn.nf,
+                rn.commitment_tree_position, rn.recipient_key_scope,
+                accounts.ufvk
+         FROM orchard_received_notes rn
+         JOIN transactions t_recv ON t_recv.id_tx = rn.transaction_id
+         JOIN accounts ON accounts.id = rn.account_id
+         WHERE t_recv.mined_height IS NOT NULL
+           AND t_recv.mined_height <= :snapshot_height
+           AND rn.nf IS NOT NULL
+           AND rn.commitment_tree_position IS NOT NULL
+           AND rn.recipient_key_scope IN (0, 1)
+           AND accounts.ufvk IS NOT NULL{account_filter}
+           AND rn.id NOT IN (
+               SELECT rns.orchard_received_note_id
+               FROM orchard_received_note_spends rns
+               JOIN transactions t_spend ON t_spend.id_tx = rns.transaction_id
+               WHERE t_spend.mined_height IS NOT NULL
+                 AND t_spend.mined_height <= :snapshot_height
+           )
+         ORDER BY rn.commitment_tree_position"
+    );
+
     let mut stmt = conn
-        .prepare(
-            "SELECT rn.diversifier, rn.value, rn.rho, rn.rseed, rn.nf,
-                    rn.commitment_tree_position, rn.recipient_key_scope,
-                    accounts.ufvk
-             FROM orchard_received_notes rn
-             JOIN transactions t_recv ON t_recv.id_tx = rn.transaction_id
-             JOIN accounts ON accounts.id = rn.account_id
-             WHERE t_recv.mined_height IS NOT NULL
-               AND t_recv.mined_height <= :snapshot_height
-               AND rn.nf IS NOT NULL
-               AND rn.commitment_tree_position IS NOT NULL
-               AND rn.recipient_key_scope IN (0, 1)
-               AND accounts.ufvk IS NOT NULL
-               AND rn.id NOT IN (
-                   SELECT rns.orchard_received_note_id
-                   FROM orchard_received_note_spends rns
-                   JOIN transactions t_spend ON t_spend.id_tx = rns.transaction_id
-                   WHERE t_spend.mined_height IS NOT NULL
-                     AND t_spend.mined_height <= :snapshot_height
-               )
-             ORDER BY rn.commitment_tree_position",
-        )
+        .prepare(&sql)
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare query: {e}"),
         })?;
 
-    let rows = stmt
-        .query_map(&[(":snapshot_height", &(snapshot_height as i64))], |row| {
-            let diversifier: Vec<u8> = row.get(0)?;
-            let value: i64 = row.get(1)?;
-            let rho: Vec<u8> = row.get(2)?;
-            let rseed: Vec<u8> = row.get(3)?;
-            let nf: Vec<u8> = row.get(4)?;
-            let position: i64 = row.get(5)?;
-            let scope_code: i32 = row.get(6)?;
-            let ufvk_str: String = row.get(7)?;
-            Ok((diversifier, value as u64, rho, rseed, nf, position as u64, scope_code as u32, ufvk_str))
-        })
-        .map_err(|e| VotingError::Internal {
-            message: format!("query failed: {e}"),
-        })?;
+    let row_mapper = |row: &rusqlite::Row<'_>| {
+        let diversifier: Vec<u8> = row.get(0)?;
+        let value: i64 = row.get(1)?;
+        let rho: Vec<u8> = row.get(2)?;
+        let rseed: Vec<u8> = row.get(3)?;
+        let nf: Vec<u8> = row.get(4)?;
+        let position: i64 = row.get(5)?;
+        let scope_code: i32 = row.get(6)?;
+        let ufvk_str: String = row.get(7)?;
+        Ok((diversifier, value as u64, rho, rseed, nf, position as u64, scope_code as u32, ufvk_str))
+    };
+
+    let rows = if let (Some(fp), Some(idx)) = (seed_fingerprint, account_index) {
+        stmt.query_map(
+            &[
+                (":snapshot_height", &(snapshot_height as i64) as &dyn rusqlite::types::ToSql),
+                (":seed_fp", &fp as &dyn rusqlite::types::ToSql),
+                (":account_idx", &(idx as i64) as &dyn rusqlite::types::ToSql),
+            ],
+            row_mapper,
+        )
+    } else {
+        stmt.query_map(
+            &[(":snapshot_height", &(snapshot_height as i64) as &dyn rusqlite::types::ToSql)],
+            row_mapper,
+        )
+    }
+    .map_err(|e| VotingError::Internal {
+        message: format!("query failed: {e}"),
+    })?;
 
     let mut notes = Vec::new();
     for row_result in rows {
@@ -232,7 +263,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let notes = get_wallet_notes_at_snapshot(path.to_str().unwrap(), 1000, 0).unwrap();
+        let notes = get_wallet_notes_at_snapshot(path.to_str().unwrap(), 1000, 0, None, None).unwrap();
         assert!(notes.is_empty());
 
         let _ = std::fs::remove_file(&path);
@@ -312,7 +343,7 @@ mod tests {
         drop(conn);
 
         // Snapshot at height 1000 — note was spent at 800, so should be excluded
-        let notes = get_wallet_notes_at_snapshot(path.to_str().unwrap(), 1000, 0).unwrap();
+        let notes = get_wallet_notes_at_snapshot(path.to_str().unwrap(), 1000, 0, None, None).unwrap();
         assert!(notes.is_empty(), "spent note should be excluded");
 
         let _ = std::fs::remove_file(&path);
@@ -375,7 +406,7 @@ mod tests {
         drop(conn);
 
         // Snapshot at height 1000 — note received at 1500 should be excluded
-        let notes = get_wallet_notes_at_snapshot(path.to_str().unwrap(), 1000, 0).unwrap();
+        let notes = get_wallet_notes_at_snapshot(path.to_str().unwrap(), 1000, 0, None, None).unwrap();
         assert!(notes.is_empty(), "future note should be excluded");
 
         let _ = std::fs::remove_file(&path);
@@ -458,7 +489,7 @@ mod tests {
         // Snapshot at 1000 — note was spent at 1500 (after snapshot) so it should be included.
         // This will error at cmx computation (dummy UFVK), but that confirms the SQL
         // correctly returns the row.
-        let result = get_wallet_notes_at_snapshot(path.to_str().unwrap(), 1000, 0);
+        let result = get_wallet_notes_at_snapshot(path.to_str().unwrap(), 1000, 0, None, None);
         assert!(
             result.is_err(),
             "should fail at UFVK decode (proves the row was returned by the query)"

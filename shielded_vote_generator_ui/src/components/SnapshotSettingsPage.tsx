@@ -213,8 +213,10 @@ export function SnapshotSettingsPage() {
               <div>
                 <p className="text-xs text-danger font-semibold">Active voting round detected</p>
                 <p className="text-[10px] text-danger/80 mt-0.5">
-                  Rebuilding the snapshot will make the PIR server unavailable — voters will be unable
-                  to cast votes during this time (~5–10 minutes). Proceed with caution.
+                  Rebuilding at a different height will <strong>permanently break</strong> the active round —
+                  the new tree root won't match the root committed on-chain, so all delegation proofs will
+                  fail. To recover you must rebuild at the original snapshot height ({status?.height?.toLocaleString()}).
+                  The PIR server will also be unavailable during the rebuild (~5–10 minutes).
                 </p>
               </div>
             </div>

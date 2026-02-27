@@ -26,12 +26,17 @@ public struct VotingCryptoClient {
     public var getVotes: @Sendable (_ roundId: String) async throws -> [VoteRecord]
     public var listRounds: @Sendable () async throws -> [RoundSummaryInfo]
     public var clearRound: @Sendable (_ roundId: String) async throws -> Void
+    /// Delete bundle rows with index >= keepCount, removing skipped bundles
+    /// so that proof_generated only considers signed+proven bundles.
+    public var deleteSkippedBundles: @Sendable (_ roundId: String, _ keepCount: UInt32) async throws -> Void
 
     // --- Wallet notes ---
     public var getWalletNotes: @Sendable (
         _ walletDbPath: String,
         _ snapshotHeight: UInt64,
-        _ networkId: UInt32
+        _ networkId: UInt32,
+        _ seedFingerprint: [UInt8]?,
+        _ accountIndex: UInt32?
     ) async throws -> [NoteInfo]
 
     // --- Bundle management ---

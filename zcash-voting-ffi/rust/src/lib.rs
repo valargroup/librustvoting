@@ -630,6 +630,12 @@ impl VotingDatabase {
         Ok(self.db.clear_round(&round_id)?)
     }
 
+    /// Delete bundle rows with index >= `keep_count`, removing skipped bundles
+    /// so that `proof_generated` only considers signed+proven bundles.
+    pub fn delete_skipped_bundles(&self, round_id: String, keep_count: u32) -> Result<u64, VotingError> {
+        Ok(self.db.delete_skipped_bundles(&round_id, keep_count)?)
+    }
+
     // --- Wallet notes ---
 
     pub fn get_wallet_notes(
@@ -637,10 +643,18 @@ impl VotingDatabase {
         wallet_db_path: String,
         snapshot_height: u64,
         network_id: u32,
+        seed_fingerprint: Option<Vec<u8>>,
+        account_index: Option<u32>,
     ) -> Result<Vec<NoteInfo>, VotingError> {
         Ok(self
             .db
-            .get_wallet_notes(&wallet_db_path, snapshot_height, network_id)?
+            .get_wallet_notes(
+                &wallet_db_path,
+                snapshot_height,
+                network_id,
+                seed_fingerprint.as_deref(),
+                account_index,
+            )?
             .into_iter()
             .map(Into::into)
             .collect())

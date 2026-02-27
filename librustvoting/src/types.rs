@@ -367,11 +367,13 @@ pub struct ChunkResult {
 /// 2. Fill bundles sequentially to capacity (5 notes each)
 /// 3. Drop bundles with total < BALLOT_DIVISOR
 /// 4. Re-sort notes within each surviving bundle by position
-/// 5. Sort surviving bundles by their minimum note position
+/// 5. Sort surviving bundles by total value DESC (min position as tiebreaker)
 ///
 /// Sequential packing concentrates high-value notes in early bundles, maximizing
 /// per-bundle VAN weight and minimizing quantization loss. Dust notes naturally
 /// end up in the last (smallest) bundle which gets dropped if below threshold.
+/// Value-descending bundle order lets Keystone users sign the most valuable
+/// bundles first and optionally skip the remaining low-value ones.
 pub fn chunk_notes(notes: &[NoteInfo]) -> ChunkResult {
     use crate::governance::BALLOT_DIVISOR;
 
@@ -404,7 +406,7 @@ pub fn chunk_notes(notes: &[NoteInfo]) -> ChunkResult {
 
     // Step 3: Drop bundles with total < BALLOT_DIVISOR
     let total_notes: usize = bundle_notes.iter().map(|b| b.len()).sum();
-    let mut surviving: Vec<Vec<NoteInfo>> = Vec::new();
+    let mut surviving: Vec<(u64, Vec<NoteInfo>)> = Vec::new();
     let mut eligible_weight: u64 = 0;
     let mut surviving_notes: usize = 0;
 
@@ -413,18 +415,27 @@ pub fn chunk_notes(notes: &[NoteInfo]) -> ChunkResult {
             surviving_notes += bundle.len();
             // Quantize per bundle: VAN weight = floor(total / BALLOT_DIVISOR) * BALLOT_DIVISOR
             eligible_weight += (bundle_totals[i] / BALLOT_DIVISOR) * BALLOT_DIVISOR;
-            surviving.push(bundle);
+            surviving.push((bundle_totals[i], bundle));
         }
     }
     let dropped_count = total_notes - surviving_notes;
 
     // Step 5: Re-sort notes within each surviving bundle by position
-    for bundle in &mut surviving {
+    for (_, bundle) in &mut surviving {
         bundle.sort_by_key(|n| n.position);
     }
 
-    // Step 6: Sort surviving bundles by their minimum note position
-    surviving.sort_by_key(|bundle| bundle.first().map(|n| n.position).unwrap_or(u64::MAX));
+    // Step 6: Sort surviving bundles by total value DESC (min position as tiebreaker).
+    // This ensures bundle 0 is always the most valuable, enabling users to skip
+    // low-value trailing bundles during Keystone signing.
+    surviving.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            let a_pos = a.1.first().map(|n| n.position).unwrap_or(u64::MAX);
+            let b_pos = b.1.first().map(|n| n.position).unwrap_or(u64::MAX);
+            a_pos.cmp(&b_pos)
+        })
+    });
+    let surviving: Vec<Vec<NoteInfo>> = surviving.into_iter().map(|(_, b)| b).collect();
 
     ChunkResult {
         bundles: surviving,
@@ -553,20 +564,61 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_notes_bundles_sorted_by_min_position() {
+    fn test_chunk_notes_bundles_sorted_by_value_desc() {
+        // 8 equal-value notes → 2 bundles with same total.
+        // Tiebreaker: min position ASC, so bundle with positions 0-4 comes first.
         let notes: Vec<NoteInfo> = (0..8).map(|i| make_note(15_000_000, i)).collect();
         let result = chunk_notes(&notes);
+        assert_eq!(result.bundles.len(), 2);
+        let totals: Vec<u64> = result
+            .bundles
+            .iter()
+            .map(|b| b.iter().map(|n| n.value).sum())
+            .collect();
+        assert!(
+            totals[0] >= totals[1],
+            "bundle 0 total ({}) must be >= bundle 1 total ({})",
+            totals[0],
+            totals[1]
+        );
+        // Equal totals — tiebreaker is min position
         let min_positions: Vec<u64> = result
             .bundles
             .iter()
             .map(|b| b.first().unwrap().position)
             .collect();
-        for window in min_positions.windows(2) {
-            assert!(
-                window[0] < window[1],
-                "bundles must be sorted by minimum position"
-            );
+        assert!(
+            min_positions[0] < min_positions[1],
+            "equal-total bundles should be ordered by min position"
+        );
+    }
+
+    #[test]
+    fn test_chunk_notes_largest_bundle_first() {
+        // Mix of high and low-value notes. Bundle 0 should be the most valuable.
+        // 5 large notes (50M each, pos 10-14) + 5 medium notes (13M each, pos 0-4)
+        // Bundle 0 (sorted by value DESC): [50M×5] = 250M
+        // Bundle 1: [13M×5] = 65M
+        // After value-DESC sort: bundle 0 (250M) before bundle 1 (65M).
+        let mut notes = Vec::new();
+        for i in 0..5 {
+            notes.push(make_note(50_000_000, 10 + i));
         }
+        for i in 0..5 {
+            notes.push(make_note(13_000_000, i));
+        }
+        let result = chunk_notes(&notes);
+        assert_eq!(result.bundles.len(), 2);
+        let total_0: u64 = result.bundles[0].iter().map(|n| n.value).sum();
+        let total_1: u64 = result.bundles[1].iter().map(|n| n.value).sum();
+        assert_eq!(total_0, 250_000_000);
+        assert_eq!(total_1, 65_000_000);
+        assert!(
+            total_0 > total_1,
+            "bundle 0 must have higher total than bundle 1"
+        );
+        // Despite bundle 1 having earlier positions (0-4), bundle 0 (positions 10-14)
+        // comes first because value takes priority over position.
     }
 
     #[test]
