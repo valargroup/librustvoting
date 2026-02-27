@@ -1702,6 +1702,7 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
   // Pending validator registrations.
   const [pendingRegistrations, setPendingRegistrations] = useState<chainApi.PendingRegistration[]>([]);
   const [approvingAddr, setApprovingAddr] = useState<string | null>(null);
+  const [rejectingAddr, setRejectingAddr] = useState<string | null>(null);
   const [approveAmounts, setApproveAmounts] = useState<Record<string, string>>({});
   const [approveResult, setApproveResult] = useState<{ addr: string; ok: boolean; msg: string } | null>(null);
 
@@ -1830,7 +1831,7 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
       });
 
       // 2. Fund the validator on-chain.
-      const amount = approveAmounts[reg.operator_address] || "1000000";
+      const amount = approveAmounts[reg.operator_address] || "10000000";
       const base = chainApi.getApiBase();
       const fundRes = await cosmosTx.fundValidator(base, wallet.signer, reg.operator_address, amount);
       if (fundRes.code !== 0) {
@@ -1855,6 +1856,38 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
       });
     } finally {
       setApprovingAddr(null);
+    }
+  };
+
+  // Reject a pending registration: sign rejection, call edge function to remove from pending.
+  const handleRejectRegistration = async (reg: chainApi.PendingRegistration) => {
+    if (!wallet.address || !wallet.signer) return;
+    setRejectingAddr(reg.operator_address);
+    setApproveResult(null);
+    try {
+      const rejectPayload = { action: "reject" as const, operator_address: reg.operator_address };
+      const payloadStr = JSON.stringify(rejectPayload);
+      const sig = await wallet.signPayload(payloadStr);
+      await chainApi.rejectRegistration({
+        payload: rejectPayload,
+        signature: sig.signature,
+        pubKey: sig.pubKey,
+        signerAddress: wallet.address,
+      });
+      setApproveResult({
+        addr: reg.operator_address,
+        ok: true,
+        msg: "Registration rejected",
+      });
+      fetchValidators(); // refresh
+    } catch (err) {
+      setApproveResult({
+        addr: reg.operator_address,
+        ok: false,
+        msg: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setRejectingAddr(null);
     }
   };
 
@@ -2004,7 +2037,7 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
                         <div className="flex items-center gap-1.5">
                           <input
                             type="text"
-                            value={approveAmounts[reg.operator_address] ?? "1000000"}
+                            value={approveAmounts[reg.operator_address] ?? "10000000"}
                             onChange={(e) =>
                               setApproveAmounts((prev) => ({
                                 ...prev,
@@ -2016,19 +2049,36 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
                           />
                           <span className="text-[9px] text-text-muted">uzvote</span>
                         </div>
-                        <button
-                          className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-accent/90 hover:bg-accent text-surface-0 text-[10px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
-                          disabled={approvingAddr === reg.operator_address}
-                          onClick={() => handleApproveRegistration(reg)}
-                        >
-                          {approvingAddr === reg.operator_address ? (
-                            <>
-                              <Loader2 size={10} className="animate-spin" /> Approving…
-                            </>
-                          ) : (
-                            "Approve & Fund"
-                          )}
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-accent/90 hover:bg-accent text-surface-0 text-[10px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                            disabled={approvingAddr === reg.operator_address || rejectingAddr === reg.operator_address}
+                            onClick={() => handleApproveRegistration(reg)}
+                          >
+                            {approvingAddr === reg.operator_address ? (
+                              <>
+                                <Loader2 size={10} className="animate-spin" /> Approving…
+                              </>
+                            ) : (
+                              "Approve & Fund"
+                            )}
+                          </button>
+                          <button
+                            className="flex items-center gap-1 px-2 py-1 rounded-md bg-danger/15 hover:bg-danger/25 text-danger text-[10px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                            disabled={approvingAddr === reg.operator_address || rejectingAddr === reg.operator_address}
+                            onClick={() => handleRejectRegistration(reg)}
+                          >
+                            {rejectingAddr === reg.operator_address ? (
+                              <>
+                                <Loader2 size={10} className="animate-spin" /> Rejecting…
+                              </>
+                            ) : (
+                              <>
+                                <Trash2 size={10} /> Reject
+                              </>
+                            )}
+                          </button>
+                        </div>
                       </div>
                     </div>
                     {approveResult?.addr === reg.operator_address && (

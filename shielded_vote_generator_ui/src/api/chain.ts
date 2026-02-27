@@ -394,7 +394,7 @@ export async function getPendingRegistrations(): Promise<PendingRegistration[]> 
 }
 
 export interface ApproveRegistrationParams {
-  payload: { action: "approve"; operator_address: string };
+  payload: { action: "approve" | "reject"; operator_address: string };
   signature: string;
   pubKey: string;
   signerAddress: string;
@@ -405,6 +405,18 @@ export interface ApproveRegistrationParams {
  * Moves the entry from pending-registrations to vote_servers in voting-config.
  */
 export async function approveRegistration(params: ApproveRegistrationParams): Promise<{ status: string }> {
+  return fetchJson<{ status: string }>("/api/approve-registration", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+}
+
+/**
+ * Reject a pending validator registration (vote-manager only).
+ * Removes the entry from pending-registrations without adding to vote_servers.
+ */
+export async function rejectRegistration(params: ApproveRegistrationParams): Promise<{ status: string }> {
   return fetchJson<{ status: string }>("/api/approve-registration", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
