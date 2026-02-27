@@ -17,8 +17,8 @@ use rand::RngCore;
 use crate::keys::{FullViewingKey, Scope, SpendAuthorizingKey, SpendingKey};
 
 use super::circuit::{
-    shares_hash, van_integrity_hash, van_nullifier_hash, vote_commitment_hash, Circuit, Instance,
-    VOTE_COMM_TREE_DEPTH,
+    share_commitment, shares_hash, van_integrity_hash, van_nullifier_hash, vote_commitment_hash,
+    Circuit, Instance, VOTE_COMM_TREE_DEPTH,
 };
 use super::prove::create_vote_proof;
 use super::{base_to_scalar, spend_auth_g_affine};
@@ -59,13 +59,17 @@ pub struct VoteProofBundle {
     /// and must be used for reveal-share payloads.
     pub encrypted_shares: [EncryptedShareOutput; 16],
     /// Poseidon hash of all encrypted share x-coordinates.
-    /// Intermediate value: vote_commitment = H(DOMAIN_VC, shares_hash, proposal_id, vote_decision).
+    /// Intermediate value: vote_commitment = H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision).
     /// Needed by the helper server to verify share payloads.
     pub shares_hash: pallas::Base,
     /// Per-share blind factors for blinded commitments.
     /// share_comm_i = Poseidon(blind_i, c1_i_x, c2_i_x).
-    /// Sent to the helper server alongside shares so it can build ZKP #3.
     pub share_blinds: [pallas::Base; 16],
+    /// Pre-computed per-share Poseidon commitments.
+    /// share_comm_i = Poseidon(blind_i, c1_i_x, c2_i_x).
+    /// Provided as public inputs to ZKP #3 (share reveal) so the helper
+    /// server only needs the primary share's blind, not all 16.
+    pub share_comms: [pallas::Base; 16],
 }
 
 /// Errors that can occur during vote proof construction.
@@ -315,6 +319,9 @@ pub fn build_vote_proof_from_delegation(
     }
 
     let share_blinds: [pallas::Base; 16] = core::array::from_fn(|_| random_valid_base_as_scalar(rng));
+    let share_comms: [pallas::Base; 16] = core::array::from_fn(|i| {
+        share_commitment(share_blinds[i], enc_c1_x[i], enc_c2_x[i])
+    });
     let shares_hash_val = shares_hash(share_blinds, enc_c1_x, enc_c2_x);
 
     // ---- Condition 4: r_vpk = ak + [alpha_v] * G ----
@@ -330,7 +337,7 @@ pub fn build_vote_proof_from_delegation(
     let proposal_id_base = pallas::Base::from(proposal_id);
     let vote_decision_base = pallas::Base::from(vote_decision);
     let vote_commitment =
-        vote_commitment_hash(shares_hash_val, proposal_id_base, vote_decision_base);
+        vote_commitment_hash(voting_round_id, shares_hash_val, proposal_id_base, vote_decision_base);
 
     // ---- Vote commitment tree root (from auth path) ----
     // Recompute the root from the leaf + auth path to set as public input.
@@ -425,5 +432,6 @@ pub fn build_vote_proof_from_delegation(
         encrypted_shares: enc_share_outputs,
         shares_hash: shares_hash_val,
         share_blinds,
+        share_comms,
     })
 }

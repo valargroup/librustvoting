@@ -294,7 +294,7 @@ This is a deliberate choice. Three properties make the attack infeasible in our 
 
 2. **Consensus-gated insertion.** Only `MsgDelegateVote` and `MsgCastVote` can append leaves, and both require valid ZKPs verified on-chain. An attacker cannot insert an arbitrary field element as a leaf — they must produce a valid delegation proof (ZKP #1) or vote proof (ZKP #2).
 
-3. **Domain-separated commitments with randomness.** Leaves are `Poseidon(DOMAIN_VAN, hotkey, weight, round, authority, rand)` or `Poseidon(DOMAIN_VC, shares_hash, proposal_id, decision)`. The probability that such a commitment collides with an internal node value `Poseidon(left_child, right_child)` is ~1/2^254 (negligible over the Pallas field).
+3. **Domain-separated commitments with randomness.** Leaves are `Poseidon(DOMAIN_VAN, hotkey, weight, round, authority, rand)` or `Poseidon(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, decision)`. The probability that such a commitment collides with an internal node value `Poseidon(left_child, right_child)` is ~1/2^254 (negligible over the Pallas field).
 
 Property (1) alone is sufficient: even if an attacker could somehow produce a leaf equal to an internal node, the circuit would still require a 24-element path from that leaf to the root. The "reinterpret the tree at a different depth" attack is structurally impossible.
 
@@ -478,7 +478,7 @@ sequenceDiagram
     W->>W: Sync vote chain tree via TreeClient
     W->>W: Generate Merkle witness for VAN at index N
     W->>W: Build new VAN (proposal authority decremented)
-    W->>W: Build VC = Poseidon(DOMAIN_VC, shares_hash, proposal_id, decision)
+    W->>W: Build VC = Poseidon(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, decision)
     W->>W: Generate ZKP #2 (proves VAN in tree at root R1)
     W->>C: MsgCastVote { van_nullifier, new_VAN, VC, anchor_height=H1, proof }
     C->>C: Look up root at H1, verify it matches R1

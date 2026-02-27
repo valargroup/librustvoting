@@ -9,7 +9,6 @@ on:
     branches: [main]
     paths:
       - 'nullifier-ingest/**'
-      - 'sdk/deploy/Caddyfile'
   workflow_dispatch: # allow manual run
 
 permissions:
@@ -49,19 +48,23 @@ jobs:
             ${{ runner.os }}-nf-server-v2-nightly-2025-02-25-
 
       - name: Build release binary
-        run: cd nf-server && cargo build --release --features serve,avx512
+        run: cd nf-server && cargo build --release --target x86_64-unknown-linux-gnu --features serve,avx512
         working-directory: nullifier-ingest
         env:
-          RUSTFLAGS: "-C target-feature=+avx512f,+avx512bw,+avx512dq,+avx512cd,+avx512vl"
+          # Explicit --target separates host vs target compilation. Build
+          # scripts and proc-macros compile for the host (baseline x86-64),
+          # while target-specific RUSTFLAGS only apply to the actual binary.
+          # Without --target, RUSTFLAGS poison build scripts too → SIGILL on
+          # runners that lack AVX-512.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C target-feature=+avx512f,+avx512bw,+avx512dq,+avx512cd,+avx512vl"
 
       - name: Upload binary and config
         uses: actions/upload-artifact@v4
         with:
           name: nf-server-binaries
           path: |
-            nullifier-ingest/nf-server/target/release/nf-server
+            nullifier-ingest/nf-server/target/x86_64-unknown-linux-gnu/release/nf-server
             nullifier-ingest/docs/nullifier-query-server.service
-            sdk/deploy/Caddyfile
 
   deploy:
     name: Deploy to remote
@@ -75,9 +78,10 @@ jobs:
 
       - name: Flatten artifacts
         run: |
-          mv nullifier-ingest/nf-server/target/release/nf-server .
-          mv nullifier-ingest/docs/nullifier-query-server.service .
-          mv sdk/deploy/Caddyfile .
+          cp nf-server/target/x86_64-unknown-linux-gnu/release/nf-server /tmp/nf-server
+          cp docs/nullifier-query-server.service /tmp/nullifier-query-server.service
+          rm -rf nf-server docs
+          mv /tmp/nf-server /tmp/nullifier-query-server.service .
 
       - name: Deploy via SSH
         uses: appleboy/scp-action@v0.1.7
@@ -85,7 +89,7 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           password: ${{ secrets.SSH_PASSWORD }}
-          source: "nf-server,nullifier-query-server.service,Caddyfile"
+          source: "nf-server,nullifier-query-server.service"
           target: ${{ env.DEPLOY_PATH }}
 
       - name: Install config and restart services
@@ -100,5 +104,3 @@ jobs:
             sudo systemctl daemon-reload
             sudo systemctl enable nullifier-query-server
             sudo systemctl restart nullifier-query-server
-            sudo cp /opt/nullifier-ingest/Caddyfile /etc/caddy/Caddyfile
-            sudo systemctl reload caddy || true

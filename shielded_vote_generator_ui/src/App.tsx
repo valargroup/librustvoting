@@ -1694,6 +1694,7 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
   const [error, setError] = useState("");
   const [sortBy, setSortBy] = useState<"power" | "moniker">("power");
   const [ceremony, setCeremony] = useState<chainApi.CeremonyState | null>(null);
+  const [pallasKeys, setPallasKeys] = useState<Set<string>>(new Set());
   const [showAddModal, setShowAddModal] = useState(false);
   const [unjailing, setUnjailing] = useState<string | null>(null); // operator_address being unjailed
   const [unjailResult, setUnjailResult] = useState<{ addr: string; ok: boolean; msg: string } | null>(null);
@@ -1730,13 +1731,15 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
     setLoading(true);
     setError("");
     try {
-      const [valResp, ceremonyResp, vcResp] = await Promise.all([
+      const [valResp, ceremonyResp, pallasResp, vcResp] = await Promise.all([
         chainApi.getValidators(),
         chainApi.getCeremonyState().catch(() => null),
+        chainApi.getPallasKeys().catch(() => ({ validators: [] })),
         chainApi.getVotingConfig().catch(() => null),
       ]);
       setValidators(valResp.validators ?? []);
       setCeremony(ceremonyResp);
+      setPallasKeys(new Set(pallasResp.validators.map((v) => v.validator_address)));
       setVotingConfig(vcResp);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -1805,7 +1808,7 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
     fetchValidators();
   }, []);
 
-  // Build a set of ceremony validator addresses for cross-referencing.
+  // Build a set of per-round ceremony participants for cross-referencing.
   const ceremonyValidators = new Set(
     ceremony?.ceremony?.validators?.map((v) => v.validator_address) ?? []
   );
@@ -1884,7 +1887,7 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
         )}
 
         {/* Election authority notice */}
-        {ceremony?.ceremony?.validators && ceremony.ceremony.validators.length > 0 && (
+        {pallasKeys.size > 0 && (
           <div className="bg-accent/5 border border-accent/20 rounded-xl p-4 mb-6">
             <div className="flex items-center gap-2 mb-1">
               <ShieldCheck size={14} className="text-accent" />
@@ -1893,12 +1896,10 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
               </span>
             </div>
             <p className="text-[11px] text-text-secondary">
-              {ceremony.ceremony.validators.length} election authorit{ceremony.ceremony.validators.length !== 1 ? "ies" : "y"} can
-              help facilitate the tallying for the vote conclusion if they have the shield.
-              Authorities marked with <ShieldCheck size={10} className="text-accent inline" /> below have registered their Pallas key.
-            </p>
-            <p className="text-[10px] text-text-muted mt-2 italic">
-              In the future, the election authority key will be generated via DKG and threshold decrypted.
+              {pallasKeys.size} validator{pallasKeys.size !== 1 ? "s have" : " has"} registered
+              a Pallas key (<ShieldCheck size={10} className="text-accent inline" />) and {pallasKeys.size !== 1 ? "are" : "is"} eligible
+              to participate in EA key ceremonies.
+              {ceremonyValidators.size > 0 && <>{" "}Validators with <span className="text-[9px] px-1 py-0.5 rounded-full bg-accent/15 text-accent font-semibold">EA</span> are participating in the current round{"'"}s ceremony.</>}
             </p>
           </div>
         )}
@@ -1957,6 +1958,7 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
               totalPower > BigInt(0) && val.status === "BOND_STATUS_BONDED"
                 ? Number((BigInt(tokens) * BigInt(10000)) / totalPower) / 100
                 : 0;
+            const hasPallasKey = pallasKeys.has(val.operator_address ?? "");
             const isCeremonyParticipant = ceremonyValidators.has(val.operator_address ?? "");
 
             return (
@@ -1976,8 +1978,15 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
                       <span className="text-xs font-semibold text-text-primary truncate">
                         {moniker}
                       </span>
+                      {hasPallasKey && (
+                        <span title="Pallas key registered">
+                          <ShieldCheck size={12} className="text-accent shrink-0" />
+                        </span>
+                      )}
                       {isCeremonyParticipant && (
-                        <span title="Election authority"><ShieldCheck size={12} className="text-accent shrink-0" /></span>
+                        <span className="text-[8px] px-1.5 py-0.5 rounded-full bg-accent/15 text-accent font-semibold shrink-0" title="Participating in active round ceremony">
+                          EA
+                        </span>
                       )}
                       {val.jailed && (
                         <>

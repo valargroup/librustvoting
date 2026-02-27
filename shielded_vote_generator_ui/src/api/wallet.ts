@@ -70,6 +70,9 @@ function buildChainInfo(chainId: string, restUrl: string, rpcUrl: string): Keplr
  * For dev-mode proxy, pass the origin (window.location.origin) so that Keplr can
  * reach the node. `rpcUrl` is the Tendermint RPC endpoint (e.g. http://localhost:26657).
  */
+// Stored after successful Keplr connection so signArbitrary can use it.
+let keplrChainId = "";
+
 export async function connectKeplr(restUrl: string, rpcUrl: string): Promise<WalletConnection> {
   if (!window.keplr) {
     throw new Error("Keplr extension not found. Please install Keplr to connect your wallet.");
@@ -83,6 +86,7 @@ export async function connectKeplr(restUrl: string, rpcUrl: string): Promise<Wal
   const chainInfo = buildChainInfo(chainId, restUrl, rpcUrl);
   await window.keplr.experimentalSuggestChain(chainInfo);
   await window.keplr.enable(chainId);
+  keplrChainId = chainId;
 
   const signer = window.keplr.getOfflineSigner(chainId);
   const [account] = await signer.getAccounts();
@@ -168,8 +172,9 @@ export async function signArbitraryWithKeplr(
   if (!window.keplr) {
     throw new Error("Keplr not available");
   }
-  // Keplr signArbitrary uses chain_id="" internally for ADR-036.
-  const result = await window.keplr.signArbitrary("", signerAddress, data);
+  // Use the chain ID from the last successful connection. Keplr requires the
+  // chain to be enabled before signArbitrary works.
+  const result = await window.keplr.signArbitrary(keplrChainId, signerAddress, data);
   return {
     signature: result.signature,
     pubKey: result.pub_key.value,

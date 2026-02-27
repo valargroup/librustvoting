@@ -32,7 +32,9 @@ export function getApiBase(): string {
 }
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const base = apiBase();
+  // /api/* routes are Vercel Edge Functions served from the same origin —
+  // never prefix them with the chain URL.
+  const base = path.startsWith("/api/") ? "" : apiBase();
   const resp = await fetch(`${base}${path}`, init);
   if (!resp.ok) {
     const body = await resp.text();
@@ -277,6 +279,16 @@ export async function getValidators(): Promise<{ validators: Validator[]; pagina
   }
 
   return { validators: all };
+}
+
+export interface PallasKeyEntry {
+  validator_address: string;
+  pallas_pk: string; // base64
+}
+
+export async function getPallasKeys(): Promise<{ validators: PallasKeyEntry[] }> {
+  const resp = await fetchJson<{ validators?: PallasKeyEntry[] }>("/zally/v1/pallas-keys");
+  return { validators: resp.validators ?? [] };
 }
 
 // -- Snapshot management --

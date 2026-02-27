@@ -393,13 +393,6 @@ extension VotingAPIClient: DependencyKey {
                         serverURL = servers[0]
                     }
 
-                    let allEncSharesJSON: [[String: Any]] = payload.allEncShares.map { share in
-                        [
-                            "c1": share.c1.base64EncodedString(),
-                            "c2": share.c2.base64EncodedString(),
-                            "share_index": share.shareIndex
-                        ]
-                    }
                     let body: [String: Any] = [
                         "shares_hash": payload.sharesHash.base64EncodedString(),
                         "proposal_id": payload.proposalId,
@@ -412,8 +405,8 @@ extension VotingAPIClient: DependencyKey {
                         "share_index": payload.encShare.shareIndex,
                         "tree_position": payload.treePosition,
                         "vote_round_id": roundIdHex,
-                        "all_enc_shares": allEncSharesJSON,
-                        "share_blinds": payload.shareBlindFactors.map { $0.base64EncodedString() }
+                        "share_comms": payload.shareComms.map { $0.base64EncodedString() },
+                        "primary_blind": payload.primaryBlind.base64EncodedString()
                     ]
                     _ = try await postServerJSON(serverURL, "/api/v1/shares", body: body)
                 }

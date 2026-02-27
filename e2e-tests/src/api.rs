@@ -738,15 +738,31 @@ pub fn get_round_ea_pk(round_id_hex: &str) -> Option<Vec<u8>> {
     B64.decode(ea_pk_b64).ok()
 }
 
-/// Poll GET /zally/v1/round/{round_id_hex} until status equals expected or timeout.
+/// Poll GET /zally/v1/round/{round_id_hex} until status reaches expected or timeout.
+/// Accepts statuses that are "at or past" the expected status in the round lifecycle
+/// (PENDING → ACTIVE → TALLYING → FINALIZED), so fast transitions between polls
+/// don't cause spurious timeouts.
 pub fn wait_for_round_status(
     round_id_hex: &str,
     expected: i64,
     timeout_ms: u64,
     interval_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Round lifecycle order (proto enum values don't match lifecycle order).
+    // PENDING(4) → ACTIVE(1) → TALLYING(2) → FINALIZED(3)
+    fn lifecycle_rank(status: i64) -> i64 {
+        match status {
+            4 => 0, // PENDING
+            1 => 1, // ACTIVE
+            2 => 2, // TALLYING
+            3 => 3, // FINALIZED
+            _ => -1,
+        }
+    }
+
     let path = format!("/zally/v1/round/{}", round_id_hex);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let expected_rank = lifecycle_rank(expected);
     let mut polls = 0u32;
     while std::time::Instant::now() < deadline {
         let (_, json) = get_json(&path)?;
@@ -756,8 +772,8 @@ pub fn wait_for_round_status(
             .and_then(|s| s.as_i64())
             .unwrap_or(SESSION_STATUS_UNSPECIFIED);
         polls += 1;
-        if status == expected {
-            eprintln!("[E2E] Round {} reached status {} after {} poll(s)", round_id_hex, expected, polls);
+        if lifecycle_rank(status) >= expected_rank {
+            eprintln!("[E2E] Round {} reached status {} (wanted {}) after {} poll(s)", round_id_hex, status, expected, polls);
             return Ok(());
         }
         if polls == 1 || polls % 10 == 0 {
