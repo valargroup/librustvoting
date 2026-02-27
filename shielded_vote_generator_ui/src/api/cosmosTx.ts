@@ -18,7 +18,7 @@ import { TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx";
 import { SignMode } from "cosmjs-types/cosmos/tx/signing/v1beta1/signing";
 import type { BroadcastResult } from "./chain";
 
-const DEFAULT_GAS = "0";
+const DEFAULT_GAS = "200000";
 
 // ── Protobuf mini-writer ────────────────────────────────────────
 

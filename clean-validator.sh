@@ -23,8 +23,14 @@ done
 
 echo "=== Cleaning validator state ==="
 
-# Stop zallyd if running.
-if pgrep -x zallyd > /dev/null 2>&1; then
+# Stop zallyd — prefer systemd if a service is installed.
+if systemctl is-active --quiet zallyd 2>/dev/null; then
+  echo "Stopping zallyd systemd service..."
+  sudo systemctl stop zallyd
+  sudo systemctl disable zallyd
+  sudo rm -f /etc/systemd/system/zallyd.service
+  sudo systemctl daemon-reload
+elif pgrep -x zallyd > /dev/null 2>&1; then
   echo "Stopping zallyd..."
   pkill -x zallyd || true
   sleep 2
