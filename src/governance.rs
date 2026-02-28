@@ -6,7 +6,8 @@ use crate::types::VotingError;
 
 /// Maximum proposal authority — the default for a fresh delegation.
 /// Bitmask where each bit authorizes voting on the corresponding proposal.
-/// Full authority is 2^16 - 1 = 65535 (all 16 proposals authorized).
+/// Full authority is 2^16 - 1 = 65535. Only bits 1–15 are usable (proposal
+/// IDs are 1-indexed); bit 0 is the circuit sentinel, permanently set.
 pub(crate) const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
 
 /// Ballot divisor — must match `delegation::circuit::BALLOT_DIVISOR`.

@@ -25,7 +25,8 @@ use crate::types::{
 /// * `gov_comm_rand` - 32-byte VAN blinding factor (from DB).
 /// * `voting_round_id` - 32-byte voting round identifier (from DB, hex-decoded).
 /// * `ea_pk` - 32-byte compressed election authority public key.
-/// * `proposal_id` - Which proposal to vote on (0-15).
+/// * `proposal_id` - Which proposal to vote on (1-15, 1-indexed to match on-chain
+///   proposal IDs; bit 0 is the circuit's sentinel value and is always rejected).
 /// * `choice` - Vote decision index (0-indexed into the proposal's options).
 /// * `num_options` - Number of options declared for this proposal (2-8).
 /// * `van_auth_path` - 24 siblings for the VAN Merkle path in the vote commitment tree.
@@ -51,9 +52,12 @@ pub fn build_vote_commitment(
     progress: &dyn ProofProgressReporter,
 ) -> Result<VoteCommitmentBundle, VotingError> {
     validate_vote_decision(choice, num_options)?;
-    if proposal_id > 15 {
+    if proposal_id < 1 || proposal_id > 15 {
         return Err(VotingError::InvalidInput {
-            message: format!("proposal_id must be 0..15, got {}", proposal_id),
+            message: format!(
+                "proposal_id must be 1..15 (1-indexed, matching on-chain IDs; 0 is the circuit sentinel), got {}",
+                proposal_id
+            ),
         });
     }
     if van_auth_path.len() != VOTE_COMM_TREE_DEPTH {
@@ -240,7 +244,7 @@ mod tests {
             &[0u8; 32],
             &[0u8; 32],
             &[0u8; 32],
-            0,
+            1,
             3, // invalid choice (num_options=2)
             2,
             &[[0u8; 32]; 24],
@@ -253,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_vote_commitment_bad_proposal_id() {
+    fn test_build_vote_commitment_proposal_id_zero_rejected() {
         assert!(build_vote_commitment(
             &[0x42; 64],
             1,
@@ -262,7 +266,29 @@ mod tests {
             &[0u8; 32],
             &[0u8; 32],
             &[0u8; 32],
-            16, // invalid proposal_id
+            0, // sentinel value; circuit rejects via non-zero gate
+            0,
+            2,
+            &[[0u8; 32]; 24],
+            0,
+            1,
+            65535,
+            &TestReporter,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_build_vote_commitment_proposal_id_too_large() {
+        assert!(build_vote_commitment(
+            &[0x42; 64],
+            1,
+            0,
+            1_000_000,
+            &[0u8; 32],
+            &[0u8; 32],
+            &[0u8; 32],
+            16, // exceeds MAX_PROPOSAL_ID-1
             0,
             2,
             &[[0u8; 32]; 24],
@@ -284,7 +310,7 @@ mod tests {
             &[0u8; 32],
             &[0u8; 32],
             &[0u8; 32],
-            0,
+            1,
             0,
             2,
             &[[0u8; 32]; 10], // wrong length
