@@ -22,24 +22,75 @@ CONTEXT_FILE="/tmp/audit-context.txt"
 REPORT_FILE="/tmp/audit-report.md"
 PROMPT_FILE="$REPO_ROOT/scripts/audit-prompt.md"
 
+# ─── Token budget ────────────────────────────────────────────────────
+# Claude's input limit is 200k tokens. Empirically ~3.17 bytes/token for
+# mixed code+spec.  Budget the context file at ~580KB to leave room for
+# the system prompt (~5k tokens).
+MAX_CONTEXT_BYTES=590000
+
+# ─── Code stripping helpers ──────────────────────────────────────────
+
+# Strip Rust test modules: detects #[cfg(test)] immediately followed by
+# "mod tests" and drops everything from there to EOF.  A standalone
+# #[cfg(test)] on a single import line is preserved.  Collapses runs of
+# 3+ blank lines into one.
+strip_rust_tests() {
+  awk '
+    /^#\[cfg\(test\)\]/ { cfg_line=NR; cfg_text=$0; next }
+    cfg_line == NR-1 && /^mod tests \{/ { skip=1; next }
+    cfg_line == NR-1 && /^mod tests;/  { next }
+    cfg_line == NR-1 { print cfg_text }
+    !skip { print }
+  ' | awk '
+    /^[[:space:]]*$/ { blank++; if (blank <= 1) print; next }
+    { blank=0; print }
+  '
+}
+
+# For lower-priority tiers: also strip comment-only lines (// but not ///)
+# and collapse blanks more aggressively.
+strip_rust_aggressive() {
+  strip_rust_tests | awk '
+    /^[[:space:]]*\/\/[^\/!]/ { next }
+    /^[[:space:]]*\/\/[[:space:]]*$/ { next }
+    { print }
+  '
+}
+
+# Strip Go test functions (func Test...) and collapse blanks.
+strip_go_tests() {
+  awk '
+    /^func Test[A-Z]/ { skip=1; brace=0 }
+    skip { for(i=1;i<=length($0);i++) { c=substr($0,i,1); if(c=="{") brace++; if(c=="}") brace-- }; if(brace<=0 && /{/) { next }; if(brace<=0) { skip=0 }; next }
+    { print }
+  ' | awk '
+    /^[[:space:]]*$/ { blank++; if (blank <= 1) print; next }
+    { blank=0; print }
+  '
+}
+
+# For lower-priority Go tiers: also strip comment-only lines.
+strip_go_aggressive() {
+  strip_go_tests | awk '
+    /^[[:space:]]*\/\// { next }
+    { print }
+  '
+}
+
 # ─── Paths to spec and code ──────────────────────────────────────────
 
 SPEC_FILES=(
   "$REPO_ROOT/voting-circuits/src/vote_proof/README.md"
   "$REPO_ROOT/voting-circuits/src/delegation/README.md"
-  "$REPO_ROOT/.cursor/rules/security-audit.mdc"
+  # security-audit.mdc is omitted — its content is the system prompt
 )
 
 # ── Code files ordered by security risk (highest first) ──────────────
 #
-# Tier 1: ZKP circuits (soundness-critical)
-# Tier 2: Vote commitment tree (integrity of Merkle anchors)
-# Tier 3: Cosmos SDK vote chain (on-chain verification, state)
-# Tier 4: Helper server (ZKP #3 share reveal, relay)
-# Tier 5: Nullifier ingest (exclusion proofs for ZKP #1)
+# Tier 1-2: Strip test modules, preserve comments (constraint docs)
+# Tier 3-5: Strip tests + non-doc comments
 #
-CODE_FILES=(
-  # ── Tier 1: ZKP #1 Delegation, ZKP #2 Vote Proof, ZKP #3 Share Reveal ──
+TIER1_FILES=(
   "$REPO_ROOT/voting-circuits/src/delegation/circuit.rs"
   "$REPO_ROOT/voting-circuits/src/delegation/builder.rs"
   "$REPO_ROOT/voting-circuits/src/delegation/imt.rs"
@@ -55,15 +106,17 @@ CODE_FILES=(
   "$REPO_ROOT/voting-circuits/src/circuit/van_integrity.rs"
   "$REPO_ROOT/voting-circuits/src/circuit/vote_commitment.rs"
   "$REPO_ROOT/orchard/src/circuit/gadget/add_chip.rs"
+)
 
-  # ── Tier 2: Vote Commitment Tree ──
+TIER2_FILES=(
   "$REPO_ROOT/vote-commitment-tree/src/hash.rs"
   "$REPO_ROOT/vote-commitment-tree/src/path.rs"
   "$REPO_ROOT/vote-commitment-tree/src/server.rs"
   "$REPO_ROOT/vote-commitment-tree/src/lib.rs"
   "$REPO_ROOT/vote-commitment-tree/src/anchor.rs"
+)
 
-  # ── Tier 3: Cosmos SDK Tally Chain ──
+TIER3_FILES=(
   "$REPO_ROOT/sdk/x/vote/keeper/msg_server.go"
   "$REPO_ROOT/sdk/x/vote/keeper/keeper.go"
   "$REPO_ROOT/sdk/x/vote/ante/validate.go"
@@ -72,16 +125,18 @@ CODE_FILES=(
   "$REPO_ROOT/sdk/crypto/zkp/halo2/verify.go"
   "$REPO_ROOT/sdk/crypto/redpallas/verify.go"
   "$REPO_ROOT/sdk/app/ante.go"
+)
 
-  # ── Tier 4: Helper Server (ZKP #3 relay) ──
+TIER4_FILES=(
   "$REPO_ROOT/sdk/internal/helper/processor.go"
   "$REPO_ROOT/sdk/internal/helper/api.go"
   "$REPO_ROOT/sdk/internal/helper/types.go"
   "$REPO_ROOT/sdk/internal/helper/store.go"
   "$REPO_ROOT/sdk/internal/helper/submit.go"
   "$REPO_ROOT/sdk/internal/helper/helper.go"
+)
 
-  # ── Tier 5: Nullifier Ingest (exclusion proofs for ZKP #1) ──
+TIER5_FILES=(
   "$REPO_ROOT/nullifier-ingest/imt-tree/src/tree/nullifier_tree.rs"
   "$REPO_ROOT/nullifier-ingest/imt-tree/src/tree/mod.rs"
   "$REPO_ROOT/nullifier-ingest/imt-tree/src/proof.rs"
@@ -145,26 +200,51 @@ collect_context() {
     fi
   done
 
-  # 3. Include code files
-  for f in "${CODE_FILES[@]}"; do
-    if [ -f "$f" ]; then
-      local rel="${f#$REPO_ROOT/}"
-      local lines
-      lines=$(wc -l < "$f" | tr -d ' ')
-      echo "  + $rel ($lines lines)"
-      {
-        echo "════════════════════════════════════════════════════════════════"
-        echo "CODE: $rel ($lines lines)"
-        echo "════════════════════════════════════════════════════════════════"
-        echo ""
-        cat "$f"
-        echo ""
-        echo ""
-      } >> "$CONTEXT_FILE"
-    else
+  # 3. Include code files (tiered stripping to fit token budget)
+  #
+  # emit_code <file> <strip_func> <tier_label>
+  emit_code() {
+    local f="$1" strip="$2" tier="$3"
+    if [ ! -f "$f" ]; then
       echo "  ! Missing: $f"
+      return
     fi
-  done
+    local rel="${f#$REPO_ROOT/}"
+    local orig_lines stripped
+    orig_lines=$(wc -l < "$f" | tr -d ' ')
+    stripped=$(cat "$f" | $strip)
+    local new_lines
+    new_lines=$(echo "$stripped" | wc -l | tr -d ' ')
+    local saved=""
+    if [ "$new_lines" -lt "$orig_lines" ]; then
+      saved=" (stripped $(( orig_lines - new_lines )) test/comment lines)"
+    fi
+    echo "  + [$tier] $rel ($new_lines lines)$saved"
+    {
+      echo "════════════════════════════════════════════════════════════════"
+      echo "CODE [$tier]: $rel ($new_lines lines)"
+      echo "════════════════════════════════════════════════════════════════"
+      echo ""
+      echo "$stripped"
+      echo ""
+      echo ""
+    } >> "$CONTEXT_FILE"
+  }
+
+  echo "  --- Tier 1: ZKP Circuits (strip tests, keep comments) ---"
+  for f in "${TIER1_FILES[@]}"; do emit_code "$f" strip_rust_tests "T1"; done
+
+  echo "  --- Tier 2: Vote Commitment Tree (strip tests, keep comments) ---"
+  for f in "${TIER2_FILES[@]}"; do emit_code "$f" strip_rust_tests "T2"; done
+
+  echo "  --- Tier 3: Cosmos SDK Chain (strip tests + comments) ---"
+  for f in "${TIER3_FILES[@]}"; do emit_code "$f" strip_go_aggressive "T3"; done
+
+  echo "  --- Tier 4: Helper Server (aggressive strip) ---"
+  for f in "${TIER4_FILES[@]}"; do emit_code "$f" strip_go_aggressive "T4"; done
+
+  echo "  --- Tier 5: Nullifier Ingest (aggressive strip) ---"
+  for f in "${TIER5_FILES[@]}"; do emit_code "$f" strip_rust_aggressive "T5"; done
 
   # 4. Include git diff against main (uncommitted changes)
   local scan_dirs="voting-circuits/src/ orchard/src/ vote-commitment-tree/src/ sdk/x/vote/ sdk/crypto/ sdk/app/ sdk/internal/helper/ sdk/circuits/src/ nullifier-ingest/"
@@ -200,7 +280,16 @@ collect_context() {
 
   local size
   size=$(wc -c < "$CONTEXT_FILE" | tr -d ' ')
-  echo "=== Context collected: $(( size / 1024 ))KB ==="
+  local est_tokens=$(( size * 100 / 317 ))  # ~3.17 bytes/token (empirical)
+  local lines
+  lines=$(wc -l < "$CONTEXT_FILE" | tr -d ' ')
+  echo "=== Context collected: $(( size / 1024 ))KB, ${lines} lines, ~${est_tokens} est. tokens ==="
+
+  if [ "$size" -gt "$MAX_CONTEXT_BYTES" ]; then
+    echo "WARNING: Context (${size} bytes) exceeds budget (${MAX_CONTEXT_BYTES} bytes)."
+    echo "         Estimated ~${est_tokens} tokens — Claude limit is 200,000."
+    echo "         Consider removing lower-tier files or increasing stripping."
+  fi
 }
 
 # ─── audit ────────────────────────────────────────────────────────────
@@ -250,10 +339,25 @@ run_audit() {
       ]
     }' > "$payload_file"
 
+  # Token budget check (context + system prompt + user wrapper)
+  local ctx_bytes prompt_bytes total_bytes est_tokens
+  ctx_bytes=$(wc -c < "$CONTEXT_FILE" | tr -d ' ')
+  prompt_bytes=$(wc -c < "$PROMPT_FILE" | tr -d ' ')
+  total_bytes=$(( ctx_bytes + prompt_bytes + 200 ))
+  est_tokens=$(( total_bytes * 100 / 317 ))  # ~3.17 bytes/token (empirical)
+  echo "  Total input: $(( total_bytes / 1024 ))KB (~${est_tokens} tokens, limit 200,000)"
+
+  if [ "$est_tokens" -gt 200000 ]; then
+    echo "ERROR: Estimated ${est_tokens} tokens exceeds 200,000 limit."
+    echo "       Context: $(( ctx_bytes / 1024 ))KB, Prompt: $(( prompt_bytes / 1024 ))KB"
+    echo "       Run './scripts/ai-audit.sh collect' and review /tmp/audit-context.txt"
+    exit 1
+  fi
+
   echo "  Calling Anthropic API..."
 
   local response
-  response=$(curl -sS --max-time 120 \
+  response=$(curl -sS --max-time 300 \
     https://api.anthropic.com/v1/messages \
     -H "Content-Type: application/json" \
     -H "x-api-key: $ANTHROPIC_API_KEY" \
