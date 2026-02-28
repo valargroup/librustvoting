@@ -88,7 +88,7 @@ This is a **Zcash-derived shielded voting system**. The components, ordered by s
 
 ### Cosmos SDK Chain (Tier 3)
 
-13. **Proof Verification Completeness** — Every `MsgCastVote` and `MsgDelegateVote` must verify the ZKP before state mutation. Missing verification = fake votes accepted.
+13. **Proof Verification Completeness** — ZKP verification for `MsgCastVote` and `MsgDelegateVote` is performed in the ante handler (`validate.go`), not the msg server; confirm the ante handler correctly dispatches to `verifyDelegation` / `verifyCastVote` / `verifyRevealShare` and that `ValidateOpts` is wired with real verifiers (not mock). Do NOT flag the msg server for lacking inline ZKP calls — that is intentional (see Known Non-Issues).
 
 14. **Nullifier Double-Spend** — Nullifier set must be checked AND updated atomically. TOCTOU between check and insert = double-vote.
 
@@ -107,6 +107,12 @@ This is a **Zcash-derived shielded voting system**. The components, ordered by s
 19. **IMT Consistency** — Indexed Merkle Tree must correctly maintain sorted linked-list invariants. A corrupted IMT produces invalid non-inclusion proofs.
 
 20. **Sync Completeness** — Missing nullifiers from chain sync = false non-inclusion proofs = double-delegation.
+
+## Do Not Report
+
+The following patterns are intentional design decisions that have been reviewed and accepted. Do not report them as findings.
+
+- **ZKP not verified inside `MsgDelegateVote` / `MsgCastVote` msg_server handlers**: ZKP and RedPallas signature verification is performed in the ante handler (`sdk/x/vote/ante/validate.go`) via `ValidateVoteTx`, which the Cosmos SDK `BaseApp` guarantees runs before any msg handler during both `CheckTx` and `FinalizeBlock`. The msg server intentionally only handles state mutation. This is standard Cosmos SDK layered validation design and is not a vulnerability.
 
 ## Spec vs Code
 
