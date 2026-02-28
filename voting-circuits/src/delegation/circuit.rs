@@ -859,6 +859,14 @@ impl plonk::Circuit<pallas::Base> for Circuit {
                 self.pk_d_signed
                     .map(|pk_d_signed| pk_d_signed.inner().to_affine()),
             )?;
+            // Copy-constrain to the condition-5 witness so both cells are bound to the same
+            // point. Without this, a malicious prover could supply a different point here;
+            // soundness is still preserved through the nf_signed public-input chain, but the
+            // explicit equality closes the gap and makes the intent unambiguous.
+            pk_d_signed_for_nc.constrain_equal(
+                layouter.namespace(|| "pk_d_signed_for_nc == pk_d_signed"),
+                &pk_d_signed,
+            )?;
 
             let rcm_signed = ScalarFixed::new(
                 ecc_chip.clone(),
@@ -2139,6 +2147,98 @@ mod tests {
             vk.is_ok(),
             "keygen_vk must succeed on without_witnesses circuit"
         );
+    }
+
+    // Condition 10: is_note_real = 1 with a non-existent note claiming non-zero value.
+    // The Merkle path check is the only guard here — condition 15 allows v > 0 on
+    // "real" notes, but condition 10 requires the commitment to open to nc_root.
+    #[test]
+    fn fake_real_note_nonzero_value_fails() {
+        let mut rng = OsRng;
+        let t = make_test_data();
+        let mut circuit = t.circuit;
+        let pi = t.instance.to_halo2_instance();
+
+        // Build a note with v > 0 using a fresh key; it is NOT in the commitment
+        // tree that make_test_data() built (nc_root only covers slot 0's real note).
+        let sk2 = SpendingKey::random(&mut rng);
+        let fvk2: FullViewingKey = (&sk2).into();
+        let addr2 = fvk2.address_at(0u32, Scope::External);
+        let (_, _, dummy_parent) = Note::dummy(&mut rng, None);
+        let fake_note = Note::new(
+            addr2,
+            NoteValue::from_raw(100), // v > 0: not a zero-value padded note
+            Rho::from_nf_old(dummy_parent.nullifier(&fvk2)),
+            &mut rng,
+        );
+
+        let imt_provider = SpacedLeafImtProvider::new();
+        let fake_nf = fake_note.nullifier(&fvk2);
+        let fake_imt = imt_provider.non_membership_proof(fake_nf.0).unwrap();
+
+        // All empty siblings — this auth path does not open to nc_root.
+        let dummy_auth_path = [MerkleHashOrchard::empty_leaf(); MERKLE_DEPTH_ORCHARD];
+        // is_note_real = true activates condition 10: is_note_real * (root - nc_root) = 0.
+        let fake_slot = make_note_slot(&fake_note, &dummy_auth_path, 0u32, &fake_imt, true, false);
+
+        // Replace slot 1 (was padded, v=0, is_note_real=false) with the fake claim.
+        circuit.notes[1] = fake_slot;
+
+        let prover = MockProver::run(K, &circuit, vec![pi]).unwrap();
+        // Condition 10: the dummy auth path produces a computed root ≠ nc_root,
+        // so the Merkle path check rejects the non-existent "real" note.
+        assert!(prover.verify().is_err());
+    }
+
+    // Condition 11 copy-constraint: confirms that ivk from condition 5 (the signed
+    // note's key) is enforced in ALL per-note pk_d ownership checks via copy constraint.
+    // If the per-note addresses use a different key, condition 11 fails even though
+    // condition 10 (Merkle path) is skipped (is_note_real = false).
+    #[test]
+    fn different_ivk_per_note_fails() {
+        let mut rng = OsRng;
+        let t = make_test_data();
+        let mut circuit = t.circuit;
+        let pi = t.instance.to_halo2_instance();
+
+        // Build a note from a different key (fvk2). The circuit derives ivk1 in
+        // condition 5 (from fvk1, the signed note's key) and the copy constraint
+        // propagates ivk1 into every condition 11 per-note ownership check.
+        // For this foreign slot: [ivk1] * g_d_fvk2 ≠ pk_d_fvk2, so condition 11 fails.
+        let sk2 = SpendingKey::random(&mut rng);
+        let fvk2: FullViewingKey = (&sk2).into();
+        let addr2 = fvk2.address_at(100u32, Scope::External);
+        let (_, _, dummy_parent) = Note::dummy(&mut rng, None);
+        let foreign_note = Note::new(
+            addr2,
+            NoteValue::zero(),
+            Rho::from_nf_old(dummy_parent.nullifier(&fvk2)),
+            &mut rng,
+        );
+
+        let imt_provider = SpacedLeafImtProvider::new();
+        let foreign_nf = foreign_note.nullifier(&fvk2);
+        let foreign_imt = imt_provider.non_membership_proof(foreign_nf.0).unwrap();
+
+        let dummy_auth_path = [MerkleHashOrchard::empty_leaf(); MERKLE_DEPTH_ORCHARD];
+        // is_note_real = false: condition 10 (Merkle root check) is skipped.
+        // Condition 11 still applies to all slots and cannot be bypassed.
+        let foreign_slot = make_note_slot(
+            &foreign_note,
+            &dummy_auth_path,
+            0u32,
+            &foreign_imt,
+            false,
+            false,
+        );
+
+        circuit.notes[1] = foreign_slot;
+
+        let prover = MockProver::run(K, &circuit, vec![pi]).unwrap();
+        // Condition 11: the copy constraint forces ivk from condition 5 (fvk1's ivk)
+        // into this check; [ivk1] * g_d_fvk2 ≠ pk_d_fvk2 so the constraint fails,
+        // confirming substitution of a foreign ivk in condition 11 is impossible.
+        assert!(prover.verify().is_err());
     }
 
     // ----------------------------------------------------------------

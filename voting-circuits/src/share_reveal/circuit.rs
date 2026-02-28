@@ -1055,6 +1055,29 @@ mod tests {
         assert!(prover.verify().is_err());
     }
 
+    /// Tampers with share_comms[5] (a share other than the primary share at index 0).
+    /// The share_comms are private witnesses but transitively bound to the public
+    /// vote_comm_tree_root via:
+    ///   share_comms → shares_hash (condition 3)
+    ///   shares_hash → vote_commitment (condition 2)
+    ///   vote_commitment → Merkle root (condition 1)
+    /// Changing any share_comm alters shares_hash → vote_commitment, so the Merkle
+    /// root computed in-circuit no longer matches the public instance root.
+    #[test]
+    fn test_share_reveal_tampered_share_comms_fails() {
+        let (mut circuit, instance) = make_test_data(0);
+
+        // Replace share_comms[5] (index ≠ primary share index 0) with a wrong value.
+        // Any single-field substitution propagates through shares_hash → vote_commitment
+        // → Merkle root, invalidating condition 1.
+        circuit.share_comms[5] = Value::known(pallas::Base::from(99999u64));
+
+        let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
+        // Must fail: tampered share_comm → wrong shares_hash → wrong vote_commitment
+        // → Merkle root computed in-circuit ≠ instance.vote_comm_tree_root.
+        assert!(prover.verify().is_err());
+    }
+
     #[test]
     fn test_share_reveal_domain_tag_matches_server() {
         use ff::PrimeField;

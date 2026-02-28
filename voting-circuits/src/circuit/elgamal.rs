@@ -190,6 +190,13 @@ pub(crate) fn prove_elgamal_encryptions(
                 r_cells[i].clone(),
             )?;
 
+        // Only the x-coordinate of C1 is constrained as a public input. This
+        // is the standard Halo2 `extract_p` convention (Pallas x-coord as Fp).
+        // The y-coordinate is not exposed; the transaction carries the full
+        // compressed point (x || sign_bit). The chain-side verifier
+        // (VerifyShareRevealProof) decompresses the compressed point to confirm
+        // it is on the Pallas curve before stripping the sign bit to obtain the
+        // x-coordinate that is fed back here as a public input.
         let c1_x = c1_point.extract_p().inner().clone();
         layouter.assign_region(
             || alloc::format!("{namespace} C1[{i}] x == enc_c1_x[{i}]"),
@@ -245,6 +252,7 @@ pub(crate) fn prove_elgamal_encryptions(
             &r_ea_pk_point,
         )?;
 
+        // Same x-only public input convention as C1 above.
         let c2_x = c2_point.extract_p().inner().clone();
         layouter.assign_region(
             || alloc::format!("{namespace} C2[{i}] x == enc_c2_x[{i}]"),

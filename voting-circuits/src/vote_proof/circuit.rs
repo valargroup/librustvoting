@@ -176,8 +176,13 @@ const EA_PK_Y: usize = 10;
 
 // Suppress dead-code warnings for public input offsets that are
 // defined but not yet used by any condition's constraint logic.
-// VOTE_COMM_TREE_ANCHOR_HEIGHT is checked out-of-circuit by the
-// verifier (the chain validates the anchor height matches the tree).
+// VOTE_COMM_TREE_ANCHOR_HEIGHT is validated out-of-circuit by the chain's
+// ante handler: sdk/x/vote/ante/validate.go calls GetCommitmentRootAtHeight
+// with msg.VoteCommTreeAnchorHeight and rejects the transaction if no root
+// exists at that height (ErrInvalidAnchorHeight). The retrieved root is then
+// passed as the VoteCommTreeRoot public input to the ZKP verifier, which the
+// circuit constrains via constrain_instance. This binds the anchor height to
+// the in-circuit tree root, mirroring Zcash's out-of-circuit anchor design.
 const _: usize = VOTE_COMM_TREE_ANCHOR_HEIGHT;
 
 // ================================================================
@@ -2226,6 +2231,22 @@ mod tests {
         assert_eq!(prover.verify(), Ok(()));
     }
 
+    /// proposal_authority_old = 65536 = 2^16 lies outside the valid 16-bit bitmask
+    /// range [0, 65535]. The authority_decrement gadget decomposes the value into
+    /// exactly 16 bits (positions 0–15); a value with bit 16 set cannot be represented
+    /// in that decomposition and must be rejected by the range check.
+    #[test]
+    fn proposal_authority_exceeds_16_bits_fails() {
+        // 65536 = 2^16 is the first value not representable as a 16-bit bitmask.
+        let (circuit, instance) =
+            make_test_data_with_authority(pallas::Base::from(65536u64));
+        let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
+        assert!(
+            prover.verify().is_err(),
+            "authority > 65535 must be rejected by the 16-bit bit decomposition"
+        );
+    }
+
     // ================================================================
     // Condition 7 (New VAN Integrity) tests
     // ================================================================
@@ -2527,6 +2548,109 @@ mod tests {
 
         let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
         assert!(prover.verify().is_err());
+    }
+
+    /// Shares that sum correctly to total_note_value but with shares[0] = 2^30
+    /// (one above the per-share maximum). Condition 8 (sum check) passes because
+    /// total_note_value is set to match the sum. Condition 9 (range check) must
+    /// still reject the individual overflow, confirming it checks each share
+    /// independently — a correct sum does not bypass the per-share range gate.
+    #[test]
+    fn shares_range_single_overflow_correct_sum_fails() {
+        let mut rng = OsRng;
+
+        let overflow_share = pallas::Base::from(1u64 << 30); // 2^30 — just above [0, 2^30)
+        let normal_share_u64 = 625u64;
+        // total_note_value = 2^30 + 15 * 625 so sum(shares) == total_note_value.
+        let total_note_value = overflow_share + pallas::Base::from(15u64 * normal_share_u64);
+
+        let vsk = pallas::Scalar::random(&mut rng);
+        let vsk_nk = pallas::Base::random(&mut rng);
+        let rivk_v = pallas::Scalar::random(&mut rng);
+        let alpha_v = pallas::Scalar::random(&mut rng);
+        let (vpk_g_d_affine, vpk_pk_d_affine) = derive_voting_address(vsk, vsk_nk, rivk_v);
+        let vpk_g_d_x = *vpk_g_d_affine.coordinates().unwrap().x();
+        let vpk_pk_d_x = *vpk_pk_d_affine.coordinates().unwrap().x();
+
+        let voting_round_id = pallas::Base::random(&mut rng);
+        let proposal_authority_old = pallas::Base::from(13u64); // bit 3 set
+        let proposal_id = TEST_PROPOSAL_ID;
+        let van_comm_rand = pallas::Base::random(&mut rng);
+
+        let vote_authority_note_old = van_integrity_hash(
+            vpk_g_d_x, vpk_pk_d_x, total_note_value, voting_round_id,
+            proposal_authority_old, van_comm_rand,
+        );
+        let (auth_path, position, vote_comm_tree_root) =
+            build_single_leaf_merkle_path(vote_authority_note_old);
+        let van_nullifier = van_nullifier_hash(vsk_nk, voting_round_id, vote_authority_note_old);
+        let one_shifted = pallas::Base::from(1u64 << proposal_id);
+        let proposal_authority_new = proposal_authority_old - one_shifted;
+        let vote_authority_note_new = van_integrity_hash(
+            vpk_g_d_x, vpk_pk_d_x, total_note_value, voting_round_id,
+            proposal_authority_new, van_comm_rand,
+        );
+
+        // shares[0] overflows (2^30); shares[1..16] are valid (625 each).
+        // The encryption is computed with these exact values so condition 11 is consistent.
+        let shares_u64: [u64; 16] = {
+            let mut arr = [normal_share_u64; 16];
+            arr[0] = 1u64 << 30;
+            arr
+        };
+        let (_ea_sk, ea_pk_point, ea_pk_affine) = generate_ea_keypair();
+        let (enc_c1_x, enc_c2_x, randomness, share_blinds, shares_hash_val) =
+            encrypt_shares(shares_u64, ea_pk_point);
+
+        let g = pallas::Point::from(spend_auth_g_affine());
+        let r_vpk = (g * vsk + g * alpha_v).to_affine();
+
+        let mut circuit = Circuit::with_van_witnesses(
+            Value::known(auth_path),
+            Value::known(position),
+            Value::known(vpk_g_d_affine),
+            Value::known(vpk_pk_d_affine),
+            Value::known(total_note_value),
+            Value::known(proposal_authority_old),
+            Value::known(van_comm_rand),
+            Value::known(vote_authority_note_old),
+            Value::known(vsk),
+            Value::known(rivk_v),
+            Value::known(vsk_nk),
+            Value::known(alpha_v),
+        );
+        circuit.one_shifted = Value::known(one_shifted);
+        circuit.shares = shares_u64.map(|s| Value::known(pallas::Base::from(s)));
+        circuit.enc_share_c1_x = enc_c1_x.map(Value::known);
+        circuit.enc_share_c2_x = enc_c2_x.map(Value::known);
+        circuit.share_blinds = share_blinds.map(Value::known);
+        circuit.share_randomness = randomness.map(Value::known);
+        circuit.ea_pk = Value::known(ea_pk_affine);
+
+        let vote_commitment =
+            set_condition_11(&mut circuit, shares_hash_val, proposal_id, voting_round_id);
+
+        let instance = Instance::from_parts(
+            van_nullifier,
+            *r_vpk.coordinates().unwrap().x(),
+            *r_vpk.coordinates().unwrap().y(),
+            vote_authority_note_new,
+            vote_commitment,
+            vote_comm_tree_root,
+            pallas::Base::zero(),
+            pallas::Base::from(proposal_id),
+            voting_round_id,
+            *ea_pk_affine.coordinates().unwrap().x(),
+            *ea_pk_affine.coordinates().unwrap().y(),
+        );
+
+        let prover = MockProver::run(K, &circuit, vec![instance.to_halo2_instance()]).unwrap();
+        // Condition 8 (sum check) passes: shares sum to total_note_value.
+        // Condition 9 (range check) must reject shares[0] = 2^30 regardless.
+        assert!(
+            prover.verify().is_err(),
+            "range check must reject a share equal to 2^30 even when the total sum is correct"
+        );
     }
 
     // ================================================================
