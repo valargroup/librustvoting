@@ -13,7 +13,7 @@ todos:
     status: completed
   - id: step1-ceremony-ack
     content: "Modify ack handler: decrypt share, verify share_i * G == VK_i, store share to disk"
-    status: pending
+    status: completed
   - id: step1-tally-partial
     content: "New PrepareProposal injector: submit bare partial decryptions (no DLEQ) when round is TALLYING"
     status: pending
@@ -25,7 +25,7 @@ todos:
     status: pending
   - id: step1-kv-storage
     content: "Add KV storage for partial decryptions and VK_i, accessor methods on Keeper"
-    status: pending
+    status: completed
   - id: step1-tests
     content: "Unit tests for shamir package, integration tests for modified ceremony + tally flow"
     status: pending
