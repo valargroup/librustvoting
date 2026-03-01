@@ -10,7 +10,7 @@ todos:
     status: completed
   - id: step1-ceremony-deal
     content: "Modify deal PrepareProposal: generate polynomial, ECIES-encrypt shares, publish VK_i per validator"
-    status: pending
+    status: completed
   - id: step1-ceremony-ack
     content: "Modify ack handler: decrypt share, verify share_i * G == VK_i, store share to disk"
     status: pending
