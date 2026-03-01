@@ -7,7 +7,7 @@ todos:
     status: completed
   - id: step1-proto
     content: "Add MsgSubmitPartialDecryption proto, add threshold + verification_keys fields to deal message and VoteRound"
-    status: pending
+    status: completed
   - id: step1-ceremony-deal
     content: "Modify deal PrepareProposal: generate polynomial, ECIES-encrypt shares, publish VK_i per validator"
     status: pending
