@@ -16,9 +16,13 @@ import { encodeSecp256k1Pubkey } from "@cosmjs/amino";
 import { toBase64, fromBase64 } from "@cosmjs/encoding";
 import { TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx";
 import { SignMode } from "cosmjs-types/cosmos/tx/signing/v1beta1/signing";
+import { sha256 } from "@noble/hashes/sha2.js";
 import type { BroadcastResult } from "./chain";
 
-const DEFAULT_GAS = "200000";
+// All transactions are fee-exempt on this chain. Setting gas to "0" means
+// Keplr computes fee = gasPrice × 0 = 0, so the user sees a zero fee.
+const CEREMONY_GAS = "0";
+
 
 // ── Protobuf mini-writer ────────────────────────────────────────
 
@@ -383,7 +387,7 @@ async function signAndBroadcast({
   signer,
   messages,
   memo = "",
-  gas = DEFAULT_GAS,
+  gas = CEREMONY_GAS,
 }: SignAndBroadcastOptions): Promise<BroadcastResult> {
   const [account] = await signer.getAccounts();
 
@@ -439,15 +443,18 @@ const STUB_VK_ZKP3            = filledBytes(0xf3, 64);
 /** Compute a SHA-256 hash of the serialized proposals for use as proposals_hash.
  *  This ensures each round with different proposals gets a unique vote_round_id
  *  (the chain derives round ID from snapshot_height, blockhash, proposals_hash,
- *  vote_end_time, nullifier_imt_root, and nc_root). */
-async function computeProposalsHash(
+ *  vote_end_time, nullifier_imt_root, and nc_root).
+ *
+ *  Uses @noble/hashes instead of crypto.subtle so it works on non-secure
+ *  origins (plain HTTP dev servers) where crypto.subtle is undefined. */
+function computeProposalsHash(
   proposals: Array<{
     id: number;
     title: string;
     description: string;
     options: Array<{ index: number; label: string }>;
   }>,
-): Promise<Uint8Array> {
+): Uint8Array {
   const canonical = JSON.stringify(
     proposals.map((p) => ({
       id: p.id,
@@ -457,8 +464,7 @@ async function computeProposalsHash(
     })),
   );
   const encoded = new TextEncoder().encode(canonical);
-  const digest = await crypto.subtle.digest("SHA-256", encoded);
-  return new Uint8Array(digest);
+  return sha256(encoded);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -555,10 +561,10 @@ export async function createVotingSession(
   const [account] = await signer.getAccounts();
 
   // Fetch real snapshot data (nc_root, nullifier_imt_root, blockhash).
-  const [snapshot, proposalsHash] = await Promise.all([
+  const [snapshot] = await Promise.all([
     fetchSnapshotData(apiBase, params.snapshotHeight),
-    computeProposalsHash(params.proposals),
   ]);
+  const proposalsHash = computeProposalsHash(params.proposals);
 
   return signAndBroadcast({
     apiBase,
