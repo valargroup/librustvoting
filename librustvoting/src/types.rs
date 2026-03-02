@@ -211,10 +211,6 @@ pub struct SharePayload {
 /// needs to provide the signature (which was signed over the same sighash).
 #[derive(Clone, Debug)]
 pub struct CastVoteSignature {
-    /// Decompressed r_vpk x-coordinate (32 bytes).
-    pub r_vpk_x: Vec<u8>,
-    /// Decompressed r_vpk y-coordinate (32 bytes).
-    pub r_vpk_y: Vec<u8>,
     /// Spend auth signature over the canonical sighash (64 bytes).
     pub vote_auth_sig: Vec<u8>,
 }
