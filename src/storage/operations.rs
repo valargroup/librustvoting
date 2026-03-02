@@ -679,9 +679,6 @@ impl VotingDb {
         // Compute rsk = ask.randomize(alpha)
         let rsk = ask.randomize(&alpha);
 
-        // enc_memo = [0x05; 64] (mock, matches e2e test and chain expectations)
-        let enc_memo = [0x05u8; 64];
-
         // Sign the ZIP-244 sighash (extracted from PCZT during Phase 1)
         let mut rng = rand::rngs::OsRng;
         let sig = rsk.sign(&mut rng, &sighash);
@@ -698,7 +695,6 @@ impl VotingDb {
             vote_round_id: data.vote_round_id,
             spend_auth_sig: sig_bytes.to_vec(),
             sighash: sighash.to_vec(),
-            enc_memo: enc_memo.to_vec(),
         })
     }
 
@@ -734,9 +730,6 @@ impl VotingDb {
         let conn = self.conn();
         let data = queries::load_delegation_submission_data(&conn, round_id, bundle_index)?;
 
-        // enc_memo = [0x05; 64] (mock, matches e2e test and chain expectations)
-        let enc_memo = [0x05u8; 64];
-
         Ok(DelegationSubmissionData {
             proof: data.proof,
             rk: data.rk,
@@ -748,7 +741,6 @@ impl VotingDb {
             vote_round_id: data.vote_round_id,
             spend_auth_sig: keystone_sig.to_vec(),
             sighash: keystone_sighash.to_vec(),
-            enc_memo: enc_memo.to_vec(),
         })
     }
 

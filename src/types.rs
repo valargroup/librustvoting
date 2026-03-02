@@ -221,7 +221,7 @@ pub struct CastVoteSignature {
 
 /// All fields needed to submit a delegation TX to the chain.
 /// Fields from DB (proof, rk, nf_signed, cmx_new, gov_comm, gov_nullifiers, alpha)
-/// plus computed fields (spend_auth_sig, sighash, enc_memo).
+/// plus computed fields (spend_auth_sig, sighash).
 #[derive(Clone, Debug)]
 pub struct DelegationSubmissionData {
     pub proof: Vec<u8>,
@@ -236,8 +236,6 @@ pub struct DelegationSubmissionData {
     pub spend_auth_sig: Vec<u8>,
     /// Canonical sighash (32 bytes). Blake2b-256 of domain-separated fields.
     pub sighash: Vec<u8>,
-    /// Encrypted memo (64 bytes). Currently mock: [0x05; 64].
-    pub enc_memo: Vec<u8>,
 }
 
 /// Result of real delegation proof generation (ZKP #1).
