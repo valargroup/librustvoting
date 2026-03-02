@@ -405,15 +405,7 @@ fn voting_flow_librustvoting_path() {
     // ---- Step 8: Submit cast-vote TX ----
     log_step("Step 8", "computing sighash and signing cast-vote TX");
 
-    // 8a: Decompress r_vpk to get x, y coordinates for the payload.
-    let r_vpk_arr: [u8; 32] = bundle.r_vpk_bytes.as_slice().try_into().unwrap();
-    let r_vpk_affine: pallas::Affine =
-        Option::from(pallas::Affine::from_bytes(&r_vpk_arr)).expect("decompress r_vpk");
-    let coords = r_vpk_affine.coordinates().unwrap();
-    let r_vpk_x_bytes = coords.x().to_repr();
-    let r_vpk_y_bytes = coords.y().to_repr();
-
-    // 8b: Compute canonical sighash (must match Go's ComputeCastVoteSighash).
+    // 8a: Compute canonical sighash (must match Go's ComputeCastVoteSighash).
     const CAST_VOTE_SIGHASH_DOMAIN: &[u8] = b"ZALLY_CAST_VOTE_SIGHASH_V0";
     let mut canonical = Vec::new();
     canonical.extend_from_slice(CAST_VOTE_SIGHASH_DOMAIN);
@@ -465,8 +457,6 @@ fn voting_flow_librustvoting_path() {
         &round_id,
         anchor_height,
         &bundle.van_nullifier,
-        r_vpk_x_bytes.as_ref(),
-        r_vpk_y_bytes.as_ref(),
         &bundle.vote_authority_note_new,
         &bundle.vote_commitment,
         1, // proposal_id

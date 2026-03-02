@@ -372,8 +372,6 @@ extension VotingAPIClient: DependencyKey {
                 let roundIdBytes = dataFromHex(bundle.voteRoundId)
                 let body: [String: Any] = [
                     "van_nullifier": bundle.vanNullifier.base64EncodedString(),
-                    "r_vpk_x": signature.rVpkX.base64EncodedString(),
-                    "r_vpk_y": signature.rVpkY.base64EncodedString(),
                     "vote_authority_note_new": bundle.voteAuthorityNoteNew.base64EncodedString(),
                     "vote_commitment": bundle.voteCommitment.base64EncodedString(),
                     "proposal_id": bundle.proposalId,

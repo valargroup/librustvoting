@@ -71,8 +71,6 @@ pub fn sign_cast_vote(
     alpha_v: &[u8],
 ) -> Result<CastVoteSignature, VotingError> {
     use ff::PrimeField;
-    use group::GroupEncoding;
-    use pasta_curves::arithmetic::CurveAffine;
 
     // Derive hotkey SpendingKey from seed
     let sk = crate::zkp2::derive_spending_key(hotkey_seed, network_id)?;
@@ -92,19 +90,12 @@ pub fn sign_cast_vote(
     // Compute rsk_v = ask_v.randomize(alpha_v)
     let rsk_v = ask.randomize(&alpha_v_scalar);
 
-    // Decompress r_vpk to get x, y coordinates
-    let r_vpk_arr: [u8; 32] = r_vpk_bytes.try_into().map_err(|_| VotingError::Internal {
-        message: format!("r_vpk must be 32 bytes, got {}", r_vpk_bytes.len()),
-    })?;
-    let r_vpk_affine: pasta_curves::pallas::Affine =
-        Option::from(pasta_curves::pallas::Affine::from_bytes(&r_vpk_arr)).ok_or_else(|| {
-            VotingError::Internal {
-                message: "r_vpk is not a valid compressed Pallas point".to_string(),
-            }
-        })?;
-    let coords = r_vpk_affine.coordinates().unwrap();
-    let r_vpk_x = coords.x().to_repr().to_vec();
-    let r_vpk_y = coords.y().to_repr().to_vec();
+    // Validate r_vpk is 32 bytes
+    if r_vpk_bytes.len() != 32 {
+        return Err(VotingError::Internal {
+            message: format!("r_vpk must be 32 bytes, got {}", r_vpk_bytes.len()),
+        });
+    }
 
     // Decode vote_round_id from hex to bytes
     let vote_round_id_bytes =
@@ -145,8 +136,6 @@ pub fn sign_cast_vote(
     let sig_bytes: [u8; 64] = (&sig).into();
 
     Ok(CastVoteSignature {
-        r_vpk_x,
-        r_vpk_y,
         vote_auth_sig: sig_bytes.to_vec(),
     })
 }

@@ -524,13 +524,9 @@ public struct CommitmentTreeState: Equatable, Sendable {
 /// The sighash is computed on-chain from message fields; the client only
 /// provides the signature (which was signed over the same sighash).
 public struct CastVoteSignature: Equatable, Sendable {
-    public let rVpkX: Data
-    public let rVpkY: Data
     public let voteAuthSig: Data
 
-    public init(rVpkX: Data, rVpkY: Data, voteAuthSig: Data) {
-        self.rVpkX = rVpkX
-        self.rVpkY = rVpkY
+    public init(voteAuthSig: Data) {
         self.voteAuthSig = voteAuthSig
     }
 }
