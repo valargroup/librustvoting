@@ -138,6 +138,12 @@ else
   TARBALL_DIR="zally-${VERSION}-${PLATFORM}"
   tar xzf /tmp/zally-release.tar.gz -C /tmp "${TARBALL_DIR}/bin/zallyd" "${TARBALL_DIR}/bin/create-val-tx"
 
+  # Stop running service before overwriting (avoids "Text file busy").
+  if systemctl is-active --quiet zallyd 2>/dev/null; then
+    echo "Stopping running zallyd service before upgrading..."
+    systemctl stop zallyd
+  fi
+
   cp "/tmp/${TARBALL_DIR}/bin/zallyd" "${INSTALL_DIR}/zallyd"
   cp "/tmp/${TARBALL_DIR}/bin/create-val-tx" "${INSTALL_DIR}/create-val-tx"
   chmod +x "${INSTALL_DIR}/zallyd" "${INSTALL_DIR}/create-val-tx"
