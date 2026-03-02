@@ -1707,8 +1707,8 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
     }
   };
 
-  const fetchValidators = async () => {
-    setLoading(true);
+  const fetchValidators = async (silent = false) => {
+    if (!silent) setLoading(true);
     setError("");
     try {
       const [valResp, ceremonyResp, pallasResp, vcResp, pendingResp] = await Promise.all([
@@ -1724,9 +1724,9 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
       setVotingConfig(vcResp);
       setPendingRegistrations(pendingResp);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (!silent) setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -1866,6 +1866,8 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
 
   useEffect(() => {
     fetchValidators();
+    const id = setInterval(() => fetchValidators(true), 5000);
+    return () => clearInterval(id);
   }, []);
 
   // Build a set of per-round ceremony participants for cross-referencing.
