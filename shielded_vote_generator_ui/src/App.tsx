@@ -1921,7 +1921,7 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
               Fund validator
             </button>
             <button
-              onClick={fetchValidators}
+              onClick={() => fetchValidators()}
               className="p-2 hover:bg-surface-3 rounded-lg text-text-muted hover:text-text-secondary cursor-pointer"
               title="Refresh"
             >
