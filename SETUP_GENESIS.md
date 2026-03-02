@@ -72,13 +72,14 @@ make install-ffi
 1. Runs `zallyd init validator --chain-id zvote-1`
 2. Creates a `validator` Cosmos key and a `manager` key (deterministic, used by vote-module tests)
 3. Adds both accounts to genesis with initial balances
-4. Creates and collects the genesis transaction (10 000 000 stake self-delegation)
-5. Validates `genesis.json`
-6. Enables the REST API on port `1318` with CORS
-7. Sets `timeout_broadcast_tx_commit = 120s` (required for ZKP verification ≈ 30–60 s)
-8. Generates a Pallas keypair for ECIES ceremony key distribution → `~/.zallyd/pallas.sk` / `pallas.pk`
-9. Sets `ea_sk_path` as a directory placeholder — the actual EA key is generated per-round by auto-deal
-10. Writes the `[vote]` and `[helper]` sections into `~/.zallyd/config/app.toml`
+4. Creates and collects the genesis transaction (10 000 000 uzvote self-delegation)
+5. Patches slashing genesis: zeroes out slash fractions (no token burning)
+6. Validates `genesis.json`
+7. Enables the REST API on port `1318` with CORS
+8. Sets `timeout_broadcast_tx_commit = 120s` (required for ZKP verification ≈ 30–60 s)
+9. Generates a Pallas keypair for ECIES ceremony key distribution → `~/.zallyd/pallas.sk` / `pallas.pk`
+10. Sets `ea_sk_path` as a directory placeholder — the actual EA key is generated per-round by auto-deal
+11. Writes the `[vote]` and `[helper]` sections into `~/.zallyd/config/app.toml`
 
 ```bash
 mise run chain:init

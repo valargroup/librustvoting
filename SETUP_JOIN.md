@@ -31,8 +31,13 @@ ZALLY_MONIKER=my-validator \
 2. Queries the Vercel voting-config API to discover a live validator
 3. Fetches `genesis.json` from the discovered validator's `/zally/v1/genesis` endpoint
 4. Fetches the validator's P2P node identity from `/cosmos/base/tendermint/v1beta1/node_info`
-5. Initializes the node, generates keys, configures CometBFT with the discovered peer
-6. Starts the node, waits for sync, waits for funding, and registers as validator
+5. Initializes the node, generates Cosmos + Pallas cryptographic keys
+6. Configures CometBFT with the discovered peer, sets up Caddy TLS reverse proxy
+7. Registers as a pending validator with the Vercel API (self-registration — admin sees it in the UI)
+8. Installs a systemd service and starts the node
+9. Waits for sync, then waits for admin to approve and fund via the admin UI
+10. Once funded, automatically creates the validator on-chain (`MsgCreateValidatorWithPallasKey`)
+11. Re-registers with the Vercel API to promote the URL to `vote_servers` in Edge Config
 
 #### Optional env vars
 
@@ -71,7 +76,15 @@ zallyd query staking validators --node tcp://localhost:26657
 
 The EA key ceremony is automatic. When a new voting round is created, your validator is included in the ceremony if it is bonded and has a registered Pallas key (done automatically by `join.sh`). The block proposer handles dealing and acking via `PrepareProposal` — no manual steps required.
 
-If your validator fails to ack in 3 consecutive ceremonies, it will be jailed. Any bonded validator can unjail a jailed validator using the admin UI (click the "Unjail" button on the jailed validator's card). Unjailing also resets the ceremony miss counter.
+## Jailing and Unjailing
+
+Validators are jailed by the standard `x/slashing` module if they miss too many blocks (default: 50% of a 100-block window). There is no ceremony-miss jailing — block-miss detection covers liveness. Slash fractions are zeroed out (no token burning; jailing is for liveness signaling only).
+
+To unjail, the jailed validator sends a standard `cosmos.slashing.v1beta1.MsgUnjail` after the 10-minute cooldown. This can be done via the admin UI (click "Unjail" on the validator's card) or the CLI:
+
+```bash
+zallyd tx slashing unjail --from validator --keyring-backend test --home ~/.zallyd --chain-id zvote-1
+```
 
 Check ceremony status:
 

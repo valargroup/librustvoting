@@ -86,9 +86,10 @@ The config is served from **Vercel Edge Config**, a key-value store that can be 
 
 ### Updating the config
 
-1. **Vercel Dashboard**: Go to the project's Edge Config store → edit the `voting-config` key
-2. **Vercel CLI**: `vercel edge-config items update voting-config --value '{"version":1,...}'`
-3. **REST API**: `PATCH https://api.vercel.com/v1/edge-config/{id}/items` with your Vercel token
+1. **Admin UI** (primary): Register/remove validator URLs via the Validators panel, or approve pending self-registrations
+2. **Self-registration**: `join.sh` auto-registers via `POST /api/register-validator` (admin approves in UI, or auto-promoted after bonding)
+3. **Vercel Dashboard**: Go to the project's Edge Config store → edit the `voting-config` key directly
+4. **Vercel CLI**: `vercel edge-config items update voting-config --value '{"version":1,...}'`
 
 Changes take effect immediately — no git push or redeploy needed. This is useful for demos where you spin up new servers and want TestFlight builds to pick them up right away.
 

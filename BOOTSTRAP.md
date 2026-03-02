@@ -147,10 +147,12 @@ Share the join URL with new validators:
 curl -fsSL https://vote.fra1.digitaloceanspaces.com/join.sh | bash
 ```
 
-After they run `join.sh` and report their address:
+`join.sh` handles the full flow automatically:
 
-1. Fund their account via the admin UI (send stake tokens)
-2. `join.sh` detects the funding and auto-registers them as a validator
+1. The validator self-registers with the Vercel API — their entry appears as "pending" in the admin UI
+2. Approve and fund the validator in the admin UI (Validators → Approve & Fund)
+3. `join.sh` detects the funding and auto-registers on-chain via `MsgCreateValidatorWithPallasKey`
+4. After bonding, `join.sh` re-registers to promote its URL to `vote_servers` in Edge Config
 
 Verify new validators appear:
 

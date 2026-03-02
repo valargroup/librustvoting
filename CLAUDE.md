@@ -101,7 +101,7 @@ Data files (`nullifiers.bin`, `nullifiers.checkpoint`) are stored at the `nullif
 
 ### Ceremony
 
-The EA key ceremony is automatic per voting round. When a round is published, eligible validators are snapshotted and the ceremony proceeds via PrepareProposal (auto-deal + auto-ack). Pallas key registration happens at validator join time. Validators who fail to ack in 3 consecutive ceremonies are jailed.
+The EA key ceremony is automatic per voting round. When a round is published, eligible validators are snapshotted and the ceremony proceeds via PrepareProposal (auto-deal + auto-ack). Pallas key registration happens at validator join time. Jailing is handled by the standard `x/slashing` module for block-miss detection (no ceremony-miss jailing). Unjail via standard `MsgUnjail`.
 
 ## Protocol Documentation
 
