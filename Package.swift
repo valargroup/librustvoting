@@ -17,7 +17,7 @@ let package = Package(
         .binaryTarget(
             name: "zcash_voting_ffiFFI",
             url: "https://github.com/z-cale/librustvoting/releases/download/0.1.0/zcash_voting_ffiFFI.xcframework.zip",
-            checksum: "68f317ca62efc5fab5ab8d6880ab14ed059d567e708f7b372e96980c56cada85"
+            checksum: "38dd3602f6d3766e1a568035a2ec3635efe56888aaf96678b77164dbec51af9a"
         ),
         .target(
             name: "ZcashVotingFFI",
