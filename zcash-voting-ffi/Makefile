@@ -8,6 +8,9 @@ MAKEFLAGS += --no-builtin-rules
 LIB_NAME = zcash_voting_ffi
 FFI_NAME = zcash_voting_ffiFFI
 
+# Workspace target directory (cargo outputs here, not in the crate subdir)
+TARGET_DIR = ../target
+
 PLATFORMS = ios-device macos ios-simulator
 IOS_DEVICE_ARCHS = aarch64-apple-ios
 IOS_SIM_ARCHS = x86_64-apple-ios aarch64-apple-ios-sim
@@ -28,11 +31,11 @@ install:
 # dev-incr:     simulator + device (needed before running on a real iPhone).
 dev-incr-sim:
 	cargo build --release --target aarch64-apple-ios-sim
-	cp target/aarch64-apple-ios-sim/release/lib$(LIB_NAME).a releases/$(FFI_NAME).xcframework/ios-arm64_x86_64-simulator/$(FFI_NAME).framework/$(FFI_NAME)
+	cp $(TARGET_DIR)/aarch64-apple-ios-sim/release/lib$(LIB_NAME).a releases/$(FFI_NAME).xcframework/ios-arm64_x86_64-simulator/$(FFI_NAME).framework/$(FFI_NAME)
 
 dev-incr: dev-incr-sim
 	cargo build --release --target aarch64-apple-ios
-	cp target/aarch64-apple-ios/release/lib$(LIB_NAME).a releases/$(FFI_NAME).xcframework/ios-arm64/$(FFI_NAME).framework/$(FFI_NAME)
+	cp $(TARGET_DIR)/aarch64-apple-ios/release/lib$(LIB_NAME).a releases/$(FFI_NAME).xcframework/ios-arm64/$(FFI_NAME).framework/$(FFI_NAME)
 
 # Dev build: Apple Silicon only (arm64 device + arm64 simulator + arm64 macOS)
 dev: clean bindings
@@ -42,7 +45,7 @@ dev: clean bindings
 	# ios-device framework
 	mkdir -p products/ios-device/frameworks/$(FFI_NAME).framework/Headers
 	mkdir -p products/ios-device/frameworks/$(FFI_NAME).framework/Modules
-	cp target/aarch64-apple-ios/release/lib$(LIB_NAME).a products/ios-device/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
+	cp $(TARGET_DIR)/aarch64-apple-ios/release/lib$(LIB_NAME).a products/ios-device/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
 	cp products/bindings/$(FFI_NAME).h products/ios-device/frameworks/$(FFI_NAME).framework/Headers/
 	cp support/platform-Info.plist products/ios-device/frameworks/$(FFI_NAME).framework/Info.plist
 	echo 'framework module $(FFI_NAME) {' > products/ios-device/frameworks/$(FFI_NAME).framework/Modules/module.modulemap
@@ -53,7 +56,7 @@ dev: clean bindings
 	# ios-simulator framework (arm64 only for dev)
 	mkdir -p products/ios-simulator/frameworks/$(FFI_NAME).framework/Headers
 	mkdir -p products/ios-simulator/frameworks/$(FFI_NAME).framework/Modules
-	cp target/aarch64-apple-ios-sim/release/lib$(LIB_NAME).a products/ios-simulator/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
+	cp $(TARGET_DIR)/aarch64-apple-ios-sim/release/lib$(LIB_NAME).a products/ios-simulator/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
 	cp products/bindings/$(FFI_NAME).h products/ios-simulator/frameworks/$(FFI_NAME).framework/Headers/
 	cp support/platform-Info.plist products/ios-simulator/frameworks/$(FFI_NAME).framework/Info.plist
 	echo 'framework module $(FFI_NAME) {' > products/ios-simulator/frameworks/$(FFI_NAME).framework/Modules/module.modulemap
@@ -64,7 +67,7 @@ dev: clean bindings
 	# macos framework (arm64 only for dev)
 	mkdir -p products/macos/frameworks/$(FFI_NAME).framework/Headers
 	mkdir -p products/macos/frameworks/$(FFI_NAME).framework/Modules
-	cp target/aarch64-apple-darwin/release/lib$(LIB_NAME).a products/macos/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
+	cp $(TARGET_DIR)/aarch64-apple-darwin/release/lib$(LIB_NAME).a products/macos/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
 	cp products/bindings/$(FFI_NAME).h products/macos/frameworks/$(FFI_NAME).framework/Headers/
 	cp support/platform-Info.plist products/macos/frameworks/$(FFI_NAME).framework/Info.plist
 	echo 'framework module $(FFI_NAME) {' > products/macos/frameworks/$(FFI_NAME).framework/Modules/module.modulemap
@@ -86,9 +89,8 @@ dev: clean bindings
 	cp products/bindings/$(LIB_NAME).swift Sources/ZcashVotingFFI/
 	$(MAKE) sanitize-generated-whitespace
 
-# Release build: all platforms
+# Release build: all platforms (includes x86_64 for simulator + macOS)
 release: clean bindings
-	# Build all targets
 	cargo build --release --target aarch64-apple-ios
 	cargo build --release --target aarch64-apple-ios-sim
 	cargo build --release --target x86_64-apple-ios
@@ -97,7 +99,7 @@ release: clean bindings
 	# ios-device framework
 	mkdir -p products/ios-device/frameworks/$(FFI_NAME).framework/Headers
 	mkdir -p products/ios-device/frameworks/$(FFI_NAME).framework/Modules
-	cp target/aarch64-apple-ios/release/lib$(LIB_NAME).a products/ios-device/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
+	cp $(TARGET_DIR)/aarch64-apple-ios/release/lib$(LIB_NAME).a products/ios-device/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
 	cp products/bindings/$(FFI_NAME).h products/ios-device/frameworks/$(FFI_NAME).framework/Headers/
 	cp support/platform-Info.plist products/ios-device/frameworks/$(FFI_NAME).framework/Info.plist
 	echo 'framework module $(FFI_NAME) {' > products/ios-device/frameworks/$(FFI_NAME).framework/Modules/module.modulemap
@@ -109,8 +111,8 @@ release: clean bindings
 	mkdir -p products/ios-simulator/frameworks/$(FFI_NAME).framework/Headers
 	mkdir -p products/ios-simulator/frameworks/$(FFI_NAME).framework/Modules
 	lipo -create \
-		target/aarch64-apple-ios-sim/release/lib$(LIB_NAME).a \
-		target/x86_64-apple-ios/release/lib$(LIB_NAME).a \
+		$(TARGET_DIR)/aarch64-apple-ios-sim/release/lib$(LIB_NAME).a \
+		$(TARGET_DIR)/x86_64-apple-ios/release/lib$(LIB_NAME).a \
 		-output products/ios-simulator/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
 	cp products/bindings/$(FFI_NAME).h products/ios-simulator/frameworks/$(FFI_NAME).framework/Headers/
 	cp support/platform-Info.plist products/ios-simulator/frameworks/$(FFI_NAME).framework/Info.plist
@@ -123,8 +125,8 @@ release: clean bindings
 	mkdir -p products/macos/frameworks/$(FFI_NAME).framework/Headers
 	mkdir -p products/macos/frameworks/$(FFI_NAME).framework/Modules
 	lipo -create \
-		target/aarch64-apple-darwin/release/lib$(LIB_NAME).a \
-		target/x86_64-apple-darwin/release/lib$(LIB_NAME).a \
+		$(TARGET_DIR)/aarch64-apple-darwin/release/lib$(LIB_NAME).a \
+		$(TARGET_DIR)/x86_64-apple-darwin/release/lib$(LIB_NAME).a \
 		-output products/macos/frameworks/$(FFI_NAME).framework/$(FFI_NAME)
 	cp products/bindings/$(FFI_NAME).h products/macos/frameworks/$(FFI_NAME).framework/Headers/
 	cp support/platform-Info.plist products/macos/frameworks/$(FFI_NAME).framework/Info.plist
@@ -152,7 +154,7 @@ bindings:
 	cargo build
 	mkdir -p products/bindings
 	cargo run --features bindgen --bin uniffi-bindgen generate \
-		--library target/debug/lib$(LIB_NAME).dylib \
+		--library $(TARGET_DIR)/debug/lib$(LIB_NAME).dylib \
 		--language swift \
 		--out-dir products/bindings
 
@@ -164,4 +166,4 @@ sanitize-generated-whitespace:
 
 clean:
 	rm -rf products
-	rm -rf target
+	rm -rf releases
