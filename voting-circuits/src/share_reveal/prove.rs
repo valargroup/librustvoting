@@ -1,7 +1,9 @@
 //! Real Halo2 prove/verify for the Share Reveal circuit (ZKP #3).
 //!
-//! Follows the same pattern as `delegation/prove.rs` but for the
-//! 5-condition share reveal circuit at K=11.
+//! Params and keys are cached in a `OnceLock` so only the first call pays
+//! keygen. This matters for the helper server where proofs are generated
+//! concurrently: without caching, every proof redundantly regenerates
+//! SRS params (~1s) and proving key (~0.5-1s).
 
 use alloc::format;
 use alloc::string::String;
@@ -19,36 +21,67 @@ use rand::rngs::OsRng;
 use super::circuit::{Circuit, Instance, K};
 
 // ================================================================
-// Params / key generation
+// Cached params + keys
+// ================================================================
+
+// Keygen is deterministic and expensive (~1-2s). Compute once per process
+// and reuse for all subsequent proofs and verifications.
+#[cfg(feature = "std")]
+static SHARE_REVEAL_KEY_CACHE: std::sync::OnceLock<(
+    Params<EqAffine>,
+    plonk::ProvingKey<EqAffine>,
+    plonk::VerifyingKey<EqAffine>,
+)> = std::sync::OnceLock::new();
+
+#[cfg(feature = "std")]
+fn get_share_reveal_keys() -> &'static (
+    Params<EqAffine>,
+    plonk::ProvingKey<EqAffine>,
+    plonk::VerifyingKey<EqAffine>,
+) {
+    SHARE_REVEAL_KEY_CACHE.get_or_init(|| {
+        let params = Params::new(K);
+        let (pk, vk) = share_reveal_proving_key_for_params(&params);
+        (params, pk, vk)
+    })
+}
+
+// ================================================================
+// Params / key generation (public API, non-cached fallbacks)
 // ================================================================
 
 /// Generate the IPA params (SRS) for the share reveal circuit.
 /// Deterministic for a given `K`.
 ///
-/// **Expensive**: K=11 params generation takes ~1 second.
-/// Callers should cache the result.
+/// Prefer [`get_share_reveal_keys`] when the `std` feature is enabled —
+/// it caches the result across calls.
 pub fn share_reveal_params() -> Params<EqAffine> {
     Params::new(K)
 }
 
-/// Generate the proving and verifying keys for the share reveal circuit.
-///
-/// Uses `Circuit::default()` (all witnesses unknown) as the empty circuit
-/// for key generation — the same pattern as the delegation circuit.
-///
-/// **Expensive**: first call involves full circuit layout. Callers should
-/// cache the result alongside the params.
-pub fn share_reveal_proving_key(
+fn share_reveal_proving_key_for_params(
     params: &Params<EqAffine>,
-) -> (
-    plonk::ProvingKey<EqAffine>,
-    plonk::VerifyingKey<EqAffine>,
-) {
+) -> (plonk::ProvingKey<EqAffine>, plonk::VerifyingKey<EqAffine>) {
     let empty_circuit = Circuit::default();
     let vk = keygen_vk(params, &empty_circuit).expect("share_reveal keygen_vk should not fail");
     let pk = keygen_pk(params, vk.clone(), &empty_circuit)
         .expect("share_reveal keygen_pk should not fail");
     (pk, vk)
+}
+
+/// Generate the proving and verifying keys for the share reveal circuit.
+///
+/// Uses [`share_reveal_params`] and `Circuit::default()` (all witnesses unknown)
+/// as the empty circuit for key generation.
+///
+/// Prefer [`get_share_reveal_keys`] when the `std` feature is enabled —
+/// it caches the result across calls.
+pub fn share_reveal_proving_key() -> (
+    plonk::ProvingKey<EqAffine>,
+    plonk::VerifyingKey<EqAffine>,
+) {
+    let params = share_reveal_params();
+    share_reveal_proving_key_for_params(&params)
 }
 
 // ================================================================
@@ -61,17 +94,27 @@ pub fn share_reveal_proving_key(
 /// a valid `Circuit` (with all witnesses populated) and a matching
 /// `Instance` (7 public inputs).
 ///
-/// **Expensive**: K=11 proof generation takes ~5-15 seconds in release mode.
+/// **Expensive**: K=11 proof generation takes ~1-2 seconds in release mode.
+/// Params and keys are cached (with `std`) so only the first call pays keygen.
 pub fn create_share_reveal_proof(circuit: Circuit, instance: &Instance) -> Vec<u8> {
-    let params = share_reveal_params();
-    let (pk, _vk) = share_reveal_proving_key(&params);
+    #[cfg(feature = "std")]
+    let (params, pk, _vk) = get_share_reveal_keys();
+
+    #[cfg(not(feature = "std"))]
+    let (params_owned, pk, _vk) = {
+        let p = share_reveal_params();
+        let (pk, vk) = share_reveal_proving_key_for_params(&p);
+        (p, pk, vk)
+    };
+    #[cfg(not(feature = "std"))]
+    let params = &params_owned;
 
     let public_inputs = instance.to_halo2_instance();
 
     let mut transcript = Blake2bWrite::<_, EqAffine, Challenge255<_>>::init(vec![]);
     create_proof(
-        &params,
-        &pk,
+        params,
+        pk,
         &[circuit],
         &[&[&public_inputs]],
         OsRng,
@@ -89,19 +132,25 @@ pub fn create_share_reveal_proof(circuit: Circuit, instance: &Instance) -> Vec<u
 /// the 7 public inputs.
 ///
 /// Returns `Ok(())` if verification succeeds, or an error message.
-pub fn verify_share_reveal_proof(
-    proof: &[u8],
-    instance: &Instance,
-) -> Result<(), String> {
-    let params = share_reveal_params();
-    let (_pk, vk) = share_reveal_proving_key(&params);
+pub fn verify_share_reveal_proof(proof: &[u8], instance: &Instance) -> Result<(), String> {
+    #[cfg(feature = "std")]
+    let (params, _pk, vk) = get_share_reveal_keys();
+
+    #[cfg(not(feature = "std"))]
+    let (params_owned, _pk, vk) = {
+        let p = share_reveal_params();
+        let (pk, vk) = share_reveal_proving_key_for_params(&p);
+        (p, pk, vk)
+    };
+    #[cfg(not(feature = "std"))]
+    let params = &params_owned;
 
     let public_inputs = instance.to_halo2_instance();
 
-    let strategy = SingleVerifier::new(&params);
+    let strategy = SingleVerifier::new(params);
     let mut transcript = Blake2bRead::<_, EqAffine, Challenge255<_>>::init(proof);
 
-    verify_proof(&params, &vk, strategy, &[&[&public_inputs]], &mut transcript)
+    verify_proof(params, vk, strategy, &[&[&public_inputs]], &mut transcript)
         .map_err(|e| format!("share_reveal verification failed: {:?}", e))
 }
 
@@ -124,7 +173,9 @@ pub fn verify_share_reveal_proof_raw(
     if public_inputs_bytes.len() != EXPECTED_BYTES {
         return Err(format!(
             "expected {} bytes ({} × 32) for public inputs, got {}",
-            EXPECTED_BYTES, NUM_PUBLIC_INPUTS, public_inputs_bytes.len()
+            EXPECTED_BYTES,
+            NUM_PUBLIC_INPUTS,
+            public_inputs_bytes.len()
         ));
     }
 
@@ -148,18 +199,21 @@ pub fn verify_share_reveal_proof_raw(
         }
     }
 
-    let params = share_reveal_params();
-    let (_pk, vk) = share_reveal_proving_key(&params);
+    #[cfg(feature = "std")]
+    let (params, _pk, vk) = get_share_reveal_keys();
 
-    let strategy = SingleVerifier::new(&params);
+    #[cfg(not(feature = "std"))]
+    let (params_owned, _pk, vk) = {
+        let p = share_reveal_params();
+        let (pk, vk) = share_reveal_proving_key_for_params(&p);
+        (p, pk, vk)
+    };
+    #[cfg(not(feature = "std"))]
+    let params = &params_owned;
+
+    let strategy = SingleVerifier::new(params);
     let mut transcript = Blake2bRead::<_, EqAffine, Challenge255<_>>::init(proof);
 
-    verify_proof(
-        &params,
-        &vk,
-        strategy,
-        &[&[&public_inputs]],
-        &mut transcript,
-    )
-    .map_err(|e| format!("share_reveal verification failed: {:?}", e))
+    verify_proof(params, vk, strategy, &[&[&public_inputs]], &mut transcript)
+        .map_err(|e| format!("share_reveal verification failed: {:?}", e))
 }

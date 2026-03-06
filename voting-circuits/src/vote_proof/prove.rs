@@ -38,11 +38,7 @@ static VOTE_PROOF_PK_CACHE: std::sync::OnceLock<(
 fn get_vote_proof_keys() -> &'static (Params<EqAffine>, plonk::ProvingKey<EqAffine>, plonk::VerifyingKey<EqAffine>) {
     VOTE_PROOF_PK_CACHE.get_or_init(|| {
         let params = Params::new(K);
-        let empty_circuit = Circuit::default();
-        let vk = keygen_vk(&params, &empty_circuit)
-            .expect("vote_proof keygen_vk should not fail");
-        let pk = keygen_pk(&params, vk.clone(), &empty_circuit)
-            .expect("vote_proof keygen_pk should not fail");
+        let (pk, vk) = vote_proof_proving_key_for_params(&params);
         (params, pk, vk)
     })
 }
@@ -67,7 +63,7 @@ pub fn vote_proof_params() -> Params<EqAffine> {
 ///
 /// Prefer [`get_vote_proof_keys`] when the `std` feature is enabled —
 /// it caches the result across calls.
-pub fn vote_proof_proving_key(
+fn vote_proof_proving_key_for_params(
     params: &Params<EqAffine>,
 ) -> (
     plonk::ProvingKey<EqAffine>,
@@ -78,6 +74,21 @@ pub fn vote_proof_proving_key(
     let pk = keygen_pk(params, vk.clone(), &empty_circuit)
         .expect("vote_proof keygen_pk should not fail");
     (pk, vk)
+}
+
+/// Generate the proving and verifying keys for the vote proof circuit.
+///
+/// Uses [`vote_proof_params`] and `Circuit::default()` (all witnesses unknown)
+/// as the empty circuit for key generation.
+///
+/// Prefer [`get_vote_proof_keys`] when the `std` feature is enabled —
+/// it caches the result across calls.
+pub fn vote_proof_proving_key() -> (
+    plonk::ProvingKey<EqAffine>,
+    plonk::VerifyingKey<EqAffine>,
+) {
+    let params = vote_proof_params();
+    vote_proof_proving_key_for_params(&params)
 }
 
 // ================================================================
@@ -99,7 +110,7 @@ pub fn create_vote_proof(circuit: Circuit, instance: &Instance) -> Vec<u8> {
     #[cfg(not(feature = "std"))]
     let (params_owned, pk, _vk) = {
         let p = vote_proof_params();
-        let (pk, vk) = vote_proof_proving_key(&p);
+        let (pk, vk) = vote_proof_proving_key_for_params(&p);
         (p, pk, vk)
     };
     #[cfg(not(feature = "std"))]
@@ -138,7 +149,7 @@ pub fn verify_vote_proof(
     #[cfg(not(feature = "std"))]
     let (params_owned, _pk, vk) = {
         let p = vote_proof_params();
-        let (pk, vk) = vote_proof_proving_key(&p);
+        let (pk, vk) = vote_proof_proving_key_for_params(&p);
         (p, pk, vk)
     };
     #[cfg(not(feature = "std"))]
@@ -200,7 +211,7 @@ pub fn verify_vote_proof_raw(
     #[cfg(not(feature = "std"))]
     let (params_owned, _pk, vk) = {
         let p = vote_proof_params();
-        let (pk, vk) = vote_proof_proving_key(&p);
+        let (pk, vk) = vote_proof_proving_key_for_params(&p);
         (p, pk, vk)
     };
     #[cfg(not(feature = "std"))]
