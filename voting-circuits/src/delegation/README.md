@@ -219,7 +219,7 @@ Where:
 - **pk_d_new_x**: the x-coordinate of the output note's diversified transmission key. Reuses the ECC point from condition 6.
 - **num_ballots**: the ballot count `floor(v_total / 12,500,000)`, computed in condition 8. `v_total` is the sum `v_1 + v_2 + v_3 + v_4 + v_5`, computed in-circuit via four `AddChip` additions. **Each `v_i` is an internal wire** — produced by per-note condition 9 (note commitment integrity), not a free witness. The value is bound to the actual note commitment.
 - **vote_round_id**: the vote round identifier (public input, same cell as condition 3).
-- **MAX_PROPOSAL_AUTHORITY**: `2^16 - 1 = 65535`. A 16-bit bitmask authorizing voting on all 16 proposals. Assigned via `assign_constant` so the value is baked into the verification key.
+- **MAX_PROPOSAL_AUTHORITY**: `2^16 - 1 = 65535`. A 16-bit bitmask with all bits set. Bits 1–15 correspond to proposal IDs 1–15; bit 0 is reserved as the lookup table default (see `authority_decrement.rs`). Assigned via `assign_constant` so the value is baked into the verification key.
 - **van_comm_rand**: a random blinding factor. Prevents observers from brute-forcing the address or weight from the public `van_comm`.
 
 **Function layout:** Two Poseidon hashes via the shared `circuit::van_integrity` gadget:

@@ -119,8 +119,9 @@ func (s *MsgServerTestSuite) createPendingRoundWithValidators(n int) (roundID []
 // Threshold mode is used automatically when n >= 2.
 func (s *MsgServerTestSuite) dealPendingRound(n int) (roundID []byte, addrs []string) {
 	roundID, addrs, _ = s.createPendingRoundWithValidators(n)
+	s.setBlockProposer(addrs[0])
 	msg := &types.MsgDealExecutiveAuthorityKey{
-		Creator:     "dealer",
+		Creator:     addrs[0],
 		VoteRoundId: roundID,
 		EaPk:        testPallasPK(),
 		Payloads:    makePayloads(addrs),
@@ -289,6 +290,7 @@ func (s *MsgServerTestSuite) TestDealExecutiveAuthorityKey_HappyPath() {
 	s.SetupTest()
 
 	roundID, addrs, _ := s.createPendingRoundWithValidators(3)
+	s.setBlockProposer(addrs[0])
 	eaPk := testPallasPK()
 	payloads := makePayloads(addrs)
 	vks := make([][]byte, 3)
@@ -297,7 +299,7 @@ func (s *MsgServerTestSuite) TestDealExecutiveAuthorityKey_HappyPath() {
 	}
 
 	_, err := s.msgServer.DealExecutiveAuthorityKey(s.ctx, &types.MsgDealExecutiveAuthorityKey{
-		Creator:          "dealer1",
+		Creator:          addrs[0],
 		VoteRoundId:      roundID,
 		EaPk:             eaPk,
 		Payloads:         payloads,
@@ -313,7 +315,7 @@ func (s *MsgServerTestSuite) TestDealExecutiveAuthorityKey_HappyPath() {
 	s.Require().Equal(types.CeremonyStatus_CEREMONY_STATUS_DEALT, round.CeremonyStatus)
 	s.Require().Equal(types.SessionStatus_SESSION_STATUS_PENDING, round.Status)
 	s.Require().Equal(eaPk, round.EaPk)
-	s.Require().Equal("dealer1", round.CeremonyDealer)
+	s.Require().Equal(addrs[0], round.CeremonyDealer)
 	s.Require().Equal(uint64(s.ctx.BlockTime().Unix()), round.CeremonyPhaseStart)
 	s.Require().Equal(types.DefaultDealTimeout, round.CeremonyPhaseTimeout)
 	s.Require().Len(round.CeremonyPayloads, 3)
@@ -603,7 +605,12 @@ func (s *MsgServerTestSuite) TestDealExecutiveAuthorityKey_Rejects() {
 		s.Run(tc.name, func() {
 			s.SetupTest()
 			roundID, addrs := tc.setup()
-			_, err := s.msgServer.DealExecutiveAuthorityKey(s.ctx, tc.msg(roundID, addrs))
+			msg := tc.msg(roundID, addrs)
+			if len(addrs) > 0 {
+				msg.Creator = addrs[0]
+			}
+			s.setBlockProposer(msg.Creator)
+			_, err := s.msgServer.DealExecutiveAuthorityKey(s.ctx, msg)
 			s.Require().Error(err)
 			s.Require().Contains(err.Error(), tc.errContains)
 		})
@@ -618,6 +625,7 @@ func (s *MsgServerTestSuite) TestAckExecutiveAuthorityKey_HappyPath() {
 	s.SetupTest()
 	roundID, addrs := s.dealPendingRound(3)
 
+	s.setBlockProposer(addrs[0])
 	_, err := s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 		Creator:      addrs[0],
 		VoteRoundId:  roundID,
@@ -631,6 +639,7 @@ func (s *MsgServerTestSuite) TestAckExecutiveAuthorityKey_HappyPath() {
 	s.Require().Equal(types.CeremonyStatus_CEREMONY_STATUS_DEALT, round.CeremonyStatus)
 	s.Require().Equal(types.SessionStatus_SESSION_STATUS_PENDING, round.Status)
 
+	s.setBlockProposer(addrs[1])
 	_, err = s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 		Creator:      addrs[1],
 		VoteRoundId:  roundID,
@@ -642,6 +651,7 @@ func (s *MsgServerTestSuite) TestAckExecutiveAuthorityKey_HappyPath() {
 	s.Require().NoError(err)
 	s.Require().Equal(types.CeremonyStatus_CEREMONY_STATUS_DEALT, round.CeremonyStatus)
 
+	s.setBlockProposer(addrs[2])
 	_, err = s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 		Creator:      addrs[2],
 		VoteRoundId:  roundID,
@@ -671,6 +681,7 @@ func (s *MsgServerTestSuite) TestAckExecutiveAuthorityKey_PartialAcks() {
 	s.SetupTest()
 	roundID, addrs := s.dealPendingRound(4)
 
+	s.setBlockProposer(addrs[0])
 	_, err := s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 		Creator:      addrs[0],
 		VoteRoundId:  roundID,
@@ -684,6 +695,7 @@ func (s *MsgServerTestSuite) TestAckExecutiveAuthorityKey_PartialAcks() {
 	s.Require().Equal(types.CeremonyStatus_CEREMONY_STATUS_DEALT, round.CeremonyStatus)
 	s.Require().Equal(types.SessionStatus_SESSION_STATUS_PENDING, round.Status)
 
+	s.setBlockProposer(addrs[1])
 	_, err = s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 		Creator:      addrs[1],
 		VoteRoundId:  roundID,
@@ -796,7 +808,9 @@ func (s *MsgServerTestSuite) TestAckExecutiveAuthorityKey_Rejects() {
 		s.Run(tc.name, func() {
 			s.SetupTest()
 			roundID, addrs := tc.setup()
-			_, err := s.msgServer.AckExecutiveAuthorityKey(s.ctx, tc.msg(roundID, addrs))
+			msg := tc.msg(roundID, addrs)
+			s.setBlockProposer(msg.Creator)
+			_, err := s.msgServer.AckExecutiveAuthorityKey(s.ctx, msg)
 			s.Require().Error(err)
 			s.Require().Contains(err.Error(), tc.errContains)
 		})
@@ -818,6 +832,7 @@ func (s *MsgServerTestSuite) TestCeremonyLog_DealAndAck() {
 	s.Require().Contains(round.CeremonyLog[0], "deal from")
 	s.Require().Contains(round.CeremonyLog[0], "ea_pk=")
 
+	s.setBlockProposer(addrs[0])
 	_, err = s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 		Creator:      addrs[0],
 		VoteRoundId:  roundID,
@@ -832,6 +847,7 @@ func (s *MsgServerTestSuite) TestCeremonyLog_DealAndAck() {
 	s.Require().Contains(round.CeremonyLog[1], "1/3 acked")
 
 	for _, addr := range addrs[1:] {
+		s.setBlockProposer(addr)
 		_, err = s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 			Creator:      addr,
 			VoteRoundId:  roundID,
@@ -852,6 +868,7 @@ func (s *MsgServerTestSuite) TestCeremonyLog_PartialAcksNoConfirm() {
 	s.SetupTest()
 	roundID, addrs := s.dealPendingRound(4)
 
+	s.setBlockProposer(addrs[0])
 	_, err := s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 		Creator:      addrs[0],
 		VoteRoundId:  roundID,
@@ -865,6 +882,7 @@ func (s *MsgServerTestSuite) TestCeremonyLog_PartialAcksNoConfirm() {
 	s.Require().Len(round.CeremonyLog, 2)
 	s.Require().Contains(round.CeremonyLog[1], "1/4 acked")
 
+	s.setBlockProposer(addrs[1])
 	_, err = s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 		Creator:      addrs[1],
 		VoteRoundId:  roundID,
@@ -906,6 +924,7 @@ func (s *MsgServerTestSuite) TestFullCeremonyWithECIES() {
 	}
 
 	roundID := s.createPendingRound(ceremonyVals)
+	s.setBlockProposer(addrs[0])
 
 	eaSk, eaPk := elgamal.KeyGen(rand.Reader)
 	eaPkBytes := eaPk.Point.ToAffineCompressed()
@@ -929,7 +948,7 @@ func (s *MsgServerTestSuite) TestFullCeremonyWithECIES() {
 	}
 
 	_, err = s.msgServer.DealExecutiveAuthorityKey(s.ctx, &types.MsgDealExecutiveAuthorityKey{
-		Creator:          "dealer",
+		Creator:          addrs[0],
 		VoteRoundId:      roundID,
 		EaPk:             eaPkBytes,
 		Payloads:         payloads,
@@ -968,6 +987,7 @@ func (s *MsgServerTestSuite) TestFullCeremonyWithECIES() {
 	}
 
 	for _, addr := range addrs {
+		s.setBlockProposer(addr)
 		_, err = s.msgServer.AckExecutiveAuthorityKey(s.ctx, &types.MsgAckExecutiveAuthorityKey{
 			Creator:      addr,
 			VoteRoundId:  roundID,
