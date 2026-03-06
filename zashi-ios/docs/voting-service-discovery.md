@@ -40,13 +40,62 @@ Validators can register their URL with a single command via `join.sh`. The regis
 
 **Phase 2 (bonded):** After `join.sh` registers the validator on-chain (via `create-val-tx`), it re-registers with the same endpoint. This time the edge function detects the validator is bonded and promotes the URL directly to `vote_servers` — no admin approval needed.
 
-Both phases use the same endpoint (`POST /api/register-validator`) and the same ADR-036 amino signature format. The edge function decides the path based on on-chain bonding status.
+Both phases use the same endpoint (`POST /api/register-validator`) and the same ADR-036 amino signature format. The edge function decides the path based on on-chain bonding status. Both phases also write to `approved-servers` (see below).
 
 The `zallyd sign-arbitrary` command provides the signature:
 ```bash
 zallyd sign-arbitrary '{"operator_address":"...","url":"...","moniker":"...","timestamp":...}' \
   --from validator --keyring-backend test --home ~/.zallyd
 ```
+
+## Server heartbeat (active vs approved)
+
+`vote_servers` is split into two tiers:
+
+- **`approved-servers`** (persistent) — once a server is approved (via admin approval or on-chain bonding), it stays in this list unless manually removed. Survives reboots and pulse gaps.
+- **`vote_servers`** (active) — only contains servers that are approved AND actively pulsing. This is what iOS reads. Servers are added when they pulse and evicted if no pulse is received for >2 minutes.
+
+### Heartbeat flow
+
+Each helper server calls `POST /api/server-heartbeat` on startup and every 30 seconds thereafter. The payload and signature format are identical to `register-validator` (ADR-036 amino signature over `{ operator_address, url, moniker, timestamp }`).
+
+The edge function checks `approved-servers`:
+- **Approved** → upsert into `vote_servers`, update `server-pulses[url] = now`, evict stale entries (>2 min), return `{ status: "active" }`.
+- **Not approved** → upsert into `pending-registrations` (same queue as `register-validator`), return `{ status: "pending" }`.
+
+A safety-net cron (`/api/evict-stale-servers`, every 2 minutes) handles eviction when all servers are down and nobody is pulsing.
+
+### Edge Config keys
+
+| Key | Purpose |
+|-----|---------|
+| `voting-config` | Active config — `vote_servers` and `pir_servers`. iOS reads this. |
+| `approved-servers` | Persistent list of `{ url, label, operator_address }`. Only removed manually. |
+| `server-pulses` | Map `{ [url]: unix_timestamp }`. Updated every 30s by each server. |
+| `pending-registrations` | Unapproved servers waiting for admin approval (7-day expiry). |
+
+### Helper configuration
+
+The heartbeat is configured in `app.toml` under `[helper]`:
+
+```toml
+# Vercel base URL for the heartbeat endpoint.
+pulse_url = "https://zally-phi.vercel.app"
+
+# This server's public URL as seen by clients (the Caddy TLS URL).
+helper_url = "https://1-2-3-4.sslip.io"
+```
+
+Both fields must be set for the heartbeat to activate. `join.sh` writes these automatically — `pulse_url` from `VOTING_CONFIG_URL` and `helper_url` from the detected `VALIDATOR_URL` after Caddy TLS setup. Local dev scripts (`init.sh`, `init_multi.sh`) leave both empty to disable the heartbeat.
+
+### Lifecycle
+
+1. `join.sh` runs → `register-validator` adds server to `approved-servers` + `vote_servers`
+2. `zallyd start` → helper pulse goroutine calls `/api/server-heartbeat` immediately, then every 30s
+3. If the server is in `approved-servers`, it stays in `vote_servers` as long as it keeps pulsing
+4. If the server stops (crash, restart, network issue), it is evicted from `vote_servers` after 2 minutes
+5. On restart, the next pulse re-adds it to `vote_servers` automatically (still in `approved-servers`)
+6. Admin can see active/inactive status in the admin UI "Approved servers" panel
 
 ## Local testing
 
@@ -86,9 +135,9 @@ The config is served from **Vercel Edge Config**, a key-value store that can be 
 
 ### Updating the config
 
-1. **Admin UI** (primary): Register/remove validator URLs via the Validators panel, or approve pending self-registrations
-2. **Self-registration**: `join.sh` auto-registers via `POST /api/register-validator` (admin approves in UI, or auto-promoted after bonding)
-3. **Vercel Dashboard**: Go to the project's Edge Config store → edit the `voting-config` key directly
+1. **Admin UI** (primary): Register/remove validator URLs via the Validators panel, or approve pending self-registrations. The "Approved servers" panel shows which servers are actively pulsing.
+2. **Self-registration**: `join.sh` auto-registers via `POST /api/register-validator` (admin approves in UI, or auto-promoted after bonding). The heartbeat (`/api/server-heartbeat`) keeps the server in `vote_servers` after registration.
+3. **Vercel Dashboard**: Go to the project's Edge Config store → edit keys directly (`voting-config`, `approved-servers`, `server-pulses`, `pending-registrations`)
 4. **Vercel CLI**: `vercel edge-config items update voting-config --value '{"version":1,...}'`
 
 Changes take effect immediately — no git push or redeploy needed. This is useful for demos where you spin up new servers and want TestFlight builds to pick them up right away.

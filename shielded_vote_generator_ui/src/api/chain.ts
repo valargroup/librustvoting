@@ -416,5 +416,27 @@ export async function rejectRegistration(params: ApproveRegistrationParams): Pro
   });
 }
 
+// -- Server heartbeat / approved-servers --
+
+/** Persistent list of admin-approved servers (survives pulse gaps). */
+export async function getApprovedServers(): Promise<ServiceEntry[]> {
+  try {
+    return await fetchJson<ServiceEntry[]>("/api/approved-servers");
+  } catch {
+    return [];
+  }
+}
+
+/** Pulse timestamps: { [url]: unix_timestamp }. */
+export type ServerPulses = Record<string, number>;
+
+export async function getServerPulses(): Promise<ServerPulses> {
+  try {
+    return await fetchJson<ServerPulses>("/api/server-pulses");
+  } catch {
+    return {};
+  }
+}
+
 // submitSession was removed: MsgCreateVotingSession is now a standard Cosmos
 // SDK transaction signed client-side. See cosmosTx.ts.

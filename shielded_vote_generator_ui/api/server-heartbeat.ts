@@ -1,15 +1,21 @@
-// Edge function for validator self-registration.
+// Edge function for server heartbeat (registration + pulse).
 //
-// A validator signs { operator_address, url, moniker, timestamp } with their
-// operator key. If the validator is already bonded on-chain, their URL is
-// written directly to vote_servers in Edge Config. Otherwise, the entry is
-// added to a pending-registrations queue with a 7-day expiry for the
-// vote-manager to approve.
+// Called by each helper server on startup and every 30s thereafter.
+// The server signs { operator_address, url, moniker, timestamp } with its
+// operator key (same ADR-036 format as register-validator).
+//
+// If the server's operator_address is in approved-servers, the URL is
+// upserted into vote_servers and the pulse timestamp is recorded. Stale
+// entries (no pulse for >2 minutes) are evicted from vote_servers on each
+// call (piggybacked eviction).
+//
+// If the server is NOT in approved-servers, it is added to the
+// pending-registrations queue for admin approval (same queue as
+// register-validator).
 //
 // Required env vars:
 //   VERCEL_API_TOKEN   — Vercel REST API token with Edge Config write access
 //   EDGE_CONFIG_ID     — ID of the Edge Config store (ecfg_...)
-//   CHAIN_API_URL      — Public URL of a chain node REST API
 
 import { get } from '@vercel/edge-config';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
@@ -20,12 +26,11 @@ import { bech32 } from 'bech32';
 export const config = { runtime: 'edge' };
 
 const BECH32_PREFIX = 'zvote';
-const VALOPER_PREFIX = 'zvotevaloper';
 const TIMESTAMP_WINDOW_SECS = 300; // 5 minutes
 const PENDING_EXPIRY_SECS = 7 * 24 * 60 * 60; // 7 days
+const STALE_PULSE_SECS = 120; // 2 minutes — evict from vote_servers after this
 
-// -- Crypto helpers (duplicated from update-voting-config.ts — edge functions
-//    can't share modules without build config changes) --
+// -- Crypto helpers (duplicated — edge functions can't share modules) --
 
 function makeSignArbitraryDoc(signer: string, data: string): Uint8Array {
   const signDoc = {
@@ -52,11 +57,6 @@ function pubkeyToAddress(compressedPubkey: Uint8Array): string {
   return bech32.encode(BECH32_PREFIX, bech32.toWords(hash));
 }
 
-function addressToValoper(address: string): string {
-  const { words } = bech32.decode(address);
-  return bech32.encode(VALOPER_PREFIX, words);
-}
-
 function base64ToBytes(b64: string): Uint8Array {
   const binary = atob(b64);
   const bytes = new Uint8Array(binary.length);
@@ -81,7 +81,7 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-interface RegisterBody {
+interface HeartbeatBody {
   operator_address: string;
   url: string;
   moniker: string;
@@ -112,6 +112,9 @@ interface PendingRegistration {
   expires_at: number;
 }
 
+// server-pulses: { [url]: unix_timestamp }
+type ServerPulses = Record<string, number>;
+
 export default async function handler(req: Request) {
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -123,16 +126,15 @@ export default async function handler(req: Request) {
 
   const VERCEL_API_TOKEN = process.env.VERCEL_API_TOKEN;
   const EDGE_CONFIG_ID = process.env.EDGE_CONFIG_ID;
-  const CHAIN_API_URL = process.env.CHAIN_API_URL;
 
-  if (!VERCEL_API_TOKEN || !EDGE_CONFIG_ID || !CHAIN_API_URL) {
+  if (!VERCEL_API_TOKEN || !EDGE_CONFIG_ID) {
     return jsonResponse(
-      { error: 'Server misconfigured: missing VERCEL_API_TOKEN, EDGE_CONFIG_ID, or CHAIN_API_URL' },
+      { error: 'Server misconfigured: missing VERCEL_API_TOKEN or EDGE_CONFIG_ID' },
       500,
     );
   }
 
-  let body: RegisterBody;
+  let body: HeartbeatBody;
   try {
     body = await req.json();
   } catch {
@@ -177,44 +179,32 @@ export default async function handler(req: Request) {
     return jsonResponse({ error: 'Public key does not match operator_address' }, 401);
   }
 
-  // 4. Check if this validator is bonded on-chain.
-  const valoperAddress = addressToValoper(operator_address);
-  let isBonded = false;
-  try {
-    const resp = await fetch(
-      `${CHAIN_API_URL}/cosmos/staking/v1beta1/validators/${valoperAddress}`,
-    );
-    if (resp.ok) {
-      const data = await resp.json();
-      isBonded = data.validator?.status === 'BOND_STATUS_BONDED';
+  // 4. Check if this server is in the approved-servers list.
+  const approvedServers = (await get('approved-servers') as ServiceEntry[] | null) ?? [];
+  const isApproved = approvedServers.some(
+    (s) => s.operator_address === operator_address,
+  );
+
+  if (!isApproved) {
+    // Not approved — add to pending-registrations (same queue as register-validator).
+    const currentPending = (await get('pending-registrations') as PendingRegistration[] | null) ?? [];
+
+    const pendingEntry: PendingRegistration = {
+      operator_address,
+      url,
+      moniker,
+      timestamp,
+      signature,
+      pub_key,
+      expires_at: now + PENDING_EXPIRY_SECS,
+    };
+
+    const pendingIdx = currentPending.findIndex((p) => p.operator_address === operator_address);
+    if (pendingIdx >= 0) {
+      currentPending[pendingIdx] = pendingEntry;
+    } else {
+      currentPending.push(pendingEntry);
     }
-  } catch {
-    // If the chain query fails, treat as not bonded (goes to pending queue).
-  }
-
-  // 5. Read current state from Edge Config.
-  const currentConfig = (await get('voting-config') as VotingConfig | null) ?? {
-    version: 1,
-    vote_servers: [],
-    pir_servers: [],
-  };
-
-  if (isBonded) {
-    // Phase 2: Directly upsert into vote_servers and approved-servers.
-    // Both URL and operator_address are unique keys — evict any existing entry
-    // matching either field to prevent duplicates, then append the new entry.
-    const entry: ServiceEntry = { url, label: moniker, operator_address };
-    currentConfig.vote_servers = currentConfig.vote_servers.filter(
-      (s) => s.url !== url && s.operator_address !== operator_address,
-    );
-    currentConfig.vote_servers.push(entry);
-
-    // Also persist in approved-servers so the server survives pulse gaps.
-    const approvedServers = (await get('approved-servers') as ServiceEntry[] | null) ?? [];
-    const updatedApproved = approvedServers.filter(
-      (s) => s.url !== url && s.operator_address !== operator_address,
-    );
-    updatedApproved.push(entry);
 
     try {
       const resp = await fetch(
@@ -227,8 +217,7 @@ export default async function handler(req: Request) {
           },
           body: JSON.stringify({
             items: [
-              { operation: 'upsert', key: 'voting-config', value: currentConfig },
-              { operation: 'upsert', key: 'approved-servers', value: updatedApproved },
+              { operation: 'upsert', key: 'pending-registrations', value: currentPending },
             ],
           }),
         },
@@ -241,30 +230,51 @@ export default async function handler(req: Request) {
       return jsonResponse({ error: `Edge Config update failed: ${err}` }, 502);
     }
 
-    return jsonResponse({ status: 'registered', phase: 'bonded' });
+    return jsonResponse({ status: 'pending', expires_at: now + PENDING_EXPIRY_SECS });
   }
 
-  // Phase 1: Add to pending-registrations queue.
-  const currentPending = (await get('pending-registrations') as PendingRegistration[] | null) ?? [];
-
-  const pendingEntry: PendingRegistration = {
-    operator_address,
-    url,
-    moniker,
-    timestamp,
-    signature,
-    pub_key,
-    expires_at: now + PENDING_EXPIRY_SECS,
+  // 5. Server is approved — activate it.
+  const currentConfig = (await get('voting-config') as VotingConfig | null) ?? {
+    version: 1,
+    vote_servers: [],
+    pir_servers: [],
   };
+  const pulses = (await get('server-pulses') as ServerPulses | null) ?? {};
 
-  // Upsert by operator_address (replace existing entry if re-registering).
-  const pendingIdx = currentPending.findIndex((p) => p.operator_address === operator_address);
-  if (pendingIdx >= 0) {
-    currentPending[pendingIdx] = pendingEntry;
-  } else {
-    currentPending.push(pendingEntry);
+  // Record this server's pulse.
+  pulses[url] = now;
+
+  // Upsert into vote_servers (use the approved entry's label if URL changed).
+  const approvedEntry = approvedServers.find((s) => s.operator_address === operator_address)!;
+  const entry: ServiceEntry = { url, label: moniker, operator_address };
+  currentConfig.vote_servers = currentConfig.vote_servers.filter(
+    (s) => s.url !== url && s.operator_address !== operator_address,
+  );
+  currentConfig.vote_servers.push(entry);
+
+  // Also update the approved entry's URL if the server re-registered with a new one.
+  if (approvedEntry.url !== url) {
+    approvedEntry.url = url;
+    approvedEntry.label = moniker;
   }
 
+  // 6. Evict stale entries — only those tracked in server-pulses.
+  const staleUrls: string[] = [];
+  for (const [pulseUrl, pulseTime] of Object.entries(pulses)) {
+    if (pulseUrl === url) continue; // just updated above
+    if (now - pulseTime > STALE_PULSE_SECS) {
+      staleUrls.push(pulseUrl);
+      delete pulses[pulseUrl];
+    }
+  }
+
+  if (staleUrls.length > 0) {
+    currentConfig.vote_servers = currentConfig.vote_servers.filter(
+      (s) => !staleUrls.includes(s.url),
+    );
+  }
+
+  // 7. Atomic write: voting-config, server-pulses, and approved-servers (URL update).
   try {
     const resp = await fetch(
       `https://api.vercel.com/v1/edge-config/${EDGE_CONFIG_ID}/items`,
@@ -276,7 +286,9 @@ export default async function handler(req: Request) {
         },
         body: JSON.stringify({
           items: [
-            { operation: 'upsert', key: 'pending-registrations', value: currentPending },
+            { operation: 'upsert', key: 'voting-config', value: currentConfig },
+            { operation: 'upsert', key: 'server-pulses', value: pulses },
+            { operation: 'upsert', key: 'approved-servers', value: approvedServers },
           ],
         }),
       },
@@ -289,5 +301,8 @@ export default async function handler(req: Request) {
     return jsonResponse({ error: `Edge Config update failed: ${err}` }, 502);
   }
 
-  return jsonResponse({ status: 'pending', phase: 'unbonded', expires_at: pendingEntry.expires_at });
+  return jsonResponse({
+    status: 'active',
+    evicted: staleUrls.length > 0 ? staleUrls : undefined,
+  });
 }

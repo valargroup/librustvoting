@@ -293,6 +293,14 @@ chain_api_port = 1317
 
 # Maximum concurrent proof generation goroutines.
 max_concurrent_proofs = 2
+
+# Heartbeat pulse URL (Vercel base URL for server-heartbeat endpoint).
+# Empty disables the heartbeat.
+pulse_url = "${VOTING_CONFIG_URL}"
+
+# This server's public URL as seen by clients (set after Caddy TLS setup).
+# Empty disables the heartbeat.
+helper_url = ""
 HELPERCFG
 
 echo "Node configured."
@@ -392,6 +400,12 @@ CADDYEOF
   echo "Caddy configured: ${VALIDATOR_URL} → localhost:1317"
 else
   VALIDATOR_URL=""
+fi
+
+# Patch [helper] helper_url now that VALIDATOR_URL is known.
+if [ -n "$VALIDATOR_URL" ]; then
+  sed -i.bak "s|^helper_url = \"\"$|helper_url = \"${VALIDATOR_URL}\"|" "${APP_TOML}"
+  rm -f "${APP_TOML}.bak"
 fi
 
 # ─── Phase 1: Register as pending validator ─────────────────────────────────

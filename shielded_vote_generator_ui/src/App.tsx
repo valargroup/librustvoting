@@ -1679,6 +1679,10 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
   const [approveAmounts, setApproveAmounts] = useState<Record<string, string>>({});
   const [approveResult, setApproveResult] = useState<{ addr: string; ok: boolean; msg: string } | null>(null);
 
+  // Approved servers + pulse status.
+  const [approvedServers, setApprovedServers] = useState<chainApi.ServiceEntry[]>([]);
+  const [serverPulses, setServerPulses] = useState<chainApi.ServerPulses>({});
+
   // Edge Config network management state.
   const [votingConfig, setVotingConfig] = useState<chainApi.VotingConfig | null>(null);
   const [urlInputFor, setUrlInputFor] = useState<string | null>(null); // moniker being edited
@@ -1711,18 +1715,22 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
     if (!silent) setLoading(true);
     setError("");
     try {
-      const [valResp, ceremonyResp, pallasResp, vcResp, pendingResp] = await Promise.all([
+      const [valResp, ceremonyResp, pallasResp, vcResp, pendingResp, approvedResp, pulsesResp] = await Promise.all([
         chainApi.getValidators(),
         chainApi.getCeremonyState().catch(() => null),
         chainApi.getPallasKeys().catch(() => ({ validators: [] })),
         chainApi.getVotingConfig().catch(() => null),
         chainApi.getPendingRegistrations().catch(() => []),
+        chainApi.getApprovedServers().catch(() => []),
+        chainApi.getServerPulses().catch(() => ({})),
       ]);
       setValidators(valResp.validators ?? []);
       setCeremony(ceremonyResp);
       setPallasKeys(new Set(pallasResp.validators.map((v) => v.validator_address)));
       setVotingConfig(vcResp);
       setPendingRegistrations(pendingResp);
+      setApprovedServers(approvedResp);
+      setServerPulses(pulsesResp);
     } catch (err) {
       if (!silent) setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -2061,6 +2069,64 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
                         {approveResult.msg}
                       </p>
                     )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Approved servers with pulse status */}
+        {approvedServers.length > 0 && (
+          <div className="mb-6">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-[10px] text-text-muted uppercase tracking-wider">
+                Approved servers
+              </span>
+              <span className="text-[9px] bg-accent/20 text-accent px-1.5 py-0.5 rounded-full">
+                {approvedServers.length}
+              </span>
+            </div>
+            <div className="space-y-1.5">
+              {approvedServers.map((srv) => {
+                const pulseTime = serverPulses[srv.url];
+                const now = Math.floor(Date.now() / 1000);
+                const isActive = pulseTime != null && now - pulseTime <= 120;
+                const lastSeen = pulseTime
+                  ? `${Math.floor((now - pulseTime) / 60)}m ${(now - pulseTime) % 60}s ago`
+                  : "never";
+
+                return (
+                  <div
+                    key={srv.url}
+                    className="flex items-center justify-between bg-surface-1 border border-border-subtle rounded-lg px-3 py-2"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className={`w-1.5 h-1.5 rounded-full ${isActive ? "bg-success" : "bg-text-muted"}`} />
+                        <span className="text-[11px] font-semibold text-text-primary truncate">
+                          {srv.label}
+                        </span>
+                        <span className="text-[9px] text-text-muted font-mono truncate">
+                          {srv.operator_address ? `${srv.operator_address.slice(0, 12)}…` : ""}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-text-secondary truncate ml-3.5 mt-0.5">
+                        {srv.url}
+                      </p>
+                    </div>
+                    <div className="shrink-0 text-right ml-3">
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-semibold ${
+                        isActive
+                          ? "bg-success/15 text-success"
+                          : "bg-text-muted/15 text-text-muted"
+                      }`}>
+                        {isActive ? "Active" : "Inactive"}
+                      </span>
+                      <p className="text-[9px] text-text-muted mt-0.5">
+                        {pulseTime ? `Pulse: ${lastSeen}` : "No pulse"}
+                      </p>
+                    </div>
                   </div>
                 );
               })}

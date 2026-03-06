@@ -222,7 +222,7 @@ export default async function handler(req: Request) {
     return jsonResponse({ status: 'rejected', operator_address: entry.operator_address });
   }
 
-  // 5. Approve: move to vote_servers in voting-config.
+  // 5. Approve: move to vote_servers in voting-config and approved-servers.
   const currentConfig = (await get('voting-config') as VotingConfig | null) ?? {
     version: 1,
     vote_servers: [],
@@ -242,7 +242,14 @@ export default async function handler(req: Request) {
   );
   currentConfig.vote_servers.push(serviceEntry);
 
-  // 6. Atomic Edge Config PATCH with both keys.
+  // Also persist in approved-servers so the server survives pulse gaps.
+  const approvedServers = (await get('approved-servers') as ServiceEntry[] | null) ?? [];
+  const updatedApproved = approvedServers.filter(
+    (s) => s.url !== entry.url && s.operator_address !== entry.operator_address,
+  );
+  updatedApproved.push(serviceEntry);
+
+  // 6. Atomic Edge Config PATCH with all three keys.
   try {
     const resp = await fetch(
       `https://api.vercel.com/v1/edge-config/${EDGE_CONFIG_ID}/items`,
@@ -256,6 +263,7 @@ export default async function handler(req: Request) {
           items: [
             { operation: 'upsert', key: 'voting-config', value: currentConfig },
             { operation: 'upsert', key: 'pending-registrations', value: updatedPending },
+            { operation: 'upsert', key: 'approved-servers', value: updatedApproved },
           ],
         }),
       },
