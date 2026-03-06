@@ -27,8 +27,3 @@ uniffi = { version = "0.29", features = ["build"] }
 name = "uniffi-bindgen"
 path = "src/uniffi-bindgen.rs"
 required-features = ["bindgen"]
-
-# Speed up dev builds: parallel codegen + thin LTO.
-[profile.release]
-codegen-units = 16
-lto = "thin"
