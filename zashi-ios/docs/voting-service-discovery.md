@@ -53,7 +53,7 @@ svoted sign-arbitrary '{"operator_address":"...","url":"...","moniker":"...","ti
 `vote_servers` is split into two tiers:
 
 - **`approved-servers`** (persistent) — once a server is approved (via admin approval or on-chain bonding), it stays in this list unless manually removed. Survives reboots and pulse gaps.
-- **`vote_servers`** (active) — only contains servers that are approved AND actively pulsing. This is what iOS reads. Servers are added when they pulse and evicted if no pulse is received for >2 minutes.
+- **`vote_servers`** (active) — only contains servers that are approved AND actively pulsing. This is what iOS reads. Servers are added when they pulse and evicted if no pulse is received for >6 hours.
 
 ### Startup and heartbeat flow
 
@@ -61,13 +61,13 @@ On every `svoted start`, the helper performs two steps:
 
 **Step 1 — Register** (`POST /api/register-validator`): Called once on startup. The edge function checks on-chain bonding status. If the validator is bonded, it upserts into both `approved-servers` and `vote_servers`. If not bonded, the entry goes to `pending-registrations` for admin approval. This is the same endpoint `join.sh` uses, so existing bonded validators automatically populate `approved-servers` on their first restart with the new binary — no manual re-registration needed.
 
-**Step 2 — Pulse** (`POST /api/server-heartbeat`, every 30s): The edge function checks `approved-servers`:
-- **Approved** → upsert into `vote_servers`, update `server-pulses[url] = now`, evict stale entries (>2 min), return `{ status: "active" }`.
+**Step 2 — Pulse** (`POST /api/server-heartbeat`, every 2 hours): The edge function checks `approved-servers`:
+- **Approved** → upsert into `vote_servers`, update `server-pulses[url] = now`, evict stale entries (>6 hours), return `{ status: "active" }`.
 - **Not approved** → upsert into `pending-registrations`, return `{ status: "pending" }`.
 
 Both endpoints use the same payload and ADR-036 signature format (`{ operator_address, url, moniker, timestamp }`).
 
-A safety-net cron (`/api/evict-stale-servers`, every 2 minutes) handles eviction when all servers are down and nobody is pulsing.
+A safety-net cron (`/api/evict-stale-servers`) handles eviction when all servers are down and nobody is pulsing.
 
 ### Edge Config keys
 
@@ -75,7 +75,7 @@ A safety-net cron (`/api/evict-stale-servers`, every 2 minutes) handles eviction
 |-----|---------|
 | `voting-config` | Active config — `vote_servers` and `pir_servers`. iOS reads this. |
 | `approved-servers` | Persistent list of `{ url, label, operator_address }`. Only removed manually. |
-| `server-pulses` | Map `{ [url]: unix_timestamp }`. Updated every 30s by each server. |
+| `server-pulses` | Map `{ [url]: unix_timestamp }`. Updated every 2 hours by each server. |
 | `pending-registrations` | Unapproved servers waiting for admin approval (7-day expiry). |
 
 ### Helper configuration
@@ -96,8 +96,8 @@ Both fields must be set for the heartbeat to activate. `join.sh` writes these au
 
 1. `join.sh` runs → `register-validator` adds server to `approved-servers` + `vote_servers`
 2. `svoted start` → helper calls `register-validator` once (ensures `approved-servers` is populated for bonded validators)
-3. Helper starts 30s pulse loop → calls `server-heartbeat` which keeps the server in `vote_servers`
-4. If the server stops (crash, restart, network issue), it is evicted from `vote_servers` after 2 minutes but stays in `approved-servers`
+3. Helper starts 2-hour pulse loop → calls `server-heartbeat` which keeps the server in `vote_servers`
+4. If the server stops (crash, restart, network issue), it is evicted from `vote_servers` after 6 hours but stays in `approved-servers`
 5. On restart, step 2 re-registers, step 3 resumes pulsing — server re-appears in `vote_servers` automatically
 6. Admin can see active/inactive status in the admin UI "Approved servers" panel
 

@@ -2069,7 +2069,7 @@ function ValidatorsView({ wallet }: { wallet: UseWallet }) {
               {approvedServers.map((srv) => {
                 const pulseTime = serverPulses[srv.url];
                 const now = Math.floor(Date.now() / 1000);
-                const isActive = pulseTime != null && now - pulseTime <= 120;
+                const isActive = pulseTime != null && now - pulseTime <= 21600;
                 const lastSeen = pulseTime
                   ? `${Math.floor((now - pulseTime) / 60)}m ${(now - pulseTime) % 60}s ago`
                   : "never";

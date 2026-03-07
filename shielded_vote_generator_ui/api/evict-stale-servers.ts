@@ -1,4 +1,4 @@
-// Vercel cron: evict servers whose heartbeat pulse is stale (>2 minutes).
+// Vercel cron: evict servers whose heartbeat pulse is stale (>6 hours).
 //
 // Safety net for when all servers are down simultaneously and nobody is
 // pulsing to trigger the piggybacked eviction in server-heartbeat.ts.
@@ -14,7 +14,7 @@ import { get } from '@vercel/edge-config';
 
 export const config = { runtime: 'edge' };
 
-const STALE_PULSE_SECS = 120; // 2 minutes
+const STALE_PULSE_SECS = 21600; // 6 hours (3× the 2-hour pulse interval)
 
 interface ServiceEntry {
   url: string;

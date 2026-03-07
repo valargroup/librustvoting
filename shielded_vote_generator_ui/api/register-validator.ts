@@ -177,7 +177,15 @@ export default async function handler(req: Request) {
     return jsonResponse({ error: 'Public key does not match operator_address' }, 401);
   }
 
-  // 4. Check if this validator is bonded on-chain.
+  // 4a. If already in approved-servers, short-circuit — no bonding check needed.
+  // This avoids re-adding to pending-registrations when the chain API is temporarily
+  // unreachable (e.g. during a simultaneous restart).
+  const existingApproved = (await get('approved-servers') as ServiceEntry[] | null) ?? [];
+  if (existingApproved.some((s) => s.operator_address === operator_address)) {
+    return jsonResponse({ status: 'registered', phase: 'already-approved' });
+  }
+
+  // 4b. Check if this validator is bonded on-chain.
   const valoperAddress = addressToValoper(operator_address);
   let isBonded = false;
   try {
