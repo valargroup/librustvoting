@@ -29,19 +29,36 @@ FIXTURE_COUNT=10000 FIXTURE_DIR=e2e-tests/fixtures/10k \
 
 ## Running the benchmark
 
-Initialize a benchmark-friendly chain:
+### 1. Initialize a benchmark-friendly chain
 
 ```bash
 mise run chain:init-benchmark
 ```
 
-Start the chain in another terminal:
+This calls `sdk/scripts/init_benchmark.sh`, which overrides the default helper
+settings before invoking `init.sh`. The values are baked into
+`~/.svoted/config/app.toml` under the `[helper]` section:
+
+| Setting | Default (dev) | Benchmark override | Purpose |
+|---------|---------------|-------------------|---------|
+| `mean_delay` | 60 | **0** | Unlinkability delay mean (seconds). 0 = process immediately. |
+| `min_delay` | 90 | **0** | Minimum delay floor (seconds). 0 = no floor. |
+| `process_interval` | 5 | **1** | How often the processor checks for ready shares (seconds). |
+| `max_concurrent_proofs` | 2 | **16** | Parallel ZKP #3 proof generators. |
+| `expose_queue_status` | false | **true** | Enables `GET /api/v1/queue-status` (used by the test to monitor progress). |
+| `api_token` | *(empty)* | **benchmark-helper-token** | Must match `HELPER_API_TOKEN` passed to the test. |
+
+The fixtures use `vote_end_time = 2099-12-31` so they never expire. With
+production delay settings, shares would be spread over decades — the zero-delay
+overrides are essential.
+
+### 2. Start the chain (separate terminal)
 
 ```bash
 mise run chain:start
 ```
 
-Run the throughput test:
+### 3. Run the throughput test
 
 ```bash
 HELPER_API_TOKEN=benchmark-helper-token \
@@ -50,10 +67,12 @@ cargo test --release --manifest-path e2e-tests/Cargo.toml \
   --test voter_throughput -- --ignored --nocapture
 ```
 
-Useful overrides:
-- `STRESS_VOTER_COUNT=10` to do a smaller smoke test
-- `PROOF_GEN_THREADS=4` to control runtime ZKP #2 generation parallelism
-- `WAVE_SIZE=10` and `WAVE_INTERVAL_MS=1000` to control helper share arrival
+### Useful overrides
+
+- `STRESS_VOTER_COUNT=50` — use only the first N voters from fixtures (quick smoke test)
+- `PROOF_GEN_THREADS=4` — control runtime ZKP #2 generation parallelism
+- `WAVE_SIZE=10` and `WAVE_INTERVAL_MS=1000` — control helper share arrival pattern
+- `SHARE_STALL_TIMEOUT_SECS=1800` — fail if share processing makes no progress for N seconds (0 = disabled)
 
 ## Results
 
