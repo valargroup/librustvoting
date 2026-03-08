@@ -181,11 +181,6 @@ Variables**, add:
 | `SLACK_MENTION_IDS`         | `U12345,U67890`           | Slack user IDs to @-mention         |
 | `NOTIFIER_DRY_RUN`          | `true`                    | Start in dry-run; remove when ready |
 
-Adam: U0A8B0NM744
-Roman: U0A81KAPYMR
-Dev: U0A7RS10AJ3
-Greg: U0A8L9SA4QH
-
 Optional overrides (have sensible defaults):
 
 | Variable                 | Default                                                                                  |
