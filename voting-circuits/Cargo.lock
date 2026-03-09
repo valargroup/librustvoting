@@ -508,7 +508,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "imt-tree"
 version = "0.1.0"
-source = "git+ssh://git@github.com/valargroup/vote-nullifier-pir.git?branch=main#70aa58b222498153f71d3e487108fe684daf42d2"
+source = "git+ssh://git@github.com/valargroup/vote-nullifier-pir.git?branch=main#b560bf08858dc86f70d9d04ca5aa50264cd292ac"
 dependencies = [
  "anyhow",
  "ff",
