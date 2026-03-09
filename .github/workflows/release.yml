@@ -130,7 +130,7 @@ jobs:
 
       - name: Download nf-server from vote-nullifier-pir
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         run: |
           mkdir -p ingest-binaries
           gh release download --repo valargroup/vote-nullifier-pir \
