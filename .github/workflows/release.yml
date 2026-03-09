@@ -1,12 +1,11 @@
 # Build pre-compiled binaries and publish a GitHub Release on version tags.
 #
-# SDK binaries (svoted, create-val-tx) are built here. nf-server is fetched
-# from the latest release of valargroup/vote-nullifier-pir.
+# nf-server is released separately from valargroup/vote-nullifier-pir.
 #
 # Tarball layout:
 #   shielded-vote-<version>-<platform>/
-#     bin/svoted, create-val-tx, nf-server
-#     systemd/svoted-val{1,2,3}.service, nullifier-query-server.service  (Linux only)
+#     bin/svoted, create-val-tx
+#     systemd/svoted-val{1,2,3}.service  (Linux only)
 #     scripts/init_multi.sh
 #     config/Caddyfile
 #
@@ -128,19 +127,6 @@ jobs:
           name: sdk-binaries-${{ matrix.platform }}
           path: sdk-binaries
 
-      - name: Download nf-server from vote-nullifier-pir
-        env:
-          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
-        run: |
-          mkdir -p ingest-binaries
-          gh release download --repo valargroup/vote-nullifier-pir \
-            --pattern "nf-server-${{ matrix.platform }}" \
-            --output ingest-binaries/nf-server
-          gh release download --repo valargroup/vote-nullifier-pir \
-            --pattern "nullifier-query-server.service" \
-            --output ingest-binaries/nullifier-query-server.service
-          chmod +x ingest-binaries/nf-server
-
       - name: Assemble tarball
         run: |
           VERSION="${GITHUB_REF_NAME}"
@@ -149,7 +135,6 @@ jobs:
 
           # Binaries (artifact downloads flatten the common path prefix)
           cp sdk-binaries/svoted sdk-binaries/create-val-tx "${DIR}/bin/"
-          cp ingest-binaries/nf-server "${DIR}/bin/"
           chmod +x "${DIR}/bin/"*
 
           # Systemd service files — Linux only, transform paths for /opt/shielded-vote layout
@@ -161,12 +146,6 @@ jobs:
                   -e 's|ExecStart=/opt/shielded-vote/svoted|ExecStart=/opt/shielded-vote/bin/svoted|' \
                   "$f" > "${DIR}/systemd/${name}"
             done
-
-            # Nullifier query server service — remap paths to /opt/shielded-vote layout
-            sed -e 's|WorkingDirectory=/opt/nullifier-ingest|WorkingDirectory=/opt/shielded-vote/nullifier-data|' \
-                -e 's|DATA_DIR=/opt/nullifier-ingest|DATA_DIR=/opt/shielded-vote/nullifier-data|' \
-                -e 's|ExecStart=/opt/nullifier-ingest/nf-server|ExecStart=/opt/shielded-vote/bin/nf-server|' \
-                ingest-binaries/nullifier-query-server.service > "${DIR}/systemd/nullifier-query-server.service"
           fi
 
           # Scripts
