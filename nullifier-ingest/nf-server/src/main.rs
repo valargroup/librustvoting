@@ -2,6 +2,8 @@ mod cmd_export;
 mod cmd_ingest;
 #[cfg(feature = "serve")]
 mod cmd_serve;
+#[cfg(feature = "serve")]
+mod serve;
 
 use clap::{Parser, Subcommand};
 
