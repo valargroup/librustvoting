@@ -4,17 +4,17 @@ use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use std::io::{Read, Seek, SeekFrom};
 use tracing::{info, warn};
 
 use pir_server::{
-    HealthInfo, QueryTiming, RootInfo,
+    HealthInfo, InflightGuard, RootInfo,
     TIER1_ROWS, TIER1_ROW_BYTES, TIER2_ROWS, TIER2_ROW_BYTES,
+    read_tier_row, write_timing_headers,
 };
 
-use super::state::{AppState, InflightGuard, ServerPhase};
+use super::state::{AppState, ServerPhase};
 
 // ── PIR data endpoints ───────────────────────────────────────────────────────
 
@@ -135,15 +135,6 @@ async fn post_tier_query(state: &AppState, tier: &str, body: Bytes) -> axum::res
     }
 }
 
-fn write_timing_headers(headers: &mut axum::http::HeaderMap, req_id: u64, timing: QueryTiming) {
-    headers.insert("x-pir-req-id", HeaderValue::from_str(&req_id.to_string()).expect("req_id header"));
-    headers.insert("x-pir-server-total-ms", HeaderValue::from_str(&format!("{:.3}", timing.total_ms)).expect("timing header"));
-    headers.insert("x-pir-server-validate-ms", HeaderValue::from_str(&format!("{:.3}", timing.validate_ms)).expect("timing header"));
-    headers.insert("x-pir-server-decode-copy-ms", HeaderValue::from_str(&format!("{:.3}", timing.decode_copy_ms)).expect("timing header"));
-    headers.insert("x-pir-server-compute-ms", HeaderValue::from_str(&format!("{:.3}", timing.online_compute_ms)).expect("timing header"));
-    headers.insert("x-pir-server-response-bytes", HeaderValue::from_str(&timing.response_bytes.to_string()).expect("timing header"));
-}
-
 // ── Tier row endpoints (raw row reads for debugging) ─────────────────────────
 
 pub(crate) async fn get_tier1_row(
@@ -184,14 +175,6 @@ pub(crate) async fn get_tier2_row(
             .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("read error: {e}")).into_response(),
     }
-}
-
-fn read_tier_row(path: &std::path::Path, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open(path)?;
-    f.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; len];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
 }
 
 // ── Root and health ──────────────────────────────────────────────────────────

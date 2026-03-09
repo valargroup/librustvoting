@@ -1,4 +1,3 @@
-use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -7,15 +6,16 @@ use std::time::Instant;
 use anyhow::Result;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
 
 use pir_export::PirMetadata;
 use pir_server::{
-    HealthInfo, OwnedTierState, QueryTiming, RootInfo, YpirScenario, TIER1_ROWS, TIER1_ROW_BYTES,
-    TIER2_ROWS, TIER2_ROW_BYTES,
+    HealthInfo, InflightGuard, OwnedTierState, RootInfo, YpirScenario,
+    TIER1_ROWS, TIER1_ROW_BYTES, TIER2_ROWS, TIER2_ROW_BYTES,
+    read_tier_row, write_timing_headers,
 };
 use tracing::{info, warn};
 
@@ -277,54 +277,6 @@ async fn post_tier2_query(State(state): State<Arc<AppState>>, body: Bytes) -> im
     }
 }
 
-struct InflightGuard<'a> {
-    inflight: &'a AtomicUsize,
-}
-
-impl<'a> InflightGuard<'a> {
-    fn new(inflight: &'a AtomicUsize) -> Self {
-        Self { inflight }
-    }
-}
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-fn write_timing_headers(headers: &mut axum::http::HeaderMap, req_id: u64, timing: QueryTiming) {
-    // Expose server-side stage timing so the client can split RTT into server vs network/queue.
-    headers.insert(
-        "x-pir-req-id",
-        HeaderValue::from_str(&req_id.to_string()).expect("req_id header must be valid"),
-    );
-    headers.insert(
-        "x-pir-server-total-ms",
-        HeaderValue::from_str(&format!("{:.3}", timing.total_ms))
-            .expect("timing header must be valid"),
-    );
-    headers.insert(
-        "x-pir-server-validate-ms",
-        HeaderValue::from_str(&format!("{:.3}", timing.validate_ms))
-            .expect("timing header must be valid"),
-    );
-    headers.insert(
-        "x-pir-server-decode-copy-ms",
-        HeaderValue::from_str(&format!("{:.3}", timing.decode_copy_ms))
-            .expect("timing header must be valid"),
-    );
-    headers.insert(
-        "x-pir-server-compute-ms",
-        HeaderValue::from_str(&format!("{:.3}", timing.online_compute_ms))
-            .expect("timing header must be valid"),
-    );
-    headers.insert(
-        "x-pir-server-response-bytes",
-        HeaderValue::from_str(&timing.response_bytes.to_string())
-            .expect("response size header must be valid"),
-    );
-}
 
 async fn get_tier1_row(
     State(state): State<Arc<AppState>>,
@@ -364,14 +316,6 @@ async fn get_tier2_row(
     }
 }
 
-/// Read a single row from a tier file on disk.
-fn read_tier_row(path: &std::path::Path, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open(path)?;
-    f.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; len];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
-}
 
 async fn get_root(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let info = RootInfo {

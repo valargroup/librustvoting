@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -52,22 +52,6 @@ pub(crate) struct AppState {
     pub chain_url: Option<String>,
     pub next_req_id: AtomicU64,
     pub inflight_requests: AtomicUsize,
-}
-
-pub(crate) struct InflightGuard<'a> {
-    inflight: &'a AtomicUsize,
-}
-
-impl<'a> InflightGuard<'a> {
-    pub fn new(inflight: &'a AtomicUsize) -> Self {
-        Self { inflight }
-    }
-}
-
-impl Drop for InflightGuard<'_> {
-    fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::Relaxed);
-    }
 }
 
 /// Acquire the serving state read-guard or return 503 if unavailable (during rebuild).

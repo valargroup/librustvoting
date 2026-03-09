@@ -333,3 +333,48 @@ impl OwnedTierState {
 // the AppState RwLock.
 unsafe impl Send for OwnedTierState {}
 unsafe impl Sync for OwnedTierState {}
+
+// ── Shared HTTP helpers ──────────────────────────────────────────────────────
+
+use axum::http::HeaderValue;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// RAII guard that decrements an atomic inflight counter on drop.
+pub struct InflightGuard<'a> {
+    inflight: &'a AtomicUsize,
+}
+
+impl<'a> InflightGuard<'a> {
+    pub fn new(inflight: &'a AtomicUsize) -> Self {
+        Self { inflight }
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Write PIR query timing breakdown as HTTP response headers.
+///
+/// Used by both `pir-server` and `nf-server` to expose server-side stage
+/// timing so the client can split RTT into server vs network/queue.
+pub fn write_timing_headers(headers: &mut axum::http::HeaderMap, req_id: u64, timing: QueryTiming) {
+    headers.insert("x-pir-req-id", HeaderValue::from_str(&req_id.to_string()).expect("req_id header"));
+    headers.insert("x-pir-server-total-ms", HeaderValue::from_str(&format!("{:.3}", timing.total_ms)).expect("timing header"));
+    headers.insert("x-pir-server-validate-ms", HeaderValue::from_str(&format!("{:.3}", timing.validate_ms)).expect("timing header"));
+    headers.insert("x-pir-server-decode-copy-ms", HeaderValue::from_str(&format!("{:.3}", timing.decode_copy_ms)).expect("timing header"));
+    headers.insert("x-pir-server-compute-ms", HeaderValue::from_str(&format!("{:.3}", timing.online_compute_ms)).expect("timing header"));
+    headers.insert("x-pir-server-response-bytes", HeaderValue::from_str(&timing.response_bytes.to_string()).expect("timing header"));
+}
+
+/// Read a single row from a tier binary file on disk.
+pub fn read_tier_row(path: &std::path::Path, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
