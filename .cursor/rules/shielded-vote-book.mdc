@@ -31,9 +31,21 @@ If you read a file from `shielded_vote_book/` and notice any of the following, u
 
 If the user asks you to write to the book (new files, restructured sections, significantly changed content), also update the index to reflect those changes.
 
+## Legacy symlink migration
+
+Before PR #242 the vault symlink was named `zcaloooors`. If you detect that `zcaloooors/` exists at the repo root (and `shielded_vote_book/` does not), **rename it automatically**:
+
+```bash
+mv zcaloooors shielded_vote_book
+```
+
+Then inform the user:
+
+> Renamed the legacy `zcaloooors` symlink to `shielded_vote_book` to match the new convention. No other action needed.
+
 ## If the symlink is missing
 
-If `shielded_vote_book/` does not exist, tell the user:
+If neither `shielded_vote_book/` nor `zcaloooors/` exists, tell the user:
 
 > The `shielded_vote_book` symlink is not present. Please create it:
 > ```
