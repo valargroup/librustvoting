@@ -48,21 +48,13 @@ async fn main() -> Result<()> {
 
     let t_total = Instant::now();
 
-    // Load tier files
-    eprintln!("Loading tier files from {:?}...", data_dir);
+    info!(dir = ?data_dir, "Loading tier files");
 
     let tier0_data = Bytes::from(std::fs::read(data_dir.join("tier0.bin"))?);
-    eprintln!("  Tier 0: {} bytes", tier0_data.len());
+    info!(bytes = tier0_data.len(), "Tier 0 loaded");
 
-    // Read tier data into temporary buffers. These are dropped after YPIR
-    // construction — the YPIR server copies everything into its own
-    // `db_buf_aligned` during `YServer::new()`.
     let tier1_data = std::fs::read(data_dir.join("tier1.bin"))?;
-    eprintln!(
-        "  Tier 1: {} bytes ({} rows)",
-        tier1_data.len(),
-        tier1_data.len() / TIER1_ROW_BYTES
-    );
+    info!(bytes = tier1_data.len(), rows = tier1_data.len() / TIER1_ROW_BYTES, "Tier 1 loaded");
     anyhow::ensure!(
         tier1_data.len() == TIER1_ROWS * TIER1_ROW_BYTES,
         "tier1.bin size mismatch: got {} bytes, expected {}",
@@ -71,11 +63,7 @@ async fn main() -> Result<()> {
     );
 
     let tier2_data = std::fs::read(data_dir.join("tier2.bin"))?;
-    eprintln!(
-        "  Tier 2: {} bytes ({} rows)",
-        tier2_data.len(),
-        tier2_data.len() / TIER2_ROW_BYTES
-    );
+    info!(bytes = tier2_data.len(), rows = tier2_data.len() / TIER2_ROW_BYTES, "Tier 2 loaded");
     anyhow::ensure!(
         tier2_data.len() == TIER2_ROWS * TIER2_ROW_BYTES,
         "tier2.bin size mismatch: got {} bytes, expected {}",
@@ -85,29 +73,23 @@ async fn main() -> Result<()> {
 
     let metadata: PirMetadata =
         serde_json::from_str(&std::fs::read_to_string(data_dir.join("pir_root.json"))?)?;
-    eprintln!(
-        "  Metadata: {} ranges, root29={}...",
-        metadata.num_ranges,
-        metadata.root29.get(..16).unwrap_or(&metadata.root29)
-    );
+    info!(num_ranges = metadata.num_ranges, "Metadata loaded");
 
-    // Initialize YPIR servers. Pass borrowed data — OwnedTierState does not
-    // retain it (YPIR copies into its own db_buf_aligned during construction).
-    eprintln!("Initializing YPIR servers...");
+    info!("Initializing YPIR servers");
 
     let tier1_scenario = pir_server::tier1_scenario();
     let mut tier1 = OwnedTierState::new(&tier1_data, tier1_scenario.clone());
     drop(tier1_data); // free ~48 MB
     let tier1_hint = Bytes::from(tier1.take_hint_bytes());
-    eprintln!("  Tier 1 YPIR ready (hint: {} bytes)", tier1_hint.len());
+    info!(hint_bytes = tier1_hint.len(), "Tier 1 YPIR ready");
 
     let tier2_scenario = pir_server::tier2_scenario();
     let mut tier2 = OwnedTierState::new(&tier2_data, tier2_scenario.clone());
     drop(tier2_data); // free ~6 GB
     let tier2_hint = Bytes::from(tier2.take_hint_bytes());
-    eprintln!("  Tier 2 YPIR ready (hint: {} bytes)", tier2_hint.len());
+    info!(hint_bytes = tier2_hint.len(), "Tier 2 YPIR ready");
 
-    eprintln!("Server ready in {:.1}s", t_total.elapsed().as_secs_f64());
+    info!(elapsed_s = format!("{:.1}", t_total.elapsed().as_secs_f64()), "Server ready");
 
     let state = Arc::new(AppState {
         tier0_data,
@@ -139,7 +121,7 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
-    eprintln!("Listening on {addr}");
+    info!(addr, "Listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 

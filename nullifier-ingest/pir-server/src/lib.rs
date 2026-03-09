@@ -7,6 +7,7 @@
 use anyhow::Result;
 use std::io::Cursor;
 use std::time::Instant;
+use tracing::info;
 
 use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 
@@ -127,9 +128,10 @@ impl<'a> TierServer<'a> {
             std::mem::transmute::<&Params, &'a Params>(params_box.as_ref())
         };
 
-        eprintln!(
-            "  YPIR server init: {} items × {} bits",
-            scenario.num_items, scenario.item_size_bits
+        info!(
+            num_items = scenario.num_items,
+            item_size_bits = scenario.item_size_bits,
+            "YPIR server init"
         );
 
         // Use FilePtIter to pack raw bytes into 14-bit u16 values.
@@ -137,25 +139,16 @@ impl<'a> TierServer<'a> {
         let bytes_per_row = scenario.item_size_bits / 8;
         let db_cols = params.db_cols_simplepir();
         let pt_bits = params.pt_modulus_bits();
-        eprintln!(
-            "  FilePtIter: bytes_per_row={}, db_cols={}, pt_bits={}",
-            bytes_per_row, db_cols, pt_bits
-        );
+        info!(bytes_per_row, db_cols, pt_bits, "FilePtIter config");
         let cursor = Cursor::new(data);
         let pt_iter = FilePtIter::new(cursor, bytes_per_row, db_cols, pt_bits);
         let server = YServer::<u16>::new(params, pt_iter, true, false, true);
 
         let t1 = Instant::now();
-        eprintln!(
-            "  YPIR server constructed in {:.1}s",
-            (t1 - t0).as_secs_f64()
-        );
+        info!(elapsed_s = format!("{:.1}", (t1 - t0).as_secs_f64()), "YPIR server constructed");
 
         let offline = server.perform_offline_precomputation_simplepir(None, None, None);
-        eprintln!(
-            "  YPIR offline precomputation done in {:.1}s",
-            t1.elapsed().as_secs_f64()
-        );
+        info!(elapsed_s = format!("{:.1}", t1.elapsed().as_secs_f64()), "YPIR offline precomputation done");
 
         Self {
             server: std::mem::ManuallyDrop::new(server),

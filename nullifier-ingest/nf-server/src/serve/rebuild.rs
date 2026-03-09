@@ -24,14 +24,10 @@ pub(crate) fn load_serving_state(pir_data_dir: &std::path::Path) -> Result<Servi
     let t_total = Instant::now();
 
     let tier0_data = Bytes::from(std::fs::read(pir_data_dir.join("tier0.bin"))?);
-    eprintln!("  Tier 0: {} bytes", tier0_data.len());
+    info!(bytes = tier0_data.len(), "Tier 0 loaded");
 
     let tier1_data = std::fs::read(pir_data_dir.join("tier1.bin"))?;
-    eprintln!(
-        "  Tier 1: {} bytes ({} rows)",
-        tier1_data.len(),
-        tier1_data.len() / TIER1_ROW_BYTES
-    );
+    info!(bytes = tier1_data.len(), rows = tier1_data.len() / TIER1_ROW_BYTES, "Tier 1 loaded");
     anyhow::ensure!(
         tier1_data.len() == TIER1_ROWS * TIER1_ROW_BYTES,
         "tier1.bin size mismatch: got {} bytes, expected {}",
@@ -40,11 +36,7 @@ pub(crate) fn load_serving_state(pir_data_dir: &std::path::Path) -> Result<Servi
     );
 
     let tier2_data = std::fs::read(pir_data_dir.join("tier2.bin"))?;
-    eprintln!(
-        "  Tier 2: {} bytes ({} rows)",
-        tier2_data.len(),
-        tier2_data.len() / TIER2_ROW_BYTES
-    );
+    info!(bytes = tier2_data.len(), rows = tier2_data.len() / TIER2_ROW_BYTES, "Tier 2 loaded");
     anyhow::ensure!(
         tier2_data.len() == TIER2_ROWS * TIER2_ROW_BYTES,
         "tier2.bin size mismatch: got {} bytes, expected {}",
@@ -54,26 +46,22 @@ pub(crate) fn load_serving_state(pir_data_dir: &std::path::Path) -> Result<Servi
 
     let metadata: pir_export::PirMetadata =
         serde_json::from_str(&std::fs::read_to_string(pir_data_dir.join("pir_root.json"))?)?;
-    eprintln!(
-        "  Metadata: {} ranges, root29={}...",
-        metadata.num_ranges,
-        metadata.root29.get(..16).unwrap_or(&metadata.root29)
-    );
+    info!(num_ranges = metadata.num_ranges, "Metadata loaded");
 
-    eprintln!("Initializing YPIR servers...");
+    info!("Initializing YPIR servers");
     let tier1_scenario = pir_server::tier1_scenario();
     let mut tier1 = OwnedTierState::new(&tier1_data, tier1_scenario.clone());
     drop(tier1_data);
     let tier1_hint = Bytes::from(tier1.take_hint_bytes());
-    eprintln!("  Tier 1 YPIR ready (hint: {} bytes)", tier1_hint.len());
+    info!(hint_bytes = tier1_hint.len(), "Tier 1 YPIR ready");
 
     let tier2_scenario = pir_server::tier2_scenario();
     let mut tier2 = OwnedTierState::new(&tier2_data, tier2_scenario.clone());
     drop(tier2_data);
     let tier2_hint = Bytes::from(tier2.take_hint_bytes());
-    eprintln!("  Tier 2 YPIR ready (hint: {} bytes)", tier2_hint.len());
+    info!(hint_bytes = tier2_hint.len(), "Tier 2 YPIR ready");
 
-    eprintln!("Server ready in {:.1}s", t_total.elapsed().as_secs_f64());
+    info!(elapsed_s = format!("{:.1}", t_total.elapsed().as_secs_f64()), "Server ready");
 
     Ok(ServingState {
         tier0_data,
@@ -272,7 +260,7 @@ async fn run_rebuild(state: Arc<AppState>, target_height: u64) -> Result<()> {
                 .enable_all()
                 .build()?;
             rt.block_on(sync_nullifiers::sync(&dd, &lwd, Some(target_height), |h, t, _, _| {
-                eprintln!("  ingest: {h}/{t}");
+                info!(height = h, target = t, "ingest progress");
                 let pct = if t > 0 {
                     2 + ((h as f64 / t as f64) * 8.0) as u8
                 } else {
@@ -308,12 +296,9 @@ async fn run_rebuild(state: Arc<AppState>, target_height: u64) -> Result<()> {
         let (idx_height, byte_offset) = entry.ok_or_else(|| {
             anyhow::anyhow!("no index entry for target height {}", target_height)
         })?;
-        eprintln!(
-            "  Export: loading nullifiers up to height {} (offset={})",
-            idx_height, byte_offset
-        );
+        info!(height = idx_height, byte_offset, "Loading nullifiers for export");
         let nfs = file_store::load_nullifiers_up_to(&dd, byte_offset)?;
-        eprintln!("  Loaded {} nullifiers", nfs.len());
+        info!(count = nfs.len(), "Nullifiers loaded");
 
         pir_export::build_and_export_with_progress(nfs, &pd, Some(idx_height), |msg, pct| {
             let overall_pct = 10 + (pct as u16 * 45 / 55).min(45) as u8;
