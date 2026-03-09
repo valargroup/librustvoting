@@ -16,7 +16,7 @@ Monorepo for the Zcash shielded voting system. Contains the vote chain (Cosmos S
 | Component                     | Language           | Description                                                                                             |
 | ----------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------- |
 | `sdk/`                        | Go + Rust (CGo)    | Cosmos SDK chain (`svoted`) with vote module, ante handlers, and ZK verification                        |
-| `nullifier-ingest/`           | Rust               | Ingests Orchard nullifiers from a lightwallet server into flat binary files and serves exclusion proofs |
+| `vote-nullifier-pir` (external) | Rust             | Ingests Orchard nullifiers and serves PIR exclusion proofs ([repo](https://github.com/valargroup/vote-nullifier-pir)) |
 | `shielded_vote_generator_ui/` | TypeScript / React | UI for constructing and submitting shielded votes                                                       |
 | `zcash-voting-ffi/`           | Rust + Swift       | iOS FFI bindings for the voting circuits                                                                |
 | `e2e-tests/`                  | Rust               | End-to-end API tests against a running chain                                                            |

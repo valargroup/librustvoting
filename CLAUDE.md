@@ -49,7 +49,7 @@ After modifying the FFI public API, you **must** run `make dev` and commit the r
 
 ## Local Development
 
-All workflow commands go through [mise](https://mise.jdx.dev). Run `mise tasks` to see everything, or `mise tasks --hidden` for internal tasks too. Tasks are thin wrappers over sub-Makefiles (`sdk/Makefile`, `nullifier-ingest/Makefile`).
+All workflow commands go through [mise](https://mise.jdx.dev). Run `mise tasks` to see everything, or `mise tasks --hidden` for internal tasks too. Tasks are thin wrappers over sub-Makefiles (`sdk/Makefile`) and the sibling `vote-nullifier-pir` repo (`../vote-nullifier-pir/Makefile`).
 
 ### Setup and daily workflow
 
@@ -68,7 +68,7 @@ mise test           # end-to-end tests against running chain
 - **`start:*`** — `start:chain` (chain-only, no nullifiers — used by CI)
 - **`chain:*`** — `chain:init`, `chain:start`, `chain:clean`, `chain:ceremony`
 - **`multi:*`** — `multi:init`, `multi:start`, `multi:start-chain`, `multi:restart`, `multi:stop`, `multi:status`, `multi:clean`
-- **`nullifier:*`** — `nullifier:bootstrap`, `nullifier:ingest`, `nullifier:export`, `nullifier:serve`, `nullifier:status`, `nullifier:clean`
+- **`nullifier:*`** — `nullifier:bootstrap`, `nullifier:ingest`, `nullifier:export`, `nullifier:serve`, `nullifier:status`, `nullifier:clean` (delegate to `../vote-nullifier-pir`)
 - **`test:*`** — `test:unit`, `test:integration`, `test:helper`, `test:go`, `test:circuits`, `test:ffi`, `test:nullifier`, `test:proof`
 - **Flat** — `fmt`, `lint`, `fixtures`, `proto`, `validator:join`
 
@@ -81,13 +81,15 @@ mise test           # end-to-end tests against running chain
 
 ### Architecture: PIR server owns all nullifier endpoints
 
-The PIR server (`nf-server serve`, port 3000 locally) is the **sole provider** of nullifier data — snapshot status, tree root, rebuild triggers, and PIR queries all live on the PIR server. Clients (admin UI, iOS wallet) talk to the PIR server directly. The chain node (svoted) does **not** proxy nullifier endpoints — it only uses the PIR server internally when fetching snapshot data for session creation (`/shielded-vote/v1/snapshot-data/{height}`). In local dev, the admin UI's Vite proxy routes `/nullifier/*` to the PIR server (stripping the prefix).
+The PIR server (`nf-server serve`, port 3000 locally, from the `vote-nullifier-pir` repo) is the **sole provider** of nullifier data — snapshot status, tree root, rebuild triggers, and PIR queries all live on the PIR server. Clients (admin UI, iOS wallet) talk to the PIR server directly. The chain node (svoted) does **not** proxy nullifier endpoints — it only uses the PIR server internally when fetching snapshot data for session creation (`/shielded-vote/v1/snapshot-data/{height}`). In local dev, the admin UI's Vite proxy routes `/nullifier/*` to the PIR server (stripping the prefix).
 
 ### Nullifier ingest (`nf-server`)
 
-The unified `nf-server` binary lives in `nullifier-ingest/nf-server/` and has three subcommands: `ingest`, `export`, and `serve`. The `serve` subcommand requires `--features serve` (enabled automatically by `make serve`). For production AVX-512 acceleration, the deploy workflow additionally enables `--features avx512`.
+The `nf-server` binary and all nullifier crates live in the **separate `vote-nullifier-pir` repo** (`git@github.com:valargroup/vote-nullifier-pir.git`), expected at `../vote-nullifier-pir/`. The `nullifier:*` mise tasks delegate to its Makefile.
 
-Data files (`nullifiers.bin`, `nullifiers.checkpoint`) are stored at the `nullifier-ingest/` root. PIR tier files go in `nullifier-ingest/pir-data/`. For manual operations use `make -C nullifier-ingest`:
+`nf-server` has three subcommands: `ingest`, `export`, and `serve`. The `serve` subcommand requires `--features serve` (enabled automatically by `make serve`). For production AVX-512 acceleration, the deploy workflow additionally enables `--features avx512`.
+
+Data files (`nullifiers.bin`, `nullifiers.checkpoint`) are stored at the `vote-nullifier-pir/` root. PIR tier files go in `vote-nullifier-pir/pir-data/`. For manual operations use `make -C ../vote-nullifier-pir`:
 
 - `SYNC_HEIGHT` must be a **multiple of 10**
 - The full pipeline is **ingest → export → serve**. After re-ingesting nullifiers, you must re-export before the server sees the new data: `make ingest-resync` (deletes stale tier files), then `make export-nf`, then `make serve`
@@ -105,7 +107,7 @@ The EA key ceremony is automatic per voting round. When a round is published, el
 
 ## Protocol Documentation
 
-When modifying circuit logic (in `orchard/`, `librustvoting/`, or `sdk/circuits/`), the corresponding documentation in the Obsidian gitbook (the `shielded_vote_book` repository) must also be updated. The book is served live and describes the circuit structure — any protocol change that affects conditions, public inputs, witness fields, or hash parameters must be reflected there.
+When modifying circuit logic (in `orchard/`, `librustvoting/`, `sdk/circuits/`, or `vote-nullifier-pir`), the corresponding documentation in the Obsidian gitbook (the `shielded_vote_book` repository) must also be updated. The book is served live and describes the circuit structure — any protocol change that affects conditions, public inputs, witness fields, or hash parameters must be reflected there.
 
 ## Claude Code Workflow Rules
 

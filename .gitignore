@@ -46,16 +46,11 @@ keystone-qr/.build/
 # xcframework (regenerated via `cd zcash-voting-ffi && make dev`)
 zcash-voting-ffi/releases/zcash_voting_ffiFFI.xcframework/
 
-# Nullifier service data
-nullifier-ingest/service/nullifiers.bin
-nullifier-ingest/service/nullifiers.checkpoint
-nullifier-ingest/service/nullifiers.tree
-
+# Nullifier service data (lives in vote-nullifier-pir repo)
 nullifiers.bin
 nullifiers.checkpoint
 nullifiers.tree
 nullifiers.index
-nullifier-ingest/pir-data/
 
 # Downloaded/generated E2E throughput fixtures
 e2e-tests/fixtures/**/manifest.json

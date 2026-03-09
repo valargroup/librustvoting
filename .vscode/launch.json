@@ -29,55 +29,14 @@
             "showLog": true
         },
         {
-            // Requires the CodeLLDB extension (vadimcn.vscode-lldb).
-            // Builds and launches the nullifier query server.
-            // Data files are read from nullifier-ingest/service/ (DATA_DIR=.).
-            "name": "Launch nullifier query-server",
-            "type": "lldb",
+            // Nullifier tools (nf-server, PIR server) now live in the
+            // vote-nullifier-pir repo.  Open that repo separately for
+            // LLDB launch configs.
+            "name": "(see vote-nullifier-pir repo)",
+            "type": "node",
             "request": "launch",
-            "cargo": {
-                "args": ["build", "--manifest-path", "${workspaceFolder}/nullifier-ingest/service/Cargo.toml", "--bin", "query-server"],
-                "filter": { "name": "query-server", "kind": "bin" }
-            },
-            "cwd": "${workspaceFolder}/nullifier-ingest/service",
-            "env": {
-                "DATA_DIR": ".",
-                "PORT": "3000",
-                "LWD_URL": "https://zec.rocks:443"
-            }
-        },
-        {
-            // Builds and launches the PIR server (YPIR-backed nullifier lookup).
-            // Expects exported tier files in nullifier-ingest/pir-data/.
-            // Run `make -C nullifier-ingest export-nf` first if tier files are missing.
-            "name": "Launch PIR server",
-            "type": "lldb",
-            "request": "launch",
-            "cargo": {
-                "args": ["build", "--manifest-path", "${workspaceFolder}/nullifier-ingest/pir-server/Cargo.toml", "--bin", "pir-server"],
-                "filter": { "name": "pir-server", "kind": "bin" }
-            },
-            "args": ["${workspaceFolder}/nullifier-ingest/pir-data", "3001"],
-            "cwd": "${workspaceFolder}/nullifier-ingest",
-            "env": {
-                "RUST_LOG": "info"
-            }
-        },
-        {
-            // Builds and runs the nullifier ingest binary (incremental sync to tip).
-            // Set INVALIDATE_TREE=1 in env to force a tree sidecar rebuild after sync.
-            "name": "Launch nullifier ingest-nfs",
-            "type": "lldb",
-            "request": "launch",
-            "cargo": {
-                "args": ["build", "--manifest-path", "${workspaceFolder}/nullifier-ingest/service/Cargo.toml", "--bin", "ingest-nfs"],
-                "filter": { "name": "ingest-nfs", "kind": "bin" }
-            },
-            "cwd": "${workspaceFolder}/nullifier-ingest/service",
-            "env": {
-                "DATA_DIR": ".",
-                "LWD_URL": "https://zec.rocks:443"
-            }
+            "runtimeExecutable": "echo",
+            "args": ["Nullifier launch configs moved to vote-nullifier-pir repo"]
         }
     ]
 }

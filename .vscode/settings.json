@@ -4,8 +4,6 @@
   },
   "rust-analyzer.linkedProjects": [
     "e2e-tests/Cargo.toml",
-    "nullifier-ingest/imt-tree/Cargo.toml",
-    "nullifier-ingest/service/Cargo.toml",
     "orchard/Cargo.toml",
     "librustzcash/Cargo.toml",
     "vote-commitment-tree/Cargo.toml"
