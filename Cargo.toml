@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "librustvoting",
-    "zcash-voting-ffi",
     "vote-commitment-tree",
     "vote-commitment-tree-client",
 ]

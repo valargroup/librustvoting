@@ -1,25 +1,27 @@
 # librustvoting
 
-Client-side cryptographic library for Zcash shielded voting. Implements proof generation, vote construction, tree synchronization, and FFI bindings for the [Zally governance protocol](https://github.com/valargroup/shielded-vote-book).
+Client-side cryptographic library for Zcash shielded voting. Implements proof generation, vote construction, and tree synchronization for the [Zally governance protocol](https://github.com/valargroup/shielded-vote-book).
 
 ## Workspace Crates
 
 | Crate | Description |
 |-------|-------------|
 | **librustvoting** | Core library: ZKP delegation and vote proofs (Halo2), El Gamal encryption, governance PCZT construction, Merkle witness generation, SQLite round-state persistence |
-| **zcash-voting-ffi** | UniFFI bridge exposing librustvoting to Swift (iOS) and Kotlin (Android) |
 | **vote-commitment-tree** | Append-only Poseidon Merkle tree for Vote Authority Notes and Vote Commitments |
 | **vote-commitment-tree-client** | HTTP client for syncing the vote commitment tree from a chain node |
 | **imt-tree** | Indexed Merkle tree primitive used by the vote commitment tree and nullifier infrastructure |
 | **pir-export** | Generates PIR tier files from the nullifier indexed Merkle tree |
 | **pir-client** | PIR (Private Information Retrieval) query client for private nullifier exclusion proofs |
 
+## FFI
+
+Mobile FFI bindings live in [zcash-swift-wallet-sdk](https://github.com/valargroup/zcash-swift-wallet-sdk) (hand-rolled C FFI + Swift wrappers). This repo is a pure Rust workspace.
+
 ## Building
 
 ```bash
 cargo check                    # check all crates
 cargo build -p librustvoting   # build just the core library
-cargo build -p zcash-voting-ffi --release  # FFI for mobile (release profile)
 ```
 
 The workspace depends on the private [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits) repo. The `.cargo/config.toml` enables `git-fetch-with-cli` so your local git credentials are used automatically.
@@ -35,28 +37,24 @@ This workspace uses `[patch.crates-io]` (in the root `Cargo.toml`) to override t
 ## Architecture
 
 ```
-                    ┌──────────────────┐
-                    │   zashi-ios /    │
-                    │   zashi-android  │
-                    └────────┬─────────┘
-                             │ UniFFI
-                    ┌────────┴─────────┐
-                    │ zcash-voting-ffi │
-                    └────────┬─────────┘
-                             │
-                    ┌────────┴─────────┐
-              ┌─────┤  librustvoting   ├─────┐
-              │     └──────────────────┘     │
-              │              │               │
-    ┌─────────┴──────┐ ┌────┴─────┐  ┌──────┴──────┐
-    │ vote-commitment│ │   pir-   │  │  voting-    │
-    │    -tree       │ │  client  │  │  circuits   │
-    └───────┬────────┘ └────┬─────┘  └─────────────┘
-            │               │
-    ┌───────┴────────┐ ┌────┴─────┐
-    │    imt-tree    │ │   pir-   │
-    └────────────────┘ │  export  │
-                       └──────────┘
+              ┌─────────────────────┐
+              │ zcash-swift-wallet- │
+              │        sdk          │
+              └────────┬────────────┘
+                       │ C FFI
+              ┌────────┴─────────┐
+        ┌─────┤  librustvoting   ├─────┐
+        │     └──────────────────┘     │
+        │              │               │
+┌───────┴────────┐ ┌───┴──────┐  ┌────┴──────┐
+│ vote-commitment│ │   pir-   │  │  voting-  │
+│    -tree       │ │  client  │  │  circuits │
+└───────┬────────┘ └───┬──────┘  └───────────┘
+        │              │
+┌───────┴────────┐ ┌───┴──────┐
+│    imt-tree    │ │   pir-   │
+└────────────────┘ │  export  │
+                   └──────────┘
 ```
 
 ## License
