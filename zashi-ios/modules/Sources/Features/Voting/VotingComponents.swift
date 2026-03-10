@@ -124,7 +124,7 @@ struct ZKPStatusBanner: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                     .font(.caption)
-                Text("Proof failed: \(error)")
+                Text(error)
                     .font(.caption)
             }
         }
