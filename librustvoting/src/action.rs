@@ -12,6 +12,9 @@ use orchard::pczt::Zip32Derivation;
 use orchard::tree::{MerkleHashOrchard, MerklePath};
 use orchard::value::NoteValue;
 use orchard::{Anchor, Address};
+use zcash_primitives::transaction::builder::PcztParts;
+use zcash_primitives::transaction::TxVersion;
+use zcash_protocol::consensus::{BlockHeight, BranchId, Network};
 use zip32::Scope;
 
 /// Orchard Merkle tree depth (32 levels).
@@ -438,24 +441,34 @@ pub fn build_governance_pczt(
         })?;
 
     // --- Serialize to full PCZT ---
-    // Create an empty Pczt shell with Creator, then replace the orchard bundle.
-    let sapling_anchor = [0u8; 32]; // No sapling bundle
-    let orchard_anchor_bytes = anchor.to_bytes();
-    let mut pczt = pczt::roles::creator::Creator::new(
-        consensus_branch_id,
-        0, // expiry_height: 0 = no expiry (never broadcast)
-        coin_type,
-        sapling_anchor,
-        orchard_anchor_bytes,
-    )
-    // Keystone's determine_lock_time returns global.lock_time() for pure-Orchard PCZTs
-    // (no transparent inputs). Without a fallback_lock_time, it returns None → error.
-    .with_fallback_lock_time(0)
-    .build();
-
-    // Serialize the orchard pczt bundle and set it on the Pczt
-    let pczt_orchard_bundle = pczt::orchard::Bundle::serialize_from(orchard_pczt_bundle);
-    pczt.set_orchard(pczt_orchard_bundle);
+    // Use Creator::build_from_parts to construct the PCZT with the orchard bundle,
+    // matching the same path the wallet transaction builder uses.
+    let branch_id = BranchId::try_from(consensus_branch_id).map_err(|e| {
+        VotingError::InvalidInput {
+            message: format!("invalid consensus_branch_id 0x{:08X}: {}", consensus_branch_id, e),
+        }
+    })?;
+    let network = match coin_type {
+        133 => Network::MainNetwork,
+        _ => Network::TestNetwork,
+    };
+    let parts = PcztParts {
+        params: network,
+        version: TxVersion::suggested_for_branch(branch_id),
+        consensus_branch_id: branch_id,
+        // Keystone's determine_lock_time returns global.lock_time() for pure-Orchard PCZTs
+        // (no transparent inputs). Without a lock_time, it returns None → error.
+        lock_time: 0,
+        expiry_height: BlockHeight::from_u32(0), // no expiry (never broadcast)
+        transparent: None,
+        sapling: None,
+        orchard: Some(orchard_pczt_bundle),
+    };
+    let pczt = pczt::roles::creator::Creator::build_from_parts(parts).ok_or_else(|| {
+        VotingError::Internal {
+            message: "Creator::build_from_parts returned None (incompatible tx version)".to_string(),
+        }
+    })?;
 
     // Run IO Finalizer so the Signer (Keystone) can compute the sighash
     let pczt = pczt::roles::io_finalizer::IoFinalizer::new(pczt)

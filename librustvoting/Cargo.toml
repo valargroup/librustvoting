@@ -46,4 +46,5 @@ zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
 # PCZT construction (governance-specific PCZT for Keystone signing)
-pczt = { version = "0.5", features = ["orchard", "io-finalizer", "signer"] }
+pczt = { version = "0.5", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_primitives = "0.26"
