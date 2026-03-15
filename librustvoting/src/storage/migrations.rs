@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 4;
 
 pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
     let version: u32 = conn
@@ -70,6 +70,30 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
                 message: format!("migration to version 3 failed (create): {}", e),
             })?;
         conn.pragma_update(None, "user_version", 3)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to update database version: {}", e),
+            })?;
+    }
+
+    if version < 4 {
+        // v4: add wallet_id column for per-wallet state isolation.
+        // Drop everything and recreate from 001_init.sql.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS votes;
+             DROP TABLE IF EXISTS witnesses;
+             DROP TABLE IF EXISTS proofs;
+             DROP TABLE IF EXISTS bundles;
+             DROP TABLE IF EXISTS cached_tree_state;
+             DROP TABLE IF EXISTS rounds;"
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("migration to version 4 failed (drop): {}", e),
+        })?;
+        conn.execute_batch(include_str!("migrations/001_init.sql"))
+            .map_err(|e| VotingError::Internal {
+                message: format!("migration to version 4 failed (create): {}", e),
+            })?;
+        conn.pragma_update(None, "user_version", 4)
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to update database version: {}", e),
             })?;
@@ -148,13 +172,13 @@ mod tests {
 
         // Insert a round first
         conn.execute(
-            "INSERT INTO rounds (round_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at) VALUES ('test', 1, X'00', X'00', X'00', 0, 0)",
+            "INSERT INTO rounds (round_id, wallet_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at) VALUES ('test', 'w1', 1, X'00', X'00', X'00', 0, 0)",
             [],
         ).unwrap();
 
         // Insert a bundle row using all nullable BLOB columns.
         conn.execute(
-            "INSERT INTO bundles (round_id, bundle_index, van_comm_rand, dummy_nullifiers, rho_signed, padded_note_data, nf_signed, cmx_new, alpha, rseed_signed, rseed_output) VALUES ('test', 0, X'AA', X'BB', X'CC', X'DD', X'EE', X'FF', X'11', X'22', X'33')",
+            "INSERT INTO bundles (round_id, wallet_id, bundle_index, van_comm_rand, dummy_nullifiers, rho_signed, padded_note_data, nf_signed, cmx_new, alpha, rseed_signed, rseed_output) VALUES ('test', 'w1', 0, X'AA', X'BB', X'CC', X'DD', X'EE', X'FF', X'11', X'22', X'33')",
             [],
         ).unwrap();
 

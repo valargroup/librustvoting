@@ -1,16 +1,19 @@
 CREATE TABLE rounds (
-    round_id            TEXT PRIMARY KEY,
+    round_id            TEXT NOT NULL,
+    wallet_id           TEXT NOT NULL DEFAULT '',
     snapshot_height     INTEGER NOT NULL,
     ea_pk               BLOB NOT NULL,
     nc_root             BLOB NOT NULL,
     nullifier_imt_root  BLOB NOT NULL,
     session_json        TEXT,
     phase               INTEGER NOT NULL DEFAULT 0,
-    created_at          INTEGER NOT NULL
+    created_at          INTEGER NOT NULL,
+    PRIMARY KEY (round_id, wallet_id)
 );
 
 CREATE TABLE bundles (
-    round_id            TEXT NOT NULL REFERENCES rounds(round_id) ON DELETE CASCADE,
+    round_id            TEXT NOT NULL,
+    wallet_id           TEXT NOT NULL DEFAULT '',
     bundle_index        INTEGER NOT NULL,
     note_positions_blob BLOB,
     van_comm_rand       BLOB,
@@ -30,47 +33,54 @@ CREATE TABLE bundles (
     gov_nullifiers_blob BLOB,
     padded_note_secrets BLOB,
     pczt_sighash        BLOB,
-    PRIMARY KEY (round_id, bundle_index)
+    PRIMARY KEY (round_id, wallet_id, bundle_index),
+    FOREIGN KEY (round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE
 );
 
 CREATE TABLE cached_tree_state (
-    round_id        TEXT PRIMARY KEY REFERENCES rounds(round_id) ON DELETE CASCADE,
+    round_id        TEXT NOT NULL,
+    wallet_id       TEXT NOT NULL DEFAULT '',
     snapshot_height INTEGER NOT NULL,
-    tree_state      BLOB NOT NULL
+    tree_state      BLOB NOT NULL,
+    PRIMARY KEY (round_id, wallet_id),
+    FOREIGN KEY (round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE
 );
 
 CREATE TABLE proofs (
     round_id      TEXT NOT NULL,
+    wallet_id     TEXT NOT NULL DEFAULT '',
     bundle_index  INTEGER NOT NULL,
     witness       BLOB,
     proof         BLOB,
     success       INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
-    PRIMARY KEY (round_id, bundle_index),
-    FOREIGN KEY (round_id, bundle_index) REFERENCES bundles(round_id, bundle_index) ON DELETE CASCADE
+    PRIMARY KEY (round_id, wallet_id, bundle_index),
+    FOREIGN KEY (round_id, wallet_id, bundle_index) REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
 );
 
 CREATE TABLE witnesses (
     round_id        TEXT NOT NULL,
+    wallet_id       TEXT NOT NULL DEFAULT '',
     bundle_index    INTEGER NOT NULL,
     note_position   INTEGER NOT NULL,
     note_commitment BLOB NOT NULL,
     root            BLOB NOT NULL,
     auth_path       BLOB NOT NULL,
     created_at      INTEGER NOT NULL,
-    PRIMARY KEY (round_id, bundle_index, note_position),
-    FOREIGN KEY (round_id, bundle_index) REFERENCES bundles(round_id, bundle_index) ON DELETE CASCADE
+    PRIMARY KEY (round_id, wallet_id, bundle_index, note_position),
+    FOREIGN KEY (round_id, wallet_id, bundle_index) REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
 );
 
 CREATE TABLE votes (
     id              INTEGER PRIMARY KEY,
     round_id        TEXT NOT NULL,
+    wallet_id       TEXT NOT NULL DEFAULT '',
     bundle_index    INTEGER NOT NULL,
     proposal_id     INTEGER NOT NULL,
     choice          INTEGER NOT NULL,
     commitment      BLOB,
     submitted       INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
-    UNIQUE(round_id, bundle_index, proposal_id),
-    FOREIGN KEY (round_id, bundle_index) REFERENCES bundles(round_id, bundle_index) ON DELETE CASCADE
+    UNIQUE(round_id, wallet_id, bundle_index, proposal_id),
+    FOREIGN KEY (round_id, wallet_id, bundle_index) REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
 );

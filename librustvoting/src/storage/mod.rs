@@ -56,19 +56,23 @@ pub struct VoteRecord {
 #[derive(Clone, Debug)]
 pub struct RoundSummary {
     pub round_id: String,
+    pub wallet_id: String,
     pub phase: RoundPhase,
     pub snapshot_height: u64,
     pub created_at: u64,
 }
 
-/// Database handle for voting state. Wraps a SQLite connection.
+/// Database handle for voting state. Wraps a SQLite connection and a
+/// wallet identifier that scopes all round data to a single wallet.
 pub struct VotingDb {
     conn: Mutex<Connection>,
+    wallet_id: Mutex<String>,
 }
 
 impl VotingDb {
     /// Open (or create) the voting database at the given path.
     /// Runs migrations automatically.
+    /// Call `set_wallet_id` before performing any round operations.
     pub fn open(path: &str) -> Result<Self, VotingError> {
         let conn = if path == ":memory:" {
             Connection::open_in_memory()
@@ -88,7 +92,20 @@ impl VotingDb {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            wallet_id: Mutex::new(String::new()),
         })
+    }
+
+    /// Set the wallet identifier used to scope all subsequent operations.
+    pub fn set_wallet_id(&self, id: &str) {
+        *self.wallet_id.lock().expect("wallet_id mutex poisoned") = id.to_string();
+    }
+
+    /// Get the current wallet identifier. Panics if not set.
+    pub fn wallet_id(&self) -> String {
+        let id = self.wallet_id.lock().expect("wallet_id mutex poisoned").clone();
+        assert!(!id.is_empty(), "wallet_id must be set before performing voting operations");
+        id
     }
 
     /// Get a lock on the underlying connection for query execution.
@@ -101,6 +118,8 @@ impl VotingDb {
 mod tests {
     use super::*;
     use crate::types::VotingRoundParams;
+
+    const W: &str = "test-wallet";
 
     fn test_db() -> VotingDb {
         VotingDb::open(":memory:").unwrap()
@@ -123,7 +142,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -132,19 +151,19 @@ mod tests {
         let conn = db.conn();
         let params = test_params();
 
-        queries::insert_round(&conn, &params, None).unwrap();
+        queries::insert_round(&conn, W, &params, None).unwrap();
 
-        let state = queries::get_round_state(&conn, "test-round-1").unwrap();
+        let state = queries::get_round_state(&conn, "test-round-1", W).unwrap();
         assert_eq!(state.phase, RoundPhase::Initialized);
         assert_eq!(state.snapshot_height, 1000);
         assert!(!state.proof_generated);
 
-        let rounds = queries::list_rounds(&conn).unwrap();
+        let rounds = queries::list_rounds(&conn, W).unwrap();
         assert_eq!(rounds.len(), 1);
         assert_eq!(rounds[0].round_id, "test-round-1");
 
-        queries::clear_round(&conn, "test-round-1").unwrap();
-        let rounds = queries::list_rounds(&conn).unwrap();
+        queries::clear_round(&conn, "test-round-1", W).unwrap();
+        let rounds = queries::list_rounds(&conn, W).unwrap();
         assert!(rounds.is_empty());
     }
 
@@ -152,12 +171,12 @@ mod tests {
     fn test_tree_state_cache() {
         let db = test_db();
         let conn = db.conn();
-        queries::insert_round(&conn, &test_params(), None).unwrap();
+        queries::insert_round(&conn, W, &test_params(), None).unwrap();
 
         let tree_state = vec![0xCC; 1024];
-        queries::store_tree_state(&conn, "test-round-1", 1000, &tree_state).unwrap();
+        queries::store_tree_state(&conn, "test-round-1", W, 1000, &tree_state).unwrap();
 
-        let loaded = queries::load_tree_state(&conn, "test-round-1").unwrap();
+        let loaded = queries::load_tree_state(&conn, "test-round-1", W).unwrap();
         assert_eq!(loaded, tree_state);
     }
 
@@ -165,16 +184,15 @@ mod tests {
     fn test_proof_storage() {
         let db = test_db();
         let conn = db.conn();
-        queries::insert_round(&conn, &test_params(), None).unwrap();
-        queries::insert_bundle(&conn, "test-round-1", 0, &[]).unwrap();
-        queries::store_proof(&conn, "test-round-1", 0, &vec![0xAB; 256]).unwrap();
+        queries::insert_round(&conn, W, &test_params(), None).unwrap();
+        queries::insert_bundle(&conn, "test-round-1", W, 0, &[]).unwrap();
+        queries::store_proof(&conn, "test-round-1", W, 0, &vec![0xAB; 256]).unwrap();
 
-        // proof_generated requires both proof AND VAN position
-        let state = queries::get_round_state(&conn, "test-round-1").unwrap();
+        let state = queries::get_round_state(&conn, "test-round-1", W).unwrap();
         assert!(!state.proof_generated, "proof alone should not be enough");
 
-        queries::store_van_position(&conn, "test-round-1", 0, 42).unwrap();
-        let state = queries::get_round_state(&conn, "test-round-1").unwrap();
+        queries::store_van_position(&conn, "test-round-1", W, 0, 42).unwrap();
+        let state = queries::get_round_state(&conn, "test-round-1", W).unwrap();
         assert!(state.proof_generated, "proof + VAN position should be enough");
     }
 
@@ -182,33 +200,31 @@ mod tests {
     fn test_vote_storage() {
         let db = test_db();
         let conn = db.conn();
-        queries::insert_round(&conn, &test_params(), None).unwrap();
-        queries::insert_bundle(&conn, "test-round-1", 0, &[]).unwrap();
+        queries::insert_round(&conn, W, &test_params(), None).unwrap();
+        queries::insert_bundle(&conn, "test-round-1", W, 0, &[]).unwrap();
 
         let commitment = vec![0xCC; 128];
-        queries::store_vote(&conn, "test-round-1", 0, 0, 0, &commitment).unwrap();
-        queries::store_vote(&conn, "test-round-1", 0, 1, 1, &commitment).unwrap();
+        queries::store_vote(&conn, "test-round-1", W, 0, 0, 0, &commitment).unwrap();
+        queries::store_vote(&conn, "test-round-1", W, 0, 1, 1, &commitment).unwrap();
 
-        queries::mark_vote_submitted(&conn, "test-round-1", 0, 0).unwrap();
+        queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
     }
 
     #[test]
     fn test_get_votes() {
         let db = test_db();
         let conn = db.conn();
-        queries::insert_round(&conn, &test_params(), None).unwrap();
-        queries::insert_bundle(&conn, "test-round-1", 0, &[]).unwrap();
+        queries::insert_round(&conn, W, &test_params(), None).unwrap();
+        queries::insert_bundle(&conn, "test-round-1", W, 0, &[]).unwrap();
 
-        // No votes initially
-        let votes = queries::get_votes(&conn, "test-round-1").unwrap();
+        let votes = queries::get_votes(&conn, "test-round-1", W).unwrap();
         assert!(votes.is_empty());
 
-        // Store two votes with different choices
         let commitment = vec![0xCC; 128];
-        queries::store_vote(&conn, "test-round-1", 0, 0, 0, &commitment).unwrap();
-        queries::store_vote(&conn, "test-round-1", 0, 1, 2, &commitment).unwrap();
+        queries::store_vote(&conn, "test-round-1", W, 0, 0, 0, &commitment).unwrap();
+        queries::store_vote(&conn, "test-round-1", W, 0, 1, 2, &commitment).unwrap();
 
-        let votes = queries::get_votes(&conn, "test-round-1").unwrap();
+        let votes = queries::get_votes(&conn, "test-round-1", W).unwrap();
         assert_eq!(votes.len(), 2);
         assert_eq!(votes[0].proposal_id, 0);
         assert_eq!(votes[0].choice, 0);
@@ -216,10 +232,37 @@ mod tests {
         assert_eq!(votes[1].proposal_id, 1);
         assert_eq!(votes[1].choice, 2);
 
-        // Mark first vote submitted and verify
-        queries::mark_vote_submitted(&conn, "test-round-1", 0, 0).unwrap();
-        let votes = queries::get_votes(&conn, "test-round-1").unwrap();
+        queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
+        let votes = queries::get_votes(&conn, "test-round-1", W).unwrap();
         assert!(votes[0].submitted);
         assert!(!votes[1].submitted);
+    }
+
+    #[test]
+    fn test_wallet_isolation() {
+        let db = test_db();
+        let conn = db.conn();
+        let params = test_params();
+
+        queries::insert_round(&conn, "wallet-a", &params, None).unwrap();
+        queries::insert_round(&conn, "wallet-b", &params, None).unwrap();
+
+        queries::insert_bundle(&conn, "test-round-1", "wallet-a", 0, &[]).unwrap();
+        queries::insert_bundle(&conn, "test-round-1", "wallet-b", 0, &[]).unwrap();
+
+        let commitment = vec![0xCC; 128];
+        queries::store_vote(&conn, "test-round-1", "wallet-a", 0, 0, 1, &commitment).unwrap();
+        queries::store_vote(&conn, "test-round-1", "wallet-b", 0, 0, 2, &commitment).unwrap();
+
+        let votes_a = queries::get_votes(&conn, "test-round-1", "wallet-a").unwrap();
+        let votes_b = queries::get_votes(&conn, "test-round-1", "wallet-b").unwrap();
+        assert_eq!(votes_a.len(), 1);
+        assert_eq!(votes_b.len(), 1);
+        assert_eq!(votes_a[0].choice, 1);
+        assert_eq!(votes_b[0].choice, 2);
+
+        queries::clear_round(&conn, "test-round-1", "wallet-a").unwrap();
+        let rounds_b = queries::list_rounds(&conn, "wallet-b").unwrap();
+        assert_eq!(rounds_b.len(), 1, "wallet-b round should survive wallet-a clear");
     }
 }

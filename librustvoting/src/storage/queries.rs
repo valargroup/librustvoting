@@ -7,6 +7,7 @@ use crate::types::{VotingError, VotingRoundParams};
 
 pub fn insert_round(
     conn: &Connection,
+    wallet_id: &str,
     params: &VotingRoundParams,
     session_json: Option<&str>,
 ) -> Result<(), VotingError> {
@@ -16,10 +17,11 @@ pub fn insert_round(
         .as_secs() as i64;
 
     conn.execute(
-        "INSERT INTO rounds (round_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root, session_json, phase, created_at)
-         VALUES (:round_id, :snapshot_height, :ea_pk, :nc_root, :nullifier_imt_root, :session_json, :phase, :created_at)",
+        "INSERT INTO rounds (round_id, wallet_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root, session_json, phase, created_at)
+         VALUES (:round_id, :wallet_id, :snapshot_height, :ea_pk, :nc_root, :nullifier_imt_root, :session_json, :phase, :created_at)",
         named_params! {
             ":round_id": params.vote_round_id,
+            ":wallet_id": wallet_id,
             ":snapshot_height": params.snapshot_height as i64,
             ":ea_pk": params.ea_pk,
             ":nc_root": params.nc_root,
@@ -39,14 +41,16 @@ pub fn insert_round(
 pub fn update_round_phase(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     phase: RoundPhase,
 ) -> Result<(), VotingError> {
     let rows = conn
         .execute(
-            "UPDATE rounds SET phase = :phase WHERE round_id = :round_id",
+            "UPDATE rounds SET phase = :phase WHERE round_id = :round_id AND wallet_id = :wallet_id",
             named_params! {
                 ":phase": phase as i32,
                 ":round_id": round_id,
+                ":wallet_id": wallet_id,
             },
         )
         .map_err(|e| VotingError::Internal {
@@ -65,10 +69,11 @@ pub fn update_round_phase(
 pub fn load_round_params(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
 ) -> Result<VotingRoundParams, VotingError> {
     conn.query_row(
-        "SELECT round_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root FROM rounds WHERE round_id = :round_id",
-        named_params! { ":round_id": round_id },
+        "SELECT round_id, snapshot_height, ea_pk, nc_root, nullifier_imt_root FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
         |row| {
             Ok(VotingRoundParams {
                 vote_round_id: row.get(0)?,
@@ -84,11 +89,11 @@ pub fn load_round_params(
     })
 }
 
-pub fn get_round_state(conn: &Connection, round_id: &str) -> Result<RoundState, VotingError> {
+pub fn get_round_state(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<RoundState, VotingError> {
     let (phase_int, snapshot_height): (i32, i64) = conn
         .query_row(
-            "SELECT phase, snapshot_height FROM rounds WHERE round_id = :round_id",
-            named_params! { ":round_id": round_id },
+            "SELECT phase, snapshot_height FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| VotingError::InvalidInput {
@@ -101,8 +106,8 @@ pub fn get_round_state(conn: &Connection, round_id: &str) -> Result<RoundState, 
     // on-chain submission finishes.
     let bundle_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id",
-            named_params! { ":round_id": round_id },
+            "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
             |row| row.get(0),
         )
         .map_err(|e| VotingError::Internal {
@@ -114,8 +119,8 @@ pub fn get_round_state(conn: &Connection, round_id: &str) -> Result<RoundState, 
     } else {
         let proofs_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM proofs WHERE round_id = :round_id AND success = 1",
-                named_params! { ":round_id": round_id },
+                "SELECT COUNT(*) FROM proofs WHERE round_id = :round_id AND wallet_id = :wallet_id AND success = 1",
+                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
                 |row| row.get(0),
             )
             .map_err(|e| VotingError::Internal {
@@ -124,8 +129,8 @@ pub fn get_round_state(conn: &Connection, round_id: &str) -> Result<RoundState, 
 
         let van_positions_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id AND van_leaf_position IS NOT NULL",
-                named_params! { ":round_id": round_id },
+                "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND van_leaf_position IS NOT NULL",
+                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
                 |row| row.get(0),
             )
             .map_err(|e| VotingError::Internal {
@@ -145,20 +150,21 @@ pub fn get_round_state(conn: &Connection, round_id: &str) -> Result<RoundState, 
     })
 }
 
-pub fn list_rounds(conn: &Connection) -> Result<Vec<RoundSummary>, VotingError> {
+pub fn list_rounds(conn: &Connection, wallet_id: &str) -> Result<Vec<RoundSummary>, VotingError> {
     let mut stmt = conn
-        .prepare("SELECT round_id, phase, snapshot_height, created_at FROM rounds ORDER BY created_at DESC")
+        .prepare("SELECT round_id, wallet_id, phase, snapshot_height, created_at FROM rounds WHERE wallet_id = :wallet_id ORDER BY created_at DESC")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare list_rounds query: {}", e),
         })?;
 
     let rounds = stmt
-        .query_map([], |row| {
+        .query_map(named_params! { ":wallet_id": wallet_id }, |row| {
             Ok(RoundSummary {
                 round_id: row.get(0)?,
-                phase: RoundPhase::from_i32(row.get(1)?),
-                snapshot_height: row.get::<_, i64>(2)? as u64,
-                created_at: row.get::<_, i64>(3)? as u64,
+                wallet_id: row.get(1)?,
+                phase: RoundPhase::from_i32(row.get(2)?),
+                snapshot_height: row.get::<_, i64>(3)? as u64,
+                created_at: row.get::<_, i64>(4)? as u64,
             })
         })
         .map_err(|e| VotingError::Internal {
@@ -174,10 +180,10 @@ pub fn list_rounds(conn: &Connection) -> Result<Vec<RoundSummary>, VotingError> 
 
 /// Delete a round and all associated data. Child tables (bundles, cached_tree_state,
 /// proofs, witnesses, votes) are removed automatically via ON DELETE CASCADE.
-pub fn clear_round(conn: &Connection, round_id: &str) -> Result<(), VotingError> {
+pub fn clear_round(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<(), VotingError> {
     conn.execute(
-        "DELETE FROM rounds WHERE round_id = :round_id",
-        named_params! { ":round_id": round_id },
+        "DELETE FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {
         message: format!("failed to clear round: {}", e),
@@ -191,6 +197,7 @@ pub fn clear_round(conn: &Connection, round_id: &str) -> Result<(), VotingError>
 pub fn insert_bundle(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
     note_positions: &[u64],
 ) -> Result<(), VotingError> {
@@ -200,10 +207,11 @@ pub fn insert_bundle(
         .collect();
 
     conn.execute(
-        "INSERT INTO bundles (round_id, bundle_index, note_positions_blob)
-         VALUES (:round_id, :bundle_index, :note_positions_blob)",
+        "INSERT INTO bundles (round_id, wallet_id, bundle_index, note_positions_blob)
+         VALUES (:round_id, :wallet_id, :bundle_index, :note_positions_blob)",
         named_params! {
             ":round_id": round_id,
+            ":wallet_id": wallet_id,
             ":bundle_index": bundle_index as i64,
             ":note_positions_blob": blob,
         },
@@ -216,10 +224,10 @@ pub fn insert_bundle(
 }
 
 /// Get the number of bundles for a round.
-pub fn get_bundle_count(conn: &Connection, round_id: &str) -> Result<u32, VotingError> {
+pub fn get_bundle_count(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<u32, VotingError> {
     conn.query_row(
-        "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id",
-        named_params! { ":round_id": round_id },
+        "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
         |row| row.get::<_, i64>(0).map(|c| c as u32),
     )
     .map_err(|e| VotingError::Internal {
@@ -231,13 +239,15 @@ pub fn get_bundle_count(conn: &Connection, round_id: &str) -> Result<u32, Voting
 pub fn load_bundle_note_positions(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
 ) -> Result<Vec<u64>, VotingError> {
     let blob: Vec<u8> = conn
         .query_row(
-            "SELECT note_positions_blob FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
+            "SELECT note_positions_blob FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":round_id": round_id,
+                ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
             |row| row.get(0),
@@ -276,6 +286,7 @@ pub fn load_bundle_note_positions(
 pub fn store_delegation_data(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
     van_comm_rand: &[u8],
     dummy_nullifiers: &[Vec<u8>],
@@ -317,7 +328,7 @@ pub fn store_delegation_data(
              rseed_output = :rseed_output, gov_comm = :gov_comm, \
              total_note_value = :total_note_value, address_index = :address_index, \
              padded_note_secrets = :secrets, pczt_sighash = :sighash \
-             WHERE round_id = :round_id AND bundle_index = :bundle_index",
+             WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":rand": van_comm_rand,
                 ":dummies": dummy_blob,
@@ -334,6 +345,7 @@ pub fn store_delegation_data(
                 ":secrets": secrets_blob,
                 ":sighash": pczt_sighash,
                 ":round_id": round_id,
+                ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
         )
@@ -352,10 +364,10 @@ pub fn store_delegation_data(
 }
 
 /// Load nf_signed (signed note nullifier, 32 bytes) for a bundle.
-pub fn load_nf_signed(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_nf_signed(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT nf_signed FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT nf_signed FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -364,10 +376,10 @@ pub fn load_nf_signed(conn: &Connection, round_id: &str, bundle_index: u32) -> R
 }
 
 /// Load cmx_new (output note commitment, 32 bytes) for a bundle.
-pub fn load_cmx_new(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_cmx_new(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT cmx_new FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT cmx_new FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -376,10 +388,10 @@ pub fn load_cmx_new(conn: &Connection, round_id: &str, bundle_index: u32) -> Res
 }
 
 /// Load alpha (spend auth randomizer scalar, 32 bytes) for a bundle.
-pub fn load_alpha(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_alpha(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT alpha FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT alpha FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -388,10 +400,10 @@ pub fn load_alpha(conn: &Connection, round_id: &str, bundle_index: u32) -> Resul
 }
 
 /// Load signed note rseed (32 bytes) for a bundle.
-pub fn load_rseed_signed(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_rseed_signed(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT rseed_signed FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT rseed_signed FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -400,10 +412,10 @@ pub fn load_rseed_signed(conn: &Connection, round_id: &str, bundle_index: u32) -
 }
 
 /// Load output note rseed (32 bytes) for a bundle.
-pub fn load_rseed_output(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_rseed_output(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT rseed_output FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT rseed_output FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -416,12 +428,13 @@ pub fn load_rseed_output(conn: &Connection, round_id: &str, bundle_index: u32) -
 pub fn load_padded_note_secrets(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, VotingError> {
     let blob: Vec<u8> = conn
         .query_row(
-            "SELECT padded_note_secrets FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-            named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+            "SELECT padded_note_secrets FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
             |row| row.get(0),
         )
         .map_err(|e| VotingError::InvalidInput {
@@ -446,11 +459,12 @@ pub fn load_padded_note_secrets(
 pub fn load_pczt_sighash(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
 ) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT pczt_sighash FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT pczt_sighash FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -459,10 +473,10 @@ pub fn load_pczt_sighash(
 }
 
 /// Load the VAN blinding factor for a bundle. Needed as a private witness in ZKP #2.
-pub fn load_van_comm_rand(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_van_comm_rand(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT van_comm_rand FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT van_comm_rand FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -475,12 +489,13 @@ pub fn load_van_comm_rand(conn: &Connection, round_id: &str, bundle_index: u32) 
 pub fn load_dummy_nullifiers(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
 ) -> Result<Vec<Vec<u8>>, VotingError> {
     let blob: Vec<u8> = conn
         .query_row(
-            "SELECT dummy_nullifiers FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-            named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+            "SELECT dummy_nullifiers FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
             |row| row.get(0),
         )
         .map_err(|e| VotingError::InvalidInput {
@@ -502,10 +517,10 @@ pub fn load_dummy_nullifiers(
 // --- Rho & Padded Note Data ---
 
 /// Load rho_signed for a bundle (32-byte constrained rho).
-pub fn load_rho_signed(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_rho_signed(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT rho_signed FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT rho_signed FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -514,11 +529,11 @@ pub fn load_rho_signed(conn: &Connection, round_id: &str, bundle_index: u32) -> 
 }
 
 /// Load padded note cmx data. Returns 0-3 entries of 32 bytes each.
-pub fn load_padded_cmx(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<Vec<Vec<u8>>, VotingError> {
+pub fn load_padded_cmx(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<Vec<u8>>, VotingError> {
     let blob: Vec<u8> = conn
         .query_row(
-            "SELECT padded_note_data FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-            named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+            "SELECT padded_note_data FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
             |row| row.get(0),
         )
         .map_err(|e| VotingError::InvalidInput {
@@ -563,13 +578,14 @@ const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
 pub fn load_zkp2_inputs(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
 ) -> Result<Zkp2DelegationData, VotingError> {
     let data = conn.query_row(
         "SELECT b.van_comm_rand, b.total_note_value, b.address_index, r.ea_pk, r.round_id \
-         FROM bundles b JOIN rounds r ON b.round_id = r.round_id \
-         WHERE b.round_id = :round_id AND b.bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+         FROM bundles b JOIN rounds r ON b.round_id = r.round_id AND b.wallet_id = r.wallet_id \
+         WHERE b.round_id = :round_id AND b.wallet_id = :wallet_id AND b.bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| {
             Ok(Zkp2DelegationData {
                 gov_comm_rand: row.get(0)?,
@@ -589,13 +605,13 @@ pub fn load_zkp2_inputs(
     // for THIS bundle specifically.
     let mut authority = MAX_PROPOSAL_AUTHORITY;
     let mut stmt = conn
-        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND bundle_index = :bundle_index AND submitted = 1")
+        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND submitted = 1")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare proposal_authority query: {}", e),
         })?;
     let rows = stmt
         .query_map(
-            named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
             |row| row.get::<_, i64>(0),
         )
         .map_err(|e| VotingError::Internal {
@@ -620,15 +636,17 @@ pub fn load_zkp2_inputs(
 pub fn store_van_position(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
     position: u32,
 ) -> Result<(), VotingError> {
     let rows = conn
         .execute(
-            "UPDATE bundles SET van_leaf_position = :position WHERE round_id = :round_id AND bundle_index = :bundle_index",
+            "UPDATE bundles SET van_leaf_position = :position WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":position": position as i64,
                 ":round_id": round_id,
+                ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
         )
@@ -644,10 +662,10 @@ pub fn store_van_position(
 }
 
 /// Load the VAN leaf position for witness generation.
-pub fn load_van_position(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<u32, VotingError> {
+pub fn load_van_position(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<u32, VotingError> {
     conn.query_row(
-        "SELECT van_leaf_position FROM bundles WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT van_leaf_position FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get::<_, Option<i64>>(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -666,6 +684,7 @@ pub fn load_van_position(conn: &Connection, round_id: &str, bundle_index: u32) -
 pub fn store_proof_result_fields(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
     rk: &[u8],
     gov_nullifiers: &[Vec<u8>],
@@ -682,13 +701,14 @@ pub fn store_proof_result_fields(
         .execute(
             "UPDATE bundles SET rk = :rk, gov_nullifiers_blob = :gov_nullifiers_blob, \
              nf_signed = :nf_signed, cmx_new = :cmx_new \
-             WHERE round_id = :round_id AND bundle_index = :bundle_index",
+             WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":rk": rk,
                 ":gov_nullifiers_blob": gov_nullifiers_blob,
                 ":nf_signed": nf_signed,
                 ":cmx_new": cmx_new,
                 ":round_id": round_id,
+                ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
         )
@@ -721,6 +741,7 @@ pub struct DelegationDbFields {
 pub fn load_delegation_submission_data(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
 ) -> Result<DelegationDbFields, VotingError> {
     let (proof_bytes, rk, nf_signed, cmx_new, gov_comm, gov_nullifiers_blob, alpha, vote_round_id): (
@@ -729,9 +750,9 @@ pub fn load_delegation_submission_data(
         .query_row(
             "SELECT p.proof, b.rk, b.nf_signed, b.cmx_new, b.gov_comm, \
              b.gov_nullifiers_blob, b.alpha, b.round_id \
-             FROM bundles b JOIN proofs p ON b.round_id = p.round_id AND b.bundle_index = p.bundle_index \
-             WHERE b.round_id = :round_id AND b.bundle_index = :bundle_index AND p.success = 1",
-            named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+             FROM bundles b JOIN proofs p ON b.round_id = p.round_id AND b.bundle_index = p.bundle_index AND b.wallet_id = p.wallet_id \
+             WHERE b.round_id = :round_id AND b.wallet_id = :wallet_id AND b.bundle_index = :bundle_index AND p.success = 1",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
             |row| {
                 Ok((
                     row.get(0)?,
@@ -783,14 +804,16 @@ pub fn load_delegation_submission_data(
 pub fn store_tree_state(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     snapshot_height: u64,
     tree_state: &[u8],
 ) -> Result<(), VotingError> {
     conn.execute(
-        "INSERT OR REPLACE INTO cached_tree_state (round_id, snapshot_height, tree_state)
-         VALUES (:round_id, :snapshot_height, :tree_state)",
+        "INSERT OR REPLACE INTO cached_tree_state (round_id, wallet_id, snapshot_height, tree_state)
+         VALUES (:round_id, :wallet_id, :snapshot_height, :tree_state)",
         named_params! {
             ":round_id": round_id,
+            ":wallet_id": wallet_id,
             ":snapshot_height": snapshot_height as i64,
             ":tree_state": tree_state,
         },
@@ -801,10 +824,10 @@ pub fn store_tree_state(
     Ok(())
 }
 
-pub fn load_tree_state(conn: &Connection, round_id: &str) -> Result<Vec<u8>, VotingError> {
+pub fn load_tree_state(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
-        "SELECT tree_state FROM cached_tree_state WHERE round_id = :round_id",
-        named_params! { ":round_id": round_id },
+        "SELECT tree_state FROM cached_tree_state WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
         |row| row.get(0),
     )
     .map_err(|e| VotingError::InvalidInput {
@@ -815,10 +838,10 @@ pub fn load_tree_state(conn: &Connection, round_id: &str) -> Result<Vec<u8>, Vot
 // --- Witnesses (Merkle inclusion proofs for Orchard notes) ---
 
 /// Check if witnesses are already cached for a bundle.
-pub fn has_witnesses(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<bool, VotingError> {
+pub fn has_witnesses(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<bool, VotingError> {
     conn.query_row(
-        "SELECT COUNT(*) FROM witnesses WHERE round_id = :round_id AND bundle_index = :bundle_index",
-        named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+        "SELECT COUNT(*) FROM witnesses WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get::<_, i64>(0).map(|c| c > 0),
     )
     .map_err(|e| VotingError::Internal {
@@ -832,6 +855,7 @@ pub fn has_witnesses(conn: &Connection, round_id: &str, bundle_index: u32) -> Re
 pub fn store_witnesses(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
     witnesses: &[crate::types::WitnessData],
 ) -> Result<(), VotingError> {
@@ -845,10 +869,11 @@ pub fn store_witnesses(
         let auth_blob: Vec<u8> = w.auth_path.iter().flat_map(|h| h.iter().copied()).collect();
 
         conn.execute(
-            "INSERT OR REPLACE INTO witnesses (round_id, bundle_index, note_position, note_commitment, root, auth_path, created_at)
-             VALUES (:round_id, :bundle_index, :position, :commitment, :root, :auth_path, :created_at)",
+            "INSERT OR REPLACE INTO witnesses (round_id, wallet_id, bundle_index, note_position, note_commitment, root, auth_path, created_at)
+             VALUES (:round_id, :wallet_id, :bundle_index, :position, :commitment, :root, :auth_path, :created_at)",
             named_params! {
                 ":round_id": round_id,
+                ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
                 ":position": w.position as i64,
                 ":commitment": w.note_commitment,
@@ -866,11 +891,11 @@ pub fn store_witnesses(
 }
 
 /// Load cached witnesses for a bundle, ordered by position.
-pub fn load_witnesses(conn: &Connection, round_id: &str, bundle_index: u32) -> Result<Vec<crate::types::WitnessData>, VotingError> {
+pub fn load_witnesses(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<crate::types::WitnessData>, VotingError> {
     let mut stmt = conn
         .prepare(
             "SELECT note_position, note_commitment, root, auth_path FROM witnesses
-             WHERE round_id = :round_id AND bundle_index = :bundle_index ORDER BY note_position",
+             WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index ORDER BY note_position",
         )
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare load_witnesses: {}", e),
@@ -878,7 +903,7 @@ pub fn load_witnesses(conn: &Connection, round_id: &str, bundle_index: u32) -> R
 
     let witnesses = stmt
         .query_map(
-            named_params! { ":round_id": round_id, ":bundle_index": bundle_index as i64 },
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
             |row| {
                 let position: i64 = row.get(0)?;
                 let note_commitment: Vec<u8> = row.get(1)?;
@@ -925,16 +950,18 @@ pub fn load_witnesses(conn: &Connection, round_id: &str, bundle_index: u32) -> R
 pub fn store_proof(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
     proof_bytes: &[u8],
 ) -> Result<(), VotingError> {
     conn.execute(
-        "INSERT INTO proofs (round_id, bundle_index, proof, success, created_at)
-         VALUES (:round_id, :bundle_index, :proof, 1, strftime('%s','now'))
-         ON CONFLICT(round_id, bundle_index) DO UPDATE SET proof = :proof, success = 1",
+        "INSERT INTO proofs (round_id, wallet_id, bundle_index, proof, success, created_at)
+         VALUES (:round_id, :wallet_id, :bundle_index, :proof, 1, strftime('%s','now'))
+         ON CONFLICT(round_id, wallet_id, bundle_index) DO UPDATE SET proof = :proof, success = 1",
         named_params! {
             ":proof": proof_bytes,
             ":round_id": round_id,
+            ":wallet_id": wallet_id,
             ":bundle_index": bundle_index as i64,
         },
     )
@@ -949,6 +976,7 @@ pub fn store_proof(
 pub fn store_vote(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
     proposal_id: u32,
     choice: u32,
@@ -960,10 +988,11 @@ pub fn store_vote(
         .as_secs() as i64;
 
     conn.execute(
-        "INSERT OR REPLACE INTO votes (round_id, bundle_index, proposal_id, choice, commitment, submitted, created_at)
-         VALUES (:round_id, :bundle_index, :proposal_id, :choice, :commitment, 0, :created_at)",
+        "INSERT OR REPLACE INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, commitment, submitted, created_at)
+         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :choice, :commitment, 0, :created_at)",
         named_params! {
             ":round_id": round_id,
+            ":wallet_id": wallet_id,
             ":bundle_index": bundle_index as i64,
             ":proposal_id": proposal_id as i64,
             ":choice": choice as i64,
@@ -978,15 +1007,15 @@ pub fn store_vote(
 }
 
 /// Get all votes for a round (across all bundles).
-pub fn get_votes(conn: &Connection, round_id: &str) -> Result<Vec<VoteRecord>, VotingError> {
+pub fn get_votes(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<Vec<VoteRecord>, VotingError> {
     let mut stmt = conn
-        .prepare("SELECT proposal_id, bundle_index, choice, submitted FROM votes WHERE round_id = :round_id")
+        .prepare("SELECT proposal_id, bundle_index, choice, submitted FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare get_votes: {}", e),
         })?;
 
     let votes = stmt
-        .query_map(named_params! { ":round_id": round_id }, |row| {
+        .query_map(named_params! { ":round_id": round_id, ":wallet_id": wallet_id }, |row| {
             Ok(VoteRecord {
                 proposal_id: row.get::<_, i64>(0)? as u32,
                 bundle_index: row.get::<_, i64>(1)? as u32,
@@ -1012,13 +1041,15 @@ pub fn get_votes(conn: &Connection, round_id: &str) -> Result<Vec<VoteRecord>, V
 pub fn delete_bundles_from(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     from_index: u32,
 ) -> Result<u64, VotingError> {
     let rows = conn
         .execute(
-            "DELETE FROM bundles WHERE round_id = :round_id AND bundle_index >= :from_index",
+            "DELETE FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index >= :from_index",
             named_params! {
                 ":round_id": round_id,
+                ":wallet_id": wallet_id,
                 ":from_index": from_index as i64,
             },
         )
@@ -1031,13 +1062,15 @@ pub fn delete_bundles_from(
 pub fn mark_vote_submitted(
     conn: &Connection,
     round_id: &str,
+    wallet_id: &str,
     bundle_index: u32,
     proposal_id: u32,
 ) -> Result<(), VotingError> {
     conn.execute(
-        "UPDATE votes SET submitted = 1 WHERE round_id = :round_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        "UPDATE votes SET submitted = 1 WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
         named_params! {
             ":round_id": round_id,
+            ":wallet_id": wallet_id,
             ":bundle_index": bundle_index as i64,
             ":proposal_id": proposal_id as i64,
         },

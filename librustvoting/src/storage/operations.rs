@@ -20,31 +20,36 @@ impl VotingDb {
         session_json: Option<&str>,
     ) -> Result<(), VotingError> {
         let conn = self.conn();
-        queries::insert_round(&conn, params, session_json)
+        let wallet_id = self.wallet_id();
+        queries::insert_round(&conn, &wallet_id, params, session_json)
     }
 
     /// Get the current state of a voting round.
     pub fn get_round_state(&self, round_id: &str) -> Result<RoundState, VotingError> {
         let conn = self.conn();
-        queries::get_round_state(&conn, round_id)
+        let wallet_id = self.wallet_id();
+        queries::get_round_state(&conn, round_id, &wallet_id)
     }
 
     /// List all rounds.
     pub fn list_rounds(&self) -> Result<Vec<RoundSummary>, VotingError> {
         let conn = self.conn();
-        queries::list_rounds(&conn)
+        let wallet_id = self.wallet_id();
+        queries::list_rounds(&conn, &wallet_id)
     }
 
     /// Get all votes for a round (with choice, bundle_index, and submitted status).
     pub fn get_votes(&self, round_id: &str) -> Result<Vec<VoteRecord>, VotingError> {
         let conn = self.conn();
-        queries::get_votes(&conn, round_id)
+        let wallet_id = self.wallet_id();
+        queries::get_votes(&conn, round_id, &wallet_id)
     }
 
     /// Delete all data for a round.
     pub fn clear_round(&self, round_id: &str) -> Result<(), VotingError> {
         let conn = self.conn();
-        queries::clear_round(&conn, round_id)
+        let wallet_id = self.wallet_id();
+        queries::clear_round(&conn, round_id, &wallet_id)
     }
 
     // --- Bundles ---
@@ -54,6 +59,7 @@ impl VotingDb {
     /// threshold are created. Notes in sub-threshold bundles are dropped.
     pub fn setup_bundles(&self, round_id: &str, notes: &[NoteInfo]) -> Result<(u32, u64), VotingError> {
         let conn = self.conn();
+        let wallet_id = self.wallet_id();
         let result = crate::types::chunk_notes(notes);
         if result.dropped_count > 0 {
             eprintln!(
@@ -65,7 +71,7 @@ impl VotingDb {
         }
         for (i, chunk) in result.bundles.iter().enumerate() {
             let positions: Vec<u64> = chunk.iter().map(|n| n.position).collect();
-            queries::insert_bundle(&conn, round_id, i as u32, &positions)?;
+            queries::insert_bundle(&conn, round_id, &wallet_id, i as u32, &positions)?;
         }
         Ok((result.bundles.len() as u32, result.eligible_weight))
     }
@@ -73,7 +79,8 @@ impl VotingDb {
     /// Get the number of bundles for a round.
     pub fn get_bundle_count(&self, round_id: &str) -> Result<u32, VotingError> {
         let conn = self.conn();
-        queries::get_bundle_count(&conn, round_id)
+        let wallet_id = self.wallet_id();
+        queries::get_bundle_count(&conn, round_id, &wallet_id)
     }
 
     // --- Phase 1: Delegation setup ---
@@ -114,7 +121,8 @@ impl VotingDb {
         address_index: u32,
     ) -> Result<GovernancePczt, VotingError> {
         let conn = self.conn();
-        let params = queries::load_round_params(&conn, round_id)?;
+        let wallet_id = self.wallet_id();
+        let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
         let result = crate::action::build_governance_pczt(
             notes,
             &params,
@@ -138,6 +146,7 @@ impl VotingDb {
         queries::store_delegation_data(
             &conn,
             round_id,
+            &wallet_id,
             bundle_index,
             &result.van_comm_rand,
             &result.dummy_nullifiers,
@@ -160,8 +169,9 @@ impl VotingDb {
     /// Cache tree state fetched from lightwalletd by SDK.
     pub fn store_tree_state(&self, round_id: &str, tree_state: &[u8]) -> Result<(), VotingError> {
         let conn = self.conn();
-        let params = queries::load_round_params(&conn, round_id)?;
-        queries::store_tree_state(&conn, round_id, params.snapshot_height, tree_state)
+        let wallet_id = self.wallet_id();
+        let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
+        queries::store_tree_state(&conn, round_id, &wallet_id, params.snapshot_height, tree_state)
     }
 
     /// Verify and cache Merkle inclusion witnesses for notes in a bundle.
@@ -177,9 +187,10 @@ impl VotingDb {
         witnesses: &[WitnessData],
     ) -> Result<(), VotingError> {
         let conn = self.conn();
+        let wallet_id = self.wallet_id();
 
         // Return early if already cached
-        if queries::has_witnesses(&conn, round_id, bundle_index)? {
+        if queries::has_witnesses(&conn, round_id, &wallet_id, bundle_index)? {
             return Ok(());
         }
 
@@ -197,7 +208,7 @@ impl VotingDb {
         }
 
         // Cache results
-        queries::store_witnesses(&conn, round_id, bundle_index, witnesses)?;
+        queries::store_witnesses(&conn, round_id, &wallet_id, bundle_index, witnesses)?;
 
         Ok(())
     }
@@ -233,16 +244,17 @@ impl VotingDb {
         // Phase 1: DB queries
         let db_start = std::time::Instant::now();
         let conn = self.conn();
-        let params = queries::load_round_params(&conn, round_id)?;
-        let alpha = queries::load_alpha(&conn, round_id, bundle_index)?;
-        let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, bundle_index)?;
-        let witnesses = queries::load_witnesses(&conn, round_id, bundle_index)?;
+        let wallet_id = self.wallet_id();
+        let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
+        let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
+        let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, &wallet_id, bundle_index)?;
+        let witnesses = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
 
         // Load Phase 1 randomness for ZCA-74 fix: ensures Phase 2 produces
         // the same nf_signed/cmx_new that Phase 1 committed to in the PCZT.
-        let rseed_signed = queries::load_rseed_signed(&conn, round_id, bundle_index)?;
-        let rseed_output = queries::load_rseed_output(&conn, round_id, bundle_index)?;
-        let padded_secrets = queries::load_padded_note_secrets(&conn, round_id, bundle_index)?;
+        let rseed_signed = queries::load_rseed_signed(&conn, round_id, &wallet_id, bundle_index)?;
+        let rseed_output = queries::load_rseed_output(&conn, round_id, &wallet_id, bundle_index)?;
+        let padded_secrets = queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
 
         // Align witnesses (keyed by commitment) to notes order
         let witness_count = witnesses.len();
@@ -407,20 +419,21 @@ impl VotingDb {
         );
 
         // Store proof bytes for debugging/recovery
-        queries::store_proof(&conn, round_id, bundle_index, &result.proof)?;
+        queries::store_proof(&conn, round_id, &wallet_id, bundle_index, &result.proof)?;
         // Persist prover's public inputs — needed later for delegation TX submission.
         // With PrecomputedRandomness (ZCA-74 fix), nf_signed/cmx_new should match
         // Phase 1 values. We still store them to be explicit and support the legacy path.
         queries::store_proof_result_fields(
             &conn,
             round_id,
+            &wallet_id,
             bundle_index,
             &result.rk,
             &result.gov_nullifiers,
             &result.nf_signed,
             &result.cmx_new,
         )?;
-        queries::update_round_phase(&conn, round_id, RoundPhase::DelegationProved)?;
+        queries::update_round_phase(&conn, round_id, &wallet_id, RoundPhase::DelegationProved)?;
 
         let total_elapsed = total_start.elapsed();
         eprintln!(
@@ -444,7 +457,8 @@ impl VotingDb {
         shares: &[u64],
     ) -> Result<Vec<EncryptedShare>, VotingError> {
         let conn = self.conn();
-        let params = queries::load_round_params(&conn, round_id)?;
+        let wallet_id = self.wallet_id();
+        let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
         crate::elgamal::encrypt_shares(shares, &params.ea_pk)
     }
 
@@ -471,7 +485,8 @@ impl VotingDb {
         progress: &dyn ProofProgressReporter,
     ) -> Result<VoteCommitmentBundle, VotingError> {
         let conn = self.conn();
-        let zkp2_data = queries::load_zkp2_inputs(&conn, round_id, bundle_index)?;
+        let wallet_id = self.wallet_id();
+        let zkp2_data = queries::load_zkp2_inputs(&conn, round_id, &wallet_id, bundle_index)?;
 
         // Decode voting_round_id from hex string to 32 bytes
         let voting_round_id_bytes =
@@ -514,12 +529,13 @@ impl VotingDb {
         queries::store_vote(
             &conn,
             round_id,
+            &wallet_id,
             bundle_index,
             proposal_id,
             choice,
             &commitment_bytes,
         )?;
-        queries::update_round_phase(&conn, round_id, RoundPhase::VoteReady)?;
+        queries::update_round_phase(&conn, round_id, &wallet_id, RoundPhase::VoteReady)?;
         Ok(bundle)
     }
 
@@ -555,13 +571,15 @@ impl VotingDb {
         position: u32,
     ) -> Result<(), VotingError> {
         let conn = self.conn();
-        queries::store_van_position(&conn, round_id, bundle_index, position)
+        let wallet_id = self.wallet_id();
+        queries::store_van_position(&conn, round_id, &wallet_id, bundle_index, position)
     }
 
     /// Load the VAN leaf position for a bundle.
     pub fn load_van_position(&self, round_id: &str, bundle_index: u32) -> Result<u32, VotingError> {
         let conn = self.conn();
-        queries::load_van_position(&conn, round_id, bundle_index)
+        let wallet_id = self.wallet_id();
+        queries::load_van_position(&conn, round_id, &wallet_id, bundle_index)
     }
 
     /// Reconstruct the full chain-ready delegation TX payload from DB + seed.
@@ -580,8 +598,9 @@ impl VotingDb {
         _account_index: u32,
     ) -> Result<DelegationSubmissionData, VotingError> {
         let conn = self.conn();
-        let data = queries::load_delegation_submission_data(&conn, round_id, bundle_index)?;
-        let sighash_vec = queries::load_pczt_sighash(&conn, round_id, bundle_index)?;
+        let wallet_id = self.wallet_id();
+        let data = queries::load_delegation_submission_data(&conn, round_id, &wallet_id, bundle_index)?;
+        let sighash_vec = queries::load_pczt_sighash(&conn, round_id, &wallet_id, bundle_index)?;
         drop(conn);
 
         let sighash: [u8; 32] =
@@ -666,7 +685,8 @@ impl VotingDb {
         }
 
         let conn = self.conn();
-        let data = queries::load_delegation_submission_data(&conn, round_id, bundle_index)?;
+        let wallet_id = self.wallet_id();
+        let data = queries::load_delegation_submission_data(&conn, round_id, &wallet_id, bundle_index)?;
 
         Ok(DelegationSubmissionData {
             proof: data.proof,
@@ -687,7 +707,8 @@ impl VotingDb {
     /// Returns the number of deleted rows.
     pub fn delete_skipped_bundles(&self, round_id: &str, keep_count: u32) -> Result<u64, VotingError> {
         let conn = self.conn();
-        queries::delete_bundles_from(&conn, round_id, keep_count)
+        let wallet_id = self.wallet_id();
+        queries::delete_bundles_from(&conn, round_id, &wallet_id, keep_count)
     }
 
     /// Mark a vote as submitted to the vote chain.
@@ -698,7 +719,8 @@ impl VotingDb {
         proposal_id: u32,
     ) -> Result<(), VotingError> {
         let conn = self.conn();
-        queries::mark_vote_submitted(&conn, round_id, bundle_index, proposal_id)
+        let wallet_id = self.wallet_id();
+        queries::mark_vote_submitted(&conn, round_id, &wallet_id, bundle_index, proposal_id)
     }
 }
 
@@ -709,9 +731,12 @@ mod tests {
     // 64 hex chars = 32 bytes when decoded. Required because build_governance_pczt
     // hex-decodes vote_round_id and validates it as exactly 32 bytes (a Pallas field element).
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    const W: &str = "test-wallet";
 
     fn test_db() -> VotingDb {
-        VotingDb::open(":memory:").unwrap()
+        let db = VotingDb::open(":memory:").unwrap();
+        db.set_wallet_id(W);
+        db
     }
 
     fn test_params() -> VotingRoundParams {
@@ -794,7 +819,7 @@ mod tests {
         db.store_tree_state(ROUND_ID, &tree_state).unwrap();
 
         let conn = db.conn();
-        let loaded = queries::load_tree_state(&conn, ROUND_ID).unwrap();
+        let loaded = queries::load_tree_state(&conn, ROUND_ID, W).unwrap();
         assert_eq!(loaded, tree_state);
     }
 
@@ -830,7 +855,7 @@ mod tests {
         )
         .unwrap();
 
-        queries::store_vote(&db.conn(), ROUND_ID, 0, 0, 0, &[0xAA; 32]).unwrap();
+        queries::store_vote(&db.conn(), ROUND_ID, W, 0, 0, 0, &[0xAA; 32]).unwrap();
         db.mark_vote_submitted(ROUND_ID, 0, 0).unwrap();
     }
 
@@ -873,9 +898,9 @@ mod tests {
 
         // Verify note positions per bundle (sequential fill)
         let conn = db.conn();
-        let positions_0 = queries::load_bundle_note_positions(&conn, ROUND_ID, 0).unwrap();
+        let positions_0 = queries::load_bundle_note_positions(&conn, ROUND_ID, W, 0).unwrap();
         assert_eq!(positions_0, vec![0, 1, 2, 3, 4]);
-        let positions_1 = queries::load_bundle_note_positions(&conn, ROUND_ID, 1).unwrap();
+        let positions_1 = queries::load_bundle_note_positions(&conn, ROUND_ID, W, 1).unwrap();
         assert_eq!(positions_1, vec![5]);
         drop(conn);
 
@@ -917,13 +942,13 @@ mod tests {
 
             // Verify data persisted per bundle
             let conn = db.conn();
-            let stored_rand = queries::load_van_comm_rand(&conn, ROUND_ID, i as u32).unwrap();
+            let stored_rand = queries::load_van_comm_rand(&conn, ROUND_ID, W, i as u32).unwrap();
             assert_eq!(stored_rand, result.van_comm_rand);
-            let stored_alpha = queries::load_alpha(&conn, ROUND_ID, i as u32).unwrap();
+            let stored_alpha = queries::load_alpha(&conn, ROUND_ID, W, i as u32).unwrap();
             assert_eq!(stored_alpha, result.alpha);
 
             // ZKP2 inputs loadable per bundle
-            let zkp2 = queries::load_zkp2_inputs(&conn, ROUND_ID, i as u32).unwrap();
+            let zkp2 = queries::load_zkp2_inputs(&conn, ROUND_ID, W, i as u32).unwrap();
             assert_eq!(zkp2.gov_comm_rand.len(), 32);
         }
 
@@ -931,18 +956,18 @@ mod tests {
         db.store_van_position(ROUND_ID, 0, 100).unwrap();
         db.store_van_position(ROUND_ID, 1, 101).unwrap();
         assert_eq!(
-            queries::load_van_position(&db.conn(), ROUND_ID, 0).unwrap(),
+            queries::load_van_position(&db.conn(), ROUND_ID, W, 0).unwrap(),
             100
         );
         assert_eq!(
-            queries::load_van_position(&db.conn(), ROUND_ID, 1).unwrap(),
+            queries::load_van_position(&db.conn(), ROUND_ID, W, 1).unwrap(),
             101
         );
 
         // Store votes for proposal 0 across both bundles
         let conn = db.conn();
-        queries::store_vote(&conn, ROUND_ID, 0, 0, 0, &[0xAA; 32]).unwrap();
-        queries::store_vote(&conn, ROUND_ID, 1, 0, 0, &[0xBB; 32]).unwrap();
+        queries::store_vote(&conn, ROUND_ID, W, 0, 0, 0, &[0xAA; 32]).unwrap();
+        queries::store_vote(&conn, ROUND_ID, W, 1, 0, 0, &[0xBB; 32]).unwrap();
         drop(conn);
 
         let votes = db.get_votes(ROUND_ID).unwrap();
@@ -970,9 +995,9 @@ mod tests {
 
         // Verify proposal_authority reflects per-bundle submission state
         let conn = db.conn();
-        let zkp2_0 = queries::load_zkp2_inputs(&conn, ROUND_ID, 0).unwrap();
+        let zkp2_0 = queries::load_zkp2_inputs(&conn, ROUND_ID, W, 0).unwrap();
         assert_eq!(zkp2_0.proposal_authority, 0xFFFF & !(1u64 << 0)); // bit 0 cleared
-        let zkp2_1 = queries::load_zkp2_inputs(&conn, ROUND_ID, 1).unwrap();
+        let zkp2_1 = queries::load_zkp2_inputs(&conn, ROUND_ID, W, 1).unwrap();
         assert_eq!(zkp2_1.proposal_authority, 0xFFFF); // no bits cleared
         drop(conn);
 
