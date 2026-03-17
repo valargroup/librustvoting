@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use ff::PrimeField;
 
 use crate::storage::queries;
-use crate::storage::{RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb};
+use crate::storage::{
+    KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb,
+};
 use crate::types::{
     DelegationProofResult, DelegationSubmissionData, EncryptedShare,
     GovernancePczt, NoteInfo, ProofProgressReporter, SharePayload, VoteCommitmentBundle,
@@ -721,6 +723,104 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::mark_vote_submitted(&conn, round_id, &wallet_id, bundle_index, proposal_id)
+    }
+
+    // --- Recovery state ---
+
+    pub fn store_delegation_tx_hash(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        tx_hash: &str,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::store_delegation_tx_hash(&conn, round_id, &wallet_id, bundle_index, tx_hash)
+    }
+
+    pub fn get_delegation_tx_hash(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<Option<String>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::get_delegation_tx_hash(&conn, round_id, &wallet_id, bundle_index)
+    }
+
+    pub fn store_vote_tx_hash(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        tx_hash: &str,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::store_vote_tx_hash(&conn, round_id, &wallet_id, bundle_index, proposal_id, tx_hash)
+    }
+
+    pub fn get_vote_tx_hash(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<Option<String>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::get_vote_tx_hash(&conn, round_id, &wallet_id, bundle_index, proposal_id)
+    }
+
+    pub fn store_commitment_bundle(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        bundle_json: &str,
+        vc_tree_position: u64,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::store_commitment_bundle(&conn, round_id, &wallet_id, bundle_index, proposal_id, bundle_json, vc_tree_position)
+    }
+
+    pub fn get_commitment_bundle(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<Option<(String, u64)>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::get_commitment_bundle(&conn, round_id, &wallet_id, bundle_index, proposal_id)
+    }
+
+    pub fn store_keystone_signature(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        sig: &[u8],
+        sighash: &[u8],
+        rk: &[u8],
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::store_keystone_signature(&conn, round_id, &wallet_id, bundle_index, sig, sighash, rk)
+    }
+
+    pub fn get_keystone_signatures(
+        &self,
+        round_id: &str,
+    ) -> Result<Vec<KeystoneSignatureRecord>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::get_keystone_signatures(&conn, round_id, &wallet_id)
+    }
+
+    pub fn clear_recovery_state(&self, round_id: &str) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::clear_recovery_state(&conn, round_id, &wallet_id)
     }
 }
 

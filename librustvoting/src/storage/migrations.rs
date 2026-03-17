@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 4;
+const CURRENT_VERSION: u32 = 5;
 
 pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
     let version: u32 = conn
@@ -55,7 +55,9 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
         // v3: delegation data moved from rounds to bundles table, witnesses
         // gained bundle_index. Drop everything and recreate from 001_init.sql.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS votes;
+            "DROP TABLE IF EXISTS share_delegations;
+             DROP TABLE IF EXISTS keystone_signatures;
+             DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
              DROP TABLE IF EXISTS proofs;
              DROP TABLE IF EXISTS bundles;
@@ -79,7 +81,9 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
         // v4: add wallet_id column for per-wallet state isolation.
         // Drop everything and recreate from 001_init.sql.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS votes;
+            "DROP TABLE IF EXISTS share_delegations;
+             DROP TABLE IF EXISTS keystone_signatures;
+             DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
              DROP TABLE IF EXISTS proofs;
              DROP TABLE IF EXISTS bundles;
@@ -94,6 +98,33 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
                 message: format!("migration to version 4 failed (create): {}", e),
             })?;
         conn.pragma_update(None, "user_version", 4)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to update database version: {}", e),
+            })?;
+    }
+
+    if version < 5 {
+        // v5: add share_delegations, keystone_signatures tables; add columns to
+        // bundles (delegation_tx_hash) and votes (tx_hash, vc_tree_position,
+        // commitment_bundle_json). Drop-all-recreate for pre-production.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS share_delegations;
+             DROP TABLE IF EXISTS keystone_signatures;
+             DROP TABLE IF EXISTS votes;
+             DROP TABLE IF EXISTS witnesses;
+             DROP TABLE IF EXISTS proofs;
+             DROP TABLE IF EXISTS bundles;
+             DROP TABLE IF EXISTS cached_tree_state;
+             DROP TABLE IF EXISTS rounds;"
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("migration to version 5 failed (drop): {}", e),
+        })?;
+        conn.execute_batch(include_str!("migrations/001_init.sql"))
+            .map_err(|e| VotingError::Internal {
+                message: format!("migration to version 5 failed (create): {}", e),
+            })?;
+        conn.pragma_update(None, "user_version", 5)
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to update database version: {}", e),
             })?;
@@ -162,6 +193,8 @@ mod tests {
         assert!(tables.contains(&"cached_tree_state".to_string()));
         assert!(tables.contains(&"proofs".to_string()));
         assert!(tables.contains(&"votes".to_string()));
+        assert!(tables.contains(&"share_delegations".to_string()));
+        assert!(tables.contains(&"keystone_signatures".to_string()));
     }
 
     /// Verify that the bundles table columns exist after migration and can round-trip BLOB data.

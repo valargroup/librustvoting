@@ -1,6 +1,8 @@
 use rusqlite::{named_params, Connection};
 
-use crate::storage::{RoundPhase, RoundState, RoundSummary, VoteRecord};
+use crate::storage::{
+    KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord,
+};
 use crate::types::{VotingError, VotingRoundParams};
 
 // --- Rounds ---
@@ -1077,6 +1079,257 @@ pub fn mark_vote_submitted(
     )
     .map_err(|e| VotingError::Internal {
         message: format!("failed to mark vote submitted: {}", e),
+    })?;
+    Ok(())
+}
+
+// --- Recovery state: TX hashes ---
+
+pub fn store_delegation_tx_hash(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    tx_hash: &str,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "UPDATE bundles SET delegation_tx_hash = :tx_hash WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! {
+            ":tx_hash": tx_hash,
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to store delegation tx hash: {}", e),
+    })?;
+    Ok(())
+}
+
+pub fn get_delegation_tx_hash(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Option<String>, VotingError> {
+    conn.query_row(
+        "SELECT delegation_tx_hash FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| row.get(0),
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to get delegation tx hash: {}", e),
+    })
+}
+
+pub fn store_vote_tx_hash(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    tx_hash: &str,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "UPDATE votes SET tx_hash = :tx_hash WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        named_params! {
+            ":tx_hash": tx_hash,
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to store vote tx hash: {}", e),
+    })?;
+    Ok(())
+}
+
+pub fn get_vote_tx_hash(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Option<String>, VotingError> {
+    conn.query_row(
+        "SELECT tx_hash FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+        |row| row.get(0),
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to get vote tx hash: {}", e),
+    })
+}
+
+// --- Recovery state: commitment bundles ---
+
+pub fn store_commitment_bundle(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    bundle_json: &str,
+    vc_tree_position: u64,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = :pos WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        named_params! {
+            ":json": bundle_json,
+            ":pos": vc_tree_position as i64,
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to store commitment bundle: {}", e),
+    })?;
+    Ok(())
+}
+
+pub fn get_commitment_bundle(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Option<(String, u64)>, VotingError> {
+    let result = conn.query_row(
+        "SELECT commitment_bundle_json, vc_tree_position FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+        |row| {
+            let json: Option<String> = row.get(0)?;
+            let pos: Option<i64> = row.get(1)?;
+            Ok(json.map(|j| (j, pos.unwrap_or(0) as u64)))
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to get commitment bundle: {}", e),
+    })?;
+    Ok(result)
+}
+
+// --- Keystone signatures ---
+
+pub fn store_keystone_signature(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    sig: &[u8],
+    sighash: &[u8],
+    rk: &[u8],
+) -> Result<(), VotingError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    conn.execute(
+        "INSERT OR REPLACE INTO keystone_signatures (round_id, wallet_id, bundle_index, sig, sighash, rk, created_at) VALUES (:round_id, :wallet_id, :bundle_index, :sig, :sighash, :rk, :created_at)",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":sig": sig,
+            ":sighash": sighash,
+            ":rk": rk,
+            ":created_at": now as i64,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to store keystone signature: {}", e),
+    })?;
+    Ok(())
+}
+
+pub fn get_keystone_signatures(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<KeystoneSignatureRecord>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, sig, sighash, rk FROM keystone_signatures WHERE round_id = :round_id AND wallet_id = :wallet_id ORDER BY bundle_index",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare get_keystone_signatures: {}", e),
+        })?;
+
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok(KeystoneSignatureRecord {
+                    bundle_index: row.get::<_, i64>(0)? as u32,
+                    sig: row.get(1)?,
+                    sighash: row.get(2)?,
+                    rk: row.get(3)?,
+                })
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to query keystone signatures: {}", e),
+        })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read keystone signature row: {}", e),
+        })
+}
+
+// --- Recovery state cleanup ---
+
+pub fn clear_recovery_state(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "DELETE FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear share delegations: {}", e),
+    })?;
+    conn.execute(
+        "DELETE FROM keystone_signatures WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear keystone signatures: {}", e),
+    })?;
+    conn.execute(
+        "UPDATE bundles SET delegation_tx_hash = NULL WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear delegation tx hashes: {}", e),
+    })?;
+    conn.execute(
+        "UPDATE votes SET tx_hash = NULL, vc_tree_position = NULL, commitment_bundle_json = NULL WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear vote recovery columns: {}", e),
     })?;
     Ok(())
 }
