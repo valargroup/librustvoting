@@ -33,6 +33,7 @@ CREATE TABLE bundles (
     gov_nullifiers_blob BLOB,
     padded_note_secrets BLOB,
     pczt_sighash        BLOB,
+    delegation_tx_hash  TEXT,
     PRIMARY KEY (round_id, wallet_id, bundle_index),
     FOREIGN KEY (round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE
 );
@@ -81,6 +82,37 @@ CREATE TABLE votes (
     commitment      BLOB,
     submitted       INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
+    tx_hash                 TEXT,
+    vc_tree_position        INTEGER,
+    commitment_bundle_json  TEXT,
     UNIQUE(round_id, wallet_id, bundle_index, proposal_id),
     FOREIGN KEY (round_id, wallet_id, bundle_index) REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
+);
+
+CREATE TABLE share_delegations (
+    round_id        TEXT NOT NULL,
+    wallet_id       TEXT NOT NULL DEFAULT '',
+    bundle_index    INTEGER NOT NULL,
+    proposal_id     INTEGER NOT NULL,
+    share_index     INTEGER NOT NULL,
+    helper_url      TEXT NOT NULL,
+    nullifier       BLOB NOT NULL,
+    confirmed       INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (round_id, wallet_id, bundle_index, proposal_id, share_index),
+    FOREIGN KEY (round_id, wallet_id, bundle_index)
+        REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
+);
+
+CREATE TABLE keystone_signatures (
+    round_id        TEXT NOT NULL,
+    wallet_id       TEXT NOT NULL DEFAULT '',
+    bundle_index    INTEGER NOT NULL,
+    sig             BLOB NOT NULL,
+    sighash         BLOB NOT NULL,
+    rk              BLOB NOT NULL,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (round_id, wallet_id, bundle_index),
+    FOREIGN KEY (round_id, wallet_id, bundle_index)
+        REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
 );
