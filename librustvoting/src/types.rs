@@ -179,14 +179,14 @@ pub struct VoteCommitmentBundle {
     pub anchor_height: u32,
     /// Voting round ID (hex string).
     pub vote_round_id: String,
-    /// Poseidon hash of encrypted share x-coordinates (32 bytes).
+    /// Poseidon hash of encrypted share coordinates (32 bytes).
     /// Intermediate value: vote_commitment = H(DOMAIN_VC, voting_round_id, shares_hash, proposal_id, vote_decision).
     pub shares_hash: Vec<u8>,
     /// Per-share blind factors (16 x 32 bytes, LE pallas::Base repr).
     /// Deterministically derived from (sk, round_id, proposal_id, van_commitment, share_index).
     pub share_blinds: Vec<Vec<u8>>,
     /// Pre-computed per-share Poseidon commitments (N x 32 bytes, LE pallas::Base repr).
-    /// share_comm_i = Poseidon(blind_i, c1_i_x, c2_i_x).
+    /// share_comm_i = Poseidon(blind_i, c1_i_x, c2_i_x, c1_i_y, c2_i_y).
     /// Sent as public inputs to ZKP #3; the helper only needs the primary blind.
     pub share_comms: Vec<Vec<u8>>,
     /// Compressed r_vpk (32 bytes) for sighash computation and signature verification.

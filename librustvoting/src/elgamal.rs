@@ -15,8 +15,9 @@ use crate::types::{validate_32_bytes, EncryptedShare, VotingError};
 /// - C2 = v * G + r * ea_pk
 ///
 /// Returns compressed Pallas points (32 bytes each): x-coordinate LE with
-/// the sign of y in the high bit of byte 31. To extract the raw x-coordinate
-/// (for `shares_hash` / circuit `ExtractP`), clear bit 7 of byte 31.
+/// the sign of y in the high bit of byte 31. To extract both coordinates
+/// (for `shares_hash` / circuit constraints), decompress the point to
+/// recover (x, y).
 pub fn encrypt_shares(shares: &[u64], ea_pk: &[u8]) -> Result<Vec<EncryptedShare>, VotingError> {
     validate_32_bytes(ea_pk, "ea_pk")?;
 
@@ -144,7 +145,7 @@ mod tests {
             let r = pallas::Base::one();
             let v = pallas::Base::one();
             let pk = pallas::Point::identity(); // pk=0 simplifies C2
-            let (c1_x, _c2_x) = voting_circuits::vote_proof::elgamal_encrypt(v, r, pk);
+            let (c1_x, _c2_x, _c1_y, _c2_y) = voting_circuits::vote_proof::elgamal_encrypt(v, r, pk);
             c1_x
         };
 
@@ -169,15 +170,20 @@ mod tests {
         let c1_x = *c1.to_affine().coordinates().unwrap().x();
         let c2_x = *c2.to_affine().coordinates().unwrap().x();
 
+        let c1_y = *c1.to_affine().coordinates().unwrap().y();
+        let c2_y = *c2.to_affine().coordinates().unwrap().y();
+
         // Circuit helper encryption.
         // It uses pallas::Base for randomness and value, and calls base_to_scalar internally.
         let r_base = pallas::Base::from(7u64);
         let v_base = pallas::Base::from(share_value);
-        let (circuit_c1_x, circuit_c2_x) =
+        let (circuit_c1_x, circuit_c2_x, circuit_c1_y, circuit_c2_y) =
             voting_circuits::vote_proof::elgamal_encrypt(v_base, r_base, pk);
 
         assert_eq!(c1_x, circuit_c1_x, "C1.x must match circuit helper");
         assert_eq!(c2_x, circuit_c2_x, "C2.x must match circuit helper");
+        assert_eq!(c1_y, circuit_c1_y, "C1.y must match circuit helper");
+        assert_eq!(c2_y, circuit_c2_y, "C2.y must match circuit helper");
     }
 
     #[test]
@@ -190,19 +196,26 @@ mod tests {
         let result = encrypt_shares(&shares_input, &pk_bytes).unwrap();
         assert_eq!(result.len(), 16);
 
-        // Extract x-coordinates from compressed ciphertexts.
-        // Compressed encoding = x-coord with sign bit in the high bit of byte 31.
-        // Clear the sign bit to recover the raw x-coordinate as pallas::Base.
+        // Decompress ciphertext points to extract full (x, y) coordinates.
         let mut c1_x = [pallas::Base::zero(); 16];
         let mut c2_x = [pallas::Base::zero(); 16];
+        let mut c1_y = [pallas::Base::zero(); 16];
+        let mut c2_y = [pallas::Base::zero(); 16];
         for (i, share) in result.iter().enumerate() {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&share.c1);
-            arr[31] &= 0x7F;
-            c1_x[i] = pallas::Base::from_repr(arr).unwrap();
+            let c1_affine: pallas::Affine = Option::from(pallas::Affine::from_bytes(&arr))
+                .expect("c1 is a valid Pallas point");
+            let c1_coords = c1_affine.coordinates().unwrap();
+            c1_x[i] = *c1_coords.x();
+            c1_y[i] = *c1_coords.y();
+
             arr.copy_from_slice(&share.c2);
-            arr[31] &= 0x7F;
-            c2_x[i] = pallas::Base::from_repr(arr).unwrap();
+            let c2_affine: pallas::Affine = Option::from(pallas::Affine::from_bytes(&arr))
+                .expect("c2 is a valid Pallas point");
+            let c2_coords = c2_affine.coordinates().unwrap();
+            c2_x[i] = *c2_coords.x();
+            c2_y[i] = *c2_coords.y();
         }
 
         // Use synthetic blinds for testing.
@@ -211,13 +224,13 @@ mod tests {
         });
 
         // Compute shares_hash using the circuit helper.
-        let hash = voting_circuits::vote_proof::shares_hash(blinds, c1_x, c2_x);
+        let hash = voting_circuits::vote_proof::shares_hash(blinds, c1_x, c2_x, c1_y, c2_y);
 
         // Verify it's not zero (sanity).
         assert_ne!(hash, pallas::Base::zero());
 
         // Verify determinism: same inputs → same hash.
-        let hash2 = voting_circuits::vote_proof::shares_hash(blinds, c1_x, c2_x);
+        let hash2 = voting_circuits::vote_proof::shares_hash(blinds, c1_x, c2_x, c1_y, c2_y);
         assert_eq!(hash, hash2);
     }
 
