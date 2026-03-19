@@ -35,6 +35,10 @@ enum Command {
         #[arg(long, default_value = "http://localhost:1317")]
         node: String,
 
+        /// Hex-encoded voting round identifier.
+        #[arg(long)]
+        round: String,
+
         /// Leaf positions to mark for future witness generation (comma-separated).
         #[arg(long, value_delimiter = ',')]
         mark: Vec<u64>,
@@ -45,6 +49,10 @@ enum Command {
         /// Chain REST API base URL.
         #[arg(long, default_value = "http://localhost:1317")]
         node: String,
+
+        /// Hex-encoded voting round identifier.
+        #[arg(long)]
+        round: String,
 
         /// Leaf position (index) to generate a witness for.
         #[arg(long)]
@@ -76,6 +84,10 @@ enum Command {
         /// Chain REST API base URL.
         #[arg(long, default_value = "http://localhost:1317")]
         node: String,
+
+        /// Hex-encoded voting round identifier.
+        #[arg(long)]
+        round: String,
     },
 }
 
@@ -114,8 +126,8 @@ fn fp_hex(fp: &Fp) -> String {
 // Commands
 // ---------------------------------------------------------------------------
 
-fn cmd_sync(node: &str, mark_positions: &[u64]) {
-    let api = HttpTreeSyncApi::new(node);
+fn cmd_sync(node: &str, round: &str, mark_positions: &[u64]) {
+    let api = HttpTreeSyncApi::new(node, round);
 
     // Fetch remote state first for display.
     let remote_state = api.get_tree_state().unwrap_or_else(|e| {
@@ -158,8 +170,8 @@ fn cmd_sync(node: &str, mark_positions: &[u64]) {
     }
 }
 
-fn cmd_witness(node: &str, position: u64, anchor_height: Option<u32>) {
-    let api = HttpTreeSyncApi::new(node);
+fn cmd_witness(node: &str, round: &str, position: u64, anchor_height: Option<u32>) {
+    let api = HttpTreeSyncApi::new(node, round);
 
     let remote_state = api.get_tree_state().unwrap_or_else(|e| {
         eprintln!("error: failed to fetch tree state: {}", e);
@@ -231,8 +243,8 @@ fn cmd_verify(leaf_hex: &str, witness_hex: &str, root_hex: &str) {
     }
 }
 
-fn cmd_status(node: &str) {
-    let api = HttpTreeSyncApi::new(node);
+fn cmd_status(node: &str, round: &str) {
+    let api = HttpTreeSyncApi::new(node, round);
 
     let state = api.get_tree_state().unwrap_or_else(|e| {
         eprintln!("error: failed to fetch tree state: {}", e);
@@ -259,17 +271,18 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Command::Sync { node, mark } => cmd_sync(node, mark),
+        Command::Sync { node, round, mark } => cmd_sync(node, round, mark),
         Command::Witness {
             node,
+            round,
             position,
             anchor_height,
-        } => cmd_witness(node, *position, *anchor_height),
+        } => cmd_witness(node, round, *position, *anchor_height),
         Command::Verify {
             leaf,
             witness,
             root,
         } => cmd_verify(leaf, witness, root),
-        Command::Status { node } => cmd_status(node),
+        Command::Status { node, round } => cmd_status(node, round),
     }
 }

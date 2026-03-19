@@ -10,6 +10,9 @@ use pasta_curves::Fp;
 use vote_commitment_tree::{TreeClient, TreeSyncApi};
 use vote_commitment_tree_client::http_sync_api::HttpTreeSyncApi;
 
+/// Dummy round ID used across all tests.
+const TEST_ROUND: &str = "aabbccdd";
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -39,7 +42,7 @@ fn get_tree_state_parses_response() {
     let root_b64 = fp_bytes_to_b64(fp(42));
 
     let mock = server
-        .mock("GET", "/zally/v1/commitment-tree/latest")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/latest")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -48,7 +51,7 @@ fn get_tree_state_parses_response() {
         ))
         .create();
 
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     let state = api.get_tree_state().unwrap();
     assert_eq!(state.next_index, 10);
     assert_eq!(state.height, 5);
@@ -63,7 +66,7 @@ fn get_root_at_height_parses_response() {
     let root_b64 = fp_bytes_to_b64(fp(99));
 
     let mock = server
-        .mock("GET", "/zally/v1/commitment-tree/7")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/7")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -72,7 +75,7 @@ fn get_root_at_height_parses_response() {
         ))
         .create();
 
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     let root = api.get_root_at_height(7).unwrap();
     assert_eq!(root, Some(fp(99)));
     mock.assert();
@@ -84,13 +87,13 @@ fn get_root_at_height_null_tree() {
     let mut server = mockito::Server::new();
 
     let mock = server
-        .mock("GET", "/zally/v1/commitment-tree/999")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/999")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"tree":null}"#)
         .create();
 
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     let root = api.get_root_at_height(999).unwrap();
     assert!(root.is_none());
     mock.assert();
@@ -110,14 +113,14 @@ fn get_block_commitments_parses_response() {
     let mock = server
         .mock(
             "GET",
-            "/zally/v1/commitment-tree/leaves?from_height=1&to_height=10",
+            "/shielded-vote/v1/commitment-tree/aabbccdd/leaves?from_height=1&to_height=10",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(body)
         .create();
 
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     let blocks = api.get_block_commitments(1, 10).unwrap();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].height, 5);
@@ -136,14 +139,14 @@ fn get_block_commitments_empty() {
     let mock = server
         .mock(
             "GET",
-            "/zally/v1/commitment-tree/leaves?from_height=1&to_height=10",
+            "/shielded-vote/v1/commitment-tree/aabbccdd/leaves?from_height=1&to_height=10",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"blocks":[]}"#)
         .create();
 
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     let blocks = api.get_block_commitments(1, 10).unwrap();
     assert!(blocks.is_empty());
     mock.assert();
@@ -172,9 +175,9 @@ fn full_sync_pipeline() {
     tree_server.checkpoint(2).unwrap();
     let root_at_2 = tree_server.root_at_height(2).unwrap();
 
-    // Mock: GET /zally/v1/commitment-tree/latest
+    // Mock: GET /shielded-vote/v1/commitment-tree/aabbccdd/latest
     let _m_latest = server
-        .mock("GET", "/zally/v1/commitment-tree/latest")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/latest")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -183,11 +186,11 @@ fn full_sync_pipeline() {
         ))
         .create();
 
-    // Mock: GET /zally/v1/commitment-tree/leaves?from_height=1&to_height=2
+    // Mock: GET /shielded-vote/v1/commitment-tree/aabbccdd/leaves?from_height=1&to_height=2
     let _m_leaves = server
         .mock(
             "GET",
-            "/zally/v1/commitment-tree/leaves?from_height=1&to_height=2",
+            "/shielded-vote/v1/commitment-tree/aabbccdd/leaves?from_height=1&to_height=2",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -199,9 +202,9 @@ fn full_sync_pipeline() {
         ))
         .create();
 
-    // Mock: GET /zally/v1/commitment-tree/1 (root verification after block 1)
+    // Mock: GET /shielded-vote/v1/commitment-tree/aabbccdd/1 (root verification after block 1)
     let _m_root1 = server
-        .mock("GET", "/zally/v1/commitment-tree/1")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/1")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -210,9 +213,9 @@ fn full_sync_pipeline() {
         ))
         .create();
 
-    // Mock: GET /zally/v1/commitment-tree/2 (root verification after block 2)
+    // Mock: GET /shielded-vote/v1/commitment-tree/aabbccdd/2 (root verification after block 2)
     let _m_root2 = server
-        .mock("GET", "/zally/v1/commitment-tree/2")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/2")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -222,7 +225,7 @@ fn full_sync_pipeline() {
         .create();
 
     // Create client, mark position 0 (for witness generation), sync.
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     let mut client = TreeClient::empty();
     client.mark_position(0);
     client.mark_position(1);
@@ -258,7 +261,7 @@ fn incremental_sync() {
     // --- First sync: only block 1 ---
 
     let _m_latest1 = server
-        .mock("GET", "/zally/v1/commitment-tree/latest")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/latest")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -271,7 +274,7 @@ fn incremental_sync() {
     let _m_leaves1 = server
         .mock(
             "GET",
-            "/zally/v1/commitment-tree/leaves?from_height=1&to_height=1",
+            "/shielded-vote/v1/commitment-tree/aabbccdd/leaves?from_height=1&to_height=1",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -283,7 +286,7 @@ fn incremental_sync() {
         .create();
 
     let _m_root_h1 = server
-        .mock("GET", "/zally/v1/commitment-tree/1")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/1")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -293,7 +296,7 @@ fn incremental_sync() {
         .expect(1)
         .create();
 
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     let mut client = TreeClient::empty();
     client.mark_position(0);
     client.sync(&api).unwrap();
@@ -314,7 +317,7 @@ fn incremental_sync() {
     let root_at_2 = tree_server.root_at_height(2).unwrap();
 
     let _m_latest2 = server
-        .mock("GET", "/zally/v1/commitment-tree/latest")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/latest")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -328,7 +331,7 @@ fn incremental_sync() {
     let _m_leaves2 = server
         .mock(
             "GET",
-            "/zally/v1/commitment-tree/leaves?from_height=2&to_height=2",
+            "/shielded-vote/v1/commitment-tree/aabbccdd/leaves?from_height=2&to_height=2",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -341,7 +344,7 @@ fn incremental_sync() {
         .create();
 
     let _m_root_h2 = server
-        .mock("GET", "/zally/v1/commitment-tree/2")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/2")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -373,12 +376,12 @@ fn server_error_propagates() {
     let mut server = mockito::Server::new();
 
     let _m = server
-        .mock("GET", "/zally/v1/commitment-tree/latest")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/latest")
         .with_status(500)
         .with_body("internal server error")
         .create();
 
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     // get_tree_state should fail because the 500 response isn't valid JSON.
     let result = api.get_tree_state();
     assert!(result.is_err());
@@ -392,7 +395,7 @@ fn empty_tree_sync() {
     let zero_root_b64 = fp_bytes_to_b64(Fp::zero());
 
     let _m = server
-        .mock("GET", "/zally/v1/commitment-tree/latest")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/latest")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -401,7 +404,7 @@ fn empty_tree_sync() {
         ))
         .create();
 
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     let mut client = TreeClient::empty();
     client.sync(&api).unwrap(); // Should be a no-op.
     assert_eq!(client.size(), 0);
@@ -419,7 +422,7 @@ fn witness_hex_roundtrip() {
     let root = tree_server.root_at_height(1).unwrap();
 
     let _m_latest = server
-        .mock("GET", "/zally/v1/commitment-tree/latest")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/latest")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -431,7 +434,7 @@ fn witness_hex_roundtrip() {
     let _m_leaves = server
         .mock(
             "GET",
-            "/zally/v1/commitment-tree/leaves?from_height=1&to_height=1",
+            "/shielded-vote/v1/commitment-tree/aabbccdd/leaves?from_height=1&to_height=1",
         )
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -442,7 +445,7 @@ fn witness_hex_roundtrip() {
         .create();
 
     let _m_root = server
-        .mock("GET", "/zally/v1/commitment-tree/1")
+        .mock("GET", "/shielded-vote/v1/commitment-tree/aabbccdd/1")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
@@ -451,7 +454,7 @@ fn witness_hex_roundtrip() {
         ))
         .create();
 
-    let api = HttpTreeSyncApi::new(server.url());
+    let api = HttpTreeSyncApi::new(server.url(), TEST_ROUND);
     let mut client = TreeClient::empty();
     client.mark_position(0);
     client.sync(&api).unwrap();

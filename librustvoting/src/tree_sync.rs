@@ -1,9 +1,10 @@
 //! Vote commitment tree sync and VAN witness generation.
 //!
-//! Manages an in-memory `TreeClient` that syncs incrementally from a chain node
-//! via HTTP, then generates Merkle authentication paths (witnesses) for Vote
-//! Authority Notes (VANs) needed by ZKP #2.
+//! Manages per-round in-memory `TreeClient` instances that sync incrementally
+//! from a chain node via HTTP, then generates Merkle authentication paths
+//! (witnesses) for Vote Authority Notes (VANs) needed by ZKP #2.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use vote_commitment_tree::{MerklePath, TreeClient};
@@ -42,45 +43,47 @@ impl From<(MerklePath, u32)> for VanWitness {
     }
 }
 
-/// Manages the in-memory vote commitment tree for VAN witness generation.
+/// Manages per-round in-memory vote commitment trees for VAN witness generation.
 ///
-/// Wraps a `TreeClient` behind a `Mutex` for thread-safe incremental sync.
-/// Created lazily on first `sync` call; can be reset to recover from stale state.
+/// Wraps a `HashMap<String, TreeClient>` behind a `Mutex` for thread-safe
+/// per-round incremental sync. Each round gets its own `TreeClient`, created
+/// lazily on first `sync` call for that round.
 pub struct VoteTreeSync {
-    client: Mutex<Option<TreeClient>>,
+    clients: Mutex<HashMap<String, TreeClient>>,
 }
 
 impl VoteTreeSync {
     pub fn new() -> Self {
         Self {
-            client: Mutex::new(None),
+            clients: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Sync the vote commitment tree from a chain node.
+    /// Sync the vote commitment tree for a specific round from a chain node.
     ///
-    /// Creates a `TreeClient` on first call, then syncs incrementally on
-    /// subsequent calls. VAN positions from ALL bundles are automatically
+    /// Creates a per-round `TreeClient` on first call, then syncs incrementally
+    /// on subsequent calls. VAN positions from ALL bundles are automatically
     /// marked for witness generation before syncing.
     ///
     /// Returns the latest synced block height.
     pub fn sync(&self, db: &VotingDb, round_id: &str, node_url: &str) -> Result<u32, VotingError> {
         let bundle_count = db.get_bundle_count(round_id)?;
 
-        let mut guard = self.client.lock().map_err(|e| VotingError::Internal {
+        let mut guard = self.clients.lock().map_err(|e| VotingError::Internal {
             message: format!("tree client lock poisoned: {}", e),
         })?;
 
-        let client = guard.get_or_insert_with(TreeClient::empty);
+        let client = guard
+            .entry(round_id.to_string())
+            .or_insert_with(TreeClient::empty);
 
         for bi in 0..bundle_count {
-            // load_van_position may fail if VAN hasn't been stored yet for a bundle — skip it.
             if let Ok(pos) = db.load_van_position(round_id, bi) {
                 client.mark_position(pos as u64);
             }
         }
 
-        let api = HttpTreeSyncApi::new(node_url);
+        let api = HttpTreeSyncApi::new(node_url, round_id);
         client.sync(&api).map_err(|e| VotingError::Internal {
             message: format!("vote tree sync failed: {}", e),
         })?;
@@ -94,8 +97,9 @@ impl VoteTreeSync {
 
     /// Generate a VAN Merkle witness for ZKP #2.
     ///
-    /// Requires `sync` to have been called first. Loads the VAN position
-    /// for the specified bundle and generates a witness at the given anchor height.
+    /// Requires `sync` to have been called first for this round. Loads the VAN
+    /// position for the specified bundle and generates a witness at the given
+    /// anchor height.
     pub fn generate_van_witness(
         &self,
         db: &VotingDb,
@@ -105,11 +109,11 @@ impl VoteTreeSync {
     ) -> Result<VanWitness, VotingError> {
         let van_position = db.load_van_position(round_id, bundle_index)?;
 
-        let guard = self.client.lock().map_err(|e| VotingError::Internal {
+        let guard = self.clients.lock().map_err(|e| VotingError::Internal {
             message: format!("tree client lock poisoned: {}", e),
         })?;
 
-        let client = guard.as_ref().ok_or_else(|| VotingError::InvalidInput {
+        let client = guard.get(round_id).ok_or_else(|| VotingError::InvalidInput {
             message: "must call sync before generate_van_witness".to_string(),
         })?;
 
@@ -125,14 +129,19 @@ impl VoteTreeSync {
         Ok(VanWitness::from((path, anchor_height)))
     }
 
-    /// Drop the in-memory TreeClient so the next `sync` call creates a fresh
-    /// one and does a full resync from genesis. This recovers from stale state
-    /// that would otherwise cause `StartIndexMismatch` or `RootMismatch` errors.
-    pub fn reset(&self) -> Result<(), VotingError> {
-        let mut guard = self.client.lock().map_err(|e| VotingError::Internal {
+    /// Drop the in-memory TreeClient for a round so the next `sync` call
+    /// creates a fresh one and does a full resync. This recovers from stale
+    /// state that would otherwise cause `StartIndexMismatch` or `RootMismatch`.
+    /// If `round_id` is empty, all clients are dropped.
+    pub fn reset(&self, round_id: &str) -> Result<(), VotingError> {
+        let mut guard = self.clients.lock().map_err(|e| VotingError::Internal {
             message: format!("tree client lock poisoned: {}", e),
         })?;
-        *guard = None;
+        if round_id.is_empty() {
+            guard.clear();
+        } else {
+            guard.remove(round_id);
+        }
         Ok(())
     }
 }
