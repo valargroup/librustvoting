@@ -484,6 +484,7 @@ impl VotingDb {
         van_auth_path: &[[u8; 32]],
         van_position: u32,
         anchor_height: u32,
+        single_share: bool,
         progress: &dyn ProofProgressReporter,
     ) -> Result<VoteCommitmentBundle, VotingError> {
         let conn = self.conn();
@@ -514,6 +515,7 @@ impl VotingDb {
             van_position,
             anchor_height,
             zkp2_data.proposal_authority,
+            single_share,
             progress,
         )?;
 
@@ -554,6 +556,7 @@ impl VotingDb {
         vote_decision: u32,
         num_options: u32,
         vc_tree_position: u64,
+        single_share: bool,
     ) -> Result<Vec<SharePayload>, VotingError> {
         crate::vote_commitment::build_share_payloads(
             enc_shares,
@@ -561,6 +564,7 @@ impl VotingDb {
             vote_decision,
             num_options,
             vc_tree_position,
+            single_share,
         )
     }
 

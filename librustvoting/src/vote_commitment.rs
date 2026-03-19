@@ -21,14 +21,24 @@ pub fn build_share_payloads(
     vote_decision: u32,
     num_options: u32,
     vc_tree_position: u64,
+    single_share: bool,
 ) -> Result<Vec<SharePayload>, VotingError> {
     validate_encrypted_shares(enc_shares)?;
     validate_vote_decision(vote_decision, num_options)?;
 
     let all_enc_shares: Vec<WireEncryptedShare> = enc_shares.to_vec();
 
-    let mut payloads = Vec::with_capacity(enc_shares.len());
-    for (i, share) in enc_shares.iter().enumerate() {
+    // In single-share mode (last-moment votes), only build a payload for share 0
+    // which carries all the voting weight. The remaining 15 zero-value shares are
+    // never sent to the helper, saving 15 ZKP #3 proofs and 15 on-chain transactions.
+    let iter_shares: &[WireEncryptedShare] = if single_share {
+        &enc_shares[..1.min(enc_shares.len())]
+    } else {
+        enc_shares
+    };
+
+    let mut payloads = Vec::with_capacity(iter_shares.len());
+    for (i, share) in iter_shares.iter().enumerate() {
         let primary_blind = commitment.share_blinds.get(i)
             .cloned()
             .unwrap_or_default();
@@ -188,7 +198,7 @@ mod tests {
     #[test]
     fn test_build_share_payloads() {
         let commitment = mock_commitment();
-        let result = build_share_payloads(&mock_enc_shares(), &commitment, 1, 2, 42).unwrap();
+        let result = build_share_payloads(&mock_enc_shares(), &commitment, 1, 2, 42, false).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].proposal_id, 1);
         assert_eq!(result[0].vote_decision, 1);

@@ -55,6 +55,7 @@ pub fn build_vote_commitment(
     van_position: u32,
     anchor_height: u32,
     proposal_authority: u64,
+    single_share: bool,
     progress: &dyn ProofProgressReporter,
 ) -> Result<VoteCommitmentBundle, VotingError> {
     validate_vote_decision(choice, num_options)?;
@@ -142,6 +143,7 @@ pub fn build_vote_commitment(
         ea_pk_affine,
         alpha_v,
         proposal_authority,
+        single_share,
     )
     .map_err(|e| VotingError::ProofFailed {
         message: format!("vote proof generation failed: {}", e),
@@ -255,6 +257,7 @@ mod tests {
             0,
             1,
             65535,
+            false,
             &TestReporter,
         )
         .is_err());
@@ -277,6 +280,7 @@ mod tests {
             0,
             1,
             65535,
+            false,
             &TestReporter,
         )
         .is_err());
@@ -299,6 +303,7 @@ mod tests {
             0,
             1,
             65535,
+            false,
             &TestReporter,
         )
         .is_err());
@@ -321,6 +326,7 @@ mod tests {
             0,
             1,
             65535,
+            false,
             &TestReporter,
         )
         .is_err());
