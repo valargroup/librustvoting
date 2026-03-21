@@ -71,6 +71,33 @@ pub struct KeystoneSignatureRecord {
     pub rk: Vec<u8>,
 }
 
+/// One helper-targeted share submission receipt (deterministic share nullifier for status polling).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ShareDelegationReceipt {
+    pub share_index: u32,
+    pub helper_url: String,
+    /// 32-byte share nullifier (JSON: lowercase hex string, matches `hex::serde`).
+    #[serde(with = "hex::serde")]
+    pub share_nullifier: Vec<u8>,
+    /// Submission order within `(share_index, bundle, proposal)` for status polling (first target first).
+    pub seq: u32,
+    /// Unix seconds when the helper should reveal; 0 = immediate.
+    #[serde(default)]
+    pub submit_at: u64,
+    /// Whether this helper row has observed on-chain confirmation for this nullifier.
+    #[serde(default)]
+    pub reveal_confirmed: bool,
+}
+
+/// Pending share-reveal work for one `(round, bundle, proposal)` (votes not yet fully confirmed).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PendingShareRevealGroup {
+    pub round_id: String,
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub receipts: Vec<ShareDelegationReceipt>,
+}
+
 /// Database handle for voting state. Wraps a SQLite connection and a
 /// wallet identifier that scopes all round data to a single wallet.
 pub struct VotingDb {
@@ -151,7 +178,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]

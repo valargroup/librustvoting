@@ -143,7 +143,6 @@ pub fn build_vote_commitment(
         ea_pk_affine,
         alpha_v,
         proposal_authority,
-        single_share,
     )
     .map_err(|e| VotingError::ProofFailed {
         message: format!("vote proof generation failed: {}", e),

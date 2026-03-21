@@ -1,7 +1,8 @@
-use rusqlite::{named_params, Connection};
+use rusqlite::{named_params, params, Connection};
 
 use crate::storage::{
-    KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord,
+    KeystoneSignatureRecord, PendingShareRevealGroup, RoundPhase, RoundState, RoundSummary,
+    ShareDelegationReceipt, VoteRecord,
 };
 use crate::types::{VotingError, VotingRoundParams};
 
@@ -575,8 +576,8 @@ pub struct Zkp2DelegationData {
 const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
 
 /// Load all fields ZKP #2 needs from the bundles table (persisted during delegation).
-/// Computes proposal_authority from submitted votes — each submitted vote clears its
-/// proposal's bit, so the next vote's VAN reconstruction matches what's in the VC tree.
+/// Computes proposal_authority from votes whose VAN authority was already spent,
+/// so the next vote's VAN reconstruction matches what's in the VC tree.
 pub fn load_zkp2_inputs(
     conn: &Connection,
     round_id: &str,
@@ -603,11 +604,11 @@ pub fn load_zkp2_inputs(
         message: format!("failed to load ZKP2 inputs for round={}, bundle={} ({})", round_id, bundle_index, e),
     })?;
 
-    // Compute current proposal_authority by clearing bits for already-submitted votes
-    // for THIS bundle specifically.
+    // Compute current proposal_authority by clearing bits for proposals whose VAN
+    // authority has been spent (ZKP #2 completed and CastVote TX confirmed).
     let mut authority = MAX_PROPOSAL_AUTHORITY;
     let mut stmt = conn
-        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND submitted = 1")
+        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND van_authority_spent = 1")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare proposal_authority query: {}", e),
         })?;
@@ -990,8 +991,12 @@ pub fn store_vote(
         .as_secs() as i64;
 
     conn.execute(
-        "INSERT OR REPLACE INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, commitment, submitted, created_at)
-         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :choice, :commitment, 0, :created_at)",
+        "INSERT INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, commitment, submitted, created_at)
+         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :choice, :commitment, 0, :created_at)
+         ON CONFLICT(round_id, wallet_id, bundle_index, proposal_id) DO UPDATE SET
+           choice = excluded.choice,
+           commitment = excluded.commitment,
+           created_at = excluded.created_at",
         named_params! {
             ":round_id": round_id,
             ":wallet_id": wallet_id,
@@ -1068,7 +1073,7 @@ pub fn mark_vote_submitted(
     bundle_index: u32,
     proposal_id: u32,
 ) -> Result<(), VotingError> {
-    conn.execute(
+    let rows = conn.execute(
         "UPDATE votes SET submitted = 1 WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
         named_params! {
             ":round_id": round_id,
@@ -1080,6 +1085,49 @@ pub fn mark_vote_submitted(
     .map_err(|e| VotingError::Internal {
         message: format!("failed to mark vote submitted: {}", e),
     })?;
+    if rows == 0 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "vote not found: round={}, bundle={}, proposal={}",
+                round_id, bundle_index, proposal_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Mark a proposal's VAN authority bit as spent for this bundle. This
+/// clears the bit in the `proposal_authority` bitmask computed by
+/// `load_zkp2_inputs`, so the next proposal reconstructs the updated VAN
+/// (with the decremented bitmask). Separate from `submitted` which tracks
+/// share-reveal completion.
+pub fn mark_van_authority_spent(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<(), VotingError> {
+    let rows = conn.execute(
+        "UPDATE votes SET van_authority_spent = 1 WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to mark van_authority_spent: {}", e),
+    })?;
+    if rows == 0 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "vote not found: round={}, bundle={}, proposal={}",
+                round_id, bundle_index, proposal_id
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -1294,6 +1342,238 @@ pub fn get_keystone_signatures(
         .map_err(|e| VotingError::Internal {
             message: format!("failed to read keystone signature row: {}", e),
         })
+}
+
+// --- Share delegation receipts (per-helper share nullifiers) ---
+
+pub fn store_share_delegation_receipt(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    receipt: &ShareDelegationReceipt,
+) -> Result<(), VotingError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT INTO share_delegations (round_id, wallet_id, bundle_index, proposal_id, share_index, helper_url, share_nullifier, seq, created_at, submit_at, reveal_confirmed)
+         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :helper_url, :share_nullifier, :seq, :created_at, :submit_at, :reveal_confirmed)
+         ON CONFLICT(round_id, wallet_id, bundle_index, proposal_id, share_index, helper_url)
+         DO UPDATE SET share_nullifier = excluded.share_nullifier, seq = excluded.seq, created_at = excluded.created_at,
+                       submit_at = excluded.submit_at, reveal_confirmed = excluded.reveal_confirmed",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+            ":share_index": receipt.share_index as i64,
+            ":helper_url": receipt.helper_url,
+            ":share_nullifier": receipt.share_nullifier.as_slice(),
+            ":seq": receipt.seq as i64,
+            ":created_at": now,
+            ":submit_at": receipt.submit_at as i64,
+            ":reveal_confirmed": if receipt.reveal_confirmed { 1i64 } else { 0i64 },
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to store share delegation receipt: {}", e),
+    })?;
+    Ok(())
+}
+
+pub fn list_share_delegation_receipts(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Vec<ShareDelegationReceipt>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_index, helper_url, share_nullifier, seq, submit_at, reveal_confirmed FROM share_delegations
+             WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3 AND proposal_id = ?4
+             ORDER BY share_index ASC, seq ASC, helper_url ASC",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("prepare list share_delegation_receipts: {}", e),
+        })?;
+
+    let rows = stmt
+        .query_map(
+            params![round_id, wallet_id, bundle_index as i64, proposal_id as i64],
+            |r| {
+                Ok(ShareDelegationReceipt {
+                    share_index: r.get::<_, i64>(0)? as u32,
+                    helper_url: r.get(1)?,
+                    share_nullifier: r.get(2)?,
+                    seq: r.get::<_, i64>(3)? as u32,
+                    submit_at: r.get::<_, i64>(4)? as u64,
+                    reveal_confirmed: r.get::<_, i64>(5)? != 0,
+                })
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("query share_delegation_receipts: {}", e),
+        })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::Internal {
+            message: format!("read share_delegation_receipt row: {}", e),
+        })
+}
+
+pub fn mark_share_revealed_for_helper(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    helper_url: &str,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "UPDATE share_delegations SET reveal_confirmed = 1
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index AND proposal_id = :proposal_id
+           AND share_index = :share_index AND helper_url = :helper_url",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+            ":share_index": share_index as i64,
+            ":helper_url": helper_url,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to mark share revealed: {}", e),
+    })?;
+    Ok(())
+}
+
+/// Groups with at least one `reveal_confirmed = 0` row and matching vote `submitted = 0`.
+/// `submitted` tracks share-reveal completion (separate from `van_authority_spent` which
+/// tracks CastVote TX acceptance for proposal_authority bookkeeping).
+pub fn list_pending_share_reveal_groups(
+    conn: &Connection,
+    wallet_id: &str,
+) -> Result<Vec<PendingShareRevealGroup>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT s.round_id, s.bundle_index, s.proposal_id
+             FROM share_delegations s
+             INNER JOIN votes v
+               ON v.round_id = s.round_id AND v.wallet_id = s.wallet_id
+               AND v.bundle_index = s.bundle_index AND v.proposal_id = s.proposal_id
+             WHERE s.wallet_id = :wallet_id
+               AND s.reveal_confirmed = 0
+               AND v.submitted = 0
+             ORDER BY s.round_id, s.bundle_index, s.proposal_id",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("prepare list_pending_share_reveal_groups: {}", e),
+        })?;
+
+    let keys: Vec<(String, i64, i64)> = stmt
+        .query_map(named_params! { ":wallet_id": wallet_id }, |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| VotingError::Internal {
+            message: format!("query pending share reveal keys: {}", e),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::Internal {
+            message: format!("read pending share reveal key row: {}", e),
+        })?;
+
+    let mut out = Vec::with_capacity(keys.len());
+    for (round_id, bundle_index, proposal_id) in keys {
+        let receipts = list_pending_receipts_for_vote(
+            conn,
+            &round_id,
+            wallet_id,
+            bundle_index as u32,
+            proposal_id as u32,
+        )?;
+        if !receipts.is_empty() {
+            out.push(PendingShareRevealGroup {
+                round_id,
+                bundle_index: bundle_index as u32,
+                proposal_id: proposal_id as u32,
+                receipts,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn list_pending_receipts_for_vote(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Vec<ShareDelegationReceipt>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT share_index, helper_url, share_nullifier, seq, submit_at, reveal_confirmed
+             FROM share_delegations
+             WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3 AND proposal_id = ?4
+               AND reveal_confirmed = 0
+             ORDER BY share_index ASC, seq ASC, helper_url ASC",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("prepare list_pending_receipts_for_vote: {}", e),
+        })?;
+
+    let rows = stmt
+        .query_map(
+            params![round_id, wallet_id, bundle_index as i64, proposal_id as i64],
+            |r| {
+                Ok(ShareDelegationReceipt {
+                    share_index: r.get::<_, i64>(0)? as u32,
+                    helper_url: r.get(1)?,
+                    share_nullifier: r.get(2)?,
+                    seq: r.get::<_, i64>(3)? as u32,
+                    submit_at: r.get::<_, i64>(4)? as u64,
+                    reveal_confirmed: r.get::<_, i64>(5)? != 0,
+                })
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("query pending receipts: {}", e),
+        })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::Internal {
+            message: format!("read pending receipt row: {}", e),
+        })
+}
+
+pub fn clear_share_delegation_receipts_for_vote(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "DELETE FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear share delegation receipts: {}", e),
+    })?;
+    Ok(())
 }
 
 // --- Recovery state cleanup ---

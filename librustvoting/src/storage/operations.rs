@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
 use ff::PrimeField;
+use pasta_curves::pallas;
 
 use crate::storage::queries;
 use crate::storage::{
-    KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb,
+    KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, ShareDelegationReceipt,
+    VoteRecord, VotingDb,
 };
 use crate::types::{
     DelegationProofResult, DelegationSubmissionData, EncryptedShare,
@@ -243,20 +245,22 @@ impl VotingDb {
     ) -> Result<DelegationProofResult, VotingError> {
         let total_start = std::time::Instant::now();
 
-        // Phase 1: DB queries
+        // Phase 1: DB queries — acquire and release the connection before the
+        // long-running PIR fetch and proof generation so other callers (e.g.
+        // checkPendingShareReveals) aren't blocked for the entire proof duration.
         let db_start = std::time::Instant::now();
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
-        let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
-        let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, &wallet_id, bundle_index)?;
-        let witnesses = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
-
-        // Load Phase 1 randomness for ZCA-74 fix: ensures Phase 2 produces
-        // the same nf_signed/cmx_new that Phase 1 committed to in the PCZT.
-        let rseed_signed = queries::load_rseed_signed(&conn, round_id, &wallet_id, bundle_index)?;
-        let rseed_output = queries::load_rseed_output(&conn, round_id, &wallet_id, bundle_index)?;
-        let padded_secrets = queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
+        let (params, alpha, van_comm_rand, witnesses, rseed_signed, rseed_output, padded_secrets) = {
+            let conn = self.conn();
+            let p = queries::load_round_params(&conn, round_id, &wallet_id)?;
+            let a = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
+            let v = queries::load_van_comm_rand(&conn, round_id, &wallet_id, bundle_index)?;
+            let w = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
+            let rs = queries::load_rseed_signed(&conn, round_id, &wallet_id, bundle_index)?;
+            let ro = queries::load_rseed_output(&conn, round_id, &wallet_id, bundle_index)?;
+            let ps = queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
+            (p, a, v, w, rs, ro, ps)
+        }; // MutexGuard dropped here
 
         // Align witnesses (keyed by commitment) to notes order
         let witness_count = witnesses.len();
@@ -360,6 +364,41 @@ impl VotingDb {
             imt_proofs.len()
         );
 
+        // The delegation circuit's public `nf_imt_root` is taken from each PIR proof.
+        // CheckTx verifies the proof against `round.nullifier_imt_root` from
+        // `MsgCreateVotingSession`. If the app points at a different PIR deployment than
+        // the round creator, proving still succeeds locally but the chain rejects with
+        // "invalid zero-knowledge proof" — fail fast with an explicit error instead.
+        let expected_nf_imt: [u8; 32] = params
+            .nullifier_imt_root
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!(
+                    "stored nullifier_imt_root must be exactly 32 bytes, got {}",
+                    params.nullifier_imt_root.len()
+                ),
+            })?;
+        let expected_nf_imt_fe = Option::from(pallas::Base::from_repr(expected_nf_imt)).ok_or_else(|| {
+            VotingError::Internal {
+                message: "stored nullifier_imt_root is not a canonical Pallas field element"
+                    .to_string(),
+            }
+        })?;
+        for (i, proof) in imt_proofs.iter().enumerate() {
+            if proof.root != expected_nf_imt_fe {
+                return Err(VotingError::Internal {
+                    message: format!(
+                        "PIR nullifier IMT root does not match this voting round (note {i}). \
+                         actual_from_pir={} expected_from_round={}. \
+                         Use the same nullifier / PIR server URL as when the round was created, or recreate the round.",
+                        hex::encode(proof.root.to_repr()),
+                        hex::encode(expected_nf_imt_fe.to_repr()),
+                    ),
+                });
+            }
+        }
+
         // Phase 3: Proof generation
         let prove_start = std::time::Instant::now();
         eprintln!("[ZKP1] Starting proof generation...");
@@ -420,22 +459,22 @@ impl VotingDb {
             prove_elapsed.as_secs_f64()
         );
 
-        // Store proof bytes for debugging/recovery
-        queries::store_proof(&conn, round_id, &wallet_id, bundle_index, &result.proof)?;
-        // Persist prover's public inputs — needed later for delegation TX submission.
-        // With PrecomputedRandomness (ZCA-74 fix), nf_signed/cmx_new should match
-        // Phase 1 values. We still store them to be explicit and support the legacy path.
-        queries::store_proof_result_fields(
-            &conn,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            &result.rk,
-            &result.gov_nullifiers,
-            &result.nf_signed,
-            &result.cmx_new,
-        )?;
-        queries::update_round_phase(&conn, round_id, &wallet_id, RoundPhase::DelegationProved)?;
+        // Re-acquire the DB connection to persist results.
+        {
+            let conn = self.conn();
+            queries::store_proof(&conn, round_id, &wallet_id, bundle_index, &result.proof)?;
+            queries::store_proof_result_fields(
+                &conn,
+                round_id,
+                &wallet_id,
+                bundle_index,
+                &result.rk,
+                &result.gov_nullifiers,
+                &result.nf_signed,
+                &result.cmx_new,
+            )?;
+            queries::update_round_phase(&conn, round_id, &wallet_id, RoundPhase::DelegationProved)?;
+        }
 
         let total_elapsed = total_start.elapsed();
         eprintln!(
@@ -717,7 +756,7 @@ impl VotingDb {
         queries::delete_bundles_from(&conn, round_id, &wallet_id, keep_count)
     }
 
-    /// Mark a vote as submitted to the vote chain.
+    /// Mark a vote as submitted (share reveals confirmed).
     pub fn mark_vote_submitted(
         &self,
         round_id: &str,
@@ -727,6 +766,18 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::mark_vote_submitted(&conn, round_id, &wallet_id, bundle_index, proposal_id)
+    }
+
+    /// Mark a proposal's VAN authority bit as spent for this bundle.
+    pub fn mark_van_authority_spent(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::mark_van_authority_spent(&conn, round_id, &wallet_id, bundle_index, proposal_id)
     }
 
     // --- Recovery state ---
@@ -826,11 +877,94 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         queries::clear_recovery_state(&conn, round_id, &wallet_id)
     }
+
+    pub fn store_share_delegation_receipt(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        receipt: &ShareDelegationReceipt,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::store_share_delegation_receipt(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            receipt,
+        )
+    }
+
+    pub fn list_share_delegation_receipts(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<Vec<ShareDelegationReceipt>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::list_share_delegation_receipts(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+        )
+    }
+
+    pub fn clear_share_delegation_receipts_for_vote(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::clear_share_delegation_receipts_for_vote(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+        )
+    }
+
+    pub fn mark_share_revealed_for_helper(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        helper_url: &str,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::mark_share_revealed_for_helper(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+            helper_url,
+        )
+    }
+
+    pub fn list_pending_share_reveal_groups(
+        &self,
+    ) -> Result<Vec<super::PendingShareRevealGroup>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::list_pending_share_reveal_groups(&conn, &wallet_id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ShareDelegationReceipt;
 
     // 64 hex chars = 32 bytes when decoded. Required because build_governance_pczt
     // hex-decodes vote_round_id and validates it as exactly 32 bytes (a Pallas field element).
@@ -864,6 +998,106 @@ mod tests {
         let state = db.get_round_state(ROUND_ID).unwrap();
         assert_eq!(state.phase, RoundPhase::Initialized);
         assert_eq!(state.snapshot_height, 1000);
+    }
+
+    #[test]
+    fn test_share_delegation_receipt_roundtrip() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        let conn = db.conn();
+        queries::insert_bundle(&conn, ROUND_ID, W, 0, &[]).unwrap();
+        drop(conn);
+
+        let r = ShareDelegationReceipt {
+            share_index: 2,
+            helper_url: "https://helper.example".to_string(),
+            share_nullifier: vec![0xde; 32],
+            seq: 1,
+            submit_at: 1700000000,
+            reveal_confirmed: false,
+        };
+        db.store_share_delegation_receipt(ROUND_ID, 0, 7, &r).unwrap();
+        let rows = db.list_share_delegation_receipts(ROUND_ID, 0, 7).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].share_index, 2);
+        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[0].helper_url, "https://helper.example");
+        assert_eq!(rows[0].share_nullifier, vec![0xde; 32]);
+
+        db.clear_share_delegation_receipts_for_vote(ROUND_ID, 0, 7).unwrap();
+        assert!(db
+            .list_share_delegation_receipts(ROUND_ID, 0, 7)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_pending_share_reveal_groups_lifecycle() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        let conn = db.conn();
+        queries::insert_bundle(&conn, ROUND_ID, W, 0, &[]).unwrap();
+        let commitment = vec![0xCC; 128];
+        queries::store_vote(&conn, ROUND_ID, W, 0, 3, 1, &commitment).unwrap();
+        queries::store_vote(&conn, ROUND_ID, W, 0, 5, 0, &commitment).unwrap();
+        drop(conn);
+
+        // No receipts yet — nothing pending.
+        assert!(db.list_pending_share_reveal_groups().unwrap().is_empty());
+
+        // Insert receipts for proposal 3: two shares, each sent to two helpers.
+        for (si, nf_byte) in [(0u32, 0xA0u8), (1, 0xA1)] {
+            for (seq, url) in [(0u32, "https://h1"), (1, "https://h2")] {
+                db.store_share_delegation_receipt(ROUND_ID, 0, 3, &ShareDelegationReceipt {
+                    share_index: si,
+                    helper_url: url.to_string(),
+                    share_nullifier: vec![nf_byte; 32],
+                    seq,
+                    submit_at: 1700000000,
+                    reveal_confirmed: false,
+                }).unwrap();
+            }
+        }
+        // Insert receipts for proposal 5: one share, one helper.
+        db.store_share_delegation_receipt(ROUND_ID, 0, 5, &ShareDelegationReceipt {
+            share_index: 0,
+            helper_url: "https://h1".to_string(),
+            share_nullifier: vec![0xB0; 32],
+            seq: 0,
+            submit_at: 0,
+            reveal_confirmed: false,
+        }).unwrap();
+
+        // Both proposals appear as pending groups.
+        let groups = db.list_pending_share_reveal_groups().unwrap();
+        assert_eq!(groups.len(), 2);
+        let g3 = groups.iter().find(|g| g.proposal_id == 3).unwrap();
+        let g5 = groups.iter().find(|g| g.proposal_id == 5).unwrap();
+        assert_eq!(g3.receipts.len(), 4); // 2 shares × 2 helpers
+        assert_eq!(g5.receipts.len(), 1);
+
+        // Confirm share 0 on helper h1 for proposal 3.
+        db.mark_share_revealed_for_helper(ROUND_ID, 0, 3, 0, "https://h1").unwrap();
+        let groups = db.list_pending_share_reveal_groups().unwrap();
+        let g3 = groups.iter().find(|g| g.proposal_id == 3).unwrap();
+        assert_eq!(g3.receipts.len(), 3); // one fewer pending receipt
+
+        // Confirm all remaining receipts for proposal 3.
+        db.mark_share_revealed_for_helper(ROUND_ID, 0, 3, 0, "https://h2").unwrap();
+        db.mark_share_revealed_for_helper(ROUND_ID, 0, 3, 1, "https://h1").unwrap();
+        db.mark_share_revealed_for_helper(ROUND_ID, 0, 3, 1, "https://h2").unwrap();
+
+        // Proposal 3 still appears because votes.submitted = 0.
+        // Mark it submitted — now it should vanish.
+        db.mark_vote_submitted(ROUND_ID, 0, 3).unwrap();
+        let groups = db.list_pending_share_reveal_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].proposal_id, 5);
+
+        // Confirm and submit proposal 5 — list should be empty.
+        db.mark_share_revealed_for_helper(ROUND_ID, 0, 5, 0, "https://h1").unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 5).unwrap();
+        assert!(db.list_pending_share_reveal_groups().unwrap().is_empty());
     }
 
     #[test]
@@ -1097,7 +1331,14 @@ mod tests {
                 .submitted
         );
 
-        // Verify proposal_authority reflects per-bundle submission state
+        // proposal_authority uses van_authority_spent, not submitted
+        let conn = db.conn();
+        let zkp2_0 = queries::load_zkp2_inputs(&conn, ROUND_ID, W, 0).unwrap();
+        assert_eq!(zkp2_0.proposal_authority, 0xFFFF); // submitted ≠ van_authority_spent
+
+        // Mark van_authority_spent and verify proposal_authority clears the bit
+        drop(conn);
+        db.mark_van_authority_spent(ROUND_ID, 0, 0).unwrap();
         let conn = db.conn();
         let zkp2_0 = queries::load_zkp2_inputs(&conn, ROUND_ID, W, 0).unwrap();
         assert_eq!(zkp2_0.proposal_authority, 0xFFFF & !(1u64 << 0)); // bit 0 cleared

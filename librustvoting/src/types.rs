@@ -241,6 +241,9 @@ pub struct SharePayload {
     /// Blind factor for this specific share (32 bytes, LE pallas::Base repr).
     /// Only the revealed share's blind is needed for ZKP #3.
     pub primary_blind: Vec<u8>,
+    /// Deterministic share nullifier (32 bytes, LE `pallas::Base` repr).
+    /// Used for helper share-status polling without an opaque server token.
+    pub share_nullifier: Vec<u8>,
 }
 
 /// Computed signature fields for cast-vote TX submission.

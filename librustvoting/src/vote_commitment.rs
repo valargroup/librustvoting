@@ -2,6 +2,73 @@ use crate::types::{
     validate_encrypted_shares, validate_vote_decision, CastVoteSignature, WireEncryptedShare,
     SharePayload, VoteCommitmentBundle, VotingError,
 };
+use ff::PrimeField;
+use pasta_curves::pallas;
+use vote_commitment_tree::vote_commitment_hash;
+use voting_circuits::share_reveal::share_nullifier_hash;
+
+/// Parse 32 bytes as canonical little-endian `pallas::Base` (same as circuit public inputs).
+fn fp_from_repr32(bytes: &[u8]) -> Result<pallas::Base, VotingError> {
+    if bytes.len() != 32 {
+        return Err(VotingError::Internal {
+            message: format!("field repr must be 32 bytes, got {}", bytes.len()),
+        });
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(bytes);
+    Option::from(pallas::Base::from_repr(arr)).ok_or_else(|| VotingError::Internal {
+        message: "invalid pallas::Base representation".to_string(),
+    })
+}
+
+/// Decode vote round id hex (optional `0x`) to 32-byte canonical field repr (zero-padded).
+fn round_id_bytes_from_hex(round_id_hex: &str) -> Result<[u8; 32], VotingError> {
+    let s = round_id_hex.trim().strip_prefix("0x").unwrap_or(round_id_hex.trim());
+    let raw = hex::decode(s).map_err(|e| VotingError::Internal {
+        message: format!("invalid vote_round_id hex: {e}"),
+    })?;
+    if raw.len() > 32 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "vote_round_id hex decodes to {} bytes, max is 32",
+                raw.len()
+            ),
+        });
+    }
+    let mut out = [0u8; 32];
+    out[..raw.len()].copy_from_slice(&raw);
+    Ok(out)
+}
+
+/// Compute the share nullifier (32-byte LE `pallas::Base` repr) for share-status polling.
+///
+/// Matches the circuit: `vote_commitment_hash` then `share_nullifier_hash` with the same
+/// domain tag as ZKP #3 (`voting_circuits::share_reveal`).
+#[must_use]
+pub fn compute_share_nullifier(
+    round_id_hex: &str,
+    shares_hash: &[u8],
+    proposal_id: u32,
+    vote_decision: u32,
+    share_index: u32,
+    primary_blind: &[u8],
+) -> Result<Vec<u8>, VotingError> {
+    let rid = round_id_bytes_from_hex(round_id_hex)?;
+    let round_id_fp = fp_from_repr32(&rid)?;
+    let shares_hash_fp = fp_from_repr32(shares_hash)?;
+    let proposal_id_fp = pallas::Base::from(u64::from(proposal_id));
+    let vote_decision_fp = pallas::Base::from(u64::from(vote_decision));
+    let vc = vote_commitment_hash(
+        round_id_fp,
+        shares_hash_fp,
+        proposal_id_fp,
+        vote_decision_fp,
+    );
+    let share_index_fp = pallas::Base::from(u64::from(share_index));
+    let blind_fp = fp_from_repr32(primary_blind)?;
+    let nf = share_nullifier_hash(vc, share_index_fp, blind_fp);
+    Ok(nf.to_repr().to_vec())
+}
 
 /// Build payloads for helper server (one per share).
 ///
@@ -39,9 +106,19 @@ pub fn build_share_payloads(
 
     let mut payloads = Vec::with_capacity(iter_shares.len());
     for (i, share) in iter_shares.iter().enumerate() {
-        let primary_blind = commitment.share_blinds.get(i)
+        let primary_blind = commitment
+            .share_blinds
+            .get(i)
             .cloned()
             .unwrap_or_default();
+        let share_nullifier = compute_share_nullifier(
+            &commitment.vote_round_id,
+            &commitment.shares_hash,
+            commitment.proposal_id,
+            vote_decision,
+            share.share_index,
+            &primary_blind,
+        )?;
         payloads.push(SharePayload {
             shares_hash: commitment.shares_hash.clone(),
             proposal_id: commitment.proposal_id,
@@ -51,6 +128,7 @@ pub fn build_share_payloads(
             all_enc_shares: all_enc_shares.clone(),
             share_comms: commitment.share_comms.clone(),
             primary_blind,
+            share_nullifier,
         });
     }
 
@@ -186,9 +264,11 @@ mod tests {
             proof: vec![0xAB; 256],
             enc_shares: vec![],
             anchor_height: 0,
-            vote_round_id: String::new(),
-            shares_hash: vec![0xDD; 32],
-            share_blinds: (0..5).map(|_| vec![0x11; 32]).collect(),
+            // 32-byte hex so `compute_share_nullifier` parses round id like production.
+            vote_round_id: "00".repeat(32),
+            // Canonical zero field reprs so `compute_share_nullifier` accepts mock data.
+            shares_hash: vec![0u8; 32],
+            share_blinds: (0..5).map(|_| vec![0u8; 32]).collect(),
             share_comms: (0..5).map(|_| vec![0x22; 32]).collect(),
             r_vpk_bytes: vec![0xEE; 32],
             alpha_v: vec![0xFF; 32],
@@ -206,5 +286,8 @@ mod tests {
         assert_eq!(result[0].shares_hash, commitment.shares_hash);
         assert_eq!(result[0].enc_share.share_index, 0);
         assert_eq!(result[1].enc_share.share_index, 1);
+        assert_eq!(result[0].share_nullifier.len(), 32);
+        assert_eq!(result[1].share_nullifier.len(), 32);
+        assert_ne!(result[0].share_nullifier, result[1].share_nullifier);
     }
 }

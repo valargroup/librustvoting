@@ -81,6 +81,7 @@ CREATE TABLE votes (
     choice          INTEGER NOT NULL,
     commitment      BLOB,
     submitted       INTEGER NOT NULL DEFAULT 0,
+    van_authority_spent INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     tx_hash                 TEXT,
     vc_tree_position        INTEGER,
@@ -90,16 +91,18 @@ CREATE TABLE votes (
 );
 
 CREATE TABLE share_delegations (
-    round_id        TEXT NOT NULL,
-    wallet_id       TEXT NOT NULL DEFAULT '',
-    bundle_index    INTEGER NOT NULL,
-    proposal_id     INTEGER NOT NULL,
-    share_index     INTEGER NOT NULL,
-    helper_url      TEXT NOT NULL,
-    nullifier       BLOB NOT NULL,
-    confirmed       INTEGER NOT NULL DEFAULT 0,
-    created_at      INTEGER NOT NULL,
-    PRIMARY KEY (round_id, wallet_id, bundle_index, proposal_id, share_index),
+    round_id          TEXT NOT NULL,
+    wallet_id         TEXT NOT NULL DEFAULT '',
+    bundle_index      INTEGER NOT NULL,
+    proposal_id       INTEGER NOT NULL,
+    share_index       INTEGER NOT NULL,
+    helper_url        TEXT NOT NULL,
+    share_nullifier   BLOB NOT NULL,
+    seq               INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL,
+    submit_at         INTEGER NOT NULL DEFAULT 0,
+    reveal_confirmed  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (round_id, wallet_id, bundle_index, proposal_id, share_index, helper_url),
     FOREIGN KEY (round_id, wallet_id, bundle_index)
         REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
 );
