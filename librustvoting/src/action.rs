@@ -228,9 +228,10 @@ pub fn build_governance_pczt(
     let mut rng = rand::thread_rng();
 
     // --- Compute governance nullifiers ---
+    let dom = governance::compute_nullifier_domain(&vri_32)?;
     let mut gov_nullifiers: Vec<Vec<u8>> = Vec::with_capacity(5);
     for note in notes {
-        let gov_null = governance::derive_gov_nullifier(nk_bytes, &vri_32, &note.nullifier)?;
+        let gov_null = governance::derive_gov_nullifier(nk_bytes, &dom, &note.nullifier)?;
         gov_nullifiers.push(gov_null);
     }
 
@@ -247,7 +248,7 @@ pub fn build_governance_pczt(
             let cmx: ExtractedNoteCommitment = pad_note.commitment().into();
             let real_nf = pad_note.nullifier(&fvk);
             let gov_null =
-                governance::derive_gov_nullifier(nk_bytes, &vri_32, &real_nf.to_bytes())?;
+                governance::derive_gov_nullifier(nk_bytes, &dom, &real_nf.to_bytes())?;
             padded_cmx.push(cmx.to_bytes().to_vec());
             gov_nullifiers.push(gov_null);
             dummy_nullifiers.push(real_nf.to_bytes().to_vec());

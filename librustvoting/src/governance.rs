@@ -17,8 +17,8 @@ pub(crate) const BALLOT_DIVISOR: u64 = 12_500_000;
 /// Prepended as the first Poseidon input in van_comm for domain separation.
 pub(crate) const DOMAIN_VAN: u64 = 0;
 
-/// Domain tag for governance authorization nullifier (per spec §1.3.2).
-/// `"governance authorization"` encoded as a little-endian Pallas field element.
+/// Protocol identifier for governance authorization, encoded as a little-endian
+/// Pallas field element. Used to derive the nullifier domain for this application.
 fn gov_auth_domain_tag() -> pallas::Base {
     let mut bytes = [0u8; 32];
     bytes[..24].copy_from_slice(b"governance authorization");
@@ -29,6 +29,17 @@ fn gov_auth_domain_tag() -> pallas::Base {
 /// Matches `orchard/src/delegation/imt.rs:poseidon_hash_2`.
 fn poseidon_hash_2(a: pallas::Base, b: pallas::Base) -> pallas::Base {
     poseidon::Hash::<_, P128Pow5T3, ConstantLength<2>, 3, 2>::init().hash([a, b])
+}
+
+/// Derive the nullifier domain for a voting round (ZIP §Nullifier Domains).
+///
+/// `dom = Poseidon("governance authorization", vote_round_id)`
+///
+/// Matches `orchard/src/delegation/imt.rs:derive_nullifier_domain`.
+pub fn compute_nullifier_domain(vote_round_id: &[u8]) -> Result<Vec<u8>, VotingError> {
+    let vri_fp = bytes_to_fp(vote_round_id)?;
+    let dom = poseidon_hash_2(gov_auth_domain_tag(), vri_fp);
+    Ok(fp_to_bytes(dom))
 }
 
 /// Convert a 32-byte slice to a Pallas base field element.
@@ -47,26 +58,26 @@ fn fp_to_bytes(fp: pallas::Base) -> Vec<u8> {
     repr.to_vec()
 }
 
-/// Derive governance nullifier (per spec §1.3.2, condition 14).
+/// Derive alternate nullifier (ZIP §Alternate Nullifier Derivation).
 ///
-/// `gov_null = Poseidon(nk, domain_tag, vote_round_id, real_nf)`
+/// `nf_dom = Poseidon(nk, dom, nf^old)`
 ///
-/// Single Poseidon call with ConstantLength<4> (2 permutations at rate=2).
+/// where `dom` is the nullifier domain (see [`compute_nullifier_domain`]).
+/// Single Poseidon call with ConstantLength<3> (2 permutations at rate=2).
 /// Matches `orchard/src/delegation/imt.rs:gov_null_hash`.
 pub fn derive_gov_nullifier(
     nk: &[u8],
-    vote_round_id: &[u8],
+    dom: &[u8],
     note_nullifier: &[u8],
 ) -> Result<Vec<u8>, VotingError> {
     let nk_fp = bytes_to_fp(nk)?;
-    let vri_fp = bytes_to_fp(vote_round_id)?;
+    let dom_fp = bytes_to_fp(dom)?;
     let nf_fp = bytes_to_fp(note_nullifier)?;
 
     let gov_null =
-        poseidon::Hash::<_, P128Pow5T3, ConstantLength<4>, 3, 2>::init().hash([
+        poseidon::Hash::<_, P128Pow5T3, ConstantLength<3>, 3, 2>::init().hash([
             nk_fp,
-            gov_auth_domain_tag(),
-            vri_fp,
+            dom_fp,
             nf_fp,
         ]);
 
@@ -165,9 +176,10 @@ mod tests {
         let nk = [0x01u8; 32];
         let vri = [0x02u8; 32];
         let nf = [0x03u8; 32];
+        let dom = compute_nullifier_domain(&vri).unwrap();
 
-        let result1 = derive_gov_nullifier(&nk, &vri, &nf).unwrap();
-        let result2 = derive_gov_nullifier(&nk, &vri, &nf).unwrap();
+        let result1 = derive_gov_nullifier(&nk, &dom, &nf).unwrap();
+        let result2 = derive_gov_nullifier(&nk, &dom, &nf).unwrap();
 
         assert_eq!(result1.len(), 32);
         assert_eq!(result1, result2, "gov nullifier must be deterministic");
@@ -178,8 +190,9 @@ mod tests {
         let nk = [0x01u8; 32];
         let vri = [0x02u8; 32];
         let nf = [0x03u8; 32];
+        let dom = compute_nullifier_domain(&vri).unwrap();
 
-        let result = derive_gov_nullifier(&nk, &vri, &nf).unwrap();
+        let result = derive_gov_nullifier(&nk, &dom, &nf).unwrap();
         // Should not be all zeros or all same byte
         assert_ne!(result, vec![0x00; 32]);
         assert_ne!(result, vec![0xAA; 32]); // not the old mock
@@ -191,9 +204,10 @@ mod tests {
         let vri = [0x02u8; 32];
         let nf1 = [0x03u8; 32];
         let nf2 = [0x04u8; 32];
+        let dom = compute_nullifier_domain(&vri).unwrap();
 
-        let result1 = derive_gov_nullifier(&nk, &vri, &nf1).unwrap();
-        let result2 = derive_gov_nullifier(&nk, &vri, &nf2).unwrap();
+        let result1 = derive_gov_nullifier(&nk, &dom, &nf1).unwrap();
+        let result2 = derive_gov_nullifier(&nk, &dom, &nf2).unwrap();
 
         assert_ne!(
             result1, result2,
@@ -267,10 +281,13 @@ mod tests {
         let nk = [0x01u8; 32];
         let vri = [0x02u8; 32];
         let nf = [0x03u8; 32];
+        let dom = compute_nullifier_domain(&vri).unwrap();
 
-        let result = derive_gov_nullifier(&nk, &vri, &nf).unwrap();
+        let result = derive_gov_nullifier(&nk, &dom, &nf).unwrap();
+        // Formula: dom = Poseidon("governance authorization", vri),
+        // then gov_null = Poseidon(nk, dom, nf) — 3 inputs.
         let expected =
-            hex::decode("2cc64d6e6474545476a0724bb158af64526cc1966c81c58e81f36a79a6811402")
+            hex::decode("996e97b7ba33cd031e1d561596c3ac5cace4d4a27f83a51457a63ccf2145ee1a")
                 .unwrap();
         assert_eq!(result, expected, "gov nullifier known-answer mismatch — formula may have diverged from orchard reference");
     }
@@ -295,9 +312,10 @@ mod tests {
 
     #[test]
     fn test_invalid_length_inputs() {
-        assert!(derive_gov_nullifier(&[0u8; 31], &[0u8; 32], &[0u8; 32]).is_err());
+        let dom = compute_nullifier_domain(&[0u8; 32]).unwrap();
+        assert!(derive_gov_nullifier(&[0u8; 31], &dom, &[0u8; 32]).is_err());
         assert!(derive_gov_nullifier(&[0u8; 32], &[0u8; 31], &[0u8; 32]).is_err());
-        assert!(derive_gov_nullifier(&[0u8; 32], &[0u8; 32], &[0u8; 31]).is_err());
+        assert!(derive_gov_nullifier(&[0u8; 32], &dom, &[0u8; 31]).is_err());
 
         assert!(construct_van(&[0u8; 31], &[0u8; 32], 15_000_000, &[0u8; 32], &[0u8; 32]).is_err());
         assert!(construct_van(&[0u8; 32], &[0u8; 31], 15_000_000, &[0u8; 32], &[0u8; 32]).is_err());
