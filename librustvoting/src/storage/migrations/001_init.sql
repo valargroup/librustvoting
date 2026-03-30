@@ -95,9 +95,10 @@ CREATE TABLE share_delegations (
     bundle_index    INTEGER NOT NULL,
     proposal_id     INTEGER NOT NULL,
     share_index     INTEGER NOT NULL,
-    helper_url      TEXT NOT NULL,
+    sent_to_urls    TEXT NOT NULL,
     nullifier       BLOB NOT NULL,
     confirmed       INTEGER NOT NULL DEFAULT 0,
+    submit_at       INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     PRIMARY KEY (round_id, wallet_id, bundle_index, proposal_id, share_index),
     FOREIGN KEY (round_id, wallet_id, bundle_index)

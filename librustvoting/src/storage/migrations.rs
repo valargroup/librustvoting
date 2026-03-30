@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 5;
+const CURRENT_VERSION: u32 = 6;
 
 pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
     let version: u32 = conn
@@ -125,6 +125,33 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
                 message: format!("migration to version 5 failed (create): {}", e),
             })?;
         conn.pragma_update(None, "user_version", 5)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to update database version: {}", e),
+            })?;
+    }
+
+    if version < 6 {
+        // v6: share_delegations schema change: helper_url -> sent_to_urls (JSON array),
+        // add submit_at column for share timing tracking.
+        // Drop-all-recreate for pre-production.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS share_delegations;
+             DROP TABLE IF EXISTS keystone_signatures;
+             DROP TABLE IF EXISTS votes;
+             DROP TABLE IF EXISTS witnesses;
+             DROP TABLE IF EXISTS proofs;
+             DROP TABLE IF EXISTS bundles;
+             DROP TABLE IF EXISTS cached_tree_state;
+             DROP TABLE IF EXISTS rounds;"
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("migration to version 6 failed (drop): {}", e),
+        })?;
+        conn.execute_batch(include_str!("migrations/001_init.sql"))
+            .map_err(|e| VotingError::Internal {
+                message: format!("migration to version 6 failed (create): {}", e),
+            })?;
+        conn.pragma_update(None, "user_version", 6)
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to update database version: {}", e),
             })?;

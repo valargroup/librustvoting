@@ -243,6 +243,26 @@ pub struct SharePayload {
     pub primary_blind: Vec<u8>,
 }
 
+/// A share delegation record from the local DB.
+/// Tracks which helper servers received each share and its on-chain confirmation status.
+#[derive(Clone, Debug)]
+pub struct ShareDelegationRecord {
+    pub round_id: String,
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub share_index: u32,
+    /// JSON-decoded list of helper server URLs that received this share.
+    pub sent_to_urls: Vec<String>,
+    /// Pre-computed share reveal nullifier (32 bytes).
+    pub nullifier: Vec<u8>,
+    /// Whether the share has been confirmed on-chain.
+    pub confirmed: bool,
+    /// Unix seconds: when the helper should submit the share (0 = immediate).
+    pub submit_at: u64,
+    /// Unix seconds: when the share was delegated.
+    pub created_at: u64,
+}
+
 /// Computed signature fields for cast-vote TX submission.
 /// Returned by `sign_cast_vote` after ZKP #2 builds the vote commitment bundle.
 /// The sighash is computed on-chain from the message fields; the client only

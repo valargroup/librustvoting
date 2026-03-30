@@ -3,7 +3,7 @@ use rusqlite::{named_params, Connection};
 use crate::storage::{
     KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord,
 };
-use crate::types::{VotingError, VotingRoundParams};
+use crate::types::{ShareDelegationRecord, VotingError, VotingRoundParams};
 
 // --- Rounds ---
 
@@ -1330,6 +1330,241 @@ pub fn clear_recovery_state(
     )
     .map_err(|e| VotingError::Internal {
         message: format!("failed to clear vote recovery columns: {}", e),
+    })?;
+    Ok(())
+}
+
+// --- Share delegation tracking ---
+
+/// Record a share delegation after sending to helper servers.
+pub fn record_share_delegation(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    sent_to_urls: &[String],
+    nullifier: &[u8],
+    submit_at: u64,
+) -> Result<(), VotingError> {
+    let urls_json = serde_json::to_string(sent_to_urls).map_err(|e| VotingError::Internal {
+        message: format!("failed to serialize sent_to_urls: {}", e),
+    })?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    conn.execute(
+        "INSERT OR REPLACE INTO share_delegations \
+         (round_id, wallet_id, bundle_index, proposal_id, share_index, sent_to_urls, nullifier, confirmed, submit_at, created_at) \
+         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :sent_to_urls, :nullifier, 0, :submit_at, :created_at)",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index,
+            ":proposal_id": proposal_id,
+            ":share_index": share_index,
+            ":sent_to_urls": urls_json,
+            ":nullifier": nullifier,
+            ":submit_at": submit_at,
+            ":created_at": now,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to record share delegation: {}", e),
+    })?;
+    Ok(())
+}
+
+/// Load all share delegations for a round.
+pub fn get_share_delegations(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<ShareDelegationRecord>, VotingError> {
+    load_share_delegations(
+        conn,
+        "SELECT bundle_index, proposal_id, share_index, sent_to_urls, nullifier, confirmed, submit_at, created_at, round_id \
+         FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id \
+         ORDER BY proposal_id, share_index",
+        round_id,
+        wallet_id,
+    )
+}
+
+/// Load only unconfirmed share delegations for a round.
+pub fn get_unconfirmed_delegations(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<ShareDelegationRecord>, VotingError> {
+    load_share_delegations(
+        conn,
+        "SELECT bundle_index, proposal_id, share_index, sent_to_urls, nullifier, confirmed, submit_at, created_at, round_id \
+         FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id AND confirmed = 0 \
+         ORDER BY proposal_id, share_index",
+        round_id,
+        wallet_id,
+    )
+}
+
+fn load_share_delegations(
+    conn: &Connection,
+    sql: &str,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<ShareDelegationRecord>, VotingError> {
+    let mut stmt = conn.prepare(sql).map_err(|e| VotingError::Internal {
+        message: format!("failed to prepare share delegation query: {}", e),
+    })?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                let urls_json: String = row.get(3)?;
+                let nullifier_blob: Vec<u8> = row.get(4)?;
+                let confirmed_int: i32 = row.get(5)?;
+                let round_id_val: String = row.get(8)?;
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, u32>(2)?,
+                    urls_json,
+                    nullifier_blob,
+                    confirmed_int != 0,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, u64>(7)?,
+                    round_id_val,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to query share delegations: {}", e),
+        })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        let (bundle_index, proposal_id, share_index, urls_json, nullifier, confirmed, submit_at, created_at, round_id_val) =
+            row.map_err(|e| VotingError::Internal {
+                message: format!("failed to read share delegation row: {}", e),
+            })?;
+        let sent_to_urls: Vec<String> =
+            serde_json::from_str(&urls_json).map_err(|e| VotingError::Internal {
+                message: format!("failed to deserialize sent_to_urls: {}", e),
+            })?;
+        results.push(ShareDelegationRecord {
+            round_id: round_id_val,
+            bundle_index,
+            proposal_id,
+            share_index,
+            sent_to_urls,
+            nullifier,
+            confirmed,
+            submit_at,
+            created_at,
+        });
+    }
+    Ok(results)
+}
+
+/// Mark a share delegation as confirmed on-chain.
+pub fn mark_share_confirmed(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<(), VotingError> {
+    let updated = conn
+        .execute(
+            "UPDATE share_delegations SET confirmed = 1 \
+             WHERE round_id = :round_id AND wallet_id = :wallet_id \
+             AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index,
+                ":proposal_id": proposal_id,
+                ":share_index": share_index,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to mark share confirmed: {}", e),
+        })?;
+    if updated == 0 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "no share delegation found: round={}, bundle={}, proposal={}, share={}",
+                round_id, bundle_index, proposal_id, share_index
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Append new server URLs to a share delegation's sent_to_urls.
+/// Used after resubmitting an overdue share to additional servers.
+pub fn add_sent_servers(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    new_urls: &[String],
+) -> Result<(), VotingError> {
+    // Read current URLs
+    let current_json: String = conn
+        .query_row(
+            "SELECT sent_to_urls FROM share_delegations \
+             WHERE round_id = :round_id AND wallet_id = :wallet_id \
+             AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index,
+                ":proposal_id": proposal_id,
+                ":share_index": share_index,
+            },
+            |row| row.get(0),
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read sent_to_urls for update: {}", e),
+        })?;
+
+    let mut urls: Vec<String> =
+        serde_json::from_str(&current_json).map_err(|e| VotingError::Internal {
+            message: format!("failed to deserialize sent_to_urls: {}", e),
+        })?;
+
+    // Append new URLs (deduplicated)
+    for url in new_urls {
+        if !urls.contains(url) {
+            urls.push(url.clone());
+        }
+    }
+
+    let updated_json = serde_json::to_string(&urls).map_err(|e| VotingError::Internal {
+        message: format!("failed to serialize updated sent_to_urls: {}", e),
+    })?;
+
+    conn.execute(
+        "UPDATE share_delegations SET sent_to_urls = :urls, submit_at = 0 \
+         WHERE round_id = :round_id AND wallet_id = :wallet_id \
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
+        named_params! {
+            ":urls": updated_json,
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index,
+            ":proposal_id": proposal_id,
+            ":share_index": share_index,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to update sent_to_urls: {}", e),
     })?;
     Ok(())
 }

@@ -826,6 +826,81 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         queries::clear_recovery_state(&conn, round_id, &wallet_id)
     }
+
+    // --- Share delegation tracking ---
+
+    /// Record a share delegation after sending to helper servers.
+    pub fn record_share_delegation(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        sent_to_urls: &[String],
+        nullifier: &[u8],
+        submit_at: u64,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::record_share_delegation(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+            sent_to_urls,
+            nullifier,
+            submit_at,
+        )
+    }
+
+    /// Load all share delegations for a round.
+    pub fn get_share_delegations(
+        &self,
+        round_id: &str,
+    ) -> Result<Vec<crate::ShareDelegationRecord>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::get_share_delegations(&conn, round_id, &wallet_id)
+    }
+
+    /// Load only unconfirmed share delegations for a round.
+    pub fn get_unconfirmed_delegations(
+        &self,
+        round_id: &str,
+    ) -> Result<Vec<crate::ShareDelegationRecord>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::get_unconfirmed_delegations(&conn, round_id, &wallet_id)
+    }
+
+    /// Mark a share delegation as confirmed on-chain.
+    pub fn mark_share_confirmed(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::mark_share_confirmed(&conn, round_id, &wallet_id, bundle_index, proposal_id, share_index)
+    }
+
+    /// Append new server URLs to a share delegation's sent_to_urls.
+    pub fn add_sent_servers(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        new_urls: &[String],
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::add_sent_servers(&conn, round_id, &wallet_id, bundle_index, proposal_id, share_index, new_urls)
+    }
 }
 
 #[cfg(test)]
