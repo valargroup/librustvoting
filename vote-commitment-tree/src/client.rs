@@ -20,6 +20,10 @@ use crate::hash::{MerkleHashVote, MAX_CHECKPOINTS, SHARD_HEIGHT, TREE_DEPTH};
 use crate::path::MerklePath;
 use crate::sync_api::TreeSyncApi;
 
+/// Keep each leaf query window within the chain's public API cap
+/// (`to_height - from_height <= 1000`).
+const MAX_SYNC_HEIGHT_SPAN: u32 = 1000;
+
 // ---------------------------------------------------------------------------
 // SyncError
 // ---------------------------------------------------------------------------
@@ -168,56 +172,69 @@ impl TreeClient {
             return Ok(()); // Already up to date.
         }
 
-        let blocks = api.get_block_commitments(from_height, to_height)?;
+        // Fetch in bounded windows so long catch-up syncs never exceed the
+        // chain API range cap.
+        let mut chunk_from = from_height;
+        while chunk_from <= to_height {
+            let chunk_to = chunk_from
+                .saturating_add(MAX_SYNC_HEIGHT_SPAN)
+                .min(to_height);
+            let blocks = api.get_block_commitments(chunk_from, chunk_to)?;
 
-        for block in &blocks {
-            // Validate start_index continuity: the block's first leaf index must
-            // match exactly where the client expects the next leaf. A mismatch
-            // means missed blocks, duplicates, or wrong ordering.
-            if !block.leaves.is_empty() && block.start_index != self.next_position {
-                return Err(SyncError::StartIndexMismatch {
-                    height: block.height,
-                    expected: self.next_position,
-                    got: block.start_index,
-                });
-            }
-
-            for leaf in &block.leaves {
-                // Use Marked retention for positions the client registered
-                // interest in; Ephemeral for everything else. This gives
-                // ShardTree the signal to retain witness data only where needed.
-                let retention = if self.marked_positions.contains(&self.next_position) {
-                    Retention::Marked
-                } else {
-                    Retention::Ephemeral
-                };
-                self.inner
-                    .append(*leaf, retention)
-                    .expect("append must succeed (tree not full)");
-                self.next_position += 1;
-            }
-
-            // Checkpoint after each block's leaves, mirroring the server's
-            // EndBlocker snapshots.
-            self.inner
-                .checkpoint(block.height)
-                .expect("checkpoint must succeed");
-            self.last_synced_height = Some(block.height);
-
-            // Root consistency check: verify the client's computed root matches
-            // the server's root at this height. This catches corrupted leaf data,
-            // hash mismatches, or tree implementation differences.
-            let server_root = api.get_root_at_height(block.height)?;
-            if let Some(expected) = server_root {
-                let local = self.root_at_height(block.height);
-                if local != Some(expected) {
-                    return Err(SyncError::RootMismatch {
+            for block in &blocks {
+                // Validate start_index continuity: the block's first leaf index must
+                // match exactly where the client expects the next leaf. A mismatch
+                // means missed blocks, duplicates, or wrong ordering.
+                if !block.leaves.is_empty() && block.start_index != self.next_position {
+                    return Err(SyncError::StartIndexMismatch {
                         height: block.height,
-                        local,
-                        server: expected,
+                        expected: self.next_position,
+                        got: block.start_index,
                     });
                 }
+
+                for leaf in &block.leaves {
+                    // Use Marked retention for positions the client registered
+                    // interest in; Ephemeral for everything else. This gives
+                    // ShardTree the signal to retain witness data only where needed.
+                    let retention = if self.marked_positions.contains(&self.next_position) {
+                        Retention::Marked
+                    } else {
+                        Retention::Ephemeral
+                    };
+                    self.inner
+                        .append(*leaf, retention)
+                        .expect("append must succeed (tree not full)");
+                    self.next_position += 1;
+                }
+
+                // Checkpoint after each block's leaves, mirroring the server's
+                // EndBlocker snapshots.
+                self.inner
+                    .checkpoint(block.height)
+                    .expect("checkpoint must succeed");
+                self.last_synced_height = Some(block.height);
+
+                // Root consistency check: verify the client's computed root matches
+                // the server's root at this height. This catches corrupted leaf data,
+                // hash mismatches, or tree implementation differences.
+                let server_root = api.get_root_at_height(block.height)?;
+                if let Some(expected) = server_root {
+                    let local = self.root_at_height(block.height);
+                    if local != Some(expected) {
+                        return Err(SyncError::RootMismatch {
+                            height: block.height,
+                            local,
+                            server: expected,
+                        });
+                    }
+                }
             }
+
+            chunk_from = match chunk_to.checked_add(1) {
+                Some(next) => next,
+                None => break,
+            };
         }
 
         Ok(())
