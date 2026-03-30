@@ -40,14 +40,28 @@ static DELEGATION_PK_CACHE: OnceLock<(
     plonk::ProvingKey<vesta::Affine>,
 )> = OnceLock::new();
 
+fn compute_delegation_proving_key() -> (Params<vesta::Affine>, plonk::ProvingKey<vesta::Affine>) {
+    let params = Params::new(K);
+    let vk = plonk::keygen_vk(&params, &DelegationCircuit::default())
+        .expect("delegation keygen_vk: circuit is valid");
+    let pk = plonk::keygen_pk(&params, vk, &DelegationCircuit::default())
+        .expect("delegation keygen_pk: circuit is valid");
+    (params, pk)
+}
+
 fn get_delegation_proving_key() -> &'static (Params<vesta::Affine>, plonk::ProvingKey<vesta::Affine>) {
     DELEGATION_PK_CACHE.get_or_init(|| {
-        let params = Params::new(K);
-        let vk = plonk::keygen_vk(&params, &DelegationCircuit::default())
-            .expect("delegation keygen_vk: circuit is valid");
-        let pk = plonk::keygen_pk(&params, vk, &DelegationCircuit::default())
-            .expect("delegation keygen_pk: circuit is valid");
-        (params, pk)
+        // Delegation keygen can be stack-hungry with larger circuits.
+        // Run it on a dedicated thread with an explicit large stack to avoid
+        // simulator/runtime crashes caused by stack exhaustion.
+        const KEYGEN_STACK_BYTES: usize = 64 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name("delegation-keygen".to_string())
+            .stack_size(KEYGEN_STACK_BYTES)
+            .spawn(compute_delegation_proving_key)
+            .expect("spawn delegation keygen thread")
+            .join()
+            .expect("delegation keygen thread panicked")
     })
 }
 
@@ -57,14 +71,12 @@ fn get_delegation_proving_key() -> &'static (Params<vesta::Affine>, plonk::Provi
 
 use pir_client::PirClientBlocking;
 
-/// Convert a PIR-crate `ImtProofData` (from `pir_client`, re-exported from `imt_tree`)
-/// into the orchard-crate `ImtProofData`. Both structs have identical fields — this
-/// is a field-by-field copy bridging the two crate boundaries.
+/// Convert a PIR-crate `ImtProofData` into the circuit-crate `ImtProofData`.
+/// Both use the K=2 punctured-range format with `nf_bounds = [nf_lo, nf_mid, nf_hi]`.
 pub fn convert_pir_proof(pir: pir_client::ImtProofData) -> ImtProofData {
     ImtProofData {
         root: pir.root,
-        low: pir.low,
-        width: pir.width,
+        nf_bounds: pir.nf_bounds,
         leaf_pos: pir.leaf_pos,
         path: pir.path,
     }
@@ -425,22 +437,41 @@ pub fn build_and_prove_delegation(
 
     progress.on_progress(0.5);
 
-    // Create the proof.
+    // Create the proof on a dedicated large-stack thread. For larger circuits,
+    // create_proof can also exhaust the default thread stack on simulator builds.
     let instance_vec = bundle.instance.to_halo2_instance();
-    let instance_refs: Vec<&[vesta::Scalar]> = vec![instance_vec.as_slice()];
-    let mut transcript = Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
-    plonk::create_proof(
-        &params,
-        &pk,
-        &[bundle.circuit],
-        &[instance_refs.as_slice()],
-        &mut rng,
-        &mut transcript,
-    )
-    .map_err(|e| VotingError::ProofFailed {
-        message: format!("create_proof failed: {e}"),
+    let circuit = bundle.circuit;
+    let proof_instance = instance_vec.clone();
+    const PROVING_STACK_BYTES: usize = 64 * 1024 * 1024;
+    let proof_bytes = std::thread::scope(|scope| -> Result<Vec<u8>, VotingError> {
+        let handle = std::thread::Builder::new()
+            .name("delegation-prove".to_string())
+            .stack_size(PROVING_STACK_BYTES)
+            .spawn_scoped(scope, move || -> Result<Vec<u8>, VotingError> {
+                let instance_refs: Vec<&[vesta::Scalar]> = vec![proof_instance.as_slice()];
+                let mut local_rng = OsRng;
+                let mut transcript =
+                    Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
+                plonk::create_proof(
+                    params,
+                    pk,
+                    &[circuit],
+                    &[instance_refs.as_slice()],
+                    &mut local_rng,
+                    &mut transcript,
+                )
+                .map_err(|e| VotingError::ProofFailed {
+                    message: format!("create_proof failed: {e}"),
+                })?;
+                Ok(transcript.finalize())
+            })
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to spawn delegation proving thread: {e}"),
+            })?;
+        handle.join().map_err(|_| VotingError::Internal {
+            message: "delegation proving thread panicked".to_string(),
+        })?
     })?;
-    let proof_bytes = transcript.finalize();
 
     progress.on_progress(1.0);
 

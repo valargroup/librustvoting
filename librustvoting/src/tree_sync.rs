@@ -88,11 +88,9 @@ impl VoteTreeSync {
             message: format!("vote tree sync failed: {}", e),
         })?;
 
-        client
-            .last_synced_height()
-            .ok_or_else(|| VotingError::Internal {
-                message: "tree has no synced height after sync".to_string(),
-            })
+        // Empty tree is valid before the first delegation commitment is appended.
+        // Report height 0 so callers can proceed instead of failing sync.
+        Ok(client.last_synced_height().unwrap_or(0))
     }
 
     /// Generate a VAN Merkle witness for ZKP #2.
