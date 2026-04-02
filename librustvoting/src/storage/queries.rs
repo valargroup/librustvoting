@@ -1356,9 +1356,13 @@ pub fn record_share_delegation(
         .unwrap_or_default()
         .as_secs();
     conn.execute(
-        "INSERT OR REPLACE INTO share_delegations \
+        "INSERT INTO share_delegations \
          (round_id, wallet_id, bundle_index, proposal_id, share_index, sent_to_urls, nullifier, confirmed, submit_at, created_at) \
-         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :sent_to_urls, :nullifier, 0, :submit_at, :created_at)",
+         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :sent_to_urls, :nullifier, 0, :submit_at, :created_at) \
+         ON CONFLICT (round_id, wallet_id, bundle_index, proposal_id, share_index) DO UPDATE SET \
+         sent_to_urls = excluded.sent_to_urls, \
+         nullifier = excluded.nullifier, \
+         submit_at = excluded.submit_at",
         named_params! {
             ":round_id": round_id,
             ":wallet_id": wallet_id,
