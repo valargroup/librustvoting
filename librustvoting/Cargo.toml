@@ -45,6 +45,10 @@ nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
+# Orchard witness generation (shard tree copied from wallet DB)
+zcash_client_sqlite = { version = "0.19", features = ["orchard"] }
+shardtree = "0.6"
+
 # PCZT construction (governance-specific PCZT for Keystone signing)
 pczt = { version = "0.5", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
 zcash_primitives = "0.26"
