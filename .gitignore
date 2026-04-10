@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 
 # zcash-voting-ffi build artifacts
 zcash-voting-ffi/target

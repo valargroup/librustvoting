@@ -1,0 +1,13 @@
+name: Lockfile guard
+on: [push, pull_request]
+jobs:
+  check-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Cargo.lock is committed
+        run: |
+          if [ ! -f Cargo.lock ]; then
+            echo "ERROR: Cargo.lock must be committed for reproducible builds"
+            exit 1
+          fi
