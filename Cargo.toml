@@ -18,11 +18,12 @@ resolver = "2"
 #   zcash_client_sqlite need our governance visibility changes (pub getters on
 #   PCZT types, etc.) and wallet helpers (create_orchard_tree_tables, snapshot
 #   note queries).
+#   Pinned by rev to shielded-voting-wallet-support HEAD (6858db4).
 [patch.crates-io]
 orchard = { git = "https://github.com/valargroup/voting-circuits.git" }
 
-zcash_client_sqlite = { git = "https://github.com/valargroup/librustzcash.git", branch = "shielded-voting-wallet-support" }
-pczt                = { git = "https://github.com/valargroup/librustzcash.git", branch = "shielded-voting-wallet-support" }
-zcash_keys          = { git = "https://github.com/valargroup/librustzcash.git", branch = "shielded-voting-wallet-support" }
-zcash_primitives    = { git = "https://github.com/valargroup/librustzcash.git", branch = "shielded-voting-wallet-support" }
-zcash_protocol      = { git = "https://github.com/valargroup/librustzcash.git", branch = "shielded-voting-wallet-support" }
+zcash_client_sqlite = { git = "https://github.com/valargroup/librustzcash.git", rev = "6858db4a523de05f7474a89c7df751510c71874d" }
+pczt                = { git = "https://github.com/valargroup/librustzcash.git", rev = "6858db4a523de05f7474a89c7df751510c71874d" }
+zcash_keys          = { git = "https://github.com/valargroup/librustzcash.git", rev = "6858db4a523de05f7474a89c7df751510c71874d" }
+zcash_primitives    = { git = "https://github.com/valargroup/librustzcash.git", rev = "6858db4a523de05f7474a89c7df751510c71874d" }
+zcash_protocol      = { git = "https://github.com/valargroup/librustzcash.git", rev = "6858db4a523de05f7474a89c7df751510c71874d" }

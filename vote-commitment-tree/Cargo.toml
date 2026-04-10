@@ -5,7 +5,7 @@ edition = "2021"
 description = "Append-only Poseidon Merkle tree for Vote Authority Notes and Vote Commitments (Zally voting protocol)"
 
 [dependencies]
-imt-tree = { git = "https://github.com/valargroup/vote-nullifier-pir.git" }
+imt-tree = "0.1"
 pasta_curves = "0.5"
 ff = "0.13"
 halo2_gadgets = { version = "0.3", default-features = false }
