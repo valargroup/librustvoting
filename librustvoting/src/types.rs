@@ -7,8 +7,6 @@ pub enum VotingError {
     InvalidInput { message: String },
     #[error("Proof generation failed: {message}")]
     ProofFailed { message: String },
-    #[error("Witness generation failed: {message}")]
-    WitnessGeneration { message: String },
     #[error("Internal error: {message}")]
     Internal { message: String },
 }
