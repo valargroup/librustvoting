@@ -3,7 +3,6 @@ pub mod decompose;
 pub mod elgamal;
 pub mod governance;
 pub mod hotkey;
-mod orchard_compat;
 pub mod share_tracking;
 pub mod storage;
 pub mod tree_sync;

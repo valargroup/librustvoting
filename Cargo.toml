@@ -5,3 +5,12 @@ members = [
     "vote-commitment-tree-client",
 ]
 resolver = "2"
+
+# Mirrors the sapling-crypto git pin used by the librustzcash fork
+# (valargroup/librustzcash PR #43, `shielded-vote-for-zodl-3.4.0`). `zcash_primitives`
+# depends on `sapling = "0.6.2"` from crates.io; without this patch its build picks
+# up the published 0.6.2 crate, diverging from the fork's build graph and
+# producing two distinct `sapling` nodes (one for our build, one inside the fork
+# crates) that are incompatible at the type level.
+[patch.crates-io]
+sapling = { package = "sapling-crypto", git = "https://github.com/zcash/sapling-crypto.git", rev = "b8a81c22f034d68f9bbd6cba728aab807b9ba2ea" }
