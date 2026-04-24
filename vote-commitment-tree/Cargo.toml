@@ -20,5 +20,5 @@ libc = "0.2"
 
 [dev-dependencies]
 rand = "0.8"
-orchard = { version = "0.11.0", package = "valar-orchard" }
-voting-circuits = "0.1.0"
+orchard = { version = "0.12.0", package = "valar-orchard" }
+voting-circuits = "0.2.0"

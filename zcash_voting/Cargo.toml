@@ -42,11 +42,13 @@ thiserror = "2"
 # Dual orchard: voting-circuits takes valar-orchard in its public API; zcash_keys,
 # valar-pczt, and zcash_primitives expose upstream orchard. Both must be namable
 # here until the valar visibility changes land in zcash/orchard upstream;
-# orchard_compat.rs bridges them via byte-round-trip (wire formats are identical).
+# orchard_compat.rs bridges them via byte-round-trip (FullViewingKey and
+# SpendingKey wire formats are unchanged across the 0.11 → 0.12 bump and
+# between upstream orchard and valar-orchard).
 subtle = "2.6"
-orchard = { version = "0.11.0", package = "valar-orchard" }
+orchard = { version = "0.12.0", package = "valar-orchard" }
 orchard_upstream = { version = "0.11.0", package = "orchard" }
-voting-circuits = "0.1.0"
+voting-circuits = { version = "0.2.0", features = ["share-reveal"] }
 zcash_keys = { version = "0.12", features = ["orchard"] }
 zcash_protocol = "0.7"
 nonempty = "0.11"
