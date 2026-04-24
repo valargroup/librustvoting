@@ -39,22 +39,27 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # Error handling
 thiserror = "2"
 
-# Dual orchard: voting-circuits takes valar-orchard in its public API; zcash_keys,
-# valar-pczt, and zcash_primitives expose upstream orchard. Both must be namable
-# here until the valar visibility changes land in zcash/orchard upstream;
-# orchard_compat.rs bridges them via byte-round-trip (FullViewingKey and
-# SpendingKey wire formats are unchanged across the 0.11 → 0.12 bump and
-# between upstream orchard and valar-orchard).
+# Single orchard: zcash_keys / pczt / zcash_primitives are pulled from the fork tip
+# (valargroup/librustzcash PR #43), which internally resolves `orchard` through the
+# `valar-orchard` package on crates.io — the same crate voting-circuits depends on.
+# Cargo sees one Orchard node in the graph, so no compat bridge is needed.
 subtle = "2.6"
 orchard = { version = "0.12.0", package = "valar-orchard" }
-orchard_upstream = { version = "0.11.0", package = "orchard" }
 voting-circuits = { version = "0.2.0", features = ["share-reveal"] }
-zcash_keys = { version = "0.12", features = ["orchard"] }
-zcash_protocol = "0.7"
 nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
-# PCZT construction (governance-specific PCZT for Keystone signing)
-pczt = { version = "0.5.1", package = "valar-pczt", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_primitives = "0.26"
+# librustzcash pins — valargroup/librustzcash PR #43 tip
+# (`shielded-vote-for-zodl-3.4.0`, rebased onto upstream zcash/main 95b000e,
+# i.e. the last commit before sapling-crypto 0.7 / orchard 0.13). Bump in lockstep
+# when that PR advances or merges.
+#
+# `zcash_protocol` is pinned alongside the other librustzcash crates so the graph
+# has a single version; pulling it from crates.io would let zcash_keys / pczt /
+# zcash_primitives see a second `zcash_protocol` node and Cargo would reject the
+# trait impls as "different types".
+zcash_protocol = { git = "https://github.com/valargroup/librustzcash", rev = "6534482c1cc595f38e0aaa63c4c7c4689360d766" }
+zcash_keys = { git = "https://github.com/valargroup/librustzcash", rev = "6534482c1cc595f38e0aaa63c4c7c4689360d766", features = ["orchard"] }
+pczt = { git = "https://github.com/valargroup/librustzcash", rev = "6534482c1cc595f38e0aaa63c4c7c4689360d766", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_primitives = { git = "https://github.com/valargroup/librustzcash", rev = "6534482c1cc595f38e0aaa63c4c7c4689360d766" }

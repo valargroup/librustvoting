@@ -5,15 +5,13 @@ use pasta_curves::pallas;
 use rand::RngCore;
 use subtle::CtOption;
 
-// Uses upstream orchard (not valar-orchard): builds a bundle for PcztParts.orchard,
-// which is upstream-typed. None of the governance-visibility methods are needed here.
-use orchard_upstream::builder::{Builder, BundleType};
-use orchard_upstream::keys::FullViewingKey;
-use orchard_upstream::note::{ExtractedNoteCommitment, RandomSeed, Rho};
-use orchard_upstream::pczt::Zip32Derivation;
-use orchard_upstream::tree::{MerkleHashOrchard, MerklePath};
-use orchard_upstream::value::NoteValue;
-use orchard_upstream::{Anchor, Address};
+use orchard::builder::{Builder, BundleType};
+use orchard::keys::FullViewingKey;
+use orchard::note::{ExtractedNoteCommitment, RandomSeed, Rho};
+use orchard::pczt::Zip32Derivation;
+use orchard::tree::{MerkleHashOrchard, MerklePath};
+use orchard::value::NoteValue;
+use orchard::{Anchor, Address};
 use zcash_primitives::transaction::builder::PcztParts;
 use zcash_primitives::transaction::TxVersion;
 use zcash_protocol::consensus::{BlockHeight, BranchId, Network};
@@ -100,15 +98,14 @@ fn random_rseed(rng: &mut impl RngCore, rho: &Rho) -> (RandomSeed, [u8; 32]) {
 }
 
 /// Construct a 1-zatoshi orchard Note at the given address with the given Rho.
-/// Uses Note::from_parts (orchard 0.11 public API).
 /// Value is 1 zatoshi so that Keystone renders the transaction on screen.
 fn make_dummy_note(
     addr: Address,
     rho: Rho,
     rng: &mut impl RngCore,
-) -> Result<(orchard_upstream::Note, [u8; 32]), VotingError> {
+) -> Result<(orchard::Note, [u8; 32]), VotingError> {
     let (rseed, rseed_bytes) = random_rseed(rng, &rho);
-    let note = orchard_upstream::Note::from_parts(addr, NoteValue::from_raw(1), rho, rseed);
+    let note = orchard::Note::from_parts(addr, NoteValue::from_raw(1), rho, rseed);
     if !bool::from(note.is_some()) {
         return Err(VotingError::Internal {
             message: "failed to construct dummy note".to_string(),
@@ -582,7 +579,7 @@ pub fn extract_spend_auth_sig(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchard_upstream::keys::SpendingKey;
+    use orchard::keys::SpendingKey;
 
     fn mock_note() -> NoteInfo {
         NoteInfo {
