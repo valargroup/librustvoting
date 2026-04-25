@@ -11,7 +11,7 @@ readme = "README.md"
 imt-tree = "0.1"
 pasta_curves = "0.5"
 ff = "0.13"
-halo2_gadgets = { version = "0.3", default-features = false }
+halo2_gadgets = { version = "0.4", default-features = false }
 anyhow = "1.0"
 incrementalmerkletree = "0.8.1"
 shardtree = "0.6"

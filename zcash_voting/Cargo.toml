@@ -18,7 +18,7 @@ rand = "0.8"
 
 # Hashing
 blake2b_simd = "1"
-halo2_gadgets = "0.3"
+halo2_gadgets = "0.4"
 halo2_proofs = "0.3"
 
 # Serialization
