@@ -21,12 +21,10 @@ See the [wallet integration guide](https://github.com/valargroup/vote-sdk/blob/m
 
 ## Dependency notes
 
-`zcash_voting` depends on two Valar Group maintenance forks published on crates.io under `valar-*` names:
+`zcash_voting` tracks the upstream Zcash crates directly:
 
-- **`valar-orchard 0.11`** — fork of [`orchard`](https://github.com/zcash/orchard) adding governance-visibility methods needed by the voting circuits.
-- **`valar-pczt 0.5`** — fork of [`pczt`](https://github.com/zcash/librustzcash) adding shielded-voting getters.
-
-Both are consumed via cargo's `package = "valar-*"` rename trick so consumer code writes `use orchard::…` and `use pczt::…` unchanged. These forks will be dropped once the changes land in upstream ECC releases.
+- **`orchard 0.13`** — upstream [`zcash/orchard`](https://github.com/zcash/orchard), pinned via a `[patch.crates-io]` redirect to the `valargroup/orchard` `valar/0.13-spend-auth-g` branch (tracked by [valargroup/orchard PR #19](https://github.com/valargroup/orchard/pull/19)). That branch carries orchard 0.13.0 plus the `unstable-voting-circuits` feature gate that exposes the governance-visibility APIs, plus cherry-picks of [zcash/orchard #489](https://github.com/zcash/orchard/pull/489) (SpendAuthG fixed-base multiplication) and [zcash/orchard #495](https://github.com/zcash/orchard/pull/495) (`NoteValue::ZERO` public associated constant). Once both upstream PRs land and an `orchard 0.14` ships, this pin will collapse to the published crate.
+- **`pczt`, `zcash_keys`, `zcash_primitives`, `zcash_protocol`, `zcash_address`, `zcash_encoding`, `zcash_transparent`** — pinned to a recent commit of upstream [`zcash/librustzcash`](https://github.com/zcash/librustzcash) `main`. The previous `valargroup/librustzcash` fork (with shielded-voting getters in PCZT and friends) has been fully retired now that the relevant PRs (#2281, #2283, #2284) have all merged upstream.
 
 ## License
 

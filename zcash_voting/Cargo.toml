@@ -18,7 +18,7 @@ rand = "0.8"
 
 # Hashing
 blake2b_simd = "1"
-halo2_gadgets = "0.3"
+halo2_gadgets = "0.4"
 halo2_proofs = "0.3"
 
 # Serialization
@@ -39,27 +39,24 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # Error handling
 thiserror = "2"
 
-# Single orchard: zcash_keys / pczt / zcash_primitives are pulled from the fork tip
-# (valargroup/librustzcash PR #43), which internally resolves `orchard` through the
-# `valar-orchard` package on crates.io — the same crate voting-circuits depends on.
-# Cargo sees one Orchard node in the graph, so no compat bridge is needed.
+# Single orchard node: every consumer (this crate, voting-circuits, and the
+# librustzcash crates we pin below) resolves `orchard` through the workspace's
+# `[patch.crates-io]` redirect to valargroup/orchard `valar/0.13-spend-auth-g`
+# (orchard 0.13.0 + zcash/orchard #489 SpendAuthG + zcash/orchard #495
+# `NoteValue::ZERO`; tracked by valargroup/orchard PR #19). The
+# `unstable-voting-circuits` feature is required by integration tests in
+# `zkp1.rs` (`Note::new`, `Note::dummy`, `Rho::from_nf_old`).
 subtle = "2.6"
-orchard = { version = "0.12.0", package = "valar-orchard" }
+orchard = { version = "0.13", features = ["unstable-voting-circuits"] }
 voting-circuits = { version = "0.2.0", features = ["share-reveal"] }
 nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
-# librustzcash pins — valargroup/librustzcash PR #43 tip
-# (`shielded-vote-for-zodl-3.4.0`, rebased onto upstream zcash/main 95b000e,
-# i.e. the last commit before sapling-crypto 0.7 / orchard 0.13). Bump in lockstep
-# when that PR advances or merges.
-#
-# `zcash_protocol` is pinned alongside the other librustzcash crates so the graph
-# has a single version; pulling it from crates.io would let zcash_keys / pczt /
-# zcash_primitives see a second `zcash_protocol` node and Cargo would reject the
-# trait impls as "different types".
-zcash_protocol = { git = "https://github.com/valargroup/librustzcash", rev = "6534482c1cc595f38e0aaa63c4c7c4689360d766" }
-zcash_keys = { git = "https://github.com/valargroup/librustzcash", rev = "6534482c1cc595f38e0aaa63c4c7c4689360d766", features = ["orchard"] }
-pczt = { git = "https://github.com/valargroup/librustzcash", rev = "6534482c1cc595f38e0aaa63c4c7c4689360d766", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_primitives = { git = "https://github.com/valargroup/librustzcash", rev = "6534482c1cc595f38e0aaa63c4c7c4689360d766" }
+# librustzcash pins — upstream zcash/librustzcash `main` HEAD. All governance
+# PRs (#2283, #2284, #2281) that previously kept the valargroup fork alive are
+# now merged upstream; bump this rev in lockstep when zcash/main advances.
+zcash_protocol = "0.8"
+zcash_keys = { version = "0.12", features = ["orchard"] }
+pczt = { version = "0.5", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_primitives = "0.27"

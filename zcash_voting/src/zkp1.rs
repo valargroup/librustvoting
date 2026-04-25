@@ -868,8 +868,8 @@ mod tests {
         assert!(!result.proof.is_empty(), "proof bytes should be non-empty");
         assert_eq!(
             result.public_inputs.len(),
-            12,
-            "should have 12 public inputs"
+            14,
+            "should have 14 public inputs"
         );
         for (i, pi) in result.public_inputs.iter().enumerate() {
             assert_eq!(pi.len(), 32, "public_input[{i}] should be 32 bytes");
