@@ -3066,42 +3066,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
-name = "valar-orchard"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0415fc8aba029019c974bb0b0cc47e0bca53a27fdc2da263a2e6c99c9b3727f8"
-dependencies = [
- "aes",
- "bitvec",
- "blake2b_simd",
- "corez",
- "ff",
- "fpe",
- "getset",
- "group",
- "halo2_gadgets",
- "halo2_poseidon",
- "halo2_proofs",
- "hex",
- "incrementalmerkletree",
- "lazy_static",
- "memuse",
- "nonempty",
- "pasta_curves",
- "rand 0.8.6",
- "rand_core 0.6.4",
- "reddsa",
- "serde",
- "sinsemilla",
- "subtle",
- "tracing",
- "visibility",
- "zcash_note_encryption",
- "zcash_spec",
- "zip32",
-]
-
-[[package]]
 name = "valar-spiral-rs"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3180,7 +3144,7 @@ dependencies = [
  "pasta_curves",
  "rand 0.8.6",
  "shardtree",
- "voting-circuits 0.2.0",
+ "voting-circuits",
 ]
 
 [[package]]
@@ -3198,26 +3162,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "vote-commitment-tree",
-]
-
-[[package]]
-name = "voting-circuits"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ce96b6c906e2df417f66e0bbef5d61ec0931d03e5951e7e36c5e292b17b40b"
-dependencies = [
- "blake2b_simd",
- "ff",
- "group",
- "halo2_gadgets",
- "halo2_poseidon",
- "halo2_proofs",
- "incrementalmerkletree",
- "lazy_static",
- "pasta_curves",
- "rand 0.8.6",
- "sinsemilla",
- "valar-orchard",
 ]
 
 [[package]]
@@ -3798,7 +3742,7 @@ dependencies = [
  "thiserror 2.0.18",
  "vote-commitment-tree",
  "vote-commitment-tree-client",
- "voting-circuits 0.3.0",
+ "voting-circuits",
  "zcash_keys",
  "zcash_primitives",
  "zcash_protocol",
