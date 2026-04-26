@@ -3223,6 +3223,7 @@ dependencies = [
 [[package]]
 name = "voting-circuits"
 version = "0.3.0"
+source = "git+https://github.com/valargroup/voting-circuits.git?rev=70497dab0b3c676f5e9fbe4407d14b21e898eaad#70497dab0b3c676f5e9fbe4407d14b21e898eaad"
 dependencies = [
  "blake2b_simd",
  "ff",

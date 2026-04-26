@@ -8,21 +8,18 @@ resolver = "2"
 
 # Single-source patches for the orchard 0.13 + librustzcash zcash/main migration.
 #
-# - `orchard`: pin to the valargroup branch carrying orchard 0.13.0 plus the
-#   cherry-picks tracked by valargroup/orchard PR #19:
-#     * zcash/orchard PR #489 — SpendAuthG fixed-base multiplication, and
-#     * zcash/orchard PR #495 — `NoteValue::ZERO` public associated constant.
-#   The same pin is used by every downstream consumer so the entire dep graph
+# - `orchard`: pin to upstream zcash/orchard `main` at the workspace-wide revision
+#   (includes SpendAuthG fixed-base support, `NoteValue::ZERO`, and voting-circuit
+#   visibility via `unstable-voting-circuits`). Same pin everywhere so the graph
 #   collapses to a single orchard node.
-# - `voting-circuits`: pin to the matching valargroup branch (consumes the orchard
-#   git pin above; published 0.2.0 still depends on the retired valar-orchard fork
-#   and would create a duplicate orchard node in the graph).
+# - `voting-circuits`: git pin to valargroup/voting-circuits tag v0.3.0 so the
+#   workspace matches vote-sdk and does not require a sibling checkout.
 # - `pczt` / `zcash_*` / `transparent`: pin to the upstream zcash/librustzcash
 #   `main` HEAD now that all governance PRs (#2283, #2284, #2281) are merged
 #   upstream — the valargroup/librustzcash fork is fully retired.
 [patch.crates-io]
-orchard = { git = "https://github.com/valargroup/orchard.git", rev = "c26a6ec6860cc62bb15d208c3d790dfb616bfbe7" }
-voting-circuits = { git = "https://github.com/valargroup/voting-circuits.git", rev = "66777e27e10970c38dc1ebb93d8c7715a5b984c7" }
+orchard = { git = "https://github.com/zcash/orchard.git", rev = "2d88d48d1d86a1b49c3cee00d67dbbfd57f89d0d" }
+voting-circuits = { git = "https://github.com/valargroup/voting-circuits.git", rev = "70497dab0b3c676f5e9fbe4407d14b21e898eaad" }
 pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
 zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
 zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
