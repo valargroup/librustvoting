@@ -39,15 +39,13 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # Error handling
 thiserror = "2"
 
-# Single orchard node: every consumer (this crate, voting-circuits, and the
-# librustzcash crates we pin below) resolves `orchard` through the workspace's
-# `[patch.crates-io]` redirect to upstream zcash/orchard at the pinned `main`
-# revision (SpendAuthG, `NoteValue::ZERO`, `unstable-voting-circuits`). The
-# `unstable-voting-circuits` feature is required by integration tests in
-# `zkp1.rs` (`Note::new`, `Note::dummy`, `Rho::from_nf_old`).
+# Single orchard node: every consumer resolves upstream `orchard` from
+# crates.io at 0.13.1. The `unstable-voting-circuits` feature is required by
+# integration tests in `zkp1.rs` (`Note::new`, `Note::dummy`,
+# `Rho::from_nf_old`).
 subtle = "2.6"
-orchard = { version = "0.13", features = ["unstable-voting-circuits"] }
-voting-circuits = { version = "0.3.0", features = ["share-reveal"] }
+orchard = { version = "=0.13.1", features = ["unstable-voting-circuits"] }
+voting-circuits = { version = "0.3.1", features = ["share-reveal"] }
 nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"

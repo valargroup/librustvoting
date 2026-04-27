@@ -6,20 +6,17 @@ members = [
 ]
 resolver = "2"
 
-# Single-source patches for the orchard 0.13 + librustzcash zcash/main migration.
+# Single-source patches for unreleased librustzcash integration points.
 #
-# - `orchard`: pin to upstream zcash/orchard `main` at the workspace-wide revision
-#   (includes SpendAuthG fixed-base support, `NoteValue::ZERO`, and voting-circuit
-#   visibility via `unstable-voting-circuits`). Same pin everywhere so the graph
-#   collapses to a single orchard node.
-# - `voting-circuits`: git pin to valargroup/voting-circuits tag v0.3.0 so the
-#   workspace matches vote-sdk and does not require a sibling checkout.
+# - `orchard` now resolves from crates.io at 0.13.1, which includes SpendAuthG
+#   fixed-base support, `NoteValue::ZERO`, and the `unstable-voting-circuits`
+#   surface.
+# - `voting-circuits` now resolves from crates.io at 0.3.1, which includes the
+#   Orchard 0.13.1 migration.
 # - `pczt` / `zcash_*` / `transparent`: pin to the upstream zcash/librustzcash
 #   `main` HEAD now that all governance PRs (#2283, #2284, #2281) are merged
 #   upstream — the valargroup/librustzcash fork is fully retired.
 [patch.crates-io]
-orchard = { git = "https://github.com/zcash/orchard.git", rev = "2d88d48d1d86a1b49c3cee00d67dbbfd57f89d0d" }
-voting-circuits = { git = "https://github.com/valargroup/voting-circuits.git", rev = "70497dab0b3c676f5e9fbe4407d14b21e898eaad" }
 pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
 zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
 zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
