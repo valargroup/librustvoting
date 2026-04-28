@@ -50,10 +50,7 @@ nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
-# librustzcash pins — upstream zcash/librustzcash `main` HEAD. All governance
-# PRs (#2283, #2284, #2281) that previously kept the valargroup fork alive are
-# now merged upstream; bump this rev in lockstep when zcash/main advances.
 zcash_protocol = "0.8"
-zcash_keys = { version = "0.12", features = ["orchard"] }
-pczt = { version = "0.5", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_keys = { version = "0.13", features = ["orchard"] }
+pczt = { version = "0.6", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
 zcash_primitives = "0.27"

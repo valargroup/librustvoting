@@ -5,22 +5,3 @@ members = [
     "vote-commitment-tree-client",
 ]
 resolver = "2"
-
-# Single-source patches for unreleased librustzcash integration points.
-#
-# - `orchard` now resolves from crates.io at 0.13.1, which includes SpendAuthG
-#   fixed-base support, `NoteValue::ZERO`, and the `unstable-voting-circuits`
-#   surface.
-# - `voting-circuits` now resolves from crates.io at 0.3.1, which includes the
-#   Orchard 0.13.1 migration.
-# - `pczt` / `zcash_*` / `transparent`: pin to the upstream zcash/librustzcash
-#   `main` HEAD now that all governance PRs (#2283, #2284, #2281) are merged
-#   upstream — the valargroup/librustzcash fork is fully retired.
-[patch.crates-io]
-pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
-zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
-transparent = { package = "zcash_transparent", git = "https://github.com/zcash/librustzcash.git", rev = "976efa76ca2195d693f373aeaa201a2c50b6e0ab" }
