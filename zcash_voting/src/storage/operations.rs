@@ -345,14 +345,48 @@ impl VotingDb {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let imt_proofs: Vec<_> = pir_client
+        let expected_nf_imt_root = {
+            let root_bytes: [u8; 32] =
+                params.nullifier_imt_root.as_slice().try_into().map_err(|_| {
+                    VotingError::Internal {
+                        message: format!(
+                            "nullifier_imt_root must be 32 bytes, got {}",
+                            params.nullifier_imt_root.len()
+                        ),
+                    }
+                })?;
+            Option::from(pasta_curves::pallas::Base::from_repr(root_bytes)).ok_or_else(|| {
+                VotingError::Internal {
+                    message: "nullifier_imt_root is not a valid field element".to_string(),
+                }
+            })?
+        };
+
+        let raw_imt_proofs = pir_client
             .fetch_proofs(&nullifiers)
             .map_err(|e| VotingError::Internal {
                 message: format!("PIR parallel fetch failed: {e}"),
-            })?
+            })?;
+        if raw_imt_proofs.len() != nullifiers.len() {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "PIR returned {} proofs for {} nullifiers",
+                    raw_imt_proofs.len(),
+                    nullifiers.len()
+                ),
+            });
+        }
+        let imt_proofs: Vec<_> = raw_imt_proofs
             .into_iter()
-            .map(crate::zkp1::convert_pir_proof)
-            .collect();
+            .zip(nullifiers.iter().copied())
+            .map(|(proof, nullifier)| {
+                crate::zkp1::validate_and_convert_pir_proof(
+                    proof,
+                    nullifier,
+                    expected_nf_imt_root,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let pir_elapsed = pir_start.elapsed();
         eprintln!(
             "[ZKP1] PIR fetch total: {:.2}s for {} proofs",
@@ -407,6 +441,7 @@ impl VotingDb {
             &alpha,
             &van_comm_rand,
             &vote_round_id_bytes,
+            &params.nullifier_imt_root,
             &ordered_witnesses,
             &imt_proofs,
             Some(&pir_client),

@@ -1,6 +1,6 @@
 [package]
 name = "zcash_voting"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Client-side library for Zcash shielded voting: ZKP delegation and vote-commitment proofs (Halo 2), ElGamal encryption, governance PCZT construction, Merkle witness generation, and SQLite round-state persistence."
 license = "MIT OR Apache-2.0"
@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # PIR (private nullifier exclusion proofs)
-pir-client = "0.1.0"
+pir-client = "0.1.1"
 
 # Vote commitment tree (VAN witness generation)
 vote-commitment-tree = { path = "../vote-commitment-tree", version = "0.1.1" }

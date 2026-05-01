@@ -87,6 +87,41 @@ pub fn convert_pir_proof(pir: pir_client::ImtProofData) -> ImtProofData {
     }
 }
 
+fn base_hex(value: pallas::Base) -> String {
+    hex::encode(value.to_repr())
+}
+
+fn validate_pir_proof_raw(
+    proof: &pir_client::ImtProofData,
+    nullifier: pallas::Base,
+    expected_root: pallas::Base,
+) -> Result<(), String> {
+    if !proof.verify(nullifier) {
+        return Err(
+            "PIR proof verification failed: Merkle path/root does not authenticate queried nullifier"
+                .to_string(),
+        );
+    }
+    if proof.root != expected_root {
+        return Err(format!(
+            "PIR proof root mismatch: expected {}, got {}",
+            base_hex(expected_root),
+            base_hex(proof.root)
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_and_convert_pir_proof(
+    proof: pir_client::ImtProofData,
+    nullifier: pallas::Base,
+    expected_root: pallas::Base,
+) -> Result<ImtProofData, VotingError> {
+    validate_pir_proof_raw(&proof, nullifier, expected_root)
+        .map_err(|message| VotingError::Internal { message })?;
+    Ok(convert_pir_proof(proof))
+}
+
 /// IMT provider that wraps pre-fetched proofs for real notes and
 /// fetches proofs for padded notes on-the-fly via PIR.
 struct PirImtProvider<'a> {
@@ -112,6 +147,7 @@ impl ImtProvider for PirImtProvider<'_> {
         let pir_proof = client
             .fetch_proof(nf)
             .map_err(|e| ImtError(format!("PIR fetch failed: {e}")))?;
+        validate_pir_proof_raw(&pir_proof, nf, self.root).map_err(ImtError)?;
         Ok(convert_pir_proof(pir_proof))
     }
 }
@@ -268,6 +304,7 @@ fn parse_merkle_path(witness: &WitnessData) -> Result<MerklePath, VotingError> {
 /// - `alpha_bytes`: 32-byte spend auth randomizer scalar.
 /// - `van_comm_rand_bytes`: 32-byte governance commitment blinding factor.
 /// - `vote_round_id_bytes`: 32-byte voting round identifier.
+/// - `expected_nf_imt_root_bytes`: 32-byte nullifier IMT root from the active round.
 /// - `merkle_witnesses`: Merkle inclusion proofs for each note (from `generate_note_witnesses`).
 /// - `imt_proofs`: Pre-fetched IMT exclusion proofs (one per real note, from PIR client).
 /// - `pir_client`: PIR client for fetching proofs for padded notes (None if 5 real notes).
@@ -280,6 +317,7 @@ pub fn build_and_prove_delegation(
     alpha_bytes: &[u8],
     van_comm_rand_bytes: &[u8],
     vote_round_id_bytes: &[u8],
+    expected_nf_imt_root_bytes: &[u8],
     merkle_witnesses: &[WitnessData],
     imt_proofs: &[ImtProofData],
     pir_client: Option<&PirClientBlocking>,
@@ -326,6 +364,7 @@ pub fn build_and_prove_delegation(
     let alpha = bytes_to_scalar(alpha_bytes, "alpha")?;
     let van_comm_rand = bytes_to_base(van_comm_rand_bytes, "van_comm_rand")?;
     let vote_round_id = bytes_to_base(vote_round_id_bytes, "vote_round_id")?;
+    let expected_nf_imt_root = bytes_to_base(expected_nf_imt_root_bytes, "expected_nf_imt_root")?;
 
     // Parse hotkey address (43-byte raw Orchard address).
     let addr_arr: [u8; 43] =
@@ -347,12 +386,12 @@ pub fn build_and_prove_delegation(
     let mut imt_cache = HashMap::new();
     let mut shared_fvk: Option<FullViewingKey> = None;
     let mut nc_root: Option<pallas::Base> = None;
-    let mut nf_imt_root: Option<pallas::Base> = None;
 
     for i in 0..n {
         let (note, note_fvk) = reconstruct_note(&full_notes[i], &network)?;
         let merkle_path = parse_merkle_path(&merkle_witnesses[i])?;
         let imt_proof = imt_proofs[i].clone();
+        let nf = note.nullifier(&note_fvk);
 
         // All notes must share the same FVK (same account).
         match &shared_fvk {
@@ -377,18 +416,17 @@ pub fn build_and_prove_delegation(
             }
             _ => {}
         }
-        match nf_imt_root {
-            None => nf_imt_root = Some(imt_proof.root),
-            Some(r) if r != imt_proof.root => {
-                return Err(VotingError::InvalidInput {
-                    message: format!("imt_proof[{i}] has a different root than imt_proof[0]"),
-                });
-            }
-            _ => {}
+        if imt_proof.root != expected_nf_imt_root {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "PIR proof root mismatch: expected {}, got {} for imt_proof[{i}]",
+                    base_hex(expected_nf_imt_root),
+                    base_hex(imt_proof.root)
+                ),
+            });
         }
 
         // Cache this proof for the ServerImtProvider.
-        let nf = note.nullifier(&note_fvk);
         imt_cache.insert(nf.to_bytes(), imt_proof.clone());
 
         let scope = match full_notes[i].scope {
@@ -411,11 +449,10 @@ pub fn build_and_prove_delegation(
 
     let fvk = shared_fvk.expect("guaranteed by n >= 1 check");
     let nc_root = nc_root.expect("guaranteed by n >= 1 check");
-    let nf_imt_root = nf_imt_root.expect("guaranteed by n >= 1 check");
 
     // Create IMT provider: pre-fetched proofs for real notes, PIR for padded notes.
     let imt_provider = PirImtProvider {
-        root: nf_imt_root,
+        root: expected_nf_imt_root,
         cached: imt_cache,
         pir_client,
     };
@@ -662,6 +699,56 @@ mod tests {
         }
     }
 
+    fn raw_pir_proof(proof: ImtProofData) -> pir_client::ImtProofData {
+        pir_client::ImtProofData {
+            root: proof.root,
+            nf_bounds: proof.nf_bounds,
+            leaf_pos: proof.leaf_pos,
+            path: proof.path,
+        }
+    }
+
+    #[test]
+    fn validate_and_convert_pir_proof_accepts_valid_proof() {
+        let imt = TestImt::new();
+        let nf = imt.leaves[0][0] + pallas::Base::one();
+        let proof = raw_pir_proof(imt.proof(nf));
+
+        let converted = validate_and_convert_pir_proof(proof, nf, imt.root).unwrap();
+
+        assert_eq!(converted.root, imt.root);
+    }
+
+    #[test]
+    fn validate_and_convert_pir_proof_rejects_unverified_path() {
+        let imt = TestImt::new();
+        let nf = imt.leaves[0][0] + pallas::Base::one();
+        let proof = raw_pir_proof(imt.proof(nf));
+        let boundary_value = imt.leaves[0][0];
+
+        let err = validate_and_convert_pir_proof(proof, boundary_value, imt.root).unwrap_err();
+
+        assert!(
+            err.to_string().contains("PIR proof verification failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_and_convert_pir_proof_rejects_wrong_root() {
+        let imt = TestImt::new();
+        let nf = imt.leaves[0][0] + pallas::Base::one();
+        let proof = raw_pir_proof(imt.proof(nf));
+        let wrong_root = imt.root + pallas::Base::one();
+
+        let err = validate_and_convert_pir_proof(proof, nf, wrong_root).unwrap_err();
+
+        assert!(
+            err.to_string().contains("PIR proof root mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_build_and_prove_validation() {
         let reporter = TestReporter {
@@ -671,6 +758,7 @@ mod tests {
         let result = build_and_prove_delegation(
             &[],
             &[0u8; 43],
+            &[0u8; 32],
             &[0u8; 32],
             &[0u8; 32],
             &[0u8; 32],
@@ -857,6 +945,7 @@ mod tests {
             &alpha.to_repr(),
             &van_comm_rand.to_repr(),
             &vote_round_id.to_repr(),
+            &imt.root.to_repr(),
             &merkle_witnesses,
             &imt_proofs,
             None, // 5 notes = no padding, no PIR client needed
