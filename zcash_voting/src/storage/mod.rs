@@ -112,8 +112,15 @@ impl VotingDb {
 
     /// Get the current wallet identifier. Panics if not set.
     pub fn wallet_id(&self) -> String {
-        let id = self.wallet_id.lock().expect("wallet_id mutex poisoned").clone();
-        assert!(!id.is_empty(), "wallet_id must be set before performing voting operations");
+        let id = self
+            .wallet_id
+            .lock()
+            .expect("wallet_id mutex poisoned")
+            .clone();
+        assert!(
+            !id.is_empty(),
+            "wallet_id must be set before performing voting operations"
+        );
         id
     }
 
@@ -151,7 +158,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -202,7 +209,10 @@ mod tests {
 
         queries::store_van_position(&conn, "test-round-1", W, 0, 42).unwrap();
         let state = queries::get_round_state(&conn, "test-round-1", W).unwrap();
-        assert!(state.proof_generated, "proof + VAN position should be enough");
+        assert!(
+            state.proof_generated,
+            "proof + VAN position should be enough"
+        );
     }
 
     #[test]
@@ -272,6 +282,10 @@ mod tests {
 
         queries::clear_round(&conn, "test-round-1", "wallet-a").unwrap();
         let rounds_b = queries::list_rounds(&conn, "wallet-b").unwrap();
-        assert_eq!(rounds_b.len(), 1, "wallet-b round should survive wallet-a clear");
+        assert_eq!(
+            rounds_b.len(),
+            1,
+            "wallet-b round should survive wallet-a clear"
+        );
     }
 }

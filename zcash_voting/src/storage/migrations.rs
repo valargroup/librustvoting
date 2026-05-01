@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 6;
+const CURRENT_VERSION: u32 = 7;
 
 pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
     let version: u32 = conn
@@ -54,15 +54,19 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
     if version < 3 {
         // v3: delegation data moved from rounds to bundles table, witnesses
         // gained bundle_index. Drop everything and recreate from 001_init.sql.
+        // The drop list must cover every table in 001_init.sql so a fresh DB
+        // can chain through later drop-all migrations without colliding on a
+        // newer table introduced by a subsequent version.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS share_delegations;
+            "DROP TABLE IF EXISTS imt_proofs;
+             DROP TABLE IF EXISTS share_delegations;
              DROP TABLE IF EXISTS keystone_signatures;
              DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
              DROP TABLE IF EXISTS proofs;
              DROP TABLE IF EXISTS bundles;
              DROP TABLE IF EXISTS cached_tree_state;
-             DROP TABLE IF EXISTS rounds;"
+             DROP TABLE IF EXISTS rounds;",
         )
         .map_err(|e| VotingError::Internal {
             message: format!("migration to version 3 failed (drop): {}", e),
@@ -81,14 +85,15 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
         // v4: add wallet_id column for per-wallet state isolation.
         // Drop everything and recreate from 001_init.sql.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS share_delegations;
+            "DROP TABLE IF EXISTS imt_proofs;
+             DROP TABLE IF EXISTS share_delegations;
              DROP TABLE IF EXISTS keystone_signatures;
              DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
              DROP TABLE IF EXISTS proofs;
              DROP TABLE IF EXISTS bundles;
              DROP TABLE IF EXISTS cached_tree_state;
-             DROP TABLE IF EXISTS rounds;"
+             DROP TABLE IF EXISTS rounds;",
         )
         .map_err(|e| VotingError::Internal {
             message: format!("migration to version 4 failed (drop): {}", e),
@@ -108,14 +113,15 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
         // bundles (delegation_tx_hash) and votes (tx_hash, vc_tree_position,
         // commitment_bundle_json). Drop-all-recreate for pre-production.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS share_delegations;
+            "DROP TABLE IF EXISTS imt_proofs;
+             DROP TABLE IF EXISTS share_delegations;
              DROP TABLE IF EXISTS keystone_signatures;
              DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
              DROP TABLE IF EXISTS proofs;
              DROP TABLE IF EXISTS bundles;
              DROP TABLE IF EXISTS cached_tree_state;
-             DROP TABLE IF EXISTS rounds;"
+             DROP TABLE IF EXISTS rounds;",
         )
         .map_err(|e| VotingError::Internal {
             message: format!("migration to version 5 failed (drop): {}", e),
@@ -135,14 +141,15 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
         // add submit_at column for share timing tracking.
         // Drop-all-recreate for pre-production.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS share_delegations;
+            "DROP TABLE IF EXISTS imt_proofs;
+             DROP TABLE IF EXISTS share_delegations;
              DROP TABLE IF EXISTS keystone_signatures;
              DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
              DROP TABLE IF EXISTS proofs;
              DROP TABLE IF EXISTS bundles;
              DROP TABLE IF EXISTS cached_tree_state;
-             DROP TABLE IF EXISTS rounds;"
+             DROP TABLE IF EXISTS rounds;",
         )
         .map_err(|e| VotingError::Internal {
             message: format!("migration to version 6 failed (drop): {}", e),
@@ -152,6 +159,33 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
                 message: format!("migration to version 6 failed (create): {}", e),
             })?;
         conn.pragma_update(None, "user_version", 6)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to update database version: {}", e),
+            })?;
+    }
+
+    if version < 7 {
+        // v7: add imt_proofs cache table for pre-submit PIR lookup.
+        // Drop-all-recreate for pre-production, matching the previous voting DB migrations.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS imt_proofs;
+             DROP TABLE IF EXISTS share_delegations;
+             DROP TABLE IF EXISTS keystone_signatures;
+             DROP TABLE IF EXISTS votes;
+             DROP TABLE IF EXISTS witnesses;
+             DROP TABLE IF EXISTS proofs;
+             DROP TABLE IF EXISTS bundles;
+             DROP TABLE IF EXISTS cached_tree_state;
+             DROP TABLE IF EXISTS rounds;",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("migration to version 7 failed (drop): {}", e),
+        })?;
+        conn.execute_batch(include_str!("migrations/001_init.sql"))
+            .map_err(|e| VotingError::Internal {
+                message: format!("migration to version 7 failed (create): {}", e),
+            })?;
+        conn.pragma_update(None, "user_version", 7)
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to update database version: {}", e),
             })?;
