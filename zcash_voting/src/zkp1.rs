@@ -297,6 +297,11 @@ fn parse_merkle_path(witness: &WitnessData) -> Result<MerklePath, VotingError> {
 /// Constructs the circuit from wallet notes, Merkle witnesses, and
 /// IMT exclusion proofs (fetched via PIR), then generates a Halo2 proof.
 ///
+/// This legacy entry point derives the nullifier IMT root from the supplied
+/// real-note proofs. Use
+/// [`build_and_prove_delegation_with_expected_nf_imt_root`] when the active
+/// round's expected nullifier IMT root is available.
+///
 /// # Arguments
 ///
 /// - `full_notes`: 1–5 wallet notes (from `get_wallet_notes_at_snapshot`).
@@ -304,7 +309,6 @@ fn parse_merkle_path(witness: &WitnessData) -> Result<MerklePath, VotingError> {
 /// - `alpha_bytes`: 32-byte spend auth randomizer scalar.
 /// - `van_comm_rand_bytes`: 32-byte governance commitment blinding factor.
 /// - `vote_round_id_bytes`: 32-byte voting round identifier.
-/// - `expected_nf_imt_root_bytes`: 32-byte nullifier IMT root from the active round.
 /// - `merkle_witnesses`: Merkle inclusion proofs for each note (from `generate_note_witnesses`).
 /// - `imt_proofs`: Pre-fetched IMT exclusion proofs (one per real note, from PIR client).
 /// - `pir_client`: PIR client for fetching proofs for padded notes (None if 5 real notes).
@@ -312,6 +316,42 @@ fn parse_merkle_path(witness: &WitnessData) -> Result<MerklePath, VotingError> {
 /// - `progress`: Progress callback.
 #[allow(clippy::too_many_arguments)]
 pub fn build_and_prove_delegation(
+    full_notes: &[NoteInfo],
+    hotkey_raw_address: &[u8],
+    alpha_bytes: &[u8],
+    van_comm_rand_bytes: &[u8],
+    vote_round_id_bytes: &[u8],
+    merkle_witnesses: &[WitnessData],
+    imt_proofs: &[ImtProofData],
+    pir_client: Option<&PirClientBlocking>,
+    network_id: u32,
+    progress: &dyn ProofProgressReporter,
+    precomputed_randomness: Option<&PrecomputedRandomness>,
+) -> Result<DelegationProofResult, VotingError> {
+    let expected_nf_imt_root_bytes = imt_proofs
+        .first()
+        .map(|proof| proof.root.to_repr())
+        .unwrap_or([0u8; 32]);
+    build_and_prove_delegation_with_expected_nf_imt_root(
+        full_notes,
+        hotkey_raw_address,
+        alpha_bytes,
+        van_comm_rand_bytes,
+        vote_round_id_bytes,
+        &expected_nf_imt_root_bytes,
+        merkle_witnesses,
+        imt_proofs,
+        pir_client,
+        network_id,
+        progress,
+        precomputed_randomness,
+    )
+}
+
+/// Like [`build_and_prove_delegation`], but pins every IMT proof to an
+/// application-supplied expected nullifier IMT root.
+#[allow(clippy::too_many_arguments)]
+pub fn build_and_prove_delegation_with_expected_nf_imt_root(
     full_notes: &[NoteInfo],
     hotkey_raw_address: &[u8],
     alpha_bytes: &[u8],
@@ -761,7 +801,6 @@ mod tests {
             &[0u8; 32],
             &[0u8; 32],
             &[0u8; 32],
-            &[0u8; 32],
             &[],
             &[],
             None,
@@ -939,7 +978,7 @@ mod tests {
         println!("This will take a while (keygen + proving)...");
 
         let start = std::time::Instant::now();
-        let result = build_and_prove_delegation(
+        let result = build_and_prove_delegation_with_expected_nf_imt_root(
             &full_notes,
             &hotkey_raw_address,
             &alpha.to_repr(),

@@ -435,7 +435,7 @@ impl VotingDb {
             None
         };
 
-        let result = crate::zkp1::build_and_prove_delegation(
+        let result = crate::zkp1::build_and_prove_delegation_with_expected_nf_imt_root(
             &notes,
             hotkey_raw_address,
             &alpha,
