@@ -287,7 +287,7 @@ pub fn load_bundle_note_positions(
 // we persist two values needed for later proof steps:
 //   - van_comm_rand: the 32-byte blinding factor used in the VAN Poseidon hash.
 //     Needed again in ZKP #2 (vote commitment) to reconstruct the VAN as a witness.
-//   - dummy_nullifiers: random nullifiers generated for padded note slots (§1.3.5).
+//   - dummy_nullifiers: nullifiers generated for zero-value padded note slots (§1.3.5).
 //     Each is 32 bytes. Stored so the witness builder can reconstruct padded notes.
 
 /// Persist all delegation action data in a single UPDATE on the bundles table:
@@ -314,7 +314,7 @@ pub fn store_delegation_data(
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     pczt_sighash: &[u8],
 ) -> Result<(), VotingError> {
-    // Serialize dummy nullifiers as a flat byte blob: [nf0 (32 bytes) | nf1 | nf2 | ...].
+    // Serialize padded-note nullifiers as a flat byte blob: [nf0 (32 bytes) | nf1 | nf2 | ...].
     // Length 0 means no padding was needed (all 5 notes were real).
     // Length 32/64/96/128 means 1/2/3/4 dummy notes respectively.
     let dummy_blob: Vec<u8> = dummy_nullifiers

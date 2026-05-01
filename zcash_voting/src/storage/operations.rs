@@ -82,12 +82,9 @@ fn nullifier_imt_root_to_base(bytes: &[u8]) -> Result<pallas::Base, VotingError>
 /// does: `Note::from_parts(fvk.address_at(1000+i, External), NoteValue::ZERO,
 /// rho, rseed)` then `note.nullifier(&fvk)`.
 ///
-/// The values we store under `dummy_nullifiers` come from `make_dummy_note`,
-/// which uses `NoteValue::from_raw(1)` so Keystone renders the padded actions
-/// in the PCZT. The circuit pads with `NoteValue::ZERO`, so the nullifier
-/// the circuit asks the IMT provider for is *different* from what
-/// `dummy_nullifiers` stores. Caching by `dummy_nullifiers` would always miss
-/// at proof-gen time.
+/// The `dummy_nullifiers` DB column is populated from these same zero-value
+/// padded notes. This helper recomputes from the stored rho/rseed pairs so PIR
+/// precompute and proof generation share the exact circuit-side derivation.
 fn padded_nullifiers_for_circuit(
     notes: &[NoteInfo],
     padded_secrets: &[(Vec<u8>, Vec<u8>)],
@@ -395,9 +392,7 @@ impl VotingDb {
     ///
     /// The padded-slot nullifiers we cache are derived to match what the
     /// circuit builder asks for at proof-gen time (see
-    /// `padded_nullifiers_for_circuit`) — *not* the `dummy_nullifiers` column,
-    /// which stores the 1-zatoshi nullifiers used to make Keystone render the
-    /// PCZT actions and is unrelated to circuit padding.
+    /// `padded_nullifiers_for_circuit`).
     pub fn precompute_delegation_pir(
         &self,
         round_id: &str,
@@ -534,9 +529,8 @@ impl VotingDb {
         let rseed_output = queries::load_rseed_output(&conn, round_id, &wallet_id, bundle_index)?;
         let padded_secrets =
             queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
-        // These are the 0-zat circuit-side padded nullifiers, NOT the
-        // 1-zat `dummy_nullifiers` column populated by build_governance_pczt
-        // for Keystone's PCZT rendering. See padded_nullifiers_for_circuit.
+        // These are the zero-value circuit-side padded nullifiers derived
+        // from the Phase 1 padded-note rho/rseed pairs.
         let padded_nullifiers =
             padded_nullifiers_for_circuit(notes, &padded_secrets, network_id)?;
 

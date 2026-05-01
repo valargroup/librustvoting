@@ -75,7 +75,7 @@ pub struct DelegationAction {
     pub van: Vec<u8>,
     /// 32-byte blinding factor used for VAN (must be persisted for later use).
     pub van_comm_rand: Vec<u8>,
-    /// Random nullifiers used for padded dummy notes (needed for circuit witness in later steps).
+    /// Nullifiers for zero-value padded notes (needed for circuit witness in later steps).
     pub dummy_nullifiers: Vec<Vec<u8>>,
     /// Constrained rho for the signed note (32 bytes). Spec §1.3.4.1.
     pub rho_signed: Vec<u8>,
@@ -120,7 +120,7 @@ pub struct GovernancePczt {
     pub van: Vec<u8>,
     /// 32-byte blinding factor used for VAN (must be persisted for later use).
     pub van_comm_rand: Vec<u8>,
-    /// Random nullifiers used for padded dummy notes (needed for circuit witness).
+    /// Nullifiers for zero-value padded notes (needed for circuit witness).
     pub dummy_nullifiers: Vec<Vec<u8>>,
     /// Constrained rho for the signed note (32 bytes). Spec §1.3.4.1.
     pub rho_signed: Vec<u8>,

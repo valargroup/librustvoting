@@ -97,21 +97,32 @@ fn random_rseed(rng: &mut impl RngCore, rho: &Rho) -> (RandomSeed, [u8; 32]) {
     }
 }
 
-/// Construct a 1-zatoshi orchard Note at the given address with the given Rho.
-/// Value is 1 zatoshi so that Keystone renders the transaction on screen.
+/// Construct an Orchard note at the given address with the given value and Rho.
+fn make_note(
+    addr: Address,
+    value: NoteValue,
+    rho: Rho,
+    rng: &mut impl RngCore,
+) -> Result<(orchard::Note, [u8; 32]), VotingError> {
+    let (rseed, rseed_bytes) = random_rseed(rng, &rho);
+    let note = orchard::Note::from_parts(addr, value, rho, rseed);
+    if !bool::from(note.is_some()) {
+        return Err(VotingError::Internal {
+            message: "failed to construct note".to_string(),
+        });
+    }
+    Ok((note.expect("is_some checked above"), rseed_bytes))
+}
+
+/// Construct a 1-zatoshi Orchard note.
+///
+/// The signed note uses value 1 so Keystone renders a non-zero Orchard action.
 fn make_dummy_note(
     addr: Address,
     rho: Rho,
     rng: &mut impl RngCore,
 ) -> Result<(orchard::Note, [u8; 32]), VotingError> {
-    let (rseed, rseed_bytes) = random_rseed(rng, &rho);
-    let note = orchard::Note::from_parts(addr, NoteValue::from_raw(1), rho, rseed);
-    if !bool::from(note.is_some()) {
-        return Err(VotingError::Internal {
-            message: "failed to construct dummy note".to_string(),
-        });
-    }
-    Ok((note.expect("is_some checked above"), rseed_bytes))
+    make_note(addr, NoteValue::from_raw(1), rho, rng)
 }
 
 /// Canonical delegate action payload encoding for external signing.
@@ -234,7 +245,9 @@ pub fn build_governance_pczt(
         gov_nullifiers.push(gov_null);
     }
 
-    // Padded note generation (also collect rho+rseed for ZCA-74 randomness threading)
+    // Padded note generation (also collect rho+rseed for ZCA-74 randomness threading).
+    // These must match the delegation circuit builder exactly: unused note slots
+    // are zero-value notes at address index 1000+i.
     let mut padded_cmx: Vec<Vec<u8>> = Vec::new();
     let mut dummy_nullifiers: Vec<Vec<u8>> = Vec::new();
     let mut padded_note_secrets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -243,7 +256,7 @@ pub fn build_governance_pczt(
         for i in n_real..5 {
             let pad_addr = fvk.address_at(1000u32 + i as u32, Scope::External);
             let rho = random_rho(&mut rng);
-            let (pad_note, rseed_bytes) = make_dummy_note(pad_addr, rho, &mut rng)?;
+            let (pad_note, rseed_bytes) = make_note(pad_addr, NoteValue::ZERO, rho, &mut rng)?;
             let cmx: ExtractedNoteCommitment = pad_note.commitment().into();
             let real_nf = pad_note.nullifier(&fvk);
             let gov_null =
@@ -342,7 +355,8 @@ pub fn build_governance_pczt(
             message: format!("Builder::add_spend failed: {:?}", e),
         })?;
 
-    // Add output to hotkey address (1 zatoshi, with delegation memo)
+    // Add output to hotkey address. The circuit commits to a zero-value output
+    // note for cmx_new, so Phase 1 must use the same value and rseed.
     let ovk = fvk.to_ovk(Scope::External);
     let memo = {
         let zec_whole = total_weight / 100_000_000;
@@ -358,7 +372,7 @@ pub fn build_governance_pczt(
         buf
     };
     builder
-        .add_output(Some(ovk), hotkey_addr, NoteValue::from_raw(1), memo)
+        .add_output(Some(ovk), hotkey_addr, NoteValue::ZERO, memo)
         .map_err(|e| VotingError::Internal {
             message: format!("Builder::add_output failed: {:?}", e),
         })?;
@@ -755,6 +769,76 @@ mod tests {
         // The parsed PCZT should have 2 orchard actions (1 real + 1 padding)
         let pczt = parsed.unwrap();
         assert_eq!(pczt.orchard().actions().len(), 2);
+        let output_value = pczt
+            .orchard()
+            .actions()
+            .iter()
+            .find_map(|action| action.output().value().as_ref().copied())
+            .expect("PCZT should expose the output value");
+        assert_eq!(output_value, NoteValue::ZERO.inner());
+    }
+
+    #[test]
+    fn test_build_governance_pczt_padded_slots_match_circuit_zero_value_notes() {
+        let note = mock_note();
+        let params = mock_params();
+        let fvk_bytes = mock_fvk_bytes();
+        let result = build_governance_pczt(
+            &[note.clone()],
+            &params,
+            &fvk_bytes,
+            &mock_hotkey_address(),
+            NU5_BRANCH_ID,
+            MAINNET_COIN_TYPE,
+            &MOCK_SEED_FP,
+            MOCK_ACCOUNT,
+            "Test Round",
+        )
+        .unwrap();
+
+        let fvk_96: [u8; 96] = fvk_bytes.clone().try_into().unwrap();
+        let fvk = FullViewingKey::from_bytes(&fvk_96).unwrap();
+        let nk_bytes = &fvk_bytes[32..64];
+        let vote_round_id_bytes = hex::decode(&params.vote_round_id).unwrap();
+        let vri_32: [u8; 32] = vote_round_id_bytes.try_into().unwrap();
+        let dom = crate::governance::compute_nullifier_domain(&vri_32).unwrap();
+
+        assert_eq!(result.padded_cmx.len(), 4);
+        assert_eq!(result.dummy_nullifiers.len(), 4);
+        assert_eq!(result.padded_note_secrets.len(), 4);
+
+        for (i_pad, (rho_bytes, rseed_bytes)) in result.padded_note_secrets.iter().enumerate() {
+            let i_slot = 1 + i_pad;
+            let pad_addr = fvk.address_at((1000 + i_slot) as u32, Scope::External);
+            let rho_arr: [u8; 32] = rho_bytes.as_slice().try_into().unwrap();
+            let rseed_arr: [u8; 32] = rseed_bytes.as_slice().try_into().unwrap();
+            let rho = Rho::from_bytes(&rho_arr).unwrap();
+            let rseed = RandomSeed::from_bytes(rseed_arr, &rho).unwrap();
+            let pad_note =
+                orchard::Note::from_parts(pad_addr, NoteValue::ZERO, rho, rseed).unwrap();
+            let cmx: ExtractedNoteCommitment = pad_note.commitment().into();
+            let nf = pad_note.nullifier(&fvk);
+            let gov_null =
+                crate::governance::derive_gov_nullifier(nk_bytes, &dom, &nf.to_bytes()).unwrap();
+
+            assert_eq!(result.padded_cmx[i_pad], cmx.to_bytes().to_vec());
+            assert_eq!(result.dummy_nullifiers[i_pad], nf.to_bytes().to_vec());
+            assert_eq!(result.gov_nullifiers[i_slot], gov_null);
+        }
+
+        let mut all_cmx = vec![note.commitment];
+        all_cmx.extend(result.padded_cmx.iter().cloned());
+        let expected_rho_signed = crate::governance::compute_rho_binding(
+            &all_cmx[0],
+            &all_cmx[1],
+            &all_cmx[2],
+            &all_cmx[3],
+            &all_cmx[4],
+            &result.van,
+            &vri_32,
+        )
+        .unwrap();
+        assert_eq!(result.rho_signed, expected_rho_signed);
     }
 
     #[test]
