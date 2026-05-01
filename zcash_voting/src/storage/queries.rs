@@ -1,8 +1,9 @@
-use rusqlite::{named_params, Connection};
+use ff::PrimeField;
+use pasta_curves::pallas;
+use rusqlite::{named_params, Connection, OptionalExtension};
+use voting_circuits::delegation::imt::ImtProofData;
 
-use crate::storage::{
-    KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord,
-};
+use crate::storage::{KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord};
 use crate::types::{ShareDelegationRecord, VotingError, VotingRoundParams};
 
 // --- Rounds ---
@@ -91,7 +92,11 @@ pub fn load_round_params(
     })
 }
 
-pub fn get_round_state(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<RoundState, VotingError> {
+pub fn get_round_state(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<RoundState, VotingError> {
     let (phase_int, snapshot_height): (i32, i64) = conn
         .query_row(
             "SELECT phase, snapshot_height FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
@@ -226,7 +231,11 @@ pub fn insert_bundle(
 }
 
 /// Get the number of bundles for a round.
-pub fn get_bundle_count(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<u32, VotingError> {
+pub fn get_bundle_count(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<u32, VotingError> {
     conn.query_row(
         "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -358,7 +367,10 @@ pub fn store_delegation_data(
     // If no rows were updated, the bundle doesn't exist.
     if rows == 0 {
         return Err(VotingError::InvalidInput {
-            message: format!("bundle not found: round={}, bundle={}", round_id, bundle_index),
+            message: format!(
+                "bundle not found: round={}, bundle={}",
+                round_id, bundle_index
+            ),
         });
     }
 
@@ -366,7 +378,12 @@ pub fn store_delegation_data(
 }
 
 /// Load nf_signed (signed note nullifier, 32 bytes) for a bundle.
-pub fn load_nf_signed(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_nf_signed(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
         "SELECT nf_signed FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -378,7 +395,12 @@ pub fn load_nf_signed(conn: &Connection, round_id: &str, wallet_id: &str, bundle
 }
 
 /// Load cmx_new (output note commitment, 32 bytes) for a bundle.
-pub fn load_cmx_new(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_cmx_new(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
         "SELECT cmx_new FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -390,7 +412,12 @@ pub fn load_cmx_new(conn: &Connection, round_id: &str, wallet_id: &str, bundle_i
 }
 
 /// Load alpha (spend auth randomizer scalar, 32 bytes) for a bundle.
-pub fn load_alpha(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_alpha(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
         "SELECT alpha FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -402,7 +429,12 @@ pub fn load_alpha(conn: &Connection, round_id: &str, wallet_id: &str, bundle_ind
 }
 
 /// Load signed note rseed (32 bytes) for a bundle.
-pub fn load_rseed_signed(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_rseed_signed(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
         "SELECT rseed_signed FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -414,7 +446,12 @@ pub fn load_rseed_signed(conn: &Connection, round_id: &str, wallet_id: &str, bun
 }
 
 /// Load output note rseed (32 bytes) for a bundle.
-pub fn load_rseed_output(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_rseed_output(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
         "SELECT rseed_output FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -475,7 +512,12 @@ pub fn load_pczt_sighash(
 }
 
 /// Load the VAN blinding factor for a bundle. Needed as a private witness in ZKP #2.
-pub fn load_van_comm_rand(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_van_comm_rand(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
         "SELECT van_comm_rand FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -519,7 +561,12 @@ pub fn load_dummy_nullifiers(
 // --- Rho & Padded Note Data ---
 
 /// Load rho_signed for a bundle (32-byte constrained rho).
-pub fn load_rho_signed(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<u8>, VotingError> {
+pub fn load_rho_signed(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
         "SELECT rho_signed FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -531,7 +578,12 @@ pub fn load_rho_signed(conn: &Connection, round_id: &str, wallet_id: &str, bundl
 }
 
 /// Load padded note cmx data. Returns 0-3 entries of 32 bytes each.
-pub fn load_padded_cmx(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<Vec<u8>>, VotingError> {
+pub fn load_padded_cmx(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<Vec<u8>>, VotingError> {
     let blob: Vec<u8> = conn
         .query_row(
             "SELECT padded_note_data FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
@@ -657,14 +709,22 @@ pub fn store_van_position(
         })?;
     if rows == 0 {
         return Err(VotingError::InvalidInput {
-            message: format!("bundle not found: round={}, bundle={}", round_id, bundle_index),
+            message: format!(
+                "bundle not found: round={}, bundle={}",
+                round_id, bundle_index
+            ),
         });
     }
     Ok(())
 }
 
 /// Load the VAN leaf position for witness generation.
-pub fn load_van_position(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<u32, VotingError> {
+pub fn load_van_position(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<u32, VotingError> {
     conn.query_row(
         "SELECT van_leaf_position FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -720,7 +780,10 @@ pub fn store_proof_result_fields(
 
     if rows == 0 {
         return Err(VotingError::InvalidInput {
-            message: format!("bundle not found: round={}, bundle={}", round_id, bundle_index),
+            message: format!(
+                "bundle not found: round={}, bundle={}",
+                round_id, bundle_index
+            ),
         });
     }
 
@@ -826,7 +889,11 @@ pub fn store_tree_state(
     Ok(())
 }
 
-pub fn load_tree_state(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<Vec<u8>, VotingError> {
+pub fn load_tree_state(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<u8>, VotingError> {
     conn.query_row(
         "SELECT tree_state FROM cached_tree_state WHERE round_id = :round_id AND wallet_id = :wallet_id",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -840,7 +907,12 @@ pub fn load_tree_state(conn: &Connection, round_id: &str, wallet_id: &str) -> Re
 // --- Witnesses (Merkle inclusion proofs for Orchard notes) ---
 
 /// Check if witnesses are already cached for a bundle.
-pub fn has_witnesses(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<bool, VotingError> {
+pub fn has_witnesses(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<bool, VotingError> {
     conn.query_row(
         "SELECT COUNT(*) FROM witnesses WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -893,7 +965,12 @@ pub fn store_witnesses(
 }
 
 /// Load cached witnesses for a bundle, ordered by position.
-pub fn load_witnesses(conn: &Connection, round_id: &str, wallet_id: &str, bundle_index: u32) -> Result<Vec<crate::types::WitnessData>, VotingError> {
+pub fn load_witnesses(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<crate::types::WitnessData>, VotingError> {
     let mut stmt = conn
         .prepare(
             "SELECT note_position, note_commitment, root, auth_path FROM witnesses
@@ -945,6 +1022,134 @@ pub fn load_witnesses(conn: &Connection, round_id: &str, wallet_id: &str, bundle
             })
         })
         .collect()
+}
+
+// --- PIR-backed IMT non-membership proof cache ---
+
+fn field_to_bytes(value: pallas::Base) -> Vec<u8> {
+    value.to_repr().to_vec()
+}
+
+fn field_from_bytes(bytes: &[u8], name: &str) -> Result<pallas::Base, VotingError> {
+    let arr: [u8; 32] = bytes.try_into().map_err(|_| VotingError::Internal {
+        message: format!("{name} must be 32 bytes, got {}", bytes.len()),
+    })?;
+    Option::from(pallas::Base::from_repr(arr)).ok_or_else(|| VotingError::Internal {
+        message: format!("{name} is not a valid Pallas field element"),
+    })
+}
+
+fn fields_to_blob(values: impl IntoIterator<Item = pallas::Base>) -> Vec<u8> {
+    values
+        .into_iter()
+        .flat_map(|value| field_to_bytes(value).into_iter())
+        .collect()
+}
+
+fn fields_from_blob<const N: usize>(
+    blob: &[u8],
+    name: &str,
+) -> Result<[pallas::Base; N], VotingError> {
+    let expected_len = N * 32;
+    if blob.len() != expected_len {
+        return Err(VotingError::Internal {
+            message: format!("{name} must be {expected_len} bytes, got {}", blob.len()),
+        });
+    }
+
+    let fields: Vec<pallas::Base> = blob
+        .chunks_exact(32)
+        .enumerate()
+        .map(|(idx, chunk)| field_from_bytes(chunk, &format!("{name}[{idx}]")))
+        .collect::<Result<_, _>>()?;
+
+    fields.try_into().map_err(|_| VotingError::Internal {
+        message: format!("{name} did not decode to {N} field elements"),
+    })
+}
+
+pub fn store_imt_proof(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    nullifier: &[u8],
+    proof: &ImtProofData,
+) -> Result<(), VotingError> {
+    let root = field_to_bytes(proof.root);
+    let nf_bounds = fields_to_blob(proof.nf_bounds);
+    let path = fields_to_blob(proof.path);
+
+    conn.execute(
+        "INSERT INTO imt_proofs (round_id, wallet_id, bundle_index, nullifier, root, nf_bounds, leaf_pos, path, created_at)
+         VALUES (:round_id, :wallet_id, :bundle_index, :nullifier, :root, :nf_bounds, :leaf_pos, :path, strftime('%s','now'))
+         ON CONFLICT(round_id, wallet_id, bundle_index, nullifier)
+         DO UPDATE SET root = :root, nf_bounds = :nf_bounds, leaf_pos = :leaf_pos, path = :path, created_at = strftime('%s','now')",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":nullifier": nullifier,
+            ":root": root,
+            ":nf_bounds": nf_bounds,
+            ":leaf_pos": proof.leaf_pos as i64,
+            ":path": path,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to store IMT proof for bundle {bundle_index}: {e}"),
+    })?;
+    Ok(())
+}
+
+pub fn load_imt_proof(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    nullifier: &[u8],
+    expected_root: &[u8],
+) -> Result<Option<ImtProofData>, VotingError> {
+    let row = conn
+        .query_row(
+            "SELECT root, nf_bounds, leaf_pos, path FROM imt_proofs
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index AND nullifier = :nullifier",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":nullifier": nullifier,
+            },
+            |row| {
+                let root: Vec<u8> = row.get(0)?;
+                let nf_bounds: Vec<u8> = row.get(1)?;
+                let leaf_pos: i64 = row.get(2)?;
+                let path: Vec<u8> = row.get(3)?;
+                Ok((root, nf_bounds, leaf_pos, path))
+            },
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load IMT proof for bundle {bundle_index}: {e}"),
+        })?;
+
+    let Some((root, nf_bounds, leaf_pos, path)) = row else {
+        return Ok(None);
+    };
+
+    if root != expected_root {
+        return Ok(None);
+    }
+
+    Ok(Some(ImtProofData {
+        root: field_from_bytes(&root, "imt_proof.root")?,
+        nf_bounds: fields_from_blob::<3>(&nf_bounds, "imt_proof.nf_bounds")?,
+        leaf_pos: u32::try_from(leaf_pos).map_err(|_| VotingError::Internal {
+            message: format!("invalid IMT proof leaf_pos {leaf_pos}"),
+        })?,
+        path: fields_from_blob::<29>(&path, "imt_proof.path")?,
+    }))
 }
 
 // --- Proofs ---
@@ -1009,7 +1214,11 @@ pub fn store_vote(
 }
 
 /// Get all votes for a round (across all bundles).
-pub fn get_votes(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<Vec<VoteRecord>, VotingError> {
+pub fn get_votes(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<VoteRecord>, VotingError> {
     let mut stmt = conn
         .prepare("SELECT proposal_id, bundle_index, choice, submitted FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id")
         .map_err(|e| VotingError::Internal {
@@ -1017,14 +1226,17 @@ pub fn get_votes(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<V
         })?;
 
     let votes = stmt
-        .query_map(named_params! { ":round_id": round_id, ":wallet_id": wallet_id }, |row| {
-            Ok(VoteRecord {
-                proposal_id: row.get::<_, i64>(0)? as u32,
-                bundle_index: row.get::<_, i64>(1)? as u32,
-                choice: row.get::<_, i64>(2)? as u32,
-                submitted: row.get::<_, i64>(3)? != 0,
-            })
-        })
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok(VoteRecord {
+                    proposal_id: row.get::<_, i64>(0)? as u32,
+                    bundle_index: row.get::<_, i64>(1)? as u32,
+                    choice: row.get::<_, i64>(2)? as u32,
+                    submitted: row.get::<_, i64>(3)? != 0,
+                })
+            },
+        )
         .map_err(|e| VotingError::Internal {
             message: format!("failed to get votes: {}", e),
         })?
@@ -1449,10 +1661,19 @@ fn load_share_delegations(
 
     let mut results = Vec::new();
     for row in rows {
-        let (bundle_index, proposal_id, share_index, urls_json, nullifier, confirmed, submit_at, created_at, round_id_val) =
-            row.map_err(|e| VotingError::Internal {
-                message: format!("failed to read share delegation row: {}", e),
-            })?;
+        let (
+            bundle_index,
+            proposal_id,
+            share_index,
+            urls_json,
+            nullifier,
+            confirmed,
+            submit_at,
+            created_at,
+            round_id_val,
+        ) = row.map_err(|e| VotingError::Internal {
+            message: format!("failed to read share delegation row: {}", e),
+        })?;
         let sent_to_urls: Vec<String> =
             serde_json::from_str(&urls_json).map_err(|e| VotingError::Internal {
                 message: format!("failed to deserialize sent_to_urls: {}", e),

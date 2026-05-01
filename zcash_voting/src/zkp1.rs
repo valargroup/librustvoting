@@ -8,11 +8,6 @@ use halo2_proofs::{
     transcript::{Blake2bWrite, Challenge255},
 };
 use incrementalmerkletree::Hashable;
-use voting_circuits::delegation::{
-    builder::{build_delegation_bundle, PrecomputedRandomness, RealNoteInput},
-    circuit::Circuit as DelegationCircuit,
-    imt::{ImtError, ImtProofData, ImtProvider},
-};
 use orchard::{
     keys::{Diversifier, FullViewingKey, Scope},
     note::{RandomSeed, Rho},
@@ -22,12 +17,17 @@ use orchard::{
 };
 use pasta_curves::{pallas, vesta};
 use rand::rngs::OsRng;
+use voting_circuits::delegation::{
+    builder::{build_delegation_bundle, PrecomputedRandomness, RealNoteInput},
+    circuit::Circuit as DelegationCircuit,
+    imt::{ImtError, ImtProofData, ImtProvider},
+};
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::Network;
 
 use crate::types::{
-    ct_option_to_result, validate_32_bytes, DelegationProofResult, NoteInfo,
-    ProofProgressReporter, VotingError, WitnessData,
+    ct_option_to_result, validate_32_bytes, DelegationProofResult, NoteInfo, ProofProgressReporter,
+    VotingError, WitnessData,
 };
 
 /// Circuit size parameter. Matches the value used in delegation builder/circuit tests.
@@ -35,10 +35,8 @@ const K: u32 = 14;
 
 // Cached proving key — keygen is deterministic and expensive (~5 min on simulator,
 // ~30s on device). Compute once per process and reuse for all subsequent proofs.
-static DELEGATION_PK_CACHE: OnceLock<(
-    Params<vesta::Affine>,
-    plonk::ProvingKey<vesta::Affine>,
-)> = OnceLock::new();
+static DELEGATION_PK_CACHE: OnceLock<(Params<vesta::Affine>, plonk::ProvingKey<vesta::Affine>)> =
+    OnceLock::new();
 
 fn compute_delegation_proving_key() -> (Params<vesta::Affine>, plonk::ProvingKey<vesta::Affine>) {
     let params = Params::new(K);
@@ -49,7 +47,8 @@ fn compute_delegation_proving_key() -> (Params<vesta::Affine>, plonk::ProvingKey
     (params, pk)
 }
 
-fn get_delegation_proving_key() -> &'static (Params<vesta::Affine>, plonk::ProvingKey<vesta::Affine>) {
+fn get_delegation_proving_key() -> &'static (Params<vesta::Affine>, plonk::ProvingKey<vesta::Affine>)
+{
     DELEGATION_PK_CACHE.get_or_init(|| {
         // Delegation keygen can be stack-hungry with larger circuits.
         // Run it on a dedicated thread with an explicit large stack to avoid
@@ -68,6 +67,11 @@ fn get_delegation_proving_key() -> &'static (Params<vesta::Affine>, plonk::Provi
 /// Warm the process-lifetime delegation proving-key cache.
 pub fn warm_delegation_proving_key() {
     let _ = get_delegation_proving_key();
+}
+
+/// Warm the process-lifetime ZKP #1 proving key cache.
+pub fn warm_proving_cache() {
+    warm_delegation_proving_key();
 }
 
 // ================================================================
@@ -306,6 +310,8 @@ fn parse_merkle_path(witness: &WitnessData) -> Result<MerklePath, VotingError> {
 /// - `vote_round_id_bytes`: 32-byte voting round identifier.
 /// - `merkle_witnesses`: Merkle inclusion proofs for each note (from `generate_note_witnesses`).
 /// - `imt_proofs`: Pre-fetched IMT exclusion proofs (one per real note, from PIR client).
+/// - `extra_imt_proofs`: Additional pre-fetched IMT proofs keyed by nullifier,
+///   currently used for padded dummy notes.
 /// - `pir_client`: PIR client for fetching proofs for padded notes (None if 5 real notes).
 /// - `network_id`: 0 = mainnet, 1 = testnet (for UFVK decoding).
 /// - `progress`: Progress callback.
@@ -318,6 +324,7 @@ pub fn build_and_prove_delegation(
     vote_round_id_bytes: &[u8],
     merkle_witnesses: &[WitnessData],
     imt_proofs: &[ImtProofData],
+    extra_imt_proofs: &[([u8; 32], ImtProofData)],
     pir_client: Option<&PirClientBlocking>,
     network_id: u32,
     progress: &dyn ProofProgressReporter,
@@ -381,6 +388,9 @@ pub fn build_and_prove_delegation(
     // Reconstruct notes and parse Merkle paths + IMT proofs.
     let mut real_inputs = Vec::with_capacity(n);
     let mut imt_cache = HashMap::new();
+    for (nf, proof) in extra_imt_proofs {
+        imt_cache.insert(*nf, proof.clone());
+    }
     let mut shared_fvk: Option<FullViewingKey> = None;
     let mut nc_root: Option<pallas::Base> = None;
     let mut nf_imt_root: Option<pallas::Base> = None;
@@ -554,9 +564,8 @@ mod tests {
     use halo2_gadgets::poseidon::primitives::{self as poseidon, ConstantLength};
     use incrementalmerkletree::{Hashable, Level};
     use orchard::{
-        keys::Scope, note::commitment::ExtractedNoteCommitment, note::Rho,
-        tree::MerkleHashOrchard, value::NoteValue,
-        NOTE_COMMITMENT_TREE_DEPTH as TEST_TREE_DEPTH,
+        keys::Scope, note::commitment::ExtractedNoteCommitment, note::Rho, tree::MerkleHashOrchard,
+        value::NoteValue, NOTE_COMMITMENT_TREE_DEPTH as TEST_TREE_DEPTH,
     };
     use voting_circuits::delegation::imt::IMT_DEPTH as TEST_IMT_DEPTH;
 
@@ -588,7 +597,11 @@ mod tests {
 
     /// Precomputed empty subtree hashes for the test IMT.
     fn empty_imt_hashes() -> Vec<pallas::Base> {
-        let empty_leaf = poseidon3(pallas::Base::zero(), pallas::Base::zero(), pallas::Base::zero());
+        let empty_leaf = poseidon3(
+            pallas::Base::zero(),
+            pallas::Base::zero(),
+            pallas::Base::zero(),
+        );
         let mut hashes = vec![empty_leaf];
         for _ in 1..=TEST_IMT_DEPTH {
             let prev = *hashes.last().unwrap();
@@ -639,7 +652,11 @@ mod tests {
             }
 
             // Build 32-leaf subtree. Each leaf is Poseidon3(nf_lo, nf_mid, nf_hi).
-            let empty_leaf_hash = poseidon3(pallas::Base::zero(), pallas::Base::zero(), pallas::Base::zero());
+            let empty_leaf_hash = poseidon3(
+                pallas::Base::zero(),
+                pallas::Base::zero(),
+                pallas::Base::zero(),
+            );
             let mut level0 = vec![empty_leaf_hash; 32];
             for (k, [lo, mid, hi]) in leaves.iter().enumerate() {
                 level0[k] = poseidon3(*lo, *mid, *hi);
@@ -672,9 +689,11 @@ mod tests {
         fn proof(&self, nf: pallas::Base) -> ImtProofData {
             // Find the punctured range containing this nullifier:
             // nf_lo < nf < nf_hi and nf != nf_mid.
-            let k = self.leaves.iter().position(|[lo, mid, hi]| {
-                *lo < nf && nf < *hi && nf != *mid
-            }).expect("nullifier must fall in some punctured range");
+            let k = self
+                .leaves
+                .iter()
+                .position(|[lo, mid, hi]| *lo < nf && nf < *hi && nf != *mid)
+                .expect("nullifier must fall in some punctured range");
 
             let empties = empty_imt_hashes();
 
@@ -760,6 +779,7 @@ mod tests {
             &[0u8; 32],
             &[0u8; 32],
             &[0u8; 32],
+            &[],
             &[],
             &[],
             None,
@@ -945,6 +965,7 @@ mod tests {
             &vote_round_id.to_repr(),
             &merkle_witnesses,
             &imt_proofs,
+            &[],
             None, // 5 notes = no padding, no PIR client needed
             0,    // mainnet
             &reporter,

@@ -311,6 +311,15 @@ pub struct DelegationProofResult {
     pub rk: Vec<u8>,
 }
 
+/// Result of pre-fetching PIR-backed IMT non-membership proofs for ZKP #1.
+#[derive(Clone, Debug)]
+pub struct DelegationPirPrecomputeResult {
+    /// Number of nullifier proofs that were already cached for this bundle.
+    pub cached_count: u32,
+    /// Number of nullifier proofs fetched from the PIR server during this call.
+    pub fetched_count: u32,
+}
+
 /// Merkle witness for a note in the Orchard commitment tree.
 #[derive(Clone, Debug)]
 pub struct WitnessData {

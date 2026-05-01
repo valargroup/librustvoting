@@ -72,6 +72,20 @@ CREATE TABLE witnesses (
     FOREIGN KEY (round_id, wallet_id, bundle_index) REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
 );
 
+CREATE TABLE imt_proofs (
+    round_id       TEXT NOT NULL,
+    wallet_id      TEXT NOT NULL DEFAULT '',
+    bundle_index   INTEGER NOT NULL,
+    nullifier      BLOB NOT NULL,
+    root           BLOB NOT NULL,
+    nf_bounds      BLOB NOT NULL,
+    leaf_pos       INTEGER NOT NULL,
+    path           BLOB NOT NULL,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (round_id, wallet_id, bundle_index, nullifier),
+    FOREIGN KEY (round_id, wallet_id, bundle_index) REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
+);
+
 CREATE TABLE votes (
     id              INTEGER PRIMARY KEY,
     round_id        TEXT NOT NULL,
