@@ -54,8 +54,12 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
     if version < 3 {
         // v3: delegation data moved from rounds to bundles table, witnesses
         // gained bundle_index. Drop everything and recreate from 001_init.sql.
+        // The drop list must cover every table in 001_init.sql so a fresh DB
+        // can chain through later drop-all migrations without colliding on a
+        // newer table introduced by a subsequent version.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS share_delegations;
+            "DROP TABLE IF EXISTS imt_proofs;
+             DROP TABLE IF EXISTS share_delegations;
              DROP TABLE IF EXISTS keystone_signatures;
              DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
@@ -81,7 +85,8 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
         // v4: add wallet_id column for per-wallet state isolation.
         // Drop everything and recreate from 001_init.sql.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS share_delegations;
+            "DROP TABLE IF EXISTS imt_proofs;
+             DROP TABLE IF EXISTS share_delegations;
              DROP TABLE IF EXISTS keystone_signatures;
              DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
@@ -108,7 +113,8 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
         // bundles (delegation_tx_hash) and votes (tx_hash, vc_tree_position,
         // commitment_bundle_json). Drop-all-recreate for pre-production.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS share_delegations;
+            "DROP TABLE IF EXISTS imt_proofs;
+             DROP TABLE IF EXISTS share_delegations;
              DROP TABLE IF EXISTS keystone_signatures;
              DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
@@ -135,7 +141,8 @@ pub fn migrate(conn: &Connection) -> Result<(), VotingError> {
         // add submit_at column for share timing tracking.
         // Drop-all-recreate for pre-production.
         conn.execute_batch(
-            "DROP TABLE IF EXISTS share_delegations;
+            "DROP TABLE IF EXISTS imt_proofs;
+             DROP TABLE IF EXISTS share_delegations;
              DROP TABLE IF EXISTS keystone_signatures;
              DROP TABLE IF EXISTS votes;
              DROP TABLE IF EXISTS witnesses;
