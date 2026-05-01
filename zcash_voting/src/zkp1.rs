@@ -65,6 +65,11 @@ fn get_delegation_proving_key() -> &'static (Params<vesta::Affine>, plonk::Provi
     })
 }
 
+/// Warm the process-lifetime delegation proving-key cache.
+pub fn warm_delegation_proving_key() {
+    let _ = get_delegation_proving_key();
+}
+
 // ================================================================
 // PIR-backed IMT Provider
 // ================================================================
