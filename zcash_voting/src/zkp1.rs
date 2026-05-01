@@ -78,8 +78,6 @@ pub fn warm_proving_cache() {
 // PIR-backed IMT Provider
 // ================================================================
 
-use pir_client::PirClientBlocking;
-
 /// Convert a PIR-crate `ImtProofData` into the circuit-crate `ImtProofData`.
 /// Both use the K=2 punctured-range format with `nf_bounds = [nf_lo, nf_mid, nf_hi]`.
 pub fn convert_pir_proof(pir: pir_client::ImtProofData) -> ImtProofData {
@@ -126,15 +124,13 @@ pub(crate) fn validate_and_convert_pir_proof(
     Ok(convert_pir_proof(proof))
 }
 
-/// IMT provider that wraps pre-fetched proofs for real notes and
-/// fetches proofs for padded notes on-the-fly via PIR.
-struct PirImtProvider<'a> {
+/// IMT provider that wraps pre-fetched proofs for real and padded notes.
+struct PirImtProvider {
     root: pallas::Base,
     cached: HashMap<[u8; 32], ImtProofData>,
-    pir_client: Option<&'a PirClientBlocking>,
 }
 
-impl ImtProvider for PirImtProvider<'_> {
+impl ImtProvider for PirImtProvider {
     fn root(&self) -> pallas::Base {
         self.root
     }
@@ -144,15 +140,10 @@ impl ImtProvider for PirImtProvider<'_> {
         if let Some(proof) = self.cached.get(&key) {
             return Ok(proof.clone());
         }
-        // Fetch from PIR server for padded notes (whose nullifiers weren't known in advance).
-        let client = self
-            .pir_client
-            .ok_or_else(|| ImtError("PIR client not available for padded note proof".into()))?;
-        let pir_proof = client
-            .fetch_proof(nf)
-            .map_err(|e| ImtError(format!("PIR fetch failed: {e}")))?;
-        validate_pir_proof_raw(&pir_proof, nf, self.root).map_err(ImtError)?;
-        Ok(convert_pir_proof(pir_proof))
+        Err(ImtError(format!(
+            "missing precomputed IMT proof for nullifier {}",
+            base_hex(nf)
+        )))
     }
 }
 
@@ -312,7 +303,6 @@ fn parse_merkle_path(witness: &WitnessData) -> Result<MerklePath, VotingError> {
 /// - `imt_proofs`: Pre-fetched IMT exclusion proofs (one per real note, from PIR client).
 /// - `extra_imt_proofs`: Additional pre-fetched IMT proofs keyed by nullifier,
 ///   currently used for padded dummy notes.
-/// - `pir_client`: PIR client for fetching proofs for padded notes (None if 5 real notes).
 /// - `network_id`: 0 = mainnet, 1 = testnet (for UFVK decoding).
 /// - `progress`: Progress callback.
 #[allow(clippy::too_many_arguments)]
@@ -325,7 +315,6 @@ pub fn build_and_prove_delegation(
     merkle_witnesses: &[WitnessData],
     imt_proofs: &[ImtProofData],
     extra_imt_proofs: &[([u8; 32], ImtProofData)],
-    pir_client: Option<&PirClientBlocking>,
     network_id: u32,
     progress: &dyn ProofProgressReporter,
     precomputed_randomness: Option<&PrecomputedRandomness>,
@@ -459,11 +448,10 @@ pub fn build_and_prove_delegation(
     let nc_root = nc_root.expect("guaranteed by n >= 1 check");
     let nf_imt_root = nf_imt_root.expect("guaranteed by n >= 1 check");
 
-    // Create IMT provider: pre-fetched proofs for real notes, PIR for padded notes.
+    // Create IMT provider from pre-fetched proofs for real and padded notes.
     let imt_provider = PirImtProvider {
         root: nf_imt_root,
         cached: imt_cache,
-        pir_client,
     };
 
     // Build the delegation bundle (circuit + instance).
@@ -782,7 +770,6 @@ mod tests {
             &[],
             &[],
             &[],
-            None,
             0,
             &reporter,
             None,
@@ -966,8 +953,7 @@ mod tests {
             &merkle_witnesses,
             &imt_proofs,
             &[],
-            None, // 5 notes = no padding, no PIR client needed
-            0,    // mainnet
+            0, // mainnet
             &reporter,
             None,
         )

@@ -581,7 +581,6 @@ impl VotingDb {
             &ordered_witnesses,
             &imt_proofs,
             &extra_imt_proofs,
-            None,
             network_id,
             progress,
             precomputed.as_ref(),
