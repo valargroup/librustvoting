@@ -21,11 +21,22 @@ pub use types::*;
 pub fn warm_proving_caches() {
     const KEYGEN_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-    std::thread::Builder::new()
-        .name("voting-delegation-cache-warmup".to_string())
-        .stack_size(KEYGEN_STACK_BYTES)
-        .spawn(zkp1::warm_delegation_proving_key)
-        .expect("spawn delegation proving cache warm-up thread")
-        .join()
-        .expect("proving cache warm-up thread panicked");
+    let handles = [
+        std::thread::Builder::new()
+            .name("voting-delegation-cache-warmup".to_string())
+            .stack_size(KEYGEN_STACK_BYTES)
+            .spawn(zkp1::warm_delegation_proving_key)
+            .expect("spawn delegation proving cache warm-up thread"),
+        std::thread::Builder::new()
+            .name("voting-vote-proof-cache-warmup".to_string())
+            .stack_size(KEYGEN_STACK_BYTES)
+            .spawn(voting_circuits::vote_proof::warm_vote_proof_keys)
+            .expect("spawn vote proof cache warm-up thread"),
+    ];
+
+    for handle in handles {
+        handle
+            .join()
+            .expect("proving cache warm-up thread panicked");
+    }
 }
