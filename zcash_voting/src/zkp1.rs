@@ -87,6 +87,41 @@ pub fn convert_pir_proof(pir: pir_client::ImtProofData) -> ImtProofData {
     }
 }
 
+fn base_hex(value: pallas::Base) -> String {
+    hex::encode(value.to_repr())
+}
+
+fn validate_pir_proof_raw(
+    proof: &pir_client::ImtProofData,
+    nullifier: pallas::Base,
+    expected_root: pallas::Base,
+) -> Result<(), String> {
+    if !proof.verify(nullifier) {
+        return Err(
+            "PIR proof verification failed: Merkle path/root does not authenticate queried nullifier"
+                .to_string(),
+        );
+    }
+    if proof.root != expected_root {
+        return Err(format!(
+            "PIR proof root mismatch: expected {}, got {}",
+            base_hex(expected_root),
+            base_hex(proof.root)
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_and_convert_pir_proof(
+    proof: pir_client::ImtProofData,
+    nullifier: pallas::Base,
+    expected_root: pallas::Base,
+) -> Result<ImtProofData, VotingError> {
+    validate_pir_proof_raw(&proof, nullifier, expected_root)
+        .map_err(|message| VotingError::Internal { message })?;
+    Ok(convert_pir_proof(proof))
+}
+
 /// IMT provider that wraps pre-fetched proofs for real notes and
 /// fetches proofs for padded notes on-the-fly via PIR.
 struct PirImtProvider<'a> {
@@ -112,6 +147,7 @@ impl ImtProvider for PirImtProvider<'_> {
         let pir_proof = client
             .fetch_proof(nf)
             .map_err(|e| ImtError(format!("PIR fetch failed: {e}")))?;
+        validate_pir_proof_raw(&pir_proof, nf, self.root).map_err(ImtError)?;
         Ok(convert_pir_proof(pir_proof))
     }
 }
@@ -660,6 +696,56 @@ mod tests {
                 path,
             }
         }
+    }
+
+    fn raw_pir_proof(proof: ImtProofData) -> pir_client::ImtProofData {
+        pir_client::ImtProofData {
+            root: proof.root,
+            nf_bounds: proof.nf_bounds,
+            leaf_pos: proof.leaf_pos,
+            path: proof.path,
+        }
+    }
+
+    #[test]
+    fn validate_and_convert_pir_proof_accepts_valid_proof() {
+        let imt = TestImt::new();
+        let nf = imt.leaves[0][0] + pallas::Base::one();
+        let proof = raw_pir_proof(imt.proof(nf));
+
+        let converted = validate_and_convert_pir_proof(proof, nf, imt.root).unwrap();
+
+        assert_eq!(converted.root, imt.root);
+    }
+
+    #[test]
+    fn validate_and_convert_pir_proof_rejects_unverified_path() {
+        let imt = TestImt::new();
+        let nf = imt.leaves[0][0] + pallas::Base::one();
+        let proof = raw_pir_proof(imt.proof(nf));
+        let boundary_value = imt.leaves[0][0];
+
+        let err = validate_and_convert_pir_proof(proof, boundary_value, imt.root).unwrap_err();
+
+        assert!(
+            err.to_string().contains("PIR proof verification failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_and_convert_pir_proof_rejects_wrong_root() {
+        let imt = TestImt::new();
+        let nf = imt.leaves[0][0] + pallas::Base::one();
+        let proof = raw_pir_proof(imt.proof(nf));
+        let wrong_root = imt.root + pallas::Base::one();
+
+        let err = validate_and_convert_pir_proof(proof, nf, wrong_root).unwrap_err();
+
+        assert!(
+            err.to_string().contains("PIR proof root mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
