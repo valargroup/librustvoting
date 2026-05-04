@@ -7,5 +7,6 @@
 //! Used by the `vote-tree-cli` binary and available as a library for
 //! integration in other Rust tools.
 
+#[cfg(feature = "http")]
 pub mod http_sync_api;
 pub mod types;
