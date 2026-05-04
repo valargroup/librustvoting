@@ -3203,7 +3203,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_voting"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "blake2b_simd",
  "ff",

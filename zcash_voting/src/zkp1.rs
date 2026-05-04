@@ -80,6 +80,7 @@ pub fn warm_proving_cache() {
 
 /// Convert a PIR-crate `ImtProofData` into the circuit-crate `ImtProofData`.
 /// Both use the K=2 punctured-range format with `nf_bounds = [nf_lo, nf_mid, nf_hi]`.
+#[cfg(feature = "client")]
 pub fn convert_pir_proof(pir: pir_client::ImtProofData) -> ImtProofData {
     ImtProofData {
         root: pir.root,
@@ -93,6 +94,7 @@ fn base_hex(value: pallas::Base) -> String {
     hex::encode(value.to_repr())
 }
 
+#[cfg(feature = "client")]
 fn validate_pir_proof_raw(
     proof: &pir_client::ImtProofData,
     nullifier: pallas::Base,
@@ -114,6 +116,7 @@ fn validate_pir_proof_raw(
     Ok(())
 }
 
+#[cfg(feature = "client")]
 pub(crate) fn validate_and_convert_pir_proof(
     proof: pir_client::ImtProofData,
     nullifier: pallas::Base,
@@ -705,6 +708,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "client")]
     fn raw_pir_proof(proof: ImtProofData) -> pir_client::ImtProofData {
         pir_client::ImtProofData {
             root: proof.root,
@@ -714,6 +718,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "client")]
     #[test]
     fn validate_and_convert_pir_proof_accepts_valid_proof() {
         let imt = TestImt::new();
@@ -725,6 +730,7 @@ mod tests {
         assert_eq!(converted.root, imt.root);
     }
 
+    #[cfg(feature = "client")]
     #[test]
     fn validate_and_convert_pir_proof_rejects_unverified_path() {
         let imt = TestImt::new();
@@ -740,6 +746,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "client")]
     #[test]
     fn validate_and_convert_pir_proof_rejects_wrong_root() {
         let imt = TestImt::new();

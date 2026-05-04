@@ -1,3 +1,10 @@
+// The PIR-RPC helpers and orchestration methods at the top of this file are
+// gated behind the `client` feature. When that feature is off, several
+// imports below are only reachable from `#[cfg(test)]` code, which is fine
+// for `cargo test` but trips `unused_imports` on `cargo check`. Silence that
+// narrow case rather than fragment the imports along feature/test lines.
+#![cfg_attr(not(feature = "client"), allow(unused_imports, dead_code))]
+
 use std::collections::HashMap;
 
 use ff::PrimeField;
@@ -21,6 +28,7 @@ use crate::types::{
     VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
 };
 
+#[cfg(feature = "client")]
 fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, VotingError> {
     let nf_bytes: [u8; 32] = bytes.try_into().map_err(|_| VotingError::Internal {
         message: format!("{label} nullifier must be 32 bytes, got {}", bytes.len()),
@@ -30,6 +38,7 @@ fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, Vo
     })
 }
 
+#[cfg(feature = "client")]
 fn delegation_nullifier_targets(
     notes: &[NoteInfo],
     dummy_nullifiers: &[Vec<u8>],
@@ -69,6 +78,7 @@ fn delegation_nullifier_targets(
     Ok(targets)
 }
 
+#[cfg(feature = "client")]
 fn nullifier_imt_root_to_base(bytes: &[u8]) -> Result<pallas::Base, VotingError> {
     let root_bytes: [u8; 32] = bytes.try_into().map_err(|_| VotingError::Internal {
         message: format!("nullifier_imt_root must be 32 bytes, got {}", bytes.len()),
@@ -85,6 +95,7 @@ fn nullifier_imt_root_to_base(bytes: &[u8]) -> Result<pallas::Base, VotingError>
 /// The `dummy_nullifiers` DB column is populated from these same zero-value
 /// padded notes. This helper recomputes from the stored rho/rseed pairs so PIR
 /// precompute and proof generation share the exact circuit-side derivation.
+#[cfg(feature = "client")]
 fn padded_nullifiers_for_circuit(
     notes: &[NoteInfo],
     padded_secrets: &[(Vec<u8>, Vec<u8>)],
@@ -393,6 +404,7 @@ impl VotingDb {
     /// The padded-slot nullifiers we cache are derived to match what the
     /// circuit builder asks for at proof-gen time (see
     /// `padded_nullifiers_for_circuit`).
+    #[cfg(feature = "client")]
     pub fn precompute_delegation_pir(
         &self,
         round_id: &str,
@@ -502,6 +514,7 @@ impl VotingDb {
     /// For padded notes (< 5 real notes), the prover fetches proofs internally via PIR.
     ///
     /// Stores the proof result and advances phase to `DelegationProved`.
+    #[cfg(feature = "client")]
     pub fn build_and_prove_delegation(
         &self,
         round_id: &str,

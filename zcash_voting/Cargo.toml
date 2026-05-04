@@ -1,11 +1,28 @@
 [package]
 name = "zcash_voting"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Client-side library for Zcash shielded voting: ZKP delegation and vote-commitment proofs (Halo 2), ElGamal encryption, governance PCZT construction, Merkle witness generation, and SQLite round-state persistence."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/valargroup/zcash_voting"
 readme = "README.md"
+
+[features]
+default = []
+# Network/PIR client surface. Enables:
+#   * the `tree_sync` module (HTTP sync of the vote commitment tree, via
+#     `vote-commitment-tree-client[http]`)
+#   * `precompute_delegation_pir` storage operation (RPC fetch of IMT
+#     non-membership proofs, via `pir-client`)
+#   * the `convert_pir_proof` / `validate_and_convert_pir_proof` helpers
+#     in `zkp1` (translate `pir_client::ImtProofData` into the circuit
+#     crate's `ImtProofData`)
+# Library consumers that only need the pure-crypto surface (decompose,
+# elgamal, governance, hotkey, share_tracking, vote_commitment, witness,
+# types, warm_proving_caches, and `build_and_prove_delegation` from
+# pre-fetched proofs) can leave this off and avoid the full `reqwest` /
+# `url` / `idna` / `icu_*` tree it pulls in.
+client = ["dep:pir-client", "dep:vote-commitment-tree", "dep:vote-commitment-tree-client"]
 
 [dependencies]
 # Curves (same as Orchard/Zcash)
@@ -26,14 +43,17 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# PIR (private nullifier exclusion proofs)
-pir-client = "0.1"
+# PIR (private nullifier exclusion proofs). Behind the `client` feature
+# because it pulls `reqwest` (and its full URL/IDNA/ICU/quinn tree) for
+# the HTTP RPC client.
+pir-client = { version = "0.1", optional = true }
 
-# Vote commitment tree (VAN witness generation). `vote-commitment-tree-client`
-# is consumed with `features = ["http"]` because `tree_sync.rs` uses
-# `HttpTreeSyncApi`. The default surface is types-only.
-vote-commitment-tree = { path = "../vote-commitment-tree", version = "0.1" }
-vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "0.2", features = ["http"] }
+# Vote commitment tree (VAN witness generation). Both crates are behind
+# the `client` feature: `vote-commitment-tree` is tiny but only used by
+# `tree_sync.rs`, and `vote-commitment-tree-client[http]` brings in
+# `reqwest` for the HTTP sync transport.
+vote-commitment-tree = { path = "../vote-commitment-tree", version = "0.1", optional = true }
+vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "0.2", features = ["http"], optional = true }
 
 # Storage
 rusqlite = { version = "0.37", features = ["bundled"] }
