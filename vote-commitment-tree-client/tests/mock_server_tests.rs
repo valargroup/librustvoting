@@ -2,6 +2,12 @@
 //!
 //! These validate the full HTTP pipeline:
 //! mock HTTP server → HttpTreeSyncApi → TreeClient.sync() → witness generation.
+//!
+//! `HttpTreeSyncApi` lives behind the crate's `http` feature, so this entire
+//! test file is gated the same way. `cargo test` (default features) skips it;
+//! `cargo test --features http` (or `--all-features`) runs it.
+
+#![cfg(feature = "http")]
 
 use base64::prelude::*;
 use ff::PrimeField;
