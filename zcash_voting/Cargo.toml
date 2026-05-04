@@ -1,6 +1,6 @@
 [package]
 name = "zcash_voting"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Client-side library for Zcash shielded voting: ZKP delegation and vote-commitment proofs (Halo 2), ElGamal encryption, governance PCZT construction, Merkle witness generation, and SQLite round-state persistence."
 license = "MIT OR Apache-2.0"
@@ -27,11 +27,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # PIR (private nullifier exclusion proofs)
-pir-client = "0.1.0"
+pir-client = "0.1"
 
-# Vote commitment tree (VAN witness generation)
-vote-commitment-tree = { path = "../vote-commitment-tree", version = "0.1.1" }
-vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "0.1.1" }
+# Vote commitment tree (VAN witness generation). `vote-commitment-tree-client`
+# is consumed with `features = ["http"]` because `tree_sync.rs` uses
+# `HttpTreeSyncApi`. The default surface is types-only.
+vote-commitment-tree = { path = "../vote-commitment-tree", version = "0.1" }
+vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "0.2", features = ["http"] }
 
 # Storage
 rusqlite = { version = "0.37", features = ["bundled"] }
