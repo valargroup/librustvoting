@@ -21,6 +21,8 @@ pub use http_transport::HyperTransport;
 pub use pir_client::{
     ImtProofData, PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
+
+pub use governance::BALLOT_DIVISOR;
 pub use types::*;
 
 /// Warm process-lifetime proving-key caches used by on-device voting proofs.

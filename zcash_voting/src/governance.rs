@@ -10,8 +10,11 @@ use crate::types::VotingError;
 /// IDs are 1-indexed); bit 0 is the circuit sentinel, permanently set.
 pub(crate) const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
 
-/// Ballot divisor — must match `delegation::circuit::BALLOT_DIVISOR`.
-pub(crate) const BALLOT_DIVISOR: u64 = 12_500_000;
+/// Ballot divisor in zatoshi.
+///
+/// Must match `delegation::circuit::BALLOT_DIVISOR`. One ballot is this many
+/// zatoshi, and bundle weights are quantized down to this boundary.
+pub const BALLOT_DIVISOR: u64 = 12_500_000;
 
 /// Domain tag for Vote Authority Notes.
 /// Prepended as the first Poseidon input in van_comm for domain separation.
