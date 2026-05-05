@@ -400,12 +400,12 @@ impl VotingDb {
     /// circuit builder asks for at proof-gen time (see
     /// `padded_nullifiers_for_circuit`).
     #[cfg(feature = "client-pir")]
-    pub fn precompute_delegation_pir(
+    pub fn precompute_delegation_pir_with_transport(
         &self,
         round_id: &str,
         bundle_index: u32,
         notes: &[NoteInfo],
-        pir_server_url: &str,
+        pir_client: &pir_client::PirClientBlocking,
         network_id: u32,
     ) -> Result<DelegationPirPrecomputeResult, VotingError> {
         let conn = self.conn();
@@ -444,16 +444,10 @@ impl VotingDb {
         }
 
         eprintln!(
-            "[ZKP1] Precomputing PIR proofs from {}: {} cached, {} missing",
-            pir_server_url,
+            "[ZKP1] Precomputing PIR proofs: {} cached, {} missing",
             cached_count,
             missing.len()
         );
-        let pir_client = pir_client::PirClientBlocking::connect(pir_server_url).map_err(|e| {
-            VotingError::Internal {
-                message: format!("PIR server connect failed: {e}"),
-            }
-        })?;
         let missing_nullifiers: Vec<_> = missing.iter().map(|(_, nf)| *nf).collect();
         let expected_nf_imt_root = nullifier_imt_root_to_base(&params.nullifier_imt_root)?;
         let raw_fetched_proofs =
@@ -506,13 +500,13 @@ impl VotingDb {
     ///
     /// Stores the proof result and advances phase to `DelegationProved`.
     #[cfg(feature = "client-pir")]
-    pub fn build_and_prove_delegation(
+    pub fn build_and_prove_delegation_with_transport(
         &self,
         round_id: &str,
         bundle_index: u32,
         notes: &[NoteInfo],
         hotkey_raw_address: &[u8],
-        pir_server_url: &str,
+        pir_client: &pir_client::PirClientBlocking,
         network_id: u32,
         progress: &dyn ProofProgressReporter,
     ) -> Result<DelegationProofResult, VotingError> {
@@ -593,11 +587,11 @@ impl VotingDb {
 
         // Phase 2: Load/fetch IMT exclusion proofs via PIR.
         let pir_start = std::time::Instant::now();
-        let precompute = self.precompute_delegation_pir(
+        let precompute = self.precompute_delegation_pir_with_transport(
             round_id,
             bundle_index,
             notes,
-            pir_server_url,
+            pir_client,
             network_id,
         )?;
 

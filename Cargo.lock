@@ -1209,8 +1209,6 @@ dependencies = [
 [[package]]
 name = "imt-tree"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c378a3c5c44b985233906c966bd82a4f775a83aa4e1bde1635961c2eb8673d7b"
 dependencies = [
  "anyhow",
  "ff",
@@ -1506,8 +1504,6 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "orchard"
 version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "497e74492624a1d1cc8c9675a7afb17b430d32fd9efc171513d0840140b5f0c7"
 dependencies = [
  "aes",
  "bitvec",
@@ -1629,9 +1625,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pir-client"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d55bf18f4478135b41df902f5aef125f310fb6fa5d8850076b88de4eb328f27b"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ff",
@@ -1641,7 +1635,6 @@ dependencies = [
  "log",
  "pasta_curves",
  "pir-types",
- "reqwest",
  "serde_json",
  "tokio",
  "valar-ypir",
@@ -1650,8 +1643,6 @@ dependencies = [
 [[package]]
 name = "pir-types"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fd3d6025cac852a7b3b81d6d07d6e21cc03bb3d5873fc13144a74c56f325b9d"
 dependencies = [
  "anyhow",
  "ff",
@@ -2784,8 +2775,6 @@ dependencies = [
 [[package]]
 name = "voting-circuits"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ba6635f8e207689c290634f6e34f7eddaf1b254aa0f9b0ef65418d89d1d1ae7"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -3203,14 +3192,21 @@ dependencies = [
 
 [[package]]
 name = "zcash_voting"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
+ "anyhow",
  "blake2b_simd",
+ "bytes",
  "ff",
  "group",
  "halo2_gadgets",
  "halo2_proofs",
  "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "incrementalmerkletree",
  "nonempty",
  "orchard",
