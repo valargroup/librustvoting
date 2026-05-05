@@ -400,7 +400,7 @@ impl VotingDb {
     /// circuit builder asks for at proof-gen time (see
     /// `padded_nullifiers_for_circuit`).
     #[cfg(feature = "client-pir")]
-    pub fn precompute_delegation_pir_with_transport(
+    pub fn precompute_delegation_pir(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -587,7 +587,7 @@ impl VotingDb {
 
         // Phase 2: Load/fetch IMT exclusion proofs via PIR.
         let pir_start = std::time::Instant::now();
-        let precompute = self.precompute_delegation_pir_with_transport(
+        let precompute = self.precompute_delegation_pir(
             round_id,
             bundle_index,
             notes,
