@@ -500,7 +500,7 @@ impl VotingDb {
     ///
     /// Stores the proof result and advances phase to `DelegationProved`.
     #[cfg(feature = "client-pir")]
-    pub fn build_and_prove_delegation_with_transport(
+    pub fn build_and_prove_delegation(
         &self,
         round_id: &str,
         bundle_index: u32,
