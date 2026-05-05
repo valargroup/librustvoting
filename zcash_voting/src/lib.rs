@@ -5,7 +5,7 @@ pub mod governance;
 pub mod hotkey;
 pub mod share_tracking;
 pub mod storage;
-#[cfg(feature = "client")]
+#[cfg(feature = "client-tree-sync")]
 pub mod tree_sync;
 pub mod types;
 pub mod vote_commitment;

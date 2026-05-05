@@ -3,7 +3,7 @@
 // imports below are only reachable from `#[cfg(test)]` code, which is fine
 // for `cargo test` but trips `unused_imports` on `cargo check`. Silence that
 // narrow case rather than fragment the imports along feature/test lines.
-#![cfg_attr(not(feature = "client"), allow(unused_imports, dead_code))]
+#![cfg_attr(not(feature = "client-pir"), allow(unused_imports, dead_code))]
 
 use std::collections::HashMap;
 
@@ -28,7 +28,7 @@ use crate::types::{
     VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
 };
 
-#[cfg(feature = "client")]
+#[cfg(feature = "client-pir")]
 fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, VotingError> {
     let nf_bytes: [u8; 32] = bytes.try_into().map_err(|_| VotingError::Internal {
         message: format!("{label} nullifier must be 32 bytes, got {}", bytes.len()),
@@ -38,7 +38,7 @@ fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, Vo
     })
 }
 
-#[cfg(feature = "client")]
+#[cfg(feature = "client-pir")]
 fn delegation_nullifier_targets(
     notes: &[NoteInfo],
     dummy_nullifiers: &[Vec<u8>],
@@ -78,7 +78,7 @@ fn delegation_nullifier_targets(
     Ok(targets)
 }
 
-#[cfg(feature = "client")]
+#[cfg(feature = "client-pir")]
 fn nullifier_imt_root_to_base(bytes: &[u8]) -> Result<pallas::Base, VotingError> {
     let root_bytes: [u8; 32] = bytes.try_into().map_err(|_| VotingError::Internal {
         message: format!("nullifier_imt_root must be 32 bytes, got {}", bytes.len()),
@@ -95,7 +95,7 @@ fn nullifier_imt_root_to_base(bytes: &[u8]) -> Result<pallas::Base, VotingError>
 /// The `dummy_nullifiers` DB column is populated from these same zero-value
 /// padded notes. This helper recomputes from the stored rho/rseed pairs so PIR
 /// precompute and proof generation share the exact circuit-side derivation.
-#[cfg(feature = "client")]
+#[cfg(feature = "client-pir")]
 fn padded_nullifiers_for_circuit(
     notes: &[NoteInfo],
     padded_secrets: &[(Vec<u8>, Vec<u8>)],
@@ -166,15 +166,10 @@ fn padded_nullifiers_for_circuit(
                 message: format!("padded[{i_pad}] rseed is not valid for the stored rho"),
             }
         })?;
-        let pad_note: Note = Option::from(Note::from_parts(
-            pad_addr,
-            NoteValue::ZERO,
-            rho,
-            rseed,
-        ))
-        .ok_or_else(|| VotingError::Internal {
-            message: format!("padded[{i_pad}] note construction failed"),
-        })?;
+        let pad_note: Note = Option::from(Note::from_parts(pad_addr, NoteValue::ZERO, rho, rseed))
+            .ok_or_else(|| VotingError::Internal {
+                message: format!("padded[{i_pad}] note construction failed"),
+            })?;
         out.push(pad_note.nullifier(&fvk).to_bytes().to_vec());
     }
     Ok(out)
@@ -404,7 +399,7 @@ impl VotingDb {
     /// The padded-slot nullifiers we cache are derived to match what the
     /// circuit builder asks for at proof-gen time (see
     /// `padded_nullifiers_for_circuit`).
-    #[cfg(feature = "client")]
+    #[cfg(feature = "client-pir")]
     pub fn precompute_delegation_pir(
         &self,
         round_id: &str,
@@ -418,8 +413,7 @@ impl VotingDb {
         let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
         let padded_secrets =
             queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
-        let padded_nullifiers =
-            padded_nullifiers_for_circuit(notes, &padded_secrets, network_id)?;
+        let padded_nullifiers = padded_nullifiers_for_circuit(notes, &padded_secrets, network_id)?;
         let targets = delegation_nullifier_targets(notes, &padded_nullifiers)?;
 
         let mut cached_count = 0u32;
@@ -462,11 +456,12 @@ impl VotingDb {
         })?;
         let missing_nullifiers: Vec<_> = missing.iter().map(|(_, nf)| *nf).collect();
         let expected_nf_imt_root = nullifier_imt_root_to_base(&params.nullifier_imt_root)?;
-        let raw_fetched_proofs = pir_client
-            .fetch_proofs(&missing_nullifiers)
-            .map_err(|e| VotingError::Internal {
-                message: format!("PIR parallel fetch failed: {e}"),
-            })?;
+        let raw_fetched_proofs =
+            pir_client
+                .fetch_proofs(&missing_nullifiers)
+                .map_err(|e| VotingError::Internal {
+                    message: format!("PIR parallel fetch failed: {e}"),
+                })?;
         if raw_fetched_proofs.len() != missing_nullifiers.len() {
             return Err(VotingError::Internal {
                 message: format!(
@@ -480,11 +475,7 @@ impl VotingDb {
             .into_iter()
             .zip(missing_nullifiers.iter().copied())
             .map(|(proof, nullifier)| {
-                crate::zkp1::validate_and_convert_pir_proof(
-                    proof,
-                    nullifier,
-                    expected_nf_imt_root,
-                )
+                crate::zkp1::validate_and_convert_pir_proof(proof, nullifier, expected_nf_imt_root)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -514,7 +505,7 @@ impl VotingDb {
     /// For padded notes (< 5 real notes), the prover fetches proofs internally via PIR.
     ///
     /// Stores the proof result and advances phase to `DelegationProved`.
-    #[cfg(feature = "client")]
+    #[cfg(feature = "client-pir")]
     pub fn build_and_prove_delegation(
         &self,
         round_id: &str,
@@ -544,8 +535,7 @@ impl VotingDb {
             queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
         // These are the zero-value circuit-side padded nullifiers derived
         // from the Phase 1 padded-note rho/rseed pairs.
-        let padded_nullifiers =
-            padded_nullifiers_for_circuit(notes, &padded_secrets, network_id)?;
+        let padded_nullifiers = padded_nullifiers_for_circuit(notes, &padded_secrets, network_id)?;
 
         // Align witnesses (keyed by commitment) to notes order
         let witness_count = witnesses.len();
