@@ -78,7 +78,7 @@ pub fn warm_proving_cache() {
 // PIR-backed IMT Provider
 // ================================================================
 
-/// Convert a PIR-crate `ImtProofData` into the circuit-crate `ImtProofData`.
+/// Convert an IMT proof from the PIR data crate into the circuit-crate `ImtProofData`.
 /// Both use the K=2 punctured-range format with `nf_bounds = [nf_lo, nf_mid, nf_hi]`.
 #[cfg(feature = "client-pir")]
 pub fn convert_pir_proof(pir: pir_client::ImtProofData) -> ImtProofData {
