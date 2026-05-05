@@ -4,6 +4,13 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# 0.5.1
+
+## Changed
+- Moved vote commitment tree sync onto the injected transport boundary and
+  provided a direct Hyper/Rustls transport from `zcash_voting`.
+- Removed `reqwest` from `vote-commitment-tree-client`'s library path.
+
 # 0.5.0
 
 ## Changed

@@ -1,6 +1,6 @@
 [package]
 name = "zcash_voting"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Client-side library for Zcash shielded voting: ZKP delegation and vote-commitment proofs (Halo 2), ElGamal encryption, governance PCZT construction, Merkle witness generation, and SQLite round-state persistence."
 license = "MIT OR Apache-2.0"
@@ -13,7 +13,7 @@ default = []
 # Hyper/Rustls HTTP.
 client-pir = ["dep:pir-client", "dep:bytes", "dep:http", "dep:http-body-util", "dep:hyper", "dep:hyper-rustls", "dep:hyper-util"]
 # Vote commitment tree HTTP sync surface for VAN witness generation.
-client-tree-sync = ["dep:vote-commitment-tree", "dep:vote-commitment-tree-client"]
+client-tree-sync = ["dep:vote-commitment-tree", "dep:vote-commitment-tree-client", "dep:bytes", "dep:http", "dep:http-body-util", "dep:hyper", "dep:hyper-rustls", "dep:hyper-util", "dep:tokio"]
 # Backwards-compatible aggregate for consumers that already enable `client`.
 client = ["client-pir", "client-tree-sync"]
 
@@ -39,17 +39,18 @@ serde_json = "1"
 # PIR (private nullifier exclusion proofs).
 pir-client = { version = "0.2.0", default-features = false, optional = true }
 
-# Direct PIR HTTP transport. Behind `client-pir`.
+# Direct Hyper/Rustls HTTP transport. Behind `client-pir` and `client-tree-sync`.
 bytes = { version = "1", optional = true }
 http = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", features = ["client", "http1", "http2"], optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots"], optional = true }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
 # Vote commitment tree (VAN witness generation). Behind `client-tree-sync`.
 vote-commitment-tree = { path = "../vote-commitment-tree", version = "0.1", optional = true }
-vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "0.2", features = ["http"], optional = true }
+vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "0.3", features = ["http"], optional = true }
 
 # Storage
 rusqlite = { version = "0.37", features = ["bundled"] }

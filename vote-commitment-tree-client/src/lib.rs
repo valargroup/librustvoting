@@ -9,4 +9,5 @@
 
 #[cfg(feature = "http")]
 pub mod http_sync_api;
+pub mod transport;
 pub mod types;
