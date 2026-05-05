@@ -4,6 +4,13 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# 0.5.2
+
+## Changed
+- Reissued the tree-sync transport release from the merged `main` history.
+- Confirmed the Hyper/Rustls tree-sync transport against production vote-chain
+  endpoints for non-empty rounds.
+
 # 0.5.1
 
 ## Changed
