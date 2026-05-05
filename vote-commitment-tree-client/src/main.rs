@@ -6,14 +6,23 @@
 //! - `verify`  — Verify a witness against a root and leaf
 //! - `status`  — Fetch and display the chain's current tree state
 
-use std::process;
+use std::{process, sync::Arc};
 
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use ff::PrimeField;
+use http_body_util::{BodyExt, Empty};
+use hyper::Request;
+use hyper_rustls::HttpsConnector;
+use hyper_util::{
+    client::legacy::{connect::HttpConnector, Client},
+    rt::TokioExecutor,
+};
 use pasta_curves::Fp;
 
 use vote_commitment_tree::{MerklePath, TreeClient, TreeSyncApi};
 use vote_commitment_tree_client::http_sync_api::HttpTreeSyncApi;
+use vote_commitment_tree_client::transport::{Transport, TransportError, TransportResponse};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -122,12 +131,75 @@ fn fp_hex(fp: &Fp) -> String {
     hex::encode(fp.to_repr())
 }
 
+type RequestBody = Empty<Bytes>;
+type HyperClient = Client<HttpsConnector<HttpConnector>, RequestBody>;
+
+struct CliHyperTransport {
+    runtime: tokio::runtime::Runtime,
+    client: HyperClient,
+}
+
+impl CliHyperTransport {
+    fn new() -> Result<Self, TransportError> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| TransportError::Request(e.to_string()))?;
+        let mut connector = HttpConnector::new();
+        connector.enforce_http(false);
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(connector);
+        let client = Client::builder(TokioExecutor::new()).build(https);
+
+        Ok(Self { runtime, client })
+    }
+}
+
+impl Transport for CliHyperTransport {
+    fn get(&self, url: &str) -> Result<TransportResponse, TransportError> {
+        self.runtime.block_on(async {
+            let request = Request::builder()
+                .method("GET")
+                .uri(url)
+                .body(Empty::<Bytes>::new())
+                .map_err(|e| TransportError::Request(e.to_string()))?;
+            let response = self
+                .client
+                .request(request)
+                .await
+                .map_err(|e| TransportError::Request(e.to_string()))?;
+            let status = response.status().as_u16();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| TransportError::Request(e.to_string()))?
+                .to_bytes()
+                .to_vec();
+
+            Ok(TransportResponse { status, body })
+        })
+    }
+}
+
+fn http_api(node: &str, round: &str) -> HttpTreeSyncApi {
+    let transport = CliHyperTransport::new().unwrap_or_else(|e| {
+        eprintln!("error: failed to create HTTP transport: {}", e);
+        process::exit(1);
+    });
+    HttpTreeSyncApi::new(node, round, Arc::new(transport))
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
 fn cmd_sync(node: &str, round: &str, mark_positions: &[u64]) {
-    let api = HttpTreeSyncApi::new(node, round);
+    let api = http_api(node, round);
 
     // Fetch remote state first for display.
     let remote_state = api.get_tree_state().unwrap_or_else(|e| {
@@ -171,7 +243,7 @@ fn cmd_sync(node: &str, round: &str, mark_positions: &[u64]) {
 }
 
 fn cmd_witness(node: &str, round: &str, position: u64, anchor_height: Option<u32>) {
-    let api = HttpTreeSyncApi::new(node, round);
+    let api = http_api(node, round);
 
     let remote_state = api.get_tree_state().unwrap_or_else(|e| {
         eprintln!("error: failed to fetch tree state: {}", e);
@@ -244,7 +316,7 @@ fn cmd_verify(leaf_hex: &str, witness_hex: &str, root_hex: &str) {
 }
 
 fn cmd_status(node: &str, round: &str) {
-    let api = HttpTreeSyncApi::new(node, round);
+    let api = http_api(node, round);
 
     let state = api.get_tree_state().unwrap_or_else(|e| {
         eprintln!("error: failed to fetch tree state: {}", e);

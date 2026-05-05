@@ -3,7 +3,7 @@ pub mod decompose;
 pub mod elgamal;
 pub mod governance;
 pub mod hotkey;
-#[cfg(feature = "client-pir")]
+#[cfg(any(feature = "client-pir", feature = "client-tree-sync"))]
 mod http_transport;
 pub mod share_tracking;
 pub mod storage;
@@ -15,7 +15,7 @@ pub mod witness;
 pub mod zkp1;
 pub mod zkp2;
 
-#[cfg(feature = "client-pir")]
+#[cfg(any(feature = "client-pir", feature = "client-tree-sync"))]
 pub use http_transport::HyperTransport;
 #[cfg(feature = "client-pir")]
 pub use pir_client::{

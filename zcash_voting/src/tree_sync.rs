@@ -5,13 +5,14 @@
 //! (witnesses) for Vote Authority Notes (VANs) needed by ZKP #2.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use vote_commitment_tree::{MerklePath, TreeClient};
 use vote_commitment_tree_client::http_sync_api::HttpTreeSyncApi;
 
 use crate::storage::VotingDb;
 use crate::types::VotingError;
+use crate::HyperTransport;
 
 /// VAN Merkle witness for ZKP #2.
 ///
@@ -50,12 +51,14 @@ impl From<(MerklePath, u32)> for VanWitness {
 /// lazily on first `sync` call for that round.
 pub struct VoteTreeSync {
     clients: Mutex<HashMap<String, TreeClient>>,
+    transport: Arc<HyperTransport>,
 }
 
 impl VoteTreeSync {
     pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
+            transport: Arc::new(HyperTransport::new()),
         }
     }
 
@@ -83,7 +86,7 @@ impl VoteTreeSync {
             }
         }
 
-        let api = HttpTreeSyncApi::new(node_url, round_id);
+        let api = HttpTreeSyncApi::new(node_url, round_id, self.transport.clone());
         client.sync(&api).map_err(|e| VotingError::Internal {
             message: format!("vote tree sync failed: {}", e),
         })?;
