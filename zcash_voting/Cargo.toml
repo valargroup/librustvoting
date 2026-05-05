@@ -1,6 +1,6 @@
 [package]
 name = "zcash_voting"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Client-side library for Zcash shielded voting: ZKP delegation and vote-commitment proofs (Halo 2), ElGamal encryption, governance PCZT construction, Merkle witness generation, and SQLite round-state persistence."
 license = "MIT OR Apache-2.0"
@@ -9,20 +9,12 @@ readme = "README.md"
 
 [features]
 default = []
-# Network/PIR client surface. Enables:
-#   * the `tree_sync` module (HTTP sync of the vote commitment tree, via
-#     `vote-commitment-tree-client[http]`)
-#   * `precompute_delegation_pir` storage operation (RPC fetch of IMT
-#     non-membership proofs, via `pir-client`)
-#   * the `convert_pir_proof` / `validate_and_convert_pir_proof` helpers
-#     in `zkp1` (translate `pir_client::ImtProofData` into the circuit
-#     crate's `ImtProofData`)
-# Library consumers that only need the pure-crypto surface (decompose,
-# elgamal, governance, hotkey, share_tracking, vote_commitment, witness,
-# types, warm_proving_caches, and `build_and_prove_delegation` from
-# pre-fetched proofs) can leave this off and avoid the full `reqwest` /
-# `url` / `idna` / `icu_*` tree it pulls in.
-client = ["dep:pir-client", "dep:vote-commitment-tree", "dep:vote-commitment-tree-client"]
+# PIR client surface for fetching IMT non-membership proofs.
+client-pir = ["dep:pir-client"]
+# Vote commitment tree HTTP sync surface for VAN witness generation.
+client-tree-sync = ["dep:vote-commitment-tree", "dep:vote-commitment-tree-client"]
+# Backwards-compatible aggregate for consumers that already enable `client`.
+client = ["client-pir", "client-tree-sync"]
 
 [dependencies]
 # Curves (same as Orchard/Zcash)
@@ -43,15 +35,11 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# PIR (private nullifier exclusion proofs). Behind the `client` feature
-# because it pulls `reqwest` (and its full URL/IDNA/ICU/quinn tree) for
-# the HTTP RPC client.
+# PIR (private nullifier exclusion proofs). Behind `client-pir` because it
+# pulls the HTTP RPC client stack.
 pir-client = { version = "0.1", optional = true }
 
-# Vote commitment tree (VAN witness generation). Both crates are behind
-# the `client` feature: `vote-commitment-tree` is tiny but only used by
-# `tree_sync.rs`, and `vote-commitment-tree-client[http]` brings in
-# `reqwest` for the HTTP sync transport.
+# Vote commitment tree (VAN witness generation). Behind `client-tree-sync`.
 vote-commitment-tree = { path = "../vote-commitment-tree", version = "0.1", optional = true }
 vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "0.2", features = ["http"], optional = true }
 
