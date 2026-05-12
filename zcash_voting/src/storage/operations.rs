@@ -28,6 +28,15 @@ use crate::types::{
     VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
 };
 
+fn short_hex(bytes: &[u8]) -> String {
+    let prefix_len = bytes.len().min(8);
+    let mut value = hex::encode(&bytes[..prefix_len]);
+    if bytes.len() > prefix_len {
+        value.push_str("...");
+    }
+    value
+}
+
 #[cfg(feature = "client-pir")]
 fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, VotingError> {
     let nf_bytes: [u8; 32] = bytes.try_into().map_err(|_| VotingError::Internal {
@@ -565,6 +574,10 @@ impl VotingDb {
         let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
         let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, &wallet_id, bundle_index)?;
         let witnesses = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
+        let stored_nf_signed = queries::load_nf_signed(&conn, round_id, &wallet_id, bundle_index)?;
+        let stored_cmx_new = queries::load_cmx_new(&conn, round_id, &wallet_id, bundle_index)?;
+        let stored_pczt_sighash =
+            queries::load_pczt_sighash(&conn, round_id, &wallet_id, bundle_index)?;
 
         // Load Phase 1 randomness for ZCA-74 fix: ensures Phase 2 produces
         // the same nf_signed/cmx_new that Phase 1 committed to in the PCZT.
@@ -627,6 +640,15 @@ impl VotingDb {
             db_elapsed.as_secs_f64(),
             notes.len(),
             witness_count
+        );
+        eprintln!(
+            "[ZKP1][DB] loaded stored PCZT fields: round_id={round_id}, wallet_id={wallet_id}, bundle_index={bundle_index}, pczt_sighash={}, nf_signed={}, cmx_new={}, alpha={}, rseed_signed={}, rseed_output={}",
+            short_hex(&stored_pczt_sighash),
+            short_hex(&stored_nf_signed),
+            short_hex(&stored_cmx_new),
+            short_hex(&alpha),
+            short_hex(&rseed_signed),
+            short_hex(&rseed_output)
         );
         drop(conn);
 
@@ -739,6 +761,15 @@ impl VotingDb {
         eprintln!(
             "[ZKP1] Proof generation: {:.2}s",
             prove_elapsed.as_secs_f64()
+        );
+        eprintln!(
+            "[ZKP1][PROOF] produced public fields: round_id={round_id}, wallet_id={wallet_id}, bundle_index={bundle_index}, rk={}, nf_signed={}, cmx_new={}, van_comm={}, stored_nf_signed={}, stored_cmx_new={}",
+            short_hex(&result.rk),
+            short_hex(&result.nf_signed),
+            short_hex(&result.cmx_new),
+            short_hex(&result.van_comm),
+            short_hex(&stored_nf_signed),
+            short_hex(&stored_cmx_new)
         );
 
         // Persist proof bytes, public inputs, and phase together. The public

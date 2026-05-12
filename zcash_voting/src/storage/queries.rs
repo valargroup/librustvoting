@@ -9,6 +9,15 @@ use crate::types::{NoteInfo, ShareDelegationRecord, VotingError, VotingRoundPara
 const NOTE_IDENTITY_HASH_BYTES: usize = 32;
 const NOTE_IDENTITY_DOMAIN: &[u8] = b"zcash-voting-note-identity-v1";
 
+fn short_hex(bytes: &[u8]) -> String {
+    let prefix_len = bytes.len().min(8);
+    let mut value = hex::encode(&bytes[..prefix_len]);
+    if bytes.len() > prefix_len {
+        value.push_str("...");
+    }
+    value
+}
+
 fn update_hash_with_len_prefixed_bytes(state: &mut blake2b_simd::State, value: &[u8]) {
     state.update(&(value.len() as u64).to_le_bytes());
     state.update(value);
@@ -1036,8 +1045,20 @@ fn require_matching_stored_field(
 ) -> Result<(), VotingError> {
     if let Some(stored) = stored {
         if stored != requested {
+            eprintln!(
+                "[ZKP1][MISMATCH] delegation proof result {field} does not match stored PCZT data: stored_len={}, requested_len={}, stored={}, requested={}",
+                stored.len(),
+                requested.len(),
+                short_hex(stored),
+                short_hex(requested)
+            );
             return Err(VotingError::InvalidInput {
-                message: format!("delegation proof result {field} does not match stored PCZT data"),
+                message: format!(
+                    "delegation proof result {field} does not match stored PCZT data \
+                     (stored={}, requested={})",
+                    short_hex(stored),
+                    short_hex(requested)
+                ),
             });
         }
     }
