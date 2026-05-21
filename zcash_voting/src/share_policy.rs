@@ -83,6 +83,35 @@ impl ShareTrackingSummary {
     }
 }
 
+/// Stable key for a delegated share that needs wallet IO.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareDelegationKey {
+    pub round_id: String,
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub share_index: u32,
+}
+
+impl From<&ShareDelegationRecord> for ShareDelegationKey {
+    fn from(share: &ShareDelegationRecord) -> Self {
+        Self {
+            round_id: share.round_id.clone(),
+            bundle_index: share.bundle_index,
+            proposal_id: share.proposal_id,
+            share_index: share.share_index,
+        }
+    }
+}
+
+/// Recovery actions a wallet should perform after loading delegated shares.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareRecoveryActionPlan {
+    pub ready_for_status_check: Vec<ShareDelegationKey>,
+    pub overdue_for_resubmission: Vec<ShareDelegationKey>,
+    pub next_delay_seconds: Option<u64>,
+    pub summary: ShareTrackingSummary,
+}
+
 /// Return the time recovery should use as the share's base time.
 ///
 /// Delayed shares use `submit_at`; immediate shares use `created_at`.
@@ -218,6 +247,33 @@ pub fn summarize_share_tracking(
     }
 
     summary
+}
+
+/// Plan share recovery IO using the shared readiness, retry, and sleep policy.
+pub fn plan_share_recovery_actions(
+    shares: &[ShareDelegationRecord],
+    now_seconds: u64,
+    vote_end_time_seconds: u64,
+    policy: ShareTimingPolicy,
+) -> ShareRecoveryActionPlan {
+    let mut ready_for_status_check = Vec::new();
+    let mut overdue_for_resubmission = Vec::new();
+
+    for share in shares {
+        if is_share_ready_for_status_check(share, now_seconds, policy) {
+            ready_for_status_check.push(ShareDelegationKey::from(share));
+        }
+        if should_resubmit_share(share, now_seconds, vote_end_time_seconds, policy) {
+            overdue_for_resubmission.push(ShareDelegationKey::from(share));
+        }
+    }
+
+    ShareRecoveryActionPlan {
+        ready_for_status_check,
+        overdue_for_resubmission,
+        next_delay_seconds: next_tracking_delay_seconds(shares, now_seconds, policy),
+        summary: summarize_share_tracking(shares, now_seconds, Some(vote_end_time_seconds), policy),
+    }
 }
 
 /// Return the random bytes needed to sample a delayed share submission time.
@@ -385,6 +441,116 @@ pub fn share_submission_random_bytes_required(
         submit_at_random_bytes: submit_at_per_share.saturating_mul(share_count),
         server_random_bytes: server_per_share.saturating_mul(share_count),
     }
+}
+
+fn eligible_initial_fallback_candidates(
+    planned_target_servers: &[String],
+    available_server_urls: &[String],
+    accepted_server_urls: &[String],
+    tried_server_urls: &[String],
+) -> Vec<String> {
+    let planned: HashSet<&str> = planned_target_servers.iter().map(String::as_str).collect();
+    let accepted: HashSet<&str> = accepted_server_urls.iter().map(String::as_str).collect();
+    let tried: HashSet<&str> = tried_server_urls.iter().map(String::as_str).collect();
+
+    available_server_urls
+        .iter()
+        .filter(|server| {
+            let server = server.as_str();
+            !planned.contains(server) && !accepted.contains(server) && !tried.contains(server)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Return random bytes needed to backfill initial share delivery targets.
+pub fn initial_share_delivery_random_bytes_required(
+    planned_target_servers: &[String],
+    available_server_urls: &[String],
+    accepted_server_urls: &[String],
+    tried_server_urls: &[String],
+) -> usize {
+    share_server_order_random_bytes_required(
+        eligible_initial_fallback_candidates(
+            planned_target_servers,
+            available_server_urls,
+            accepted_server_urls,
+            tried_server_urls,
+        )
+        .len(),
+    )
+}
+
+/// Return the next helper targets for initial share delivery.
+///
+/// Planned targets are tried first. If planned targets are unavailable or already
+/// tried, the function backfills from a randomized order of remaining helpers
+/// until `target_count` is satisfied or no untried available helpers remain.
+pub fn next_initial_share_targets(
+    target_count: u64,
+    planned_target_servers: &[String],
+    available_server_urls: &[String],
+    accepted_server_urls: &[String],
+    tried_server_urls: &[String],
+    server_random_bytes: &[u8],
+) -> Result<Vec<String>, VotingError> {
+    require_unique_share_servers(planned_target_servers)?;
+    require_unique_share_servers(available_server_urls)?;
+
+    let target_count = usize::try_from(target_count).map_err(|_| VotingError::InvalidInput {
+        message: "target_count does not fit in usize".to_string(),
+    })?;
+    if target_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let accepted: HashSet<&str> = accepted_server_urls.iter().map(String::as_str).collect();
+    let tried: HashSet<&str> = tried_server_urls.iter().map(String::as_str).collect();
+    let available: HashSet<&str> = available_server_urls.iter().map(String::as_str).collect();
+
+    let accepted_count = accepted
+        .iter()
+        .filter(|server| available.contains(*server))
+        .count();
+    let remaining = target_count.saturating_sub(accepted_count);
+    if remaining == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut selected = Vec::new();
+    let mut selected_set: HashSet<&str> = HashSet::new();
+    for server in planned_target_servers {
+        let server_str = server.as_str();
+        if available.contains(server_str)
+            && !accepted.contains(server_str)
+            && !tried.contains(server_str)
+            && selected_set.insert(server_str)
+        {
+            selected.push(server.clone());
+            if selected.len() == remaining {
+                return Ok(selected);
+            }
+        }
+    }
+
+    let fallback_candidates = eligible_initial_fallback_candidates(
+        planned_target_servers,
+        available_server_urls,
+        accepted_server_urls,
+        tried_server_urls,
+    );
+    let needed_bytes = share_server_order_random_bytes_required(fallback_candidates.len());
+    if server_random_bytes.len() < needed_bytes {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "server_random_bytes must contain at least {needed_bytes} bytes for initial delivery"
+            ),
+        });
+    }
+    let fallback_order = shuffled_share_server_order(&fallback_candidates, server_random_bytes)?;
+    selected.extend(fallback_order.into_iter().take(remaining - selected.len()));
+
+    Ok(selected)
 }
 
 /// Return the random bytes needed for `resubmission_server_order`.
@@ -1008,6 +1174,25 @@ mod tests {
     }
 
     #[test]
+    fn recovery_action_plan_lists_ready_and_overdue_shares() {
+        let mut confirmed = share(0, 100);
+        confirmed.confirmed = true;
+        confirmed.share_index = 1;
+        let shares = vec![share(0, 100), confirmed];
+
+        let plan = plan_share_recovery_actions(&shares, 130, 200, ShareTimingPolicy::default());
+
+        assert_eq!(plan.ready_for_status_check.len(), 1);
+        assert_eq!(plan.ready_for_status_check[0].share_index, 0);
+        assert_eq!(plan.overdue_for_resubmission.len(), 1);
+        assert_eq!(plan.overdue_for_resubmission[0].share_index, 0);
+        assert_eq!(plan.next_delay_seconds, Some(15));
+        assert_eq!(plan.summary.total, 2);
+        assert_eq!(plan.summary.confirmed, 1);
+        assert_eq!(plan.summary.overdue, 1);
+    }
+
+    #[test]
     fn helper_target_count_is_half_rounded_up() {
         assert_eq!(share_submission_target_count(0), 0);
         assert_eq!(share_submission_target_count(1), 1);
@@ -1308,6 +1493,81 @@ mod tests {
             vec![
                 "https://three.example.com".to_string(),
                 "https://one.example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn initial_delivery_backfills_when_planned_target_is_unavailable() {
+        let planned = vec![
+            "https://helper-a.example".to_string(),
+            "https://helper-b.example".to_string(),
+            "https://helper-c.example".to_string(),
+        ];
+        let available = vec![
+            "https://helper-b.example".to_string(),
+            "https://helper-c.example".to_string(),
+            "https://helper-d.example".to_string(),
+            "https://helper-e.example".to_string(),
+        ];
+
+        let bytes_needed =
+            initial_share_delivery_random_bytes_required(&planned, &available, &[], &[]);
+        assert_eq!(bytes_needed, share_server_order_random_bytes_required(2));
+
+        let targets =
+            next_initial_share_targets(3, &planned, &available, &[], &[], &random_bytes(&[0]))
+                .unwrap();
+
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0], "https://helper-b.example");
+        assert_eq!(targets[1], "https://helper-c.example");
+        assert!(
+            ["https://helper-d.example", "https://helper-e.example"].contains(&targets[2].as_str())
+        );
+    }
+
+    #[test]
+    fn initial_delivery_stops_after_target_count_is_satisfied() {
+        let planned = vec![
+            "https://helper-a.example".to_string(),
+            "https://helper-b.example".to_string(),
+        ];
+        let available = vec![
+            "https://helper-a.example".to_string(),
+            "https://helper-b.example".to_string(),
+            "https://helper-c.example".to_string(),
+        ];
+        let accepted = vec!["https://helper-a.example".to_string()];
+
+        let targets =
+            next_initial_share_targets(2, &planned, &available, &accepted, &[], &[]).unwrap();
+
+        assert_eq!(targets, vec!["https://helper-b.example".to_string()]);
+    }
+
+    #[test]
+    fn initial_delivery_skips_tried_helpers() {
+        let planned = vec![
+            "https://helper-a.example".to_string(),
+            "https://helper-b.example".to_string(),
+        ];
+        let available = vec![
+            "https://helper-a.example".to_string(),
+            "https://helper-b.example".to_string(),
+            "https://helper-c.example".to_string(),
+        ];
+        let tried = vec!["https://helper-a.example".to_string()];
+
+        let targets =
+            next_initial_share_targets(2, &planned, &available, &[], &tried, &random_bytes(&[]))
+                .unwrap();
+
+        assert_eq!(
+            targets,
+            vec![
+                "https://helper-b.example".to_string(),
+                "https://helper-c.example".to_string()
             ]
         );
     }

@@ -4,6 +4,13 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# Unreleased
+
+## Added
+- Added share-policy helpers for initial helper delivery backfill and batched
+  share recovery actions, so SDKs can apply crate plans without reinterpreting
+  target counts or per-share tracking decisions in wallet code.
+
 # 0.9.1
 
 ## Added

@@ -29,8 +29,10 @@ that should stay consistent across SDKs:
 - delayed helper-share `submit_at` scheduling
 - helper target counts and randomized helper ordering
 - batch share planning with independent entropy per share
+- initial share delivery backfill that preserves the planned target count
 - resubmission ordering with untried helpers before already-sent helpers
-- share tracking summaries, readiness checks, retry thresholds, and polling delay
+- share recovery action plans, tracking summaries, retry thresholds, and polling
+  delay
 
 Wallet SDKs should provide fresh CSPRNG bytes from their platform RNG and let the
 crate own the sampling and ordering policy.
