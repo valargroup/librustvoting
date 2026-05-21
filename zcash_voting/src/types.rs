@@ -283,7 +283,7 @@ pub struct SharePayload {
 
 /// A share delegation record from the local DB.
 /// Tracks which helper servers received each share and its on-chain confirmation status.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShareDelegationRecord {
     pub round_id: String,
     pub bundle_index: u32,

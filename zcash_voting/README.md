@@ -37,6 +37,13 @@ that should stay consistent across SDKs:
 Wallet SDKs should provide fresh CSPRNG bytes from their platform RNG and let the
 crate own the sampling and ordering policy.
 
+The `share_workflow` module builds on that policy with a pure reducer for
+helper-share IO. Hosts submit a workflow request plus platform CSPRNG bytes and
+execute the returned actions, such as posting a share, fetching helper status,
+recording a delegation, adding sent servers, or scheduling the next wakeup. The
+host still owns HTTP, storage, timers, and UI, while the crate owns target
+backfill, recovery, and resubmission decisions.
+
 ## Dependency notes
 
 `zcash_voting` tracks the upstream Zcash crates directly:

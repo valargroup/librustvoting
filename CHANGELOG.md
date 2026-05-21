@@ -7,6 +7,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 # Unreleased
 
 ## Added
+- Added a pure `share_workflow` reducer that turns helper-share delivery,
+  recovery polling, and resubmission results into host IO/storage actions.
 - Added share-policy helpers for initial helper delivery backfill and batched
   share recovery actions, so SDKs can apply crate plans without reinterpreting
   target counts or per-share tracking decisions in wallet code.

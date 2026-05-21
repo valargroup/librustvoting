@@ -9,6 +9,7 @@ pub mod note_bundling;
 pub mod pir_snapshot;
 pub mod share_policy;
 pub mod share_tracking;
+pub mod share_workflow;
 pub mod storage;
 #[cfg(feature = "client-tree-sync")]
 pub mod tree_sync;
