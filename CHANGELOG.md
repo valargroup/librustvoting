@@ -4,6 +4,13 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# Unreleased
+
+## Added
+- Added a coarse `share_workflow` planner for wallet SDKs that need crate-owned
+  share mode, `submit_at`, and share tracking decisions without moving wallet
+  networking or UI loops into `zcash_voting`.
+
 # 0.10.0
 
 ## Changed

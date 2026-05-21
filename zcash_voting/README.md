@@ -35,6 +35,11 @@ that should stay consistent across SDKs:
 Wallet SDKs should provide fresh CSPRNG bytes from their platform RNG and let the
 crate own the sampling and ordering policy.
 
+The `share_workflow` module wraps the share policy helpers into coarser planner
+calls for SDKs that want crate-owned share mode, `submit_at`, and tracking
+decisions while keeping HTTP submission, persistence, scheduling, and UI state in
+the wallet.
+
 ## Dependency notes
 
 `zcash_voting` tracks the upstream Zcash crates directly:
