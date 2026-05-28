@@ -29,6 +29,7 @@ pub mod pir_snapshot;
 pub mod precompute;
 pub mod prelude;
 pub mod round;
+pub mod session;
 pub mod share;
 pub mod share_policy;
 pub mod share_tracking;
