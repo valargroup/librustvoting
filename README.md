@@ -42,6 +42,13 @@ stage-oriented API:
   `VoteRecoveryBundle`, and reconstructs vote-chain submissions after a crash.
 - `share::*` recovers helper-share payloads, computes share nullifiers, applies
   share scheduling policy, and records helper-share confirmation state.
+- `session::*` records durable ballot intent and returns a round-level
+  `RoundPlan` with ordered `NextStep`s for restart recovery. Wallets should
+  write `Decision::Choice` before starting a cast-vote flow, write
+  `Decision::Skipped` for proposals the user intentionally leaves blank, and
+  use `resume_plan` after restart to decide whether to delegate, poll
+  delegation/vote transactions, cast remaining votes, or confirm helper shares.
+  `open_proposals` contains only proposals with no terminal decision yet.
 
 ## Migrating 0.11 to 0.12
 
@@ -55,6 +62,9 @@ stage-oriented API:
   imports with `share::policy::*`.
 - Replace raw vote/share workflow SQL with
   `VotingDb::{vote_phase, vote_phases, share_phase, share_phases}`.
+- Replace wallet-local recovery fusion with `session::resume_plan`; keep only
+  wallet-specific networking, proof execution, signing, and UI routing at the
+  wallet boundary.
 
 The workspace depends on the private [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits) repo. The `.cargo/config.toml` enables `git-fetch-with-cli` so your local git credentials are used automatically.
 

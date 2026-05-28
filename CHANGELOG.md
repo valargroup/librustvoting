@@ -14,7 +14,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   vote, and share phases with the voter's recorded ballot intent into an ordered
   list of `NextStep`s, so wallet SDKs can resume an interrupted multi-question
   vote without re-deriving recovery state. Exported via the prelude
-  (`Decision`, `NextStep`, `RoundPlan`, `resume_plan`).
+  (`Decision`, `NextStep`, `RoundPlan`, `resume_plan`). Skipped ballot intents
+  are treated as terminal decisions, and choice intents now fail fast if no
+  eligible bundle rows exist for the round.
 - Added shared delegation request/report types, account-key loading, Keystone
   PCZT redaction, display memo formatting, prepared-PCZT caching, skipped-suffix
   bundle validation, and bundle weight helpers so wallet SDKs can keep only

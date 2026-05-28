@@ -50,7 +50,9 @@ impl VotingDb {
                 ":now": now,
             },
         )
-        .map_err(|e| VotingError::Internal { message: format!("set_ballot_intent failed: {e}") })?;
+        .map_err(|e| VotingError::Internal {
+            message: format!("set_ballot_intent failed: {e}"),
+        })?;
         Ok(())
     }
 
@@ -64,7 +66,9 @@ impl VotingDb {
                  WHERE round_id = :round_id AND wallet_id = :wallet_id
                  ORDER BY proposal_id",
             )
-            .map_err(|e| VotingError::Internal { message: format!("prepare ballot_intents: {e}") })?;
+            .map_err(|e| VotingError::Internal {
+                message: format!("prepare ballot_intents: {e}"),
+            })?;
         let rows = stmt
             .query_map(
                 named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -80,9 +84,13 @@ impl VotingDb {
                     Ok((pid, decision))
                 },
             )
-            .map_err(|e| VotingError::Internal { message: format!("query ballot_intents: {e}") })?;
+            .map_err(|e| VotingError::Internal {
+                message: format!("query ballot_intents: {e}"),
+            })?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| VotingError::Internal { message: format!("collect ballot_intents: {e}") })
+            .map_err(|e| VotingError::Internal {
+                message: format!("collect ballot_intents: {e}"),
+            })
     }
 }
 
@@ -97,11 +105,25 @@ fn now_secs() -> i64 {
 /// `RoundPlan`, so a restart yields the same sequence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NextStep {
-    Delegate { bundle_index: u32 },
-    PollDelegation { bundle_index: u32 },
-    CastVote { bundle_index: u32, proposal_id: u32 },
-    PollVote { bundle_index: u32, proposal_id: u32 },
-    ConfirmShare { bundle_index: u32, proposal_id: u32, share_index: u32 },
+    Delegate {
+        bundle_index: u32,
+    },
+    PollDelegation {
+        bundle_index: u32,
+    },
+    CastVote {
+        bundle_index: u32,
+        proposal_id: u32,
+    },
+    PollVote {
+        bundle_index: u32,
+        proposal_id: u32,
+    },
+    ConfirmShare {
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+    },
 }
 
 /// Derived resume state for one round.
@@ -112,7 +134,10 @@ pub struct RoundPlan {
     pub pending_recovery: bool,
     /// Ordered remaining recovery work.
     pub next_steps: Vec<NextStep>,
-    /// Proposals still open to vote (Skipped or never decided) while the round is open.
+    /// Proposals with no terminal decision yet.
+    ///
+    /// `Decision::Skipped` is terminal for this plan, so skipped proposals are
+    /// not returned here.
     pub open_proposals: Vec<u32>,
     /// Informational: every proposal is either a confirmed Choice or Skipped.
     pub all_decided: bool,
@@ -125,11 +150,19 @@ fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
     match step {
         NextStep::Delegate { bundle_index } => (*bundle_index, 0, 0, 0),
         NextStep::PollDelegation { bundle_index } => (*bundle_index, 0, 0, 0),
-        NextStep::CastVote { bundle_index, proposal_id } => (*bundle_index, 1, *proposal_id, 0),
-        NextStep::PollVote { bundle_index, proposal_id } => (*bundle_index, 1, *proposal_id, 0),
-        NextStep::ConfirmShare { bundle_index, proposal_id, share_index } => {
-            (*bundle_index, 2, *proposal_id, *share_index)
-        }
+        NextStep::CastVote {
+            bundle_index,
+            proposal_id,
+        } => (*bundle_index, 1, *proposal_id, 0),
+        NextStep::PollVote {
+            bundle_index,
+            proposal_id,
+        } => (*bundle_index, 1, *proposal_id, 0),
+        NextStep::ConfirmShare {
+            bundle_index,
+            proposal_id,
+            share_index,
+        } => (*bundle_index, 2, *proposal_id, *share_index),
     }
 }
 
@@ -160,11 +193,20 @@ pub fn resume_plan(
     for &pid in proposal_ids {
         match intents.get(&pid) {
             Some(Decision::Choice(_)) => choice_proposals.push(pid),
-            _ => open_proposals.push(pid), // Skipped or never decided -> open, votable later
+            Some(Decision::Skipped) => {}
+            None => open_proposals.push(pid),
         }
     }
     choice_proposals.sort_unstable();
     open_proposals.sort_unstable();
+
+    if !choice_proposals.is_empty() && bundles.is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} has ballot choice intent but no eligible bundle rows"
+            ),
+        });
+    }
 
     let mut steps: Vec<NextStep> = Vec::new();
     let mut bundles_needing_delegation: BTreeSet<u32> = BTreeSet::new();
@@ -175,11 +217,17 @@ pub fn resume_plan(
             match votes.get(&(b, pid)) {
                 Some(VotePhase::Confirmed) => {}
                 Some(VotePhase::Submitted) => {
-                    steps.push(NextStep::PollVote { bundle_index: b, proposal_id: pid });
+                    steps.push(NextStep::PollVote {
+                        bundle_index: b,
+                        proposal_id: pid,
+                    });
                 }
                 // Prepared, Committed, or no row yet -> still needs casting.
                 _ => {
-                    steps.push(NextStep::CastVote { bundle_index: b, proposal_id: pid });
+                    steps.push(NextStep::CastVote {
+                        bundle_index: b,
+                        proposal_id: pid,
+                    });
                     bundles_needing_delegation.insert(b);
                 }
             }
@@ -288,7 +336,10 @@ mod tests {
         db.set_ballot_intent(ROUND, 1, Decision::Choice(3)).unwrap(); // upsert
 
         let intents = db.ballot_intents(ROUND).unwrap();
-        assert_eq!(intents, vec![(1, Decision::Choice(3)), (2, Decision::Skipped)]);
+        assert_eq!(
+            intents,
+            vec![(1, Decision::Choice(3)), (2, Decision::Skipped)]
+        );
     }
 
     #[test]
@@ -313,7 +364,10 @@ mod tests {
             plan.next_steps,
             vec![
                 NextStep::Delegate { bundle_index: 0 },
-                NextStep::CastVote { bundle_index: 0, proposal_id: 2 },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 2
+                },
             ]
         );
         assert_eq!(plan.open_proposals, vec![1, 3]);
@@ -329,16 +383,36 @@ mod tests {
         db.store_vote_tx_hash(ROUND, 0, 2, "vtx").unwrap();
         db.mark_vote_submitted(ROUND, 0, 2).unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
-        assert_eq!(plan.next_steps, vec![NextStep::PollVote { bundle_index: 0, proposal_id: 2 }]);
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::PollVote {
+                bundle_index: 0,
+                proposal_id: 2
+            }]
+        );
     }
 
     #[test]
-    fn skipped_proposal_is_open_not_recovery() {
+    fn skipped_proposal_is_terminal_not_recovery() {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 1, Decision::Skipped).unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert!(!plan.pending_recovery);
-        assert!(plan.open_proposals.contains(&1));
+        assert_eq!(plan.open_proposals, vec![2, 3]);
+    }
+
+    #[test]
+    fn choice_intent_without_bundles_is_invalid() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(W);
+        db.create_round(&round_params()).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+
+        let err = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap_err();
+        assert!(
+            err.to_string().contains("no eligible bundle rows"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -346,7 +420,10 @@ mod tests {
         let db = db_with_bundle();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap(); // Submitted, no VAN
         let plan = resume_plan(&db, ROUND, &[1]).unwrap();
-        assert_eq!(plan.next_steps, vec![NextStep::PollDelegation { bundle_index: 0 }]);
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::PollDelegation { bundle_index: 0 }]
+        );
     }
 
     #[test]
@@ -379,9 +456,15 @@ mod tests {
             plan.next_steps,
             vec![
                 NextStep::Delegate { bundle_index: 0 },
-                NextStep::CastVote { bundle_index: 0, proposal_id: 2 },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 2
+                },
                 NextStep::Delegate { bundle_index: 1 },
-                NextStep::CastVote { bundle_index: 1, proposal_id: 2 },
+                NextStep::CastVote {
+                    bundle_index: 1,
+                    proposal_id: 2
+                },
             ]
         );
     }
@@ -435,8 +518,11 @@ mod tests {
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
         assert!(
-            plan.next_steps
-                .contains(&NextStep::ConfirmShare { bundle_index: 0, proposal_id: 2, share_index: 0 }),
+            plan.next_steps.contains(&NextStep::ConfirmShare {
+                bundle_index: 0,
+                proposal_id: 2,
+                share_index: 0
+            }),
             "expected ConfirmShare in steps, got: {:?}",
             plan.next_steps
         );
