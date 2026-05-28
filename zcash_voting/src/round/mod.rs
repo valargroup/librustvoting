@@ -58,6 +58,49 @@ pub fn note_bundles(notes: &[NoteInfo]) -> Result<Vec<Vec<NoteInfo>>, VotingErro
     Ok(chunk_notes(notes).bundles)
 }
 
+/// Returns the unquantized zatoshi value for a bundle.
+///
+/// The sum is checked so caller-visible bundle reports cannot silently wrap on
+/// malformed or unexpectedly large note sets.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] if summing note values overflows `u64`.
+pub fn raw_bundle_weight(notes: &[NoteInfo]) -> Result<u64, VotingError> {
+    notes.iter().try_fold(0u64, |acc, note| {
+        acc.checked_add(note.value)
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "delegation bundle weight overflows u64".to_string(),
+            })
+    })
+}
+
+/// Returns the bundle voting weight rounded down to the ballot divisor.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] if summing note values overflows `u64`.
+pub fn quantized_bundle_weight(notes: &[NoteInfo]) -> Result<u64, VotingError> {
+    let raw = raw_bundle_weight(notes)?;
+    Ok((raw / crate::governance::BALLOT_DIVISOR) * crate::governance::BALLOT_DIVISOR)
+}
+
+/// Returns the quantized voting weight for a set of persisted bundles.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] if any bundle sum or the final set sum
+/// overflows `u64`.
+pub fn quantized_bundle_set_weight(bundles: &[Vec<NoteInfo>]) -> Result<u64, VotingError> {
+    bundles.iter().try_fold(0u64, |acc, bundle| {
+        let weight = quantized_bundle_weight(bundle)?;
+        acc.checked_add(weight)
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "delegation bundle set weight overflows u64".to_string(),
+            })
+    })
+}
+
 impl VotingDb {
     /// Opens or creates a voting database at `path` and runs migrations.
     ///
@@ -191,6 +234,67 @@ impl VotingDb {
             dropped_count: plan.dropped_count as u32,
         })
     }
+
+    /// Creates bundle rows or validates a persisted prefix of bundle rows.
+    ///
+    /// This variant supports Keystone recovery flows where the user intentionally
+    /// skips unsigned trailing bundles. Existing rows must still match the
+    /// current note selection prefix exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] if `notes` are invalid, if the
+    /// current note selection has fewer bundles than storage, if persisted
+    /// bundle note identities do not match, or if bundle weight calculation
+    /// overflows. Database failures are returned as [`VotingError::Internal`].
+    pub fn ensure_bundles_with_skipped_suffix(
+        &self,
+        round_id: &str,
+        notes: &[NoteInfo],
+    ) -> Result<BundleLayout, VotingError> {
+        crate::types::validate_notes_for_round(notes)?;
+        let stored_count = self.get_bundle_count(round_id)?;
+        if stored_count == 0 {
+            return self.ensure_bundles(round_id, notes);
+        }
+
+        let bundles = note_bundles(notes)?;
+        if bundles.len() < stored_count as usize {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "current note selection produces {} delegation bundles, but {stored_count} bundle rows are already persisted for round {round_id}",
+                    bundles.len()
+                ),
+            });
+        }
+
+        let stored_bundles = &bundles[..stored_count as usize];
+        validate_persisted_bundle_notes(self, round_id, stored_bundles)?;
+        Ok(BundleLayout {
+            bundle_count: stored_count,
+            eligible_weight: quantized_bundle_set_weight(stored_bundles)?,
+            dropped_count: 0,
+        })
+    }
+}
+
+fn validate_persisted_bundle_notes(
+    db: &VotingDb,
+    round_id: &str,
+    bundles: &[Vec<NoteInfo>],
+) -> Result<(), VotingError> {
+    let conn = db.conn();
+    let wallet_id = db.wallet_id();
+    for (bundle_index, bundle_notes) in bundles.iter().enumerate() {
+        queries::require_bundle_notes(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index as u32,
+            bundle_notes,
+        )?;
+    }
+    Ok(())
 }
 
 fn round_eligible_weight(
@@ -306,5 +410,95 @@ mod tests {
 
         assert_eq!(round.bundle_count, layout.bundle_count);
         assert_eq!(round.eligible_weight, Some(layout.eligible_weight));
+    }
+
+    #[test]
+    fn ensure_bundles_with_skipped_suffix_accepts_persisted_prefix() {
+        let db = test_db("wallet-d");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+            note(2, crate::governance::BALLOT_DIVISOR),
+            note(3, crate::governance::BALLOT_DIVISOR),
+            note(4, crate::governance::BALLOT_DIVISOR),
+            note(5, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        db.delete_skipped_bundles(ROUND_ID, 1).unwrap();
+
+        let reused = db
+            .ensure_bundles_with_skipped_suffix(ROUND_ID, &notes)
+            .unwrap();
+
+        assert_eq!(reused.bundle_count, 1);
+        assert_eq!(
+            reused.eligible_weight,
+            5 * crate::governance::BALLOT_DIVISOR
+        );
+    }
+
+    #[test]
+    fn ensure_bundles_with_skipped_suffix_rejects_missing_stored_bundle() {
+        let db = test_db("wallet-e");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+            note(2, crate::governance::BALLOT_DIVISOR),
+            note(3, crate::governance::BALLOT_DIVISOR),
+            note(4, crate::governance::BALLOT_DIVISOR),
+            note(5, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+
+        let err = db
+            .ensure_bundles_with_skipped_suffix(
+                ROUND_ID,
+                &[note(0, crate::governance::BALLOT_DIVISOR)],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("current note selection produces 1 delegation bundles"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bundle_weight_helpers_quantize_and_check_sets() {
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR + 1),
+            note(1, crate::governance::BALLOT_DIVISOR / 2),
+        ];
+
+        assert_eq!(
+            raw_bundle_weight(&notes).unwrap(),
+            crate::governance::BALLOT_DIVISOR + 1 + crate::governance::BALLOT_DIVISOR / 2
+        );
+        assert_eq!(
+            quantized_bundle_weight(&notes).unwrap(),
+            crate::governance::BALLOT_DIVISOR
+        );
+        assert_eq!(
+            quantized_bundle_set_weight(&[notes]).unwrap(),
+            crate::governance::BALLOT_DIVISOR
+        );
+    }
+
+    #[test]
+    fn bundle_weight_helpers_reject_overflow() {
+        let err = raw_bundle_weight(&[note(0, u64::MAX), note(1, 1)])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("delegation bundle weight overflows u64"));
+
+        let near_max =
+            (u64::MAX / crate::governance::BALLOT_DIVISOR) * crate::governance::BALLOT_DIVISOR;
+        let err = quantized_bundle_set_weight(&[vec![note(0, near_max)], vec![note(1, near_max)]])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("delegation bundle set weight overflows u64"));
     }
 }

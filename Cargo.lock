@@ -3176,6 +3176,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
  "valar-spiral-rs",
  "valar-ypir",
  "vote-commitment-tree",
