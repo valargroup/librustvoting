@@ -108,7 +108,7 @@ pub enum NextStep {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoundPlan {
     pub round_id: String,
-    /// True iff there is interrupted, answered work to finish (`!next_steps.is_empty()`).
+    /// True iff any recovery step remains (`!next_steps.is_empty()`).
     pub pending_recovery: bool,
     /// Ordered remaining recovery work.
     pub next_steps: Vec<NextStep>,
@@ -119,6 +119,9 @@ pub struct RoundPlan {
 }
 
 fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
+    // Delegate and PollDelegation never coexist for one bundle, and CastVote
+    // and PollVote never coexist for one (bundle, proposal), so the shared sort
+    // keys are unambiguous.
     match step {
         NextStep::Delegate { bundle_index } => (*bundle_index, 0, 0, 0),
         NextStep::PollDelegation { bundle_index } => (*bundle_index, 0, 0, 0),
@@ -202,8 +205,15 @@ pub fn resume_plan(
 
     // Confirm already-submitted helper shares.
     for (b, p, s, phase) in shares {
-        if phase == SharePhase::Submitted {
-            steps.push(NextStep::ConfirmShare { bundle_index: b, proposal_id: p, share_index: s });
+        match phase {
+            SharePhase::Submitted => {
+                steps.push(NextStep::ConfirmShare {
+                    bundle_index: b,
+                    proposal_id: p,
+                    share_index: s,
+                });
+            }
+            SharePhase::Confirmed => {}
         }
     }
 
@@ -337,5 +347,127 @@ mod tests {
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap(); // Submitted, no VAN
         let plan = resume_plan(&db, ROUND, &[1]).unwrap();
         assert_eq!(plan.next_steps, vec![NextStep::PollDelegation { bundle_index: 0 }]);
+    }
+
+    #[test]
+    fn multi_bundle_orders_steps_by_bundle() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(W);
+        db.create_round(&round_params()).unwrap();
+        db.ensure_bundles(
+            ROUND,
+            &[note(0), note(1), note(2), note(3), note(4), note(5)],
+        )
+        .unwrap();
+
+        // Verify the actual bundle count before asserting; 6 notes with
+        // BALLOT_DIVISOR value each should produce 2 bundles (indices 0 and 1).
+        let phases = db.delegation_phases(ROUND).unwrap();
+        let bundle_count = phases.len();
+        assert_eq!(
+            bundle_count,
+            2,
+            "expected 6 notes → 2 bundles, got {bundle_count}; adjust this test if bundling rules changed"
+        );
+
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        // Bundle-primary ordering: all of bundle 0's steps come before bundle 1's.
+        // Within a bundle, Delegate (prereq) precedes CastVote.
+        assert_eq!(
+            plan.next_steps,
+            vec![
+                NextStep::Delegate { bundle_index: 0 },
+                NextStep::CastVote { bundle_index: 0, proposal_id: 2 },
+                NextStep::Delegate { bundle_index: 1 },
+                NextStep::CastVote { bundle_index: 1, proposal_id: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn delegate_suppressed_when_vote_confirmed() {
+        let db = db_with_bundle();
+        // Drive proposal 2 on bundle 0 to VotePhase::Confirmed:
+        // store_vote → store_commitment_bundle → store_vote_tx_hash → mark_vote_submitted.
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        crate::storage::queries::store_commitment_bundle(
+            &db.conn(),
+            ROUND,
+            W,
+            0,
+            2,
+            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
+            42,
+        )
+        .unwrap();
+        db.store_vote_tx_hash(ROUND, 0, 2, "tx").unwrap();
+        db.mark_vote_submitted(ROUND, 0, 2).unwrap();
+
+        // Bundle 0 delegation is still only Prepared — but the vote is Confirmed,
+        // so no Delegate step should appear and the plan has no work left.
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert!(
+            plan.next_steps.is_empty(),
+            "expected no steps, got: {:?}",
+            plan.next_steps
+        );
+        assert!(!plan.pending_recovery);
+    }
+
+    #[test]
+    fn confirm_share_emitted_for_unconfirmed_share() {
+        let db = db_with_bundle();
+        db.record_share_delegation(
+            ROUND,
+            0,
+            2,
+            0,
+            &["https://helper.example".to_string()],
+            &[0x44; 32],
+            0,
+        )
+        .unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert!(
+            plan.next_steps
+                .contains(&NextStep::ConfirmShare { bundle_index: 0, proposal_id: 2, share_index: 0 }),
+            "expected ConfirmShare in steps, got: {:?}",
+            plan.next_steps
+        );
+    }
+
+    #[test]
+    fn all_decided_true_with_confirmed_choice_and_skip() {
+        let db = db_with_bundle();
+
+        // Proposal 2: drive to Confirmed.
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        crate::storage::queries::store_commitment_bundle(
+            &db.conn(),
+            ROUND,
+            W,
+            0,
+            2,
+            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
+            42,
+        )
+        .unwrap();
+        db.store_vote_tx_hash(ROUND, 0, 2, "tx").unwrap();
+        db.mark_vote_submitted(ROUND, 0, 2).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+
+        // Proposal 1: skipped.
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped).unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[1, 2]).unwrap();
+
+        assert!(plan.all_decided, "expected all_decided == true");
+        assert!(!plan.pending_recovery, "expected pending_recovery == false");
     }
 }
