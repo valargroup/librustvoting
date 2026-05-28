@@ -24,6 +24,52 @@ pub enum DelegationPhase {
     Confirmed,
 }
 
+/// Cast-vote lifecycle for one bundle/proposal pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VotePhase {
+    /// The vote row exists, but no recovery bundle has been persisted.
+    Prepared,
+    /// The ZKP #2 bundle, share recovery data, and cast-vote signature are persisted.
+    Committed,
+    /// A cast-vote transaction hash has been recorded.
+    Submitted,
+    /// The vote commitment tree position has been recorded.
+    Confirmed,
+}
+
+impl VotePhase {
+    /// Returns the stable string used by FFI layers and UI state machines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Committed => "committed",
+            Self::Submitted => "submitted",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+/// Helper-share lifecycle for one delegated share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SharePhase {
+    /// A helper-server submission record exists.
+    Submitted,
+    /// The helper share has been confirmed on-chain.
+    Confirmed,
+}
+
+impl SharePhase {
+    /// Returns the stable string used by FFI layers and UI state machines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
 impl DelegationPhase {
     /// Returns the stable string used by FFI layers and UI state machines.
     pub fn as_str(self) -> &'static str {
@@ -145,6 +191,183 @@ impl VotingDb {
 
         Ok(rows)
     }
+
+    /// Loads the canonical vote phase for one bundle/proposal pair.
+    pub fn vote_phase(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<VotePhase, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let phase = conn
+            .query_row(
+                "SELECT submitted, tx_hash IS NOT NULL, vc_tree_position IS NOT NULL,
+                        commitment_bundle_json IS NOT NULL
+                 FROM votes
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND bundle_index = :bundle_index
+                   AND proposal_id = :proposal_id",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index as i64,
+                    ":proposal_id": proposal_id as i64,
+                },
+                |row| {
+                    Ok(vote_phase_from_columns(
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to load vote phase: {e}"),
+            })?;
+
+        phase.ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "vote not found for round {round_id} bundle {bundle_index} proposal {proposal_id}"
+            ),
+        })
+    }
+
+    /// Lists canonical vote phases for all votes in one round.
+    pub fn vote_phases(&self, round_id: &str) -> Result<Vec<(u32, u32, VotePhase)>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let mut stmt = conn
+            .prepare(
+                "SELECT bundle_index, proposal_id, submitted, tx_hash IS NOT NULL,
+                        vc_tree_position IS NOT NULL, commitment_bundle_json IS NOT NULL
+                 FROM votes
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                 ORDER BY bundle_index, proposal_id",
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to prepare vote phases query: {e}"),
+            })?;
+
+        let rows = stmt
+            .query_map(
+                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u32,
+                        row.get::<_, i64>(1)? as u32,
+                        vote_phase_from_columns(
+                            row.get::<_, i64>(2)? != 0,
+                            row.get::<_, i64>(3)? != 0,
+                            row.get::<_, i64>(4)? != 0,
+                            row.get::<_, i64>(5)? != 0,
+                        ),
+                    ))
+                },
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to query vote phases: {e}"),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to read vote phase row: {e}"),
+            })?;
+        Ok(rows)
+    }
+
+    /// Loads the canonical helper-share phase for one share record.
+    pub fn share_phase(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+    ) -> Result<SharePhase, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let phase = conn
+            .query_row(
+                "SELECT confirmed
+                 FROM share_delegations
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND bundle_index = :bundle_index
+                   AND proposal_id = :proposal_id
+                   AND share_index = :share_index",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index as i64,
+                    ":proposal_id": proposal_id as i64,
+                    ":share_index": share_index as i64,
+                },
+                |row| {
+                    Ok(if row.get::<_, i64>(0)? != 0 {
+                        SharePhase::Confirmed
+                    } else {
+                        SharePhase::Submitted
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to load share phase: {e}"),
+            })?;
+
+        phase.ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "share not found for round {round_id} bundle {bundle_index} proposal {proposal_id} share {share_index}"
+            ),
+        })
+    }
+
+    /// Lists canonical helper-share phases for all shares in one round.
+    pub fn share_phases(
+        &self,
+        round_id: &str,
+    ) -> Result<Vec<(u32, u32, u32, SharePhase)>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let mut stmt = conn
+            .prepare(
+                "SELECT bundle_index, proposal_id, share_index, confirmed
+                 FROM share_delegations
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                 ORDER BY bundle_index, proposal_id, share_index",
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to prepare share phases query: {e}"),
+            })?;
+
+        let rows = stmt
+            .query_map(
+                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u32,
+                        row.get::<_, i64>(1)? as u32,
+                        row.get::<_, i64>(2)? as u32,
+                        if row.get::<_, i64>(3)? != 0 {
+                            SharePhase::Confirmed
+                        } else {
+                            SharePhase::Submitted
+                        },
+                    ))
+                },
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to query share phases: {e}"),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to read share phase row: {e}"),
+            })?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +467,68 @@ mod tests {
         assert_eq!(phases[0], (0, DelegationPhase::Prepared));
         assert_eq!(phases[1], (1, DelegationPhase::Prepared));
     }
+
+    #[test]
+    fn vote_phase_advances_from_persisted_artifacts() {
+        let db = db_with_bundle();
+        crate::storage::queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 1, 2, &[0xCA; 32])
+            .unwrap();
+        assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Prepared);
+
+        crate::storage::queries::store_commitment_bundle(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            0,
+            1,
+            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
+            456,
+        )
+        .unwrap();
+        assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Committed);
+
+        db.store_vote_tx_hash(ROUND_ID, 0, 1, "tx").unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1).unwrap();
+        assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Confirmed);
+    }
+
+    #[test]
+    fn vote_and_share_phase_lists_are_sorted() {
+        let db = db_with_bundle();
+        crate::storage::queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 2, 1, &[0xCA; 32])
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 1, 2, &[0xCB; 32])
+            .unwrap();
+        db.record_share_delegation(
+            ROUND_ID,
+            0,
+            1,
+            1,
+            &["https://helper.example".to_string()],
+            &[0x44; 32],
+            0,
+        )
+        .unwrap();
+
+        let vote_phases = db.vote_phases(ROUND_ID).unwrap();
+        let share_phases = db.share_phases(ROUND_ID).unwrap();
+
+        assert_eq!(
+            vote_phases,
+            vec![(0, 1, VotePhase::Prepared), (0, 2, VotePhase::Prepared)]
+        );
+        assert_eq!(share_phases, vec![(0, 1, 1, SharePhase::Submitted)]);
+
+        assert_eq!(
+            db.share_phase(ROUND_ID, 0, 1, 1).unwrap(),
+            SharePhase::Submitted
+        );
+        db.mark_share_confirmed(ROUND_ID, 0, 1, 1).unwrap();
+        assert_eq!(
+            db.share_phase(ROUND_ID, 0, 1, 1).unwrap(),
+            SharePhase::Confirmed
+        );
+    }
 }
 
 fn phase_from_columns(
@@ -262,5 +547,22 @@ fn phase_from_columns(
         DelegationPhase::PcztBuilt
     } else {
         DelegationPhase::Prepared
+    }
+}
+
+fn vote_phase_from_columns(
+    submitted: bool,
+    has_tx_hash: bool,
+    has_vc_position: bool,
+    has_recovery_bundle: bool,
+) -> VotePhase {
+    if submitted && has_tx_hash && has_vc_position && has_recovery_bundle {
+        VotePhase::Confirmed
+    } else if submitted && has_tx_hash {
+        VotePhase::Submitted
+    } else if has_recovery_bundle {
+        VotePhase::Committed
+    } else {
+        VotePhase::Prepared
     }
 }

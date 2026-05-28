@@ -27,6 +27,30 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   so wallet SDKs can share the snapshot tree-state persistence, witness
   generation, and bundle witness caching flow while keeping wallet DB opening at
   each SDK boundary.
+- Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
+  `VoteCommit`, `VoteSigner`, `VoteSubmission`, and `VoteRecoveryBundle`.
+  `vote::commit` now builds ZKP #2, signs the cast-vote payload, persists the
+  canonical recovery bundle, and can reconstruct submission fields after a
+  process restart.
+- Added the stable `share::*` API for helper-share nullifier computation,
+  recovery payload reconstruction, share tracking persistence, confirmation,
+  sent-server updates, and `share::policy::*` scheduling re-exports.
+- Added `VotePhase` and `SharePhase` plus
+  `VotingDb::{vote_phase, vote_phases, share_phase, share_phases}` so wallets
+  can derive vote/share recovery state without querying SQLite tables directly.
+- Added `precompute::{sync_vote_tree, van_witness, reset_vote_tree}` as the
+  public vote commitment tree sync and VAN witness surface.
+- Added `examples/end_to_end_vote.rs` and README migration notes for moving from
+  the delegation-oriented V2 API to the new vote/share API.
+
+### Changed
+- `vote::serialize_recovery` / `vote::parse_recovery` now own the canonical
+  `zcash_voting_vote_recovery_v1` recovery JSON format, replacing wallet-owned
+  cast-vote recovery blobs.
+- `tree_sync::VanWitness` now uses the typed `vote::VanWitness` shape with a
+  fixed 24-element authentication path.
+- Cast-vote signing can derive the hotkey for an explicit ZIP-32 account index
+  through the new account-aware signing path used by `vote::commit`.
 
 # 0.10.1
 

@@ -1,5 +1,5 @@
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-use std::future::Future;
+use std::{future::Future, sync::OnceLock};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -34,6 +34,8 @@ pub struct HyperTransport {
 
 impl HyperTransport {
     pub fn new() -> Self {
+        #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+        ensure_rustls_provider();
         #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
         let runtime = BlockingRuntime::new();
         let mut connector = HttpConnector::new();
@@ -91,6 +93,14 @@ impl HyperTransport {
             body,
         })
     }
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+fn ensure_rustls_provider() {
+    static RUSTLS_PROVIDER: OnceLock<()> = OnceLock::new();
+    RUSTLS_PROVIDER.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 impl Default for HyperTransport {

@@ -3170,6 +3170,7 @@ dependencies = [
  "prost",
  "rand",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "sinsemilla",

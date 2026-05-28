@@ -2,10 +2,11 @@
 //!
 //! Wallet SDKs should import [`prelude`] and follow the lifecycle:
 //! create a round, bind eligible notes into bundles, precompute witness/PIR
-//! data, build a delegation PCZT, prove delegation, and finally record chain
-//! submission data. Lower-level modules remain available for the current
-//! 0.10-to-0.11 migration window, but new integrations should use `round`,
-//! `precompute`, and `delegate`.
+//! data, build a delegation PCZT, prove delegation, sync the vote commitment
+//! tree, cast votes with `vote::commit`, recover helper-share payloads through
+//! `share`, and finally record chain submission data. Lower-level modules remain
+//! available during the wallet migration window, but new integrations should use
+//! `round`, `precompute`, `delegate`, `vote`, and `share`.
 
 pub mod action;
 pub mod decompose;
@@ -28,6 +29,7 @@ pub mod pir_snapshot;
 pub mod precompute;
 pub mod prelude;
 pub mod round;
+pub mod share;
 pub mod share_policy;
 pub mod share_tracking;
 pub mod storage;
@@ -35,6 +37,7 @@ pub mod transport;
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub mod tree_sync;
 pub mod types;
+pub mod vote;
 pub mod vote_commitment;
 pub mod witness;
 pub mod zkp1;
