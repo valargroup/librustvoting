@@ -4,22 +4,42 @@ Client-side library for integrating [Zcash shielded voting](https://github.com/v
 
 ## Usage
 
-Wallets typically consume this through a language bridge:
+Wallets should import `zcash_voting::prelude::*` and follow the stable setup →
+precompute → delegate lifecycle:
 
-- **Rust wallets**: add `zcash_voting = "0.9"` to `Cargo.toml`.
-- **Mobile wallets**: expose the needed Rust APIs through the wallet SDK's FFI
-  layer and keep platform-specific work, such as CSPRNG byte generation and
-  HTTP submission, at the SDK boundary.
-
-See the [wallet integration guide](https://github.com/valargroup/vote-sdk/blob/main/docs/wallet-integration.md) for the full flow.
+1. Open a `VotingDb`, set the wallet id, and call `create_round`.
+2. Convert eligible Orchard notes into `NoteInfo` with
+   `NoteInfo::from_orchard_note`, then call `ensure_bundles`.
+3. Build the governance PCZT with `setup_delegation`.
+4. Precompute delegation inputs with `note_witnesses` and, with the `pir`
+   feature, `delegation_pir`.
+5. Prove with `delegate::prove`, assemble submission fields with
+   `delegation_submission`, and record chain recovery data with
+   `record_submission` and `record_van_position`.
 
 ## Crate layout
 
 | Crate | Purpose |
 |---|---|
-| **`zcash_voting`** (this crate) | Top-level API: proof generation, hotkey derivation, share construction, PCZT assembly, round-state storage. |
+| **`zcash_voting`** (this crate) | Stable wallet API: round setup, note bundles, delegation precompute/proving, hotkey derivation, and round-state storage. |
 | [`vote-commitment-tree`](../vote-commitment-tree) | Append-only Poseidon Merkle tree for VANs and vote commitments. |
 | [`vote-commitment-tree-client`](../vote-commitment-tree-client) | HTTP client + CLI for syncing the vote commitment tree from a running chain node. |
+
+## Public modules
+
+| Module | Purpose |
+|---|---|
+| `prelude` | Recommended imports for wallet SDKs. |
+| `round` | `VotingDb`, `RoundParams`, `RoundInfo`, and idempotent `ensure_bundles`. |
+| `precompute` | Orchard note witness generation and PIR precompute wrappers. |
+| `delegate` | PCZT setup, proof generation, submission assembly, and chain recovery writes. |
+| `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
+| `pir` | PIR endpoint selection helpers and client re-exports. |
+| `hotkey` | Primitive hotkey derivation from caller-supplied seed bytes. |
+| `governance` | Low-level governance derivations and `BALLOT_DIVISOR`. |
+
+Lower-level modules from previous releases remain available during the 0.11
+migration window, but new wallet code should prefer the lifecycle modules above.
 
 ## Shared wallet policy helpers
 
@@ -41,11 +61,25 @@ crate own the sampling and ordering policy.
 
 - **`orchard 0.13.1`** from crates.io, with the
   `unstable-voting-circuits` feature enabled for the governance proof paths.
-- **`voting-circuits 0.5.0`** for the delegation and vote proof circuits.
+- **`voting-circuits 0.6.0`** for the delegation and vote proof circuits.
 - **`vote-commitment-tree 0.3`** and **`vote-commitment-tree-client 0.5`** for
   vote commitment tree state and optional HTTP sync.
 - **`pczt`, `zcash_keys`, `zcash_primitives`, and `zcash_protocol`** from the
   published upstream Zcash crate line used by this release.
+
+## Migrating from 0.10
+
+- Enable `pir` and `tree-sync` instead of `client-pir` and
+  `client-tree-sync`. The old feature names remain aliases for existing
+  consumers during migration.
+- Prefer `VotingDb::create_round`, `VotingDb::ensure_bundles`, and
+  `VotingDb::delegation_phases` over direct `storage::queries` calls.
+- Use `precompute::note_witnesses` instead of hand-validating cached
+  `TreeState` bytes and manually constructing `WitnessData`.
+- Use `delegate::submission` with `DelegationSigner::Seed` or
+  `DelegationSigner::Keystone` instead of separate submission methods.
+- Treat contextual hotkey mixing as wallet policy. The library intentionally
+  keeps `generate_hotkey(seed)` primitive.
 
 ## License
 

@@ -1,16 +1,38 @@
+//! Client-side APIs for Zcash shielded voting.
+//!
+//! Wallet SDKs should import [`prelude`] and follow the lifecycle:
+//! create a round, bind eligible notes into bundles, precompute witness/PIR
+//! data, build a delegation PCZT, prove delegation, and finally record chain
+//! submission data. Lower-level modules remain available for the current
+//! 0.10-to-0.11 migration window, but new integrations should use `round`,
+//! `precompute`, and `delegate`.
+
 pub mod action;
 pub mod decompose;
+pub mod delegate;
 pub mod elgamal;
+pub mod error;
 pub mod governance;
 pub mod hotkey;
-#[cfg(any(feature = "client-pir", feature = "client-tree-sync"))]
+#[cfg(any(
+    feature = "pir",
+    feature = "tree-sync",
+    feature = "client-pir",
+    feature = "client-tree-sync"
+))]
 mod http_transport;
 pub mod note_bundling;
+pub mod phases;
+pub mod pir;
 pub mod pir_snapshot;
+pub mod precompute;
+pub mod prelude;
+pub mod round;
 pub mod share_policy;
 pub mod share_tracking;
 pub mod storage;
-#[cfg(feature = "client-tree-sync")]
+pub mod transport;
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub mod tree_sync;
 pub mod types;
 pub mod vote_commitment;
@@ -18,15 +40,27 @@ pub mod witness;
 pub mod zkp1;
 pub mod zkp2;
 
-#[cfg(any(feature = "client-pir", feature = "client-tree-sync"))]
+#[cfg(any(
+    feature = "pir",
+    feature = "tree-sync",
+    feature = "client-pir",
+    feature = "client-tree-sync"
+))]
 pub use http_transport::HyperTransport;
-#[cfg(feature = "client-pir")]
+#[cfg(any(feature = "pir", feature = "client-pir"))]
 pub use pir_client::{
     ImtProofData, PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
 
 pub use governance::BALLOT_DIVISOR;
-pub use types::*;
+pub use types::{
+    validate_round_params, BundleSetupResult, CastVoteSignature, DelegationAction,
+    DelegationPirPrecomputeResult, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
+    GovernancePczt, Network, NoopProgressReporter, NoteInfo, PreparedDelegationPirResult,
+    ProgressReporter, ProofProgressReporter, ShareDelegationRecord, SharePayload,
+    VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare,
+    WitnessData,
+};
 
 /// Warm process-lifetime proving-key caches used by on-device voting proofs.
 ///

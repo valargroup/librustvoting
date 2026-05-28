@@ -11,7 +11,7 @@ readme = "README.md"
 default = []
 # PIR client surface for fetching IMT non-membership proofs over direct
 # Hyper/Rustls HTTP.
-client-pir = [
+pir = [
     "dep:imt-tree",
     "dep:pir-client",
     "dep:pir-types",
@@ -25,7 +25,7 @@ client-pir = [
     "dep:hyper-util",
 ]
 # Vote commitment tree HTTP sync surface for VAN witness generation.
-client-tree-sync = [
+tree-sync = [
     "dep:imt-tree",
     "dep:vote-commitment-tree",
     "dep:vote-commitment-tree-client",
@@ -37,8 +37,11 @@ client-tree-sync = [
     "dep:hyper-util",
     "dep:tokio",
 ]
+# Legacy feature names kept as aliases during the wallet migration window.
+client-pir = ["pir"]
+client-tree-sync = ["tree-sync"]
 # Backwards-compatible aggregate for consumers that already enable `client`.
-client = ["client-pir", "client-tree-sync"]
+client = ["pir", "tree-sync"]
 # Downstream test-only helpers for setting up persisted voting state without
 # depending on SQLite schema details.
 test-fixtures = []
