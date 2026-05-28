@@ -15,6 +15,7 @@ pub use crate::delegate::{
 pub use crate::error::VotingError;
 pub use crate::governance::BALLOT_DIVISOR;
 pub use crate::hotkey::generate_hotkey;
+pub use crate::phases::{SharePhase, VotePhase};
 pub use crate::pir::{select_pir_endpoint, PirEndpoint};
 pub use crate::precompute::{
     note_witnesses, stored_note_witnesses, verify_witness, PirPrecomputeReport,
@@ -23,10 +24,23 @@ pub use crate::round::{
     note_bundles, quantized_bundle_set_weight, quantized_bundle_weight, raw_bundle_weight,
     BundleLayout, RoundInfo, RoundParams, VotingDb,
 };
+pub use crate::share::{
+    add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,
+    record as record_share, recover_payload, unconfirmed as unconfirmed_shares, SharePlan,
+    ShareRecord, ShareTimingPolicy, ShareTrackingSummary,
+};
 pub use crate::types::{
     Network, NoopProgressReporter, NoteInfo, ProgressReporter, VotingHotkey, WitnessData,
+};
+pub use crate::vote::{
+    commit as commit_vote, parse_recovery, record_submission as record_vote_submission,
+    record_vc_position, recovery_bundle, serialize_recovery, submission as vote_submission,
+    DraftVote, VanWitness, VoteCommit, VoteRecoveryBundle, VoteSigner, VoteSubmission,
 };
 pub use crate::warm_proving_caches;
 
 #[cfg(feature = "pir")]
 pub use crate::precompute::delegation_pir;
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub use crate::precompute::{reset_vote_tree, sync_vote_tree, van_witness};

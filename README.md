@@ -28,6 +28,34 @@ cargo check                    # check all crates
 cargo build -p zcash_voting   # build just the core library
 ```
 
+## Wallet API Lifecycle
+
+New wallet integrations should import `zcash_voting::prelude::*` and use the
+stage-oriented API:
+
+- `round::*` creates rounds and binds eligible notes into bundles.
+- `precompute::*` prepares Orchard witnesses, delegation PIR inputs, and VAN
+  witnesses for vote proofs.
+- `delegate::*` builds delegation PCZTs, proves delegation, and records VAN
+  positions.
+- `vote::*` builds ZKP #2, signs cast-vote payloads, persists the canonical
+  `VoteRecoveryBundle`, and reconstructs vote-chain submissions after a crash.
+- `share::*` recovers helper-share payloads, computes share nullifiers, applies
+  share scheduling policy, and records helper-share confirmation state.
+
+## Migrating 0.11 to 0.12
+
+- Replace `VotingDb::build_vote_commitment` + `vote_commitment::sign_cast_vote`
+  + `VotingDb::build_share_payloads` orchestration with `vote::commit`.
+- Replace custom cast-vote recovery JSON with `vote::serialize_recovery` and
+  `vote::parse_recovery`.
+- Replace direct `VoteTreeSync` ownership with
+  `precompute::{sync_vote_tree, van_witness, reset_vote_tree}`.
+- Replace direct `share_tracking` calls with `share::*`, and `share_policy`
+  imports with `share::policy::*`.
+- Replace raw vote/share workflow SQL with
+  `VotingDb::{vote_phase, vote_phases, share_phase, share_phases}`.
+
 The workspace depends on the private [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits) repo. The `.cargo/config.toml` enables `git-fetch-with-cli` so your local git credentials are used automatically.
 
 ## Dependency Strategy

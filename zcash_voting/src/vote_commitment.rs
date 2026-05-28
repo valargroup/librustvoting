@@ -87,10 +87,40 @@ pub fn sign_cast_vote(
     anchor_height: u32,
     alpha_v: &[u8],
 ) -> Result<CastVoteSignature, VotingError> {
+    sign_cast_vote_for_account(
+        hotkey_seed,
+        network_id,
+        0,
+        vote_round_id_hex,
+        r_vpk_bytes,
+        van_nullifier,
+        vote_authority_note_new,
+        vote_commitment,
+        proposal_id,
+        anchor_height,
+        alpha_v,
+    )
+}
+
+/// Compute the canonical cast-vote sighash and sign it for a ZIP-32 account.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_cast_vote_for_account(
+    hotkey_seed: &[u8],
+    network_id: u32,
+    account_index: u32,
+    vote_round_id_hex: &str,
+    r_vpk_bytes: &[u8],
+    van_nullifier: &[u8],
+    vote_authority_note_new: &[u8],
+    vote_commitment: &[u8],
+    proposal_id: u32,
+    anchor_height: u32,
+    alpha_v: &[u8],
+) -> Result<CastVoteSignature, VotingError> {
     use ff::PrimeField;
 
     // Derive hotkey SpendingKey from seed
-    let sk = crate::zkp2::derive_spending_key(hotkey_seed, network_id)?;
+    let sk = crate::zkp2::derive_spending_key_for_account(hotkey_seed, network_id, account_index)?;
     let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
 
     // Deserialize alpha_v
