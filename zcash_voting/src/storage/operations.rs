@@ -22,10 +22,29 @@ use crate::storage::{
     KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb,
 };
 use crate::types::{
-    DelegationPirPrecomputeResult, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
-    GovernancePczt, NoteInfo, ProofProgressReporter, SharePayload, VoteCommitmentBundle,
+    BundleSetupResult, DelegationPirPrecomputeResult, DelegationProofResult,
+    DelegationSubmissionData, EncryptedShare, GovernancePczt, NoteInfo,
+    PreparedDelegationPirResult, ProofProgressReporter, SharePayload, VoteCommitmentBundle,
     VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
 };
+
+/// Wallet-supplied inputs for shared delegation PCZT and PIR preparation.
+#[cfg(feature = "client-pir")]
+pub struct PrepareDelegationPirParams<'a> {
+    pub round_id: &'a str,
+    pub bundle_index: u32,
+    pub notes: &'a [NoteInfo],
+    pub fvk_bytes: &'a [u8],
+    pub hotkey_raw_address: &'a [u8],
+    pub consensus_branch_id: u32,
+    pub coin_type: u32,
+    pub seed_fingerprint: &'a [u8; 32],
+    pub account_index: u32,
+    pub round_name: &'a str,
+    pub address_index: u32,
+    pub pir_client: &'a pir_client::PirClientBlocking,
+    pub network_id: u32,
+}
 
 #[cfg(feature = "client-pir")]
 fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, VotingError> {
@@ -380,6 +399,54 @@ impl VotingDb {
         queries::get_bundle_count(&conn, round_id, &wallet_id)
     }
 
+    /// Create bundle rows for the current note selection, or validate that
+    /// existing rows still match the same chunked note identities.
+    pub fn ensure_bundles_for_notes(
+        &self,
+        round_id: &str,
+        notes: &[NoteInfo],
+    ) -> Result<BundleSetupResult, VotingError> {
+        let stored_count = self.get_bundle_count(round_id)?;
+        if stored_count == 0 {
+            let (bundle_count, eligible_weight_zatoshi) = self.setup_bundles(round_id, notes)?;
+            return Ok(BundleSetupResult {
+                bundle_count,
+                eligible_weight_zatoshi,
+            });
+        }
+
+        let chunks = crate::types::chunk_notes(notes);
+        if chunks.bundles.len() != stored_count as usize {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "current note selection produces {} delegation bundles, but {stored_count} \
+                     bundle rows are already persisted for round {round_id}",
+                    chunks.bundles.len()
+                ),
+            });
+        }
+
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        for (bundle_index, bundle_notes) in chunks.bundles.iter().enumerate() {
+            queries::require_bundle_notes(
+                &conn,
+                round_id,
+                &wallet_id,
+                bundle_index as u32,
+                bundle_notes,
+            )
+            .map_err(|e| VotingError::InvalidInput {
+                message: format!("persisted bundle notes do not match current selection: {e}"),
+            })?;
+        }
+
+        Ok(BundleSetupResult {
+            bundle_count: stored_count,
+            eligible_weight_zatoshi: chunks.eligible_weight,
+        })
+    }
+
     // --- Phase 1: Delegation setup ---
 
     /// Generate a voting hotkey from seed bytes. Returns the hotkey (SDK needs address for Keystone flow).
@@ -616,6 +683,62 @@ impl VotingDb {
         Ok(DelegationPirPrecomputeResult {
             cached_count,
             fetched_count,
+        })
+    }
+
+    /// Build the governance PCZT for one eligible delegation bundle and
+    /// precompute the PIR-backed IMT proofs required by delegation proving.
+    #[cfg(feature = "client-pir")]
+    pub fn prepare_delegation_pir(
+        &self,
+        params: PrepareDelegationPirParams<'_>,
+    ) -> Result<PreparedDelegationPirResult, VotingError> {
+        let bundle_setup = self.ensure_bundles_for_notes(params.round_id, params.notes)?;
+        if bundle_setup.bundle_count == 0 {
+            return Err(VotingError::InvalidInput {
+                message: "no eligible voting bundles were created for delegation PIR preparation"
+                    .to_string(),
+            });
+        }
+
+        let chunks = crate::types::chunk_notes(params.notes);
+        let bundle_notes = chunks
+            .bundles
+            .get(params.bundle_index as usize)
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: format!(
+                    "bundle_index {} has no eligible note bundle",
+                    params.bundle_index
+                ),
+            })?;
+
+        let governance_pczt = self.build_governance_pczt(
+            params.round_id,
+            params.bundle_index,
+            bundle_notes,
+            params.fvk_bytes,
+            params.hotkey_raw_address,
+            params.consensus_branch_id,
+            params.coin_type,
+            params.seed_fingerprint,
+            params.account_index,
+            params.round_name,
+            params.address_index,
+        )?;
+        let precompute = self.precompute_delegation_pir(
+            params.round_id,
+            params.bundle_index,
+            bundle_notes,
+            params.pir_client,
+            params.network_id,
+        )?;
+
+        Ok(PreparedDelegationPirResult {
+            governance_pczt,
+            precompute,
+            bundle_count: bundle_setup.bundle_count,
+            eligible_weight_zatoshi: bundle_setup.eligible_weight_zatoshi,
+            bundle_index: params.bundle_index,
         })
     }
 
@@ -1559,6 +1682,16 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
         db.setup_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
+        {
+            let conn = db.conn();
+            let err = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0)
+                .expect_err("padded secrets should only exist after PCZT construction");
+            assert!(
+                err.to_string().contains("padded_note_secrets")
+                    || err.to_string().contains("delegation data"),
+                "{err}"
+            );
+        }
 
         let hotkey_sk = SpendingKey::from_bytes([0x43; 32]).expect("valid spending key");
         let hotkey_fvk = FullViewingKey::from(&hotkey_sk);
@@ -1594,6 +1727,169 @@ mod tests {
         assert_eq!(pir_nullifiers, result.dummy_nullifiers);
     }
 
+    #[cfg(feature = "client-pir")]
+    #[test]
+    fn test_prepare_delegation_pir_builds_pczt_and_reuses_cached_pir_proofs() {
+        use orchard::{
+            keys::{FullViewingKey, SpendingKey},
+            note::Rho,
+            value::NoteValue,
+        };
+        use rand::rngs::OsRng;
+        use voting_circuits::delegation::ImtProvider;
+        use zcash_keys::keys::UnifiedSpendingKey;
+        use zcash_protocol::consensus::TEST_NETWORK;
+        use zip32::{AccountId, Scope};
+
+        struct StaticPirTransport;
+
+        impl pir_client::Transport for StaticPirTransport {
+            fn get<'a>(&'a self, url: &'a str) -> pir_client::TransportFuture<'a> {
+                Box::pin(async move {
+                    let path = request_path(url);
+                    match path {
+                        "/tier0" => Ok(transport_response(vec![
+                            0;
+                            ((1usize
+                                << pir_types::TIER0_LAYERS)
+                                - 1)
+                                * 32
+                                + pir_types::TIER1_ROWS * 64
+                        ])),
+                        "/params/tier1" => Ok(transport_response(
+                            serde_json::to_vec(&pir_types::YpirScenario {
+                                num_items: pir_types::TIER1_YPIR_ROWS,
+                                item_size_bits: pir_types::TIER1_ITEM_BITS,
+                            })
+                            .unwrap(),
+                        )),
+                        "/params/tier2" => Ok(transport_response(
+                            serde_json::to_vec(&pir_types::YpirScenario {
+                                num_items: pir_types::TIER1_YPIR_ROWS,
+                                item_size_bits: pir_types::TIER2_ITEM_BITS,
+                            })
+                            .unwrap(),
+                        )),
+                        "/root" => Ok(transport_response(
+                            serde_json::to_vec(&pir_types::RootInfo {
+                                root29: hex::encode([0u8; 32]),
+                                root25: hex::encode([0u8; 32]),
+                                num_ranges: 1,
+                                pir_depth: pir_types::PIR_DEPTH,
+                                height: None,
+                            })
+                            .unwrap(),
+                        )),
+                        _ => Err(anyhow::anyhow!("unexpected GET {path}")),
+                    }
+                })
+            }
+
+            fn post<'a>(&'a self, url: &'a str, _body: Vec<u8>) -> pir_client::TransportFuture<'a> {
+                Box::pin(async move {
+                    Err(anyhow::anyhow!(
+                        "unexpected POST {}; proofs should be cached",
+                        request_path(url)
+                    ))
+                })
+            }
+        }
+
+        fn request_path(url: &str) -> &str {
+            let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+            without_scheme
+                .find('/')
+                .map(|idx| &without_scheme[idx..])
+                .unwrap_or("/")
+        }
+
+        fn transport_response(body: Vec<u8>) -> pir_client::TransportResponse {
+            pir_client::TransportResponse {
+                status: 200,
+                headers: Vec::new(),
+                body,
+            }
+        }
+
+        let seed = [0x42u8; 32];
+        let account = AccountId::try_from(0u32).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &seed, account).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key();
+        let fvk = ufvk.orchard().unwrap().clone();
+        let address = fvk.address_at(0u32, Scope::External);
+
+        let mut rng = OsRng;
+        let mut notes = Vec::new();
+        for position in 0..5 {
+            let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+            let note = orchard::Note::new(
+                address,
+                NoteValue::from_raw(13_000_000),
+                Rho::from_nf_old(parent_note.nullifier(&fvk)),
+                &mut rng,
+            );
+            notes.push(
+                NoteInfo::from_orchard_note(&note, position, Scope::External, &ufvk, &TEST_NETWORK)
+                    .unwrap(),
+            );
+        }
+
+        let imt = voting_circuits::delegation::SpacedLeafImtProvider::new();
+        let mut params = test_params();
+        params.nullifier_imt_root = imt.root().to_repr().to_vec();
+
+        let db = test_db();
+        db.init_round(&params, None).unwrap();
+        db.ensure_bundles_for_notes(ROUND_ID, &notes).unwrap();
+        {
+            let conn = db.conn();
+            for note in &notes {
+                let nf_bytes: [u8; 32] = note.nullifier.as_slice().try_into().unwrap();
+                let nf = Option::from(pallas::Base::from_repr(nf_bytes)).unwrap();
+                let proof = imt.non_membership_proof(nf).unwrap();
+                queries::store_imt_proof(&conn, ROUND_ID, W, 0, &nf_bytes, &proof).unwrap();
+            }
+        }
+
+        let hotkey_sk = SpendingKey::from_bytes([0x43; 32]).expect("valid spending key");
+        let hotkey_fvk = FullViewingKey::from(&hotkey_sk);
+        let hotkey_raw_address = hotkey_fvk
+            .address_at(0u32, Scope::External)
+            .to_raw_address_bytes()
+            .to_vec();
+        let seed_fingerprint = [0x42u8; 32];
+        let pir_client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            std::sync::Arc::new(StaticPirTransport),
+        )
+        .unwrap();
+
+        let result = db
+            .prepare_delegation_pir(PrepareDelegationPirParams {
+                round_id: ROUND_ID,
+                bundle_index: 0,
+                notes: &notes,
+                fvk_bytes: &fvk.to_bytes(),
+                hotkey_raw_address: &hotkey_raw_address,
+                consensus_branch_id: 0xC8E71055,
+                coin_type: 1,
+                seed_fingerprint: &seed_fingerprint,
+                account_index: 0,
+                round_name: "test-round",
+                address_index: 0,
+                pir_client: &pir_client,
+                network_id: 0,
+            })
+            .unwrap();
+
+        assert_eq!(result.bundle_count, 1);
+        assert_eq!(result.bundle_index, 0);
+        assert_eq!(result.precompute.cached_count, 5);
+        assert_eq!(result.precompute.fetched_count, 0);
+        assert_eq!(result.governance_pczt.pczt_bytes.is_empty(), false);
+        assert_eq!(result.governance_pczt.gov_nullifiers.len(), 5);
+    }
+
     #[test]
     fn test_setup_bundles() {
         let db = test_db();
@@ -1619,6 +1915,50 @@ mod tests {
         // Quantized: bundle 0 (65M → 5×12.5M=62.5M) = 62.5M
         assert_eq!(eligible, 62_500_000);
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_ensure_bundles_for_notes_creates_once_then_reuses_matching_rows() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        let notes = vec![identity_test_note()];
+
+        let created = db.ensure_bundles_for_notes(ROUND_ID, &notes).unwrap();
+        let reused = db.ensure_bundles_for_notes(ROUND_ID, &notes).unwrap();
+
+        assert_eq!(created.bundle_count, 1);
+        assert_eq!(created, reused);
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_ensure_bundles_for_notes_rejects_current_note_selection_drift() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        db.ensure_bundles_for_notes(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+
+        let shape_err = db
+            .ensure_bundles_for_notes(ROUND_ID, &[])
+            .expect_err("empty note selection must not match persisted rows");
+        assert!(
+            shape_err
+                .to_string()
+                .contains("bundle rows are already persisted"),
+            "{shape_err}"
+        );
+
+        let mut substituted = identity_test_note();
+        substituted.nullifier[0] ^= 0x01;
+        let identity_err = db
+            .ensure_bundles_for_notes(ROUND_ID, &[substituted])
+            .expect_err("same-position note substitution must be rejected");
+        assert!(
+            identity_err
+                .to_string()
+                .contains("persisted bundle notes do not match current selection"),
+            "{identity_err}"
+        );
     }
 
     #[test]

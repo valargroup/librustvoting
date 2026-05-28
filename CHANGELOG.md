@@ -9,6 +9,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added `VotingDb::ensure_bundles_for_notes` and
+  `VotingDb::prepare_delegation_pir` so wallet SDKs can share the delegation
+  bundle validation, governance PCZT construction, and PIR precompute sequence
+  while still supplying wallet-specific notes, account metadata, hotkey address,
+  consensus branch, and PIR transport at their own boundaries.
 - Added `zcash_voting::witness::generate_note_witnesses` for Orchard note
   witness generation from a stored voting round snapshot. The V2 API validates
   the cached lightwalletd `TreeState` height and Orchard root against the
