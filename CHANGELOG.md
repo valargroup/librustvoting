@@ -14,6 +14,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the cached lightwalletd `TreeState` height and Orchard root against the
   persisted round parameters before asking the wallet DB for historical Merkle
   paths, then returns `WitnessData` for each bundled note.
+- Added `zcash_voting::witness::store_tree_state_and_generate_note_witnesses`
+  so wallet SDKs can share the snapshot tree-state persistence, witness
+  generation, and bundle witness caching flow while keeping wallet DB opening at
+  each SDK boundary.
 
 # 0.10.1
 
