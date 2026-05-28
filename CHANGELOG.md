@@ -9,6 +9,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added `session::resume_plan` plus a durable `ballot_intent` table (schema v10):
+  a pure, I/O-free round-level planner that fuses the per-bundle delegation,
+  vote, and share phases with the voter's recorded ballot intent into an ordered
+  list of `NextStep`s, so wallet SDKs can resume an interrupted multi-question
+  vote without re-deriving recovery state. Exported via the prelude
+  (`Decision`, `NextStep`, `RoundPlan`, `resume_plan`).
 - Added shared delegation request/report types, account-key loading, Keystone
   PCZT redaction, display memo formatting, prepared-PCZT caching, skipped-suffix
   bundle validation, and bundle weight helpers so wallet SDKs can keep only

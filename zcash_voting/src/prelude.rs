@@ -24,6 +24,7 @@ pub use crate::round::{
     note_bundles, quantized_bundle_set_weight, quantized_bundle_weight, raw_bundle_weight,
     BundleLayout, RoundInfo, RoundParams, VotingDb,
 };
+pub use crate::session::{resume_plan, Decision, NextStep, RoundPlan};
 pub use crate::share::{
     add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,
     record as record_share, recover_payload, unconfirmed as unconfirmed_shares, SharePlan,
