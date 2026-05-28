@@ -6,7 +6,9 @@
 //! network/proof/sign plumbing.
 
 use rusqlite::named_params;
+use std::collections::{BTreeMap, BTreeSet};
 
+use crate::phases::{DelegationPhase, SharePhase, VotePhase};
 use crate::storage::VotingDb;
 use crate::types::VotingError;
 
@@ -91,6 +93,142 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// One unit of remaining work for a round. Ordered deterministically within a
+/// `RoundPlan`, so a restart yields the same sequence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NextStep {
+    Delegate { bundle_index: u32 },
+    PollDelegation { bundle_index: u32 },
+    CastVote { bundle_index: u32, proposal_id: u32 },
+    PollVote { bundle_index: u32, proposal_id: u32 },
+    ConfirmShare { bundle_index: u32, proposal_id: u32, share_index: u32 },
+}
+
+/// Derived resume state for one round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoundPlan {
+    pub round_id: String,
+    /// True iff there is interrupted, answered work to finish (`!next_steps.is_empty()`).
+    pub pending_recovery: bool,
+    /// Ordered remaining recovery work.
+    pub next_steps: Vec<NextStep>,
+    /// Proposals still open to vote (Skipped or never decided) while the round is open.
+    pub open_proposals: Vec<u32>,
+    /// Informational: every proposal is either a confirmed Choice or Skipped.
+    pub all_decided: bool,
+}
+
+fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
+    match step {
+        NextStep::Delegate { bundle_index } => (*bundle_index, 0, 0, 0),
+        NextStep::PollDelegation { bundle_index } => (*bundle_index, 0, 0, 0),
+        NextStep::CastVote { bundle_index, proposal_id } => (*bundle_index, 1, *proposal_id, 0),
+        NextStep::PollVote { bundle_index, proposal_id } => (*bundle_index, 1, *proposal_id, 0),
+        NextStep::ConfirmShare { bundle_index, proposal_id, share_index } => {
+            (*bundle_index, 2, *proposal_id, *share_index)
+        }
+    }
+}
+
+/// Build the resume plan for `round_id`.
+///
+/// `proposal_ids` is the round's full set of proposal ids (from the wallet's
+/// round config); the crate cannot enumerate "never decided" proposals on its
+/// own. The plan is a best-effort snapshot over the durable phase tables.
+pub fn resume_plan(
+    db: &VotingDb,
+    round_id: &str,
+    proposal_ids: &[u32],
+) -> Result<RoundPlan, VotingError> {
+    let delegation: BTreeMap<u32, DelegationPhase> =
+        db.delegation_phases(round_id)?.into_iter().collect();
+    let votes: BTreeMap<(u32, u32), VotePhase> = db
+        .vote_phases(round_id)?
+        .into_iter()
+        .map(|(b, p, ph)| ((b, p), ph))
+        .collect();
+    let shares = db.share_phases(round_id)?;
+    let intents: BTreeMap<u32, Decision> = db.ballot_intents(round_id)?.into_iter().collect();
+
+    let bundles: Vec<u32> = delegation.keys().copied().collect();
+
+    let mut choice_proposals: Vec<u32> = Vec::new();
+    let mut open_proposals: Vec<u32> = Vec::new();
+    for &pid in proposal_ids {
+        match intents.get(&pid) {
+            Some(Decision::Choice(_)) => choice_proposals.push(pid),
+            _ => open_proposals.push(pid), // Skipped or never decided -> open, votable later
+        }
+    }
+    choice_proposals.sort_unstable();
+    open_proposals.sort_unstable();
+
+    let mut steps: Vec<NextStep> = Vec::new();
+    let mut bundles_needing_delegation: BTreeSet<u32> = BTreeSet::new();
+
+    // Vote steps for answered proposals.
+    for &pid in &choice_proposals {
+        for &b in &bundles {
+            match votes.get(&(b, pid)) {
+                Some(VotePhase::Confirmed) => {}
+                Some(VotePhase::Submitted) => {
+                    steps.push(NextStep::PollVote { bundle_index: b, proposal_id: pid });
+                }
+                // Prepared, Committed, or no row yet -> still needs casting.
+                _ => {
+                    steps.push(NextStep::CastVote { bundle_index: b, proposal_id: pid });
+                    bundles_needing_delegation.insert(b);
+                }
+            }
+        }
+    }
+
+    // Delegation steps: resume any mid-flight delegation; otherwise only the
+    // prerequisite for a bundle that still has a vote to cast.
+    for &b in &bundles {
+        match delegation.get(&b) {
+            Some(DelegationPhase::Confirmed) => {}
+            Some(DelegationPhase::Submitted) => {
+                steps.push(NextStep::PollDelegation { bundle_index: b });
+            }
+            // Prepared / PcztBuilt / Proved: still needs the delegate flow.
+            _ => {
+                if bundles_needing_delegation.contains(&b) {
+                    steps.push(NextStep::Delegate { bundle_index: b });
+                }
+            }
+        }
+    }
+
+    // Confirm already-submitted helper shares.
+    for (b, p, s, phase) in shares {
+        if phase == SharePhase::Submitted {
+            steps.push(NextStep::ConfirmShare { bundle_index: b, proposal_id: p, share_index: s });
+        }
+    }
+
+    steps.sort_by_key(step_rank);
+
+    let all_decided = proposal_ids.iter().all(|&pid| match intents.get(&pid) {
+        Some(Decision::Skipped) => true,
+        Some(Decision::Choice(_)) => {
+            !bundles.is_empty()
+                && bundles
+                    .iter()
+                    .all(|&b| votes.get(&(b, pid)) == Some(&VotePhase::Confirmed))
+        }
+        None => false,
+    });
+
+    Ok(RoundPlan {
+        round_id: round_id.to_string(),
+        pending_recovery: !steps.is_empty(),
+        next_steps: steps,
+        open_proposals,
+        all_decided,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +279,63 @@ mod tests {
 
         let intents = db.ballot_intents(ROUND).unwrap();
         assert_eq!(intents, vec![(1, Decision::Choice(3)), (2, Decision::Skipped)]);
+    }
+
+    #[test]
+    fn fresh_round_with_no_choices_has_no_recovery() {
+        let db = db_with_bundle();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(!plan.pending_recovery);
+        assert!(plan.next_steps.is_empty());
+        assert_eq!(plan.open_proposals, vec![1, 2, 3]);
+        assert!(!plan.all_decided);
+    }
+
+    #[test]
+    fn answered_but_uncast_proposal_yields_cast_then_delegate_prereq() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(plan.pending_recovery);
+        // Bundle 0 is only Prepared, and proposal 2 needs casting on it, so the
+        // delegate prerequisite is emitted, ordered before the cast.
+        assert_eq!(
+            plan.next_steps,
+            vec![
+                NextStep::Delegate { bundle_index: 0 },
+                NextStep::CastVote { bundle_index: 0, proposal_id: 2 },
+            ]
+        );
+        assert_eq!(plan.open_proposals, vec![1, 3]);
+    }
+
+    #[test]
+    fn submitted_but_unconfirmed_vote_yields_poll() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        db.store_vote_tx_hash(ROUND, 0, 2, "vtx").unwrap();
+        db.mark_vote_submitted(ROUND, 0, 2).unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert_eq!(plan.next_steps, vec![NextStep::PollVote { bundle_index: 0, proposal_id: 2 }]);
+    }
+
+    #[test]
+    fn skipped_proposal_is_open_not_recovery() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped).unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(!plan.pending_recovery);
+        assert!(plan.open_proposals.contains(&1));
+    }
+
+    #[test]
+    fn midflight_delegation_is_recovery_without_votes() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap(); // Submitted, no VAN
+        let plan = resume_plan(&db, ROUND, &[1]).unwrap();
+        assert_eq!(plan.next_steps, vec![NextStep::PollDelegation { bundle_index: 0 }]);
     }
 }
