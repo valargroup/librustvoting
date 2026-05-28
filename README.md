@@ -14,12 +14,18 @@ Client-side cryptographic library for Zcash shielded voting. Implements proof ge
 
 ```
 zcash_voting
-├── vote-commitment-tree ──── imt-tree (vote-nullifier-pir)
-├── vote-commitment-tree-client
-├── pir-client (vote-nullifier-pir)
-├── voting-circuits ── ZK delegation + vote proofs, orchard fork
-└── librustzcash ───── pczt, zcash_keys, zcash_client_sqlite, ...
+├── config ───────────────────── config resolution + switch decisions
+├── vote-commitment-tree-client ─ vote-commitment-tree
+├── pir-client / vote-nullifier-pir types
+├── voting-circuits ───────────── ZK delegation + vote proofs
+└── librustzcash crates ───────── pczt, zcash_keys, zcash_client_sqlite, ...
 ```
+
+The config resolver itself is transport-agnostic. Wallets choose the static
+config source and network transport, fetch bytes, and pass those bytes into
+`zcash_voting::config`. The `zcash_voting/examples/config_fetcher.rs` example
+shows a direct HTTPS implementation for Rust consumers that do not need a
+custom transport.
 
 ## Building
 

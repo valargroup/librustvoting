@@ -2,6 +2,8 @@ use std::fmt;
 
 use orchard::note::ExtractedNoteCommitment;
 use serde::{Deserialize, Serialize};
+use ff::PrimeField;
+use pasta_curves::pallas;
 use subtle::CtOption;
 use thiserror::Error;
 use zcash_client_backend::proto::service::TreeState;
@@ -791,9 +793,57 @@ pub fn validate_notes(notes: &[NoteInfo]) -> Result<(), VotingError> {
 }
 
 pub fn validate_round_params(params: &VotingRoundParams) -> Result<(), VotingError> {
+    validate_vote_round_id_hex(&params.vote_round_id)?;
     validate_32_bytes(&params.ea_pk, "ea_pk")?;
     validate_32_bytes(&params.nc_root, "nc_root")?;
     validate_32_bytes(&params.nullifier_imt_root, "nullifier_imt_root")?;
+    Ok(())
+}
+
+/// Validate a hex-encoded voting round id.
+///
+/// A valid round id is exactly 32 bytes encoded as lowercase hex, and those
+/// bytes must be a canonical little-endian [`pallas::Base`] encoding. This
+/// validates the round-id representation accepted by the voting circuits; it
+/// does not recompute the on-chain Poseidon preimage for the round id.
+pub fn validate_vote_round_id_hex(vote_round_id: &str) -> Result<(), VotingError> {
+    if vote_round_id.len() != 64 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "vote_round_id must be 64 lowercase hex characters, got {}",
+                vote_round_id.len()
+            ),
+        });
+    }
+    if !vote_round_id
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(VotingError::InvalidInput {
+            message: "vote_round_id must be lowercase hex".to_string(),
+        });
+    }
+    let bytes = hex::decode(vote_round_id).map_err(|e| VotingError::InvalidInput {
+        message: format!("vote_round_id is not valid hex: {e}"),
+    })?;
+    validate_vote_round_id_bytes(&bytes)
+}
+
+/// Validate raw voting round-id bytes as a canonical Pallas base-field element.
+pub fn validate_vote_round_id_bytes(vote_round_id: &[u8]) -> Result<(), VotingError> {
+    let bytes: [u8; 32] = vote_round_id
+        .try_into()
+        .map_err(|_| VotingError::InvalidInput {
+            message: format!(
+                "vote_round_id must be 32 bytes, got {}",
+                vote_round_id.len()
+            ),
+        })?;
+    Option::<pallas::Base>::from(pallas::Base::from_repr(bytes)).ok_or_else(|| {
+        VotingError::InvalidInput {
+            message: "vote_round_id is not a canonical Pallas field element".to_string(),
+        }
+    })?;
     Ok(())
 }
 
@@ -977,6 +1027,200 @@ mod tests {
         assert_eq!(note_info.rseed, note.rseed().as_bytes().to_vec());
         assert_eq!(note_info.scope, 0);
         assert_eq!(note_info.ufvk_str, ufvk.encode(&TEST_NETWORK));
+    }
+    #[test]
+    fn test_chunk_notes_all_valid() {
+        // 5 notes each with 13M — all fit in 1 bundle (capacity 5)
+        let notes: Vec<NoteInfo> = (0..5).map(|i| make_note(13_000_000, i)).collect();
+        let result = chunk_notes(&notes);
+        assert_eq!(result.bundles.len(), 1);
+        assert_eq!(result.dropped_count, 0);
+        // Quantized: bundle 0 (65M → 5×12.5M=62.5M) = 62.5M
+        assert_eq!(result.eligible_weight, 62_500_000);
+        // Bundle 0 has 5 notes
+        assert_eq!(result.bundles[0].len(), 5);
+    }
+
+    #[test]
+    fn test_chunk_notes_dust_dropped() {
+        // 1 good note (13M) + 5 dust notes → sequential fill packs first 5 together.
+        // Sorted DESC: 13M first, then 5 dust. Bundle 0 = [13M, 100, 100, 100, 100], bundle 1 = [100].
+        // Bundle 0 survives (13M+400 ≥ 12.5M), bundle 1 dropped (100 < 12.5M).
+        let notes = vec![
+            make_note(13_000_000, 0),
+            make_note(100, 1),
+            make_note(100, 2),
+            make_note(100, 3),
+            make_note(100, 4),
+            make_note(100, 5),
+        ];
+        let result = chunk_notes(&notes);
+        assert_eq!(result.bundles.len(), 1);
+        assert_eq!(result.dropped_count, 1);
+        // Quantized: 13,000,400 → 1×12.5M = 12.5M
+        assert_eq!(result.eligible_weight, 12_500_000);
+        // Surviving bundle contains good note + 4 dust
+        assert_eq!(result.bundles[0].len(), 5);
+    }
+
+    #[test]
+    fn test_chunk_notes_all_dust_empty() {
+        // All notes below threshold — no valid bundles
+        let notes = vec![make_note(100, 0), make_note(200, 1), make_note(300, 2)];
+        let result = chunk_notes(&notes);
+        assert!(result.bundles.is_empty());
+        assert_eq!(result.eligible_weight, 0);
+        assert_eq!(result.dropped_count, 3);
+    }
+
+    #[test]
+    fn test_chunk_notes_exact_threshold() {
+        // Single note at exactly BALLOT_DIVISOR
+        let notes = vec![make_note(12_500_000, 0)];
+        let result = chunk_notes(&notes);
+        assert_eq!(result.bundles.len(), 1);
+        assert_eq!(result.eligible_weight, 12_500_000);
+        assert_eq!(result.dropped_count, 0);
+    }
+
+    #[test]
+    fn test_chunk_notes_single_note() {
+        let notes = vec![make_note(50_000_000, 42)];
+        let result = chunk_notes(&notes);
+        assert_eq!(result.bundles.len(), 1);
+        assert_eq!(result.bundles[0].len(), 1);
+        assert_eq!(result.bundles[0][0].position, 42);
+        assert_eq!(result.eligible_weight, 50_000_000);
+    }
+
+    #[test]
+    fn test_chunk_notes_deterministic() {
+        let notes: Vec<NoteInfo> = (0..7)
+            .map(|i| make_note(15_000_000 + i * 1_000_000, i))
+            .collect();
+        let r1 = chunk_notes(&notes);
+        let r2 = chunk_notes(&notes);
+        assert_eq!(r1.bundles.len(), r2.bundles.len());
+        for (b1, b2) in r1.bundles.iter().zip(r2.bundles.iter()) {
+            let p1: Vec<u64> = b1.iter().map(|n| n.position).collect();
+            let p2: Vec<u64> = b2.iter().map(|n| n.position).collect();
+            assert_eq!(p1, p2, "bundle positions must be deterministic");
+        }
+    }
+
+    #[test]
+    fn test_chunk_notes_position_ordering_within_bundles() {
+        // Notes added in random order should still have position-sorted bundles
+        let notes = vec![
+            make_note(20_000_000, 5),
+            make_note(20_000_000, 1),
+            make_note(20_000_000, 3),
+            make_note(20_000_000, 7),
+            make_note(20_000_000, 2),
+        ];
+        let result = chunk_notes(&notes);
+        for bundle in &result.bundles {
+            for window in bundle.windows(2) {
+                assert!(
+                    window[0].position < window[1].position,
+                    "notes within bundle must be sorted by position"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_notes_bundles_sorted_by_value_desc() {
+        // 8 equal-value notes → 2 bundles with same total.
+        // Tiebreaker: min position ASC, so bundle with positions 0-4 comes first.
+        let notes: Vec<NoteInfo> = (0..8).map(|i| make_note(15_000_000, i)).collect();
+        let result = chunk_notes(&notes);
+        assert_eq!(result.bundles.len(), 2);
+        let totals: Vec<u64> = result
+            .bundles
+            .iter()
+            .map(|b| b.iter().map(|n| n.value).sum())
+            .collect();
+        assert!(
+            totals[0] >= totals[1],
+            "bundle 0 total ({}) must be >= bundle 1 total ({})",
+            totals[0],
+            totals[1]
+        );
+        // Equal totals — tiebreaker is min position
+        let min_positions: Vec<u64> = result
+            .bundles
+            .iter()
+            .map(|b| b.first().unwrap().position)
+            .collect();
+        assert!(
+            min_positions[0] < min_positions[1],
+            "equal-total bundles should be ordered by min position"
+        );
+    }
+
+    #[test]
+    fn test_chunk_notes_largest_bundle_first() {
+        // Mix of high and low-value notes. Bundle 0 should be the most valuable.
+        // 5 large notes (50M each, pos 10-14) + 5 medium notes (13M each, pos 0-4)
+        // Bundle 0 (sorted by value DESC): [50M×5] = 250M
+        // Bundle 1: [13M×5] = 65M
+        // After value-DESC sort: bundle 0 (250M) before bundle 1 (65M).
+        let mut notes = Vec::new();
+        for i in 0..5 {
+            notes.push(make_note(50_000_000, 10 + i));
+        }
+        for i in 0..5 {
+            notes.push(make_note(13_000_000, i));
+        }
+        let result = chunk_notes(&notes);
+        assert_eq!(result.bundles.len(), 2);
+        let total_0: u64 = result.bundles[0].iter().map(|n| n.value).sum();
+        let total_1: u64 = result.bundles[1].iter().map(|n| n.value).sum();
+        assert_eq!(total_0, 250_000_000);
+        assert_eq!(total_1, 65_000_000);
+        assert!(
+            total_0 > total_1,
+            "bundle 0 must have higher total than bundle 1"
+        );
+        // Despite bundle 1 having earlier positions (0-4), bundle 0 (positions 10-14)
+        // comes first because value takes priority over position.
+    }
+
+    #[test]
+    fn test_chunk_notes_empty() {
+        let result = chunk_notes(&[]);
+        assert!(result.bundles.is_empty());
+        assert_eq!(result.eligible_weight, 0);
+        assert_eq!(result.dropped_count, 0);
+    }
+
+    #[test]
+    fn test_chunk_notes_max_5_per_bundle() {
+        let notes: Vec<NoteInfo> = (0..12).map(|i| make_note(15_000_000, i)).collect();
+        let result = chunk_notes(&notes);
+        for bundle in &result.bundles {
+            assert!(
+                bundle.len() <= 5,
+                "bundle has {} notes, max is 5",
+                bundle.len()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_vote_round_id_accepts_canonical_lowercase_hex() {
+        assert!(validate_vote_round_id_hex(&"01".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn validate_vote_round_id_rejects_non_canonical_field_encoding() {
+        assert!(validate_vote_round_id_hex(&"ff".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn validate_vote_round_id_rejects_uppercase_hex() {
+        assert!(validate_vote_round_id_hex(&"AA".repeat(32)).is_err());
     }
 }
 

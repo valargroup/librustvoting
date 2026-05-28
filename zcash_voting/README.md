@@ -60,12 +60,91 @@ precompute → delegate → vote → share lifecycle:
 | `share` | Helper-share payload recovery, nullifier computation, and share confirmation state. |
 | `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
+| `config` | Static and dynamic voting config validation, signature checks, and switch decisions. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
 | `hotkey` | Voting hotkey reconstruction from scoped seed material plus random app-owned hotkeys. |
 | `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |
 
 Wallet integrations should use the lifecycle modules above instead of writing
 storage rows directly.
+
+## Config resolution
+
+The `config` module keeps voting service config policy in Rust while letting
+wallets choose URLs and transport. This is a two-step flow because the dynamic
+config URL is trusted only after the static config bytes pass hash-pin and
+schema validation:
+
+```rust
+use zcash_voting::config::{
+    decide_config_switch, resolve_static_voting_config, resolve_voting_config,
+    ResolveVotingConfigOptions,
+};
+
+# fn example(static_bytes: &[u8], dynamic_bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+let source = "https://example.com/static.json?checksum=sha256:...";
+let resolved_static = resolve_static_voting_config(source, static_bytes)?;
+
+// The wallet fetches `resolved_static.dynamic_config_url` using its chosen
+// transport, then passes the response body back to Rust.
+let resolved = resolve_voting_config(
+    resolved_static,
+    dynamic_bytes,
+    ResolveVotingConfigOptions::default(),
+)?;
+
+let switch_decision = decide_config_switch(
+    None,
+    (&resolved).into(),
+);
+# Ok(())
+# }
+```
+
+Hash-pin mismatch and dynamic round signature verification failure are reported
+as `VotingConfigError::RemoteAuthenticationFailed`, so callers can surface a
+clear "remote authentication failed" message.
+
+`decide_config_switch` classifies the semantic wallet transition as
+`InitialLoad`, `Unchanged`, `SameChainServiceUpdate`, `NewChainOrRound`, or
+`ProtocolChanged`. The wallet owns executing that branch. Endpoint and signing
+key changes are same-chain service updates, so wallets should restart
+network-derived work while keeping durable artifacts indexed by round id.
+Authenticated round-set changes should reload and reselect the active round
+context, but do not by themselves require wiping hotkeys or vote commitments
+for old round ids.
+
+A direct-HTTPS example is available as:
+
+```bash
+cargo run -p zcash_voting --example config_fetcher -- \
+  'https://example.com/static.json?checksum=sha256:...'
+```
+
+The example can also persist the resolved summary used for future switch
+decisions. Run it once to create the state file, then run it again after the
+user changes the static source or the remote config changes:
+
+```bash
+cargo run -p zcash_voting --example config_fetcher -- check-switch \
+  /tmp/voting-config-state.json \
+  'https://example.com/static.json?checksum=sha256:...'
+```
+
+## Crates.io diagram
+
+```text
+zcash_voting
+├── config
+│   ├── static hash-pin verification
+│   ├── dynamic config validation
+│   ├── Ed25519 round signature verification
+│   └── config-switch decisions
+├── vote-commitment-tree-client ─── vote-commitment-tree
+├── pir-client / vote-nullifier-pir types
+├── voting-circuits
+└── librustzcash crates
+```
 
 ## Shared wallet policy helpers
 
