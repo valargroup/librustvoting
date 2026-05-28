@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
 
             print_resolved_config(&resolved);
             println!("switch kind: {:?}", decision.kind);
+            println!("state path: {}", state_path.display());
 
             let next_state = StoredConfigState {
                 summary: next_summary,

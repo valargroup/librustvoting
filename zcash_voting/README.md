@@ -117,18 +117,16 @@ for old round ids.
 A direct-HTTPS example is available as:
 
 ```bash
-cargo run -p zcash_voting --example config_fetcher -- \
-  'https://example.com/static.json?checksum=sha256:...'
+cargo run -p zcash_voting --example config_fetcher -- "https://example.com/static.json?checksum=sha256:..."
 ```
 
 The example can also persist the resolved summary used for future switch
-decisions. Run it once to create the state file, then run it again after the
-user changes the static source or the remote config changes:
+decisions. The state is written to the path passed after `check-switch`. Run it
+once to create the state file, then run it again after the user changes the
+static source or the remote config changes:
 
 ```bash
-cargo run -p zcash_voting --example config_fetcher -- check-switch \
-  /tmp/voting-config-state.json \
-  'https://example.com/static.json?checksum=sha256:...'
+cargo run -p zcash_voting --example config_fetcher -- check-switch /tmp/voting-config-state.json "https://example.com/static.json?checksum=sha256:..."
 ```
 
 ## Crates.io diagram
