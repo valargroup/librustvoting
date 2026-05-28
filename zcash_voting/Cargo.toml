@@ -62,6 +62,7 @@ sinsemilla = "0.1"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+prost = "0.14"
 
 # PIR (private nullifier exclusion proofs).
 pir-client = { version = "=0.2.0", default-features = false, optional = true }
@@ -106,6 +107,8 @@ zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
 zcash_protocol = "0.8"
+zcash_client_backend = { version = "0.22", default-features = false, features = ["orchard"] }
+zcash_client_sqlite = { version = "0.20", default-features = false, features = ["orchard"] }
 zcash_keys = { version = "0.13", features = ["orchard"] }
 pczt = { version = "0.6", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
 zcash_primitives = "0.27"

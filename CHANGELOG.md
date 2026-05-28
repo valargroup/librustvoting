@@ -4,6 +4,17 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+# Unreleased
+
+## V2 API
+
+### Added
+- Added `zcash_voting::witness::generate_note_witnesses` for Orchard note
+  witness generation from a stored voting round snapshot. The V2 API validates
+  the cached lightwalletd `TreeState` height and Orchard root against the
+  persisted round parameters before asking the wallet DB for historical Merkle
+  paths, then returns `WitnessData` for each bundled note.
+
 # 0.10.1
 
 ## Security
