@@ -9,6 +9,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added shared delegation request/report types, account-key loading, Keystone
+  PCZT redaction, display memo formatting, prepared-PCZT caching, skipped-suffix
+  bundle validation, and bundle weight helpers so wallet SDKs can keep only
+  their runtime-specific async/lightwalletd shims.
 - Added `VotingDb::ensure_bundles_for_notes` and
   `VotingDb::prepare_delegation_pir` so wallet SDKs can share the delegation
   bundle validation, governance PCZT construction, and PIR precompute sequence

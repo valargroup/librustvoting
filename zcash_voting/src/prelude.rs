@@ -5,9 +5,12 @@
 //! needed by mobile SDK boundaries without exposing proof-circuit internals.
 
 pub use crate::delegate::{
-    pczt_sighash, record_submission, record_van_position, setup as setup_delegation,
-    spend_auth_signature, submission as delegation_submission, DelegationKeys, DelegationPhase,
-    DelegationProof, DelegationSetup, DelegationSigner, DelegationSubmission,
+    cache_prepared_setup, clear_prepared_setups, display_memo, load_account_keys, pczt_sighash,
+    prepared_epoch, record_submission, record_van_position, redact_for_signer,
+    setup as setup_delegation, spend_auth_signature, submission as delegation_submission,
+    take_prepared_setup, DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProof,
+    DelegationSetup, DelegationSigner, DelegationSubmission, KeystoneSigningRequest,
+    PreparedDelegationReport, SignedDelegationBundle,
 };
 pub use crate::error::VotingError;
 pub use crate::governance::BALLOT_DIVISOR;
@@ -16,7 +19,10 @@ pub use crate::pir::{select_pir_endpoint, PirEndpoint};
 pub use crate::precompute::{
     note_witnesses, stored_note_witnesses, verify_witness, PirPrecomputeReport,
 };
-pub use crate::round::{note_bundles, BundleLayout, RoundInfo, RoundParams, VotingDb};
+pub use crate::round::{
+    note_bundles, quantized_bundle_set_weight, quantized_bundle_weight, raw_bundle_weight,
+    BundleLayout, RoundInfo, RoundParams, VotingDb,
+};
 pub use crate::types::{
     Network, NoopProgressReporter, NoteInfo, ProgressReporter, VotingHotkey, WitnessData,
 };

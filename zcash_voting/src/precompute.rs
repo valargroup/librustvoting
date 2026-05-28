@@ -10,7 +10,7 @@ use zcash_client_sqlite::WalletDb;
 
 use crate::{
     round::VotingDb,
-    types::{Network, NoteInfo, VotingError, WitnessData},
+    types::{NoteInfo, VotingError, WitnessData},
 };
 
 /// Result of PIR precomputation for one delegation bundle.
@@ -106,7 +106,7 @@ pub fn delegation_pir(
     bundle_index: u32,
     notes: &[NoteInfo],
     pir_client: &pir_client::PirClientBlocking,
-    network: Network,
+    network: crate::types::Network,
 ) -> Result<PirPrecomputeReport, VotingError> {
     let result =
         db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network.id())?;
