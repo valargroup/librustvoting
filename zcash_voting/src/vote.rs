@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use rusqlite::OptionalExtension;
+
 use crate::{
     round::VotingDb,
     types::{
@@ -269,34 +271,69 @@ pub fn record_vc_position(
     proposal_id: u32,
     vc_tree_position: u64,
 ) -> Result<(), VotingError> {
-    let conn = db.conn();
     let wallet_id = db.wallet_id();
-    let rows = conn
-        .execute(
-            "UPDATE votes SET vc_tree_position = :pos
+    let stored_json: Option<Option<String>> = {
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT commitment_bundle_json FROM votes
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
             rusqlite::named_params! {
-                ":pos": i64::try_from(vc_tree_position).map_err(|_| VotingError::InvalidInput {
-                    message: format!("vc_tree_position {vc_tree_position} does not fit in SQLite i64"),
-                })?,
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
                 ":proposal_id": proposal_id as i64,
             },
+            |row| row.get(0),
         )
+        .optional()
         .map_err(|e| VotingError::Internal {
-            message: format!("failed to record vote commitment tree position: {e}"),
-        })?;
-    if rows == 0 {
+            message: format!("failed to load vote recovery bundle: {e}"),
+        })?
+    };
+
+    let Some(stored_json) = stored_json else {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "vote not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
             ),
         });
+    };
+
+    if let Some(json) = stored_json {
+        let mut recovery = parse_recovery(&json)?;
+        recovery.vc_tree_position = vc_tree_position;
+        store_recovery_json(
+            db,
+            round_id,
+            bundle_index,
+            proposal_id,
+            &serialize_recovery(&recovery)?,
+            vc_tree_position,
+        )
+    } else {
+        let conn = db.conn();
+        let rows = conn
+            .execute(
+                "UPDATE votes SET vc_tree_position = :pos
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+                rusqlite::named_params! {
+                    ":pos": i64::try_from(vc_tree_position).map_err(|_| VotingError::InvalidInput {
+                        message: format!("vc_tree_position {vc_tree_position} does not fit in SQLite i64"),
+                    })?,
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index as i64,
+                    ":proposal_id": proposal_id as i64,
+                },
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to record vote commitment tree position: {e}"),
+            })?;
+        debug_assert_eq!(rows, 1);
+        Ok(())
     }
-    Ok(())
 }
 
 /// Loads and parses the persisted vote recovery bundle, if present.
@@ -308,7 +345,7 @@ pub fn recovery_bundle(
 ) -> Result<Option<VoteRecoveryBundle>, VotingError> {
     let conn = db.conn();
     let wallet_id = db.wallet_id();
-    let json: Option<String> = conn
+    let json: Option<Option<String>> = conn
         .query_row(
             "SELECT commitment_bundle_json FROM votes
              WHERE round_id = :round_id AND wallet_id = :wallet_id
@@ -321,10 +358,11 @@ pub fn recovery_bundle(
             },
             |row| row.get(0),
         )
+        .optional()
         .map_err(|e| VotingError::Internal {
             message: format!("failed to load vote recovery bundle: {e}"),
         })?;
-    json.as_deref().map(parse_recovery).transpose()
+    json.flatten().as_deref().map(parse_recovery).transpose()
 }
 
 /// Serializes a recovery bundle using the library-owned JSON format.
@@ -716,5 +754,53 @@ mod tests {
         record_vc_position(&db, ROUND_ID, 0, 1, 789).unwrap();
         let (_, position) = db.get_commitment_bundle(ROUND_ID, 0, 1).unwrap().unwrap();
         assert_eq!(position, 789);
+        assert_eq!(
+            recovery_bundle(&db, ROUND_ID, 0, 1)
+                .unwrap()
+                .unwrap()
+                .vc_tree_position,
+            789
+        );
+    }
+
+    #[test]
+    fn recovery_bundle_missing_vote_returns_none() {
+        let db = db_with_vote();
+
+        let recovery = recovery_bundle(&db, ROUND_ID, 0, 99).unwrap();
+
+        assert!(recovery.is_none());
+    }
+
+    #[test]
+    fn record_vc_position_without_recovery_json_updates_column() {
+        let db = db_with_vote();
+
+        record_vc_position(&db, ROUND_ID, 0, 1, 321).unwrap();
+        let position: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT vc_tree_position FROM votes
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::named_params! {
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": WALLET_ID,
+                },
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(position, Some(321));
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn record_vc_position_missing_vote_returns_invalid_input() {
+        let db = db_with_vote();
+
+        let err = record_vc_position(&db, ROUND_ID, 0, 99, 321).unwrap_err();
+
+        assert!(matches!(err, VotingError::InvalidInput { .. }));
     }
 }
