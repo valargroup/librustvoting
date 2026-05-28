@@ -15,6 +15,38 @@ pub enum VotingError {
     Internal { message: String },
 }
 
+/// Zcash network selector used by wallet-facing voting APIs.
+///
+/// The enum replaces the historical `network_id` convention, where `0`
+/// meant testnet and `1` meant mainnet. Use [`Network::id`] only when calling
+/// legacy internals that still take the numeric representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Network {
+    Testnet,
+    Mainnet,
+}
+
+impl Network {
+    /// Returns the legacy numeric network id used by existing proof builders.
+    pub fn id(self) -> u32 {
+        match self {
+            Self::Testnet => 0,
+            Self::Mainnet => 1,
+        }
+    }
+
+    /// Converts a legacy network id into a typed network selector.
+    pub fn from_id(id: u32) -> Result<Self, VotingError> {
+        match id {
+            0 => Ok(Self::Testnet),
+            1 => Ok(Self::Mainnet),
+            _ => Err(VotingError::InvalidInput {
+                message: format!("network_id must be 0 (testnet) or 1 (mainnet), got {id}"),
+            }),
+        }
+    }
+}
+
 /// Unwrap a `CtOption`, returning a `VotingError` on `None`.
 pub fn ct_option_to_result<T>(opt: CtOption<T>, msg: &str) -> Result<T, VotingError> {
     if opt.is_some().into() {
@@ -407,6 +439,14 @@ pub struct WitnessData {
 pub trait ProofProgressReporter: Send + Sync {
     fn on_progress(&self, progress: f64);
 }
+
+/// Progress callback used by the stable public API.
+///
+/// This is an alias for the legacy proof-progress trait so existing FFI
+/// adapters continue to work while the public naming is simplified.
+pub trait ProgressReporter: ProofProgressReporter {}
+
+impl<T> ProgressReporter for T where T: ProofProgressReporter + ?Sized {}
 
 /// No-op progress reporter for contexts where progress isn't observed.
 pub struct NoopProgressReporter;
