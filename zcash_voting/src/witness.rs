@@ -13,6 +13,30 @@ use zcash_client_backend::proto::service::TreeState;
 use zcash_client_sqlite::WalletDb;
 use zcash_protocol::consensus::BlockHeight;
 
+/// Persist a voting snapshot tree state, generate Orchard note witnesses, and cache them.
+///
+/// SDK boundary layers provide the already-open wallet database because wallet
+/// path, network, and FFI handling differ by client. This helper owns the shared
+/// voting invariant: the cached tree state is the round snapshot anchor used to
+/// generate and store Merkle witnesses for one bundle.
+pub fn store_tree_state_and_generate_note_witnesses<C, P, CL, R>(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    tree_state_bytes: &[u8],
+    notes: &[NoteInfo],
+    wallet_db: &WalletDb<C, P, CL, R>,
+) -> Result<Vec<WitnessData>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
+    db.store_tree_state(round_id, tree_state_bytes)?;
+    let witnesses = generate_note_witnesses(db, round_id, notes, wallet_db)?;
+    db.store_witnesses(round_id, bundle_index, &witnesses)?;
+    Ok(witnesses)
+}
+
 /// Generate Orchard Merkle witnesses for the bundle notes at the round snapshot.
 ///
 /// The cached lightwalletd `TreeState` is validated against the stored voting
@@ -357,6 +381,89 @@ mod tests {
             .expect("seed wallet Orchard tree");
 
         (wallet_db, frontier)
+    }
+
+    #[test]
+    fn store_tree_state_and_generate_note_witnesses_caches_bundle_witnesses() {
+        let positions = vec![Position::from(1), Position::from(2)];
+        let notes = positions
+            .iter()
+            .map(|position| note(u64::from(*position)))
+            .collect::<Vec<_>>();
+        let (wallet_db, frontier) = seeded_wallet_db(SNAPSHOT_HEIGHT, 200, &positions);
+        let params = round_params(SNAPSHOT_HEIGHT, &frontier);
+        let tree_state = tree_state_from_frontier(SNAPSHOT_HEIGHT, &frontier);
+        let db = VotingDb::open(":memory:").unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.init_round(&params, None).unwrap();
+        queries::insert_bundle(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            0,
+            &positions
+                .iter()
+                .map(|position| u64::from(*position))
+                .collect::<Vec<_>>(),
+        )
+        .expect("insert bundle");
+
+        let witnesses = store_tree_state_and_generate_note_witnesses(
+            &db,
+            ROUND_ID,
+            0,
+            &tree_state.encode_to_vec(),
+            &notes,
+            &wallet_db,
+        )
+        .expect("store tree state and witnesses");
+        let stored = queries::load_witnesses(&db.conn(), ROUND_ID, WALLET_ID, 0)
+            .expect("load stored witnesses");
+
+        assert_eq!(witnesses.len(), notes.len());
+        assert_eq!(stored.len(), witnesses.len());
+        for (stored_witness, witness) in stored.iter().zip(witnesses.iter()) {
+            assert_eq!(stored_witness.note_commitment, witness.note_commitment);
+            assert_eq!(stored_witness.position, witness.position);
+            assert_eq!(stored_witness.root, witness.root);
+            assert_eq!(stored_witness.auth_path, witness.auth_path);
+            assert!(verify_witness(witness).expect("stored witness is parseable"));
+        }
+    }
+
+    #[test]
+    fn store_tree_state_and_generate_note_witnesses_rejects_invalid_tree_state() {
+        let positions = vec![Position::from(1)];
+        let notes = positions
+            .iter()
+            .map(|position| note(u64::from(*position)))
+            .collect::<Vec<_>>();
+        let (wallet_db, frontier) = seeded_wallet_db(SNAPSHOT_HEIGHT, 200, &positions);
+        let params = round_params(SNAPSHOT_HEIGHT, &frontier);
+        let db = VotingDb::open(":memory:").unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.init_round(&params, None).unwrap();
+        queries::insert_bundle(&db.conn(), ROUND_ID, WALLET_ID, 0, &[1]).expect("insert bundle");
+        let invalid_tree_state = TreeState {
+            network: "test".to_string(),
+            height: SNAPSHOT_HEIGHT,
+            hash: String::new(),
+            time: 0,
+            sapling_tree: String::new(),
+            orchard_tree: String::new(),
+        };
+
+        let err = store_tree_state_and_generate_note_witnesses(
+            &db,
+            ROUND_ID,
+            0,
+            &invalid_tree_state.encode_to_vec(),
+            &notes,
+            &wallet_db,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("orchard") || err.to_string().contains("TreeState"));
     }
 
     #[test]
