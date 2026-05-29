@@ -2317,8 +2317,8 @@ pub fn record_share_delegation(
          VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :sent_to_urls, :nullifier, 0, :submit_at, :created_at) \
          ON CONFLICT (round_id, wallet_id, bundle_index, proposal_id, share_index) DO UPDATE SET \
          sent_to_urls = excluded.sent_to_urls, \
-         nullifier = excluded.nullifier, \
-         submit_at = excluded.submit_at",
+         submit_at = excluded.submit_at \
+         WHERE share_delegations.nullifier = excluded.nullifier",
         named_params! {
             ":round_id": round_id,
             ":wallet_id": wallet_id,
@@ -2333,6 +2333,17 @@ pub fn record_share_delegation(
     )
     .map_err(|e| VotingError::Internal {
         message: format!("failed to record share delegation: {}", e),
+    })
+    .and_then(|rows| {
+        if rows == 0 {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "share nullifier conflict for round={}, wallet={}, bundle={}, proposal={}, share={}",
+                    round_id, wallet_id, bundle_index, proposal_id, share_index
+                ),
+            });
+        }
+        Ok(())
     })?;
     Ok(())
 }
@@ -2633,6 +2644,7 @@ pub fn add_sent_servers(
     share_index: u32,
     new_urls: &[String],
 ) -> Result<(), VotingError> {
+    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
     // Read current URLs
     let current_json: String = conn
         .query_row(

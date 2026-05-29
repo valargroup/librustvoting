@@ -2863,6 +2863,15 @@ mod tests {
         // submit_at reset to 0 after resubmission
         assert_eq!(share1.submit_at, 0);
 
+        let conflicting_nf = vec![0xEE; 32];
+        let err = db
+            .record_share_delegation(ROUND_ID, 0, 0, 1, &urls_b, &conflicting_nf, 2000)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("share nullifier conflict"),
+            "unexpected error: {err}"
+        );
+
         // Re-record a confirmed share (e.g. recovery path) — confirmed must be preserved
         db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &nf, 3000)
             .unwrap();

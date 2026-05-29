@@ -319,6 +319,27 @@ mod tests {
         assert_eq!(records[0].sent_to_urls.len(), 2);
         assert_eq!(records[0].submit_at, 0);
 
+        db.conn()
+            .execute(
+                "UPDATE share_delegations SET nullifier = :nullifier
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND bundle_index = 0
+                   AND proposal_id = 1
+                   AND share_index = 1",
+                rusqlite::named_params! {
+                    ":nullifier": vec![0xFF_u8; 32],
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": WALLET_ID,
+                },
+            )
+            .unwrap();
+        let err = record(&db, ROUND_ID, 0, 1, 1, &initial_urls, 99).unwrap_err();
+        assert!(
+            err.to_string().contains("share nullifier conflict"),
+            "unexpected error: {err}"
+        );
+
         confirm(&db, ROUND_ID, 0, 1, 1).unwrap();
         assert!(unconfirmed(&db, ROUND_ID).unwrap().is_empty());
         assert_eq!(list(&db, ROUND_ID).unwrap()[0].confirmed, true);
