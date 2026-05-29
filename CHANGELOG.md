@@ -89,6 +89,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Cast-vote signing can derive the hotkey for an explicit ZIP-32 account index
   through the new account-aware signing path used by `vote::commit`.
 
+### Fixed
+- `session::resume_plan` now derives missing helper-share work from recovered
+  share payloads instead of raw encrypted-share recovery material, so
+  single-share last-moment votes do not remain pending after their only helper
+  share is recorded.
+
 # 0.10.1
 
 ## Security

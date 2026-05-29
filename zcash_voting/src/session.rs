@@ -441,10 +441,9 @@ fn confirmed_vote_has_missing_shares(
             ),
         });
     };
-    let expected_share_indexes = recovery
-        .encrypted_shares
+    let expected_share_indexes = crate::share::recover_payloads(&recovery)?
         .iter()
-        .map(|share| share.share_index)
+        .map(|payload| payload.enc_share.share_index)
         .collect::<BTreeSet<_>>();
     if expected_share_indexes.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -512,6 +511,14 @@ mod tests {
             choice,
             vc_tree_position.unwrap_or(0),
         );
+        store_recovery_bundle_fixture(db, &recovery, vc_tree_position);
+    }
+
+    fn store_recovery_bundle_fixture(
+        db: &VotingDb,
+        recovery: &VoteRecoveryBundle,
+        vc_tree_position: Option<u64>,
+    ) {
         let conn = db.conn();
         let rows = conn
             .execute(
@@ -525,8 +532,8 @@ mod tests {
                     ":pos": vc_tree_position.map(|position| position as i64),
                     ":round_id": ROUND,
                     ":wallet_id": W,
-                    ":bundle_index": bundle_index as i64,
-                    ":proposal_id": proposal_id as i64,
+                    ":bundle_index": recovery.bundle_index as i64,
+                    ":proposal_id": recovery.proposal_id as i64,
                 },
             )
             .unwrap();
@@ -1031,6 +1038,21 @@ mod tests {
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
         confirm_vote_fixture(&db, 0, 2, 1);
         record_all_confirmed_share_fixtures(&db, 0, 2);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert!(plan.next_steps.is_empty(), "got {:?}", plan.next_steps);
+    }
+
+    #[test]
+    fn confirmed_single_share_vote_with_recorded_payload_has_no_share_submission_step() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        confirm_vote_fixture(&db, 0, 2, 1);
+        let mut recovery = recovery_bundle_fixture(0, 2, 1, 42);
+        recovery.single_share = true;
+        store_recovery_bundle_fixture(&db, &recovery, Some(42));
+        record_confirmed_share_fixture(&db, 0, 2, 0);
 
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
