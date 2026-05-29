@@ -1645,7 +1645,7 @@ mod tests {
         let stored_dummy = queries::load_dummy_nullifiers(&conn, ROUND_ID, W, 0).unwrap();
         let padded_secrets = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).unwrap();
         let pir_nullifiers =
-            padded_nullifiers_for_circuit(&[note_info], &padded_secrets, 0).unwrap();
+            padded_nullifiers_for_circuit(&[note_info], &padded_secrets, Network::Testnet).unwrap();
 
         assert_eq!(stored_dummy, result.dummy_nullifiers);
         assert_eq!(pir_nullifiers, result.dummy_nullifiers);
