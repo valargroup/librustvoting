@@ -22,7 +22,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   interrupted multi-bundle questions finish before later questions resume.
   Skipped ballot intents are terminal decisions, `open_proposals` contains only
   proposals with no recorded decision, and choice intents fail fast if no
-  eligible bundle rows exist for the round.
+  eligible bundle rows exist for the round. Intent changes that conflict with an
+  already-submitted vote fail before any recovery rows are cleaned up.
 - Added `vote::recover_commit` for `NextStep::SubmitVote` handling. It
   reconstructs both cast-vote submission fields and helper-share payloads from
   persisted recovery state so wallets do not need to reassemble recovery JSON

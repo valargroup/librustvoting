@@ -38,6 +38,16 @@ impl VotingDb {
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("set_ballot_intent transaction failed: {e}"),
         })?;
+        let skipped_bool = skipped != 0;
+        let choice_u32 = choice.map(|c| c as u32);
+        queries::ensure_no_submitted_vote_conflict_for_intent(
+            &tx,
+            round_id,
+            &wallet_id,
+            proposal_id,
+            skipped_bool,
+            choice_u32,
+        )?;
         tx.execute(
             "INSERT INTO ballot_intent
                 (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
@@ -61,8 +71,8 @@ impl VotingDb {
             round_id,
             &wallet_id,
             proposal_id,
-            skipped != 0,
-            choice.map(|c| c as u32),
+            skipped_bool,
+            choice_u32,
         )?;
         tx.commit().map_err(|e| VotingError::Internal {
             message: format!("set_ballot_intent commit failed: {e}"),
@@ -724,8 +734,19 @@ mod tests {
         db.store_van_position(ROUND, 0, 7).unwrap();
 
         confirm_vote_fixture(&db, 0, 2, 0);
+        db.conn()
+            .execute(
+                "INSERT INTO ballot_intent
+                    (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
+                 VALUES (:round_id, :wallet_id, :proposal_id, 0, 1, 1, 1)",
+                named_params! {
+                    ":round_id": ROUND,
+                    ":wallet_id": W,
+                    ":proposal_id": 2_i64,
+                },
+            )
+            .unwrap();
 
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
         let err = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap_err();
 
         assert!(
@@ -733,6 +754,39 @@ mod tests {
                 .contains("submitted vote that conflicts with ballot intent"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn conflicting_intent_after_submission_is_rejected_before_share_cleanup() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0)).unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        confirm_vote_fixture(&db, 0, 2, 0);
+        record_all_confirmed_share_fixtures(&db, 0, 2);
+
+        for decision in [Decision::Choice(1), Decision::Skipped] {
+            let err = db.set_ballot_intent(ROUND, 2, decision).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("submitted vote that conflicts with ballot intent"),
+                "unexpected error for {decision:?}: {err}"
+            );
+            assert_eq!(
+                db.ballot_intents(ROUND).unwrap(),
+                vec![(2, Decision::Choice(0))]
+            );
+            let shares = db.get_share_delegations(ROUND).unwrap();
+            assert_eq!(shares.len(), 2);
+            let share_indexes = shares
+                .iter()
+                .map(|share| share.share_index)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(share_indexes, BTreeSet::from([0, 1]));
+            assert!(shares.iter().all(|share| {
+                share.bundle_index == 0 && share.proposal_id == 2 && share.confirmed
+            }));
+        }
     }
 
     #[test]

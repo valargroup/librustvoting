@@ -1859,6 +1859,50 @@ pub fn clear_stale_share_delegations_for_intent(
     Ok(rows as u64)
 }
 
+pub fn ensure_no_submitted_vote_conflict_for_intent(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    proposal_id: u32,
+    skipped: bool,
+    choice: Option<u32>,
+) -> Result<(), VotingError> {
+    let conflicting_bundle = conn
+        .query_row(
+            "SELECT bundle_index
+             FROM votes
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND proposal_id = :proposal_id
+               AND tx_hash IS NOT NULL
+               AND (:skipped != 0 OR choice != :choice)
+             ORDER BY bundle_index
+             LIMIT 1",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+                ":skipped": if skipped { 1_i64 } else { 0_i64 },
+                ":choice": choice.map(|c| c as i64),
+            },
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to check submitted vote intent conflict: {}", e),
+        })?;
+
+    if let Some(bundle_index) = conflicting_bundle {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote that conflicts with ballot intent"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Get all votes for a round (across all bundles).
 pub fn get_votes(
     conn: &Connection,
