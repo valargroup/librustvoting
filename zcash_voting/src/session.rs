@@ -152,6 +152,17 @@ pub enum NextStep {
         bundle_index: u32,
         proposal_id: u32,
     },
+    /// Submit helper shares for an already-confirmed vote.
+    ///
+    /// This covers the crash boundary after the cast-vote transaction confirms
+    /// and before every helper-share row has been durably recorded. Wallets
+    /// should reconstruct the vote with `vote::recover_commit`, submit only
+    /// missing share indexes to helper servers, then record each accepted share
+    /// with `share::record`.
+    SubmitShares {
+        bundle_index: u32,
+        proposal_id: u32,
+    },
     ConfirmShare {
         bundle_index: u32,
         proposal_id: u32,
@@ -196,6 +207,10 @@ fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
             bundle_index,
             proposal_id,
         } => (1, *proposal_id, *bundle_index, 0),
+        NextStep::SubmitShares {
+            bundle_index,
+            proposal_id,
+        } => (1, *proposal_id, *bundle_index, 1),
         NextStep::ConfirmShare {
             bundle_index,
             proposal_id,
@@ -230,6 +245,15 @@ pub fn resume_plan(
         .map(|vote| ((vote.bundle_index, vote.proposal_id), vote.choice))
         .collect();
     let shares = db.share_phases(round_id)?;
+    let share_indexes_by_vote = shares.iter().fold(
+        BTreeMap::<(u32, u32), BTreeSet<u32>>::new(),
+        |mut acc, (bundle_index, proposal_id, share_index, _)| {
+            acc.entry((*bundle_index, *proposal_id))
+                .or_default()
+                .insert(*share_index);
+            acc
+        },
+    );
     let intents: BTreeMap<u32, Decision> = db.ballot_intents(round_id)?.into_iter().collect();
 
     let bundles: Vec<u32> = delegation.keys().copied().collect();
@@ -302,7 +326,23 @@ pub fn resume_plan(
                 continue;
             }
             match votes.get(&vote_key) {
-                Some(VotePhase::Confirmed) => {}
+                Some(VotePhase::Confirmed) => {
+                    if confirmed_vote_has_missing_shares(
+                        db,
+                        round_id,
+                        b,
+                        pid,
+                        share_indexes_by_vote
+                            .get(&vote_key)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )? {
+                        steps.push(NextStep::SubmitShares {
+                            bundle_index: b,
+                            proposal_id: pid,
+                        });
+                    }
+                }
                 Some(VotePhase::Committed) => {
                     steps.push(NextStep::SubmitVote {
                         bundle_index: b,
@@ -386,11 +426,43 @@ pub fn resume_plan(
     })
 }
 
+fn confirmed_vote_has_missing_shares(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    recorded_share_indexes: BTreeSet<u32>,
+) -> Result<bool, VotingError> {
+    let Some(recovery) = crate::vote::recovery_bundle(db, round_id, bundle_index, proposal_id)?
+    else {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "confirmed vote for round {round_id} bundle {bundle_index} proposal {proposal_id} is missing recovery material for helper-share submission"
+            ),
+        });
+    };
+    let expected_share_indexes = recovery
+        .encrypted_shares
+        .iter()
+        .map(|share| share.share_index)
+        .collect::<BTreeSet<_>>();
+    if expected_share_indexes.is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "confirmed vote for round {round_id} bundle {bundle_index} proposal {proposal_id} has no recoverable helper shares"
+            ),
+        });
+    }
+
+    Ok(!expected_share_indexes.is_subset(&recorded_share_indexes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::round::RoundParams;
-    use crate::types::NoteInfo;
+    use crate::types::{EncryptedShare, NoteInfo};
+    use crate::vote::VoteRecoveryBundle;
 
     const ROUND: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const W: &str = "wallet";
@@ -431,8 +503,15 @@ mod tests {
         db: &VotingDb,
         bundle_index: u32,
         proposal_id: u32,
+        choice: u32,
         vc_tree_position: Option<u64>,
     ) {
+        let recovery = recovery_bundle_fixture(
+            bundle_index,
+            proposal_id,
+            choice,
+            vc_tree_position.unwrap_or(0),
+        );
         let conn = db.conn();
         let rows = conn
             .execute(
@@ -442,7 +521,7 @@ mod tests {
                    AND bundle_index = :bundle_index
                    AND proposal_id = :proposal_id",
                 named_params! {
-                    ":json": r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
+                    ":json": crate::vote::serialize_recovery(&recovery).unwrap(),
                     ":pos": vc_tree_position.map(|position| position as i64),
                     ":round_id": ROUND,
                     ":wallet_id": W,
@@ -465,9 +544,79 @@ mod tests {
             &[0xCC; 16],
         )
         .unwrap();
-        store_vote_recovery_fixture(db, bundle_index, proposal_id, Some(42));
+        store_vote_recovery_fixture(db, bundle_index, proposal_id, choice, Some(42));
         db.record_vote_submission(ROUND, bundle_index, proposal_id, "tx")
             .unwrap();
+    }
+
+    fn recovery_bundle_fixture(
+        bundle_index: u32,
+        proposal_id: u32,
+        choice: u32,
+        vc_tree_position: u64,
+    ) -> VoteRecoveryBundle {
+        VoteRecoveryBundle {
+            vote_round_id: ROUND.to_string(),
+            bundle_index,
+            proposal_id,
+            vote_decision: choice,
+            anchor_height: 123,
+            vc_tree_position,
+            single_share: false,
+            num_options: 3,
+            van_nullifier: [0x10; 32],
+            vote_authority_note_new: [0x11; 32],
+            vote_commitment: [0x12; 32],
+            proof: vec![0x13; 96],
+            shares_hash: [0x14; 32],
+            r_vpk: [0x15; 32],
+            alpha_v: [0x16; 32],
+            vote_auth_sig: [0x17; 64],
+            encrypted_shares: vec![
+                EncryptedShare {
+                    c1: vec![0x21; 32],
+                    c2: vec![0x22; 32],
+                    share_index: 0,
+                    plaintext_value: 5,
+                    randomness: vec![0x23; 32],
+                },
+                EncryptedShare {
+                    c1: vec![0x31; 32],
+                    c2: vec![0x32; 32],
+                    share_index: 1,
+                    plaintext_value: 6,
+                    randomness: vec![0x33; 32],
+                },
+            ],
+            share_blinds: vec![[0x41; 32], [0x42; 32]],
+            share_comms: vec![[0x51; 32], [0x52; 32]],
+        }
+    }
+
+    fn record_confirmed_share_fixture(
+        db: &VotingDb,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+    ) {
+        let nullifier = vec![share_index as u8; 32];
+        db.record_share_delegation(
+            ROUND,
+            bundle_index,
+            proposal_id,
+            share_index,
+            &["https://helper.example".to_string()],
+            &nullifier,
+            0,
+        )
+        .unwrap();
+        db.mark_share_confirmed(ROUND, bundle_index, proposal_id, share_index)
+            .unwrap();
+    }
+
+    fn record_all_confirmed_share_fixtures(db: &VotingDb, bundle_index: u32, proposal_id: u32) {
+        record_confirmed_share_fixture(db, bundle_index, proposal_id, 0);
+        record_confirmed_share_fixture(db, bundle_index, proposal_id, 1);
     }
 
     #[test]
@@ -541,7 +690,7 @@ mod tests {
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
-        store_vote_recovery_fixture(&db, 0, 2, None);
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
 
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
@@ -775,8 +924,9 @@ mod tests {
                 .unwrap();
         }
         confirm_vote_fixture(&db, 0, 1, 0);
+        record_all_confirmed_share_fixtures(&db, 0, 1);
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 1, 1, 0, &[0xCC; 16]).unwrap();
-        store_vote_recovery_fixture(&db, 1, 1, None);
+        store_vote_recovery_fixture(&db, 1, 1, 0, None);
 
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
@@ -812,9 +962,86 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_vote_without_recorded_shares_yields_submit_shares() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(W);
+        db.create_round(&round_params()).unwrap();
+        db.ensure_bundles(
+            ROUND,
+            &[note(0), note(1), note(2), note(3), note(4), note(5)],
+        )
+        .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx-0").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        db.store_delegation_tx_hash(ROUND, 1, "dtx-1").unwrap();
+        db.store_van_position(ROUND, 1, 8).unwrap();
+
+        for (proposal_id, choice) in [(1, 0), (2, 1)] {
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(choice))
+                .unwrap();
+        }
+        confirm_vote_fixture(&db, 0, 1, 0);
+        record_all_confirmed_share_fixtures(&db, 0, 1);
+        confirm_vote_fixture(&db, 1, 1, 0);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![
+                NextStep::SubmitShares {
+                    bundle_index: 1,
+                    proposal_id: 1,
+                },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                    choice: 1,
+                },
+                NextStep::CastVote {
+                    bundle_index: 1,
+                    proposal_id: 2,
+                    choice: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn confirmed_vote_with_partial_recorded_shares_yields_submit_shares() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        confirm_vote_fixture(&db, 0, 2, 1);
+        record_confirmed_share_fixture(&db, 0, 2, 0);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::SubmitShares {
+                bundle_index: 0,
+                proposal_id: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn confirmed_vote_with_all_recorded_shares_has_no_share_submission_step() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        confirm_vote_fixture(&db, 0, 2, 1);
+        record_all_confirmed_share_fixtures(&db, 0, 2);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert!(plan.next_steps.is_empty(), "got {:?}", plan.next_steps);
+    }
+
+    #[test]
     fn delegate_suppressed_when_vote_confirmed() {
         let db = db_with_bundle();
         confirm_vote_fixture(&db, 0, 2, 1);
+        record_all_confirmed_share_fixtures(&db, 0, 2);
 
         // Bundle 0 delegation is still only Prepared — but the vote is Confirmed,
         // so no Delegate step should appear and the plan has no work left.
@@ -862,6 +1089,7 @@ mod tests {
 
         // Proposal 2: drive to Confirmed.
         confirm_vote_fixture(&db, 0, 2, 1);
+        record_all_confirmed_share_fixtures(&db, 0, 2);
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
 
         // Proposal 1: skipped.

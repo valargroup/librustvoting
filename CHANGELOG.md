@@ -65,6 +65,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - `session::resume_plan` now orders vote work by proposal before bundle, so an
   interrupted multi-bundle question finishes across all bundles before later
   questions resume.
+- `session::resume_plan` now emits `NextStep::SubmitShares` when a vote
+  commitment is confirmed but one or more helper-share rows were not recorded,
+  so wallets can recover a crash between vote confirmation and share
+  publication without advancing to later proposals.
 - Vote recovery state is now guarded by durable vote identity. Stale recovery
   JSON, helper-share rows, tx hashes, and vote commitment tree positions cannot
   be attached to a replacement vote after the voter changes intent.
