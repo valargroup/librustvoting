@@ -34,6 +34,25 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   PCZT redaction, display memo formatting, prepared-PCZT caching, skipped-suffix
   bundle validation, and bundle weight helpers so wallet SDKs can keep only
   their runtime-specific async/lightwalletd shims.
+- Added shared `lwd` helpers for mainnet lightwalletd channel setup, bounded
+  unary RPCs, chain-tip lookup, consensus branch resolution, and snapshot
+  `TreeState` fetching with retry so wallet SDKs no longer need local copies of
+  these queries.
+- Added shared wallet note-selection helpers and delegation input gathering
+  (`select_snapshot_notes`, `select_snapshot_note_infos`, and
+  `gather_delegation_wallet_inputs`) so wallet SDKs can reuse the snapshot
+  eligibility, Orchard note-info extraction, and selected-note summary logic.
+- Added library-owned delegation lifecycle stage reporting and branch-id
+  provider traits so wallet SDKs can pass progress and consensus-branch
+  resolution into `delegate::setup` and `delegate::prove` without duplicating
+  library internals.
+- Added `delegate::LightwalletdBranchIdProvider` and
+  `delegate::branch_id_for_height` so wallet SDKs can resolve delegation
+  consensus branches from `lightwalletd_url` plus `Network` without duplicating
+  lightwalletd tip-fetching code.
+- Added `vote::VoteCommitStage` plus `VoteCommitStageReporter` and
+  `VoteCommitStageBridge` so wallet SDKs can consume library-owned cast-vote
+  lifecycle and proof-progress stages without defining local event enums.
 - Added `VotingDb::ensure_bundles_for_notes` and
   `VotingDb::prepare_delegation_pir` so wallet SDKs can share the delegation
   bundle validation, governance PCZT construction, and PIR precompute sequence
@@ -65,6 +84,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- `DelegationKeys::with_hotkey_bytes` no longer accepts `consensus_branch_id`;
+  `delegate::setup` now resolves it through a caller-supplied
+  `BranchIdProvider`. Delegation proof progress is reported via
+  `DelegationStageReporter`, while generic vote proof progress uses
+  `ProgressReporter`.
 - Vote recovery state is now guarded by durable vote identity. Stale recovery
   JSON, helper-share rows, tx hashes, and vote commitment tree positions cannot
   be attached to a replacement vote after the voter changes intent.

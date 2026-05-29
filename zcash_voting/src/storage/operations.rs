@@ -25,10 +25,10 @@ use crate::storage::{
     KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb,
 };
 use crate::types::{
-    BundleSetupResult, DelegationPirPrecomputeResult, DelegationProofResult,
-    DelegationSubmissionData, EncryptedShare, GovernancePczt, NoteInfo,
-    PreparedDelegationPirResult, ProofProgressReporter, SharePayload, VoteCommitmentBundle,
-    VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
+    BundleSetupResult, DelegationPirPrecomputeResult, DelegationProgressReporter,
+    DelegationProofResult, DelegationSubmissionData, EncryptedShare, GovernancePczt, NoteInfo,
+    PreparedDelegationPirResult, ProgressReporter, SharePayload, VoteCommitmentBundle, VotingError,
+    VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
 };
 
 /// Wallet-supplied inputs for shared delegation PCZT and PIR preparation.
@@ -768,7 +768,7 @@ impl VotingDb {
         hotkey_raw_address: &[u8],
         pir_client: &pir_client::PirClientBlocking,
         network_id: u32,
-        progress: &dyn ProofProgressReporter,
+        stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationProofResult, VotingError> {
         let total_start = std::time::Instant::now();
 
@@ -925,7 +925,7 @@ impl VotingDb {
             &imt_proofs,
             &extra_imt_proofs,
             network_id,
-            progress,
+            stages,
             Some(&precomputed),
         )?;
         let prove_elapsed = prove_start.elapsed();
@@ -1006,7 +1006,7 @@ impl VotingDb {
         van_position: u32,
         anchor_height: u32,
         single_share: bool,
-        progress: &dyn ProofProgressReporter,
+        progress: &dyn ProgressReporter,
     ) -> Result<VoteCommitmentBundle, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();

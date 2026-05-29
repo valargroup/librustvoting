@@ -4,11 +4,16 @@
 //! prelude intentionally contains the setup, precompute, and delegation types
 //! needed by mobile SDK boundaries without exposing proof-circuit internals.
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub use crate::delegate::gather_delegation_lwd_inputs;
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub use crate::delegate::LightwalletdBranchIdProvider;
 pub use crate::delegate::{
-    cache_prepared_setup, clear_prepared_setups, display_memo, load_account_keys, pczt_sighash,
-    prepared_epoch, record_submission, record_van_position, redact_for_signer,
-    setup as setup_delegation, spend_auth_signature, submission as delegation_submission,
-    take_prepared_setup, DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProof,
+    branch_id_for_height, cache_prepared_setup, clear_prepared_setups, display_memo,
+    load_account_keys, pczt_sighash, prepared_epoch, record_submission, record_van_position,
+    redact_for_signer, setup as setup_delegation, spend_auth_signature,
+    submission as delegation_submission, take_prepared_setup, BranchIdProvider,
+    DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProgress, DelegationProof,
     DelegationSetup, DelegationSigner, DelegationSubmission, KeystoneSigningRequest,
     PreparedDelegationReport, SignedDelegationBundle,
 };
@@ -21,8 +26,12 @@ pub use crate::precompute::{
     note_witnesses, stored_note_witnesses, verify_witness, PirPrecomputeReport,
 };
 pub use crate::round::{
-    note_bundles, quantized_bundle_set_weight, quantized_bundle_weight, raw_bundle_weight,
-    BundleLayout, RoundInfo, RoundParams, VotingDb,
+    bundle_notes_for_index, delegation_round_name, note_bundles, quantized_bundle_set_weight,
+    quantized_bundle_weight, raw_bundle_weight, BundleLayout, RoundInfo, RoundParams, VotingDb,
+};
+pub use crate::selection::{
+    gather_delegation_wallet_inputs, select_snapshot_note_infos, select_snapshot_notes,
+    DelegationWalletInputs, GatherDelegationWalletParams,
 };
 pub use crate::session::{resume_plan, Decision, NextStep, RoundPlan};
 pub use crate::share::{
@@ -31,18 +40,20 @@ pub use crate::share::{
     ShareRecord, ShareTimingPolicy, ShareTrackingSummary,
 };
 pub use crate::types::{
-    Network, NoopProgressReporter, NoteInfo, ProgressReporter, VotingHotkey, WitnessData,
+    voting_power, Cancellation, DelegationProgressBridge, DelegationProgressReporter, Network,
+    NoopCancellation, NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter, SelectedNotes,
+    VoteCommitStageBridge, VoteCommitStageReporter, VotingHotkey, WitnessData,
 };
 pub use crate::vote::{
     commit as commit_vote, parse_recovery, record_submission as record_vote_submission,
     record_vc_position, recover_commit as recover_vote_commit, recovery_bundle, serialize_recovery,
-    submission as vote_submission, DraftVote, VanWitness, VoteCommit, VoteRecoveryBundle,
-    VoteSigner, VoteSubmission,
+    submission as vote_submission, DraftVote, VanWitness, VoteCommit, VoteCommitStage,
+    VoteRecoveryBundle, VoteSigner, VoteSubmission,
 };
 pub use crate::warm_proving_caches;
 
 #[cfg(feature = "pir")]
-pub use crate::precompute::delegation_pir;
+pub use crate::precompute::{delegation_pir, precompute_delegation, PrecomputeDelegationInputs};
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::precompute::{reset_vote_tree, sync_vote_tree, van_witness};
