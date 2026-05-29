@@ -2338,6 +2338,15 @@ mod tests {
             Some("delegation-tx".to_string())
         );
         assert_invalid_input(
+            db.store_delegation_tx_hash(ROUND_ID, 0, "delegation-tx-2")
+                .expect_err("different delegation tx hash must fail"),
+            "delegation tx hash already recorded",
+        );
+        assert_eq!(
+            db.get_delegation_tx_hash(ROUND_ID, 0).unwrap(),
+            Some("delegation-tx".to_string())
+        );
+        assert_invalid_input(
             db.store_delegation_tx_hash(ROUND_ID, 1, "delegation-tx")
                 .expect_err("missing bundle index must fail"),
             "no bundle found",

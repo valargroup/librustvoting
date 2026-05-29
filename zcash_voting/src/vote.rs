@@ -331,10 +331,12 @@ impl ProgressReporter for VoteProofProgressReporter<'_> {
 
 /// Reconstructs a previously committed vote from persisted recovery state.
 ///
-/// This is the safe helper for `NextStep::SubmitVote`: submit the returned
-/// cast-vote fields to the vote chain, submit `share_payloads` to helper
-/// servers, call `share::record` for each accepted helper share, then call
-/// `record_submission` with the cast-vote transaction hash.
+/// This returns helper-share payloads using the currently stored vote
+/// commitment tree position. For the pre-confirmation `NextStep::SubmitVote`
+/// cast-vote resend, use [`submission`] so stale helper-share payloads are not
+/// accidentally submitted. After `confirmation::confirm_vote_submission`
+/// records the confirmed VC position, call this helper again and submit the
+/// freshly recovered helper-share payloads.
 pub fn recover_commit(
     db: &VotingDb,
     round_id: &str,
@@ -395,13 +397,31 @@ pub fn record_vc_position(
     proposal_id: u32,
     vc_tree_position: u64,
 ) -> Result<(), VotingError> {
+    let conn = db.conn();
+    let wallet_id = db.wallet_id();
+    record_vc_position_with_conn(
+        &conn,
+        &wallet_id,
+        round_id,
+        bundle_index,
+        proposal_id,
+        vc_tree_position,
+    )
+}
+
+pub(crate) fn record_vc_position_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    vc_tree_position: u64,
+) -> Result<(), VotingError> {
     let vc_tree_position_i64 =
         i64::try_from(vc_tree_position).map_err(|_| VotingError::InvalidInput {
             message: format!("vc_tree_position {vc_tree_position} does not fit in SQLite i64"),
         })?;
-    let wallet_id = db.wallet_id();
     let stored_vote: Option<(i64, Option<Vec<u8>>, Option<String>, Option<i64>)> = {
-        let conn = db.conn();
         conn.query_row(
             "SELECT choice, commitment, commitment_bundle_json, vc_tree_position FROM votes
              WHERE round_id = :round_id AND wallet_id = :wallet_id
@@ -440,9 +460,18 @@ pub fn record_vc_position(
 
     if let Some(json) = stored_json {
         let mut recovery = parse_recovery(&json)?;
+        validate_recovery_matches_stored_vote(
+            &recovery,
+            round_id,
+            bundle_index,
+            proposal_id,
+            stored_choice,
+            stored_commitment.as_deref(),
+        )?;
         recovery.vc_tree_position = vc_tree_position;
         store_recovery_json_with_vc_position_if_unchanged(
-            db,
+            conn,
+            wallet_id,
             round_id,
             bundle_index,
             proposal_id,
@@ -454,7 +483,8 @@ pub fn record_vc_position(
         )
     } else {
         store_vc_position_if_unset_or_same(
-            db,
+            conn,
+            wallet_id,
             round_id,
             bundle_index,
             proposal_id,
@@ -600,6 +630,81 @@ fn vote_identity_changed_error(
     }
 }
 
+fn vote_recovery_identity_mismatch_error(
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    field: &str,
+) -> VotingError {
+    VotingError::InvalidInput {
+        message: format!(
+            "vote recovery bundle {field} mismatch for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+        ),
+    }
+}
+
+fn invalid_stored_choice_error(stored_choice: i64) -> VotingError {
+    VotingError::Internal {
+        message: format!("stored vote choice must be non-negative, got {stored_choice}"),
+    }
+}
+
+fn validate_recovery_matches_stored_vote(
+    recovery: &VoteRecoveryBundle,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    stored_choice: i64,
+    stored_commitment: Option<&[u8]>,
+) -> Result<(), VotingError> {
+    if recovery.vote_round_id != round_id {
+        return Err(vote_recovery_identity_mismatch_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            "round_id",
+        ));
+    }
+    if recovery.bundle_index != bundle_index {
+        return Err(vote_recovery_identity_mismatch_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            "bundle_index",
+        ));
+    }
+    if recovery.proposal_id != proposal_id {
+        return Err(vote_recovery_identity_mismatch_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            "proposal_id",
+        ));
+    }
+    let stored_choice =
+        u32::try_from(stored_choice).map_err(|_| invalid_stored_choice_error(stored_choice))?;
+    if recovery.vote_decision != stored_choice {
+        return Err(vote_recovery_identity_mismatch_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            "vote_decision",
+        ));
+    }
+    if let Some(stored_commitment) = stored_commitment {
+        let recovery_commitment = stored_vote_commitment_bytes(recovery)?;
+        if stored_commitment != recovery_commitment {
+            return Err(vote_recovery_identity_mismatch_error(
+                round_id,
+                bundle_index,
+                proposal_id,
+                "commitment",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn handle_vote_identity_update_miss(
     conn: &rusqlite::Connection,
     round_id: &str,
@@ -681,7 +786,8 @@ fn handle_vc_position_update_miss(
 }
 
 fn store_recovery_json_with_vc_position_if_unchanged(
-    db: &VotingDb,
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
@@ -691,8 +797,6 @@ fn store_recovery_json_with_vc_position_if_unchanged(
     updated_json: &str,
     vc_tree_position: i64,
 ) -> Result<(), VotingError> {
-    let conn = db.conn();
-    let wallet_id = db.wallet_id();
     let rows = conn
         .execute(
             "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = :pos
@@ -719,9 +823,9 @@ fn store_recovery_json_with_vc_position_if_unchanged(
         })?;
     if rows == 0 {
         handle_vote_identity_update_miss(
-            &conn,
+            conn,
             round_id,
-            &wallet_id,
+            wallet_id,
             bundle_index,
             proposal_id,
             choice,
@@ -753,9 +857,9 @@ fn store_recovery_json_with_vc_position_if_unchanged(
             }
             Some((_, Some(current_position))) if current_position != vc_tree_position => {
                 return handle_vc_position_update_miss(
-                    &conn,
+                    conn,
                     round_id,
-                    &wallet_id,
+                    wallet_id,
                     bundle_index,
                     proposal_id,
                     vc_tree_position,
@@ -776,7 +880,8 @@ fn store_recovery_json_with_vc_position_if_unchanged(
 }
 
 fn store_vc_position_if_unset_or_same(
-    db: &VotingDb,
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
@@ -784,8 +889,6 @@ fn store_vc_position_if_unset_or_same(
     commitment: Option<&[u8]>,
     vc_tree_position: i64,
 ) -> Result<(), VotingError> {
-    let conn = db.conn();
-    let wallet_id = db.wallet_id();
     let rows = conn
         .execute(
             "UPDATE votes SET vc_tree_position = :pos
@@ -809,9 +912,9 @@ fn store_vc_position_if_unset_or_same(
         })?;
     if rows == 0 {
         handle_vote_identity_update_miss(
-            &conn,
+            conn,
             round_id,
-            &wallet_id,
+            wallet_id,
             bundle_index,
             proposal_id,
             choice,
@@ -819,9 +922,9 @@ fn store_vc_position_if_unset_or_same(
             "recording vote commitment tree position",
         )?;
         return handle_vc_position_update_miss(
-            &conn,
+            conn,
             round_id,
-            &wallet_id,
+            wallet_id,
             bundle_index,
             proposal_id,
             vc_tree_position,

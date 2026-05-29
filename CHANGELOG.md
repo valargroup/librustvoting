@@ -25,11 +25,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   eligible bundle rows exist for the round. Intent changes that conflict with an
   already-submitted vote fail before any recovery rows are cleaned up, and stale
   vote submissions are rejected after an intent changes.
-- Added `vote::recover_commit` for `NextStep::SubmitVote` handling. It
-  reconstructs both cast-vote submission fields and helper-share payloads from
-  persisted recovery state so wallets do not need to reassemble recovery JSON
-  and share material manually, while `share::record` persists accepted recovered
-  helper shares with crate-derived nullifiers.
+- Added `vote::submission` / `vote::recover_commit` guidance for
+  `NextStep::SubmitVote` handling. Wallets can reconstruct cast-vote
+  submission fields from persisted recovery state without rebuilding from a
+  draft, then call `recover_commit` again after confirmation to recover
+  helper-share payloads with the confirmed VC position.
+- Added `confirmation::*` APIs for wallet SDKs to parse confirmed
+  `delegate_vote` and `cast_vote` tx events, then atomically record delegation
+  tx hashes, VAN positions, cast-vote tx hashes, and vote commitment tree
+  positions without writing workflow SQL locally.
 - Added shared delegation request/report types, account-key loading, Keystone
   PCZT redaction, display memo formatting, skipped-suffix bundle validation,
   and bundle weight helpers so wallet SDKs can keep only their runtime-specific

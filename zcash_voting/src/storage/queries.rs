@@ -2096,7 +2096,11 @@ pub fn store_delegation_tx_hash(
 ) -> Result<(), VotingError> {
     let rows = conn
         .execute(
-            "UPDATE bundles SET delegation_tx_hash = :tx_hash WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+            "UPDATE bundles SET delegation_tx_hash = :tx_hash
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index
+               AND (delegation_tx_hash IS NULL OR delegation_tx_hash = :tx_hash)",
             named_params! {
                 ":tx_hash": tx_hash,
                 ":round_id": round_id,
@@ -2108,6 +2112,21 @@ pub fn store_delegation_tx_hash(
             message: format!("failed to store delegation tx hash: {}", e),
         })?;
     if rows == 0 {
+        if let Some(existing) =
+            existing_delegation_tx_hash(conn, round_id, wallet_id, bundle_index)?
+        {
+            if existing.as_deref() == Some(tx_hash) {
+                return Ok(());
+            }
+            if existing.is_some() {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "delegation tx hash already recorded for round={}, wallet={}, bundle={}",
+                        round_id, wallet_id, bundle_index
+                    ),
+                });
+            }
+        }
         return Err(VotingError::InvalidInput {
             message: format!(
                 "no bundle found for round={}, wallet={}, bundle={}",
@@ -2116,6 +2135,31 @@ pub fn store_delegation_tx_hash(
         });
     }
     Ok(())
+}
+
+fn existing_delegation_tx_hash(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Option<Option<String>>, VotingError> {
+    conn.query_row(
+        "SELECT delegation_tx_hash
+         FROM bundles
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to load existing delegation tx hash: {}", e),
+    })
 }
 
 pub fn get_delegation_tx_hash(
