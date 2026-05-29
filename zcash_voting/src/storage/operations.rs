@@ -320,7 +320,7 @@ impl VotingDb {
         queries::list_rounds(&conn, &wallet_id)
     }
 
-    /// Get all votes for a round (with choice, bundle_index, and submitted status).
+    /// Get all votes for a round, including proposal, bundle, and choice.
     pub fn get_votes(&self, round_id: &str) -> Result<Vec<VoteRecord>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
@@ -1274,25 +1274,6 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::get_delegation_tx_hash(&conn, round_id, &wallet_id, bundle_index)
-    }
-
-    pub fn store_vote_tx_hash(
-        &self,
-        round_id: &str,
-        bundle_index: u32,
-        proposal_id: u32,
-        tx_hash: &str,
-    ) -> Result<(), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::store_vote_tx_hash(
-            &conn,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            proposal_id,
-            tx_hash,
-        )
     }
 
     pub fn get_vote_tx_hash(
@@ -2432,62 +2413,35 @@ mod tests {
         );
 
         assert_invalid_input(
-            db.store_vote_tx_hash(ROUND_ID, 0, 1, "vote-tx")
-                .expect_err("missing vote row must fail"),
-            "no vote found",
-        );
-        assert_invalid_input(
             db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
                 .expect_err("missing vote row must fail"),
             "no vote found",
         );
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
-        db.store_vote_tx_hash(ROUND_ID, 0, 1, "vote-tx").unwrap();
-        assert_eq!(
-            db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap(),
-            Some("vote-tx".to_string())
-        );
-        assert!(db
-            .get_votes(ROUND_ID)
-            .unwrap()
-            .iter()
-            .find(|vote| vote.proposal_id == 1)
-            .map(|vote| vote.submitted)
-            .unwrap_or(false));
         db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
             .unwrap();
         assert_eq!(
             db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap(),
             Some("vote-tx".to_string())
         );
-        assert!(db
-            .get_votes(ROUND_ID)
-            .unwrap()
-            .iter()
-            .find(|vote| vote.proposal_id == 1)
-            .map(|vote| vote.submitted)
-            .unwrap_or(false));
+        db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
+            .unwrap();
         assert_invalid_input(
             db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx-2")
                 .expect_err("different submitted tx hash must fail"),
             "tx hash already recorded",
         );
-        assert_invalid_input(
-            db.store_vote_tx_hash(ROUND_ID, 0, 1, "vote-tx-2")
-                .expect_err("different stored tx hash must fail"),
-            "tx hash already recorded",
-        );
 
         assert_invalid_input(
-            db.store_vote_tx_hash(ROUND_ID, 0, 2, "vote-tx")
+            db.record_vote_submission(ROUND_ID, 0, 2, "vote-tx")
                 .expect_err("missing proposal row must fail"),
             "no vote found",
         );
     }
 
     #[test]
-    fn test_clear_recovery_state_resets_submitted_votes() {
+    fn test_clear_recovery_state_resets_vote_recovery() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
         db.setup_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
@@ -2504,7 +2458,7 @@ mod tests {
             .into_iter()
             .find(|vote| vote.proposal_id == 1)
             .expect("vote row remains");
-        assert!(!vote.submitted);
+        assert_eq!(vote.choice, 0);
         assert_eq!(db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap(), None);
     }
 
@@ -2536,7 +2490,6 @@ mod tests {
         assert_eq!(votes[0].bundle_index, 0);
         assert_eq!(votes[0].proposal_id, 7);
         assert_eq!(votes[0].choice, 1);
-        assert!(!votes[0].submitted);
     }
 
     #[test]
@@ -2820,24 +2773,14 @@ mod tests {
         assert_eq!(votes[0].bundle_index, 0);
         assert_eq!(votes[1].bundle_index, 1);
 
-        // Record bundle 0's vote submission, verify bundle 1 still unsubmitted
+        // Record bundle 0's vote submission, verify bundle 1 still has no tx.
         db.record_vote_submission(ROUND_ID, 0, 0, "vote-tx")
             .unwrap();
-        let votes = db.get_votes(ROUND_ID).unwrap();
-        assert!(
-            votes
-                .iter()
-                .find(|v| v.bundle_index == 0)
-                .unwrap()
-                .submitted
+        assert_eq!(
+            db.get_vote_tx_hash(ROUND_ID, 0, 0).unwrap().as_deref(),
+            Some("vote-tx")
         );
-        assert!(
-            !votes
-                .iter()
-                .find(|v| v.bundle_index == 1)
-                .unwrap()
-                .submitted
-        );
+        assert_eq!(db.get_vote_tx_hash(ROUND_ID, 1, 0).unwrap(), None);
 
         // Verify proposal_authority reflects per-bundle submission state
         let conn = db.conn();

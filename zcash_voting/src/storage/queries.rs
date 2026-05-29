@@ -1000,8 +1000,7 @@ pub fn load_zkp2_inputs(
     })?;
 
     // Compute current proposal_authority by clearing bits for votes with a
-    // durable tx hash for THIS bundle specifically. The legacy submitted flag
-    // alone is not enough because there would be no transaction to poll.
+    // durable tx hash for THIS bundle specifically.
     let mut authority = MAX_PROPOSAL_AUTHORITY;
     let mut stmt = conn
         .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND tx_hash IS NOT NULL")
@@ -1757,8 +1756,8 @@ pub fn store_vote(
         }
 
         conn.execute(
-            "INSERT OR REPLACE INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, commitment, submitted, created_at)
-             VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :choice, :commitment, 0, :created_at)",
+            "INSERT OR REPLACE INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, commitment, created_at)
+             VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :choice, :commitment, :created_at)",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
@@ -1867,7 +1866,7 @@ pub fn get_votes(
     wallet_id: &str,
 ) -> Result<Vec<VoteRecord>, VotingError> {
     let mut stmt = conn
-        .prepare("SELECT proposal_id, bundle_index, choice, tx_hash IS NOT NULL FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id")
+        .prepare("SELECT proposal_id, bundle_index, choice FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare get_votes: {}", e),
         })?;
@@ -1880,7 +1879,6 @@ pub fn get_votes(
                     proposal_id: row.get::<_, i64>(0)? as u32,
                     bundle_index: row.get::<_, i64>(1)? as u32,
                     choice: row.get::<_, i64>(2)? as u32,
-                    submitted: row.get::<_, i64>(3)? != 0,
                 })
             },
         )
@@ -1973,59 +1971,6 @@ pub fn get_delegation_tx_hash(
     })
 }
 
-pub fn store_vote_tx_hash(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    tx_hash: &str,
-) -> Result<(), VotingError> {
-    let rows = conn
-        .execute(
-            "UPDATE votes SET tx_hash = :tx_hash
-             WHERE round_id = :round_id
-               AND wallet_id = :wallet_id
-               AND bundle_index = :bundle_index
-               AND proposal_id = :proposal_id
-               AND (tx_hash IS NULL OR tx_hash = :tx_hash)",
-            named_params! {
-                ":tx_hash": tx_hash,
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": bundle_index as i64,
-                ":proposal_id": proposal_id as i64,
-            },
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to store vote tx hash: {}", e),
-        })?;
-    if rows == 0 {
-        if let Some(existing) =
-            existing_vote_tx_hash(conn, round_id, wallet_id, bundle_index, proposal_id)?
-        {
-            if existing.as_deref() == Some(tx_hash) {
-                return Ok(());
-            }
-            if existing.is_some() {
-                return Err(VotingError::InvalidInput {
-                    message: format!(
-                        "vote tx hash already recorded for round={}, wallet={}, bundle={}, proposal={}",
-                        round_id, wallet_id, bundle_index, proposal_id
-                    ),
-                });
-            }
-        }
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "no vote found for round={}, wallet={}, bundle={}, proposal={}",
-                round_id, wallet_id, bundle_index, proposal_id
-            ),
-        });
-    }
-    Ok(())
-}
-
 pub fn record_vote_submission(
     conn: &Connection,
     round_id: &str,
@@ -2036,7 +1981,7 @@ pub fn record_vote_submission(
 ) -> Result<(), VotingError> {
     let rows = conn
         .execute(
-            "UPDATE votes SET tx_hash = :tx_hash, submitted = 1
+            "UPDATE votes SET tx_hash = :tx_hash
              WHERE round_id = :round_id
                AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index
@@ -2261,7 +2206,7 @@ pub fn clear_recovery_state(
         message: format!("failed to clear delegation tx hashes: {}", e),
     })?;
     conn.execute(
-        "UPDATE votes SET submitted = 0, tx_hash = NULL, vc_tree_position = NULL, commitment_bundle_json = NULL WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        "UPDATE votes SET tx_hash = NULL, vc_tree_position = NULL, commitment_bundle_json = NULL WHERE round_id = :round_id AND wallet_id = :wallet_id",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {

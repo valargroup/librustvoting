@@ -203,7 +203,7 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         let phase = conn
             .query_row(
-                "SELECT submitted, tx_hash IS NOT NULL, vc_tree_position IS NOT NULL,
+                "SELECT tx_hash IS NOT NULL, vc_tree_position IS NOT NULL,
                         commitment_bundle_json IS NOT NULL
                  FROM votes
                  WHERE round_id = :round_id
@@ -221,7 +221,6 @@ impl VotingDb {
                         row.get::<_, i64>(0)? != 0,
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
-                        row.get::<_, i64>(3)? != 0,
                     ))
                 },
             )
@@ -243,7 +242,7 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         let mut stmt = conn
             .prepare(
-                "SELECT bundle_index, proposal_id, submitted, tx_hash IS NOT NULL,
+                "SELECT bundle_index, proposal_id, tx_hash IS NOT NULL,
                         vc_tree_position IS NOT NULL, commitment_bundle_json IS NOT NULL
                  FROM votes
                  WHERE round_id = :round_id AND wallet_id = :wallet_id
@@ -264,7 +263,6 @@ impl VotingDb {
                             row.get::<_, i64>(2)? != 0,
                             row.get::<_, i64>(3)? != 0,
                             row.get::<_, i64>(4)? != 0,
-                            row.get::<_, i64>(5)? != 0,
                         ),
                     ))
                 },
@@ -567,7 +565,6 @@ fn phase_from_columns(
 }
 
 fn vote_phase_from_columns(
-    _submitted: bool,
     has_tx_hash: bool,
     has_vc_position: bool,
     has_recovery_bundle: bool,

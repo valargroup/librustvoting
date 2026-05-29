@@ -95,7 +95,6 @@ CREATE TABLE votes (
     proposal_id     INTEGER NOT NULL,
     choice          INTEGER NOT NULL,
     commitment      BLOB,
-    submitted       INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     tx_hash                 TEXT,
     vc_tree_position        INTEGER,

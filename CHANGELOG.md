@@ -9,7 +9,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
-- Added `session::resume_plan` plus a durable `ballot_intent` table (schema v10):
+- Added `session::resume_plan` plus a durable `ballot_intent` table (schema v11):
   a pure, I/O-free round-level planner that fuses the per-bundle delegation,
   vote, and share phases with the voter's recorded ballot intent into an ordered
   list of `NextStep`s, so wallet SDKs can resume an interrupted multi-question
@@ -65,8 +65,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Vote recovery state is now guarded by durable vote identity. Stale recovery
   JSON, helper-share rows, tx hashes, and vote commitment tree positions cannot
   be attached to a replacement vote after the voter changes intent.
-- Removed the legacy `VotingDb::mark_vote_submitted` and
-  `VotingDb::store_commitment_bundle` writers. Integrations now use
+- Removed the legacy `VotingDb::mark_vote_submitted`,
+  `VotingDb::store_vote_tx_hash`, and `VotingDb::store_commitment_bundle`
+  writers, and dropped the stale `votes.submitted` column. Integrations now use
   `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
   `vote::record_vc_position`.
 - `precompute::sync_vote_tree` now rebuilds a round's sparse vote-tree client

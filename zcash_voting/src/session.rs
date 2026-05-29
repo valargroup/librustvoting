@@ -523,7 +523,7 @@ mod tests {
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
-        db.store_vote_tx_hash(ROUND, 0, 2, "vtx").unwrap();
+        db.record_vote_submission(ROUND, 0, 2, "vtx").unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert_eq!(
             plan.next_steps,
