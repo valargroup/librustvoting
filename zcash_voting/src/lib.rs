@@ -59,6 +59,7 @@ pub use pir_client::{
 };
 
 pub use governance::BALLOT_DIVISOR;
+pub use round::validate_bundle_index;
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use selection::select_notes_with_lwd;
 pub use selection::{

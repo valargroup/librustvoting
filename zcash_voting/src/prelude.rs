@@ -27,7 +27,8 @@ pub use crate::precompute::{
 };
 pub use crate::round::{
     bundle_notes_for_index, delegation_round_name, note_bundles, quantized_bundle_set_weight,
-    quantized_bundle_weight, raw_bundle_weight, BundleLayout, RoundInfo, RoundParams, VotingDb,
+    quantized_bundle_weight, raw_bundle_weight, validate_bundle_index, BundleLayout, RoundInfo,
+    RoundParams, VotingDb,
 };
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::selection::select_notes_with_lwd;
