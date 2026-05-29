@@ -388,8 +388,6 @@ pub fn resume_plan(
 
 #[cfg(test)]
 mod tests {
-    #![allow(deprecated)]
-
     use super::*;
     use crate::round::RoundParams;
     use crate::types::NoteInfo;
@@ -427,6 +425,49 @@ mod tests {
         db.create_round(&round_params()).unwrap();
         db.ensure_bundles(ROUND, &[note(0)]).unwrap();
         db
+    }
+
+    fn store_vote_recovery_fixture(
+        db: &VotingDb,
+        bundle_index: u32,
+        proposal_id: u32,
+        vc_tree_position: Option<u64>,
+    ) {
+        let conn = db.conn();
+        let rows = conn
+            .execute(
+                "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = :pos
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND bundle_index = :bundle_index
+                   AND proposal_id = :proposal_id",
+                named_params! {
+                    ":json": r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
+                    ":pos": vc_tree_position.map(|position| position as i64),
+                    ":round_id": ROUND,
+                    ":wallet_id": W,
+                    ":bundle_index": bundle_index as i64,
+                    ":proposal_id": proposal_id as i64,
+                },
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    fn confirm_vote_fixture(db: &VotingDb, bundle_index: u32, proposal_id: u32, choice: u32) {
+        crate::storage::queries::store_vote(
+            &db.conn(),
+            ROUND,
+            W,
+            bundle_index,
+            proposal_id,
+            choice,
+            &[0xCC; 16],
+        )
+        .unwrap();
+        store_vote_recovery_fixture(db, bundle_index, proposal_id, Some(42));
+        db.record_vote_submission(ROUND, bundle_index, proposal_id, "tx")
+            .unwrap();
     }
 
     #[test]
@@ -494,23 +535,13 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn committed_vote_yields_submit_not_rebuild() {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
-        crate::storage::queries::store_commitment_bundle(
-            &db.conn(),
-            ROUND,
-            W,
-            0,
-            2,
-            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
-            0,
-        )
-        .unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, None);
 
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
@@ -524,25 +555,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn changed_choice_after_submission_is_invalid_recovery_state() {
         let db = db_with_bundle();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
 
-        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
-        crate::storage::queries::store_commitment_bundle(
-            &db.conn(),
-            ROUND,
-            W,
-            0,
-            2,
-            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
-            42,
-        )
-        .unwrap();
-        db.store_vote_tx_hash(ROUND, 0, 2, "vtx").unwrap();
-        db.mark_vote_submitted(ROUND, 0, 2).unwrap();
+        confirm_vote_fixture(&db, 0, 2, 0);
 
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
         let err = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap_err();
@@ -738,24 +756,9 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn delegate_suppressed_when_vote_confirmed() {
         let db = db_with_bundle();
-        // Drive proposal 2 on bundle 0 to VotePhase::Confirmed:
-        // store_vote → store_commitment_bundle → store_vote_tx_hash → mark_vote_submitted.
-        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
-        crate::storage::queries::store_commitment_bundle(
-            &db.conn(),
-            ROUND,
-            W,
-            0,
-            2,
-            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
-            42,
-        )
-        .unwrap();
-        db.store_vote_tx_hash(ROUND, 0, 2, "tx").unwrap();
-        db.mark_vote_submitted(ROUND, 0, 2).unwrap();
+        confirm_vote_fixture(&db, 0, 2, 1);
 
         // Bundle 0 delegation is still only Prepared — but the vote is Confirmed,
         // so no Delegate step should appear and the plan has no work left.
@@ -798,24 +801,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn all_decided_true_with_confirmed_choice_and_skip() {
         let db = db_with_bundle();
 
         // Proposal 2: drive to Confirmed.
-        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
-        crate::storage::queries::store_commitment_bundle(
-            &db.conn(),
-            ROUND,
-            W,
-            0,
-            2,
-            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
-            42,
-        )
-        .unwrap();
-        db.store_vote_tx_hash(ROUND, 0, 2, "tx").unwrap();
-        db.mark_vote_submitted(ROUND, 0, 2).unwrap();
+        confirm_vote_fixture(&db, 0, 2, 1);
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
 
         // Proposal 1: skipped.

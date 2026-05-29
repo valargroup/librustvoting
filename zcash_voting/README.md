@@ -93,10 +93,9 @@ crate own the sampling and ordering policy.
   keeps `generate_hotkey(seed)` primitive.
 - Use `session::resume_plan` instead of reconstructing round recovery from raw
   delegation, vote, and share tables in wallet code.
-- Do not use the legacy `VotingDb::store_commitment_bundle` writer for new
-  integrations, or `VotingDb::mark_vote_submitted` as the submission marker.
-  They are compatibility APIs. Use `vote::commit`, `vote::recover_commit`,
-  `vote::record_submission`, and `vote::record_vc_position`.
+- Use `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
+  `vote::record_vc_position` for the cast-vote lifecycle. Wallets should not
+  write recovery JSON, submission flags, or vote commitment positions directly.
 - Pre-launch database migrations reset older schema versions; export local test
   state before opening an older wallet DB with this crate version.
 

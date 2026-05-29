@@ -386,6 +386,31 @@ mod tests {
         db
     }
 
+    fn store_vote_recovery_fixture(
+        db: &VotingDb,
+        bundle_index: u32,
+        proposal_id: u32,
+        vc_tree_position: Option<u64>,
+    ) {
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = :pos
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index
+               AND proposal_id = :proposal_id",
+            named_params! {
+                ":json": r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
+                ":pos": vc_tree_position.map(|position| position as i64),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+        )
+        .unwrap();
+    }
+
     fn round_params() -> RoundParams {
         RoundParams {
             vote_round_id: ROUND_ID.to_string(),
@@ -469,26 +494,17 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn vote_phase_advances_from_persisted_artifacts() {
         let db = db_with_bundle();
         crate::storage::queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 1, 2, &[0xCA; 32])
             .unwrap();
         assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Prepared);
 
-        crate::storage::queries::store_commitment_bundle(
-            &db.conn(),
-            ROUND_ID,
-            WALLET_ID,
-            0,
-            1,
-            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
-            456,
-        )
-        .unwrap();
+        store_vote_recovery_fixture(&db, 0, 1, None);
         assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Committed);
 
-        db.store_vote_tx_hash(ROUND_ID, 0, 1, "tx").unwrap();
+        db.record_vote_submission(ROUND_ID, 0, 1, "tx").unwrap();
+        store_vote_recovery_fixture(&db, 0, 1, Some(456));
         assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Confirmed);
     }
 

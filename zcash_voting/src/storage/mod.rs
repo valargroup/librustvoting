@@ -135,8 +135,6 @@ impl VotingDb {
 
 #[cfg(test)]
 mod tests {
-    #![allow(deprecated)]
-
     use super::*;
     use crate::types::VotingRoundParams;
 
@@ -231,12 +229,8 @@ mod tests {
         queries::store_vote(&conn, "test-round-1", W, 0, 0, 0, &commitment).unwrap();
         queries::store_vote(&conn, "test-round-1", W, 0, 1, 1, &commitment).unwrap();
 
-        let missing_tx_err =
-            queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap_err();
-        assert!(missing_tx_err.to_string().contains("tx hash missing"));
-        queries::store_vote_tx_hash(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
-        queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
-        queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
+        queries::record_vote_submission(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
+        queries::record_vote_submission(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
         queries::store_vote(&conn, "test-round-1", W, 0, 0, 0, &commitment).unwrap();
         let replace_err =
             queries::store_vote(&conn, "test-round-1", W, 0, 0, 1, &commitment).unwrap_err();
@@ -251,7 +245,8 @@ mod tests {
             Some("vote-tx".to_string())
         );
 
-        let err = queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 99).unwrap_err();
+        let err = queries::record_vote_submission(&conn, "test-round-1", W, 0, 99, "vote-tx")
+            .unwrap_err();
         assert!(matches!(err, VotingError::InvalidInput { .. }));
     }
 
@@ -277,8 +272,7 @@ mod tests {
         assert_eq!(votes[1].proposal_id, 1);
         assert_eq!(votes[1].choice, 2);
 
-        queries::store_vote_tx_hash(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
-        queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
+        queries::record_vote_submission(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
         let votes = queries::get_votes(&conn, "test-round-1", W).unwrap();
         assert!(votes[0].submitted);
         assert!(!votes[1].submitted);

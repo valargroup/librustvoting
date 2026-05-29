@@ -71,10 +71,9 @@ stage-oriented API:
 - Replace wallet-local recovery fusion with `session::resume_plan`; keep only
   wallet-specific networking, proof execution, signing, and UI routing at the
   wallet boundary.
-- Do not use the legacy `VotingDb::store_commitment_bundle` writer for new
-  integrations, or `VotingDb::mark_vote_submitted` as the submission marker.
-  They are compatibility APIs. Use `vote::commit`, `vote::recover_commit`,
-  `vote::record_submission`, and `vote::record_vc_position`.
+- Use `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
+  `vote::record_vc_position` for the cast-vote lifecycle. Wallets should not
+  write recovery JSON, submission flags, or vote commitment positions directly.
 
 Pre-launch wallet databases with older schema versions are reset when opened by
 this branch; callers that need to preserve test data should export it before

@@ -65,8 +65,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Vote recovery state is now guarded by durable vote identity. Stale recovery
   JSON, helper-share rows, tx hashes, and vote commitment tree positions cannot
   be attached to a replacement vote after the voter changes intent.
-- Deprecated the legacy `VotingDb::mark_vote_submitted` and
-  `VotingDb::store_commitment_bundle` writers. New integrations should use
+- Removed the legacy `VotingDb::mark_vote_submitted` and
+  `VotingDb::store_commitment_bundle` writers. Integrations now use
   `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
   `vote::record_vc_position`.
 - `vote::serialize_recovery` / `vote::parse_recovery` now own the canonical

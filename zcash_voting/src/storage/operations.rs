@@ -1253,26 +1253,6 @@ impl VotingDb {
         queries::delete_bundles_from(&conn, round_id, &wallet_id, keep_count)
     }
 
-    /// Mark a vote as submitted to the vote chain.
-    ///
-    /// Deprecated because submitted recovery now requires a durable tx hash.
-    /// Use `vote::record_submission` or `VotingDb::record_vote_submission`.
-    #[deprecated(
-        since = "0.10.1",
-        note = "use vote::record_submission or VotingDb::record_vote_submission"
-    )]
-    pub fn mark_vote_submitted(
-        &self,
-        round_id: &str,
-        bundle_index: u32,
-        proposal_id: u32,
-    ) -> Result<(), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        #[allow(deprecated)]
-        queries::mark_vote_submitted(&conn, round_id, &wallet_id, bundle_index, proposal_id)
-    }
-
     // --- Recovery state ---
 
     pub fn store_delegation_tx_hash(
@@ -1342,39 +1322,6 @@ impl VotingDb {
             bundle_index,
             proposal_id,
             tx_hash,
-        )
-    }
-
-    /// Legacy post-confirmation recovery writer.
-    ///
-    /// This stores both the recovery JSON and the confirmed vote commitment
-    /// tree position, so callers must only use it after the cast-vote
-    /// transaction is confirmed. New wallet integrations should use
-    /// `vote::commit`, `vote::record_submission`, and `vote::record_vc_position`
-    /// instead.
-    #[allow(deprecated)]
-    #[deprecated(
-        since = "0.10.1",
-        note = "use vote::commit, vote::record_submission, and vote::record_vc_position"
-    )]
-    pub fn store_commitment_bundle(
-        &self,
-        round_id: &str,
-        bundle_index: u32,
-        proposal_id: u32,
-        bundle_json: &str,
-        vc_tree_position: u64,
-    ) -> Result<(), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::store_commitment_bundle(
-            &conn,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            proposal_id,
-            bundle_json,
-            vc_tree_position,
         )
     }
 
@@ -1521,8 +1468,6 @@ impl VotingDb {
 
 #[cfg(test)]
 mod tests {
-    #![allow(deprecated)]
-
     use super::*;
 
     // 64 hex chars = 32 bytes when decoded. Required because build_governance_pczt
@@ -2425,7 +2370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_vote_submitted() {
+    fn test_record_vote_submission() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
         db.setup_bundles(
@@ -2446,21 +2391,18 @@ mod tests {
 
         db.insert_vote_fixture(ROUND_ID, 0, 0, 0, &[0xAA; 32])
             .unwrap();
-        let missing_tx_err = db.mark_vote_submitted(ROUND_ID, 0, 0).unwrap_err();
-        assert!(
-            missing_tx_err.to_string().contains("tx hash missing"),
-            "{missing_tx_err}"
-        );
-        db.store_vote_tx_hash(ROUND_ID, 0, 0, "vote-tx").unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 0).unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 0).unwrap();
+        db.record_vote_submission(ROUND_ID, 0, 0, "vote-tx")
+            .unwrap();
+        db.record_vote_submission(ROUND_ID, 0, 0, "vote-tx")
+            .unwrap();
 
-        let err = db.mark_vote_submitted(ROUND_ID, 0, 99).unwrap_err();
+        let err = db
+            .record_vote_submission(ROUND_ID, 0, 99, "vote-tx")
+            .unwrap_err();
         assert!(matches!(err, VotingError::InvalidInput { .. }));
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_recovery_stores_require_existing_rows() {
         fn assert_invalid_input(err: VotingError, expected: &str) {
             assert!(matches!(err, VotingError::InvalidInput { .. }), "{err}");
@@ -2499,12 +2441,6 @@ mod tests {
                 .expect_err("missing vote row must fail"),
             "no vote found",
         );
-        assert_invalid_input(
-            db.store_commitment_bundle(ROUND_ID, 0, 1, "{}", 42)
-                .expect_err("missing vote row must fail"),
-            "no vote found",
-        );
-
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
         db.store_vote_tx_hash(ROUND_ID, 0, 1, "vote-tx").unwrap();
@@ -2543,32 +2479,8 @@ mod tests {
             "tx hash already recorded",
         );
 
-        db.store_commitment_bundle(ROUND_ID, 0, 1, "{\"ok\":true}", 42)
-            .unwrap();
-        db.store_commitment_bundle(ROUND_ID, 0, 1, "{\"ok\":true}", 42)
-            .unwrap();
-        assert_eq!(
-            db.get_commitment_bundle(ROUND_ID, 0, 1).unwrap(),
-            Some(("{\"ok\":true}".to_string(), 42))
-        );
-        assert_invalid_input(
-            db.store_commitment_bundle(ROUND_ID, 0, 1, "{\"ok\":false}", 42)
-                .expect_err("different commitment bundle must fail"),
-            "commitment bundle already recorded",
-        );
-        assert_invalid_input(
-            db.store_commitment_bundle(ROUND_ID, 0, 1, "{\"ok\":true}", 43)
-                .expect_err("different commitment position must fail"),
-            "tree position already recorded",
-        );
-
         assert_invalid_input(
             db.store_vote_tx_hash(ROUND_ID, 0, 2, "vote-tx")
-                .expect_err("missing proposal row must fail"),
-            "no vote found",
-        );
-        assert_invalid_input(
-            db.store_commitment_bundle(ROUND_ID, 0, 2, "{}", 42)
                 .expect_err("missing proposal row must fail"),
             "no vote found",
         );
@@ -2908,9 +2820,9 @@ mod tests {
         assert_eq!(votes[0].bundle_index, 0);
         assert_eq!(votes[1].bundle_index, 1);
 
-        // Mark bundle 0's vote submitted, verify bundle 1 still unsubmitted
-        db.store_vote_tx_hash(ROUND_ID, 0, 0, "vote-tx").unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 0).unwrap();
+        // Record bundle 0's vote submission, verify bundle 1 still unsubmitted
+        db.record_vote_submission(ROUND_ID, 0, 0, "vote-tx")
+            .unwrap();
         let votes = db.get_votes(ROUND_ID).unwrap();
         assert!(
             votes
