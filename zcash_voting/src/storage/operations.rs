@@ -18,7 +18,6 @@ use orchard::{
 use pasta_curves::pallas;
 use voting_circuits::delegation::{synthetic_padding_note_parts, ImtProofData};
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::consensus::Network;
 
 use crate::delegate::DelegationKeys;
 use crate::governance::BUNDLE_NOTE_SLOTS;
@@ -29,7 +28,7 @@ use crate::storage::{
 };
 use crate::types::{
     DelegationPirPrecomputeResult, DelegationProgressReporter, DelegationProofResult,
-    DelegationSubmissionData, EncryptedShare, GovernancePczt, NoteInfo,
+    DelegationSubmissionData, EncryptedShare, GovernancePczt, Network, NoteInfo,
     PreparedDelegationPirResult, ProgressReporter, SharePayload, VoteCommitmentBundle, VotingError,
     VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
 };
@@ -111,7 +110,7 @@ fn nullifier_imt_root_to_base(bytes: &[u8]) -> Result<pallas::Base, VotingError>
 fn padded_nullifiers_for_circuit(
     notes: &[NoteInfo],
     padded_secrets: &[(Vec<u8>, Vec<u8>)],
-    network_id: u32,
+    network: Network,
 ) -> Result<Vec<Vec<u8>>, VotingError> {
     if padded_secrets.is_empty() {
         return Ok(Vec::new());
@@ -124,17 +123,6 @@ fn padded_nullifiers_for_circuit(
         })?
         .ufvk_str;
 
-    let network = match network_id {
-        0 => Network::TestNetwork,
-        1 => Network::MainNetwork,
-        _ => {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "invalid network_id {network_id}, expected 0 (testnet) or 1 (mainnet)"
-                ),
-            })
-        }
-    };
     let ufvk =
         UnifiedFullViewingKey::decode(&network, first_ufvk).map_err(|e| VotingError::Internal {
             message: format!("failed to decode UFVK while deriving padded nullifiers: {e}"),
@@ -558,7 +546,7 @@ impl VotingDb {
         let padded_secrets =
             queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
         let padded_nullifiers =
-            padded_nullifiers_for_circuit(notes, &padded_secrets, keys.network.id())?;
+            padded_nullifiers_for_circuit(notes, &padded_secrets, keys.network)?;
         let targets = delegation_nullifier_targets(notes, &padded_nullifiers)?;
 
         let mut cached_count = 0u32;
@@ -732,7 +720,7 @@ impl VotingDb {
         // These are the zero-value circuit-side padded nullifiers derived
         // from the Phase 1 padded-note rho/rseed pairs.
         let padded_nullifiers =
-            padded_nullifiers_for_circuit(notes, &padded_secrets, keys.network.id())?;
+            padded_nullifiers_for_circuit(notes, &padded_secrets, keys.network)?;
 
         // Align witnesses (keyed by commitment) to notes order
         let witness_count = witnesses.len();
@@ -866,7 +854,7 @@ impl VotingDb {
             &ordered_witnesses,
             &imt_proofs,
             &extra_imt_proofs,
-            keys.network.id(),
+            keys.network,
             stages,
             Some(&precomputed),
         )?;
