@@ -18,13 +18,14 @@ pub use crate::selection::{
     gather_delegation_wallet_inputs, DelegationWalletInputs, GatherDelegationWalletParams,
 };
 use crate::{
+    governance::BUNDLE_NOTE_SLOTS,
     precompute::PirPrecomputeReport,
     round::{BundleLayout, VotingDb},
     types::{DelegationProgressReporter, Network, NoteInfo, VotingError},
 };
 
 #[cfg(feature = "pir")]
-pub use crate::precompute::precompute_delegation;
+pub use crate::precompute::{precompute_delegation, precompute_delegation_with_policy};
 use zcash_client_backend::data_api::{Account, WalletRead};
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_protocol::consensus::Parameters;
@@ -253,7 +254,7 @@ pub struct DelegationProof {
     pub nf_signed: [u8; 32],
     pub cmx_new: [u8; 32],
     pub van_comm: [u8; 32],
-    pub gov_nullifiers: [[u8; 32]; 5],
+    pub gov_nullifiers: [[u8; 32]; BUNDLE_NOTE_SLOTS],
 }
 
 /// Signature source used when assembling a delegation transaction payload.
@@ -292,7 +293,7 @@ pub struct DelegationSubmission {
     pub nf_signed: [u8; 32],
     pub cmx_new: [u8; 32],
     pub gov_comm: [u8; 32],
-    pub gov_nullifiers: [[u8; 32]; 5],
+    pub gov_nullifiers: [[u8; 32]; BUNDLE_NOTE_SLOTS],
     pub alpha: [u8; 32],
     pub vote_round_id: String,
     pub spend_auth_sig: [u8; 64],
@@ -482,7 +483,7 @@ pub fn prove(
         nf_signed: array32("nf_signed", proof.nf_signed)?,
         cmx_new: array32("cmx_new", proof.cmx_new)?,
         van_comm: array32("van_comm", proof.van_comm)?,
-        gov_nullifiers: array32x5("gov_nullifiers", proof.gov_nullifiers)?,
+        gov_nullifiers: array32x_bundle_note_slots("gov_nullifiers", proof.gov_nullifiers)?,
     })
 }
 
@@ -515,7 +516,7 @@ pub fn submission(
         nf_signed: array32("nf_signed", data.nf_signed)?,
         cmx_new: array32("cmx_new", data.cmx_new)?,
         gov_comm: array32("gov_comm", data.gov_comm)?,
-        gov_nullifiers: array32x5("gov_nullifiers", data.gov_nullifiers)?,
+        gov_nullifiers: array32x_bundle_note_slots("gov_nullifiers", data.gov_nullifiers)?,
         alpha: array32("alpha", data.alpha)?,
         vote_round_id: data.vote_round_id,
         spend_auth_sig: array64("spend_auth_sig", data.spend_auth_sig)?,
@@ -882,10 +883,16 @@ fn array64(label: &str, value: Vec<u8>) -> Result<[u8; 64], VotingError> {
         })
 }
 
-fn array32x5(label: &str, values: Vec<Vec<u8>>) -> Result<[[u8; 32]; 5], VotingError> {
-    if values.len() != 5 {
+fn array32x_bundle_note_slots(
+    label: &str,
+    values: Vec<Vec<u8>>,
+) -> Result<[[u8; 32]; BUNDLE_NOTE_SLOTS], VotingError> {
+    if values.len() != BUNDLE_NOTE_SLOTS {
         return Err(VotingError::Internal {
-            message: format!("{label} must contain 5 entries, got {}", values.len()),
+            message: format!(
+                "{label} must contain {BUNDLE_NOTE_SLOTS} entries, got {}",
+                values.len()
+            ),
         });
     }
 
@@ -898,7 +905,10 @@ fn array32x5(label: &str, values: Vec<Vec<u8>>) -> Result<[[u8; 32]; 5], VotingE
     arrays
         .try_into()
         .map_err(|arrays: Vec<[u8; 32]>| VotingError::Internal {
-            message: format!("{label} must contain 5 entries, got {}", arrays.len()),
+            message: format!(
+                "{label} must contain {BUNDLE_NOTE_SLOTS} entries, got {}",
+                arrays.len()
+            ),
         })
 }
 

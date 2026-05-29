@@ -9,8 +9,9 @@ use std::path::Path;
 use rusqlite::{named_params, OptionalExtension};
 
 use crate::{
+    note_bundling::{chunk_notes_with_policy, BundlePolicy},
     storage::{queries, VotingDb as InnerVotingDb},
-    types::{chunk_notes, BundleSetupResult, NoteInfo, VotingError, VotingRoundParams},
+    types::{NoteInfo, VotingError, VotingRoundParams},
 };
 
 /// Stable public name for vote-round parameters supplied by the vote chain.
@@ -36,16 +37,6 @@ pub struct BundleLayout {
     pub bundle_count: u32,
     pub eligible_weight: u64,
     pub dropped_count: u32,
-}
-
-impl From<BundleSetupResult> for BundleLayout {
-    fn from(result: BundleSetupResult) -> Self {
-        Self {
-            bundle_count: result.bundle_count,
-            eligible_weight: result.eligible_weight_zatoshi,
-            dropped_count: 0,
-        }
-    }
 }
 
 /// Validates that `bundle_index` is in `[0, bundle_count)`.
@@ -87,6 +78,23 @@ pub fn bundle_notes_for_index(
     bundle_setup: &BundleLayout,
     bundle_index: u32,
 ) -> Result<Vec<NoteInfo>, VotingError> {
+    bundle_notes_for_index_with_policy(
+        round_note_infos,
+        bundle_setup,
+        bundle_index,
+        BundlePolicy::default(),
+    )
+}
+
+/// Returns the note rows for one bundle index under an explicit bundle policy.
+///
+/// The policy must match the one used to create or validate `bundle_setup`.
+pub fn bundle_notes_for_index_with_policy(
+    round_note_infos: &[NoteInfo],
+    bundle_setup: &BundleLayout,
+    bundle_index: u32,
+    policy: BundlePolicy,
+) -> Result<Vec<NoteInfo>, VotingError> {
     if bundle_setup.bundle_count == 0 {
         return Err(VotingError::InvalidInput {
             message: "No eligible voting bundles were created for delegation".to_string(),
@@ -100,7 +108,7 @@ pub fn bundle_notes_for_index(
             ),
         });
     }
-    note_bundles(round_note_infos)?
+    note_bundles_with_policy(round_note_infos, policy)?
         .get(bundle_index as usize)
         .cloned()
         .ok_or_else(|| VotingError::InvalidInput {
@@ -114,8 +122,16 @@ pub fn bundle_notes_for_index(
 /// that need to operate on one bundle after setup can use this instead of
 /// depending on the lower-level chunking internals.
 pub fn note_bundles(notes: &[NoteInfo]) -> Result<Vec<Vec<NoteInfo>>, VotingError> {
+    note_bundles_with_policy(notes, BundlePolicy::default())
+}
+
+/// Returns the eligible note bundles for a round note set under an explicit policy.
+pub fn note_bundles_with_policy(
+    notes: &[NoteInfo],
+    policy: BundlePolicy,
+) -> Result<Vec<Vec<NoteInfo>>, VotingError> {
     crate::types::validate_notes_for_round(notes)?;
-    Ok(chunk_notes(notes).bundles)
+    Ok(chunk_notes_with_policy(notes, policy).bundles)
 }
 
 /// Returns the unquantized zatoshi value for a bundle.
@@ -270,13 +286,27 @@ impl VotingDb {
         round_id: &str,
         notes: &[NoteInfo],
     ) -> Result<BundleLayout, VotingError> {
+        self.ensure_bundles_with_policy(round_id, notes, BundlePolicy::default())
+    }
+
+    /// Creates bundle rows for `notes`, or validates existing rows under `policy`.
+    ///
+    /// The note ordering and weight quantization are controlled by `policy`. On
+    /// first call, surviving bundles are persisted. On later calls, the same
+    /// notes and policy must reproduce the stored bundle identities.
+    pub fn ensure_bundles_with_policy(
+        &self,
+        round_id: &str,
+        notes: &[NoteInfo],
+        policy: BundlePolicy,
+    ) -> Result<BundleLayout, VotingError> {
         crate::types::validate_notes_for_round(notes)?;
-        let plan = chunk_notes(notes);
+        let plan = chunk_notes_with_policy(notes, policy);
         let expected_count = plan.bundles.len() as u32;
         let existing_count = self.get_bundle_count(round_id)?;
 
         if existing_count == 0 {
-            let (bundle_count, eligible_weight) = self.setup_bundles(round_id, notes)?;
+            let (bundle_count, eligible_weight) = self.persist_bundle_plan(round_id, &plan)?;
             return Ok(BundleLayout {
                 bundle_count,
                 eligible_weight,
@@ -328,13 +358,31 @@ impl VotingDb {
         round_id: &str,
         notes: &[NoteInfo],
     ) -> Result<BundleLayout, VotingError> {
+        self.ensure_bundles_with_skipped_suffix_with_policy(
+            round_id,
+            notes,
+            BundlePolicy::default(),
+        )
+    }
+
+    /// Creates bundle rows or validates a persisted prefix under `policy`.
+    ///
+    /// This variant supports Keystone recovery flows where the user intentionally
+    /// skips unsigned trailing bundles. Existing rows must still match the
+    /// current note selection prefix exactly under the supplied policy.
+    pub fn ensure_bundles_with_skipped_suffix_with_policy(
+        &self,
+        round_id: &str,
+        notes: &[NoteInfo],
+        policy: BundlePolicy,
+    ) -> Result<BundleLayout, VotingError> {
         crate::types::validate_notes_for_round(notes)?;
         let stored_count = self.get_bundle_count(round_id)?;
         if stored_count == 0 {
-            return self.ensure_bundles(round_id, notes);
+            return self.ensure_bundles_with_policy(round_id, notes, policy);
         }
 
-        let bundles = note_bundles(notes)?;
+        let bundles = note_bundles_with_policy(notes, policy)?;
         if bundles.len() < stored_count as usize {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -460,6 +508,60 @@ mod tests {
     }
 
     #[test]
+    fn ensure_bundles_uses_custom_real_note_capacity() {
+        let db = test_db("wallet-policy");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+            note(2, crate::governance::BALLOT_DIVISOR),
+        ];
+        let policy = BundlePolicy::new(1).unwrap();
+
+        let layout = db
+            .ensure_bundles_with_policy(ROUND_ID, &notes, policy)
+            .unwrap();
+        let bundles = note_bundles_with_policy(&notes, policy).unwrap();
+
+        assert_eq!(layout.bundle_count, 3);
+        assert_eq!(
+            layout.eligible_weight,
+            3 * crate::governance::BALLOT_DIVISOR
+        );
+        assert!(bundles.iter().all(|bundle| bundle.len() == 1));
+        assert_eq!(
+            bundle_notes_for_index_with_policy(&notes, &layout, 2, policy)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn ensure_bundles_rejects_existing_rows_when_policy_changes_shape() {
+        let db = test_db("wallet-policy-change");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+            note(2, crate::governance::BALLOT_DIVISOR),
+            note(3, crate::governance::BALLOT_DIVISOR),
+            note(4, crate::governance::BALLOT_DIVISOR),
+            note(5, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::new(1).unwrap())
+            .unwrap();
+
+        let err = db
+            .ensure_bundles(ROUND_ID, &notes)
+            .expect_err("default policy must not reuse policy-1 rows");
+
+        assert!(
+            err.to_string()
+                .contains("existing bundle count 6 does not match planned bundle count 2"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn ensure_bundles_rejects_changed_existing_bundle_identity() {
         let db = test_db("wallet-b");
         db.ensure_bundles(ROUND_ID, &[note(0, crate::governance::BALLOT_DIVISOR)])
@@ -522,6 +624,30 @@ mod tests {
         assert_eq!(
             reused.eligible_weight,
             5 * crate::governance::BALLOT_DIVISOR
+        );
+    }
+
+    #[test]
+    fn ensure_bundles_with_skipped_suffix_uses_custom_policy() {
+        let db = test_db("wallet-policy-skip");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+            note(2, crate::governance::BALLOT_DIVISOR),
+        ];
+        let policy = BundlePolicy::new(1).unwrap();
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, policy)
+            .unwrap();
+        db.delete_skipped_bundles(ROUND_ID, 2).unwrap();
+
+        let reused = db
+            .ensure_bundles_with_skipped_suffix_with_policy(ROUND_ID, &notes, policy)
+            .unwrap();
+
+        assert_eq!(reused.bundle_count, 2);
+        assert_eq!(
+            reused.eligible_weight,
+            2 * crate::governance::BALLOT_DIVISOR
         );
     }
 

@@ -58,7 +58,8 @@ pub use pir_client::{
     ImtProofData, PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
 
-pub use governance::BALLOT_DIVISOR;
+pub use governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
+pub use note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
 pub use round::validate_bundle_index;
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use selection::select_notes_with_lwd;
@@ -67,13 +68,13 @@ pub use selection::{
     select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
 pub use types::{
-    validate_round_params, voting_power, BundleSetupResult, Cancellation, CastVoteSignature,
-    DelegationAction, DelegationPirPrecomputeResult, DelegationProgressBridge,
-    DelegationProgressReporter, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
-    GovernancePczt, Network, NoopCancellation, NoopProgressReporter, NoteInfo, NoteRef,
-    PreparedDelegationPirResult, ProgressReporter, SelectedNotes, ShareDelegationRecord,
-    SharePayload, VoteCommitStageBridge, VoteCommitStageReporter, VoteCommitmentBundle,
-    VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
+    validate_round_params, Cancellation, CastVoteSignature, DelegationAction,
+    DelegationPirPrecomputeResult, DelegationProgressBridge, DelegationProgressReporter,
+    DelegationProofResult, DelegationSubmissionData, EncryptedShare, GovernancePczt, Network,
+    NoopCancellation, NoopProgressReporter, NoteInfo, NoteRef, PreparedDelegationPirResult,
+    ProgressReporter, SelectedNotes, ShareDelegationRecord, SharePayload, VoteCommitStageBridge,
+    VoteCommitStageReporter, VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
+    WireEncryptedShare, WitnessData,
 };
 
 /// Warm process-lifetime proving-key caches used by on-device voting proofs.

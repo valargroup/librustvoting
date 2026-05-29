@@ -18,13 +18,14 @@ use zcash_primitives::transaction::TxVersion;
 use zcash_protocol::consensus::{BlockHeight, BranchId, Network};
 use zip32::Scope;
 
-use crate::governance;
+use crate::governance::{self, BUNDLE_NOTE_SLOTS};
 use crate::types::{
     validate_notes, validate_round_params, GovernancePczt, NoteInfo, VotingError, VotingRoundParams,
 };
 
 /// Orchard Merkle tree depth (32 levels).
 const MERKLE_DEPTH: usize = 32;
+const DELEGATION_ACTION_FIXED_FIELD_COUNT: usize = 5;
 const MAX_PCZT_LAYOUT_ATTEMPTS: usize = 32;
 const ZIP32_MAINNET_COIN_TYPE: u32 = 133;
 
@@ -130,8 +131,8 @@ fn make_dummy_note(
 /// Canonical delegate action payload encoding for external signing.
 ///
 /// Field order:
-/// nf_signed || rk || cmx_new || van_comm || gov_null_1 || gov_null_2 ||
-/// gov_null_3 || gov_null_4 || gov_null_5 || vote_round_id.
+/// nf_signed || rk || cmx_new || van_comm || governance nullifier slots ||
+/// vote_round_id.
 ///
 /// TODO: This format might change when we standardize what the cosmos chain expects.
 fn encode_delegation_action_bytes(
@@ -143,16 +144,17 @@ fn encode_delegation_action_bytes(
     vote_round_id: &[u8; 32],
 ) -> Result<Vec<u8>, VotingError> {
     crate::types::validate_32_bytes(van_comm, "van_comm")?;
-    if gov_nullifiers.len() != 5 {
+    if gov_nullifiers.len() != BUNDLE_NOTE_SLOTS {
         return Err(VotingError::InvalidInput {
             message: format!(
-                "gov_nullifiers must have exactly 5 entries, got {}",
+                "gov_nullifiers must have exactly {BUNDLE_NOTE_SLOTS} entries, got {}",
                 gov_nullifiers.len()
             ),
         });
     }
 
-    let mut out = Vec::with_capacity(32 * 10);
+    let mut out =
+        Vec::with_capacity(32 * (BUNDLE_NOTE_SLOTS + DELEGATION_ACTION_FIXED_FIELD_COUNT));
     out.extend_from_slice(nf_signed);
     out.extend_from_slice(rk);
     out.extend_from_slice(cmx_new);
@@ -173,7 +175,8 @@ fn encode_delegation_action_bytes(
 /// Keystone when it runs the Signer role.
 ///
 /// Parameters:
-/// - `notes`: 1-5 input notes for governance nullifier derivation
+/// - `notes`: input notes for governance nullifier derivation, up to
+///   [`BUNDLE_NOTE_SLOTS`].
 /// - `params`: voting round parameters (round ID, snapshot height, etc.)
 /// - `fvk_bytes`: 96-byte orchard FullViewingKey (ak[32] || nk[32] || rivk[32])
 /// - `hotkey_raw_address`: 43-byte hotkey raw orchard address
@@ -241,7 +244,7 @@ pub fn build_governance_pczt(
 
     // --- Compute governance nullifiers ---
     let dom = governance::compute_nullifier_domain(&vri_32)?;
-    let mut gov_nullifiers: Vec<Vec<u8>> = Vec::with_capacity(5);
+    let mut gov_nullifiers: Vec<Vec<u8>> = Vec::with_capacity(BUNDLE_NOTE_SLOTS);
     for note in notes {
         let gov_null = governance::derive_gov_nullifier(nk_bytes, &dom, &note.nullifier)?;
         gov_nullifiers.push(gov_null);
@@ -253,8 +256,8 @@ pub fn build_governance_pczt(
     let mut dummy_nullifiers: Vec<Vec<u8>> = Vec::new();
     let mut padded_note_secrets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let n_real = notes.len();
-    if n_real < 5 {
-        for i in n_real..5 {
+    if n_real < BUNDLE_NOTE_SLOTS {
+        for i in n_real..BUNDLE_NOTE_SLOTS {
             let rho = random_rho(&mut rng);
             let (rseed, rseed_bytes) = random_rseed(&mut rng, &rho);
             let parts = synthetic_padding_note_parts(&fvk, i, rho, rseed).map_err(|e| {
@@ -293,15 +296,18 @@ pub fn build_governance_pczt(
         &van_comm_rand,
     )?;
 
-    // Collect all 5 cmx values
-    let mut all_cmx: Vec<Vec<u8>> = Vec::with_capacity(5);
+    // Collect all circuit note-slot commitments.
+    let mut all_cmx: Vec<Vec<u8>> = Vec::with_capacity(BUNDLE_NOTE_SLOTS);
     for note in notes {
         all_cmx.push(note.commitment.clone());
     }
     all_cmx.extend(padded_cmx.iter().cloned());
-    if all_cmx.len() != 5 {
+    if all_cmx.len() != BUNDLE_NOTE_SLOTS {
         return Err(VotingError::Internal {
-            message: format!("expected 5 cmx values, got {}", all_cmx.len()),
+            message: format!(
+                "expected {BUNDLE_NOTE_SLOTS} cmx values, got {}",
+                all_cmx.len()
+            ),
         });
     }
 
@@ -693,13 +699,9 @@ mod tests {
         let rk = [0x02; 32];
         let cmx_new = [0x03; 32];
         let van_comm = vec![0x04; 32];
-        let gov_nullifiers = vec![
-            vec![0x05; 32],
-            vec![0x06; 32],
-            vec![0x07; 32],
-            vec![0x08; 32],
-            vec![0x0A; 32],
-        ];
+        let gov_nullifiers: Vec<Vec<u8>> = (0..BUNDLE_NOTE_SLOTS)
+            .map(|i| vec![0x05 + i as u8; 32])
+            .collect();
         let vote_round_id = [0x09; 32];
 
         let encoded = encode_delegation_action_bytes(
@@ -712,17 +714,23 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(encoded.len(), 32 * 10);
+        assert_eq!(
+            encoded.len(),
+            32 * (BUNDLE_NOTE_SLOTS + DELEGATION_ACTION_FIXED_FIELD_COUNT)
+        );
         assert_eq!(&encoded[0..32], &nf_signed);
         assert_eq!(&encoded[32..64], &rk);
         assert_eq!(&encoded[64..96], &cmx_new);
         assert_eq!(&encoded[96..128], &van_comm);
-        assert_eq!(&encoded[128..160], &gov_nullifiers[0]);
-        assert_eq!(&encoded[160..192], &gov_nullifiers[1]);
-        assert_eq!(&encoded[192..224], &gov_nullifiers[2]);
-        assert_eq!(&encoded[224..256], &gov_nullifiers[3]);
-        assert_eq!(&encoded[256..288], &gov_nullifiers[4]);
-        assert_eq!(&encoded[288..320], &vote_round_id);
+        for (i, gov_nullifier) in gov_nullifiers.iter().enumerate() {
+            let start = 128 + (i * 32);
+            assert_eq!(&encoded[start..start + 32], gov_nullifier);
+        }
+        let vote_round_id_start = 128 + (BUNDLE_NOTE_SLOTS * 32);
+        assert_eq!(
+            &encoded[vote_round_id_start..vote_round_id_start + 32],
+            &vote_round_id
+        );
     }
 
     #[test]
@@ -732,7 +740,7 @@ mod tests {
             &[0x02; 32],
             &[0x03; 32],
             &[0x04; 32],
-            &vec![vec![0x05; 32]; 4],
+            &vec![vec![0x05; 32]; BUNDLE_NOTE_SLOTS - 1],
             &[0x06; 32],
         );
         assert!(encoded.is_err());
@@ -787,8 +795,8 @@ mod tests {
         assert_eq!(result.cmx_new.len(), 32);
         assert_ne!(result.cmx_new, vec![0u8; 32]);
 
-        // Gov nullifiers padded to 5
-        assert_eq!(result.gov_nullifiers.len(), 5);
+        // Gov nullifiers are padded to the circuit note-slot count.
+        assert_eq!(result.gov_nullifiers.len(), BUNDLE_NOTE_SLOTS);
         for gn in &result.gov_nullifiers {
             assert_eq!(gn.len(), 32);
         }
@@ -803,8 +811,8 @@ mod tests {
         assert_eq!(result.rho_signed.len(), 32);
         assert_ne!(result.rho_signed, vec![0u8; 32]);
 
-        // 4 padded cmx (1 real + 4 padded = 5)
-        assert_eq!(result.padded_cmx.len(), 4);
+        // One real note plus padded notes fills all circuit note slots.
+        assert_eq!(result.padded_cmx.len(), BUNDLE_NOTE_SLOTS - 1);
 
         // rseed values are 32 bytes each
         assert_eq!(result.rseed_signed.len(), 32);
@@ -812,8 +820,10 @@ mod tests {
         assert_eq!(result.rseed_output.len(), 32);
         assert_ne!(result.rseed_output, vec![0u8; 32]);
 
-        // action_bytes is 10 * 32 = 320 bytes
-        assert_eq!(result.action_bytes.len(), 320);
+        assert_eq!(
+            result.action_bytes.len(),
+            32 * (BUNDLE_NOTE_SLOTS + DELEGATION_ACTION_FIXED_FIELD_COUNT)
+        );
 
         // action_index is 0 or 1 (2 actions total: 1 real + 1 dummy padding)
         assert!(result.action_index <= 1);
@@ -886,9 +896,9 @@ mod tests {
         let vri_32: [u8; 32] = vote_round_id_bytes.try_into().unwrap();
         let dom = crate::governance::compute_nullifier_domain(&vri_32).unwrap();
 
-        assert_eq!(result.padded_cmx.len(), 4);
-        assert_eq!(result.dummy_nullifiers.len(), 4);
-        assert_eq!(result.padded_note_secrets.len(), 4);
+        assert_eq!(result.padded_cmx.len(), BUNDLE_NOTE_SLOTS - 1);
+        assert_eq!(result.dummy_nullifiers.len(), BUNDLE_NOTE_SLOTS - 1);
+        assert_eq!(result.padded_note_secrets.len(), BUNDLE_NOTE_SLOTS - 1);
 
         for (i_pad, (rho_bytes, rseed_bytes)) in result.padded_note_secrets.iter().enumerate() {
             let i_slot = 1 + i_pad;
@@ -921,8 +931,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_governance_pczt_five_notes() {
-        let notes: Vec<NoteInfo> = (0..5)
+    fn test_build_governance_pczt_full_note_slots() {
+        let notes: Vec<NoteInfo> = (0..BUNDLE_NOTE_SLOTS)
             .map(|i| NoteInfo {
                 commitment: vec![i as u8 + 1; 32],
                 nullifier: vec![i as u8 + 0x10; 32],
@@ -949,13 +959,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.gov_nullifiers.len(), 5);
+        assert_eq!(result.gov_nullifiers.len(), BUNDLE_NOTE_SLOTS);
         assert!(result.padded_cmx.is_empty());
         assert!(result.dummy_nullifiers.is_empty());
 
         // Gov nullifiers should all differ
-        for i in 0..5 {
-            for j in (i + 1)..5 {
+        for i in 0..BUNDLE_NOTE_SLOTS {
+            for j in (i + 1)..BUNDLE_NOTE_SLOTS {
                 assert_ne!(result.gov_nullifiers[i], result.gov_nullifiers[j]);
             }
         }

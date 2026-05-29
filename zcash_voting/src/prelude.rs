@@ -18,17 +18,18 @@ pub use crate::delegate::{
     PreparedDelegationReport, SignedDelegationBundle,
 };
 pub use crate::error::VotingError;
-pub use crate::governance::BALLOT_DIVISOR;
+pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::hotkey::generate_hotkey;
+pub use crate::note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
 pub use crate::phases::{SharePhase, VotePhase};
 pub use crate::pir::{select_pir_endpoint, PirEndpoint};
 pub use crate::precompute::{
     note_witnesses, stored_note_witnesses, verify_witness, PirPrecomputeReport,
 };
 pub use crate::round::{
-    bundle_notes_for_index, delegation_round_name, note_bundles, quantized_bundle_set_weight,
-    quantized_bundle_weight, raw_bundle_weight, validate_bundle_index, BundleLayout, RoundInfo,
-    RoundParams, VotingDb,
+    bundle_notes_for_index, bundle_notes_for_index_with_policy, delegation_round_name,
+    note_bundles, note_bundles_with_policy, quantized_bundle_set_weight, quantized_bundle_weight,
+    raw_bundle_weight, validate_bundle_index, BundleLayout, RoundInfo, RoundParams, VotingDb,
 };
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::selection::select_notes_with_lwd;
@@ -43,8 +44,8 @@ pub use crate::share::{
     ShareRecord, ShareTimingPolicy, ShareTrackingSummary,
 };
 pub use crate::types::{
-    voting_power, Cancellation, DelegationProgressBridge, DelegationProgressReporter, Network,
-    NoopCancellation, NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter, SelectedNotes,
+    Cancellation, DelegationProgressBridge, DelegationProgressReporter, Network, NoopCancellation,
+    NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter, SelectedNotes,
     VoteCommitStageBridge, VoteCommitStageReporter, VotingHotkey, WitnessData,
 };
 pub use crate::vote::{
@@ -56,7 +57,10 @@ pub use crate::vote::{
 pub use crate::warm_proving_caches;
 
 #[cfg(feature = "pir")]
-pub use crate::precompute::{delegation_pir, precompute_delegation, PrecomputeDelegationInputs};
+pub use crate::precompute::{
+    delegation_pir, precompute_delegation, precompute_delegation_with_policy,
+    PrecomputeDelegationInputs,
+};
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::precompute::{reset_vote_tree, sync_vote_tree, van_witness};
