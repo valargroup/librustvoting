@@ -31,9 +31,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   and share material manually, while `share::record` persists accepted recovered
   helper shares with crate-derived nullifiers.
 - Added shared delegation request/report types, account-key loading, Keystone
-  PCZT redaction, display memo formatting, prepared-PCZT caching, skipped-suffix
-  bundle validation, and bundle weight helpers so wallet SDKs can keep only
-  their runtime-specific async/lightwalletd shims.
+  PCZT redaction, display memo formatting, skipped-suffix bundle validation,
+  and bundle weight helpers so wallet SDKs can keep only their runtime-specific
+  async/lightwalletd shims.
 - Added shared `lwd` helpers for mainnet lightwalletd channel setup, bounded
   unary RPCs, chain-tip lookup, consensus branch resolution, and snapshot
   `TreeState` fetching with retry so wallet SDKs no longer need local copies of
@@ -98,6 +98,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   and PIR rows only; `delegate::setup` builds the PCZT later from the persisted
   padded secrets and refuses to overwrite existing padded secrets or
   `pczt_sighash`.
+- Removed the process-local prepared-PCZT cache and its prelude exports now that
+  precompute no longer builds PCZT setup material.
 - `DelegationKeys::with_hotkey_bytes` no longer accepts `consensus_branch_id`;
   `delegate::setup` now resolves it through a caller-supplied
   `BranchIdProvider`. Delegation proof progress is reported via
