@@ -51,9 +51,10 @@ stage-oriented API:
   `CastVote` steps include the recorded choice. `SubmitVote` steps mean a vote
   was already committed locally and should be reconstructed with
   `vote::recover_commit` rather than rebuilt from a draft. Submit the recovered
-  cast-vote fields and helper-share payloads, persist the cast-vote tx hash
-  with `vote::record_submission`, then re-run the planner because later work
-  may depend on on-chain confirmations. `open_proposals` contains only
+  cast-vote fields and helper-share payloads, persist each accepted helper
+  share with `share::record`, persist the cast-vote tx hash with
+  `vote::record_submission`, then re-run the planner because later work may
+  depend on on-chain confirmations. `open_proposals` contains only
   proposals with no terminal decision yet.
 
 ## Migrating 0.11 to 0.12

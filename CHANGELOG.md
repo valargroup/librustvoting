@@ -28,7 +28,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Added `vote::recover_commit` for `NextStep::SubmitVote` handling. It
   reconstructs both cast-vote submission fields and helper-share payloads from
   persisted recovery state so wallets do not need to reassemble recovery JSON
-  and share material manually.
+  and share material manually, while `share::record` persists accepted recovered
+  helper shares with crate-derived nullifiers.
 - Added shared delegation request/report types, account-key loading, Keystone
   PCZT redaction, display memo formatting, prepared-PCZT caching, skipped-suffix
   bundle validation, and bundle weight helpers so wallet SDKs can keep only

@@ -234,7 +234,8 @@ pub fn commit(
 ///
 /// This is the safe helper for `NextStep::SubmitVote`: submit the returned
 /// cast-vote fields to the vote chain, submit `share_payloads` to helper
-/// servers, then call `record_submission` with the cast-vote transaction hash.
+/// servers, call `share::record` for each accepted helper share, then call
+/// `record_submission` with the cast-vote transaction hash.
 pub fn recover_commit(
     db: &VotingDb,
     round_id: &str,

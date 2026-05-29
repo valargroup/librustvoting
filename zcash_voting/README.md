@@ -21,9 +21,11 @@ precompute → delegate → vote → share lifecycle:
 7. After restart, call `resume_plan` with the round's full proposal id list and
    execute one returned `NextStep`, persist its result, then call `resume_plan`
    again. `CastVote` includes the recorded choice, and `SubmitVote` resumes an
-   already committed vote through `vote::recover_commit`. `Decision::Skipped`
-   is terminal, so `open_proposals` contains only proposals that have no
-   recorded decision.
+   already committed vote through `vote::recover_commit`. For `SubmitVote`,
+   submit the recovered cast-vote fields and helper-share payloads, record each
+   accepted helper share with `share::record`, then record the cast-vote tx hash
+   with `vote::record_submission`. `Decision::Skipped` is terminal, so
+   `open_proposals` contains only proposals that have no recorded decision.
 
 ## Crate layout
 
