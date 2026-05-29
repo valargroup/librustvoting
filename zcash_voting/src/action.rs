@@ -100,6 +100,28 @@ fn random_rseed(rng: &mut impl RngCore, rho: &Rho) -> (RandomSeed, [u8; 32]) {
     }
 }
 
+/// Sample the synthetic padding-note secrets used to fill delegation's fixed
+/// five-note circuit arity.
+pub(crate) fn sample_padded_note_secrets(
+    notes_len: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, VotingError> {
+    if notes_len == 0 || notes_len > BUNDLE_NOTE_SLOTS {
+        return Err(VotingError::InvalidInput {
+            message: format!("expected 1-{BUNDLE_NOTE_SLOTS} notes, got {notes_len}"),
+        });
+    }
+
+    let mut rng = rand::thread_rng();
+    let mut padded_note_secrets = Vec::with_capacity(BUNDLE_NOTE_SLOTS - notes_len);
+    for _ in notes_len..BUNDLE_NOTE_SLOTS {
+        let rho = random_rho(&mut rng);
+        let (_rseed, rseed_bytes) = random_rseed(&mut rng, &rho);
+        let rho_bytes: [u8; 32] = rho.to_bytes();
+        padded_note_secrets.push((rho_bytes.to_vec(), rseed_bytes.to_vec()));
+    }
+    Ok(padded_note_secrets)
+}
+
 /// Construct an Orchard note at the given address with the given value and Rho.
 fn make_note(
     addr: Address,
@@ -195,6 +217,7 @@ pub fn build_governance_pczt(
     seed_fingerprint: &[u8; 32],
     account_index: u32,
     round_name: &str,
+    padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<GovernancePczt, VotingError> {
     validate_notes(notes)?;
     validate_round_params(params)?;
@@ -250,29 +273,60 @@ pub fn build_governance_pczt(
         gov_nullifiers.push(gov_null);
     }
 
-    // Padded note generation (also collect rho+rseed for ZCA-74 randomness threading).
-    // These must match the delegation circuit builder's synthetic padding slots.
+    // Padded-note derivation from write-once secrets. These must match the
+    // delegation circuit builder's synthetic padding slots.
     let mut padded_cmx: Vec<Vec<u8>> = Vec::new();
     let mut dummy_nullifiers: Vec<Vec<u8>> = Vec::new();
-    let mut padded_note_secrets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut normalized_padded_note_secrets: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let n_real = notes.len();
-    if n_real < BUNDLE_NOTE_SLOTS {
-        for i in n_real..BUNDLE_NOTE_SLOTS {
-            let rho = random_rho(&mut rng);
-            let (rseed, rseed_bytes) = random_rseed(&mut rng, &rho);
-            let parts = synthetic_padding_note_parts(&fvk, i, rho, rseed).map_err(|e| {
-                VotingError::Internal {
-                    message: format!("synthetic padding slot {i}: {e}"),
-                }
+    let expected_padded_count = BUNDLE_NOTE_SLOTS.saturating_sub(n_real);
+    if padded_note_secrets.len() != expected_padded_count {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "padded_note_secrets count ({}) must match expected padded note count ({expected_padded_count})",
+                padded_note_secrets.len()
+            ),
+        });
+    }
+    for (i_pad, (rho_bytes, rseed_bytes)) in padded_note_secrets.iter().enumerate() {
+        let i = n_real + i_pad;
+        let rho_arr: [u8; 32] =
+            rho_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VotingError::InvalidInput {
+                    message: format!("padded_note_secrets[{i_pad}].rho must be 32 bytes"),
+                })?;
+        let rho =
+            Rho::from_bytes(&rho_arr)
+                .into_option()
+                .ok_or_else(|| VotingError::InvalidInput {
+                    message: format!("padded_note_secrets[{i_pad}].rho is not a valid Rho"),
+                })?;
+        let rseed_arr: [u8; 32] =
+            rseed_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VotingError::InvalidInput {
+                    message: format!("padded_note_secrets[{i_pad}].rseed must be 32 bytes"),
+                })?;
+        let rseed = RandomSeed::from_bytes(rseed_arr, &rho)
+            .into_option()
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: format!(
+                    "padded_note_secrets[{i_pad}].rseed is not valid for the stored rho"
+                ),
             })?;
-            let gov_null = governance::derive_gov_nullifier(nk_bytes, &dom, &parts.nullifier)?;
-            padded_cmx.push(parts.cmx.to_vec());
-            gov_nullifiers.push(gov_null);
-            dummy_nullifiers.push(parts.nullifier.to_vec());
-            // Store rho + rseed for this padded note so Phase 2 can reconstruct it
-            let rho_bytes: [u8; 32] = rho.to_bytes();
-            padded_note_secrets.push((rho_bytes.to_vec(), rseed_bytes.to_vec()));
-        }
+        let parts = synthetic_padding_note_parts(&fvk, i, rho, rseed).map_err(|e| {
+            VotingError::Internal {
+                message: format!("synthetic padding slot {i}: {e}"),
+            }
+        })?;
+        let gov_null = governance::derive_gov_nullifier(nk_bytes, &dom, &parts.nullifier)?;
+        padded_cmx.push(parts.cmx.to_vec());
+        gov_nullifiers.push(gov_null);
+        dummy_nullifiers.push(parts.nullifier.to_vec());
+        normalized_padded_note_secrets.push((rho_arr.to_vec(), rseed_arr.to_vec()));
     }
 
     // Per-bundle weight
@@ -572,7 +626,7 @@ pub fn build_governance_pczt(
             rseed_output: rseed_output_bytes.to_vec(),
             action_bytes,
             action_index,
-            padded_note_secrets,
+            padded_note_secrets: normalized_padded_note_secrets,
             pczt_sighash: pczt_sighash.to_vec(),
         });
     }
@@ -767,6 +821,7 @@ mod tests {
             &MOCK_SEED_FP,
             MOCK_ACCOUNT,
             "Test Round",
+            &sample_padded_note_secrets(1).unwrap(),
         )
         .unwrap();
 
@@ -853,6 +908,7 @@ mod tests {
                 &MOCK_SEED_FP,
                 MOCK_ACCOUNT,
                 "Test Round",
+                &sample_padded_note_secrets(1).unwrap(),
             )
             .unwrap();
 
@@ -886,6 +942,7 @@ mod tests {
             &MOCK_SEED_FP,
             MOCK_ACCOUNT,
             "Test Round",
+            &sample_padded_note_secrets(1).unwrap(),
         )
         .unwrap();
 
@@ -956,6 +1013,7 @@ mod tests {
             &MOCK_SEED_FP,
             MOCK_ACCOUNT,
             "Test Round",
+            &sample_padded_note_secrets(notes.len()).unwrap(),
         )
         .unwrap();
 
@@ -983,6 +1041,7 @@ mod tests {
             &MOCK_SEED_FP,
             MOCK_ACCOUNT,
             "Test Round",
+            &sample_padded_note_secrets(1).unwrap(),
         )
         .unwrap();
 
@@ -996,6 +1055,7 @@ mod tests {
             &MOCK_SEED_FP,
             MOCK_ACCOUNT,
             "Test Round",
+            &sample_padded_note_secrets(1).unwrap(),
         )
         .unwrap();
 

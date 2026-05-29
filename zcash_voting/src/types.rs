@@ -506,17 +506,6 @@ pub struct DelegationPirPrecomputeResult {
     pub fetched_count: u32,
 }
 
-/// Result of preparing the governance PCZT and PIR-backed IMT proofs for a
-/// delegation bundle.
-#[derive(Clone, Debug)]
-pub struct PreparedDelegationPirResult {
-    pub governance_pczt: GovernancePczt,
-    pub precompute: DelegationPirPrecomputeResult,
-    pub bundle_count: u32,
-    pub eligible_weight_zatoshi: u64,
-    pub bundle_index: u32,
-}
-
 /// Merkle witness for a note in the Orchard commitment tree.
 #[derive(Clone, Debug)]
 pub struct WitnessData {

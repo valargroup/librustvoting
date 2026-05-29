@@ -336,7 +336,7 @@ pub struct KeystoneSigningRequest {
     pub bundle_index: u32,
 }
 
-/// Result of warming delegation PIR and governance PCZT material.
+/// Result of warming delegation PIR inputs for one bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedDelegationReport {
     /// PIR rows reused from storage or fetched from the PIR server.
