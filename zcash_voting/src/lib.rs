@@ -59,9 +59,11 @@ pub use pir_client::{
 };
 
 pub use governance::BALLOT_DIVISOR;
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub use selection::select_notes_with_lwd;
 pub use selection::{
-    gather_delegation_wallet_inputs, select_snapshot_note_infos, select_snapshot_notes,
-    DelegationWalletInputs, GatherDelegationWalletParams,
+    gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,
+    select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
 pub use types::{
     validate_round_params, voting_power, BundleSetupResult, Cancellation, CastVoteSignature,

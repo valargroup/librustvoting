@@ -29,9 +29,11 @@ pub use crate::round::{
     bundle_notes_for_index, delegation_round_name, note_bundles, quantized_bundle_set_weight,
     quantized_bundle_weight, raw_bundle_weight, BundleLayout, RoundInfo, RoundParams, VotingDb,
 };
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub use crate::selection::select_notes_with_lwd;
 pub use crate::selection::{
-    gather_delegation_wallet_inputs, select_snapshot_note_infos, select_snapshot_notes,
-    DelegationWalletInputs, GatherDelegationWalletParams,
+    gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,
+    select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
 pub use crate::session::{resume_plan, Decision, NextStep, RoundPlan};
 pub use crate::share::{
