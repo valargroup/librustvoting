@@ -1138,24 +1138,12 @@ mod tests {
         assert!(err.contains("hotkey_raw_address must be 43 bytes"));
     }
 
+    #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
     #[test]
-    fn branch_id_for_height_follows_network_activation_heights() {
-        assert_eq!(
-            branch_id_for_height(Network::Mainnet, 3_146_399).unwrap(),
-            0xC8E7_1055
-        );
-        assert_eq!(
-            branch_id_for_height(Network::Mainnet, 3_146_400).unwrap(),
-            0x4DEC_4DF0
-        );
-        assert_eq!(
-            branch_id_for_height(Network::Testnet, 3_536_500).unwrap(),
-            0x4DEC_4DF0
-        );
-        assert_eq!(
-            branch_id_for_height(Network::Regtest, 1).unwrap(),
-            0x4DEC_4DF0
-        );
+    fn lightwalletd_branch_id_provider_resolved_returns_branch_id() {
+        let provider = LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0);
+
+        assert_eq!(provider.consensus_branch_id().unwrap(), 0x4DEC_4DF0);
     }
 
     #[test]

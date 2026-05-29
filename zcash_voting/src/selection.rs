@@ -307,6 +307,38 @@ mod tests {
     }
 
     #[test]
+    fn select_snapshot_note_infos_returns_sorted_snapshot_note_inputs() {
+        let network = crate::Network::Regtest;
+        let snapshot_height = 12;
+        let divisor = crate::governance::BALLOT_DIVISOR;
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
+        let account_ref = account_internal_id(&conn, &account_uuid);
+
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, divisor, 9);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 10, divisor * 2, 4);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 1);
+
+        let db = WalletDb::from_connection(&conn, network, SystemClock, rand::rngs::OsRng);
+        let notes = select_snapshot_note_infos(
+            &db,
+            &account_uuid.expose_uuid().to_string(),
+            snapshot_height,
+        )
+        .unwrap();
+
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].position, 4);
+        assert_eq!(notes[0].value, divisor * 2);
+        assert_eq!(notes[1].position, 9);
+        assert_eq!(notes[1].value, divisor);
+        assert!(notes.iter().all(|note| note.commitment.len() == 32));
+        assert!(notes.iter().all(|note| note.nullifier.len() == 32));
+        assert!(notes.iter().all(|note| note.scope == 0));
+        assert!(notes.iter().all(|note| !note.ufvk_str.is_empty()));
+    }
+
+    #[test]
     fn select_snapshot_notes_rejects_empty_snapshot() {
         let network = crate::Network::Regtest;
         let snapshot_height = 12;

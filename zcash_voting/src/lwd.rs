@@ -236,3 +236,28 @@ where
         Err(_) => Err(timeout_status(label, timeout)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_id_for_height_follows_network_activation_heights() {
+        assert_eq!(
+            branch_id_for_height(Network::Mainnet, 3_146_399).unwrap(),
+            0xC8E7_1055
+        );
+        assert_eq!(
+            branch_id_for_height(Network::Mainnet, 3_146_400).unwrap(),
+            0x4DEC_4DF0
+        );
+        assert_eq!(
+            branch_id_for_height(Network::Testnet, 3_536_500).unwrap(),
+            0x4DEC_4DF0
+        );
+        assert_eq!(
+            branch_id_for_height(Network::Regtest, 1).unwrap(),
+            0x4DEC_4DF0
+        );
+    }
+}
