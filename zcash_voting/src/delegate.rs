@@ -13,9 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-use std::future::Future;
-
+pub use crate::lwd::branch_id_for_height;
 pub use crate::selection::{
     gather_delegation_wallet_inputs, DelegationWalletInputs, GatherDelegationWalletParams,
 };
@@ -27,18 +25,9 @@ use crate::{
 
 #[cfg(feature = "pir")]
 pub use crate::precompute::precompute_delegation;
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-use tonic::{
-    transport::{Channel, ClientTlsConfig, Endpoint},
-    Request, Response, Status,
-};
 use zcash_client_backend::data_api::{Account, WalletRead};
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-use zcash_client_backend::proto::service::{
-    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec,
-};
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
+use zcash_protocol::consensus::Parameters;
 
 /// Wallet-derived keys and chain parameters needed to build a delegation PCZT.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -127,8 +116,8 @@ pub struct LightwalletdBranchIdProvider {
 impl LightwalletdBranchIdProvider {
     /// Fetches the current lightwalletd tip and resolves the active branch id.
     pub async fn resolve(lightwalletd_url: &str, network: Network) -> Result<Self, VotingError> {
-        let branch_height = current_chain_height(lightwalletd_url).await?;
-        let resolved = branch_id_for_height(network, branch_height)?;
+        let branch_height = crate::lwd::latest_block_height_with_retry(lightwalletd_url).await?;
+        let resolved = crate::lwd::branch_id_for_height(network, branch_height)?;
         Ok(Self { resolved })
     }
 
@@ -144,127 +133,6 @@ impl LightwalletdBranchIdProvider {
 impl BranchIdProvider for LightwalletdBranchIdProvider {
     fn consensus_branch_id(&self) -> Result<u32, VotingError> {
         Ok(self.resolved)
-    }
-}
-
-/// Resolves the consensus branch ID active at `height` for `network`.
-pub fn branch_id_for_height(network: Network, height: u64) -> Result<u32, VotingError> {
-    let height = u32::try_from(height)
-        .map(BlockHeight::from_u32)
-        .map_err(|_| VotingError::InvalidInput {
-            message: format!("chain height {height} does not fit in u32"),
-        })?;
-    Ok(u32::from(BranchId::for_height(&network, height)))
-}
-
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-const LIGHTWALLETD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-const LIGHTWALLETD_UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(20);
-
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-async fn current_chain_height(lightwalletd_url: &str) -> Result<u64, VotingError> {
-    let mut last_error = None;
-    for attempt in 1..=3 {
-        match current_chain_height_once(lightwalletd_url).await {
-            Ok(height) => return Ok(height),
-            Err(error) => {
-                if attempt == 3 {
-                    last_error = Some(error);
-                    break;
-                }
-                last_error = Some(error);
-                tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| VotingError::Internal {
-        message: "chain height fetch failed".to_string(),
-    }))
-}
-
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-async fn current_chain_height_once(lightwalletd_url: &str) -> Result<u64, VotingError> {
-    let mut client = open_lwd_channel(lightwalletd_url).await?;
-    let tip = get_latest_block(&mut client).await?;
-    Ok(tip.height)
-}
-
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-async fn open_lwd_channel(
-    lightwalletd_url: &str,
-) -> Result<CompactTxStreamerClient<Channel>, VotingError> {
-    static RUSTLS_INIT: std::sync::Once = std::sync::Once::new();
-    RUSTLS_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-
-    let endpoint = Endpoint::from_shared(lightwalletd_url.to_string())
-        .map_err(|e| VotingError::InvalidInput {
-            message: format!("invalid lightwalletd URL: {e}"),
-        })?
-        .connect_timeout(LIGHTWALLETD_CONNECT_TIMEOUT);
-    let channel = if lightwalletd_url.starts_with("https://") {
-        endpoint
-            .tls_config(ClientTlsConfig::new().with_webpki_roots())
-            .map_err(|e| VotingError::Internal {
-                message: format!("lightwalletd TLS config failed: {e}"),
-            })?
-            .connect()
-            .await
-            .map_err(|e| VotingError::Internal {
-                message: format!("lightwalletd connect failed: {e}"),
-            })?
-    } else {
-        endpoint
-            .connect()
-            .await
-            .map_err(|e| VotingError::Internal {
-                message: format!("lightwalletd connect failed: {e}"),
-            })?
-    };
-    Ok(CompactTxStreamerClient::new(channel))
-}
-
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-async fn get_latest_block(
-    client: &mut CompactTxStreamerClient<Channel>,
-) -> Result<BlockId, VotingError> {
-    await_tonic_response(
-        "get_latest_block",
-        LIGHTWALLETD_UNARY_RPC_TIMEOUT,
-        client.get_latest_block(timed_request(
-            ChainSpec::default(),
-            LIGHTWALLETD_UNARY_RPC_TIMEOUT,
-        )),
-    )
-    .await
-    .map_err(|e| VotingError::Internal {
-        message: format!("get_latest_block: {e}"),
-    })
-}
-
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-fn timed_request<T>(message: T, timeout: Duration) -> Request<T> {
-    let mut request = Request::new(message);
-    request.set_timeout(timeout);
-    request
-}
-
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-fn timeout_status(label: &str, timeout: Duration) -> Status {
-    Status::deadline_exceeded(format!("{label}: timed out after {}s", timeout.as_secs()))
-}
-
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-async fn await_tonic_response<T, F>(label: &str, timeout: Duration, future: F) -> Result<T, Status>
-where
-    F: Future<Output = Result<Response<T>, Status>>,
-{
-    match tokio::time::timeout(timeout, future).await {
-        Ok(Ok(response)) => Ok(response.into_inner()),
-        Ok(Err(status)) => Err(status),
-        Err(_) => Err(timeout_status(label, timeout)),
     }
 }
 

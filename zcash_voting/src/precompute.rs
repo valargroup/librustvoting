@@ -16,8 +16,8 @@ use std::{
 use zcash_client_sqlite::WalletDb;
 
 use crate::{
-    round::{self, VotingDb},
-    types::{NoteInfo, VotingError, VotingRoundParams, WitnessData},
+    round::VotingDb,
+    types::{NoteInfo, VotingError, WitnessData},
 };
 
 #[cfg(feature = "pir")]
@@ -26,8 +26,8 @@ use crate::{
         cache_prepared_setup, prepared_epoch, setup, BranchIdProvider, DelegationKeys,
         PreparedDelegationReport,
     },
-    round::BundleLayout,
-    types::{Cancellation, DelegationProgressReporter, Network},
+    round::{self, BundleLayout},
+    types::{Cancellation, DelegationProgressReporter, Network, VotingRoundParams},
 };
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]

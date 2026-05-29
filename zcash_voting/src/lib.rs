@@ -22,7 +22,6 @@ pub mod hotkey;
     feature = "client-tree-sync"
 ))]
 mod http_transport;
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub mod lwd;
 pub mod note_bundling;
 pub mod phases;

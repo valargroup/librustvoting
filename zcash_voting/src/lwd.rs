@@ -3,13 +3,17 @@
 //! These helpers keep the tonic/lightwalletd edge in `zcash_voting` for callers
 //! that need Zcash mainnet chain state while preparing delegation witnesses.
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 use std::{future::Future, time::Duration};
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 use prost::Message;
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 use tonic::{
     transport::{Channel, ClientTlsConfig, Endpoint},
     Request, Response, Status,
 };
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec, TreeState,
 };
@@ -17,11 +21,15 @@ use zcash_protocol::consensus::{BlockHeight, BranchId};
 
 use crate::types::{Network, VotingError};
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 const LIGHTWALLETD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 const LIGHTWALLETD_UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 const LIGHTWALLETD_RETRY_ATTEMPTS: u32 = 3;
 
 /// Opens a tonic gRPC channel to a lightwalletd URL.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn open_channel(
     lightwalletd_url: &str,
 ) -> Result<CompactTxStreamerClient<Channel>, VotingError> {
@@ -60,6 +68,7 @@ pub async fn open_channel(
 }
 
 /// Returns the current lightwalletd chain tip with a bounded response wait.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn get_latest_block(
     client: &mut CompactTxStreamerClient<Channel>,
 ) -> Result<BlockId, VotingError> {
@@ -76,12 +85,37 @@ pub async fn get_latest_block(
 }
 
 /// Opens lightwalletd and returns the latest known block height.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn latest_block_height(lightwalletd_url: &str) -> Result<u64, VotingError> {
     let mut client = open_channel(lightwalletd_url).await?;
     Ok(get_latest_block(&mut client).await?.height)
 }
 
+/// Opens lightwalletd and returns the latest known block height with bounded retry behavior.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub async fn latest_block_height_with_retry(lightwalletd_url: &str) -> Result<u64, VotingError> {
+    let mut last_error = None;
+    for attempt in 1..=LIGHTWALLETD_RETRY_ATTEMPTS {
+        match latest_block_height(lightwalletd_url).await {
+            Ok(height) => return Ok(height),
+            Err(error) => {
+                if attempt == LIGHTWALLETD_RETRY_ATTEMPTS {
+                    last_error = Some(error);
+                    break;
+                }
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| VotingError::Internal {
+        message: "chain height fetch failed".to_string(),
+    }))
+}
+
 /// Returns the note commitment tree state for `height`.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn get_tree_state(
     client: &mut CompactTxStreamerClient<Channel>,
     height: u64,
@@ -102,6 +136,7 @@ pub async fn get_tree_state(
 }
 
 /// Opens lightwalletd and returns the serialized `TreeState` for `height`.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn tree_state_bytes(lightwalletd_url: &str, height: u64) -> Result<Vec<u8>, VotingError> {
     let mut client = open_channel(lightwalletd_url).await?;
     Ok(get_tree_state(&mut client, height).await?.encode_to_vec())
@@ -109,6 +144,7 @@ pub async fn tree_state_bytes(lightwalletd_url: &str, height: u64) -> Result<Vec
 
 /// Fetches a snapshot anchor `TreeState` with bounded retry behavior around
 /// transient lightwalletd failures.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn anchor_tree_state_with_retry(
     lightwalletd_url: &str,
     snapshot_height: u64,
@@ -134,6 +170,7 @@ pub async fn anchor_tree_state_with_retry(
 }
 
 /// Fetches a snapshot anchor `TreeState` as protobuf bytes.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn anchor_tree_state_bytes_with_retry(
     lightwalletd_url: &str,
     snapshot_height: u64,
@@ -146,38 +183,49 @@ pub async fn anchor_tree_state_bytes_with_retry(
 }
 
 /// Resolves the Zcash mainnet consensus branch id from the lightwalletd tip.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn mainnet_consensus_branch_id(lightwalletd_url: &str) -> Result<u32, VotingError> {
     let height = latest_block_height(lightwalletd_url).await?;
+    branch_id_for_height(Network::Mainnet, height)
+}
+
+/// Resolves the consensus branch ID active at `height` for `network`.
+pub fn branch_id_for_height(network: Network, height: u64) -> Result<u32, VotingError> {
     let height = u32::try_from(height)
         .map(BlockHeight::from_u32)
         .map_err(|_| VotingError::InvalidInput {
             message: format!("chain height {height} does not fit in u32"),
         })?;
 
-    Ok(u32::from(BranchId::for_height(&Network::Mainnet, height)))
+    Ok(u32::from(BranchId::for_height(&network, height)))
 }
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 fn timed_request<T>(message: T, timeout: Duration) -> Request<T> {
     let mut request = Request::new(message);
     request.set_timeout(timeout);
     request
 }
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 async fn fetch_tree_state(lightwalletd_url: &str, height: u64) -> Result<TreeState, VotingError> {
     let mut client = open_channel(lightwalletd_url).await?;
     get_tree_state(&mut client, height).await
 }
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 fn timeout_status(label: &str, timeout: Duration) -> Status {
     Status::deadline_exceeded(format!("{label}: timed out after {}s", timeout.as_secs()))
 }
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 fn status_to_error(label: &str, status: Status) -> VotingError {
     VotingError::Internal {
         message: format!("{label}: {status}"),
     }
 }
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 async fn await_tonic_response<T, F>(label: &str, timeout: Duration, future: F) -> Result<T, Status>
 where
     F: Future<Output = Result<Response<T>, Status>>,
