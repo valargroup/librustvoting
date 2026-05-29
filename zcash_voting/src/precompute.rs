@@ -4,6 +4,9 @@
 //! bundle witnesses, governance PCZT construction, and PIR-backed nullifier
 //! proofs. Lower-level helpers remain available for callers that already
 //! persisted intermediate state.
+//!
+//! See the `zcash-voting-wallet-example` workspace crate for caller-oriented
+//! precompute orchestration that can evolve independently from the library API.
 
 use std::borrow::Borrow;
 

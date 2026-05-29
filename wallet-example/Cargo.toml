@@ -1,0 +1,12 @@
+[package]
+name = "zcash-voting-wallet-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+rusqlite = "0.37"
+zcash_client_sqlite = { version = "0.20", default-features = false, features = ["orchard"] }
+zcash_protocol = "0.8"
+zcash_voting = { path = "../zcash_voting", features = ["pir", "tree-sync"] }
