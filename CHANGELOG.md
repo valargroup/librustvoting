@@ -93,6 +93,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- Delegation PIR warmup no longer constructs or caches a governance PCZT.
+  `precompute::precompute_delegation` now warms witnesses, padded-note secrets,
+  and PIR rows only; `delegate::setup` builds the PCZT later from the persisted
+  padded secrets and refuses to overwrite existing padded secrets or
+  `pczt_sighash`.
 - `DelegationKeys::with_hotkey_bytes` no longer accepts `consensus_branch_id`;
   `delegate::setup` now resolves it through a caller-supplied
   `BranchIdProvider`. Delegation proof progress is reported via
