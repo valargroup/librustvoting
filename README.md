@@ -69,7 +69,9 @@ stage-oriented API:
   imports with `share::policy::*`.
 - Replace raw vote/share workflow SQL with
   `VotingDb::{vote_phase, vote_phases, share_phase, share_phases}`.
-- Replace wallet-local recovery fusion with `session::resume_plan`; keep only
+- Replace wallet-local "what comes next" recovery planning with
+  `session::resume_plan`; fetch execution material through crate APIs such as
+  `vote::recover_commit`, `share::*`, and the tx hash accessors, then keep
   wallet-specific networking, proof execution, signing, and UI routing at the
   wallet boundary.
 - Use `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and

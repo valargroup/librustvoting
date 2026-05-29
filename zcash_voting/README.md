@@ -93,8 +93,10 @@ crate own the sampling and ordering policy.
   `DelegationSigner::Keystone` instead of separate submission methods.
 - Treat contextual hotkey mixing as wallet policy. The library intentionally
   keeps `generate_hotkey(seed)` primitive.
-- Use `session::resume_plan` instead of reconstructing round recovery from raw
-  delegation, vote, and share tables in wallet code.
+- Use `session::resume_plan` instead of reconstructing what comes next from raw
+  delegation, vote, and share phases in wallet code. Fetch step execution
+  material through crate APIs such as `vote::recover_commit`, `share::*`, and
+  the tx hash accessors.
 - Use `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
   `vote::record_vc_position` for the cast-vote lifecycle. Wallets should not
   write recovery JSON, submission flags, or vote commitment positions directly.
