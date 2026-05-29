@@ -13,14 +13,32 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+use std::future::Future;
+
+pub use crate::selection::{
+    gather_delegation_wallet_inputs, DelegationWalletInputs, GatherDelegationWalletParams,
+};
 use crate::{
     precompute::PirPrecomputeReport,
     round::{BundleLayout, VotingDb},
-    types::{Network, NoteInfo, VotingError},
+    types::{DelegationProgressReporter, Network, NoteInfo, VotingError},
+};
+
+#[cfg(feature = "pir")]
+pub use crate::precompute::precompute_delegation;
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+use tonic::{
+    transport::{Channel, ClientTlsConfig, Endpoint},
+    Request, Response, Status,
 };
 use zcash_client_backend::data_api::{Account, WalletRead};
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+use zcash_client_backend::proto::service::{
+    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, ChainSpec,
+};
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_protocol::consensus::Parameters;
+use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 
 /// Wallet-derived keys and chain parameters needed to build a delegation PCZT.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -35,8 +53,6 @@ pub struct DelegationKeys {
     pub account_index: u32,
     /// Address index used for governance PCZT output metadata.
     pub address_index: u32,
-    /// Consensus branch id selected for the PCZT transaction.
-    pub consensus_branch_id: u32,
     /// SLIP-44 coin type for the target Zcash network.
     pub coin_type: u32,
     /// Human-readable round name embedded in PCZT metadata.
@@ -59,7 +75,6 @@ impl DelegationKeys {
         seed_fingerprint: [u8; 32],
         account_index: u32,
         address_index: u32,
-        consensus_branch_id: u32,
         coin_type: u32,
         round_name: String,
     ) -> Result<Self, VotingError> {
@@ -69,10 +84,187 @@ impl DelegationKeys {
             seed_fingerprint,
             account_index,
             address_index,
-            consensus_branch_id,
             coin_type,
             round_name,
         })
+    }
+}
+
+/// Delegation workflow progress events.
+///
+/// Host apps emit the bookend variants while orchestrating note selection,
+/// signing, and payload assembly. Library functions emit the PCZT/proof stages.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum DelegationProgress {
+    SelectingNotes,
+    PcztBuilding,
+    PcztBuilt,
+    ProofStarting,
+    ProofProgress(f64),
+    ProofComplete,
+    SigningPayload,
+    PayloadReady,
+}
+
+/// Deprecated alias retained for existing SDK integrations.
+#[deprecated(note = "use DelegationProgress")]
+pub type DelegationStage = DelegationProgress;
+
+/// Resolves the consensus branch id for the wallet's selected chain tip.
+pub trait BranchIdProvider {
+    fn consensus_branch_id(&self) -> Result<u32, VotingError>;
+}
+
+/// Branch-id provider backed by a lightwalletd tip lookup.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+#[derive(Clone, Debug)]
+pub struct LightwalletdBranchIdProvider {
+    resolved: u32,
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+impl LightwalletdBranchIdProvider {
+    /// Fetches the current lightwalletd tip and resolves the active branch id.
+    pub async fn resolve(lightwalletd_url: &str, network: Network) -> Result<Self, VotingError> {
+        let branch_height = current_chain_height(lightwalletd_url).await?;
+        let resolved = branch_id_for_height(network, branch_height)?;
+        Ok(Self { resolved })
+    }
+
+    /// Builds a provider from an already-resolved branch id.
+    pub fn resolved(consensus_branch_id: u32) -> Self {
+        Self {
+            resolved: consensus_branch_id,
+        }
+    }
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+impl BranchIdProvider for LightwalletdBranchIdProvider {
+    fn consensus_branch_id(&self) -> Result<u32, VotingError> {
+        Ok(self.resolved)
+    }
+}
+
+/// Resolves the consensus branch ID active at `height` for `network`.
+pub fn branch_id_for_height(network: Network, height: u64) -> Result<u32, VotingError> {
+    let height = u32::try_from(height)
+        .map(BlockHeight::from_u32)
+        .map_err(|_| VotingError::InvalidInput {
+            message: format!("chain height {height} does not fit in u32"),
+        })?;
+    Ok(u32::from(BranchId::for_height(&network, height)))
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+const LIGHTWALLETD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+const LIGHTWALLETD_UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+async fn current_chain_height(lightwalletd_url: &str) -> Result<u64, VotingError> {
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        match current_chain_height_once(lightwalletd_url).await {
+            Ok(height) => return Ok(height),
+            Err(error) => {
+                if attempt == 3 {
+                    last_error = Some(error);
+                    break;
+                }
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| VotingError::Internal {
+        message: "chain height fetch failed".to_string(),
+    }))
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+async fn current_chain_height_once(lightwalletd_url: &str) -> Result<u64, VotingError> {
+    let mut client = open_lwd_channel(lightwalletd_url).await?;
+    let tip = get_latest_block(&mut client).await?;
+    Ok(tip.height)
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+async fn open_lwd_channel(
+    lightwalletd_url: &str,
+) -> Result<CompactTxStreamerClient<Channel>, VotingError> {
+    static RUSTLS_INIT: std::sync::Once = std::sync::Once::new();
+    RUSTLS_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+
+    let endpoint = Endpoint::from_shared(lightwalletd_url.to_string())
+        .map_err(|e| VotingError::InvalidInput {
+            message: format!("invalid lightwalletd URL: {e}"),
+        })?
+        .connect_timeout(LIGHTWALLETD_CONNECT_TIMEOUT);
+    let channel = if lightwalletd_url.starts_with("https://") {
+        endpoint
+            .tls_config(ClientTlsConfig::new().with_webpki_roots())
+            .map_err(|e| VotingError::Internal {
+                message: format!("lightwalletd TLS config failed: {e}"),
+            })?
+            .connect()
+            .await
+            .map_err(|e| VotingError::Internal {
+                message: format!("lightwalletd connect failed: {e}"),
+            })?
+    } else {
+        endpoint
+            .connect()
+            .await
+            .map_err(|e| VotingError::Internal {
+                message: format!("lightwalletd connect failed: {e}"),
+            })?
+    };
+    Ok(CompactTxStreamerClient::new(channel))
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+async fn get_latest_block(
+    client: &mut CompactTxStreamerClient<Channel>,
+) -> Result<BlockId, VotingError> {
+    await_tonic_response(
+        "get_latest_block",
+        LIGHTWALLETD_UNARY_RPC_TIMEOUT,
+        client.get_latest_block(timed_request(
+            ChainSpec::default(),
+            LIGHTWALLETD_UNARY_RPC_TIMEOUT,
+        )),
+    )
+    .await
+    .map_err(|e| VotingError::Internal {
+        message: format!("get_latest_block: {e}"),
+    })
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+fn timed_request<T>(message: T, timeout: Duration) -> Request<T> {
+    let mut request = Request::new(message);
+    request.set_timeout(timeout);
+    request
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+fn timeout_status(label: &str, timeout: Duration) -> Status {
+    Status::deadline_exceeded(format!("{label}: timed out after {}s", timeout.as_secs()))
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+async fn await_tonic_response<T, F>(label: &str, timeout: Duration, future: F) -> Result<T, Status>
+where
+    F: Future<Output = Result<Response<T>, Status>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(Ok(response)) => Ok(response.into_inner()),
+        Ok(Err(status)) => Err(status),
+        Err(_) => Err(timeout_status(label, timeout)),
     }
 }
 
@@ -85,6 +277,94 @@ pub struct DelegationAccountKeys {
     pub orchard_fvk_bytes: [u8; 96],
     /// ZIP-32 seed fingerprint of the loaded account.
     pub seed_fingerprint: [u8; 32],
+}
+
+/// Delegation bundle state assembled by wallet integrations before signing.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub struct DelegationBundleContext {
+    pub voting_db: VotingDb,
+    pub round_id: String,
+    pub bundle_index: u32,
+    pub bundle_setup: BundleLayout,
+    pub selected_weight_zatoshi: u64,
+    pub bundle_note_infos: Vec<NoteInfo>,
+    pub delegated_weight_zatoshi: u64,
+    pub account: DelegationAccountKeys,
+    pub hotkey_raw_address: Vec<u8>,
+    pub branch_id_provider: LightwalletdBranchIdProvider,
+    pub round_name: String,
+}
+
+/// Parameters for resolving lightwalletd-derived delegation inputs.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub struct ResolveDelegationLwdParams<'a> {
+    pub lightwalletd_url: &'a str,
+    pub network: Network,
+    pub round_params: crate::VotingRoundParams,
+    pub round_name: &'a str,
+    pub cancellation: &'a dyn crate::Cancellation,
+}
+
+/// Parameters for gathering delegation inputs from wallet and lightwalletd state.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub struct GatherDelegationParams<'a, N> {
+    pub db_path: &'a str,
+    pub lightwalletd_url: &'a str,
+    pub wallet_network: N,
+    pub network: Network,
+    pub round_params: crate::VotingRoundParams,
+    pub round_name: &'a str,
+    pub account_uuid: &'a str,
+    pub hotkey_raw_address: Vec<u8>,
+    pub cancellation: &'a dyn crate::Cancellation,
+}
+
+/// Lightwalletd-derived inputs for delegation precompute.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+#[derive(Clone, Debug)]
+pub struct DelegationLwdInputs {
+    pub round_params: crate::VotingRoundParams,
+    pub resolved_round_name: String,
+    pub anchor_tree_state_bytes: Vec<u8>,
+    pub branch_id_provider: LightwalletdBranchIdProvider,
+}
+
+/// Validates round params and resolves lightwalletd anchor and branch state.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub async fn gather_delegation_lwd_inputs(
+    params: ResolveDelegationLwdParams<'_>,
+) -> Result<DelegationLwdInputs, VotingError> {
+    check_cancellation(params.cancellation)?;
+    crate::validate_round_params(&params.round_params)?;
+    let resolved_round_name =
+        crate::round::delegation_round_name(&params.round_params, params.round_name);
+    let anchor_tree_state_bytes = crate::lwd::anchor_tree_state_bytes_with_retry(
+        params.lightwalletd_url,
+        params.round_params.snapshot_height,
+    )
+    .await?;
+    check_cancellation(params.cancellation)?;
+    let branch_id_provider =
+        LightwalletdBranchIdProvider::resolve(params.lightwalletd_url, params.network).await?;
+
+    Ok(DelegationLwdInputs {
+        round_params: params.round_params,
+        resolved_round_name,
+        anchor_tree_state_bytes,
+        branch_id_provider,
+    })
+}
+
+/// Inputs gathered from lightwalletd and the wallet before voting-DB work.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+#[derive(Clone, Debug)]
+pub struct DelegationInputs {
+    pub account_uuid: String,
+    pub round_params: crate::VotingRoundParams,
+    pub anchor_tree_state_bytes: Vec<u8>,
+    pub round_note_infos: Vec<NoteInfo>,
+    pub branch_id_provider: LightwalletdBranchIdProvider,
+    pub delegation_keys: DelegationKeys,
 }
 
 /// PCZT setup output that callers hand to a signer or QR encoder.
@@ -253,6 +533,15 @@ fn parse_account_uuid(account_uuid: &str) -> Result<AccountUuid, VotingError> {
     Ok(AccountUuid::from_uuid(uuid))
 }
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+fn check_cancellation(cancellation: &dyn crate::Cancellation) -> Result<(), VotingError> {
+    if cancellation.is_cancelled() {
+        Err(VotingError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 /// Builds and persists a governance PCZT for one bundle.
 ///
 /// The bundle must already exist via [`VotingDb::ensure_bundles`]. The returned
@@ -263,20 +552,25 @@ pub fn setup(
     bundle_index: u32,
     notes: &[NoteInfo],
     keys: &DelegationKeys,
+    branch_id_provider: &dyn BranchIdProvider,
+    stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationSetup, VotingError> {
+    let consensus_branch_id = branch_id_provider.consensus_branch_id()?;
+    stages.on_progress(DelegationProgress::PcztBuilding);
     let pczt = db.build_governance_pczt(
         round_id,
         bundle_index,
         notes,
         &keys.fvk_bytes,
         &keys.hotkey_raw_address,
-        keys.consensus_branch_id,
+        consensus_branch_id,
         keys.coin_type,
         &keys.seed_fingerprint,
         keys.account_index,
         &keys.round_name,
         keys.address_index,
     )?;
+    stages.on_progress(DelegationProgress::PcztBuilt);
 
     Ok(DelegationSetup {
         pczt_bytes: pczt.pczt_bytes,
@@ -300,8 +594,9 @@ pub fn prove(
     hotkey_raw_address: &[u8; 43],
     pir_client: &pir_client::PirClientBlocking,
     network: Network,
-    progress: &dyn crate::types::ProgressReporter,
+    stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProof, VotingError> {
+    stages.on_progress(DelegationProgress::ProofStarting);
     let proof = db.build_and_prove_delegation(
         round_id,
         bundle_index,
@@ -309,8 +604,9 @@ pub fn prove(
         hotkey_raw_address,
         pir_client,
         network.id(),
-        progress,
+        stages,
     )?;
+    stages.on_progress(DelegationProgress::ProofComplete);
 
     Ok(DelegationProof {
         bytes: proof.proof,
@@ -760,6 +1056,20 @@ fn array64_slice(label: &str, value: &[u8]) -> Result<[u8; 64], VotingError> {
 mod tests {
     use super::*;
 
+    use orchard::{
+        note::{RandomSeed, Rho},
+        value::NoteValue,
+    };
+    use rusqlite::{params, Connection};
+    use secrecy::{ExposeSecret, SecretVec};
+    use zcash_client_backend::data_api::{chain::ChainState, AccountBirthday, WalletWrite};
+    use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db};
+    use zcash_primitives::block::BlockHash;
+    use zcash_protocol::consensus::{
+        Network as ZcashNetwork, NetworkConstants, NetworkUpgrade, Parameters,
+    };
+    use zip32::Scope;
+
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
     fn test_db(wallet_id: &str) -> VotingDb {
@@ -775,7 +1085,6 @@ mod tests {
             [9; 32],
             0,
             0,
-            0x1234,
             1,
             round_name.to_string(),
         )
@@ -806,6 +1115,128 @@ mod tests {
         }
     }
 
+    fn setup_test_account(
+        conn: &mut Connection,
+    ) -> (
+        zcash_client_sqlite::AccountUuid,
+        orchard::keys::FullViewingKey,
+    ) {
+        let seed = SecretVec::new(vec![7u8; 32]);
+        let mut db = WalletDb::from_connection(
+            conn,
+            ZcashNetwork::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        init_wallet_db(&mut db, Some(SecretVec::new(seed.expose_secret().to_vec()))).unwrap();
+
+        let sapling_height = ZcashNetwork::TestNetwork
+            .activation_height(NetworkUpgrade::Sapling)
+            .expect("testnet has Sapling activation");
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(sapling_height - 1, BlockHash([0; 32])),
+            None,
+        );
+        let (account_uuid, usk) = db.create_account("voter", &seed, &birthday, None).unwrap();
+        let orchard_fvk = usk
+            .to_unified_full_viewing_key()
+            .orchard()
+            .expect("test account has Orchard viewing key")
+            .clone();
+
+        (account_uuid, orchard_fvk)
+    }
+
+    fn account_internal_id(
+        conn: &Connection,
+        account_uuid: &zcash_client_sqlite::AccountUuid,
+    ) -> i64 {
+        conn.query_row(
+            "SELECT id FROM accounts WHERE uuid = ?1",
+            params![account_uuid.expose_uuid().as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn insert_transaction(conn: &Connection, txid_tag: u8, mined_height: u32) -> i64 {
+        let txid = [txid_tag; 32];
+        conn.execute(
+            "INSERT INTO transactions (txid, mined_height, min_observed_height)
+             VALUES (?1, ?2, ?3)",
+            params![txid, mined_height, mined_height],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn insert_orchard_note(
+        conn: &Connection,
+        account_ref: i64,
+        orchard_fvk: &orchard::keys::FullViewingKey,
+        note_tag: u8,
+        mined_height: u32,
+        value_zatoshi: u64,
+        commitment_tree_position: u64,
+    ) {
+        let transaction_id = insert_transaction(conn, note_tag, mined_height);
+        let note = test_orchard_note(orchard_fvk, note_tag, value_zatoshi);
+        let nullifier = note.nullifier(orchard_fvk);
+
+        conn.execute(
+            "INSERT INTO orchard_received_notes (
+                transaction_id, action_index, account_id, diversifier, value, rho, rseed,
+                nf, is_change, commitment_tree_position, recipient_key_scope
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0)",
+            params![
+                transaction_id,
+                i64::from(note_tag),
+                account_ref,
+                note.recipient().diversifier().as_array(),
+                value_zatoshi,
+                note.rho().to_bytes(),
+                note.rseed().as_bytes(),
+                nullifier.to_bytes(),
+                commitment_tree_position,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn test_orchard_note(
+        orchard_fvk: &orchard::keys::FullViewingKey,
+        note_tag: u8,
+        value_zatoshi: u64,
+    ) -> orchard::Note {
+        let recipient = orchard_fvk.address_at(u64::from(note_tag), Scope::External);
+        let rho = rho_from_nonce(u64::from(note_tag) + 1);
+
+        for seed_nonce in 1..10_000 {
+            let mut seed = [0u8; 32];
+            seed[..8].copy_from_slice(&(seed_nonce + u64::from(note_tag) * 10_000).to_le_bytes());
+            if let Some(rseed) = Option::<RandomSeed>::from(RandomSeed::from_bytes(seed, &rho)) {
+                if let Some(note) = Option::<orchard::Note>::from(orchard::Note::from_parts(
+                    recipient,
+                    NoteValue::from_raw(value_zatoshi),
+                    rho,
+                    rseed,
+                )) {
+                    return note;
+                }
+            }
+        }
+
+        panic!("failed to generate valid Orchard note fixture");
+    }
+
+    fn rho_from_nonce(nonce: u64) -> Rho {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&nonce.to_le_bytes());
+        Option::<Rho>::from(Rho::from_bytes(&bytes))
+            .expect("small integers are valid pallas base field elements")
+    }
+
     #[test]
     fn display_memo_uses_raw_zec_precision() {
         assert_eq!(
@@ -830,7 +1261,6 @@ mod tests {
             [9; 32],
             0,
             0,
-            0x1234,
             1,
             "Demo Round".to_string(),
         )
@@ -838,6 +1268,26 @@ mod tests {
         .to_string();
 
         assert!(err.contains("hotkey_raw_address must be 43 bytes"));
+    }
+
+    #[test]
+    fn branch_id_for_height_follows_network_activation_heights() {
+        assert_eq!(
+            branch_id_for_height(Network::Mainnet, 3_146_399).unwrap(),
+            0xC8E7_1055
+        );
+        assert_eq!(
+            branch_id_for_height(Network::Mainnet, 3_146_400).unwrap(),
+            0x4DEC_4DF0
+        );
+        assert_eq!(
+            branch_id_for_height(Network::Testnet, 3_536_500).unwrap(),
+            0x4DEC_4DF0
+        );
+        assert_eq!(
+            branch_id_for_height(Network::Regtest, 1).unwrap(),
+            0x4DEC_4DF0
+        );
     }
 
     #[test]
@@ -873,6 +1323,153 @@ mod tests {
             .to_string();
 
         assert!(err.contains("invalid account UUID"));
+    }
+
+    #[test]
+    fn gather_delegation_wallet_inputs_rejects_malformed_uuid() {
+        let db = WalletDb::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            ZcashNetwork::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
+            wallet_db: &db,
+            account_uuid: "not-a-uuid",
+            hotkey_raw_address: vec![7; 43],
+            snapshot_height: 12,
+            scanned_height: 12,
+            anchor_tree_state_bytes: vec![0xAA, 0xBB],
+            resolved_round_name: "Demo Round".to_string(),
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("invalid account UUID"));
+    }
+
+    #[test]
+    fn gather_delegation_wallet_inputs_rejects_unsynced_wallet() {
+        let db = WalletDb::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            ZcashNetwork::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
+            wallet_db: &db,
+            account_uuid: "550e8400-e29b-41d4-a716-446655440000",
+            hotkey_raw_address: vec![7; 43],
+            snapshot_height: 12,
+            scanned_height: 11,
+            anchor_tree_state_bytes: vec![0xAA, 0xBB],
+            resolved_round_name: "Demo Round".to_string(),
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("wallet is not synced to voting snapshot height 12"));
+    }
+
+    #[test]
+    fn gather_delegation_wallet_inputs_selects_sorted_notes_and_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn);
+        let account_ref = account_internal_id(&conn, &account_uuid);
+        let divisor = crate::governance::BALLOT_DIVISOR;
+
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, divisor, 7);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 10, divisor * 2, 3);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 11);
+
+        let db = WalletDb::from_connection(
+            &conn,
+            ZcashNetwork::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        let inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
+            wallet_db: &db,
+            account_uuid: &account_uuid.expose_uuid().to_string(),
+            hotkey_raw_address: vec![7; 43],
+            snapshot_height: 12,
+            scanned_height: 12,
+            anchor_tree_state_bytes: vec![0xAA, 0xBB],
+            resolved_round_name: "Demo Round".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(inputs.anchor_tree_state_bytes, vec![0xAA, 0xBB]);
+        assert_eq!(inputs.round_note_infos.len(), 2);
+        assert_eq!(inputs.round_note_infos[0].position, 3);
+        assert_eq!(inputs.round_note_infos[1].position, 7);
+        assert_eq!(inputs.delegation_keys.hotkey_raw_address, [7; 43]);
+        assert_eq!(
+            inputs.delegation_keys.coin_type,
+            ZcashNetwork::TestNetwork.network_type().coin_type()
+        );
+        assert_eq!(inputs.delegation_keys.round_name, "Demo Round");
+    }
+
+    #[test]
+    fn gather_delegation_wallet_inputs_rejects_empty_snapshot() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, _) = setup_test_account(&mut conn);
+        let db = WalletDb::from_connection(
+            &conn,
+            ZcashNetwork::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
+            wallet_db: &db,
+            account_uuid: &account_uuid.expose_uuid().to_string(),
+            hotkey_raw_address: vec![7; 43],
+            snapshot_height: 12,
+            scanned_height: 12,
+            anchor_tree_state_bytes: vec![0xAA, 0xBB],
+            resolved_round_name: "Demo Round".to_string(),
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("no spendable voting notes"));
+    }
+
+    #[test]
+    fn gather_delegation_wallet_inputs_validates_hotkey_length() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn);
+        let account_ref = account_internal_id(&conn, &account_uuid);
+        insert_orchard_note(
+            &conn,
+            account_ref,
+            &orchard_fvk,
+            1,
+            10,
+            crate::governance::BALLOT_DIVISOR,
+            7,
+        );
+
+        let db = WalletDb::from_connection(
+            &conn,
+            ZcashNetwork::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
+            wallet_db: &db,
+            account_uuid: &account_uuid.expose_uuid().to_string(),
+            hotkey_raw_address: vec![7; 42],
+            snapshot_height: 12,
+            scanned_height: 12,
+            anchor_tree_state_bytes: vec![0xAA, 0xBB],
+            resolved_round_name: "Demo Round".to_string(),
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("hotkey_raw_address must be 43 bytes"));
     }
 
     #[test]

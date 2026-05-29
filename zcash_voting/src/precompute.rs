@@ -1,8 +1,9 @@
 //! Precomputation APIs for delegation inputs.
 //!
-//! Precompute operations prepare data that is expensive to derive during proof
-//! generation: Orchard note witnesses from the wallet database and PIR-backed
-//! non-membership proofs for nullifiers.
+//! [`precompute_delegation`] is the primary warm-up entry point: round setup,
+//! bundle witnesses, governance PCZT construction, and PIR-backed nullifier
+//! proofs. Lower-level helpers remain available for callers that already
+//! persisted intermediate state.
 
 use std::borrow::Borrow;
 
@@ -15,8 +16,18 @@ use std::{
 use zcash_client_sqlite::WalletDb;
 
 use crate::{
-    round::VotingDb,
-    types::{NoteInfo, VotingError, WitnessData},
+    round::{self, VotingDb},
+    types::{NoteInfo, VotingError, VotingRoundParams, WitnessData},
+};
+
+#[cfg(feature = "pir")]
+use crate::{
+    delegate::{
+        cache_prepared_setup, prepared_epoch, setup, BranchIdProvider, DelegationKeys,
+        PreparedDelegationReport,
+    },
+    round::BundleLayout,
+    types::{Cancellation, DelegationProgressReporter, Network},
 };
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
@@ -157,7 +168,7 @@ pub fn delegation_pir(
     bundle_index: u32,
     notes: &[NoteInfo],
     pir_client: &pir_client::PirClientBlocking,
-    network: crate::types::Network,
+    network: Network,
 ) -> Result<PirPrecomputeReport, VotingError> {
     let result =
         db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network.id())?;
@@ -165,6 +176,292 @@ pub fn delegation_pir(
         cached: result.cached_count,
         fetched: result.fetched_count,
     })
+}
+
+/// Inputs for [`precompute_delegation`].
+#[cfg(feature = "pir")]
+pub struct PrecomputeDelegationInputs<'a> {
+    pub round_params: &'a VotingRoundParams,
+    pub session_json: Option<&'a str>,
+    pub bundle_index: u32,
+    pub round_note_infos: &'a [NoteInfo],
+    pub anchor_tree_state_bytes: &'a [u8],
+    pub keys: &'a DelegationKeys,
+    pub branch_id_provider: &'a dyn BranchIdProvider,
+    pub network: Network,
+    pub cancellation: &'a dyn Cancellation,
+}
+
+/// Warms delegation bundle state: round setup, witnesses, governance PCZT, and PIR.
+///
+/// Callers supply the full round note selection, the snapshot anchor tree state,
+/// and a wallet database handle for witness generation. Delegation signing keys
+/// must already include the hotkey and display round name.
+///
+/// # Errors
+///
+/// Returns [`VotingError::Cancelled`] when `cancellation` is set. Other failures
+/// come from round setup, bundle planning, witness generation, PCZT
+/// construction, PIR precompute, or prepared-setup cache insertion.
+#[cfg(feature = "pir")]
+pub fn precompute_delegation<C, P, CL, R>(
+    db: &VotingDb,
+    wallet_db: &WalletDb<C, P, CL, R>,
+    inputs: PrecomputeDelegationInputs<'_>,
+    pir_client: &pir_client::PirClientBlocking,
+    stages: &dyn DelegationProgressReporter,
+) -> Result<PreparedDelegationReport, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
+    ensure_not_cancelled(inputs.cancellation)?;
+    let round_id = inputs.round_params.vote_round_id.as_str();
+    db.ensure_round(inputs.round_params, inputs.session_json)?;
+
+    let bundle_setup = db.ensure_bundles_with_skipped_suffix(round_id, inputs.round_note_infos)?;
+    let bundle_note_infos =
+        round::bundle_notes_for_index(inputs.round_note_infos, &bundle_setup, inputs.bundle_index)?;
+
+    note_witnesses(
+        db,
+        round_id,
+        inputs.bundle_index,
+        inputs.anchor_tree_state_bytes,
+        &bundle_note_infos,
+        wallet_db,
+    )?;
+
+    warm_delegation_pir(
+        db,
+        round_id,
+        inputs.bundle_index,
+        &bundle_note_infos,
+        inputs.keys,
+        bundle_setup,
+        inputs.branch_id_provider,
+        pir_client,
+        inputs.network,
+        inputs.cancellation,
+        stages,
+    )
+}
+
+/// Builds governance PCZT material, runs PIR precompute, and caches prepared setup.
+///
+/// Witnesses must already be cached for `notes`. Prefer [`precompute_delegation`]
+/// for the full warm-up path from round notes and anchor tree state.
+///
+/// # Errors
+///
+/// Returns [`VotingError::Cancelled`] when `cancellation` is set. Other
+/// failures come from PCZT construction, PIR precompute, or prepared-setup
+/// cache insertion.
+#[cfg(feature = "pir")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn warm_delegation_pir(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+    layout: BundleLayout,
+    branch_id_provider: &dyn BranchIdProvider,
+    pir_client: &pir_client::PirClientBlocking,
+    network: Network,
+    cancellation: &dyn Cancellation,
+    stages: &dyn DelegationProgressReporter,
+) -> Result<PreparedDelegationReport, VotingError> {
+    ensure_not_cancelled(cancellation)?;
+    let prepared_epoch = prepared_epoch(db)?;
+    let setup = setup(
+        db,
+        round_id,
+        bundle_index,
+        notes,
+        keys,
+        branch_id_provider,
+        stages,
+    )?;
+    ensure_not_cancelled(cancellation)?;
+    let report = delegation_pir(db, round_id, bundle_index, notes, pir_client, network)?;
+    ensure_not_cancelled(cancellation)?;
+    let _cached = cache_prepared_setup(
+        db,
+        round_id,
+        bundle_index,
+        keys,
+        notes,
+        prepared_epoch,
+        setup,
+    )?;
+
+    Ok(PreparedDelegationReport {
+        report,
+        layout,
+        bundle_index,
+    })
+}
+
+#[cfg(feature = "pir")]
+fn ensure_not_cancelled(cancellation: &dyn Cancellation) -> Result<(), VotingError> {
+    if cancellation.is_cancelled() {
+        Err(VotingError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "pir"))]
+mod pir_tests {
+    use super::*;
+    use crate::delegate::{BranchIdProvider, DelegationKeys};
+    use crate::round::BundleLayout;
+    use crate::types::{Cancellation, NoopProgressReporter, NoteInfo};
+
+    const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+
+    #[test]
+    fn warm_delegation_pir_honours_cancellation() {
+        struct AlwaysCancelled;
+
+        impl Cancellation for AlwaysCancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+
+        struct FixedBranchId(u32);
+
+        impl BranchIdProvider for FixedBranchId {
+            fn consensus_branch_id(&self) -> Result<u32, VotingError> {
+                Ok(self.0)
+            }
+        }
+
+        struct StaticPirTransport;
+
+        impl pir_client::Transport for StaticPirTransport {
+            fn get<'a>(&'a self, url: &'a str) -> pir_client::TransportFuture<'a> {
+                Box::pin(async move {
+                    let path = request_path(url);
+                    match path {
+                        "/tier0" => Ok(transport_response(vec![
+                            0;
+                            ((1usize
+                                << pir_types::TIER0_LAYERS)
+                                - 1)
+                                * 32
+                                + pir_types::TIER1_ROWS * 64
+                        ])),
+                        "/params/tier1" => Ok(transport_response(
+                            serde_json::to_vec(&pir_types::YpirScenario {
+                                num_items: pir_types::TIER1_YPIR_ROWS,
+                                item_size_bits: pir_types::TIER1_ITEM_BITS,
+                            })
+                            .unwrap(),
+                        )),
+                        "/params/tier2" => Ok(transport_response(
+                            serde_json::to_vec(&pir_types::YpirScenario {
+                                num_items: pir_types::TIER1_YPIR_ROWS,
+                                item_size_bits: pir_types::TIER2_ITEM_BITS,
+                            })
+                            .unwrap(),
+                        )),
+                        "/root" => Ok(transport_response(
+                            serde_json::to_vec(&pir_types::RootInfo {
+                                root29: hex::encode([0u8; 32]),
+                                root25: hex::encode([0u8; 32]),
+                                num_ranges: 1,
+                                pir_depth: pir_types::PIR_DEPTH,
+                                height: None,
+                            })
+                            .unwrap(),
+                        )),
+                        _ => Err(anyhow::anyhow!("unexpected GET {path}")),
+                    }
+                })
+            }
+
+            fn post<'a>(&'a self, url: &'a str, _body: Vec<u8>) -> pir_client::TransportFuture<'a> {
+                Box::pin(async move {
+                    Err(anyhow::anyhow!(
+                        "unexpected POST {}; warm path should cancel first",
+                        request_path(url)
+                    ))
+                })
+            }
+        }
+
+        fn request_path(url: &str) -> &str {
+            let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+            without_scheme
+                .find('/')
+                .map(|idx| &without_scheme[idx..])
+                .unwrap_or("/")
+        }
+
+        fn transport_response(body: Vec<u8>) -> pir_client::TransportResponse {
+            pir_client::TransportResponse {
+                status: 200,
+                headers: Vec::new(),
+                body,
+            }
+        }
+
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id("warm-delegation-cancel");
+        let keys = DelegationKeys::with_hotkey_bytes(
+            vec![8; 96],
+            &[7; 43],
+            [9; 32],
+            0,
+            0,
+            1,
+            "Demo Round".to_string(),
+        )
+        .unwrap();
+        let notes = vec![NoteInfo {
+            commitment: vec![1; 32],
+            nullifier: vec![2; 32],
+            value: crate::governance::BALLOT_DIVISOR,
+            position: 42,
+            diversifier: vec![3; 11],
+            rho: vec![4; 32],
+            rseed: vec![5; 32],
+            scope: 0,
+            ufvk_str: "uviewtest".to_string(),
+        }];
+        let layout = BundleLayout {
+            bundle_count: 1,
+            eligible_weight: 42,
+            dropped_count: 0,
+        };
+        let branch_id = FixedBranchId(0xC8E71055);
+        let pir_client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            std::sync::Arc::new(StaticPirTransport),
+        )
+        .unwrap();
+        let stages = NoopProgressReporter;
+
+        let err = warm_delegation_pir(
+            &db,
+            ROUND_ID,
+            0,
+            &notes,
+            &keys,
+            layout,
+            &branch_id,
+            &pir_client,
+            Network::Testnet,
+            &AlwaysCancelled,
+            &stages,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VotingError::Cancelled));
+    }
 }
 
 #[cfg(all(test, any(feature = "tree-sync", feature = "client-tree-sync")))]

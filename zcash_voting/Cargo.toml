@@ -36,7 +36,10 @@ tree-sync = [
     "dep:hyper-rustls",
     "dep:hyper-util",
     "dep:rustls",
+    "dep:tonic",
     "dep:tokio",
+    "zcash_client_backend/lightwalletd-tonic",
+    "zcash_client_backend/lightwalletd-tonic-tls-webpki-roots",
 ]
 # Legacy feature names kept as aliases during the wallet migration window.
 client-pir = ["pir"]
@@ -87,7 +90,8 @@ hyper = { version = "1", features = ["client", "http1", "http2"], optional = tru
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots"], optional = true }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
+tonic = { version = "0.14", features = ["channel", "tls-webpki-roots", "tls-ring"], optional = true }
 
 # Vote commitment tree (VAN witness generation). Behind `client-tree-sync`.
 vote-commitment-tree = { path = "../vote-commitment-tree", version = "=0.3.1", optional = true }
@@ -118,3 +122,6 @@ zcash_keys = { version = "0.13", features = ["orchard"] }
 pczt = { version = "0.6", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
 zcash_primitives = "0.27"
 uuid = "1.23.1"
+
+[dev-dependencies]
+secrecy = "0.8"

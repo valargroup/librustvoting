@@ -6,7 +6,7 @@ use orchard::keys::SpendingKey;
 use voting_circuits::vote_proof::{build_vote_proof_from_delegation, VOTE_COMM_TREE_DEPTH};
 
 use crate::types::{
-    ct_option_to_result, validate_vote_decision, EncryptedShare, ProofProgressReporter,
+    ct_option_to_result, validate_vote_decision, EncryptedShare, ProgressReporter,
     VoteCommitmentBundle, VotingError,
 };
 
@@ -60,7 +60,7 @@ pub fn build_vote_commitment(
     anchor_height: u32,
     proposal_authority: u64,
     single_share: bool,
-    progress: &dyn ProofProgressReporter,
+    progress: &dyn ProgressReporter,
 ) -> Result<VoteCommitmentBundle, VotingError> {
     validate_vote_decision(choice, num_options)?;
     if proposal_id < 1 || proposal_id > 15 {
@@ -286,7 +286,7 @@ mod tests {
 
     struct TestReporter;
 
-    impl ProofProgressReporter for TestReporter {
+    impl ProgressReporter for TestReporter {
         fn on_progress(&self, _progress: f64) {}
     }
 

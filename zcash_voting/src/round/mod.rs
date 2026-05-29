@@ -48,6 +48,49 @@ impl From<BundleSetupResult> for BundleLayout {
     }
 }
 
+/// Resolves the human-readable round name used in delegation PCZT metadata.
+///
+/// An empty `round_name` falls back to [`RoundParams::vote_round_id`].
+pub fn delegation_round_name(params: &RoundParams, round_name: &str) -> String {
+    if round_name.is_empty() {
+        params.vote_round_id.clone()
+    } else {
+        round_name.to_string()
+    }
+}
+
+/// Returns the note rows for one bundle index after [`VotingDb::ensure_bundles`].
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] when no bundles exist, `bundle_index`
+/// is out of range, or note bundling fails.
+pub fn bundle_notes_for_index(
+    round_note_infos: &[NoteInfo],
+    bundle_setup: &BundleLayout,
+    bundle_index: u32,
+) -> Result<Vec<NoteInfo>, VotingError> {
+    if bundle_setup.bundle_count == 0 {
+        return Err(VotingError::InvalidInput {
+            message: "No eligible voting bundles were created for delegation".to_string(),
+        });
+    }
+    if bundle_index >= bundle_setup.bundle_count {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "bundle_index {bundle_index} is out of range for {} delegation bundles",
+                bundle_setup.bundle_count
+            ),
+        });
+    }
+    note_bundles(round_note_infos)?
+        .get(bundle_index as usize)
+        .cloned()
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!("bundle_index {bundle_index} has no eligible note bundle"),
+        })
+}
+
 /// Returns the canonical eligible note bundles for a round note set.
 ///
 /// This is the read-only counterpart to [`VotingDb::ensure_bundles`]. Wallets
@@ -127,6 +170,22 @@ impl VotingDb {
     pub fn create_round(&self, params: &RoundParams) -> Result<(), VotingError> {
         crate::types::validate_round_params(params)?;
         self.init_round(params, None)
+    }
+
+    /// Ensures a round exists for `params`, initializing it when absent.
+    ///
+    /// Existing rounds are left unchanged. `session_json` is stored only on the
+    /// first insert.
+    pub fn ensure_round(
+        &self,
+        params: &RoundParams,
+        session_json: Option<&str>,
+    ) -> Result<(), VotingError> {
+        crate::types::validate_round_params(params)?;
+        if self.has_round(&params.vote_round_id)? {
+            return Ok(());
+        }
+        self.init_round(params, session_json)
     }
 
     /// Loads one round summary for the current wallet.

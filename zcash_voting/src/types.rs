@@ -1,14 +1,19 @@
 use orchard::note::ExtractedNoteCommitment;
 use subtle::CtOption;
 use thiserror::Error;
+use zcash_client_backend::proto::service::TreeState;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::consensus;
+use zcash_protocol::consensus::{
+    self, BlockHeight, Network as ZcashNetwork, NetworkType, NetworkUpgrade, Parameters,
+};
 use zip32::Scope;
 
 #[derive(Debug, Error)]
 pub enum VotingError {
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
+    #[error("Voting work cancelled")]
+    Cancelled,
     #[error("Proof generation failed: {message}")]
     ProofFailed { message: String },
     #[error("Internal error: {message}")]
@@ -24,6 +29,7 @@ pub enum VotingError {
 pub enum Network {
     Testnet,
     Mainnet,
+    Regtest,
 }
 
 impl Network {
@@ -32,6 +38,7 @@ impl Network {
         match self {
             Self::Testnet => 0,
             Self::Mainnet => 1,
+            Self::Regtest => 0,
         }
     }
 
@@ -43,6 +50,33 @@ impl Network {
             _ => Err(VotingError::InvalidInput {
                 message: format!("network_id must be 0 (testnet) or 1 (mainnet), got {id}"),
             }),
+        }
+    }
+}
+
+impl Parameters for Network {
+    fn network_type(&self) -> NetworkType {
+        match self {
+            Self::Mainnet => NetworkType::Main,
+            Self::Testnet => NetworkType::Test,
+            Self::Regtest => NetworkType::Regtest,
+        }
+    }
+
+    fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+        match self {
+            Self::Mainnet => ZcashNetwork::MainNetwork.activation_height(nu),
+            Self::Testnet => ZcashNetwork::TestNetwork.activation_height(nu),
+            Self::Regtest => match nu {
+                NetworkUpgrade::Overwinter
+                | NetworkUpgrade::Sapling
+                | NetworkUpgrade::Blossom
+                | NetworkUpgrade::Heartwood
+                | NetworkUpgrade::Canopy
+                | NetworkUpgrade::Nu5
+                | NetworkUpgrade::Nu6
+                | NetworkUpgrade::Nu6_1 => Some(BlockHeight::from_u32(1)),
+            },
         }
     }
 }
@@ -121,6 +155,84 @@ impl NoteInfo {
             ufvk_str: ufvk.encode(network),
         })
     }
+}
+
+/// A snapshot-eligible Orchard note selected for voting.
+///
+/// `NoteInfo` is the executable proof input. `NoteRef` keeps wallet/UI metadata
+/// beside the same note material so SDKs can display the selected notes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteRef {
+    pub pool: String,
+    pub txid_hex: String,
+    pub output_index: u32,
+    pub value_zatoshi: u64,
+    /// Compatibility field for callers that display individual note rows.
+    ///
+    /// Voting power is quantized per smart bundle, not per note. This mirrors
+    /// `value_zatoshi` so sub-divisor notes remain visible to callers while
+    /// [`voting_power`] reports the real bundle-quantized total.
+    pub voting_weight_zatoshi: u64,
+    pub commitment: Vec<u8>,
+    pub nullifier: Vec<u8>,
+    pub diversifier: Vec<u8>,
+    pub rho: Vec<u8>,
+    pub rseed: Vec<u8>,
+    pub scope: u32,
+    pub ufvk_str: String,
+    pub commitment_tree_position: u64,
+    pub mined_height: u64,
+    pub anchor_height: u64,
+}
+
+impl NoteRef {
+    /// Converts this wallet-selected note into the core voting note payload.
+    pub fn to_voting_note_info(&self) -> NoteInfo {
+        NoteInfo {
+            commitment: self.commitment.clone(),
+            nullifier: self.nullifier.clone(),
+            value: self.value_zatoshi,
+            position: self.commitment_tree_position,
+            diversifier: self.diversifier.clone(),
+            rho: self.rho.clone(),
+            rseed: self.rseed.clone(),
+            scope: self.scope,
+            ufvk_str: self.ufvk_str.clone(),
+        }
+    }
+}
+
+/// Spendable notes at a voting snapshot, plus the anchor tree state for proofs.
+#[derive(Clone, Debug)]
+pub struct SelectedNotes {
+    pub notes: Vec<NoteRef>,
+    pub snapshot_height: u64,
+    pub anchor_tree_state: TreeState,
+}
+
+impl SelectedNotes {
+    /// Returns deterministic notes in the shape expected by proof APIs.
+    pub fn voting_note_infos(&self) -> Vec<NoteInfo> {
+        self.notes
+            .iter()
+            .map(NoteRef::to_voting_note_info)
+            .collect()
+    }
+}
+
+/// Returns quantized zatoshi voting power for the selected note set.
+pub fn voting_power(notes: &SelectedNotes) -> u64 {
+    crate::round::note_bundles(&notes.voting_note_infos())
+        .map(|bundles| {
+            bundles
+                .into_iter()
+                .map(|bundle| {
+                    let raw = bundle.into_iter().map(|note| note.value).sum::<u64>();
+                    (raw / crate::governance::BALLOT_DIVISOR) * crate::governance::BALLOT_DIVISOR
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// Parameters for a voting round, sourced from vote chain.
@@ -434,24 +546,163 @@ pub struct WitnessData {
     pub auth_path: Vec<Vec<u8>>,
 }
 
-/// Callback for proof generation progress reporting.
-/// Swift implements this trait; Rust calls it during long-running operations.
-pub trait ProofProgressReporter: Send + Sync {
-    fn on_progress(&self, progress: f64);
+/// Lets long-running library operations early-exit on caller-driven cancellation.
+pub trait Cancellation: Send + Sync {
+    fn is_cancelled(&self) -> bool;
 }
 
-/// Progress callback used by the stable public API.
-///
-/// This is an alias for the legacy proof-progress trait so existing FFI
-/// adapters continue to work while the public naming is simplified.
-pub trait ProgressReporter: ProofProgressReporter {}
+/// Cancellation handle for callers that do not support cancellation.
+pub struct NoopCancellation;
 
-impl<T> ProgressReporter for T where T: ProofProgressReporter + ?Sized {}
+impl Cancellation for NoopCancellation {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// Callback for delegation workflow progress events.
+pub trait DelegationProgressReporter: Send + Sync {
+    fn on_progress(&self, progress: crate::delegate::DelegationProgress);
+}
+
+/// Deprecated alias retained for existing SDK integrations.
+#[deprecated(note = "use DelegationProgressReporter")]
+pub trait DelegationStageReporter: Send + Sync {
+    fn on_stage(&self, stage: crate::delegate::DelegationProgress);
+}
+
+#[allow(deprecated)]
+impl<T> DelegationStageReporter for T
+where
+    T: DelegationProgressReporter + ?Sized,
+{
+    fn on_stage(&self, stage: crate::delegate::DelegationProgress) {
+        self.on_progress(stage);
+    }
+}
+
+fn clamp_delegation_progress(
+    progress: crate::delegate::DelegationProgress,
+) -> crate::delegate::DelegationProgress {
+    match progress {
+        crate::delegate::DelegationProgress::ProofProgress(value) => {
+            crate::delegate::DelegationProgress::ProofProgress(value.clamp(0.0, 1.0))
+        }
+        progress => progress,
+    }
+}
+
+/// Delegation progress reporter backed by a closure.
+pub struct DelegationProgressBridge<F>
+where
+    F: Fn(crate::delegate::DelegationProgress) + Send + Sync + 'static,
+{
+    on_progress: F,
+}
+
+impl<F> DelegationProgressBridge<F>
+where
+    F: Fn(crate::delegate::DelegationProgress) + Send + Sync + 'static,
+{
+    pub fn new(on_progress: F) -> Self {
+        Self { on_progress }
+    }
+}
+
+impl<F> DelegationProgressReporter for DelegationProgressBridge<F>
+where
+    F: Fn(crate::delegate::DelegationProgress) + Send + Sync + 'static,
+{
+    fn on_progress(&self, progress: crate::delegate::DelegationProgress) {
+        (self.on_progress)(clamp_delegation_progress(progress));
+    }
+}
+
+/// Deprecated alias retained for existing SDK integrations.
+#[deprecated(note = "use DelegationProgressBridge")]
+pub type DelegationStageBridge<F> = DelegationProgressBridge<F>;
+
+impl<T> DelegationProgressReporter for T
+where
+    T: ProgressReporter + ?Sized,
+{
+    fn on_progress(&self, progress: crate::delegate::DelegationProgress) {
+        if let crate::delegate::DelegationProgress::ProofProgress(value) =
+            clamp_delegation_progress(progress)
+        {
+            self.on_progress(value);
+        }
+    }
+}
+
+/// Callback for cast-vote lifecycle and proof progress stages.
+pub trait VoteCommitStageReporter: Send + Sync {
+    fn on_stage(&self, stage: crate::vote::VoteCommitStage);
+}
+
+fn clamp_vote_commit_stage(stage: crate::vote::VoteCommitStage) -> crate::vote::VoteCommitStage {
+    match stage {
+        crate::vote::VoteCommitStage::ProofProgress {
+            proposal_id,
+            bundle_index,
+            progress,
+        } => crate::vote::VoteCommitStage::ProofProgress {
+            proposal_id,
+            bundle_index,
+            progress: progress.clamp(0.0, 1.0),
+        },
+        stage => stage,
+    }
+}
+
+/// Cast-vote stage reporter backed by a closure.
+pub struct VoteCommitStageBridge<F>
+where
+    F: Fn(crate::vote::VoteCommitStage) + Send + Sync + 'static,
+{
+    on_stage: F,
+}
+
+impl<F> VoteCommitStageBridge<F>
+where
+    F: Fn(crate::vote::VoteCommitStage) + Send + Sync + 'static,
+{
+    pub fn new(on_stage: F) -> Self {
+        Self { on_stage }
+    }
+}
+
+impl<F> VoteCommitStageReporter for VoteCommitStageBridge<F>
+where
+    F: Fn(crate::vote::VoteCommitStage) + Send + Sync + 'static,
+{
+    fn on_stage(&self, stage: crate::vote::VoteCommitStage) {
+        (self.on_stage)(clamp_vote_commit_stage(stage));
+    }
+}
+
+impl<T> VoteCommitStageReporter for T
+where
+    T: ProgressReporter + ?Sized,
+{
+    fn on_stage(&self, stage: crate::vote::VoteCommitStage) {
+        if let crate::vote::VoteCommitStage::ProofProgress { progress, .. } =
+            clamp_vote_commit_stage(stage)
+        {
+            self.on_progress(progress);
+        }
+    }
+}
+
+/// Callback for proof-generation progress in flows that only report fractions.
+pub trait ProgressReporter: Send + Sync {
+    fn on_progress(&self, progress: f64);
+}
 
 /// No-op progress reporter for contexts where progress isn't observed.
 pub struct NoopProgressReporter;
 
-impl ProofProgressReporter for NoopProgressReporter {
+impl ProgressReporter for NoopProgressReporter {
     fn on_progress(&self, _progress: f64) {}
 }
 
@@ -621,6 +872,7 @@ pub fn chunk_notes(notes: &[NoteInfo]) -> ChunkResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governance::BALLOT_DIVISOR;
     use orchard::note::{ExtractedNoteCommitment, Rho};
     use orchard::value::NoteValue;
     use rand::rngs::OsRng;
@@ -640,6 +892,151 @@ mod tests {
             scope: 0,
             ufvk_str: String::new(),
         }
+    }
+
+    fn test_note_ref(value_zatoshi: u64, voting_weight_zatoshi: u64, position: u64) -> NoteRef {
+        NoteRef {
+            pool: "orchard".to_string(),
+            txid_hex: hex::encode([position as u8; 32]),
+            output_index: position as u32,
+            value_zatoshi,
+            voting_weight_zatoshi,
+            commitment: vec![0x01; 32],
+            nullifier: vec![0x02; 32],
+            diversifier: vec![0x03; 11],
+            rho: vec![0x04; 32],
+            rseed: vec![0x05; 32],
+            scope: 0,
+            ufvk_str: String::new(),
+            commitment_tree_position: position,
+            mined_height: 1,
+            anchor_height: 100,
+        }
+    }
+
+    fn placeholder_tree_state(snapshot_height: u64) -> TreeState {
+        TreeState {
+            network: "test".to_string(),
+            height: snapshot_height,
+            hash: String::new(),
+            time: 0,
+            sapling_tree: String::new(),
+            orchard_tree: String::new(),
+        }
+    }
+
+    #[test]
+    fn selected_notes_convert_to_voting_note_info() {
+        let selected = SelectedNotes {
+            notes: vec![NoteRef {
+                pool: "orchard".to_string(),
+                txid_hex: hex::encode([9u8; 32]),
+                output_index: 2,
+                value_zatoshi: 13_000_000,
+                voting_weight_zatoshi: BALLOT_DIVISOR,
+                commitment: vec![1; 32],
+                nullifier: vec![2; 32],
+                diversifier: vec![3; 11],
+                rho: vec![4; 32],
+                rseed: vec![5; 32],
+                scope: 1,
+                ufvk_str: "uviewtest".to_string(),
+                commitment_tree_position: 42,
+                mined_height: 100,
+                anchor_height: 123,
+            }],
+            snapshot_height: 123,
+            anchor_tree_state: placeholder_tree_state(123),
+        };
+
+        let infos = selected.voting_note_infos();
+
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].value, 13_000_000);
+        assert_eq!(infos[0].position, 42);
+        assert_eq!(infos[0].commitment, vec![1; 32]);
+        assert_eq!(infos[0].nullifier, vec![2; 32]);
+        assert_eq!(infos[0].diversifier, vec![3; 11]);
+        assert_eq!(infos[0].rho, vec![4; 32]);
+        assert_eq!(infos[0].rseed, vec![5; 32]);
+        assert_eq!(infos[0].scope, 1);
+        assert_eq!(infos[0].ufvk_str, "uviewtest");
+    }
+
+    #[test]
+    fn voting_power_uses_smart_bundle_quantization() {
+        let small_note_value = BALLOT_DIVISOR / 5;
+        let selected = SelectedNotes {
+            notes: vec![
+                test_note_ref(small_note_value, small_note_value, 1),
+                test_note_ref(small_note_value, small_note_value, 2),
+                test_note_ref(small_note_value, small_note_value, 3),
+                test_note_ref(small_note_value, small_note_value, 4),
+                test_note_ref(small_note_value, small_note_value, 5),
+            ],
+            snapshot_height: 100,
+            anchor_tree_state: placeholder_tree_state(100),
+        };
+
+        assert_eq!(voting_power(&selected), BALLOT_DIVISOR);
+    }
+
+    #[test]
+    fn delegation_progress_bridge_forwards_clamped_proof_progress() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_reporter = seen.clone();
+        let reporter = DelegationProgressBridge::new(move |progress| {
+            seen_for_reporter.lock().unwrap().push(progress);
+        });
+
+        reporter.on_progress(crate::delegate::DelegationProgress::PcztBuilding);
+        reporter.on_progress(crate::delegate::DelegationProgress::ProofProgress(1.5));
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                crate::delegate::DelegationProgress::PcztBuilding,
+                crate::delegate::DelegationProgress::ProofProgress(1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn vote_commit_stage_bridge_forwards_clamped_proof_progress() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_reporter = seen.clone();
+        let reporter = VoteCommitStageBridge::new(move |stage| {
+            seen_for_reporter.lock().unwrap().push(stage);
+        });
+
+        reporter.on_stage(crate::vote::VoteCommitStage::ProofStarting {
+            proposal_id: 1,
+            bundle_index: 2,
+        });
+        reporter.on_stage(crate::vote::VoteCommitStage::ProofProgress {
+            proposal_id: 1,
+            bundle_index: 2,
+            progress: 1.5,
+        });
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                crate::vote::VoteCommitStage::ProofStarting {
+                    proposal_id: 1,
+                    bundle_index: 2,
+                },
+                crate::vote::VoteCommitStage::ProofProgress {
+                    proposal_id: 1,
+                    bundle_index: 2,
+                    progress: 1.0,
+                },
+            ]
+        );
     }
 
     #[test]

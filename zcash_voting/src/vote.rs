@@ -54,6 +54,29 @@ pub struct VoteCommit {
     pub share_payloads: Vec<SharePayload>,
 }
 
+/// Lifecycle events emitted while building one cast-vote commitment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum VoteCommitStage {
+    ProofStarting {
+        proposal_id: u32,
+        bundle_index: u32,
+    },
+    ProofProgress {
+        proposal_id: u32,
+        bundle_index: u32,
+        progress: f64,
+    },
+    SharePayloadsBuilding {
+        proposal_id: u32,
+        bundle_index: u32,
+    },
+    Signing {
+        proposal_id: u32,
+        bundle_index: u32,
+    },
+}
+
 /// Cast-vote signing source.
 #[non_exhaustive]
 pub enum VoteSigner<'a> {
@@ -147,7 +170,7 @@ pub fn commit(
     draft: &DraftVote,
     witness: &VanWitness,
     signer: VoteSigner<'_>,
-    progress: &dyn ProgressReporter,
+    stages: &dyn crate::types::VoteCommitStageReporter,
 ) -> Result<VoteCommit, VotingError> {
     if let Some(recovered) = recovery_bundle(db, round_id, bundle_index, draft.proposal_id)? {
         if recovery_matches_draft(&recovered, draft) {
@@ -163,6 +186,15 @@ pub fn commit(
             account_index,
         } => (seed, network, account_index),
     };
+    stages.on_stage(VoteCommitStage::ProofStarting {
+        proposal_id: draft.proposal_id,
+        bundle_index,
+    });
+    let progress = VoteProofProgressReporter {
+        proposal_id: draft.proposal_id,
+        bundle_index,
+        stages,
+    };
     let bundle = db.build_vote_commitment(
         round_id,
         bundle_index,
@@ -175,13 +207,17 @@ pub fn commit(
         witness.position,
         witness.anchor_height,
         draft.single_share,
-        progress,
+        &progress,
     )?;
     let wire_shares = bundle
         .enc_shares
         .iter()
         .map(WireEncryptedShare::from)
         .collect::<Vec<_>>();
+    stages.on_stage(VoteCommitStage::SharePayloadsBuilding {
+        proposal_id: draft.proposal_id,
+        bundle_index,
+    });
     let share_payloads = db.build_share_payloads(
         &wire_shares,
         &bundle,
@@ -190,6 +226,10 @@ pub fn commit(
         draft.vc_tree_position,
         draft.single_share,
     )?;
+    stages.on_stage(VoteCommitStage::Signing {
+        proposal_id: draft.proposal_id,
+        bundle_index,
+    });
     let signature = crate::vote_commitment::sign_cast_vote_for_account(
         seed,
         network.id(),
@@ -228,6 +268,22 @@ pub fn commit(
         encrypted_shares: wire_shares,
         share_payloads,
     })
+}
+
+struct VoteProofProgressReporter<'a> {
+    proposal_id: u32,
+    bundle_index: u32,
+    stages: &'a dyn crate::types::VoteCommitStageReporter,
+}
+
+impl ProgressReporter for VoteProofProgressReporter<'_> {
+    fn on_progress(&self, progress: f64) {
+        self.stages.on_stage(VoteCommitStage::ProofProgress {
+            proposal_id: self.proposal_id,
+            bundle_index: self.bundle_index,
+            progress,
+        });
+    }
 }
 
 /// Reconstructs a previously committed vote from persisted recovery state.

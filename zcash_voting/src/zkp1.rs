@@ -25,8 +25,8 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::Network;
 
 use crate::types::{
-    ct_option_to_result, validate_32_bytes, DelegationProofResult, NoteInfo, ProofProgressReporter,
-    VotingError, WitnessData,
+    ct_option_to_result, validate_32_bytes, DelegationProgressReporter, DelegationProofResult,
+    NoteInfo, VotingError, WitnessData,
 };
 
 // ================================================================
@@ -304,7 +304,7 @@ pub fn build_and_prove_delegation(
     imt_proofs: &[ImtProofData],
     extra_imt_proofs: &[([u8; 32], ImtProofData)],
     network_id: u32,
-    progress: &dyn ProofProgressReporter,
+    progress: &dyn DelegationProgressReporter,
     precomputed_randomness: Option<&PrecomputedRandomness>,
 ) -> Result<DelegationProofResult, VotingError> {
     let n = full_notes.len();
@@ -460,12 +460,12 @@ pub fn build_and_prove_delegation(
         message: format!("delegation bundle build failed: {e}"),
     })?;
 
-    progress.on_progress(0.1);
+    progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(0.1));
 
     // Fill the downstream cache on a large-stack thread when warm-up was missed.
     let (params, pk, _vk) = delegation_cached_keys_large_stack()?;
 
-    progress.on_progress(0.5);
+    progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(0.5));
 
     // Create the proof on a dedicated large-stack thread. For larger circuits,
     // create_proof can also exhaust the default thread stack on simulator builds.
@@ -502,7 +502,7 @@ pub fn build_and_prove_delegation(
         })?
     })?;
 
-    progress.on_progress(1.0);
+    progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(1.0));
 
     // Extract public inputs as 32-byte LE arrays.
     let public_inputs: Vec<Vec<u8>> = instance_vec
@@ -548,9 +548,14 @@ mod tests {
         count: Arc<AtomicU32>,
     }
 
-    impl ProofProgressReporter for TestReporter {
-        fn on_progress(&self, _progress: f64) {
-            self.count.fetch_add(1, Ordering::Relaxed);
+    impl crate::types::DelegationProgressReporter for TestReporter {
+        fn on_progress(&self, progress: crate::delegate::DelegationProgress) {
+            if matches!(
+                progress,
+                crate::delegate::DelegationProgress::ProofProgress(_)
+            ) {
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 

@@ -22,6 +22,8 @@ pub mod hotkey;
     feature = "client-tree-sync"
 ))]
 mod http_transport;
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub mod lwd;
 pub mod note_bundling;
 pub mod phases;
 pub mod pir;
@@ -29,6 +31,7 @@ pub mod pir_snapshot;
 pub mod precompute;
 pub mod prelude;
 pub mod round;
+pub mod selection;
 pub mod session;
 pub mod share;
 pub mod share_policy;
@@ -57,13 +60,18 @@ pub use pir_client::{
 };
 
 pub use governance::BALLOT_DIVISOR;
+pub use selection::{
+    gather_delegation_wallet_inputs, select_snapshot_note_infos, select_snapshot_notes,
+    DelegationWalletInputs, GatherDelegationWalletParams,
+};
 pub use types::{
-    validate_round_params, BundleSetupResult, CastVoteSignature, DelegationAction,
-    DelegationPirPrecomputeResult, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
-    GovernancePczt, Network, NoopProgressReporter, NoteInfo, PreparedDelegationPirResult,
-    ProgressReporter, ProofProgressReporter, ShareDelegationRecord, SharePayload,
-    VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare,
-    WitnessData,
+    validate_round_params, voting_power, BundleSetupResult, Cancellation, CastVoteSignature,
+    DelegationAction, DelegationPirPrecomputeResult, DelegationProgressBridge,
+    DelegationProgressReporter, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
+    GovernancePczt, Network, NoopCancellation, NoopProgressReporter, NoteInfo, NoteRef,
+    PreparedDelegationPirResult, ProgressReporter, SelectedNotes, ShareDelegationRecord,
+    SharePayload, VoteCommitStageBridge, VoteCommitStageReporter, VoteCommitmentBundle,
+    VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
 };
 
 /// Warm process-lifetime proving-key caches used by on-device voting proofs.
