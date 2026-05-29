@@ -69,6 +69,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   `VotingDb::store_commitment_bundle` writers. Integrations now use
   `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
   `vote::record_vc_position`.
+- `precompute::sync_vote_tree` now rebuilds a round's sparse vote-tree client
+  when recovery records a new historical VAN position after an earlier sync,
+  so wallets can resume interrupted multi-question votes without manually
+  resetting tree state.
 - `vote::serialize_recovery` / `vote::parse_recovery` now own the canonical
   `zcash_voting_vote_recovery_v1` recovery JSON format, replacing wallet-owned
   cast-vote recovery blobs.
