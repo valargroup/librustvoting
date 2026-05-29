@@ -2,11 +2,11 @@ use ff::{Field, PrimeField};
 use group::{Curve, Group, GroupEncoding};
 use pasta_curves::pallas;
 
-use orchard::keys::SpendingKey;
 use voting_circuits::vote_proof::{build_vote_proof_from_delegation, VOTE_COMM_TREE_DEPTH};
 
+use crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX;
 use crate::types::{
-    ct_option_to_result, validate_vote_decision, EncryptedShare, ProgressReporter,
+    ct_option_to_result, validate_vote_decision, EncryptedShare, Network, ProgressReporter,
     VoteCommitmentBundle, VotingError,
 };
 
@@ -28,8 +28,8 @@ const VOTE_PROOF_STACK_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// # Arguments
 ///
-/// * `hotkey_seed` - Seed bytes for the hotkey SpendingKey (from app secure storage).
-/// * `network_id` - 0=testnet, 1=mainnet (matches the mobile SDK / wallet DB convention).
+/// * `hotkey_seed` - Seed bytes for the hotkey SpendingKey.
+/// * `network_id` - Internal legacy network id, where 0=testnet and 1=mainnet.
 /// * `address_index` - Diversifier index used for the hotkey address during delegation.
 /// * `total_note_value` - Sum of delegated note values.
 /// * `gov_comm_rand` - 32-byte VAN blinding factor (from DB).
@@ -44,7 +44,7 @@ const VOTE_PROOF_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// * `anchor_height` - Block height at which the tree was snapshotted.
 /// * `progress` - Callback for proof generation progress.
 #[allow(clippy::too_many_arguments)]
-pub fn build_vote_commitment(
+pub(crate) fn build_vote_commitment(
     hotkey_seed: &[u8],
     network_id: u32,
     address_index: u32,
@@ -83,7 +83,8 @@ pub fn build_vote_commitment(
 
     // Derive the Orchard SpendingKey from the hotkey seed via ZIP-32.
     progress.on_progress(0.05);
-    let sk = derive_spending_key(hotkey_seed, network_id)?;
+    let sk = Network::from_id(network_id)?
+        .orchard_spending_key_from_seed(hotkey_seed, VOTING_HOTKEY_ACCOUNT_INDEX)?;
 
     // Parse gov_comm_rand → pallas::Base
     let gcr_bytes: [u8; 32] = gov_comm_rand
@@ -227,59 +228,6 @@ pub fn build_vote_commitment(
     })
 }
 
-/// Derive an Orchard SpendingKey from seed bytes using ZIP-32 account 0.
-///
-/// `network_id`: 0 = testnet, 1 = mainnet (same encoding as the wallet SDK / `NoteInfo` flow).
-pub fn derive_spending_key(
-    hotkey_seed: &[u8],
-    network_id: u32,
-) -> Result<SpendingKey, VotingError> {
-    derive_spending_key_for_account(hotkey_seed, network_id, 0)
-}
-
-/// Derive an Orchard SpendingKey from seed bytes using ZIP-32.
-///
-/// `network_id`: 0 = testnet, 1 = mainnet (same encoding as the wallet SDK / `NoteInfo` flow).
-/// `account_index`: ZIP-32 account index used for the Orchard account.
-pub fn derive_spending_key_for_account(
-    seed: &[u8],
-    network_id: u32,
-    account_index: u32,
-) -> Result<SpendingKey, VotingError> {
-    use zcash_keys::keys::UnifiedSpendingKey;
-    use zcash_protocol::consensus::{MAIN_NETWORK, TEST_NETWORK};
-    use zip32::AccountId;
-
-    if seed.len() < 32 {
-        return Err(VotingError::InvalidInput {
-            message: format!("seed must be at least 32 bytes, got {}", seed.len()),
-        });
-    }
-
-    let account = AccountId::try_from(account_index).map_err(|_| VotingError::InvalidInput {
-        message: format!("invalid account_index {}", account_index),
-    })?;
-
-    let usk = match network_id {
-        0 => UnifiedSpendingKey::from_seed(&TEST_NETWORK, seed, account),
-        1 => UnifiedSpendingKey::from_seed(&MAIN_NETWORK, seed, account),
-        _ => {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "invalid network_id {}, expected 0 (testnet) or 1 (mainnet)",
-                    network_id
-                ),
-            });
-        }
-    }
-    .map_err(|e| VotingError::InvalidInput {
-        message: format!("failed to derive UnifiedSpendingKey from seed: {}", e),
-    })?;
-
-    let sk: SpendingKey = *usk.orchard();
-    Ok(sk)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,12 +239,18 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_spending_key_for_account() {
+    fn orchard_spending_key_helper_uses_zip32_account_index() {
         let seed = [0x42; 64];
 
-        let default = derive_spending_key(&seed, 1).unwrap();
-        let account_0 = derive_spending_key_for_account(&seed, 1, 0).unwrap();
-        let account_1 = derive_spending_key_for_account(&seed, 1, 1).unwrap();
+        let default = Network::Mainnet
+            .orchard_spending_key_from_seed(&seed, VOTING_HOTKEY_ACCOUNT_INDEX)
+            .unwrap();
+        let account_0 = Network::Mainnet
+            .orchard_spending_key_from_seed(&seed, 0)
+            .unwrap();
+        let account_1 = Network::Mainnet
+            .orchard_spending_key_from_seed(&seed, 1)
+            .unwrap();
 
         assert_eq!(
             orchard::keys::FullViewingKey::from(&default).to_bytes(),

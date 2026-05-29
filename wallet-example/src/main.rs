@@ -3,7 +3,7 @@ use std::env;
 use anyhow::{Context, Result};
 use rand::rngs::OsRng;
 use zcash_client_sqlite::{util::SystemClock, WalletDb};
-use zcash_voting::prelude::VotingDb;
+use zcash_voting::prelude::{voting_hotkey_from_seed, VotingDb, VotingHotkey};
 use zcash_voting::{Network, VotingRoundParams};
 use zcash_voting_wallet_example::example::{
     precompute_delegation_bundle, WalletPrecomputeRequest, PRECOMPUTE_FLOW,
@@ -46,9 +46,8 @@ async fn main() -> Result<()> {
             lightwalletd_url: &config.lightwalletd_url,
             round_params: config.round_params,
             round_name: &config.round_name,
-            hotkey_raw_address: config.hotkey_raw_address,
+            voting_hotkey: &config.voting_hotkey,
             scanned_height: config.scanned_height,
-            network: config.network,
             pir_server_url: &config.pir_server_url,
             bundle_index: config.bundle_index,
         },
@@ -73,13 +72,15 @@ struct EnvConfig {
     network: Network,
     round_name: String,
     round_params: VotingRoundParams,
-    hotkey_raw_address: Vec<u8>,
+    voting_hotkey: VotingHotkey,
     scanned_height: u64,
     bundle_index: u32,
 }
 
 impl EnvConfig {
     fn from_env() -> Result<Self> {
+        let network = parse_network(&required_env("ZVOTING_NETWORK")?)?;
+        let hotkey_seed = parse_hex_env("ZVOTING_HOTKEY_SEED_HEX")?;
         Ok(Self {
             wallet_db_path: required_env("ZVOTING_WALLET_DB")?,
             voting_db_path: required_env("ZVOTING_VOTING_DB")?,
@@ -87,7 +88,7 @@ impl EnvConfig {
             account_uuid: required_env("ZVOTING_ACCOUNT_UUID")?,
             lightwalletd_url: required_env("ZVOTING_LIGHTWALLETD_URL")?,
             pir_server_url: required_env("ZVOTING_PIR_SERVER_URL")?,
-            network: parse_network(&required_env("ZVOTING_NETWORK")?)?,
+            network,
             round_name: required_env("ZVOTING_ROUND_NAME")?,
             round_params: VotingRoundParams {
                 vote_round_id: required_env("ZVOTING_ROUND_ID")?,
@@ -96,7 +97,8 @@ impl EnvConfig {
                 nc_root: parse_hex_env("ZVOTING_NC_ROOT_HEX")?,
                 nullifier_imt_root: parse_hex_env("ZVOTING_NULLIFIER_IMT_ROOT_HEX")?,
             },
-            hotkey_raw_address: parse_hex_env("ZVOTING_HOTKEY_RAW_ADDRESS_HEX")?,
+            voting_hotkey: voting_hotkey_from_seed(&hotkey_seed, network)
+                .context("derive voting hotkey from ZVOTING_HOTKEY_SEED_HEX")?,
             scanned_height: parse_u64_env("ZVOTING_SCANNED_HEIGHT")?,
             bundle_index: parse_u32_env("ZVOTING_BUNDLE_INDEX")?,
         })

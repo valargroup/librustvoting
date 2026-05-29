@@ -1,12 +1,15 @@
-use orchard::note::ExtractedNoteCommitment;
+use std::fmt;
+
+use orchard::{keys::SpendingKey, note::ExtractedNoteCommitment};
 use subtle::CtOption;
 use thiserror::Error;
 use zcash_client_backend::proto::service::TreeState;
-use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
 use zcash_protocol::consensus::{
     self, BlockHeight, Network as ZcashNetwork, NetworkType, NetworkUpgrade, Parameters,
 };
-use zip32::Scope;
+use zeroize::Zeroizing;
+use zip32::{AccountId, Scope};
 
 use crate::governance::BUNDLE_NOTE_SLOTS;
 
@@ -27,7 +30,7 @@ pub enum VotingError {
 /// The enum replaces the historical `network_id` convention, where `0`
 /// meant testnet and `1` meant mainnet. Use [`Network::id`] only when calling
 /// legacy internals that still take the numeric representation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Network {
     Testnet,
     Mainnet,
@@ -53,6 +56,38 @@ impl Network {
                 message: format!("network_id must be 0 (testnet) or 1 (mainnet), got {id}"),
             }),
         }
+    }
+
+    /// Derives an Orchard spending key from ZIP-32 seed material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when `seed` is too short, when
+    /// `account_index` is not a valid ZIP-32 account id, or when the Zcash key
+    /// derivation fails.
+    pub fn orchard_spending_key_from_seed(
+        self,
+        seed: &[u8],
+        account_index: u32,
+    ) -> Result<SpendingKey, VotingError> {
+        if seed.len() < 32 {
+            return Err(VotingError::InvalidInput {
+                message: format!("seed must be at least 32 bytes, got {}", seed.len()),
+            });
+        }
+
+        let account =
+            AccountId::try_from(account_index).map_err(|_| VotingError::InvalidInput {
+                message: format!("invalid account_index {account_index}"),
+            })?;
+
+        let usk = UnifiedSpendingKey::from_seed(&self, seed, account).map_err(|e| {
+            VotingError::InvalidInput {
+                message: format!("failed to derive UnifiedSpendingKey from seed: {e}"),
+            }
+        })?;
+
+        Ok(*usk.orchard())
     }
 }
 
@@ -94,12 +129,76 @@ pub fn ct_option_to_result<T>(opt: CtOption<T>, msg: &str) -> Result<T, VotingEr
     }
 }
 
-/// Voting hotkey pair. secret_key must be 32 bytes (Pallas scalar).
-#[derive(Clone, Debug)]
+/// Voting hotkey material used as the delegation output target and vote signer.
+#[derive(PartialEq, Eq)]
 pub struct VotingHotkey {
-    pub secret_key: Vec<u8>,
-    pub public_key: Vec<u8>,
-    pub address: String,
+    secret_seed: Zeroizing<Vec<u8>>,
+    raw_orchard_address: [u8; 43],
+    address_index: u32,
+    network: Network,
+}
+
+impl VotingHotkey {
+    /// Builds a voting hotkey from crate-derived secret seed and address bytes.
+    pub(crate) fn from_parts(
+        secret_seed: Vec<u8>,
+        raw_orchard_address: [u8; 43],
+        address_index: u32,
+        network: Network,
+    ) -> Self {
+        Self {
+            secret_seed: Zeroizing::new(secret_seed),
+            raw_orchard_address,
+            address_index,
+            network,
+        }
+    }
+
+    /// Returns the secret seed material used for hotkey signing.
+    ///
+    /// Callers that persist hardware hotkeys should store these bytes in their
+    /// platform secret store and reconstruct the hotkey with
+    /// `hotkey::voting_hotkey_from_seed`.
+    pub fn secret_seed(&self) -> &[u8] {
+        self.secret_seed.as_slice()
+    }
+
+    /// Returns the raw Orchard address bytes used as the delegation PCZT output.
+    pub fn raw_orchard_address(&self) -> &[u8; 43] {
+        &self.raw_orchard_address
+    }
+
+    /// Returns the Orchard address index used for governance metadata.
+    pub fn address_index(&self) -> u32 {
+        self.address_index
+    }
+
+    /// Returns the network used to derive this hotkey's Orchard address.
+    pub fn network(&self) -> Network {
+        self.network
+    }
+}
+
+impl Clone for VotingHotkey {
+    fn clone(&self) -> Self {
+        Self::from_parts(
+            self.secret_seed.as_slice().to_vec(),
+            self.raw_orchard_address,
+            self.address_index,
+            self.network,
+        )
+    }
+}
+
+impl fmt::Debug for VotingHotkey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VotingHotkey")
+            .field("secret_seed_len", &self.secret_seed.len())
+            .field("raw_orchard_address", &self.raw_orchard_address)
+            .field("address_index", &self.address_index)
+            .field("network", &self.network)
+            .finish()
+    }
 }
 
 /// A shielded Orchard note from the wallet DB, containing all fields needed

@@ -1,5 +1,5 @@
 use crate::types::{
-    validate_encrypted_shares, validate_vote_decision, CastVoteSignature, SharePayload,
+    validate_encrypted_shares, validate_vote_decision, CastVoteSignature, Network, SharePayload,
     VoteCommitmentBundle, VotingError, WireEncryptedShare,
 };
 
@@ -67,7 +67,7 @@ pub fn build_share_payloads(
 /// This is a pure computation — no DB access needed. Takes the fields from
 /// `VoteCommitmentBundle` plus the hotkey seed for signing.
 ///
-/// `network_id`: 0 = testnet, 1 = mainnet (matches the wallet SDK).
+/// `network_id`: internal legacy network id, where 0 = testnet and 1 = mainnet.
 ///
 /// The canonical sighash must match Go's `ComputeCastVoteSighash`:
 /// ```text
@@ -75,39 +75,9 @@ pub fn build_share_payloads(
 ///             vote_authority_note_new || vote_commitment ||
 ///             proposal_id(4 LE, padded 32) || anchor_height(8 LE, padded 32))
 /// ```
-pub fn sign_cast_vote(
+pub(crate) fn sign_cast_vote(
     hotkey_seed: &[u8],
     network_id: u32,
-    vote_round_id_hex: &str,
-    r_vpk_bytes: &[u8],
-    van_nullifier: &[u8],
-    vote_authority_note_new: &[u8],
-    vote_commitment: &[u8],
-    proposal_id: u32,
-    anchor_height: u32,
-    alpha_v: &[u8],
-) -> Result<CastVoteSignature, VotingError> {
-    sign_cast_vote_for_account(
-        hotkey_seed,
-        network_id,
-        0,
-        vote_round_id_hex,
-        r_vpk_bytes,
-        van_nullifier,
-        vote_authority_note_new,
-        vote_commitment,
-        proposal_id,
-        anchor_height,
-        alpha_v,
-    )
-}
-
-/// Compute the canonical cast-vote sighash and sign it for a ZIP-32 account.
-#[allow(clippy::too_many_arguments)]
-pub fn sign_cast_vote_for_account(
-    hotkey_seed: &[u8],
-    network_id: u32,
-    account_index: u32,
     vote_round_id_hex: &str,
     r_vpk_bytes: &[u8],
     van_nullifier: &[u8],
@@ -119,8 +89,9 @@ pub fn sign_cast_vote_for_account(
 ) -> Result<CastVoteSignature, VotingError> {
     use ff::PrimeField;
 
-    // Derive hotkey SpendingKey from seed
-    let sk = crate::zkp2::derive_spending_key_for_account(hotkey_seed, network_id, account_index)?;
+    // Derive the voting hotkey SpendingKey from seed.
+    let sk = Network::from_id(network_id)?
+        .orchard_spending_key_from_seed(hotkey_seed, crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX)?;
     let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
 
     // Deserialize alpha_v

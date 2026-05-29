@@ -3398,6 +3398,7 @@ dependencies = [
  "zcash_keys",
  "zcash_primitives",
  "zcash_protocol",
+ "zeroize",
  "zip32",
 ]
 
