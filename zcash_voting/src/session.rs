@@ -183,6 +183,11 @@ pub fn resume_plan(
         .into_iter()
         .map(|(b, p, ph)| ((b, p), ph))
         .collect();
+    let vote_choices: BTreeMap<(u32, u32), u32> = db
+        .get_votes(round_id)?
+        .into_iter()
+        .map(|vote| ((vote.bundle_index, vote.proposal_id), vote.choice))
+        .collect();
     let shares = db.share_phases(round_id)?;
     let intents: BTreeMap<u32, Decision> = db.ballot_intents(round_id)?.into_iter().collect();
 
@@ -210,11 +215,38 @@ pub fn resume_plan(
 
     let mut steps: Vec<NextStep> = Vec::new();
     let mut bundles_needing_delegation: BTreeSet<u32> = BTreeSet::new();
+    let stale_vote_keys: BTreeSet<(u32, u32)> = vote_choices
+        .iter()
+        .filter_map(|(&(bundle_index, proposal_id), &stored_choice)| {
+            match intents.get(&proposal_id) {
+                Some(Decision::Choice(intent_choice)) if *intent_choice != stored_choice => {
+                    Some((bundle_index, proposal_id))
+                }
+                Some(Decision::Skipped) => Some((bundle_index, proposal_id)),
+                _ => None,
+            }
+        })
+        .collect();
 
     // Vote steps for answered proposals.
     for &pid in &choice_proposals {
+        let intent_choice = match intents.get(&pid) {
+            Some(Decision::Choice(choice)) => *choice,
+            _ => continue,
+        };
         for &b in &bundles {
-            match votes.get(&(b, pid)) {
+            let vote_key = (b, pid);
+            if stale_vote_keys.contains(&vote_key)
+                || vote_choices.get(&vote_key) != Some(&intent_choice)
+            {
+                steps.push(NextStep::CastVote {
+                    bundle_index: b,
+                    proposal_id: pid,
+                });
+                bundles_needing_delegation.insert(b);
+                continue;
+            }
+            match votes.get(&vote_key) {
                 Some(VotePhase::Confirmed) => {}
                 Some(VotePhase::Submitted) => {
                     steps.push(NextStep::PollVote {
@@ -253,6 +285,9 @@ pub fn resume_plan(
 
     // Confirm already-submitted helper shares.
     for (b, p, s, phase) in shares {
+        if stale_vote_keys.contains(&(b, p)) {
+            continue;
+        }
         match phase {
             SharePhase::Submitted => {
                 steps.push(NextStep::ConfirmShare {
@@ -269,11 +304,13 @@ pub fn resume_plan(
 
     let all_decided = proposal_ids.iter().all(|&pid| match intents.get(&pid) {
         Some(Decision::Skipped) => true,
-        Some(Decision::Choice(_)) => {
+        Some(Decision::Choice(choice)) => {
             !bundles.is_empty()
-                && bundles
-                    .iter()
-                    .all(|&b| votes.get(&(b, pid)) == Some(&VotePhase::Confirmed))
+                && bundles.iter().all(|&b| {
+                    let vote_key = (b, pid);
+                    vote_choices.get(&vote_key) == Some(choice)
+                        && votes.get(&vote_key) == Some(&VotePhase::Confirmed)
+                })
         }
         None => false,
     });
@@ -386,6 +423,70 @@ mod tests {
         assert_eq!(
             plan.next_steps,
             vec![NextStep::PollVote {
+                bundle_index: 0,
+                proposal_id: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn changed_choice_recasts_confirmed_stale_vote() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+        crate::storage::queries::store_commitment_bundle(
+            &db.conn(),
+            ROUND,
+            W,
+            0,
+            2,
+            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
+            42,
+        )
+        .unwrap();
+        db.store_vote_tx_hash(ROUND, 0, 2, "vtx").unwrap();
+        db.mark_vote_submitted(ROUND, 0, 2).unwrap();
+
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::CastVote {
+                bundle_index: 0,
+                proposal_id: 2
+            }]
+        );
+        assert!(plan.pending_recovery);
+        assert!(!plan.all_decided);
+    }
+
+    #[test]
+    fn changed_choice_ignores_stale_share_confirmations() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+        db.record_share_delegation(
+            ROUND,
+            0,
+            2,
+            0,
+            &["https://helper.example".to_string()],
+            &[0x44; 32],
+            0,
+        )
+        .unwrap();
+
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::CastVote {
                 bundle_index: 0,
                 proposal_id: 2
             }]

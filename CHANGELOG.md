@@ -16,7 +16,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   vote without re-deriving recovery state. Exported via the prelude
   (`Decision`, `NextStep`, `RoundPlan`, `resume_plan`). Skipped ballot intents
   are treated as terminal decisions, and choice intents now fail fast if no
-  eligible bundle rows exist for the round.
+  eligible bundle rows exist for the round. The planner compares stored vote
+  rows against the current ballot choice so stale vote/share artifacts from a
+  previous choice do not satisfy a changed decision.
 - Added shared delegation request/report types, account-key loading, Keystone
   PCZT redaction, display memo formatting, prepared-PCZT caching, skipped-suffix
   bundle validation, and bundle weight helpers so wallet SDKs can keep only
