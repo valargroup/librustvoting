@@ -177,30 +177,30 @@ pub struct RoundPlan {
 }
 
 fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
-    // Delegate and PollDelegation never coexist for one bundle, and CastVote
-    // and PollVote never coexist for one (bundle, proposal), so the shared sort
-    // keys are unambiguous.
+    // Delegation is a prerequisite for fresh vote work, so keep it before
+    // vote/share recovery. Vote work is proposal-primary so an interrupted
+    // question finishes across all bundles before later questions resume.
     match step {
-        NextStep::Delegate { bundle_index } => (*bundle_index, 0, 0, 0),
-        NextStep::PollDelegation { bundle_index } => (*bundle_index, 0, 0, 0),
+        NextStep::Delegate { bundle_index } => (0, 0, *bundle_index, 0),
+        NextStep::PollDelegation { bundle_index } => (0, 0, *bundle_index, 0),
         NextStep::CastVote {
             bundle_index,
             proposal_id,
             choice: _,
-        } => (*bundle_index, 1, *proposal_id, 0),
+        } => (1, *proposal_id, *bundle_index, 0),
         NextStep::SubmitVote {
             bundle_index,
             proposal_id,
-        } => (*bundle_index, 1, *proposal_id, 0),
+        } => (1, *proposal_id, *bundle_index, 0),
         NextStep::PollVote {
             bundle_index,
             proposal_id,
-        } => (*bundle_index, 1, *proposal_id, 0),
+        } => (1, *proposal_id, *bundle_index, 0),
         NextStep::ConfirmShare {
             bundle_index,
             proposal_id,
             share_index,
-        } => (*bundle_index, 2, *proposal_id, *share_index),
+        } => (2, *proposal_id, *bundle_index, *share_index),
     }
 }
 
@@ -711,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_bundle_orders_steps_by_bundle() {
+    fn multi_bundle_orders_vote_steps_by_proposal() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(W);
         db.create_round(&round_params()).unwrap();
@@ -734,22 +734,78 @@ mod tests {
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
-        // Bundle-primary ordering: all of bundle 0's steps come before bundle 1's.
-        // Within a bundle, Delegate (prereq) precedes CastVote.
+        // Delegation prerequisites come first, then vote work is ordered by
+        // proposal before bundle.
         assert_eq!(
             plan.next_steps,
             vec![
                 NextStep::Delegate { bundle_index: 0 },
+                NextStep::Delegate { bundle_index: 1 },
                 NextStep::CastVote {
                     bundle_index: 0,
                     proposal_id: 2,
                     choice: 1,
                 },
-                NextStep::Delegate { bundle_index: 1 },
                 NextStep::CastVote {
                     bundle_index: 1,
                     proposal_id: 2,
                     choice: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_second_bundle_vote_stays_before_later_proposals() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(W);
+        db.create_round(&round_params()).unwrap();
+        db.ensure_bundles(
+            ROUND,
+            &[note(0), note(1), note(2), note(3), note(4), note(5)],
+        )
+        .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx-0").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        db.store_delegation_tx_hash(ROUND, 1, "dtx-1").unwrap();
+        db.store_van_position(ROUND, 1, 8).unwrap();
+
+        for (proposal_id, choice) in [(1, 0), (2, 1), (3, 0)] {
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(choice))
+                .unwrap();
+        }
+        confirm_vote_fixture(&db, 0, 1, 0);
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 1, 1, 0, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 1, 1, None);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![
+                NextStep::SubmitVote {
+                    bundle_index: 1,
+                    proposal_id: 1,
+                },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                    choice: 1,
+                },
+                NextStep::CastVote {
+                    bundle_index: 1,
+                    proposal_id: 2,
+                    choice: 1,
+                },
+                NextStep::CastVote {
+                    bundle_index: 0,
+                    proposal_id: 3,
+                    choice: 0,
+                },
+                NextStep::CastVote {
+                    bundle_index: 1,
+                    proposal_id: 3,
+                    choice: 0,
                 },
             ]
         );

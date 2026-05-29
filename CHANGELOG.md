@@ -62,6 +62,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   through a distinct `SubmitVote` step. Wallets should handle unknown future
   variants conservatively and call `resume_plan` again after each persisted
   step.
+- `session::resume_plan` now orders vote work by proposal before bundle, so an
+  interrupted multi-bundle question finishes across all bundles before later
+  questions resume.
 - Vote recovery state is now guarded by durable vote identity. Stale recovery
   JSON, helper-share rows, tx hashes, and vote commitment tree positions cannot
   be attached to a replacement vote after the voter changes intent.
