@@ -17,12 +17,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   (`Decision`, `NextStep`, `RoundPlan`, `resume_plan`). `NextStep` is
   `non_exhaustive`; `CastVote` carries the recorded choice, committed but
   unsubmitted votes resume through `SubmitVote`, and confirmed votes missing
-  helper-share rows resume through `SubmitShares` derived from recovered share
-  payloads. Vote work is ordered by proposal before bundle so interrupted
-  multi-bundle questions finish before later questions resume. Skipped ballot
-  intents are terminal decisions, `open_proposals` contains only proposals with
-  no recorded decision, and choice intents fail fast if no eligible bundle rows
-  exist for the round.
+  helper-share rows resume through per-share `SubmitShares` steps derived from
+  recovered share payloads. Vote work is ordered by proposal before bundle so
+  interrupted multi-bundle questions finish before later questions resume.
+  Skipped ballot intents are terminal decisions, `open_proposals` contains only
+  proposals with no recorded decision, and choice intents fail fast if no
+  eligible bundle rows exist for the round.
 - Added `vote::recover_commit` for `NextStep::SubmitVote` handling. It
   reconstructs both cast-vote submission fields and helper-share payloads from
   persisted recovery state so wallets do not need to reassemble recovery JSON

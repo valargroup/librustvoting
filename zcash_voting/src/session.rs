@@ -156,12 +156,14 @@ pub enum NextStep {
     ///
     /// This covers the crash boundary after the cast-vote transaction confirms
     /// and before every helper-share row has been durably recorded. Wallets
-    /// should reconstruct the vote with `vote::recover_commit`, submit only
-    /// missing share indexes to helper servers, then record each accepted share
-    /// with `share::record`.
+    /// `share_index` identifies the missing helper share to submit. Wallets
+    /// should reconstruct the vote with `vote::recover_commit`, submit that
+    /// recovered share payload to helper servers, then record each accepted
+    /// share with `share::record`.
     SubmitShares {
         bundle_index: u32,
         proposal_id: u32,
+        share_index: u32,
     },
     ConfirmShare {
         bundle_index: u32,
@@ -210,7 +212,8 @@ fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
         NextStep::SubmitShares {
             bundle_index,
             proposal_id,
-        } => (1, *proposal_id, *bundle_index, 1),
+            share_index,
+        } => (1, *proposal_id, *bundle_index, *share_index),
         NextStep::ConfirmShare {
             bundle_index,
             proposal_id,
@@ -327,7 +330,7 @@ pub fn resume_plan(
             }
             match votes.get(&vote_key) {
                 Some(VotePhase::Confirmed) => {
-                    if confirmed_vote_has_missing_shares(
+                    for share_index in missing_share_indexes_for_confirmed_vote(
                         db,
                         round_id,
                         b,
@@ -340,6 +343,7 @@ pub fn resume_plan(
                         steps.push(NextStep::SubmitShares {
                             bundle_index: b,
                             proposal_id: pid,
+                            share_index,
                         });
                     }
                 }
@@ -426,13 +430,13 @@ pub fn resume_plan(
     })
 }
 
-fn confirmed_vote_has_missing_shares(
+fn missing_share_indexes_for_confirmed_vote(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
     recorded_share_indexes: BTreeSet<u32>,
-) -> Result<bool, VotingError> {
+) -> Result<Vec<u32>, VotingError> {
     let Some(recovery) = crate::vote::recovery_bundle(db, round_id, bundle_index, proposal_id)?
     else {
         return Err(VotingError::InvalidInput {
@@ -453,7 +457,10 @@ fn confirmed_vote_has_missing_shares(
         });
     }
 
-    Ok(!expected_share_indexes.is_subset(&recorded_share_indexes))
+    Ok(expected_share_indexes
+        .difference(&recorded_share_indexes)
+        .copied()
+        .collect())
 }
 
 #[cfg(test)]
@@ -999,6 +1006,12 @@ mod tests {
                 NextStep::SubmitShares {
                     bundle_index: 1,
                     proposal_id: 1,
+                    share_index: 0,
+                },
+                NextStep::SubmitShares {
+                    bundle_index: 1,
+                    proposal_id: 1,
+                    share_index: 1,
                 },
                 NextStep::CastVote {
                     bundle_index: 0,
@@ -1028,6 +1041,7 @@ mod tests {
             vec![NextStep::SubmitShares {
                 bundle_index: 0,
                 proposal_id: 2,
+                share_index: 1,
             }]
         );
     }
