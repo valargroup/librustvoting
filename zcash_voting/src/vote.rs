@@ -124,7 +124,7 @@ fn sign_cast_vote_with_signer(
     let (seed, network) = signer_seed_and_network(signer);
     crate::vote_commitment::sign_cast_vote(
         seed,
-        network.id(),
+        network,
         fields.vote_round_id,
         fields.r_vpk_bytes,
         fields.van_nullifier,
@@ -242,7 +242,7 @@ pub fn commit(
         round_id,
         bundle_index,
         seed,
-        network.id(),
+        network,
         draft.proposal_id,
         draft.choice,
         draft.num_options,
@@ -1201,14 +1201,31 @@ mod tests {
     }
 
     #[test]
-    fn typed_hotkey_signer_signs_cast_vote_payload() {
+    fn typed_hotkey_signer_signs_cast_vote_payload_with_its_network() {
+        use orchard::{
+            keys::SpendAuthorizingKey,
+            primitives::redpallas::{Signature, SpendAuth, VerificationKey},
+        };
+
+        fn randomized_verification_key(
+            seed: &[u8],
+            network: Network,
+            alpha: &pasta_curves::pallas::Scalar,
+        ) -> VerificationKey<SpendAuth> {
+            let sk = network
+                .orchard_spending_key_from_seed(seed, crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX)
+                .unwrap();
+            let ask = SpendAuthorizingKey::from(&sk);
+            VerificationKey::from(&ask.randomize(alpha))
+        }
+
         let hotkey = crate::hotkey::derive_voting_hotkey(
             &[0xAB; 64],
             crate::hotkey::HotkeyDerivationContext {
                 round_id: ROUND_ID,
                 account_id: "account-0",
             },
-            Network::Testnet,
+            Network::Regtest,
         )
         .unwrap();
         let r_vpk = [0x10; 32];
@@ -1237,6 +1254,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seed_sig.vote_auth_sig.len(), 64);
+
+        let sighash = crate::vote_commitment::cast_vote_sighash(
+            ROUND_ID,
+            &r_vpk,
+            &van_nullifier,
+            &vote_authority_note_new,
+            &vote_commitment,
+            1,
+            123,
+        )
+        .unwrap();
+        let alpha = pasta_curves::pallas::Scalar::from(7);
+        let regtest_key =
+            randomized_verification_key(hotkey.secret_seed(), Network::Regtest, &alpha);
+
+        let typed_sig_bytes: [u8; 64] = typed_sig.vote_auth_sig.as_slice().try_into().unwrap();
+        regtest_key
+            .verify(&sighash, &Signature::<SpendAuth>::from(typed_sig_bytes))
+            .unwrap();
+
+        let seed_sig_bytes: [u8; 64] = seed_sig.vote_auth_sig.as_slice().try_into().unwrap();
+        regtest_key
+            .verify(&sighash, &Signature::<SpendAuth>::from(seed_sig_bytes))
+            .unwrap();
+
+        // The legacy numeric id cannot preserve Regtest. Vote signing and proof
+        // generation must keep the typed network through the internal calls.
+        assert_eq!(
+            Network::from_id(Network::Regtest.id()).unwrap(),
+            Network::Testnet
+        );
     }
 
     #[test]

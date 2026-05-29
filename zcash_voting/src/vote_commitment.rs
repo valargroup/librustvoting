@@ -67,7 +67,7 @@ pub fn build_share_payloads(
 /// This is a pure computation — no DB access needed. Takes the fields from
 /// `VoteCommitmentBundle` plus the hotkey seed for signing.
 ///
-/// `network_id`: internal legacy network id, where 0 = testnet and 1 = mainnet.
+/// `network`: Zcash network used to derive the hotkey spending key.
 ///
 /// The canonical sighash must match Go's `ComputeCastVoteSighash`:
 /// ```text
@@ -77,7 +77,7 @@ pub fn build_share_payloads(
 /// ```
 pub(crate) fn sign_cast_vote(
     hotkey_seed: &[u8],
-    network_id: u32,
+    network: Network,
     vote_round_id_hex: &str,
     r_vpk_bytes: &[u8],
     van_nullifier: &[u8],
@@ -90,7 +90,7 @@ pub(crate) fn sign_cast_vote(
     use ff::PrimeField;
 
     // Derive the voting hotkey SpendingKey from seed.
-    let sk = Network::from_id(network_id)?
+    let sk = network
         .orchard_spending_key_from_seed(hotkey_seed, crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX)?;
     let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
 
@@ -115,38 +115,15 @@ pub(crate) fn sign_cast_vote(
         });
     }
 
-    // Decode vote_round_id from hex to bytes
-    let vote_round_id_bytes =
-        hex::decode(vote_round_id_hex).map_err(|e| VotingError::Internal {
-            message: format!("invalid vote_round_id hex: {e}"),
-        })?;
-
-    // Compute canonical sighash (must match Go's ComputeCastVoteSighash)
-    const CAST_VOTE_SIGHASH_DOMAIN: &[u8] = b"SVOTE_CAST_VOTE_SIGHASH_V0";
-    let mut canonical = Vec::new();
-    canonical.extend_from_slice(CAST_VOTE_SIGHASH_DOMAIN);
-    // vote_round_id: pad to 32 bytes
-    extend_padded32(&mut canonical, &vote_round_id_bytes);
-    // r_vpk: already 32 bytes (compressed)
-    canonical.extend_from_slice(r_vpk_bytes);
-    // van_nullifier: pad to 32 bytes
-    extend_padded32(&mut canonical, van_nullifier);
-    // vote_authority_note_new: pad to 32 bytes
-    extend_padded32(&mut canonical, vote_authority_note_new);
-    // vote_commitment: pad to 32 bytes
-    extend_padded32(&mut canonical, vote_commitment);
-    // proposal_id: 4 bytes LE, padded to 32 bytes
-    let mut pid_buf = [0u8; 32];
-    pid_buf[..4].copy_from_slice(&proposal_id.to_le_bytes());
-    canonical.extend_from_slice(&pid_buf);
-    // anchor_height: 8 bytes LE, padded to 32 bytes
-    let mut ah_buf = [0u8; 32];
-    ah_buf[..8].copy_from_slice(&(anchor_height as u64).to_le_bytes());
-    canonical.extend_from_slice(&ah_buf);
-
-    let sighash_full = blake2b_simd::Params::new().hash_length(32).hash(&canonical);
-    let mut sighash = [0u8; 32];
-    sighash.copy_from_slice(sighash_full.as_bytes());
+    let sighash = cast_vote_sighash(
+        vote_round_id_hex,
+        r_vpk_bytes,
+        van_nullifier,
+        vote_authority_note_new,
+        vote_commitment,
+        proposal_id,
+        anchor_height,
+    )?;
 
     // Sign
     let mut rng = rand::rngs::OsRng;
@@ -156,6 +133,43 @@ pub(crate) fn sign_cast_vote(
     Ok(CastVoteSignature {
         vote_auth_sig: sig_bytes.to_vec(),
     })
+}
+
+pub(crate) fn cast_vote_sighash(
+    vote_round_id_hex: &str,
+    r_vpk_bytes: &[u8],
+    van_nullifier: &[u8],
+    vote_authority_note_new: &[u8],
+    vote_commitment: &[u8],
+    proposal_id: u32,
+    anchor_height: u32,
+) -> Result<[u8; 32], VotingError> {
+    let vote_round_id_bytes =
+        hex::decode(vote_round_id_hex).map_err(|e| VotingError::Internal {
+            message: format!("invalid vote_round_id hex: {e}"),
+        })?;
+
+    const CAST_VOTE_SIGHASH_DOMAIN: &[u8] = b"SVOTE_CAST_VOTE_SIGHASH_V0";
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(CAST_VOTE_SIGHASH_DOMAIN);
+    extend_padded32(&mut canonical, &vote_round_id_bytes);
+    canonical.extend_from_slice(r_vpk_bytes);
+    extend_padded32(&mut canonical, van_nullifier);
+    extend_padded32(&mut canonical, vote_authority_note_new);
+    extend_padded32(&mut canonical, vote_commitment);
+
+    let mut pid_buf = [0u8; 32];
+    pid_buf[..4].copy_from_slice(&proposal_id.to_le_bytes());
+    canonical.extend_from_slice(&pid_buf);
+
+    let mut ah_buf = [0u8; 32];
+    ah_buf[..8].copy_from_slice(&(anchor_height as u64).to_le_bytes());
+    canonical.extend_from_slice(&ah_buf);
+
+    let sighash_full = blake2b_simd::Params::new().hash_length(32).hash(&canonical);
+    let mut sighash = [0u8; 32];
+    sighash.copy_from_slice(sighash_full.as_bytes());
+    Ok(sighash)
 }
 
 /// Append exactly 32 bytes to `out` from `b` (pad with zeros if shorter).

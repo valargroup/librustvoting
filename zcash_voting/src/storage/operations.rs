@@ -930,7 +930,8 @@ impl VotingDb {
     /// Build vote commitment + ZKP #2 for a proposal. Stores vote in db.
     ///
     /// Loads ZKP #2 inputs (gov_comm_rand, total_note_value, address_index, ea_pk,
-    /// voting_round_id) from the DB, derives the SpendingKey from hotkey_seed,
+    /// voting_round_id) from the DB, derives the SpendingKey from hotkey_seed
+    /// using the typed network carried by the vote signer,
     /// and generates a real Halo2 vote proof.
     ///
     /// The builder handles share decomposition and El Gamal encryption internally.
@@ -940,7 +941,7 @@ impl VotingDb {
         round_id: &str,
         bundle_index: u32,
         hotkey_seed: &[u8],
-        network_id: u32,
+        network: crate::Network,
         proposal_id: u32,
         choice: u32,
         num_options: u32,
@@ -965,7 +966,7 @@ impl VotingDb {
 
         let bundle = crate::zkp2::build_vote_commitment(
             hotkey_seed,
-            network_id,
+            network,
             zkp2_data.address_index,
             zkp2_data.total_note_value,
             &zkp2_data.gov_comm_rand,

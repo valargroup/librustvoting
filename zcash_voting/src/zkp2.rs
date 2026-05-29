@@ -29,7 +29,7 @@ const VOTE_PROOF_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// # Arguments
 ///
 /// * `hotkey_seed` - Seed bytes for the hotkey SpendingKey.
-/// * `network_id` - Internal legacy network id, where 0=testnet and 1=mainnet.
+/// * `network` - Zcash network used to derive the hotkey spending key.
 /// * `address_index` - Diversifier index used for the hotkey address during delegation.
 /// * `total_note_value` - Sum of delegated note values.
 /// * `gov_comm_rand` - 32-byte VAN blinding factor (from DB).
@@ -46,7 +46,7 @@ const VOTE_PROOF_STACK_BYTES: usize = 64 * 1024 * 1024;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_vote_commitment(
     hotkey_seed: &[u8],
-    network_id: u32,
+    network: Network,
     address_index: u32,
     total_note_value: u64,
     gov_comm_rand: &[u8],
@@ -83,8 +83,7 @@ pub(crate) fn build_vote_commitment(
 
     // Derive the Orchard SpendingKey from the hotkey seed via ZIP-32.
     progress.on_progress(0.05);
-    let sk = Network::from_id(network_id)?
-        .orchard_spending_key_from_seed(hotkey_seed, VOTING_HOTKEY_ACCOUNT_INDEX)?;
+    let sk = network.orchard_spending_key_from_seed(hotkey_seed, VOTING_HOTKEY_ACCOUNT_INDEX)?;
 
     // Parse gov_comm_rand → pallas::Base
     let gcr_bytes: [u8; 32] = gov_comm_rand
@@ -266,7 +265,7 @@ mod tests {
     fn test_build_vote_commitment_bad_choice() {
         assert!(build_vote_commitment(
             &[0x42; 64],
-            1,
+            Network::Mainnet,
             0,
             1_000_000,
             &[0u8; 32],
@@ -289,7 +288,7 @@ mod tests {
     fn test_build_vote_commitment_proposal_id_zero_rejected() {
         assert!(build_vote_commitment(
             &[0x42; 64],
-            1,
+            Network::Mainnet,
             0,
             1_000_000,
             &[0u8; 32],
@@ -312,7 +311,7 @@ mod tests {
     fn test_build_vote_commitment_proposal_id_too_large() {
         assert!(build_vote_commitment(
             &[0x42; 64],
-            1,
+            Network::Mainnet,
             0,
             1_000_000,
             &[0u8; 32],
@@ -335,7 +334,7 @@ mod tests {
     fn test_build_vote_commitment_wrong_auth_path_len() {
         assert!(build_vote_commitment(
             &[0x42; 64],
-            1,
+            Network::Mainnet,
             0,
             1_000_000,
             &[0u8; 32],
