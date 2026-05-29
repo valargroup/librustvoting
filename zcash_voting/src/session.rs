@@ -790,6 +790,58 @@ mod tests {
     }
 
     #[test]
+    fn stale_vote_submission_after_choice_change_is_rejected() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0)).unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        let err = db
+            .record_vote_submission(ROUND, 0, 2, "old-vtx")
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("vote submission conflicts with ballot intent"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(db.get_vote_tx_hash(ROUND, 0, 2).unwrap(), None);
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::CastVote {
+                bundle_index: 0,
+                proposal_id: 2,
+                choice: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn stale_vote_submission_after_skip_is_rejected() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0)).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+
+        db.set_ballot_intent(ROUND, 2, Decision::Skipped).unwrap();
+        let err = db
+            .record_vote_submission(ROUND, 0, 2, "old-vtx")
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("cannot record vote submission for skipped proposal"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(db.get_vote_tx_hash(ROUND, 0, 2).unwrap(), None);
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(!plan.pending_recovery);
+        assert_eq!(plan.open_proposals, vec![1, 3]);
+    }
+
+    #[test]
     fn changed_choice_ignores_stale_share_confirmations() {
         let db = db_with_bundle();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
