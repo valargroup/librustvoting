@@ -48,6 +48,23 @@ impl From<BundleSetupResult> for BundleLayout {
     }
 }
 
+/// Validates that `bundle_index` is in `[0, bundle_count)`.
+pub fn validate_bundle_index(
+    bundle_count: u32,
+    bundle_index: u32,
+    bundle_kind: &str,
+) -> Result<(), VotingError> {
+    if bundle_index < bundle_count {
+        Ok(())
+    } else {
+        Err(VotingError::InvalidInput {
+            message: format!(
+                "bundle_index {bundle_index} is out of range for {bundle_count} {bundle_kind} bundles"
+            ),
+        })
+    }
+}
+
 /// Resolves the human-readable round name used in delegation PCZT metadata.
 ///
 /// An empty `round_name` falls back to [`RoundParams::vote_round_id`].
@@ -415,6 +432,18 @@ mod tests {
             scope: 0,
             ufvk_str: "uview1test".to_string(),
         }
+    }
+
+    #[test]
+    fn validate_bundle_index_rejects_out_of_range() {
+        assert!(validate_bundle_index(2, 0, "voting").is_ok());
+        assert!(validate_bundle_index(2, 1, "voting").is_ok());
+
+        let err = validate_bundle_index(2, 2, "voting").unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+
+        let err = validate_bundle_index(0, 0, "delegation").unwrap_err();
+        assert!(err.to_string().contains("0 delegation bundles"), "{err}");
     }
 
     #[test]
