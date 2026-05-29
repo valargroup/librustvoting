@@ -29,6 +29,7 @@ use crate::{
         cache_prepared_setup, prepared_epoch, setup, BranchIdProvider, DelegationKeys,
         PreparedDelegationReport,
     },
+    note_bundling::BundlePolicy,
     round::{self, BundleLayout},
     types::{Cancellation, DelegationProgressReporter, Network, VotingRoundParams},
 };
@@ -218,13 +219,45 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
+    precompute_delegation_with_policy(
+        db,
+        wallet_db,
+        inputs,
+        pir_client,
+        stages,
+        BundlePolicy::default(),
+    )
+}
+
+/// Warms delegation bundle state using an explicit note bundle policy.
+#[cfg(feature = "pir")]
+pub fn precompute_delegation_with_policy<C, P, CL, R>(
+    db: &VotingDb,
+    wallet_db: &WalletDb<C, P, CL, R>,
+    inputs: PrecomputeDelegationInputs<'_>,
+    pir_client: &pir_client::PirClientBlocking,
+    stages: &dyn DelegationProgressReporter,
+    bundle_policy: BundlePolicy,
+) -> Result<PreparedDelegationReport, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
     ensure_not_cancelled(inputs.cancellation)?;
     let round_id = inputs.round_params.vote_round_id.as_str();
     db.ensure_round(inputs.round_params, inputs.session_json)?;
 
-    let bundle_setup = db.ensure_bundles_with_skipped_suffix(round_id, inputs.round_note_infos)?;
-    let bundle_note_infos =
-        round::bundle_notes_for_index(inputs.round_note_infos, &bundle_setup, inputs.bundle_index)?;
+    let bundle_setup = db.ensure_bundles_with_skipped_suffix_with_policy(
+        round_id,
+        inputs.round_note_infos,
+        bundle_policy,
+    )?;
+    let bundle_note_infos = round::bundle_notes_for_index_with_policy(
+        inputs.round_note_infos,
+        &bundle_setup,
+        inputs.bundle_index,
+        bundle_policy,
+    )?;
 
     note_witnesses(
         db,

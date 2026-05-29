@@ -46,6 +46,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   so wallet SDKs can reuse scan-height validation, wallet/network consistency
   checks, lightwalletd snapshot-anchor fetching, and selected-note assembly
   without carrying SDK-local wrapper logic.
+- Added `BundlePolicy`, policy-aware note planning, and policy-aware delegation
+  precompute entry points so wallet SDKs can choose how many real notes are
+  placed in each bundle while the default fills each bundle up to the circuit
+  note-slot count.
 - Added library-owned delegation lifecycle stage reporting and branch-id
   provider traits so wallet SDKs can pass progress and consensus-branch
   resolution into `delegate::setup` and `delegate::prove` without duplicating
@@ -57,11 +61,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Added `vote::VoteCommitStage` plus `VoteCommitStageReporter` and
   `VoteCommitStageBridge` so wallet SDKs can consume library-owned cast-vote
   lifecycle and proof-progress stages without defining local event enums.
-- Added `VotingDb::ensure_bundles_for_notes` and
-  `VotingDb::prepare_delegation_pir` so wallet SDKs can share the delegation
-  bundle validation, governance PCZT construction, and PIR precompute sequence
-  while still supplying wallet-specific notes, account metadata, hotkey address,
-  consensus branch, and PIR transport at their own boundaries.
+- Added `VotingDb::prepare_delegation_pir` so wallet SDKs can share the
+  delegation bundle validation, governance PCZT construction, and PIR precompute
+  sequence while still supplying wallet-specific notes, account metadata, hotkey
+  address, consensus branch, and PIR transport at their own boundaries. Callers
+  that need a non-default bundle policy can use
+  `VotingDb::prepare_delegation_pir_with_policy`.
 - Added `zcash_voting::witness::generate_note_witnesses` for Orchard note
   witness generation from a stored voting round snapshot. The V2 API validates
   the cached lightwalletd `TreeState` height and Orchard root against the
@@ -110,6 +115,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   when recovery records a new historical VAN position after an earlier sync,
   so wallets can resume interrupted multi-question votes without manually
   resetting tree state.
+- Removed the old `note_bundling` JSON facade and duplicate note-plan schema.
+  Smart bundle planning now lives in the slim `note_bundling` module and is
+  exposed through the policy-aware `round` APIs. Lower-level public bundle setup
+  helpers were removed in favor of `round` module APIs.
 - `vote::serialize_recovery` / `vote::parse_recovery` now own the canonical
   `zcash_voting_vote_recovery_v1` recovery JSON format, replacing wallet-owned
   cast-vote recovery blobs.

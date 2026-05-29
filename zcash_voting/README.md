@@ -10,6 +10,10 @@ precompute → delegate → vote → share lifecycle:
 1. Open a `VotingDb`, set the wallet id, and call `create_round`.
 2. Convert eligible Orchard notes into `NoteInfo` with
    `NoteInfo::from_orchard_note`, then call `ensure_bundles`.
+   The default `BundlePolicy` fills each bundle up to the circuit note-slot
+   count. Wallets that need fewer real notes per bundle can call the
+   `*_with_policy` variants with `BundlePolicy::new(...)`; proof construction
+   still pads each bundle to the same fixed circuit slot count.
 3. Build the governance PCZT with `setup_delegation`.
 4. Precompute delegation inputs with `note_witnesses` and, with the `pir`
    feature, `delegation_pir`.
@@ -40,7 +44,7 @@ precompute → delegate → vote → share lifecycle:
 | Module | Purpose |
 |---|---|
 | `prelude` | Recommended imports for wallet SDKs. |
-| `round` | `VotingDb`, `RoundParams`, `RoundInfo`, and idempotent `ensure_bundles`. |
+| `round` | `VotingDb`, `RoundParams`, `RoundInfo`, idempotent `ensure_bundles`, and policy-aware bundle planning. |
 | `precompute` | Orchard note witness generation and PIR precompute wrappers. |
 | `delegate` | PCZT setup, proof generation, submission assembly, and chain recovery writes. |
 | `vote` | ZKP2 construction, cast-vote signing, and vote recovery bundle persistence. |
@@ -49,7 +53,7 @@ precompute → delegate → vote → share lifecycle:
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
 | `hotkey` | Primitive hotkey derivation from caller-supplied seed bytes. |
-| `governance` | Low-level governance derivations and `BALLOT_DIVISOR`. |
+| `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |
 
 Wallet integrations should use the lifecycle modules above instead of writing
 storage rows directly.
@@ -87,6 +91,9 @@ crate own the sampling and ordering policy.
   consumers during migration.
 - Prefer `VotingDb::create_round`, `VotingDb::ensure_bundles`, and
   `VotingDb::delegation_phases` over direct `storage::queries` calls.
+- Use `BundlePolicy` plus the `*_with_policy` APIs when an integration needs
+  fewer real notes per bundle. Omit the policy for the default circuit-slot
+  behavior.
 - Use `precompute::note_witnesses` instead of hand-validating cached
   `TreeState` bytes and manually constructing `WitnessData`.
 - Use `delegate::submission` with `DelegationSigner::Seed` or
