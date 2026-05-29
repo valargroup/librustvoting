@@ -1359,7 +1359,12 @@ impl VotingDb {
     // --- Share delegation tracking ---
 
     /// Record a share delegation after sending to helper servers.
-    pub fn record_share_delegation(
+    ///
+    /// This raw storage helper is crate-internal because callers must provide a
+    /// nullifier that matches the persisted vote recovery bundle. Wallet
+    /// integrations should use `share::record`, which derives that nullifier
+    /// from recovery state.
+    pub(crate) fn record_share_delegation(
         &self,
         round_id: &str,
         bundle_index: u32,

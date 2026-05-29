@@ -2292,7 +2292,12 @@ pub fn clear_recovery_state(
 // --- Share delegation tracking ---
 
 /// Record a share delegation after sending to helper servers.
-pub fn record_share_delegation(
+///
+/// This raw SQL helper is crate-internal because callers must provide a
+/// nullifier that matches the persisted vote recovery bundle. Wallet
+/// integrations should use `share::record`, which derives that nullifier from
+/// recovery state before storing the helper delivery state.
+pub(crate) fn record_share_delegation(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,

@@ -60,8 +60,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   can derive vote/share recovery state without querying SQLite tables directly.
 - Added `precompute::{sync_vote_tree, van_witness, reset_vote_tree}` as the
   public vote commitment tree sync and VAN witness surface.
-- Added `examples/end_to_end_vote.rs` and README migration notes for moving from
-  the delegation-oriented V2 API to the new vote/share API.
+- Added `examples/end_to_end_vote.rs` and README notes for moving from the
+  delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
 - Vote recovery state is now guarded by durable vote identity. Stale recovery
@@ -69,6 +69,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   be attached to a replacement vote after the voter changes intent.
 - Helper-share recording now rejects conflicting nullifiers for an existing
   share key in the shared storage layer.
+- The raw nullifier-taking helper-share storage writer is now crate-internal.
+  Wallet integrations use `share::record`, which derives the nullifier from
+  persisted vote recovery state.
 - Removed the legacy `VotingDb::mark_vote_submitted`,
   `VotingDb::store_vote_tx_hash`, and `VotingDb::store_commitment_bundle`
   writers, and dropped the stale `votes.submitted` column. Integrations now use

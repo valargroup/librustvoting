@@ -49,8 +49,8 @@ precompute → delegate → vote → share lifecycle:
 | `hotkey` | Primitive hotkey derivation from caller-supplied seed bytes. |
 | `governance` | Low-level governance derivations and `BALLOT_DIVISOR`. |
 
-Lower-level modules from previous releases remain available during the 0.11
-migration window, but new wallet code should prefer the lifecycle modules above.
+Wallet integrations should use the lifecycle modules above instead of writing
+storage rows directly.
 
 ## Shared wallet policy helpers
 
