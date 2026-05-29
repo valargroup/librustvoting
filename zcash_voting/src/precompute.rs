@@ -1,7 +1,7 @@
 //! Precomputation APIs for delegation inputs.
 //!
 //! [`precompute_delegation`] is the primary warm-up entry point: round setup,
-//! bundle witnesses, governance PCZT construction, and PIR-backed nullifier
+//! bundle witnesses, padded-note secret initialization, and PIR-backed nullifier
 //! proofs. Lower-level helpers remain available for callers that already
 //! persisted intermediate state.
 //!
@@ -25,12 +25,9 @@ use crate::{
 
 #[cfg(feature = "pir")]
 use crate::{
-    delegate::{
-        cache_prepared_setup, prepared_epoch, setup, BranchIdProvider, DelegationKeys,
-        PreparedDelegationReport,
-    },
+    delegate::PreparedDelegationReport,
     round::{self, BundleLayout},
-    types::{Cancellation, DelegationProgressReporter, Network, VotingRoundParams},
+    types::{Cancellation, Network, VotingRoundParams},
 };
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
@@ -45,33 +42,6 @@ static VOTE_TREE_SYNCS: OnceLock<Mutex<HashMap<String, Arc<crate::tree_sync::Vot
 pub struct PirPrecomputeReport {
     pub cached: u32,
     pub fetched: u32,
-}
-
-/// Stores `tree_state_bytes`, generates Orchard witnesses, and caches them.
-///
-/// The tree state must be the exact snapshot anchor for the round. The wallet
-/// database supplies historical note paths; voting state is persisted in
-/// `db`.
-pub fn note_witnesses<C, P, CL, R>(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    tree_state_bytes: &[u8],
-    notes: &[NoteInfo],
-    wallet_db: &WalletDb<C, P, CL, R>,
-) -> Result<Vec<WitnessData>, VotingError>
-where
-    C: Borrow<rusqlite::Connection>,
-    P: zcash_protocol::consensus::Parameters,
-{
-    crate::witness::store_tree_state_and_generate_note_witnesses(
-        db,
-        round_id,
-        bundle_index,
-        tree_state_bytes,
-        notes,
-        wallet_db,
-    )
 }
 
 /// Loads a round's cached tree state, generates Orchard witnesses, and caches them.
@@ -90,19 +60,9 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
-    let tree_state_bytes = {
-        let conn = db.conn();
-        let wallet_id = db.wallet_id();
-        crate::storage::queries::load_tree_state(&conn, round_id, &wallet_id)?
-    };
-    note_witnesses(
-        db,
-        round_id,
-        bundle_index,
-        &tree_state_bytes,
-        notes,
-        wallet_db,
-    )
+    let witnesses = crate::witness::generate_note_witnesses(db, round_id, notes, wallet_db)?;
+    db.store_witnesses(round_id, bundle_index, &witnesses)?;
+    Ok(witnesses)
 }
 
 /// Verifies an Orchard note witness against its stored root.
@@ -162,8 +122,7 @@ fn vote_tree_sync_for(db: &VotingDb) -> Result<Arc<crate::tree_sync::VoteTreeSyn
 
 /// Fetches and persists PIR-backed IMT non-membership proofs for one bundle.
 ///
-/// This must run after delegation setup, because padded-note secrets are
-/// produced by the PCZT construction step.
+/// This must run after padded-note secrets have been initialized for the bundle.
 #[cfg(feature = "pir")]
 pub fn delegation_pir(
     db: &VotingDb,
@@ -189,30 +148,26 @@ pub struct PrecomputeDelegationInputs<'a> {
     pub bundle_index: u32,
     pub round_note_infos: &'a [NoteInfo],
     pub anchor_tree_state_bytes: &'a [u8],
-    pub keys: &'a DelegationKeys,
-    pub branch_id_provider: &'a dyn BranchIdProvider,
     pub network: Network,
     pub cancellation: &'a dyn Cancellation,
 }
 
-/// Warms delegation bundle state: round setup, witnesses, governance PCZT, and PIR.
+/// Warms delegation bundle state: round setup, witnesses, padded secrets, and PIR.
 ///
 /// Callers supply the full round note selection, the snapshot anchor tree state,
-/// and a wallet database handle for witness generation. Delegation signing keys
-/// must already include the hotkey and display round name.
+/// and a wallet database handle for witness generation.
 ///
 /// # Errors
 ///
 /// Returns [`VotingError::Cancelled`] when `cancellation` is set. Other failures
-/// come from round setup, bundle planning, witness generation, PCZT
-/// construction, PIR precompute, or prepared-setup cache insertion.
+/// come from round setup, bundle planning, witness generation, padded-secret
+/// initialization, or PIR precompute.
 #[cfg(feature = "pir")]
 pub fn precompute_delegation<C, P, CL, R>(
     db: &VotingDb,
     wallet_db: &WalletDb<C, P, CL, R>,
     inputs: PrecomputeDelegationInputs<'_>,
     pir_client: &pir_client::PirClientBlocking,
-    stages: &dyn DelegationProgressReporter,
 ) -> Result<PreparedDelegationReport, VotingError>
 where
     C: Borrow<rusqlite::Connection>,
@@ -226,31 +181,24 @@ where
     let bundle_note_infos =
         round::bundle_notes_for_index(inputs.round_note_infos, &bundle_setup, inputs.bundle_index)?;
 
-    note_witnesses(
-        db,
-        round_id,
-        inputs.bundle_index,
-        inputs.anchor_tree_state_bytes,
-        &bundle_note_infos,
-        wallet_db,
-    )?;
+    db.store_tree_state(round_id, inputs.anchor_tree_state_bytes)?;
+    let witnesses =
+        crate::witness::generate_note_witnesses(db, round_id, &bundle_note_infos, wallet_db)?;
+    db.store_witnesses(round_id, inputs.bundle_index, &witnesses)?;
 
     warm_delegation_pir(
         db,
         round_id,
         inputs.bundle_index,
         &bundle_note_infos,
-        inputs.keys,
         bundle_setup,
-        inputs.branch_id_provider,
         pir_client,
         inputs.network,
         inputs.cancellation,
-        stages,
     )
 }
 
-/// Builds governance PCZT material, runs PIR precompute, and caches prepared setup.
+/// Initializes padded-note secrets and runs PIR precompute.
 ///
 /// Witnesses must already be cached for `notes`. Prefer [`precompute_delegation`]
 /// for the full warm-up path from round notes and anchor tree state.
@@ -258,46 +206,22 @@ where
 /// # Errors
 ///
 /// Returns [`VotingError::Cancelled`] when `cancellation` is set. Other
-/// failures come from PCZT construction, PIR precompute, or prepared-setup
-/// cache insertion.
+/// failures come from padded-secret initialization or PIR precompute.
 #[cfg(feature = "pir")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn warm_delegation_pir(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
     notes: &[NoteInfo],
-    keys: &DelegationKeys,
     layout: BundleLayout,
-    branch_id_provider: &dyn BranchIdProvider,
     pir_client: &pir_client::PirClientBlocking,
     network: Network,
     cancellation: &dyn Cancellation,
-    stages: &dyn DelegationProgressReporter,
 ) -> Result<PreparedDelegationReport, VotingError> {
     ensure_not_cancelled(cancellation)?;
-    let prepared_epoch = prepared_epoch(db)?;
-    let setup = setup(
-        db,
-        round_id,
-        bundle_index,
-        notes,
-        keys,
-        branch_id_provider,
-        stages,
-    )?;
+    db.ensure_padded_secrets(round_id, bundle_index, notes)?;
     ensure_not_cancelled(cancellation)?;
     let report = delegation_pir(db, round_id, bundle_index, notes, pir_client, network)?;
-    ensure_not_cancelled(cancellation)?;
-    let _cached = cache_prepared_setup(
-        db,
-        round_id,
-        bundle_index,
-        keys,
-        notes,
-        prepared_epoch,
-        setup,
-    )?;
 
     Ok(PreparedDelegationReport {
         report,
@@ -318,9 +242,8 @@ fn ensure_not_cancelled(cancellation: &dyn Cancellation) -> Result<(), VotingErr
 #[cfg(all(test, feature = "pir"))]
 mod pir_tests {
     use super::*;
-    use crate::delegate::{BranchIdProvider, DelegationKeys};
     use crate::round::BundleLayout;
-    use crate::types::{Cancellation, NoopProgressReporter, NoteInfo};
+    use crate::types::{Cancellation, NoteInfo};
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
@@ -331,14 +254,6 @@ mod pir_tests {
         impl Cancellation for AlwaysCancelled {
             fn is_cancelled(&self) -> bool {
                 true
-            }
-        }
-
-        struct FixedBranchId(u32);
-
-        impl BranchIdProvider for FixedBranchId {
-            fn consensus_branch_id(&self) -> Result<u32, VotingError> {
-                Ok(self.0)
             }
         }
 
@@ -414,16 +329,6 @@ mod pir_tests {
 
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id("warm-delegation-cancel");
-        let keys = DelegationKeys::with_hotkey_bytes(
-            vec![8; 96],
-            &[7; 43],
-            [9; 32],
-            0,
-            0,
-            1,
-            "Demo Round".to_string(),
-        )
-        .unwrap();
         let notes = vec![NoteInfo {
             commitment: vec![1; 32],
             nullifier: vec![2; 32],
@@ -440,26 +345,21 @@ mod pir_tests {
             eligible_weight: 42,
             dropped_count: 0,
         };
-        let branch_id = FixedBranchId(0xC8E71055);
         let pir_client = pir_client::PirClientBlocking::with_transport(
             "https://pir.test",
             std::sync::Arc::new(StaticPirTransport),
         )
         .unwrap();
-        let stages = NoopProgressReporter;
 
         let err = warm_delegation_pir(
             &db,
             ROUND_ID,
             0,
             &notes,
-            &keys,
             layout,
-            &branch_id,
             &pir_client,
             Network::Testnet,
             &AlwaysCancelled,
-            &stages,
         )
         .unwrap_err();
 
