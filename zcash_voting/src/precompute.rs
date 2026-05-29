@@ -26,6 +26,7 @@ use crate::{
 #[cfg(feature = "pir")]
 use crate::{
     delegate::PreparedDelegationReport,
+    note_bundling::BundlePolicy,
     round::{self, BundleLayout},
     types::{Cancellation, Network, VotingRoundParams},
 };
@@ -42,6 +43,32 @@ static VOTE_TREE_SYNCS: OnceLock<Mutex<HashMap<String, Arc<crate::tree_sync::Vot
 pub struct PirPrecomputeReport {
     pub cached: u32,
     pub fetched: u32,
+}
+
+/// Persists a snapshot tree state, generates Orchard witnesses, and caches them.
+///
+/// This is the FFI-friendly variant for callers that pass the round tree state
+/// with the note-witness request.
+pub fn note_witnesses<C, P, CL, R>(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    tree_state_bytes: &[u8],
+    notes: &[NoteInfo],
+    wallet_db: &WalletDb<C, P, CL, R>,
+) -> Result<Vec<WitnessData>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
+    crate::witness::store_tree_state_and_generate_note_witnesses(
+        db,
+        round_id,
+        bundle_index,
+        tree_state_bytes,
+        notes,
+        wallet_db,
+    )
 }
 
 /// Loads a round's cached tree state, generates Orchard witnesses, and caches them.
@@ -173,13 +200,37 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
+    precompute_delegation_with_policy(db, wallet_db, inputs, pir_client, BundlePolicy::default())
+}
+
+/// Warms delegation bundle state using an explicit note bundle policy.
+#[cfg(feature = "pir")]
+pub fn precompute_delegation_with_policy<C, P, CL, R>(
+    db: &VotingDb,
+    wallet_db: &WalletDb<C, P, CL, R>,
+    inputs: PrecomputeDelegationInputs<'_>,
+    pir_client: &pir_client::PirClientBlocking,
+    bundle_policy: BundlePolicy,
+) -> Result<PreparedDelegationReport, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: zcash_protocol::consensus::Parameters,
+{
     ensure_not_cancelled(inputs.cancellation)?;
     let round_id = inputs.round_params.vote_round_id.as_str();
     db.ensure_round(inputs.round_params, inputs.session_json)?;
 
-    let bundle_setup = db.ensure_bundles_with_skipped_suffix(round_id, inputs.round_note_infos)?;
-    let bundle_note_infos =
-        round::bundle_notes_for_index(inputs.round_note_infos, &bundle_setup, inputs.bundle_index)?;
+    let bundle_setup = db.ensure_bundles_with_skipped_suffix_with_policy(
+        round_id,
+        inputs.round_note_infos,
+        bundle_policy,
+    )?;
+    let bundle_note_infos = round::bundle_notes_for_index_with_policy(
+        inputs.round_note_infos,
+        &bundle_setup,
+        inputs.bundle_index,
+        bundle_policy,
+    )?;
 
     db.store_tree_state(round_id, inputs.anchor_tree_state_bytes)?;
     let witnesses =

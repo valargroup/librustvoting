@@ -58,23 +58,22 @@ pub use pir_client::{
     ImtProofData, PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
 
-pub use governance::BALLOT_DIVISOR;
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-pub use round::setup_delegation_bundles;
+pub use governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
+pub use note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
 pub use round::validate_bundle_index;
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_notes,
-    DelegationWalletInputs, GatherDelegationWalletParams, SelectNotesWithLwdParams,
+    DelegationWalletInputs, GatherDelegationWalletParams,
 };
 pub use types::{
-    validate_round_params, voting_power, BundleSetupResult, Cancellation, CastVoteSignature,
-    DelegationAction, DelegationPirPrecomputeResult, DelegationProgressBridge,
-    DelegationProgressReporter, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
-    GovernancePczt, Network, NoopCancellation, NoopProgressReporter, NoteInfo, NoteRef,
-    ProgressReporter, SelectedNotes, ShareDelegationRecord, SharePayload, VoteCommitStageBridge,
-    VoteCommitStageReporter, VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
-    WireEncryptedShare, WitnessData,
+    validate_round_params, Cancellation, CastVoteSignature, DelegationAction,
+    DelegationPirPrecomputeResult, DelegationProgressBridge, DelegationProgressReporter,
+    DelegationProofResult, DelegationSubmissionData, EncryptedShare, GovernancePczt, Network,
+    NoopCancellation, NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter, SelectedNotes,
+    ShareDelegationRecord, SharePayload, VoteCommitStageBridge, VoteCommitStageReporter,
+    VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare,
+    WitnessData,
 };
 
 /// Warm process-lifetime proving-key caches used by on-device voting proofs.

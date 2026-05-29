@@ -20,15 +20,17 @@ use voting_circuits::delegation::{synthetic_padding_note_parts, ImtProofData};
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::Network;
 
+use crate::governance::BUNDLE_NOTE_SLOTS;
+use crate::note_bundling::ChunkResult;
 use crate::storage::queries;
 use crate::storage::{
     KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb,
 };
 use crate::types::{
-    BundleSetupResult, DelegationPirPrecomputeResult, DelegationProgressReporter,
-    DelegationProofResult, DelegationSubmissionData, EncryptedShare, GovernancePczt, NoteInfo,
-    ProgressReporter, SharePayload, VoteCommitmentBundle, VotingError, VotingHotkey,
-    VotingRoundParams, WireEncryptedShare, WitnessData,
+    DelegationPirPrecomputeResult, DelegationProgressReporter, DelegationProofResult,
+    DelegationSubmissionData, EncryptedShare, GovernancePczt, NoteInfo, ProgressReporter,
+    SharePayload, VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
+    WireEncryptedShare, WitnessData,
 };
 
 #[cfg(any(feature = "pir", feature = "client-pir"))]
@@ -183,7 +185,7 @@ fn precomputed_randomness_from_stored(
 ) -> Result<voting_circuits::delegation::PrecomputedRandomness, VotingError> {
     use voting_circuits::delegation::{PaddedNoteData, PrecomputedRandomness};
 
-    let expected_padded_count = 5usize.saturating_sub(notes_len);
+    let expected_padded_count = BUNDLE_NOTE_SLOTS.saturating_sub(notes_len);
     if padded_secrets.len() != expected_padded_count {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -346,35 +348,34 @@ impl VotingDb {
 
     // --- Bundles ---
 
-    /// Split notes into value-aware bundles of up to 5 and insert bundle rows.
-    /// Returns (bundle_count, eligible_weight) — only bundles meeting the BALLOT_DIVISOR
-    /// threshold are created. Notes in sub-threshold bundles are dropped.
-    pub fn setup_bundles(
+    /// Persist a previously planned bundle layout for a round.
+    ///
+    /// Returns `(bundle_count, eligible_weight)`. Only bundles already present in
+    /// `plan` are persisted, so caller-owned planning remains the single source
+    /// of truth for bundle policy.
+    pub(crate) fn persist_bundle_plan(
         &self,
         round_id: &str,
-        notes: &[NoteInfo],
+        plan: &ChunkResult,
     ) -> Result<(u32, u64), VotingError> {
         let mut conn = self.conn();
         let wallet_id = self.wallet_id();
-        let result = crate::types::chunk_notes(notes);
-        if result.dropped_count > 0 {
+        if plan.dropped_count > 0 {
             eprintln!(
-                "[setup_bundles] Dropped {} notes in sub-threshold bundles (eligible: {} of {} notes)",
-                result.dropped_count,
-                notes.len() - result.dropped_count,
-                notes.len()
+                "[persist_bundle_plan] Dropped {} notes in sub-threshold bundles",
+                plan.dropped_count,
             );
         }
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("failed to begin bundle setup transaction: {e}"),
         })?;
-        for (i, chunk) in result.bundles.iter().enumerate() {
+        for (i, chunk) in plan.bundles.iter().enumerate() {
             queries::insert_bundle_notes(&tx, round_id, &wallet_id, i as u32, chunk)?;
         }
         tx.commit().map_err(|e| VotingError::Internal {
             message: format!("failed to commit bundle setup transaction: {e}"),
         })?;
-        Ok((result.bundles.len() as u32, result.eligible_weight))
+        Ok((plan.bundles.len() as u32, plan.eligible_weight))
     }
 
     /// Get the number of bundles for a round.
@@ -382,54 +383,6 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::get_bundle_count(&conn, round_id, &wallet_id)
-    }
-
-    /// Create bundle rows for the current note selection, or validate that
-    /// existing rows still match the same chunked note identities.
-    pub fn ensure_bundles_for_notes(
-        &self,
-        round_id: &str,
-        notes: &[NoteInfo],
-    ) -> Result<BundleSetupResult, VotingError> {
-        let stored_count = self.get_bundle_count(round_id)?;
-        if stored_count == 0 {
-            let (bundle_count, eligible_weight_zatoshi) = self.setup_bundles(round_id, notes)?;
-            return Ok(BundleSetupResult {
-                bundle_count,
-                eligible_weight_zatoshi,
-            });
-        }
-
-        let chunks = crate::types::chunk_notes(notes);
-        if chunks.bundles.len() != stored_count as usize {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "current note selection produces {} delegation bundles, but {stored_count} \
-                     bundle rows are already persisted for round {round_id}",
-                    chunks.bundles.len()
-                ),
-            });
-        }
-
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        for (bundle_index, bundle_notes) in chunks.bundles.iter().enumerate() {
-            queries::require_bundle_notes(
-                &conn,
-                round_id,
-                &wallet_id,
-                bundle_index as u32,
-                bundle_notes,
-            )
-            .map_err(|e| VotingError::InvalidInput {
-                message: format!("persisted bundle notes do not match current selection: {e}"),
-            })?;
-        }
-
-        Ok(BundleSetupResult {
-            bundle_count: stored_count,
-            eligible_weight_zatoshi: chunks.eligible_weight,
-        })
     }
 
     /// Ensure synthetic padded-note secrets exist for a delegation bundle.
@@ -446,7 +399,7 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
-        let expected_padded_count = 5usize.saturating_sub(notes.len());
+        let expected_padded_count = BUNDLE_NOTE_SLOTS.saturating_sub(notes.len());
 
         if let Some(secrets) =
             queries::load_padded_note_secrets_optional(&conn, round_id, &wallet_id, bundle_index)?
@@ -481,7 +434,6 @@ impl VotingDb {
         }
         Ok(stored)
     }
-
     // --- Phase 1: Delegation setup ---
 
     /// Generate a voting hotkey from seed bytes. Returns the hotkey (SDK needs address for Keystone flow).
@@ -1479,6 +1431,20 @@ mod tests {
         }
     }
 
+    fn identity_note_with_position(position: u8) -> NoteInfo {
+        NoteInfo {
+            commitment: vec![position; 32],
+            nullifier: vec![position.wrapping_add(1); 32],
+            value: 13_000_000,
+            position: u64::from(position),
+            diversifier: vec![0x03; 11],
+            rho: vec![0x04; 32],
+            rseed: vec![0x05; 32],
+            scope: 0,
+            ufvk_str: "uview1test".to_string(),
+        }
+    }
+
     fn valid_tree_witness(position: u64, leaf: orchard::tree::MerkleHashOrchard) -> WitnessData {
         use incrementalmerkletree::{Hashable, Level};
         use orchard::tree::MerkleHashOrchard;
@@ -1643,7 +1609,7 @@ mod tests {
 
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.setup_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
+        db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
         {
             let conn = db.conn();
             let err = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).expect_err(
@@ -1796,7 +1762,7 @@ mod tests {
 
         let mut rng = OsRng;
         let mut notes = Vec::new();
-        for position in 0..5 {
+        for position in 0..BUNDLE_NOTE_SLOTS {
             let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
             let note = orchard::Note::new(
                 address,
@@ -1805,8 +1771,14 @@ mod tests {
                 &mut rng,
             );
             notes.push(
-                NoteInfo::from_orchard_note(&note, position, Scope::External, &ufvk, &TEST_NETWORK)
-                    .unwrap(),
+                NoteInfo::from_orchard_note(
+                    &note,
+                    position as u64,
+                    Scope::External,
+                    &ufvk,
+                    &TEST_NETWORK,
+                )
+                .unwrap(),
             );
         }
 
@@ -1816,7 +1788,7 @@ mod tests {
 
         let db = test_db();
         db.init_round(&params, None).unwrap();
-        db.ensure_bundles_for_notes(ROUND_ID, &notes).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
         {
             let conn = db.conn();
             for note in &notes {
@@ -1838,19 +1810,19 @@ mod tests {
             .precompute_delegation_pir(ROUND_ID, 0, &notes, &pir_client, 0)
             .unwrap();
 
-        assert_eq!(result.cached_count, 5);
+        assert_eq!(result.cached_count, BUNDLE_NOTE_SLOTS as u32);
         assert_eq!(result.fetched_count, 0);
         let conn = db.conn();
         assert!(queries::load_pczt_sighash(&conn, ROUND_ID, W, 0).is_err());
     }
 
     #[test]
-    fn test_setup_bundles() {
+    fn test_ensure_bundles() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        // 5 notes each 13M — all fit in 1 bundle (capacity 5)
-        let notes: Vec<NoteInfo> = (0..5)
+        // A full slot count of 13M notes fits in one default bundle.
+        let notes: Vec<NoteInfo> = (0..BUNDLE_NOTE_SLOTS)
             .map(|i| NoteInfo {
                 commitment: vec![0x01; 32],
                 nullifier: vec![0x02; 32],
@@ -1864,21 +1836,21 @@ mod tests {
             })
             .collect();
 
-        let (count, eligible) = db.setup_bundles(ROUND_ID, &notes).unwrap();
-        assert_eq!(count, 1);
+        let layout = db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        assert_eq!(layout.bundle_count, 1);
         // Quantized: bundle 0 (65M → 5×12.5M=62.5M) = 62.5M
-        assert_eq!(eligible, 62_500_000);
+        assert_eq!(layout.eligible_weight, 62_500_000);
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 1);
     }
 
     #[test]
-    fn test_ensure_bundles_for_notes_creates_once_then_reuses_matching_rows() {
+    fn test_ensure_bundles_creates_once_then_reuses_matching_rows() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
         let notes = vec![identity_test_note()];
 
-        let created = db.ensure_bundles_for_notes(ROUND_ID, &notes).unwrap();
-        let reused = db.ensure_bundles_for_notes(ROUND_ID, &notes).unwrap();
+        let created = db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        let reused = db.ensure_bundles(ROUND_ID, &notes).unwrap();
 
         assert_eq!(created.bundle_count, 1);
         assert_eq!(created, reused);
@@ -1886,37 +1858,45 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_bundles_for_notes_rejects_current_note_selection_drift() {
+    fn test_ensure_bundles_rejects_current_note_selection_drift() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles_for_notes(ROUND_ID, &[identity_test_note()])
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
             .unwrap();
 
         let shape_err = db
-            .ensure_bundles_for_notes(ROUND_ID, &[])
-            .expect_err("empty note selection must not match persisted rows");
+            .ensure_bundles(
+                ROUND_ID,
+                &[
+                    identity_test_note(),
+                    identity_note_with_position(1),
+                    identity_note_with_position(2),
+                    identity_note_with_position(3),
+                    identity_note_with_position(4),
+                    identity_note_with_position(5),
+                ],
+            )
+            .expect_err("different bundle count must not match persisted rows");
         assert!(
             shape_err
                 .to_string()
-                .contains("bundle rows are already persisted"),
+                .contains("existing bundle count 1 does not match planned bundle count 2"),
             "{shape_err}"
         );
 
         let mut substituted = identity_test_note();
         substituted.nullifier[0] ^= 0x01;
         let identity_err = db
-            .ensure_bundles_for_notes(ROUND_ID, &[substituted])
+            .ensure_bundles(ROUND_ID, &[substituted])
             .expect_err("same-position note substitution must be rejected");
         assert!(
-            identity_err
-                .to_string()
-                .contains("persisted bundle notes do not match current selection"),
+            identity_err.to_string().contains("note identity mismatch"),
             "{identity_err}"
         );
     }
 
     #[test]
-    fn test_setup_bundles_rolls_back_partial_insert_on_error() {
+    fn test_ensure_bundles_rolls_back_partial_insert_on_error() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
@@ -1939,8 +1919,9 @@ mod tests {
             queries::insert_bundle(&conn, ROUND_ID, W, 1, &[99]).unwrap();
         }
 
+        let plan = crate::note_bundling::chunk_notes(&notes);
         let err = db
-            .setup_bundles(ROUND_ID, &notes)
+            .persist_bundle_plan(ROUND_ID, &plan)
             .expect_err("bundle index conflict should fail setup");
         assert!(err.to_string().contains("failed to insert bundle"));
 
@@ -2050,7 +2031,7 @@ mod tests {
             scope: 0,
             ufvk_str: String::new(),
         }];
-        db.setup_bundles(ROUND_ID, &notes).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
 
         let mut substituted_notes = notes.clone();
         substituted_notes[0].nullifier = vec![0x03; 32];
@@ -2335,7 +2316,7 @@ mod tests {
     fn test_record_vote_submission() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.setup_bundles(
+        db.ensure_bundles(
             ROUND_ID,
             &[NoteInfo {
                 commitment: vec![0x01; 32],
@@ -2380,7 +2361,8 @@ mod tests {
             "no bundle found",
         );
 
-        db.setup_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
         db.store_delegation_tx_hash(ROUND_ID, 0, "delegation-tx")
             .unwrap();
         assert_eq!(
@@ -2425,7 +2407,8 @@ mod tests {
     fn test_clear_recovery_state_resets_vote_recovery() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.setup_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
         db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
@@ -2447,7 +2430,7 @@ mod tests {
     fn test_insert_vote_fixture() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.setup_bundles(
+        db.ensure_bundles(
             ROUND_ID,
             &[NoteInfo {
                 commitment: vec![0x01; 32],
@@ -2669,10 +2652,10 @@ mod tests {
         // Setup bundles: 6 equal-value notes → sequential fill packs first 5, then 1
         // Sorted by value DESC (all equal) then position ASC: [0,1,2,3,4,5]
         // Bundle 0 = [0,1,2,3,4], bundle 1 = [5]
-        let (bundle_count, eligible) = db.setup_bundles(ROUND_ID, &notes).unwrap();
-        assert_eq!(bundle_count, 2);
+        let layout = db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        assert_eq!(layout.bundle_count, 2);
         // Quantized: bundle 0 (65M → 5×12.5M=62.5M) + bundle 1 (13M → 1×12.5M=12.5M) = 75M
-        assert_eq!(eligible, 75_000_000);
+        assert_eq!(layout.eligible_weight, 75_000_000);
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 2);
 
         // Verify note positions per bundle (sequential fill)
@@ -2694,7 +2677,7 @@ mod tests {
         let seed_fingerprint = [0x42u8; 32];
 
         // Build governance PCZT for each bundle independently
-        let chunk_result = crate::types::chunk_notes(&notes);
+        let chunk_result = crate::note_bundling::chunk_notes(&notes);
 
         for (i, chunk) in chunk_result.bundles.iter().enumerate() {
             let result = db
@@ -2716,7 +2699,7 @@ mod tests {
             // Each bundle should have valid delegation data
             assert_eq!(result.rk.len(), 32);
             assert_eq!(result.van.len(), 32);
-            assert_eq!(result.gov_nullifiers.len(), 5);
+            assert_eq!(result.gov_nullifiers.len(), BUNDLE_NOTE_SLOTS);
             assert_eq!(result.pczt_sighash.len(), 32);
 
             // Verify data persisted per bundle
@@ -2782,7 +2765,7 @@ mod tests {
     fn test_share_delegation_lifecycle() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.setup_bundles(
+        db.ensure_bundles(
             ROUND_ID,
             &[NoteInfo {
                 commitment: vec![0x01; 32],

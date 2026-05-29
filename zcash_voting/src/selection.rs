@@ -425,16 +425,17 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
         let account_ref = account_internal_id(&conn, &account_uuid);
+        let note_value = (divisor / crate::governance::BUNDLE_NOTE_SLOTS as u64) + 1;
 
-        for note_tag in 1..=5 {
+        for note_tag in 1..=crate::governance::BUNDLE_NOTE_SLOTS {
             insert_orchard_note(
                 &conn,
                 account_ref,
                 &orchard_fvk,
-                note_tag,
+                note_tag as u8,
                 10,
-                divisor / 5,
-                u64::from(note_tag),
+                note_value,
+                note_tag as u64,
             );
         }
 
@@ -449,7 +450,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selected.notes.len(), 5);
+        assert_eq!(selected.notes.len(), crate::governance::BUNDLE_NOTE_SLOTS);
         assert!(selected
             .notes
             .iter()

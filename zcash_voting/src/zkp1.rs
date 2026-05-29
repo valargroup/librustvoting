@@ -24,6 +24,7 @@ use voting_circuits::delegation::{
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::Network;
 
+use crate::governance::BUNDLE_NOTE_SLOTS;
 use crate::types::{
     ct_option_to_result, validate_32_bytes, DelegationProgressReporter, DelegationProofResult,
     NoteInfo, VotingError, WitnessData,
@@ -282,7 +283,8 @@ fn delegation_cached_keys_large_stack() -> Result<&'static DelegationKeys, Votin
 ///
 /// # Arguments
 ///
-/// - `full_notes`: 1–5 wallet notes (from `get_wallet_notes_at_snapshot`).
+/// - `full_notes`: wallet notes up to [`BUNDLE_NOTE_SLOTS`] (from
+///   `get_wallet_notes_at_snapshot`).
 /// - `hotkey_raw_address`: 43-byte raw Orchard address of the voting hotkey.
 /// - `alpha_bytes`: 32-byte spend auth randomizer scalar.
 /// - `van_comm_rand_bytes`: 32-byte governance commitment blinding factor.
@@ -308,9 +310,9 @@ pub fn build_and_prove_delegation(
     precomputed_randomness: Option<&PrecomputedRandomness>,
 ) -> Result<DelegationProofResult, VotingError> {
     let n = full_notes.len();
-    if n == 0 || n > 5 {
+    if n == 0 || n > BUNDLE_NOTE_SLOTS {
         return Err(VotingError::InvalidInput {
-            message: format!("expected 1–5 notes, got {n}"),
+            message: format!("expected 1..={BUNDLE_NOTE_SLOTS} notes, got {n}"),
         });
     }
     if merkle_witnesses.len() != n {
@@ -635,7 +637,10 @@ mod tests {
             None,
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("1–5 notes"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains(&format!("1..={BUNDLE_NOTE_SLOTS} notes")));
     }
 
     /// Real Halo2 delegation proof end-to-end test.
@@ -644,7 +649,8 @@ mod tests {
     /// non-membership proofs as `ImtProofData`, and calls
     /// `build_and_prove_delegation()` to generate a real Halo2 proof.
     ///
-    /// Uses 5 notes to avoid padding (no PIR server needed for padded notes).
+    /// Uses a full note-slot bundle to avoid padding (no PIR server needed for
+    /// padded notes).
     /// Long-running due to keygen + proof generation.
     ///
     /// Run with: `cargo test -p zcash_voting test_real_delegation_proof -- --ignored --nocapture`
@@ -678,9 +684,12 @@ mod tests {
         let hotkey_addr = hotkey_fvk.address_at(0u32, Scope::External);
         let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
 
-        // 3. Create 5 notes (fills all 5 slots → no padding → no IMT server needed)
+        // 3. Fill all note slots so no padding or IMT server is needed.
         let mut rng = OsRng;
-        let note_values = [4_000_000u64, 4_000_000, 3_000_000, 2_000_000, 1_000_000]; // 14M total >= 12.5M min
+        let note_values = vec![
+            (crate::governance::BALLOT_DIVISOR / BUNDLE_NOTE_SLOTS as u64) + 1;
+            BUNDLE_NOTE_SLOTS
+        ];
         let address = fvk.address_at(0u32, Scope::External);
 
         let mut notes = Vec::new();

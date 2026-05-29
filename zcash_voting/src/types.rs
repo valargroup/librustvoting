@@ -8,6 +8,8 @@ use zcash_protocol::consensus::{
 };
 use zip32::Scope;
 
+use crate::governance::BUNDLE_NOTE_SLOTS;
+
 #[derive(Debug, Error)]
 pub enum VotingError {
     #[error("Invalid input: {message}")]
@@ -102,7 +104,7 @@ pub struct VotingHotkey {
 
 /// A shielded Orchard note from the wallet DB, containing all fields needed
 /// for delegation proof construction and governance PCZT building.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteInfo {
     /// Extracted note commitment (cmx), recomputed from note parts.
     pub commitment: Vec<u8>,
@@ -171,7 +173,7 @@ pub struct NoteRef {
     ///
     /// Voting power is quantized per smart bundle, not per note. This mirrors
     /// `value_zatoshi` so sub-divisor notes remain visible to callers while
-    /// [`voting_power`] reports the real bundle-quantized total.
+    /// [`crate::note_bundling::voting_power`] reports the real bundle-quantized total.
     pub voting_weight_zatoshi: u64,
     pub commitment: Vec<u8>,
     pub nullifier: Vec<u8>,
@@ -220,21 +222,6 @@ impl SelectedNotes {
     }
 }
 
-/// Returns quantized zatoshi voting power for the selected note set.
-pub fn voting_power(notes: &SelectedNotes) -> u64 {
-    crate::round::note_bundles(&notes.voting_note_infos())
-        .map(|bundles| {
-            bundles
-                .into_iter()
-                .map(|bundle| {
-                    let raw = bundle.into_iter().map(|note| note.value).sum::<u64>();
-                    (raw / crate::governance::BALLOT_DIVISOR) * crate::governance::BALLOT_DIVISOR
-                })
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
 /// Parameters for a voting round, sourced from vote chain.
 #[derive(Clone, Debug)]
 pub struct VotingRoundParams {
@@ -250,7 +237,7 @@ pub struct VotingRoundParams {
 pub struct DelegationAction {
     pub action_bytes: Vec<u8>,
     pub rk: Vec<u8>,
-    /// Governance nullifiers, always padded to 5.
+    /// Governance nullifiers, always padded to [`BUNDLE_NOTE_SLOTS`].
     pub gov_nullifiers: Vec<Vec<u8>>,
     /// 32-byte governance commitment (VAN).
     pub van: Vec<u8>,
@@ -295,7 +282,7 @@ pub struct GovernancePczt {
     pub nf_signed: Vec<u8>,
     /// Output note commitment (32 bytes). Public input to ZKP #1.
     pub cmx_new: Vec<u8>,
-    /// Governance nullifiers, always padded to 5.
+    /// Governance nullifiers, always padded to [`BUNDLE_NOTE_SLOTS`].
     pub gov_nullifiers: Vec<Vec<u8>>,
     /// 32-byte governance commitment (VAN).
     pub van: Vec<u8>,
@@ -519,13 +506,6 @@ pub struct DelegationPirPrecomputeResult {
     pub fetched_count: u32,
 }
 
-/// Result of creating or validating delegation note bundles for a round.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BundleSetupResult {
-    pub bundle_count: u32,
-    pub eligible_weight_zatoshi: u64,
-}
-
 /// Merkle witness for a note in the Orchard commitment tree.
 #[derive(Clone, Debug)]
 pub struct WitnessData {
@@ -728,9 +708,12 @@ pub fn validate_vote_decision(decision: u32, num_options: u32) -> Result<(), Vot
 }
 
 pub fn validate_notes(notes: &[NoteInfo]) -> Result<(), VotingError> {
-    if notes.is_empty() || notes.len() > 5 {
+    if notes.is_empty() || notes.len() > BUNDLE_NOTE_SLOTS {
         return Err(VotingError::InvalidInput {
-            message: format!("notes must have 1..5 entries, got {}", notes.len()),
+            message: format!(
+                "notes must have 1..={BUNDLE_NOTE_SLOTS} entries, got {}",
+                notes.len()
+            ),
         });
     }
     for (i, note) in notes.iter().enumerate() {
@@ -762,102 +745,6 @@ pub fn validate_notes_for_round(notes: &[NoteInfo]) -> Result<(), VotingError> {
     Ok(())
 }
 
-/// Result of value-aware note bundling.
-#[derive(Clone, Debug)]
-pub struct ChunkResult {
-    /// Surviving bundles (each with total >= BALLOT_DIVISOR, max 5 notes).
-    pub bundles: Vec<Vec<NoteInfo>>,
-    /// Effective voting weight after per-bundle VAN quantization
-    /// (each bundle contributes floor(total/BALLOT_DIVISOR) * BALLOT_DIVISOR).
-    pub eligible_weight: u64,
-    /// Number of notes that were dropped (in bundles below BALLOT_DIVISOR).
-    pub dropped_count: usize,
-}
-
-/// Split notes into value-aware bundles of up to 5 using sequential packing.
-///
-/// Algorithm:
-/// 1. Sort notes by value DESC, then position ASC as tiebreaker
-/// 2. Fill bundles sequentially to capacity (5 notes each)
-/// 3. Drop bundles with total < BALLOT_DIVISOR
-/// 4. Re-sort notes within each surviving bundle by position
-/// 5. Sort surviving bundles by total value DESC (min position as tiebreaker)
-///
-/// Sequential packing concentrates high-value notes in early bundles, maximizing
-/// per-bundle VAN weight and minimizing quantization loss. Dust notes naturally
-/// end up in the last (smallest) bundle which gets dropped if below threshold.
-/// Value-descending bundle order lets Keystone users sign the most valuable
-/// bundles first and optionally skip the remaining low-value ones.
-pub fn chunk_notes(notes: &[NoteInfo]) -> ChunkResult {
-    use crate::governance::BALLOT_DIVISOR;
-
-    if notes.is_empty() {
-        return ChunkResult {
-            bundles: vec![],
-            eligible_weight: 0,
-            dropped_count: 0,
-        };
-    }
-
-    // Step 1: Sort by value DESC, then position ASC as tiebreaker
-    let mut sorted = notes.to_vec();
-    sorted.sort_by(|a, b| b.value.cmp(&a.value).then(a.position.cmp(&b.position)));
-
-    // Step 2: Fill bundles sequentially to capacity (5 notes each)
-    let mut bundle_notes: Vec<Vec<NoteInfo>> = Vec::new();
-    let mut bundle_totals: Vec<u64> = Vec::new();
-
-    for note in &sorted {
-        // Start a new bundle if the current one is full or none exist
-        if bundle_notes.is_empty() || bundle_notes.last().unwrap().len() >= 5 {
-            bundle_notes.push(Vec::new());
-            bundle_totals.push(0);
-        }
-        let last = bundle_notes.len() - 1;
-        bundle_totals[last] += note.value;
-        bundle_notes[last].push(note.clone());
-    }
-
-    // Step 3: Drop bundles with total < BALLOT_DIVISOR
-    let total_notes: usize = bundle_notes.iter().map(|b| b.len()).sum();
-    let mut surviving: Vec<(u64, Vec<NoteInfo>)> = Vec::new();
-    let mut eligible_weight: u64 = 0;
-    let mut surviving_notes: usize = 0;
-
-    for (i, bundle) in bundle_notes.into_iter().enumerate() {
-        if bundle_totals[i] >= BALLOT_DIVISOR {
-            surviving_notes += bundle.len();
-            // Quantize per bundle: VAN weight = floor(total / BALLOT_DIVISOR) * BALLOT_DIVISOR
-            eligible_weight += (bundle_totals[i] / BALLOT_DIVISOR) * BALLOT_DIVISOR;
-            surviving.push((bundle_totals[i], bundle));
-        }
-    }
-    let dropped_count = total_notes - surviving_notes;
-
-    // Step 5: Re-sort notes within each surviving bundle by position
-    for (_, bundle) in &mut surviving {
-        bundle.sort_by_key(|n| n.position);
-    }
-
-    // Step 6: Sort surviving bundles by total value DESC (min position as tiebreaker).
-    // This ensures bundle 0 is always the most valuable, enabling users to skip
-    // low-value trailing bundles during Keystone signing.
-    surviving.sort_by(|a, b| {
-        b.0.cmp(&a.0).then_with(|| {
-            let a_pos = a.1.first().map(|n| n.position).unwrap_or(u64::MAX);
-            let b_pos = b.1.first().map(|n| n.position).unwrap_or(u64::MAX);
-            a_pos.cmp(&b_pos)
-        })
-    });
-    let surviving: Vec<Vec<NoteInfo>> = surviving.into_iter().map(|(_, b)| b).collect();
-
-    ChunkResult {
-        bundles: surviving,
-        eligible_weight,
-        dropped_count,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,40 +755,6 @@ mod tests {
     use zcash_keys::keys::UnifiedSpendingKey;
     use zcash_protocol::consensus::TEST_NETWORK;
     use zip32::{AccountId, Scope};
-
-    fn make_note(value: u64, position: u64) -> NoteInfo {
-        NoteInfo {
-            commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
-            value,
-            position,
-            diversifier: vec![0; 11],
-            rho: vec![0; 32],
-            rseed: vec![0; 32],
-            scope: 0,
-            ufvk_str: String::new(),
-        }
-    }
-
-    fn test_note_ref(value_zatoshi: u64, voting_weight_zatoshi: u64, position: u64) -> NoteRef {
-        NoteRef {
-            pool: "orchard".to_string(),
-            txid_hex: hex::encode([position as u8; 32]),
-            output_index: position as u32,
-            value_zatoshi,
-            voting_weight_zatoshi,
-            commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
-            diversifier: vec![0x03; 11],
-            rho: vec![0x04; 32],
-            rseed: vec![0x05; 32],
-            scope: 0,
-            ufvk_str: String::new(),
-            commitment_tree_position: position,
-            mined_height: 1,
-            anchor_height: 100,
-        }
-    }
 
     fn placeholder_tree_state(snapshot_height: u64) -> TreeState {
         TreeState {
@@ -950,24 +803,6 @@ mod tests {
         assert_eq!(infos[0].rseed, vec![5; 32]);
         assert_eq!(infos[0].scope, 1);
         assert_eq!(infos[0].ufvk_str, "uviewtest");
-    }
-
-    #[test]
-    fn voting_power_uses_smart_bundle_quantization() {
-        let small_note_value = BALLOT_DIVISOR / 5;
-        let selected = SelectedNotes {
-            notes: vec![
-                test_note_ref(small_note_value, small_note_value, 1),
-                test_note_ref(small_note_value, small_note_value, 2),
-                test_note_ref(small_note_value, small_note_value, 3),
-                test_note_ref(small_note_value, small_note_value, 4),
-                test_note_ref(small_note_value, small_note_value, 5),
-            ],
-            snapshot_height: 100,
-            anchor_tree_state: placeholder_tree_state(100),
-        };
-
-        assert_eq!(voting_power(&selected), BALLOT_DIVISOR);
     }
 
     #[test]
@@ -1065,186 +900,6 @@ mod tests {
         assert_eq!(note_info.rseed, note.rseed().as_bytes().to_vec());
         assert_eq!(note_info.scope, 0);
         assert_eq!(note_info.ufvk_str, ufvk.encode(&TEST_NETWORK));
-    }
-
-    #[test]
-    fn test_chunk_notes_all_valid() {
-        // 5 notes each with 13M — all fit in 1 bundle (capacity 5)
-        let notes: Vec<NoteInfo> = (0..5).map(|i| make_note(13_000_000, i)).collect();
-        let result = chunk_notes(&notes);
-        assert_eq!(result.bundles.len(), 1);
-        assert_eq!(result.dropped_count, 0);
-        // Quantized: bundle 0 (65M → 5×12.5M=62.5M) = 62.5M
-        assert_eq!(result.eligible_weight, 62_500_000);
-        // Bundle 0 has 5 notes
-        assert_eq!(result.bundles[0].len(), 5);
-    }
-
-    #[test]
-    fn test_chunk_notes_dust_dropped() {
-        // 1 good note (13M) + 5 dust notes → sequential fill packs first 5 together.
-        // Sorted DESC: 13M first, then 5 dust. Bundle 0 = [13M, 100, 100, 100, 100], bundle 1 = [100].
-        // Bundle 0 survives (13M+400 ≥ 12.5M), bundle 1 dropped (100 < 12.5M).
-        let notes = vec![
-            make_note(13_000_000, 0),
-            make_note(100, 1),
-            make_note(100, 2),
-            make_note(100, 3),
-            make_note(100, 4),
-            make_note(100, 5),
-        ];
-        let result = chunk_notes(&notes);
-        assert_eq!(result.bundles.len(), 1);
-        assert_eq!(result.dropped_count, 1);
-        // Quantized: 13,000,400 → 1×12.5M = 12.5M
-        assert_eq!(result.eligible_weight, 12_500_000);
-        // Surviving bundle contains good note + 4 dust
-        assert_eq!(result.bundles[0].len(), 5);
-    }
-
-    #[test]
-    fn test_chunk_notes_all_dust_empty() {
-        // All notes below threshold — no valid bundles
-        let notes = vec![make_note(100, 0), make_note(200, 1), make_note(300, 2)];
-        let result = chunk_notes(&notes);
-        assert!(result.bundles.is_empty());
-        assert_eq!(result.eligible_weight, 0);
-        assert_eq!(result.dropped_count, 3);
-    }
-
-    #[test]
-    fn test_chunk_notes_exact_threshold() {
-        // Single note at exactly BALLOT_DIVISOR
-        let notes = vec![make_note(12_500_000, 0)];
-        let result = chunk_notes(&notes);
-        assert_eq!(result.bundles.len(), 1);
-        assert_eq!(result.eligible_weight, 12_500_000);
-        assert_eq!(result.dropped_count, 0);
-    }
-
-    #[test]
-    fn test_chunk_notes_single_note() {
-        let notes = vec![make_note(50_000_000, 42)];
-        let result = chunk_notes(&notes);
-        assert_eq!(result.bundles.len(), 1);
-        assert_eq!(result.bundles[0].len(), 1);
-        assert_eq!(result.bundles[0][0].position, 42);
-        assert_eq!(result.eligible_weight, 50_000_000);
-    }
-
-    #[test]
-    fn test_chunk_notes_deterministic() {
-        let notes: Vec<NoteInfo> = (0..7)
-            .map(|i| make_note(15_000_000 + i * 1_000_000, i))
-            .collect();
-        let r1 = chunk_notes(&notes);
-        let r2 = chunk_notes(&notes);
-        assert_eq!(r1.bundles.len(), r2.bundles.len());
-        for (b1, b2) in r1.bundles.iter().zip(r2.bundles.iter()) {
-            let p1: Vec<u64> = b1.iter().map(|n| n.position).collect();
-            let p2: Vec<u64> = b2.iter().map(|n| n.position).collect();
-            assert_eq!(p1, p2, "bundle positions must be deterministic");
-        }
-    }
-
-    #[test]
-    fn test_chunk_notes_position_ordering_within_bundles() {
-        // Notes added in random order should still have position-sorted bundles
-        let notes = vec![
-            make_note(20_000_000, 5),
-            make_note(20_000_000, 1),
-            make_note(20_000_000, 3),
-            make_note(20_000_000, 7),
-            make_note(20_000_000, 2),
-        ];
-        let result = chunk_notes(&notes);
-        for bundle in &result.bundles {
-            for window in bundle.windows(2) {
-                assert!(
-                    window[0].position < window[1].position,
-                    "notes within bundle must be sorted by position"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_chunk_notes_bundles_sorted_by_value_desc() {
-        // 8 equal-value notes → 2 bundles with same total.
-        // Tiebreaker: min position ASC, so bundle with positions 0-4 comes first.
-        let notes: Vec<NoteInfo> = (0..8).map(|i| make_note(15_000_000, i)).collect();
-        let result = chunk_notes(&notes);
-        assert_eq!(result.bundles.len(), 2);
-        let totals: Vec<u64> = result
-            .bundles
-            .iter()
-            .map(|b| b.iter().map(|n| n.value).sum())
-            .collect();
-        assert!(
-            totals[0] >= totals[1],
-            "bundle 0 total ({}) must be >= bundle 1 total ({})",
-            totals[0],
-            totals[1]
-        );
-        // Equal totals — tiebreaker is min position
-        let min_positions: Vec<u64> = result
-            .bundles
-            .iter()
-            .map(|b| b.first().unwrap().position)
-            .collect();
-        assert!(
-            min_positions[0] < min_positions[1],
-            "equal-total bundles should be ordered by min position"
-        );
-    }
-
-    #[test]
-    fn test_chunk_notes_largest_bundle_first() {
-        // Mix of high and low-value notes. Bundle 0 should be the most valuable.
-        // 5 large notes (50M each, pos 10-14) + 5 medium notes (13M each, pos 0-4)
-        // Bundle 0 (sorted by value DESC): [50M×5] = 250M
-        // Bundle 1: [13M×5] = 65M
-        // After value-DESC sort: bundle 0 (250M) before bundle 1 (65M).
-        let mut notes = Vec::new();
-        for i in 0..5 {
-            notes.push(make_note(50_000_000, 10 + i));
-        }
-        for i in 0..5 {
-            notes.push(make_note(13_000_000, i));
-        }
-        let result = chunk_notes(&notes);
-        assert_eq!(result.bundles.len(), 2);
-        let total_0: u64 = result.bundles[0].iter().map(|n| n.value).sum();
-        let total_1: u64 = result.bundles[1].iter().map(|n| n.value).sum();
-        assert_eq!(total_0, 250_000_000);
-        assert_eq!(total_1, 65_000_000);
-        assert!(
-            total_0 > total_1,
-            "bundle 0 must have higher total than bundle 1"
-        );
-        // Despite bundle 1 having earlier positions (0-4), bundle 0 (positions 10-14)
-        // comes first because value takes priority over position.
-    }
-
-    #[test]
-    fn test_chunk_notes_empty() {
-        let result = chunk_notes(&[]);
-        assert!(result.bundles.is_empty());
-        assert_eq!(result.eligible_weight, 0);
-        assert_eq!(result.dropped_count, 0);
-    }
-
-    #[test]
-    fn test_chunk_notes_max_5_per_bundle() {
-        let notes: Vec<NoteInfo> = (0..12).map(|i| make_note(15_000_000, i)).collect();
-        let result = chunk_notes(&notes);
-        for bundle in &result.bundles {
-            assert!(
-                bundle.len() <= 5,
-                "bundle has {} notes, max is 5",
-                bundle.len()
-            );
-        }
     }
 }
 

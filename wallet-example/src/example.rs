@@ -7,11 +7,11 @@ use zcash_voting::{HyperTransport, PirClientBlocking, VotingRoundParams};
 
 /// Human-readable precompute stages printed by the runnable example.
 pub const PRECOMPUTE_FLOW: &[&str] = &[
-    "Resolve lightwalletd anchor tree state and consensus branch id for the round.",
-    "Gather snapshot-eligible Orchard notes and account key material from the wallet DB.",
+    "Resolve lightwalletd anchor tree state for the round.",
+    "Gather snapshot-eligible Orchard notes from the wallet DB.",
     "Connect to the PIR endpoint selected for the round snapshot.",
     "Build PrecomputeDelegationInputs with the full round note set and target bundle index.",
-    "Call precompute_delegation to persist witnesses, PIR rows, and prepared PCZT state.",
+    "Call precompute_delegation to persist witnesses, padded secrets, and PIR rows.",
 ];
 
 /// Caller-owned inputs needed to warm one delegation bundle.
@@ -29,8 +29,8 @@ pub struct WalletPrecomputeRequest<'a> {
 
 /// Example wallet-side orchestration for warming one delegation bundle.
 ///
-/// Lightwalletd supplies the round anchor and branch id. The wallet DB supplies
-/// the account notes, account keys, and the local fully-scanned height.
+/// Lightwalletd supplies the round anchor. The wallet DB supplies account notes
+/// and the local fully-scanned height.
 pub async fn precompute_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
     wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
@@ -55,10 +55,9 @@ where
     let round_params = lwd_inputs.round_params;
     let resolved_round_name = lwd_inputs.resolved_round_name;
     let anchor_tree_state_bytes = lwd_inputs.anchor_tree_state_bytes;
-    let branch_id_provider = lwd_inputs.branch_id_provider;
 
     // 2. Select the Orchard notes that were eligible at the round snapshot and
-    // load the account key material needed to build the governance PCZT.
+    // load wallet metadata needed by the later signing path.
     let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
         wallet_db,
         account_uuid: request.account_uuid,
@@ -77,21 +76,18 @@ where
 
     // 4. Build the high-level precompute request. Pass the full round note set;
     // the crate will create all bundles and then warm only `bundle_index`.
-    let progress = NoopProgressReporter;
     let inputs = PrecomputeDelegationInputs {
         round_params: &round_params,
         session_json: None,
         bundle_index: request.bundle_index,
         round_note_infos: &wallet_inputs.round_note_infos,
         anchor_tree_state_bytes: &wallet_inputs.anchor_tree_state_bytes,
-        keys: &wallet_inputs.delegation_keys,
-        branch_id_provider: &branch_id_provider,
         network: request.network,
         cancellation: &cancellation,
     };
 
     // 5. Warm persistent artifacts used by the later delegation proof step:
-    // round rows, note witnesses, PIR rows, and the prepared governance PCZT.
-    precompute_delegation(voting_db, wallet_db, inputs, &pir_client, &progress)
+    // round rows, note witnesses, padded-note secrets, and PIR rows.
+    precompute_delegation(voting_db, wallet_db, inputs, &pir_client)
         .context("precompute delegation bundle")
 }

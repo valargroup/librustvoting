@@ -677,8 +677,7 @@ fn store_delegation_data_inner(
     gov_nullifiers_blob: Option<&[u8]>,
 ) -> Result<(), VotingError> {
     // Serialize padded-note nullifiers as a flat byte blob: [nf0 (32 bytes) | nf1 | nf2 | ...].
-    // Length 0 means no padding was needed (all 5 notes were real).
-    // Length 32/64/96/128 means 1/2/3/4 dummy notes respectively.
+    // Length 0 means no padding was needed because all note slots were real.
     let dummy_blob: Vec<u8> = dummy_nullifiers
         .iter()
         .flat_map(|n| n.iter().copied())
