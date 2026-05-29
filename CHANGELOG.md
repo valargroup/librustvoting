@@ -14,9 +14,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   vote, and share phases with the voter's recorded ballot intent into an ordered
   list of `NextStep`s, so wallet SDKs can resume an interrupted multi-question
   vote without re-deriving recovery state. Exported via the prelude
-  (`Decision`, `NextStep`, `RoundPlan`, `resume_plan`). Skipped ballot intents
-  are treated as terminal decisions, and choice intents now fail fast if no
-  eligible bundle rows exist for the round.
+  (`Decision`, `NextStep`, `RoundPlan`, `resume_plan`). `NextStep` is
+  `non_exhaustive`; `CastVote` carries the recorded choice, committed but
+  unsubmitted votes resume through `SubmitVote`, and confirmed votes missing
+  helper-share rows resume through `SubmitShares` derived from recovered share
+  payloads. Vote work is ordered by proposal before bundle so interrupted
+  multi-bundle questions finish before later questions resume. Skipped ballot
+  intents are terminal decisions, `open_proposals` contains only proposals with
+  no recorded decision, and choice intents fail fast if no eligible bundle rows
+  exist for the round.
 - Added `vote::recover_commit` for `NextStep::SubmitVote` handling. It
   reconstructs both cast-vote submission fields and helper-share payloads from
   persisted recovery state so wallets do not need to reassemble recovery JSON
@@ -39,7 +45,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   so wallet SDKs can share the snapshot tree-state persistence, witness
   generation, and bundle witness caching flow while keeping wallet DB opening at
   each SDK boundary.
-
 - Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
   `VoteCommit`, `VoteSigner`, `VoteSubmission`, and `VoteRecoveryBundle`.
   `vote::commit` now builds ZKP #2, signs the cast-vote payload, persists the
@@ -57,18 +62,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
-- Changed the `NextStep` API. The enum is now `non_exhaustive`, `CastVote`
-  carries the intended ballot choice, and committed but unsubmitted votes resume
-  through a distinct `SubmitVote` step. Wallets should handle unknown future
-  variants conservatively and call `resume_plan` again after each persisted
-  step.
-- `session::resume_plan` now orders vote work by proposal before bundle, so an
-  interrupted multi-bundle question finishes across all bundles before later
-  questions resume.
-- `session::resume_plan` now emits `NextStep::SubmitShares` when a vote
-  commitment is confirmed but one or more helper-share rows were not recorded,
-  so wallets can recover a crash between vote confirmation and share
-  publication without advancing to later proposals.
 - Vote recovery state is now guarded by durable vote identity. Stale recovery
   JSON, helper-share rows, tx hashes, and vote commitment tree positions cannot
   be attached to a replacement vote after the voter changes intent.
@@ -88,12 +81,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   fixed 24-element authentication path.
 - Cast-vote signing can derive the hotkey for an explicit ZIP-32 account index
   through the new account-aware signing path used by `vote::commit`.
-
-### Fixed
-- `session::resume_plan` now derives missing helper-share work from recovered
-  share payloads instead of raw encrypted-share recovery material, so
-  single-share last-moment votes do not remain pending after their only helper
-  share is recorded.
 
 # 0.10.1
 
