@@ -35,8 +35,9 @@ pub use crate::types::{
 };
 pub use crate::vote::{
     commit as commit_vote, parse_recovery, record_submission as record_vote_submission,
-    record_vc_position, recovery_bundle, serialize_recovery, submission as vote_submission,
-    DraftVote, VanWitness, VoteCommit, VoteRecoveryBundle, VoteSigner, VoteSubmission,
+    record_vc_position, recover_commit as recover_vote_commit, recovery_bundle, serialize_recovery,
+    submission as vote_submission, DraftVote, VanWitness, VoteCommit, VoteRecoveryBundle,
+    VoteSigner, VoteSubmission,
 };
 pub use crate::warm_proving_caches;
 

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use rusqlite::OptionalExtension;
+use rusqlite::{named_params, OptionalExtension};
 
 use crate::{
     round::VotingDb,
@@ -150,8 +150,11 @@ pub fn commit(
     progress: &dyn ProgressReporter,
 ) -> Result<VoteCommit, VotingError> {
     if let Some(recovered) = recovery_bundle(db, round_id, bundle_index, draft.proposal_id)? {
-        return commit_from_recovery(&recovered);
+        if recovery_matches_draft(&recovered, draft) {
+            return commit_from_recovery(&recovered);
+        }
     }
+    ensure_vote_rebuild_allowed(db, round_id, bundle_index, draft.proposal_id)?;
 
     let (seed, network, account_index) = match signer {
         VoteSigner::Seed {
@@ -202,13 +205,15 @@ pub fn commit(
     )?;
     let vote_auth_sig = array64("vote_auth_sig", signature.vote_auth_sig)?;
     let recovery = VoteRecoveryBundle::from_parts(bundle_index, draft, bundle, vote_auth_sig)?;
-    store_recovery_json(
+    let commitment_bytes = stored_vote_commitment_bytes(&recovery)?;
+    store_recovery_json_for_vote(
         db,
         round_id,
         bundle_index,
         draft.proposal_id,
+        draft.choice,
+        Some(&commitment_bytes),
         &serialize_recovery(&recovery)?,
-        draft.vc_tree_position,
     )?;
 
     Ok(VoteCommit {
@@ -223,6 +228,26 @@ pub fn commit(
         encrypted_shares: wire_shares,
         share_payloads,
     })
+}
+
+/// Reconstructs a previously committed vote from persisted recovery state.
+///
+/// This is the safe helper for `NextStep::SubmitVote`: submit the returned
+/// cast-vote fields to the vote chain, submit `share_payloads` to helper
+/// servers, then call `record_submission` with the cast-vote transaction hash.
+pub fn recover_commit(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<VoteCommit, VotingError> {
+    recovery_bundle(db, round_id, bundle_index, proposal_id)?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+            ),
+        })
+        .and_then(|bundle| commit_from_recovery(&bundle))
 }
 
 /// Reconstructs chain-ready cast-vote fields from persisted recovery state.
@@ -259,8 +284,7 @@ pub fn record_submission(
     proposal_id: u32,
     tx_hash: &str,
 ) -> Result<(), VotingError> {
-    db.store_vote_tx_hash(round_id, bundle_index, proposal_id, tx_hash)?;
-    db.mark_vote_submitted(round_id, bundle_index, proposal_id)
+    db.record_vote_submission(round_id, bundle_index, proposal_id, tx_hash)
 }
 
 /// Records the on-chain vote commitment tree position after confirmation.
@@ -271,11 +295,15 @@ pub fn record_vc_position(
     proposal_id: u32,
     vc_tree_position: u64,
 ) -> Result<(), VotingError> {
+    let vc_tree_position_i64 =
+        i64::try_from(vc_tree_position).map_err(|_| VotingError::InvalidInput {
+            message: format!("vc_tree_position {vc_tree_position} does not fit in SQLite i64"),
+        })?;
     let wallet_id = db.wallet_id();
-    let stored_json: Option<Option<String>> = {
+    let stored_vote: Option<(i64, Option<Vec<u8>>, Option<String>, Option<i64>)> = {
         let conn = db.conn();
         conn.query_row(
-            "SELECT commitment_bundle_json FROM votes
+            "SELECT choice, commitment, commitment_bundle_json, vc_tree_position FROM votes
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
             rusqlite::named_params! {
@@ -284,7 +312,7 @@ pub fn record_vc_position(
                 ":bundle_index": bundle_index as i64,
                 ":proposal_id": proposal_id as i64,
             },
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| VotingError::Internal {
@@ -292,47 +320,48 @@ pub fn record_vc_position(
         })?
     };
 
-    let Some(stored_json) = stored_json else {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "vote not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
-            ),
-        });
+    let Some((stored_choice, stored_commitment, stored_json, stored_position)) = stored_vote else {
+        return Err(vote_not_found_error(round_id, bundle_index, proposal_id));
     };
+
+    if let Some(stored_position) = stored_position {
+        if stored_position < 0 {
+            return Err(invalid_stored_vc_position_error(stored_position));
+        }
+        let stored_position = stored_position as u64;
+        if stored_position != vc_tree_position {
+            return Err(vc_position_already_recorded_error(
+                round_id,
+                bundle_index,
+                proposal_id,
+            ));
+        }
+    }
 
     if let Some(json) = stored_json {
         let mut recovery = parse_recovery(&json)?;
         recovery.vc_tree_position = vc_tree_position;
-        store_recovery_json(
+        store_recovery_json_with_vc_position_if_unchanged(
             db,
             round_id,
             bundle_index,
             proposal_id,
+            stored_choice,
+            stored_commitment.as_deref(),
+            &json,
             &serialize_recovery(&recovery)?,
-            vc_tree_position,
+            vc_tree_position_i64,
         )
     } else {
-        let conn = db.conn();
-        let rows = conn
-            .execute(
-                "UPDATE votes SET vc_tree_position = :pos
-                 WHERE round_id = :round_id AND wallet_id = :wallet_id
-                   AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
-                rusqlite::named_params! {
-                    ":pos": i64::try_from(vc_tree_position).map_err(|_| VotingError::InvalidInput {
-                        message: format!("vc_tree_position {vc_tree_position} does not fit in SQLite i64"),
-                    })?,
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":bundle_index": bundle_index as i64,
-                    ":proposal_id": proposal_id as i64,
-                },
-            )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to record vote commitment tree position: {e}"),
-            })?;
-        debug_assert_eq!(rows, 1);
-        Ok(())
+        store_vc_position_if_unset_or_same(
+            db,
+            round_id,
+            bundle_index,
+            proposal_id,
+            stored_choice,
+            stored_commitment.as_deref(),
+            vc_tree_position_i64,
+        )
     }
 }
 
@@ -386,26 +415,28 @@ pub fn parse_recovery(json: &str) -> Result<VoteRecoveryBundle, VotingError> {
     VoteRecoveryBundle::try_from(parsed)
 }
 
-fn store_recovery_json(
+fn store_recovery_json_for_vote(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
+    choice: u32,
+    commitment: Option<&[u8]>,
     json: &str,
-    vc_tree_position: u64,
 ) -> Result<(), VotingError> {
     let conn = db.conn();
     let wallet_id = db.wallet_id();
     let rows = conn
         .execute(
-            "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = :pos
+            "UPDATE votes SET commitment_bundle_json = :json
              WHERE round_id = :round_id AND wallet_id = :wallet_id
-               AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+               AND bundle_index = :bundle_index AND proposal_id = :proposal_id
+               AND choice = :choice
+               AND (commitment = :commitment OR (commitment IS NULL AND :commitment IS NULL))",
             rusqlite::named_params! {
                 ":json": json,
-                ":pos": i64::try_from(vc_tree_position).map_err(|_| VotingError::InvalidInput {
-                    message: format!("vc_tree_position {vc_tree_position} does not fit in SQLite i64"),
-                })?,
+                ":choice": choice as i64,
+                ":commitment": commitment,
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
@@ -416,11 +447,285 @@ fn store_recovery_json(
             message: format!("failed to store vote recovery bundle: {e}"),
         })?;
     if rows == 0 {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "vote not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
-            ),
-        });
+        return handle_vote_identity_update_miss(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            choice as i64,
+            commitment,
+            "storing recovery",
+        );
+    }
+    Ok(())
+}
+
+fn vote_not_found_error(round_id: &str, bundle_index: u32, proposal_id: u32) -> VotingError {
+    VotingError::InvalidInput {
+        message: format!(
+            "vote not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+        ),
+    }
+}
+
+fn vc_position_already_recorded_error(
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> VotingError {
+    VotingError::InvalidInput {
+        message: format!(
+            "vote commitment tree position already recorded for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+        ),
+    }
+}
+
+fn invalid_stored_vc_position_error(stored_position: i64) -> VotingError {
+    VotingError::Internal {
+        message: format!("stored vc_tree_position must be non-negative, got {stored_position}"),
+    }
+}
+
+fn vote_identity_changed_error(
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    action: &str,
+) -> VotingError {
+    VotingError::InvalidInput {
+        message: format!(
+            "vote changed while {action} for round={round_id}, bundle={bundle_index}, proposal={proposal_id}; retry with the current ballot intent"
+        ),
+    }
+}
+
+fn handle_vote_identity_update_miss(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    choice: i64,
+    commitment: Option<&[u8]>,
+    action: &str,
+) -> Result<(), VotingError> {
+    let existing: Option<(i64, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT choice, commitment FROM votes
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+            rusqlite::named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load vote identity: {e}"),
+        })?;
+
+    match existing {
+        None => Err(vote_not_found_error(round_id, bundle_index, proposal_id)),
+        Some((existing_choice, existing_commitment))
+            if existing_choice == choice && existing_commitment.as_deref() == commitment =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(vote_identity_changed_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            action,
+        )),
+    }
+}
+
+fn handle_vc_position_update_miss(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    vc_tree_position: i64,
+) -> Result<(), VotingError> {
+    let existing_position: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT vc_tree_position FROM votes
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+            rusqlite::named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load vote commitment tree position: {e}"),
+        })?;
+
+    match existing_position {
+        None => Err(vote_not_found_error(round_id, bundle_index, proposal_id)),
+        Some(Some(existing)) if existing < 0 => Err(invalid_stored_vc_position_error(existing)),
+        Some(Some(existing)) if existing != vc_tree_position => Err(
+            vc_position_already_recorded_error(round_id, bundle_index, proposal_id),
+        ),
+        Some(_) => Ok(()),
+    }
+}
+
+fn store_recovery_json_with_vc_position_if_unchanged(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    choice: i64,
+    commitment: Option<&[u8]>,
+    expected_json: &str,
+    updated_json: &str,
+    vc_tree_position: i64,
+) -> Result<(), VotingError> {
+    let conn = db.conn();
+    let wallet_id = db.wallet_id();
+    let rows = conn
+        .execute(
+            "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = :pos
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index AND proposal_id = :proposal_id
+               AND choice = :choice
+               AND (commitment = :commitment OR (commitment IS NULL AND :commitment IS NULL))
+               AND commitment_bundle_json = :expected_json
+               AND (vc_tree_position IS NULL OR vc_tree_position = :pos)",
+            rusqlite::named_params! {
+                ":json": updated_json,
+                ":expected_json": expected_json,
+                ":choice": choice,
+                ":commitment": commitment,
+                ":pos": vc_tree_position,
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to store vote recovery bundle position: {e}"),
+        })?;
+    if rows == 0 {
+        handle_vote_identity_update_miss(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            choice,
+            commitment,
+            "recording vote commitment tree position",
+        )?;
+        let current: Option<(Option<String>, Option<i64>)> = conn
+            .query_row(
+                "SELECT commitment_bundle_json, vc_tree_position FROM votes
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+                rusqlite::named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index as i64,
+                    ":proposal_id": proposal_id as i64,
+                },
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to reload vote recovery bundle: {e}"),
+            })?;
+        match current {
+            Some((Some(current_json), Some(current_position)))
+                if current_json == updated_json && current_position == vc_tree_position =>
+            {
+                return Ok(());
+            }
+            Some((_, Some(current_position))) if current_position != vc_tree_position => {
+                return handle_vc_position_update_miss(
+                    &conn,
+                    round_id,
+                    &wallet_id,
+                    bundle_index,
+                    proposal_id,
+                    vc_tree_position,
+                );
+            }
+            Some(_) => {
+                return Err(vote_identity_changed_error(
+                    round_id,
+                    bundle_index,
+                    proposal_id,
+                    "recording vote commitment tree position",
+                ));
+            }
+            None => return Err(vote_not_found_error(round_id, bundle_index, proposal_id)),
+        }
+    }
+    Ok(())
+}
+
+fn store_vc_position_if_unset_or_same(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    choice: i64,
+    commitment: Option<&[u8]>,
+    vc_tree_position: i64,
+) -> Result<(), VotingError> {
+    let conn = db.conn();
+    let wallet_id = db.wallet_id();
+    let rows = conn
+        .execute(
+            "UPDATE votes SET vc_tree_position = :pos
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index AND proposal_id = :proposal_id
+               AND choice = :choice
+               AND (commitment = :commitment OR (commitment IS NULL AND :commitment IS NULL))
+               AND (vc_tree_position IS NULL OR vc_tree_position = :pos)",
+            rusqlite::named_params! {
+                ":pos": vc_tree_position,
+                ":choice": choice,
+                ":commitment": commitment,
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to record vote commitment tree position: {e}"),
+        })?;
+    if rows == 0 {
+        handle_vote_identity_update_miss(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            choice,
+            commitment,
+            "recording vote commitment tree position",
+        )?;
+        return handle_vc_position_update_miss(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            vc_tree_position,
+        );
     }
     Ok(())
 }
@@ -444,6 +749,64 @@ fn commit_from_recovery(bundle: &VoteRecoveryBundle) -> Result<VoteCommit, Votin
         encrypted_shares: wire_shares,
         share_payloads,
     })
+}
+
+fn stored_vote_commitment_bytes(bundle: &VoteRecoveryBundle) -> Result<Vec<u8>, VotingError> {
+    serde_json::to_vec(&serde_json::json!({
+        "van_nullifier": hex::encode(bundle.van_nullifier),
+        "vote_authority_note_new": hex::encode(bundle.vote_authority_note_new),
+        "vote_commitment": hex::encode(bundle.vote_commitment),
+        "proof": hex::encode(&bundle.proof),
+    }))
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to serialize vote commitment: {e}"),
+    })
+}
+
+fn recovery_matches_draft(bundle: &VoteRecoveryBundle, draft: &DraftVote) -> bool {
+    bundle.vote_decision == draft.choice
+        && bundle.num_options == draft.num_options
+        && bundle.single_share == draft.single_share
+        && bundle.vc_tree_position == draft.vc_tree_position
+}
+
+fn ensure_vote_rebuild_allowed(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<(), VotingError> {
+    let conn = db.conn();
+    let wallet_id = db.wallet_id();
+    let has_tx_hash = conn
+        .query_row(
+            "SELECT tx_hash IS NOT NULL FROM votes
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index
+               AND proposal_id = :proposal_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to check vote submission state: {e}"),
+        })?
+        .unwrap_or(false);
+
+    if has_tx_hash {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote that conflicts with requested draft"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl VoteRecoveryBundle {
@@ -696,16 +1059,86 @@ mod tests {
     }
 
     #[test]
+    fn recovered_commit_is_replayed_only_for_matching_draft() {
+        let bundle = recovery_bundle_fixture();
+        let matching = DraftVote {
+            proposal_id: 1,
+            choice: 2,
+            num_options: 3,
+            single_share: false,
+            vc_tree_position: 456,
+        };
+        assert!(recovery_matches_draft(&bundle, &matching));
+
+        assert!(!recovery_matches_draft(
+            &bundle,
+            &DraftVote {
+                choice: 1,
+                ..matching.clone()
+            }
+        ));
+        assert!(!recovery_matches_draft(
+            &bundle,
+            &DraftVote {
+                num_options: 4,
+                ..matching.clone()
+            }
+        ));
+        assert!(!recovery_matches_draft(
+            &bundle,
+            &DraftVote {
+                single_share: true,
+                ..matching.clone()
+            }
+        ));
+        assert!(!recovery_matches_draft(
+            &bundle,
+            &DraftVote {
+                vc_tree_position: 789,
+                ..matching
+            }
+        ));
+    }
+
+    #[test]
+    fn submitted_vote_rebuild_is_rejected() {
+        let db = db_with_vote();
+        db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
+            .unwrap();
+
+        let err = ensure_vote_rebuild_allowed(&db, ROUND_ID, 0, 1)
+            .expect_err("submitted votes cannot be rebuilt");
+
+        assert!(
+            err.to_string()
+                .contains("submitted vote that conflicts with requested draft"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn vote_lifecycle_apis_replay_persisted_recovery_happy_path() {
         let db = db_with_vote();
         let recovery = recovery_bundle_fixture();
-        store_recovery_json(
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        store_recovery_json_for_vote(
             &db,
             ROUND_ID,
             recovery.bundle_index,
             recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
             &serialize_recovery(&recovery).unwrap(),
-            recovery.vc_tree_position,
         )
         .unwrap();
 
@@ -716,6 +1149,10 @@ mod tests {
         assert_eq!(submission.vote_round_id, ROUND_ID);
         assert_eq!(submission.r_vpk, [0x15; 32]);
         assert_eq!(submission.vote_auth_sig, [0x17; 64]);
+
+        let recovered = recover_commit(&db, ROUND_ID, 0, 1).unwrap();
+        assert_eq!(recovered.vote_commitment, [0x12; 32]);
+        assert_eq!(recovered.share_payloads.len(), 2);
 
         let commit = commit(
             &db,
@@ -750,8 +1187,25 @@ mod tests {
             db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
             Some("txid")
         );
+        assert_eq!(
+            db.vote_phase(ROUND_ID, 0, 1).unwrap(),
+            crate::phases::VotePhase::Submitted
+        );
 
         record_vc_position(&db, ROUND_ID, 0, 1, 789).unwrap();
+        record_vc_position(&db, ROUND_ID, 0, 1, 789).unwrap();
+        let conflict = record_vc_position(&db, ROUND_ID, 0, 1, 790)
+            .expect_err("different confirmed tree position must fail");
+        assert!(
+            conflict
+                .to_string()
+                .contains("tree position already recorded"),
+            "{conflict}"
+        );
+        assert_eq!(
+            db.vote_phase(ROUND_ID, 0, 1).unwrap(),
+            crate::phases::VotePhase::Confirmed
+        );
         let (_, position) = db.get_commitment_bundle(ROUND_ID, 0, 1).unwrap().unwrap();
         assert_eq!(position, 789);
         assert_eq!(
@@ -760,6 +1214,40 @@ mod tests {
                 .unwrap()
                 .vc_tree_position,
             789
+        );
+    }
+
+    #[test]
+    fn recovery_json_write_rejects_replaced_vote_identity() {
+        let db = db_with_vote();
+        let recovery = recovery_bundle_fixture();
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            3,
+            &[0xDD; 32],
+        )
+        .unwrap();
+        let err = store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &serialize_recovery(&recovery).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("vote changed while storing recovery"),
+            "{err}"
         );
     }
 
@@ -777,6 +1265,15 @@ mod tests {
         let db = db_with_vote();
 
         record_vc_position(&db, ROUND_ID, 0, 1, 321).unwrap();
+        record_vc_position(&db, ROUND_ID, 0, 1, 321).unwrap();
+        let conflict = record_vc_position(&db, ROUND_ID, 0, 1, 322)
+            .expect_err("different tree position must fail");
+        assert!(
+            conflict
+                .to_string()
+                .contains("tree position already recorded"),
+            "{conflict}"
+        );
         let position: Option<i64> = db
             .conn()
             .query_row(

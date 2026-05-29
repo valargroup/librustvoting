@@ -9,7 +9,7 @@ use rusqlite::named_params;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::phases::{DelegationPhase, SharePhase, VotePhase};
-use crate::storage::VotingDb;
+use crate::storage::{queries, VotingDb};
 use crate::types::VotingError;
 
 /// The voter's terminal decision for one proposal.
@@ -33,9 +33,12 @@ impl VotingDb {
             Decision::Skipped => (1, None),
         };
         let now = now_secs();
-        let conn = self.conn();
+        let mut conn = self.conn();
         let wallet_id = self.wallet_id();
-        conn.execute(
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("set_ballot_intent transaction failed: {e}"),
+        })?;
+        tx.execute(
             "INSERT INTO ballot_intent
                 (round_id, wallet_id, proposal_id, skipped, choice, created_at, updated_at)
              VALUES (:round_id, :wallet_id, :proposal_id, :skipped, :choice, :now, :now)
@@ -52,6 +55,17 @@ impl VotingDb {
         )
         .map_err(|e| VotingError::Internal {
             message: format!("set_ballot_intent failed: {e}"),
+        })?;
+        queries::clear_stale_share_delegations_for_intent(
+            &tx,
+            round_id,
+            &wallet_id,
+            proposal_id,
+            skipped != 0,
+            choice.map(|c| c as u32),
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("set_ballot_intent commit failed: {e}"),
         })?;
         Ok(())
     }
@@ -103,6 +117,7 @@ fn now_secs() -> i64 {
 
 /// One unit of remaining work for a round. Ordered deterministically within a
 /// `RoundPlan`, so a restart yields the same sequence.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NextStep {
     Delegate {
@@ -111,7 +126,25 @@ pub enum NextStep {
     PollDelegation {
         bundle_index: u32,
     },
+    /// Cast a vote using the recorded ballot intent choice.
+    ///
+    /// A changed choice is recoverable only until a cast-vote transaction has
+    /// been submitted. Once submitted, the proposal authority for that bundle
+    /// has moved on-chain and `resume_plan` reports the conflict as invalid
+    /// state instead of returning a non-actionable recast step.
     CastVote {
+        bundle_index: u32,
+        proposal_id: u32,
+        choice: u32,
+    },
+    /// Submit a previously committed vote using persisted recovery material.
+    ///
+    /// Wallets should reconstruct the vote with `vote::recover_commit` instead
+    /// of rebuilding it from a caller-supplied draft. Submit the recovered
+    /// cast-vote fields to the vote chain, submit the recovered `share_payloads`
+    /// to helper servers, then record the cast-vote tx hash with
+    /// `vote::record_submission`.
+    SubmitVote {
         bundle_index: u32,
         proposal_id: u32,
     },
@@ -153,6 +186,11 @@ fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
         NextStep::CastVote {
             bundle_index,
             proposal_id,
+            choice: _,
+        } => (*bundle_index, 1, *proposal_id, 0),
+        NextStep::SubmitVote {
+            bundle_index,
+            proposal_id,
         } => (*bundle_index, 1, *proposal_id, 0),
         NextStep::PollVote {
             bundle_index,
@@ -171,6 +209,9 @@ fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
 /// `proposal_ids` is the round's full set of proposal ids (from the wallet's
 /// round config); the crate cannot enumerate "never decided" proposals on its
 /// own. The plan is a best-effort snapshot over the durable phase tables.
+/// Wallets should execute one returned step, persist that step's result, then
+/// call `resume_plan` again; later steps may depend on earlier on-chain
+/// confirmations.
 pub fn resume_plan(
     db: &VotingDb,
     round_id: &str,
@@ -228,6 +269,19 @@ pub fn resume_plan(
         })
         .collect();
 
+    for &(bundle_index, proposal_id) in &stale_vote_keys {
+        if matches!(
+            votes.get(&(bundle_index, proposal_id)),
+            Some(VotePhase::Submitted | VotePhase::Confirmed)
+        ) {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote that conflicts with ballot intent"
+                ),
+            });
+        }
+    }
+
     // Vote steps for answered proposals.
     for &pid in &choice_proposals {
         let intent_choice = match intents.get(&pid) {
@@ -242,23 +296,31 @@ pub fn resume_plan(
                 steps.push(NextStep::CastVote {
                     bundle_index: b,
                     proposal_id: pid,
+                    choice: intent_choice,
                 });
                 bundles_needing_delegation.insert(b);
                 continue;
             }
             match votes.get(&vote_key) {
                 Some(VotePhase::Confirmed) => {}
+                Some(VotePhase::Committed) => {
+                    steps.push(NextStep::SubmitVote {
+                        bundle_index: b,
+                        proposal_id: pid,
+                    });
+                }
                 Some(VotePhase::Submitted) => {
                     steps.push(NextStep::PollVote {
                         bundle_index: b,
                         proposal_id: pid,
                     });
                 }
-                // Prepared, Committed, or no row yet -> still needs casting.
+                // Prepared or no row yet -> still needs casting.
                 _ => {
                     steps.push(NextStep::CastVote {
                         bundle_index: b,
                         proposal_id: pid,
+                        choice: intent_choice,
                     });
                     bundles_needing_delegation.insert(b);
                 }
@@ -326,6 +388,8 @@ pub fn resume_plan(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use crate::round::RoundParams;
     use crate::types::NoteInfo;
@@ -403,7 +467,8 @@ mod tests {
                 NextStep::Delegate { bundle_index: 0 },
                 NextStep::CastVote {
                     bundle_index: 0,
-                    proposal_id: 2
+                    proposal_id: 2,
+                    choice: 1,
                 },
             ]
         );
@@ -418,7 +483,6 @@ mod tests {
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
         db.store_vote_tx_hash(ROUND, 0, 2, "vtx").unwrap();
-        db.mark_vote_submitted(ROUND, 0, 2).unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert_eq!(
             plan.next_steps,
@@ -430,7 +494,38 @@ mod tests {
     }
 
     #[test]
-    fn changed_choice_recasts_confirmed_stale_vote() {
+    #[allow(deprecated)]
+    fn committed_vote_yields_submit_not_rebuild() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        crate::storage::queries::store_commitment_bundle(
+            &db.conn(),
+            ROUND,
+            W,
+            0,
+            2,
+            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
+            0,
+        )
+        .unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::SubmitVote {
+                bundle_index: 0,
+                proposal_id: 2
+            }]
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn changed_choice_after_submission_is_invalid_recovery_state() {
         let db = db_with_bundle();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
@@ -450,17 +545,13 @@ mod tests {
         db.mark_vote_submitted(ROUND, 0, 2).unwrap();
 
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
-        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        let err = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap_err();
 
-        assert_eq!(
-            plan.next_steps,
-            vec![NextStep::CastVote {
-                bundle_index: 0,
-                proposal_id: 2
-            }]
+        assert!(
+            err.to_string()
+                .contains("submitted vote that conflicts with ballot intent"),
+            "unexpected error: {err}"
         );
-        assert!(plan.pending_recovery);
-        assert!(!plan.all_decided);
     }
 
     #[test]
@@ -488,8 +579,82 @@ mod tests {
             plan.next_steps,
             vec![NextStep::CastVote {
                 bundle_index: 0,
-                proposal_id: 2
+                proposal_id: 2,
+                choice: 1,
             }]
+        );
+    }
+
+    #[test]
+    fn recast_choice_keeps_old_share_confirmations_suppressed() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+        db.record_share_delegation(
+            ROUND,
+            0,
+            2,
+            0,
+            &["https://helper.example".to_string()],
+            &[0x44; 32],
+            0,
+        )
+        .unwrap();
+
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xDD; 16]).unwrap();
+
+        assert!(
+            db.get_share_delegations(ROUND).unwrap().is_empty(),
+            "recasting must clear helper-share rows for the old vote"
+        );
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::CastVote {
+                bundle_index: 0,
+                proposal_id: 2,
+                choice: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn skipped_intent_clears_and_blocks_stale_share_rows() {
+        let db = db_with_bundle();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+        db.record_share_delegation(
+            ROUND,
+            0,
+            2,
+            0,
+            &["https://helper.example".to_string()],
+            &[0x44; 32],
+            0,
+        )
+        .unwrap();
+
+        db.set_ballot_intent(ROUND, 2, Decision::Skipped).unwrap();
+
+        assert!(db.get_share_delegations(ROUND).unwrap().is_empty());
+        let err = db
+            .record_share_delegation(
+                ROUND,
+                0,
+                2,
+                0,
+                &["https://helper.example".to_string()],
+                &[0x44; 32],
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot record share delegation for skipped proposal"),
+            "{err}"
         );
     }
 
@@ -559,18 +724,21 @@ mod tests {
                 NextStep::Delegate { bundle_index: 0 },
                 NextStep::CastVote {
                     bundle_index: 0,
-                    proposal_id: 2
+                    proposal_id: 2,
+                    choice: 1,
                 },
                 NextStep::Delegate { bundle_index: 1 },
                 NextStep::CastVote {
                     bundle_index: 1,
-                    proposal_id: 2
+                    proposal_id: 2,
+                    choice: 1,
                 },
             ]
         );
     }
 
     #[test]
+    #[allow(deprecated)]
     fn delegate_suppressed_when_vote_confirmed() {
         let db = db_with_bundle();
         // Drive proposal 2 on bundle 0 to VotePhase::Confirmed:
@@ -630,6 +798,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn all_decided_true_with_confirmed_choice_and_skip() {
         let db = db_with_bundle();
 

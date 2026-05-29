@@ -469,6 +469,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn vote_phase_advances_from_persisted_artifacts() {
         let db = db_with_bundle();
         crate::storage::queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 1, 2, &[0xCA; 32])
@@ -488,7 +489,6 @@ mod tests {
         assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Committed);
 
         db.store_vote_tx_hash(ROUND_ID, 0, 1, "tx").unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 1).unwrap();
         assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Confirmed);
     }
 
@@ -551,14 +551,14 @@ fn phase_from_columns(
 }
 
 fn vote_phase_from_columns(
-    submitted: bool,
+    _submitted: bool,
     has_tx_hash: bool,
     has_vc_position: bool,
     has_recovery_bundle: bool,
 ) -> VotePhase {
-    if submitted && has_tx_hash && has_vc_position && has_recovery_bundle {
+    if has_tx_hash && has_vc_position && has_recovery_bundle {
         VotePhase::Confirmed
-    } else if submitted && has_tx_hash {
+    } else if has_tx_hash {
         VotePhase::Submitted
     } else if has_recovery_bundle {
         VotePhase::Committed

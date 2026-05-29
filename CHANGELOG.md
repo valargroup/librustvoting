@@ -16,9 +16,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   vote without re-deriving recovery state. Exported via the prelude
   (`Decision`, `NextStep`, `RoundPlan`, `resume_plan`). Skipped ballot intents
   are treated as terminal decisions, and choice intents now fail fast if no
-  eligible bundle rows exist for the round. The planner compares stored vote
-  rows against the current ballot choice so stale vote/share artifacts from a
-  previous choice do not satisfy a changed decision.
+  eligible bundle rows exist for the round.
+- Added `vote::recover_commit` for `NextStep::SubmitVote` handling. It
+  reconstructs both cast-vote submission fields and helper-share payloads from
+  persisted recovery state so wallets do not need to reassemble recovery JSON
+  and share material manually.
 - Added shared delegation request/report types, account-key loading, Keystone
   PCZT redaction, display memo formatting, prepared-PCZT caching, skipped-suffix
   bundle validation, and bundle weight helpers so wallet SDKs can keep only
@@ -37,6 +39,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   so wallet SDKs can share the snapshot tree-state persistence, witness
   generation, and bundle witness caching flow while keeping wallet DB opening at
   each SDK boundary.
+
 - Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
   `VoteCommit`, `VoteSigner`, `VoteSubmission`, and `VoteRecoveryBundle`.
   `vote::commit` now builds ZKP #2, signs the cast-vote payload, persists the
@@ -54,6 +57,18 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- Changed the `NextStep` API. The enum is now `non_exhaustive`, `CastVote`
+  carries the intended ballot choice, and committed but unsubmitted votes resume
+  through a distinct `SubmitVote` step. Wallets should handle unknown future
+  variants conservatively and call `resume_plan` again after each persisted
+  step.
+- Vote recovery state is now guarded by durable vote identity. Stale recovery
+  JSON, helper-share rows, tx hashes, and vote commitment tree positions cannot
+  be attached to a replacement vote after the voter changes intent.
+- Deprecated the legacy `VotingDb::mark_vote_submitted` and
+  `VotingDb::store_commitment_bundle` writers. New integrations should use
+  `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
+  `vote::record_vc_position`.
 - `vote::serialize_recovery` / `vote::parse_recovery` now own the canonical
   `zcash_voting_vote_recovery_v1` recovery JSON format, replacing wallet-owned
   cast-vote recovery blobs.

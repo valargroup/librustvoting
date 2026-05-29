@@ -19,8 +19,11 @@ precompute → delegate → vote → share lifecycle:
 6. Record each terminal ballot decision with `set_ballot_intent`, then use
    `vote::commit` and `share::*` to submit votes and helper shares.
 7. After restart, call `resume_plan` with the round's full proposal id list and
-   execute the returned `NextStep`s in order. `Decision::Skipped` is terminal,
-   so `open_proposals` contains only proposals that have no recorded decision.
+   execute one returned `NextStep`, persist its result, then call `resume_plan`
+   again. `CastVote` includes the recorded choice, and `SubmitVote` resumes an
+   already committed vote through `vote::recover_commit`. `Decision::Skipped`
+   is terminal, so `open_proposals` contains only proposals that have no
+   recorded decision.
 
 ## Crate layout
 
@@ -90,6 +93,12 @@ crate own the sampling and ordering policy.
   keeps `generate_hotkey(seed)` primitive.
 - Use `session::resume_plan` instead of reconstructing round recovery from raw
   delegation, vote, and share tables in wallet code.
+- Do not use the legacy `VotingDb::store_commitment_bundle` writer for new
+  integrations, or `VotingDb::mark_vote_submitted` as the submission marker.
+  They are compatibility APIs. Use `vote::commit`, `vote::recover_commit`,
+  `vote::record_submission`, and `vote::record_vc_position`.
+- Pre-launch database migrations reset older schema versions; export local test
+  state before opening an older wallet DB with this crate version.
 
 ## License
 

@@ -135,6 +135,8 @@ impl VotingDb {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use crate::types::VotingRoundParams;
 
@@ -229,8 +231,25 @@ mod tests {
         queries::store_vote(&conn, "test-round-1", W, 0, 0, 0, &commitment).unwrap();
         queries::store_vote(&conn, "test-round-1", W, 0, 1, 1, &commitment).unwrap();
 
+        let missing_tx_err =
+            queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap_err();
+        assert!(missing_tx_err.to_string().contains("tx hash missing"));
+        queries::store_vote_tx_hash(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
         queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
         queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
+        queries::store_vote(&conn, "test-round-1", W, 0, 0, 0, &commitment).unwrap();
+        let replace_err =
+            queries::store_vote(&conn, "test-round-1", W, 0, 0, 1, &commitment).unwrap_err();
+        assert!(
+            replace_err
+                .to_string()
+                .contains("cannot replace submitted vote"),
+            "{replace_err}"
+        );
+        assert_eq!(
+            queries::get_vote_tx_hash(&conn, "test-round-1", W, 0, 0).unwrap(),
+            Some("vote-tx".to_string())
+        );
 
         let err = queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 99).unwrap_err();
         assert!(matches!(err, VotingError::InvalidInput { .. }));
@@ -258,6 +277,7 @@ mod tests {
         assert_eq!(votes[1].proposal_id, 1);
         assert_eq!(votes[1].choice, 2);
 
+        queries::store_vote_tx_hash(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
         queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
         let votes = queries::get_votes(&conn, "test-round-1", W).unwrap();
         assert!(votes[0].submitted);

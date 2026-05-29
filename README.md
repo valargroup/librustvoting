@@ -48,7 +48,13 @@ stage-oriented API:
   `Decision::Skipped` for proposals the user intentionally leaves blank, and
   use `resume_plan` after restart to decide whether to delegate, poll
   delegation/vote transactions, cast remaining votes, or confirm helper shares.
-  `open_proposals` contains only proposals with no terminal decision yet.
+  `CastVote` steps include the recorded choice. `SubmitVote` steps mean a vote
+  was already committed locally and should be reconstructed with
+  `vote::recover_commit` rather than rebuilt from a draft. Submit the recovered
+  cast-vote fields and helper-share payloads, persist the cast-vote tx hash
+  with `vote::record_submission`, then re-run the planner because later work
+  may depend on on-chain confirmations. `open_proposals` contains only
+  proposals with no terminal decision yet.
 
 ## Migrating 0.11 to 0.12
 
@@ -65,6 +71,14 @@ stage-oriented API:
 - Replace wallet-local recovery fusion with `session::resume_plan`; keep only
   wallet-specific networking, proof execution, signing, and UI routing at the
   wallet boundary.
+- Do not use the legacy `VotingDb::store_commitment_bundle` writer for new
+  integrations, or `VotingDb::mark_vote_submitted` as the submission marker.
+  They are compatibility APIs. Use `vote::commit`, `vote::recover_commit`,
+  `vote::record_submission`, and `vote::record_vc_position`.
+
+Pre-launch wallet databases with older schema versions are reset when opened by
+this branch; callers that need to preserve test data should export it before
+upgrading the crate.
 
 The workspace depends on the private [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits) repo. The `.cargo/config.toml` enables `git-fetch-with-cli` so your local git credentials are used automatically.
 
