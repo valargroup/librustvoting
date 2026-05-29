@@ -2,15 +2,19 @@
 
 use std::borrow::Borrow;
 
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+use crate::storage::VotingDb;
 use crate::{
     delegate::{load_account_keys, DelegationKeys},
-    types::{NoteInfo, NoteRef, SelectedNotes, VotingError},
+    types::{Network, NoteInfo, NoteRef, SelectedNotes, VotingError},
 };
 
 use zcash_client_backend::{
-    data_api::{Account, WalletRead},
+    data_api::{wallet::ConfirmationsPolicy, Account, WalletRead},
     proto::service::TreeState,
 };
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_protocol::consensus::{BlockHeight, NetworkConstants, Parameters};
 
@@ -33,6 +37,67 @@ pub struct GatherDelegationWalletParams<'a, C, P, CL, R> {
     pub scanned_height: u64,
     pub anchor_tree_state_bytes: Vec<u8>,
     pub resolved_round_name: String,
+}
+
+/// Selects voting-eligible Orchard notes using a caller-opened wallet DB and anchor.
+///
+/// Fetch the anchor tree state first, then open the wallet once and pass it
+/// here. The handle must not be held across an `.await` in async callers because
+/// it is not [`Send`].
+///
+/// # Errors
+///
+/// Returns an error if the wallet DB network does not match `network`, the
+/// wallet is not scanned through `snapshot_height`, or note selection fails.
+pub fn select_notes_with_wallet_db<C, P, CL, R>(
+    wallet_db: &WalletDb<C, P, CL, R>,
+    network: Network,
+    account_uuid: &str,
+    snapshot_height: u64,
+    anchor_tree_state: TreeState,
+) -> Result<SelectedNotes, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    ensure_wallet_network(wallet_db.params(), network)?;
+    ensure_wallet_scanned_to_snapshot(wallet_db, snapshot_height)?;
+    select_snapshot_notes(wallet_db, account_uuid, snapshot_height, anchor_tree_state)
+}
+
+/// Selects voting-eligible Orchard notes and fetches the real snapshot anchor.
+///
+/// Fetches the anchor before opening the wallet database so async API futures
+/// do not hold a non-`Send` database handle across an `.await`.
+///
+/// # Errors
+///
+/// Returns an error if lightwalletd cannot provide the snapshot anchor, the
+/// wallet DB cannot be opened, or [`select_notes_with_wallet_db`] fails.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub async fn select_notes_with_lwd(
+    voting_db: &VotingDb,
+    db_path: &str,
+    lightwalletd_url: &str,
+    network: Network,
+    snapshot_height: u64,
+) -> Result<SelectedNotes, VotingError> {
+    let wallet_id = voting_db.wallet_id();
+    let anchor_tree_state =
+        crate::lwd::anchor_tree_state_with_retry(lightwalletd_url, snapshot_height).await?;
+    // Open after the await so async callers do not capture rusqlite state in
+    // generated Send futures.
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| VotingError::Internal {
+        message: format!("failed to open wallet database: {e}"),
+    })?;
+    let wallet_db = WalletDb::from_connection(conn, network, SystemClock, rand::rngs::OsRng);
+    select_notes_with_wallet_db(
+        &wallet_db,
+        network,
+        &wallet_id,
+        snapshot_height,
+        anchor_tree_state,
+    )
 }
 
 struct SnapshotNote {
@@ -224,6 +289,50 @@ where
     Ok(notes)
 }
 
+fn ensure_wallet_network<P>(wallet_network: &P, network: Network) -> Result<(), VotingError>
+where
+    P: Parameters,
+{
+    if wallet_network.network_type() == network.network_type() {
+        Ok(())
+    } else {
+        Err(VotingError::InvalidInput {
+            message: format!(
+                "wallet network {:?} does not match voting network {:?}",
+                wallet_network.network_type(),
+                network.network_type()
+            ),
+        })
+    }
+}
+
+fn ensure_wallet_scanned_to_snapshot<C, P, CL, R>(
+    wallet_db: &WalletDb<C, P, CL, R>,
+    snapshot_height: u64,
+) -> Result<(), VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let scanned_height = match wallet_db
+        .get_wallet_summary(ConfirmationsPolicy::default())
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load wallet summary: {e}"),
+        })? {
+        Some(summary) => u32::from(summary.fully_scanned_height()) as u64,
+        None => 0,
+    };
+    if scanned_height >= snapshot_height {
+        Ok(())
+    } else {
+        Err(VotingError::InvalidInput {
+            message: format!(
+                "wallet is not synced to voting snapshot height {snapshot_height}. Fully scanned height is {scanned_height}."
+            ),
+        })
+    }
+}
+
 fn parse_account_uuid(account_uuid: &str) -> Result<AccountUuid, VotingError> {
     let uuid = uuid::Uuid::parse_str(account_uuid).map_err(|e| VotingError::InvalidInput {
         message: format!("invalid account UUID: {e}"),
@@ -280,9 +389,11 @@ mod tests {
         )
         .unwrap();
 
+        mark_scanned_through(&conn, 0, snapshot_height);
         let db = WalletDb::from_connection(&conn, network, SystemClock, rand::rngs::OsRng);
-        let selected = select_snapshot_notes(
+        let selected = select_notes_with_wallet_db(
             &db,
+            network,
             &account_uuid.expose_uuid().to_string(),
             snapshot_height,
             placeholder_tree_state(snapshot_height),
@@ -304,6 +415,94 @@ mod tests {
         assert!(selected.notes.iter().all(|note| note.pool == POOL_ORCHARD));
         assert!(selected.notes.iter().all(|note| note.scope == 0));
         assert!(selected.notes.iter().all(|note| !note.ufvk_str.is_empty()));
+    }
+
+    #[test]
+    fn select_notes_with_wallet_db_keeps_sub_divisor_notes_for_smart_bundles() {
+        let network = crate::Network::Regtest;
+        let snapshot_height = 12;
+        let divisor = crate::governance::BALLOT_DIVISOR;
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
+        let account_ref = account_internal_id(&conn, &account_uuid);
+
+        for note_tag in 1..=5 {
+            insert_orchard_note(
+                &conn,
+                account_ref,
+                &orchard_fvk,
+                note_tag,
+                10,
+                divisor / 5,
+                u64::from(note_tag),
+            );
+        }
+
+        mark_scanned_through(&conn, 0, snapshot_height);
+        let db = WalletDb::from_connection(&conn, network, SystemClock, rand::rngs::OsRng);
+        let selected = select_notes_with_wallet_db(
+            &db,
+            network,
+            &account_uuid.expose_uuid().to_string(),
+            snapshot_height,
+            placeholder_tree_state(snapshot_height),
+        )
+        .unwrap();
+
+        assert_eq!(selected.notes.len(), 5);
+        assert!(selected
+            .notes
+            .iter()
+            .all(|note| note.value_zatoshi < divisor));
+        assert_eq!(crate::voting_power(&selected), divisor);
+    }
+
+    #[test]
+    fn select_notes_with_wallet_db_rejects_unsynced_wallet() {
+        let network = crate::Network::Regtest;
+        let snapshot_height = 12;
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
+        let account_ref = account_internal_id(&conn, &account_uuid);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, 1, 3);
+
+        mark_scanned_through(&conn, 0, snapshot_height - 1);
+        let db = WalletDb::from_connection(&conn, network, SystemClock, rand::rngs::OsRng);
+        let err = select_notes_with_wallet_db(
+            &db,
+            network,
+            &account_uuid.expose_uuid().to_string(),
+            snapshot_height,
+            placeholder_tree_state(snapshot_height),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("wallet is not synced to voting snapshot height 12"));
+    }
+
+    #[test]
+    fn select_notes_with_wallet_db_rejects_network_mismatch() {
+        let wallet_network = crate::Network::Regtest;
+        let snapshot_height = 12;
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, wallet_network);
+        let account_ref = account_internal_id(&conn, &account_uuid);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, 1, 3);
+
+        mark_scanned_through(&conn, 0, snapshot_height);
+        let db = WalletDb::from_connection(&conn, wallet_network, SystemClock, rand::rngs::OsRng);
+        let err = select_notes_with_wallet_db(
+            &db,
+            crate::Network::Mainnet,
+            &account_uuid.expose_uuid().to_string(),
+            snapshot_height,
+            placeholder_tree_state(snapshot_height),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("does not match voting network"));
     }
 
     #[test]
@@ -344,10 +543,12 @@ mod tests {
         let snapshot_height = 12;
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, _) = setup_test_account(&mut conn, network);
+        mark_scanned_through(&conn, 0, snapshot_height);
         let db = WalletDb::from_connection(&conn, network, SystemClock, rand::rngs::OsRng);
 
-        let err = select_snapshot_notes(
+        let err = select_notes_with_wallet_db(
             &db,
+            network,
             &account_uuid.expose_uuid().to_string(),
             snapshot_height,
             placeholder_tree_state(snapshot_height),
@@ -410,6 +611,29 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    fn mark_scanned_through(conn: &Connection, start_height: u32, scanned_height: u64) {
+        let scanned_height = u32::try_from(scanned_height).unwrap();
+        conn.execute("DELETE FROM scan_queue", []).unwrap();
+        conn.execute("DELETE FROM blocks", []).unwrap();
+        conn.execute(
+            "INSERT INTO scan_queue (block_range_start, block_range_end, priority)
+             VALUES (?1, ?2, 10)",
+            params![start_height, scanned_height + 1],
+        )
+        .unwrap();
+        for height in start_height..=scanned_height {
+            conn.execute(
+                "INSERT INTO blocks (
+                    height, hash, time, sapling_tree, sapling_commitment_tree_size,
+                    orchard_commitment_tree_size, sapling_output_count, orchard_action_count
+                 )
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0)",
+                params![height, [height as u8; 32], height, Vec::<u8>::new()],
+            )
+            .unwrap();
+        }
     }
 
     fn insert_orchard_note(

@@ -42,6 +42,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   (`select_snapshot_notes`, `select_snapshot_note_infos`, and
   `gather_delegation_wallet_inputs`) so wallet SDKs can reuse the snapshot
   eligibility, Orchard note-info extraction, and selected-note summary logic.
+- Added `select_notes_with_wallet_db` and tree-sync-gated `select_notes_with_lwd`
+  so wallet SDKs can reuse scan-height validation, wallet/network consistency
+  checks, lightwalletd snapshot-anchor fetching, and selected-note assembly
+  without carrying SDK-local wrapper logic.
 - Added library-owned delegation lifecycle stage reporting and branch-id
   provider traits so wallet SDKs can pass progress and consensus-branch
   resolution into `delegate::setup` and `delegate::prove` without duplicating
