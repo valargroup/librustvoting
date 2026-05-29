@@ -42,6 +42,20 @@ stage-oriented API:
   `VoteRecoveryBundle`, and reconstructs vote-chain submissions after a crash.
 - `share::*` recovers helper-share payloads, computes share nullifiers, applies
   share scheduling policy, and records helper-share confirmation state.
+- `session::*` records durable ballot intent and returns a round-level
+  `RoundPlan` with ordered `NextStep`s for restart recovery. Wallets should
+  write `Decision::Choice` before starting a cast-vote flow, write
+  `Decision::Skipped` for proposals the user intentionally leaves blank, and
+  use `resume_plan` after restart to decide whether to delegate, poll
+  delegation/vote transactions, cast remaining votes, or confirm helper shares.
+  `CastVote` steps include the recorded choice. `SubmitVote` steps mean a vote
+  was already committed locally and should be reconstructed with
+  `vote::recover_commit` rather than rebuilt from a draft. Submit the recovered
+  cast-vote fields and helper-share payloads, persist each accepted helper
+  share with `share::record`, persist the cast-vote tx hash with
+  `vote::record_submission`, then re-run the planner because later work may
+  depend on on-chain confirmations. `open_proposals` contains only
+  proposals with no terminal decision yet.
 
 ## Migrating 0.11 to 0.12
 
@@ -55,6 +69,18 @@ stage-oriented API:
   imports with `share::policy::*`.
 - Replace raw vote/share workflow SQL with
   `VotingDb::{vote_phase, vote_phases, share_phase, share_phases}`.
+- Replace wallet-local "what comes next" recovery planning with
+  `session::resume_plan`; fetch execution material through crate APIs such as
+  `vote::recover_commit`, `share::*`, and the tx hash accessors, then keep
+  wallet-specific networking, proof execution, signing, and UI routing at the
+  wallet boundary.
+- Use `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
+  `vote::record_vc_position` for the cast-vote lifecycle. Wallets should not
+  write recovery JSON, submission flags, or vote commitment positions directly.
+
+Pre-launch wallet databases with older schema versions are reset when opened by
+this branch; callers that need to preserve test data should export it before
+upgrading the crate.
 
 The workspace depends on the private [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits) repo. The `.cargo/config.toml` enables `git-fetch-with-cli` so your local git credentials are used automatically.
 

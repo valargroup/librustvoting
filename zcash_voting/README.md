@@ -5,7 +5,7 @@ Client-side library for integrating [Zcash shielded voting](https://github.com/v
 ## Usage
 
 Wallets should import `zcash_voting::prelude::*` and follow the stable setup →
-precompute → delegate lifecycle:
+precompute → delegate → vote → share lifecycle:
 
 1. Open a `VotingDb`, set the wallet id, and call `create_round`.
 2. Convert eligible Orchard notes into `NoteInfo` with
@@ -16,6 +16,16 @@ precompute → delegate lifecycle:
 5. Prove with `delegate::prove`, assemble submission fields with
    `delegation_submission`, and record chain recovery data with
    `record_submission` and `record_van_position`.
+6. Record each terminal ballot decision with `set_ballot_intent`, then use
+   `vote::commit` and `share::*` to submit votes and helper shares.
+7. After restart, call `resume_plan` with the round's full proposal id list and
+   execute one returned `NextStep`, persist its result, then call `resume_plan`
+   again. `CastVote` includes the recorded choice, and `SubmitVote` resumes an
+   already committed vote through `vote::recover_commit`. For `SubmitVote`,
+   submit the recovered cast-vote fields and helper-share payloads, record each
+   accepted helper share with `share::record`, then record the cast-vote tx hash
+   with `vote::record_submission`. `Decision::Skipped` is terminal, so
+   `open_proposals` contains only proposals that have no recorded decision.
 
 ## Crate layout
 
@@ -33,13 +43,16 @@ precompute → delegate lifecycle:
 | `round` | `VotingDb`, `RoundParams`, `RoundInfo`, and idempotent `ensure_bundles`. |
 | `precompute` | Orchard note witness generation and PIR precompute wrappers. |
 | `delegate` | PCZT setup, proof generation, submission assembly, and chain recovery writes. |
+| `vote` | ZKP2 construction, cast-vote signing, and vote recovery bundle persistence. |
+| `share` | Helper-share payload recovery, nullifier computation, and share confirmation state. |
+| `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
 | `hotkey` | Primitive hotkey derivation from caller-supplied seed bytes. |
 | `governance` | Low-level governance derivations and `BALLOT_DIVISOR`. |
 
-Lower-level modules from previous releases remain available during the 0.11
-migration window, but new wallet code should prefer the lifecycle modules above.
+Wallet integrations should use the lifecycle modules above instead of writing
+storage rows directly.
 
 ## Shared wallet policy helpers
 
@@ -80,6 +93,15 @@ crate own the sampling and ordering policy.
   `DelegationSigner::Keystone` instead of separate submission methods.
 - Treat contextual hotkey mixing as wallet policy. The library intentionally
   keeps `generate_hotkey(seed)` primitive.
+- Use `session::resume_plan` instead of reconstructing what comes next from raw
+  delegation, vote, and share phases in wallet code. Fetch step execution
+  material through crate APIs such as `vote::recover_commit`, `share::*`, and
+  the tx hash accessors.
+- Use `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
+  `vote::record_vc_position` for the cast-vote lifecycle. Wallets should not
+  write recovery JSON, submission flags, or vote commitment positions directly.
+- Pre-launch database migrations reset older schema versions; export local test
+  state before opening an older wallet DB with this crate version.
 
 ## License
 

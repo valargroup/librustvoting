@@ -52,7 +52,6 @@ pub struct VoteRecord {
     pub proposal_id: u32,
     pub bundle_index: u32,
     pub choice: u32,
-    pub submitted: bool,
 }
 
 /// Compact round info for list_rounds().
@@ -161,7 +160,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -229,10 +228,24 @@ mod tests {
         queries::store_vote(&conn, "test-round-1", W, 0, 0, 0, &commitment).unwrap();
         queries::store_vote(&conn, "test-round-1", W, 0, 1, 1, &commitment).unwrap();
 
-        queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
-        queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
+        queries::record_vote_submission(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
+        queries::record_vote_submission(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
+        queries::store_vote(&conn, "test-round-1", W, 0, 0, 0, &commitment).unwrap();
+        let replace_err =
+            queries::store_vote(&conn, "test-round-1", W, 0, 0, 1, &commitment).unwrap_err();
+        assert!(
+            replace_err
+                .to_string()
+                .contains("cannot replace submitted vote"),
+            "{replace_err}"
+        );
+        assert_eq!(
+            queries::get_vote_tx_hash(&conn, "test-round-1", W, 0, 0).unwrap(),
+            Some("vote-tx".to_string())
+        );
 
-        let err = queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 99).unwrap_err();
+        let err = queries::record_vote_submission(&conn, "test-round-1", W, 0, 99, "vote-tx")
+            .unwrap_err();
         assert!(matches!(err, VotingError::InvalidInput { .. }));
     }
 
@@ -254,14 +267,16 @@ mod tests {
         assert_eq!(votes.len(), 2);
         assert_eq!(votes[0].proposal_id, 0);
         assert_eq!(votes[0].choice, 0);
-        assert!(!votes[0].submitted);
         assert_eq!(votes[1].proposal_id, 1);
         assert_eq!(votes[1].choice, 2);
 
-        queries::mark_vote_submitted(&conn, "test-round-1", W, 0, 0).unwrap();
+        queries::record_vote_submission(&conn, "test-round-1", W, 0, 0, "vote-tx").unwrap();
         let votes = queries::get_votes(&conn, "test-round-1", W).unwrap();
-        assert!(votes[0].submitted);
-        assert!(!votes[1].submitted);
+        assert_eq!(
+            queries::get_vote_tx_hash(&conn, "test-round-1", W, 0, 0).unwrap(),
+            Some("vote-tx".to_string())
+        );
+        assert_eq!(votes.len(), 2);
     }
 
     #[test]

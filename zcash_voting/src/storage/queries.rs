@@ -999,11 +999,11 @@ pub fn load_zkp2_inputs(
         message: format!("failed to load ZKP2 inputs for round={}, bundle={} ({})", round_id, bundle_index, e),
     })?;
 
-    // Compute current proposal_authority by clearing bits for already-submitted votes
-    // for THIS bundle specifically.
+    // Compute current proposal_authority by clearing bits for votes with a
+    // durable tx hash for THIS bundle specifically.
     let mut authority = MAX_PROPOSAL_AUTHORITY;
     let mut stmt = conn
-        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND submitted = 1")
+        .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND tx_hash IS NOT NULL")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare proposal_authority query: {}", e),
         })?;
@@ -1709,22 +1709,197 @@ pub fn store_vote(
         .unwrap()
         .as_secs() as i64;
 
-    conn.execute(
-        "INSERT OR REPLACE INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, commitment, submitted, created_at)
-         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :choice, :commitment, 0, :created_at)",
-        named_params! {
-            ":round_id": round_id,
-            ":wallet_id": wallet_id,
-            ":bundle_index": bundle_index as i64,
-            ":proposal_id": proposal_id as i64,
-            ":choice": choice as i64,
-            ":commitment": commitment,
-            ":created_at": now,
-        },
-    )
+    conn.execute_batch("SAVEPOINT store_vote_replace")
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to start store vote savepoint: {}", e),
+        })?;
+
+    let result: Result<(), VotingError> = (|| {
+        let existing_vote: Option<(i64, Option<Vec<u8>>, bool)> = conn
+            .query_row(
+                "SELECT choice, commitment, tx_hash IS NOT NULL FROM votes
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND bundle_index = :bundle_index
+                   AND proposal_id = :proposal_id",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index as i64,
+                    ":proposal_id": proposal_id as i64,
+                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
+            )
+            .optional()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to load existing vote before store: {}", e),
+            })?;
+        let vote_changed = existing_vote
+            .as_ref()
+            .map(|(stored_choice, stored_commitment, _)| {
+                *stored_choice != choice as i64 || stored_commitment.as_deref() != Some(commitment)
+            })
+            .unwrap_or(false);
+        if let Some((_, _, true)) = existing_vote.as_ref() {
+            if vote_changed {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "cannot replace submitted vote for round={}, wallet={}, bundle={}, proposal={}",
+                        round_id, wallet_id, bundle_index, proposal_id
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        if existing_vote.is_some() && !vote_changed {
+            return Ok(());
+        }
+
+        conn.execute(
+            "INSERT OR REPLACE INTO votes (round_id, wallet_id, bundle_index, proposal_id, choice, commitment, created_at)
+             VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :choice, :commitment, :created_at)",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+                ":choice": choice as i64,
+                ":commitment": commitment,
+                ":created_at": now,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to store vote: {}", e),
+        })?;
+
+        if vote_changed {
+            conn.execute(
+                "DELETE FROM share_delegations
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND bundle_index = :bundle_index
+                   AND proposal_id = :proposal_id",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index as i64,
+                    ":proposal_id": proposal_id as i64,
+                },
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to clear stale share delegations: {}", e),
+            })?;
+        }
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => conn
+            .execute_batch("RELEASE SAVEPOINT store_vote_replace")
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to commit store vote savepoint: {}", e),
+            }),
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT store_vote_replace; RELEASE SAVEPOINT store_vote_replace",
+            );
+            Err(err)
+        }
+    }
+}
+
+pub fn clear_stale_share_delegations_for_intent(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    proposal_id: u32,
+    skipped: bool,
+    choice: Option<u32>,
+) -> Result<u64, VotingError> {
+    let rows = if skipped {
+        conn.execute(
+            "DELETE FROM share_delegations
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND proposal_id = :proposal_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+            },
+        )
+    } else if let Some(choice) = choice {
+        conn.execute(
+            "DELETE FROM share_delegations
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND proposal_id = :proposal_id
+               AND NOT EXISTS (
+                   SELECT 1 FROM votes
+                   WHERE votes.round_id = share_delegations.round_id
+                     AND votes.wallet_id = share_delegations.wallet_id
+                     AND votes.bundle_index = share_delegations.bundle_index
+                     AND votes.proposal_id = share_delegations.proposal_id
+                     AND votes.choice = :choice
+               )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+                ":choice": choice as i64,
+            },
+        )
+    } else {
+        Ok(0)
+    }
     .map_err(|e| VotingError::Internal {
-        message: format!("failed to store vote: {}", e),
+        message: format!("failed to clear stale share delegations: {}", e),
     })?;
+    Ok(rows as u64)
+}
+
+pub fn ensure_no_submitted_vote_conflict_for_intent(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    proposal_id: u32,
+    skipped: bool,
+    choice: Option<u32>,
+) -> Result<(), VotingError> {
+    let conflicting_bundle = conn
+        .query_row(
+            "SELECT bundle_index
+             FROM votes
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND proposal_id = :proposal_id
+               AND tx_hash IS NOT NULL
+               AND (:skipped != 0 OR choice != :choice)
+             ORDER BY bundle_index
+             LIMIT 1",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+                ":skipped": if skipped { 1_i64 } else { 0_i64 },
+                ":choice": choice.map(|c| c as i64),
+            },
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to check submitted vote intent conflict: {}", e),
+        })?;
+
+    if let Some(bundle_index) = conflicting_bundle {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote that conflicts with ballot intent"
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -1735,7 +1910,7 @@ pub fn get_votes(
     wallet_id: &str,
 ) -> Result<Vec<VoteRecord>, VotingError> {
     let mut stmt = conn
-        .prepare("SELECT proposal_id, bundle_index, choice, submitted FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id")
+        .prepare("SELECT proposal_id, bundle_index, choice FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id")
         .map_err(|e| VotingError::Internal {
             message: format!("failed to prepare get_votes: {}", e),
         })?;
@@ -1748,7 +1923,6 @@ pub fn get_votes(
                     proposal_id: row.get::<_, i64>(0)? as u32,
                     bundle_index: row.get::<_, i64>(1)? as u32,
                     choice: row.get::<_, i64>(2)? as u32,
-                    submitted: row.get::<_, i64>(3)? != 0,
                 })
             },
         )
@@ -1786,43 +1960,6 @@ pub fn delete_bundles_from(
             message: format!("failed to delete bundles from index {}: {}", from_index, e),
         })?;
     Ok(rows as u64)
-}
-
-pub fn mark_vote_submitted(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-) -> Result<(), VotingError> {
-    let rows = conn
-        .execute(
-            "UPDATE votes SET submitted = 1 \
-             WHERE round_id = :round_id \
-             AND wallet_id = :wallet_id \
-             AND bundle_index = :bundle_index \
-             AND proposal_id = :proposal_id",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": bundle_index as i64,
-                ":proposal_id": proposal_id as i64,
-            },
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to mark vote submitted: {}", e),
-        })?;
-
-    if rows == 0 {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "no vote found for round={}, wallet={}, bundle={}, proposal={}",
-                round_id, wallet_id, bundle_index, proposal_id
-            ),
-        });
-    }
-
-    Ok(())
 }
 
 // --- Recovery state: TX hashes ---
@@ -1878,7 +2015,7 @@ pub fn get_delegation_tx_hash(
     })
 }
 
-pub fn store_vote_tx_hash(
+pub fn record_vote_submission(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -1886,9 +2023,37 @@ pub fn store_vote_tx_hash(
     proposal_id: u32,
     tx_hash: &str,
 ) -> Result<(), VotingError> {
+    ensure_vote_submission_matches_ballot_intent(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+    )?;
     let rows = conn
         .execute(
-            "UPDATE votes SET tx_hash = :tx_hash WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+            "UPDATE votes SET tx_hash = :tx_hash
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index
+               AND proposal_id = :proposal_id
+               AND (tx_hash IS NULL OR tx_hash = :tx_hash)
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM ballot_intent
+                       WHERE round_id = :round_id
+                         AND wallet_id = :wallet_id
+                         AND proposal_id = :proposal_id
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM ballot_intent
+                       WHERE round_id = :round_id
+                         AND wallet_id = :wallet_id
+                         AND proposal_id = :proposal_id
+                         AND skipped = 0
+                         AND choice = votes.choice
+                   )
+               )",
             named_params! {
                 ":tx_hash": tx_hash,
                 ":round_id": round_id,
@@ -1898,9 +2063,31 @@ pub fn store_vote_tx_hash(
             },
         )
         .map_err(|e| VotingError::Internal {
-            message: format!("failed to store vote tx hash: {}", e),
+            message: format!("failed to record vote submission: {}", e),
         })?;
     if rows == 0 {
+        ensure_vote_submission_matches_ballot_intent(
+            conn,
+            round_id,
+            wallet_id,
+            bundle_index,
+            proposal_id,
+        )?;
+        if let Some(existing) =
+            existing_vote_tx_hash(conn, round_id, wallet_id, bundle_index, proposal_id)?
+        {
+            if existing.as_deref() == Some(tx_hash) {
+                return Ok(());
+            }
+            if existing.is_some() {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "vote tx hash already recorded for round={}, wallet={}, bundle={}, proposal={}",
+                        round_id, wallet_id, bundle_index, proposal_id
+                    ),
+                });
+            }
+        }
         return Err(VotingError::InvalidInput {
             message: format!(
                 "no vote found for round={}, wallet={}, bundle={}, proposal={}",
@@ -1909,6 +2096,33 @@ pub fn store_vote_tx_hash(
         });
     }
     Ok(())
+}
+
+fn existing_vote_tx_hash(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Option<Option<String>>, VotingError> {
+    conn.query_row(
+        "SELECT tx_hash FROM votes
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index
+           AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to load existing vote tx hash: {}", e),
+    })
 }
 
 pub fn get_vote_tx_hash(
@@ -1931,43 +2145,6 @@ pub fn get_vote_tx_hash(
     .map_err(|e| VotingError::Internal {
         message: format!("failed to get vote tx hash: {}", e),
     })
-}
-
-// --- Recovery state: commitment bundles ---
-
-pub fn store_commitment_bundle(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    bundle_json: &str,
-    vc_tree_position: u64,
-) -> Result<(), VotingError> {
-    let rows = conn
-        .execute(
-            "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = :pos WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
-            named_params! {
-                ":json": bundle_json,
-                ":pos": vc_tree_position as i64,
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": bundle_index as i64,
-                ":proposal_id": proposal_id as i64,
-            },
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to store commitment bundle: {}", e),
-        })?;
-    if rows == 0 {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "no vote found for round={}, wallet={}, bundle={}, proposal={}",
-                round_id, wallet_id, bundle_index, proposal_id
-            ),
-        });
-    }
-    Ok(())
 }
 
 pub fn get_commitment_bundle(
@@ -2115,7 +2292,12 @@ pub fn clear_recovery_state(
 // --- Share delegation tracking ---
 
 /// Record a share delegation after sending to helper servers.
-pub fn record_share_delegation(
+///
+/// This raw SQL helper is crate-internal because callers must provide a
+/// nullifier that matches the persisted vote recovery bundle. Wallet
+/// integrations should use `share::record`, which derives that nullifier from
+/// recovery state before storing the helper delivery state.
+pub(crate) fn record_share_delegation(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -2126,6 +2308,7 @@ pub fn record_share_delegation(
     nullifier: &[u8],
     submit_at: u64,
 ) -> Result<(), VotingError> {
+    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
     let urls_json = serde_json::to_string(sent_to_urls).map_err(|e| VotingError::Internal {
         message: format!("failed to serialize sent_to_urls: {}", e),
     })?;
@@ -2139,8 +2322,8 @@ pub fn record_share_delegation(
          VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :sent_to_urls, :nullifier, 0, :submit_at, :created_at) \
          ON CONFLICT (round_id, wallet_id, bundle_index, proposal_id, share_index) DO UPDATE SET \
          sent_to_urls = excluded.sent_to_urls, \
-         nullifier = excluded.nullifier, \
-         submit_at = excluded.submit_at",
+         submit_at = excluded.submit_at \
+         WHERE share_delegations.nullifier = excluded.nullifier",
         named_params! {
             ":round_id": round_id,
             ":wallet_id": wallet_id,
@@ -2155,6 +2338,17 @@ pub fn record_share_delegation(
     )
     .map_err(|e| VotingError::Internal {
         message: format!("failed to record share delegation: {}", e),
+    })
+    .and_then(|rows| {
+        if rows == 0 {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "share nullifier conflict for round={}, wallet={}, bundle={}, proposal={}, share={}",
+                    round_id, wallet_id, bundle_index, proposal_id, share_index
+                ),
+            });
+        }
+        Ok(())
     })?;
     Ok(())
 }
@@ -2268,6 +2462,7 @@ pub fn mark_share_confirmed(
     proposal_id: u32,
     share_index: u32,
 ) -> Result<(), VotingError> {
+    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
     let updated = conn
         .execute(
             "UPDATE share_delegations SET confirmed = 1 \
@@ -2295,6 +2490,154 @@ pub fn mark_share_confirmed(
     Ok(())
 }
 
+fn ensure_share_matches_ballot_intent(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<(), VotingError> {
+    let intent = load_ballot_intent(conn, round_id, wallet_id, proposal_id, "share delegation")?;
+    let Some((skipped, choice)) = intent else {
+        return Ok(());
+    };
+    if skipped != 0 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "cannot record share delegation for skipped proposal round={}, wallet={}, bundle={}, proposal={}",
+                round_id, wallet_id, bundle_index, proposal_id
+            ),
+        });
+    }
+    let Some(choice) = choice else {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "ballot intent choice missing for round={}, wallet={}, proposal={}",
+                round_id, wallet_id, proposal_id
+            ),
+        });
+    };
+    let vote_choice = load_vote_choice_for_intent_check(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        "share delegation",
+    )?;
+    if vote_choice == Some(choice) {
+        return Ok(());
+    }
+    Err(VotingError::InvalidInput {
+        message: format!(
+            "share delegation conflicts with ballot intent for round={}, wallet={}, bundle={}, proposal={}",
+            round_id, wallet_id, bundle_index, proposal_id
+        ),
+    })
+}
+
+fn ensure_vote_submission_matches_ballot_intent(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<(), VotingError> {
+    let intent = load_ballot_intent(conn, round_id, wallet_id, proposal_id, "vote submission")?;
+    let Some((skipped, choice)) = intent else {
+        return Ok(());
+    };
+    let vote_choice = load_vote_choice_for_intent_check(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        "vote submission",
+    )?;
+    let Some(vote_choice) = vote_choice else {
+        return Ok(());
+    };
+    if skipped != 0 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "cannot record vote submission for skipped proposal round={}, wallet={}, bundle={}, proposal={}",
+                round_id, wallet_id, bundle_index, proposal_id
+            ),
+        });
+    }
+    let Some(choice) = choice else {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "ballot intent choice missing for round={}, wallet={}, proposal={}",
+                round_id, wallet_id, proposal_id
+            ),
+        });
+    };
+    if vote_choice == choice {
+        return Ok(());
+    }
+    Err(VotingError::InvalidInput {
+        message: format!(
+            "vote submission conflicts with ballot intent for round={}, wallet={}, bundle={}, proposal={}",
+            round_id, wallet_id, bundle_index, proposal_id
+        ),
+    })
+}
+
+fn load_ballot_intent(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    proposal_id: u32,
+    artifact: &str,
+) -> Result<Option<(i64, Option<i64>)>, VotingError> {
+    conn.query_row(
+        "SELECT skipped, choice FROM ballot_intent
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":proposal_id": proposal_id as i64,
+        },
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to load ballot intent for {}: {}", artifact, e),
+    })
+}
+
+fn load_vote_choice_for_intent_check(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    artifact: &str,
+) -> Result<Option<i64>, VotingError> {
+    conn.query_row(
+        "SELECT choice FROM votes
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index
+           AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to load vote choice for {}: {}", artifact, e),
+    })
+}
+
 /// Append new server URLs to a share delegation's sent_to_urls.
 /// Used after resubmitting an overdue share to additional servers.
 pub fn add_sent_servers(
@@ -2306,6 +2649,7 @@ pub fn add_sent_servers(
     share_index: u32,
     new_urls: &[String],
 ) -> Result<(), VotingError> {
+    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
     // Read current URLs
     let current_json: String = conn
         .query_row(

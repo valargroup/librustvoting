@@ -9,6 +9,27 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added `session::resume_plan` plus a durable `ballot_intent` table (schema v11):
+  a pure, I/O-free round-level planner that fuses the per-bundle delegation,
+  vote, and share phases with the voter's recorded ballot intent into an ordered
+  list of `NextStep`s, so wallet SDKs can resume an interrupted multi-question
+  vote without re-deriving recovery state. Exported via the prelude
+  (`Decision`, `NextStep`, `RoundPlan`, `resume_plan`). `NextStep` is
+  `non_exhaustive`; `CastVote` carries the recorded choice, committed but
+  unsubmitted votes resume through `SubmitVote`, and confirmed votes missing
+  helper-share rows resume through per-share `SubmitShares` steps derived from
+  recovered share payloads. Vote work is ordered by proposal before bundle so
+  interrupted multi-bundle questions finish before later questions resume.
+  Skipped ballot intents are terminal decisions, `open_proposals` contains only
+  proposals with no recorded decision, and choice intents fail fast if no
+  eligible bundle rows exist for the round. Intent changes that conflict with an
+  already-submitted vote fail before any recovery rows are cleaned up, and stale
+  vote submissions are rejected after an intent changes.
+- Added `vote::recover_commit` for `NextStep::SubmitVote` handling. It
+  reconstructs both cast-vote submission fields and helper-share payloads from
+  persisted recovery state so wallets do not need to reassemble recovery JSON
+  and share material manually, while `share::record` persists accepted recovered
+  helper shares with crate-derived nullifiers.
 - Added shared delegation request/report types, account-key loading, Keystone
   PCZT redaction, display memo formatting, prepared-PCZT caching, skipped-suffix
   bundle validation, and bundle weight helpers so wallet SDKs can keep only
@@ -40,10 +61,27 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   can derive vote/share recovery state without querying SQLite tables directly.
 - Added `precompute::{sync_vote_tree, van_witness, reset_vote_tree}` as the
   public vote commitment tree sync and VAN witness surface.
-- Added `examples/end_to_end_vote.rs` and README migration notes for moving from
-  the delegation-oriented V2 API to the new vote/share API.
+- Added `examples/end_to_end_vote.rs` and README notes for moving from the
+  delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- Vote recovery state is now guarded by durable vote identity. Stale recovery
+  JSON, helper-share rows, tx hashes, and vote commitment tree positions cannot
+  be attached to a replacement vote after the voter changes intent.
+- Helper-share recording now rejects conflicting nullifiers for an existing
+  share key in the shared storage layer.
+- The raw nullifier-taking helper-share storage writer is now crate-internal.
+  Wallet integrations use `share::record`, which derives the nullifier from
+  persisted vote recovery state.
+- Removed the legacy `VotingDb::mark_vote_submitted`,
+  `VotingDb::store_vote_tx_hash`, and `VotingDb::store_commitment_bundle`
+  writers, and dropped the stale `votes.submitted` column. Integrations now use
+  `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
+  `vote::record_vc_position`.
+- `precompute::sync_vote_tree` now rebuilds a round's sparse vote-tree client
+  when recovery records a new historical VAN position after an earlier sync,
+  so wallets can resume interrupted multi-question votes without manually
+  resetting tree state.
 - `vote::serialize_recovery` / `vote::parse_recovery` now own the canonical
   `zcash_voting_vote_recovery_v1` recovery JSON format, replacing wallet-owned
   cast-vote recovery blobs.

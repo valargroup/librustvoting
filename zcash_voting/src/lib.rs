@@ -4,9 +4,9 @@
 //! create a round, bind eligible notes into bundles, precompute witness/PIR
 //! data, build a delegation PCZT, prove delegation, sync the vote commitment
 //! tree, cast votes with `vote::commit`, recover helper-share payloads through
-//! `share`, and finally record chain submission data. Lower-level modules remain
-//! available during the wallet migration window, but new integrations should use
-//! `round`, `precompute`, `delegate`, `vote`, and `share`.
+//! `share`, and finally record chain submission data. New integrations should
+//! use `round`, `precompute`, `delegate`, `vote`, `share`, and `session` rather
+//! than writing storage rows directly.
 
 pub mod action;
 pub mod decompose;
@@ -29,6 +29,7 @@ pub mod pir_snapshot;
 pub mod precompute;
 pub mod prelude;
 pub mod round;
+pub mod session;
 pub mod share;
 pub mod share_policy;
 pub mod share_tracking;

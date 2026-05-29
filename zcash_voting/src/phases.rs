@@ -203,7 +203,7 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         let phase = conn
             .query_row(
-                "SELECT submitted, tx_hash IS NOT NULL, vc_tree_position IS NOT NULL,
+                "SELECT tx_hash IS NOT NULL, vc_tree_position IS NOT NULL,
                         commitment_bundle_json IS NOT NULL
                  FROM votes
                  WHERE round_id = :round_id
@@ -221,7 +221,6 @@ impl VotingDb {
                         row.get::<_, i64>(0)? != 0,
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
-                        row.get::<_, i64>(3)? != 0,
                     ))
                 },
             )
@@ -243,7 +242,7 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         let mut stmt = conn
             .prepare(
-                "SELECT bundle_index, proposal_id, submitted, tx_hash IS NOT NULL,
+                "SELECT bundle_index, proposal_id, tx_hash IS NOT NULL,
                         vc_tree_position IS NOT NULL, commitment_bundle_json IS NOT NULL
                  FROM votes
                  WHERE round_id = :round_id AND wallet_id = :wallet_id
@@ -264,7 +263,6 @@ impl VotingDb {
                             row.get::<_, i64>(2)? != 0,
                             row.get::<_, i64>(3)? != 0,
                             row.get::<_, i64>(4)? != 0,
-                            row.get::<_, i64>(5)? != 0,
                         ),
                     ))
                 },
@@ -386,6 +384,31 @@ mod tests {
         db
     }
 
+    fn store_vote_recovery_fixture(
+        db: &VotingDb,
+        bundle_index: u32,
+        proposal_id: u32,
+        vc_tree_position: Option<u64>,
+    ) {
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = :pos
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index
+               AND proposal_id = :proposal_id",
+            named_params! {
+                ":json": r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
+                ":pos": vc_tree_position.map(|position| position as i64),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+        )
+        .unwrap();
+    }
+
     fn round_params() -> RoundParams {
         RoundParams {
             vote_round_id: ROUND_ID.to_string(),
@@ -475,20 +498,11 @@ mod tests {
             .unwrap();
         assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Prepared);
 
-        crate::storage::queries::store_commitment_bundle(
-            &db.conn(),
-            ROUND_ID,
-            WALLET_ID,
-            0,
-            1,
-            r#"{"format":"zcash_voting_vote_recovery_v1"}"#,
-            456,
-        )
-        .unwrap();
+        store_vote_recovery_fixture(&db, 0, 1, None);
         assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Committed);
 
-        db.store_vote_tx_hash(ROUND_ID, 0, 1, "tx").unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 1).unwrap();
+        db.record_vote_submission(ROUND_ID, 0, 1, "tx").unwrap();
+        store_vote_recovery_fixture(&db, 0, 1, Some(456));
         assert_eq!(db.vote_phase(ROUND_ID, 0, 1).unwrap(), VotePhase::Confirmed);
     }
 
@@ -551,14 +565,13 @@ fn phase_from_columns(
 }
 
 fn vote_phase_from_columns(
-    submitted: bool,
     has_tx_hash: bool,
     has_vc_position: bool,
     has_recovery_bundle: bool,
 ) -> VotePhase {
-    if submitted && has_tx_hash && has_vc_position && has_recovery_bundle {
+    if has_tx_hash && has_vc_position && has_recovery_bundle {
         VotePhase::Confirmed
-    } else if submitted && has_tx_hash {
+    } else if has_tx_hash {
         VotePhase::Submitted
     } else if has_recovery_bundle {
         VotePhase::Committed

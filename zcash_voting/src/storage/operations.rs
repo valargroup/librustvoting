@@ -320,7 +320,7 @@ impl VotingDb {
         queries::list_rounds(&conn, &wallet_id)
     }
 
-    /// Get all votes for a round (with choice, bundle_index, and submitted status).
+    /// Get all votes for a round, including proposal, bundle, and choice.
     pub fn get_votes(&self, round_id: &str) -> Result<Vec<VoteRecord>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
@@ -1253,18 +1253,6 @@ impl VotingDb {
         queries::delete_bundles_from(&conn, round_id, &wallet_id, keep_count)
     }
 
-    /// Mark a vote as submitted to the vote chain.
-    pub fn mark_vote_submitted(
-        &self,
-        round_id: &str,
-        bundle_index: u32,
-        proposal_id: u32,
-    ) -> Result<(), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::mark_vote_submitted(&conn, round_id, &wallet_id, bundle_index, proposal_id)
-    }
-
     // --- Recovery state ---
 
     pub fn store_delegation_tx_hash(
@@ -1288,25 +1276,6 @@ impl VotingDb {
         queries::get_delegation_tx_hash(&conn, round_id, &wallet_id, bundle_index)
     }
 
-    pub fn store_vote_tx_hash(
-        &self,
-        round_id: &str,
-        bundle_index: u32,
-        proposal_id: u32,
-        tx_hash: &str,
-    ) -> Result<(), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::store_vote_tx_hash(
-            &conn,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            proposal_id,
-            tx_hash,
-        )
-    }
-
     pub fn get_vote_tx_hash(
         &self,
         round_id: &str,
@@ -1318,24 +1287,22 @@ impl VotingDb {
         queries::get_vote_tx_hash(&conn, round_id, &wallet_id, bundle_index, proposal_id)
     }
 
-    pub fn store_commitment_bundle(
+    pub fn record_vote_submission(
         &self,
         round_id: &str,
         bundle_index: u32,
         proposal_id: u32,
-        bundle_json: &str,
-        vc_tree_position: u64,
+        tx_hash: &str,
     ) -> Result<(), VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        queries::store_commitment_bundle(
+        queries::record_vote_submission(
             &conn,
             round_id,
             &wallet_id,
             bundle_index,
             proposal_id,
-            bundle_json,
-            vc_tree_position,
+            tx_hash,
         )
     }
 
@@ -1380,6 +1347,9 @@ impl VotingDb {
         queries::get_keystone_signatures(&conn, round_id, &wallet_id)
     }
 
+    /// Clears derived recovery artifacts while preserving the voter's ballot
+    /// intent. Use `clear_round`/`delete_round` to remove the whole round,
+    /// including recorded decisions.
     pub fn clear_recovery_state(&self, round_id: &str) -> Result<(), VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
@@ -1389,7 +1359,12 @@ impl VotingDb {
     // --- Share delegation tracking ---
 
     /// Record a share delegation after sending to helper servers.
-    pub fn record_share_delegation(
+    ///
+    /// This raw storage helper is crate-internal because callers must provide a
+    /// nullifier that matches the persisted vote recovery bundle. Wallet
+    /// integrations should use `share::record`, which derives that nullifier
+    /// from recovery state.
+    pub(crate) fn record_share_delegation(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -2381,7 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_vote_submitted() {
+    fn test_record_vote_submission() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
         db.setup_bundles(
@@ -2402,10 +2377,14 @@ mod tests {
 
         db.insert_vote_fixture(ROUND_ID, 0, 0, 0, &[0xAA; 32])
             .unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 0).unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 0).unwrap();
+        db.record_vote_submission(ROUND_ID, 0, 0, "vote-tx")
+            .unwrap();
+        db.record_vote_submission(ROUND_ID, 0, 0, "vote-tx")
+            .unwrap();
 
-        let err = db.mark_vote_submitted(ROUND_ID, 0, 99).unwrap_err();
+        let err = db
+            .record_vote_submission(ROUND_ID, 0, 99, "vote-tx")
+            .unwrap_err();
         assert!(matches!(err, VotingError::InvalidInput { .. }));
     }
 
@@ -2439,41 +2418,53 @@ mod tests {
         );
 
         assert_invalid_input(
-            db.store_vote_tx_hash(ROUND_ID, 0, 1, "vote-tx")
+            db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
                 .expect_err("missing vote row must fail"),
             "no vote found",
         );
-        assert_invalid_input(
-            db.store_commitment_bundle(ROUND_ID, 0, 1, "{}", 42)
-                .expect_err("missing vote row must fail"),
-            "no vote found",
-        );
-
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
-        db.store_vote_tx_hash(ROUND_ID, 0, 1, "vote-tx").unwrap();
+        db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
+            .unwrap();
         assert_eq!(
             db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap(),
             Some("vote-tx".to_string())
         );
-
-        db.store_commitment_bundle(ROUND_ID, 0, 1, "{\"ok\":true}", 42)
+        db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
             .unwrap();
-        assert_eq!(
-            db.get_commitment_bundle(ROUND_ID, 0, 1).unwrap(),
-            Some(("{\"ok\":true}".to_string(), 42))
+        assert_invalid_input(
+            db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx-2")
+                .expect_err("different submitted tx hash must fail"),
+            "tx hash already recorded",
         );
 
         assert_invalid_input(
-            db.store_vote_tx_hash(ROUND_ID, 0, 2, "vote-tx")
+            db.record_vote_submission(ROUND_ID, 0, 2, "vote-tx")
                 .expect_err("missing proposal row must fail"),
             "no vote found",
         );
-        assert_invalid_input(
-            db.store_commitment_bundle(ROUND_ID, 0, 2, "{}", 42)
-                .expect_err("missing proposal row must fail"),
-            "no vote found",
-        );
+    }
+
+    #[test]
+    fn test_clear_recovery_state_resets_vote_recovery() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        db.setup_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
+            .unwrap();
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        let vote = db
+            .get_votes(ROUND_ID)
+            .unwrap()
+            .into_iter()
+            .find(|vote| vote.proposal_id == 1)
+            .expect("vote row remains");
+        assert_eq!(vote.choice, 0);
+        assert_eq!(db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap(), None);
     }
 
     #[test]
@@ -2504,7 +2495,6 @@ mod tests {
         assert_eq!(votes[0].bundle_index, 0);
         assert_eq!(votes[0].proposal_id, 7);
         assert_eq!(votes[0].choice, 1);
-        assert!(!votes[0].submitted);
     }
 
     #[test]
@@ -2788,23 +2778,14 @@ mod tests {
         assert_eq!(votes[0].bundle_index, 0);
         assert_eq!(votes[1].bundle_index, 1);
 
-        // Mark bundle 0's vote submitted, verify bundle 1 still unsubmitted
-        db.mark_vote_submitted(ROUND_ID, 0, 0).unwrap();
-        let votes = db.get_votes(ROUND_ID).unwrap();
-        assert!(
-            votes
-                .iter()
-                .find(|v| v.bundle_index == 0)
-                .unwrap()
-                .submitted
+        // Record bundle 0's vote submission, verify bundle 1 still has no tx.
+        db.record_vote_submission(ROUND_ID, 0, 0, "vote-tx")
+            .unwrap();
+        assert_eq!(
+            db.get_vote_tx_hash(ROUND_ID, 0, 0).unwrap().as_deref(),
+            Some("vote-tx")
         );
-        assert!(
-            !votes
-                .iter()
-                .find(|v| v.bundle_index == 1)
-                .unwrap()
-                .submitted
-        );
+        assert_eq!(db.get_vote_tx_hash(ROUND_ID, 1, 0).unwrap(), None);
 
         // Verify proposal_authority reflects per-bundle submission state
         let conn = db.conn();
@@ -2886,6 +2867,15 @@ mod tests {
         assert_eq!(share1.sent_to_urls.len(), 2);
         // submit_at reset to 0 after resubmission
         assert_eq!(share1.submit_at, 0);
+
+        let conflicting_nf = vec![0xEE; 32];
+        let err = db
+            .record_share_delegation(ROUND_ID, 0, 0, 1, &urls_b, &conflicting_nf, 2000)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("share nullifier conflict"),
+            "unexpected error: {err}"
+        );
 
         // Re-record a confirmed share (e.g. recovery path) — confirmed must be preserved
         db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &nf, 3000)
