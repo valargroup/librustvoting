@@ -224,6 +224,21 @@ pub enum NextStep {
     },
 }
 
+impl NextStep {
+    /// Returns the stable string discriminator used by FFI layers.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Delegate { .. } => "delegate",
+            Self::PollDelegation { .. } => "poll_delegation",
+            Self::CastVote { .. } => "cast_vote",
+            Self::SubmitVote { .. } => "submit_vote",
+            Self::PollVote { .. } => "poll_vote",
+            Self::SubmitShares { .. } => "submit_shares",
+            Self::ConfirmShare { .. } => "confirm_share",
+        }
+    }
+}
+
 /// Derived resume state for one round.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoundPlan {

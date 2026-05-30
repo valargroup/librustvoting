@@ -380,15 +380,8 @@ pub fn commit_batch(
     let mut commitments = Vec::with_capacity(drafts.len());
     for draft in drafts {
         ensure_not_cancelled(cancellation)?;
-        let committed = CommittedVote::commit(
-            db,
-            round_id,
-            bundle_index,
-            draft,
-            witness,
-            signer,
-            stages,
-        )?;
+        let committed =
+            CommittedVote::commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
         ensure_not_cancelled(cancellation)?;
         commitments.push(committed.signed_commitment(db)?);
     }
@@ -1539,7 +1532,10 @@ mod tests {
     use crate::{
         round::RoundParams,
         storage::{queries, VotingDb},
-        types::{Cancellation, NoopCancellation, NoopProgressReporter, NoteInfo, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS},
+        types::{
+            Cancellation, NoopCancellation, NoopProgressReporter, NoteInfo, MAX_PROPOSAL_ID,
+            MAX_VOTE_OPTIONS,
+        },
     };
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";

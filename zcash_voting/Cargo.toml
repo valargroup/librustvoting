@@ -123,6 +123,7 @@ zcash_keys = { version = "0.13", features = ["orchard"] }
 pczt = { version = "0.6", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
 zcash_primitives = "0.27"
 uuid = "1.23.1"
+base64 = "0.22.1"
 
 [dev-dependencies]
 secrecy = "0.8"
