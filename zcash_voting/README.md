@@ -85,8 +85,7 @@ Delegation signing follows the same boundary. After `setup_delegation`, call
 fingerprint, PCZT sighash, and spend auth randomizer. Software wallets should
 derive the account SpendAuth key locally, randomize it with `alpha`, sign the
 sighash, and call `delegation_submission` with `DelegationSigner::signature`.
-The legacy seed signer remains for migration but should not be used for new
-integrations.
+The crate no longer accepts root wallet seed material for delegation signing.
 
 ## Dependency notes
 
@@ -113,13 +112,14 @@ integrations.
 - Use `precompute::note_witnesses` instead of hand-validating cached
   `TreeState` bytes and manually constructing `WitnessData`.
 - Use `delegate::submission` with `DelegationSigner::signature(sig, sighash)`
-  after signing `delegation_signing_request` in the wallet. The older seed
-  signer remains for migration, and the Keystone-named signer variant remains as
-  the source-compatible external signature carrier.
+  after signing `delegation_signing_request` in the wallet. Signer variants that
+  accepted seeds and Keystone specific signature aliases were removed; software
+  and hardware flows both pass an externally produced SpendAuth signature and the
+  signed sighash.
 - Use `voting_hotkey_from_seed` after deriving scoped software hotkey seed
-  material in the wallet, or `generate_random_voting_hotkey` for app-owned
-  hardware-wallet hotkeys. `derive_voting_hotkey` remains available for
-  migration only and is still exported from the prelude for source compatibility.
+  material in the wallet, or `generate_random_voting_hotkey` for app owned
+  hardware wallet hotkeys. The crate no longer derives voting hotkeys from root
+  wallet seeds.
 - Use `session::resume_plan` instead of reconstructing what comes next from raw
   delegation, vote, and share phases in wallet code. Fetch step execution
   material through crate APIs such as `vote::recover_commit`, `share::*`, and
