@@ -62,6 +62,43 @@ pub struct VanWitness {
     pub anchor_height: u32,
 }
 
+impl VanWitness {
+    /// Builds a typed witness from wire-friendly sibling bytes.
+    pub fn from_wire(
+        auth_path: &[Vec<u8>],
+        position: u32,
+        anchor_height: u32,
+    ) -> Result<Self, VotingError> {
+        if auth_path.len() != VAN_AUTH_PATH_LEN {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "van_auth_path must have {VAN_AUTH_PATH_LEN} siblings, got {}",
+                    auth_path.len()
+                ),
+            });
+        }
+
+        let mut typed_path = [[0u8; 32]; VAN_AUTH_PATH_LEN];
+        for (idx, hash) in auth_path.iter().enumerate() {
+            typed_path[idx] =
+                hash.as_slice()
+                    .try_into()
+                    .map_err(|_| VotingError::InvalidInput {
+                        message: format!(
+                            "van_auth_path[{idx}] must be 32 bytes, got {}",
+                            hash.len()
+                        ),
+                    })?;
+        }
+
+        Ok(Self {
+            auth_path: typed_path,
+            position,
+            anchor_height,
+        })
+    }
+}
+
 /// Result of building, signing, and persisting one cast-vote.
 #[derive(Clone, Debug)]
 pub struct VoteCommit {
@@ -75,6 +112,26 @@ pub struct VoteCommit {
     pub vote_auth_sig: [u8; 64],
     pub encrypted_shares: Vec<WireEncryptedShare>,
     pub share_payloads: Vec<SharePayload>,
+}
+
+/// Wallet-facing aggregate of one committed vote and public helper-share data.
+#[derive(Clone, Debug)]
+pub struct SignedVoteCommitment {
+    pub proposal_id: u32,
+    pub choice: u32,
+    pub vote_round_id: String,
+    pub van_nullifier: [u8; 32],
+    pub vote_authority_note_new: [u8; 32],
+    pub vote_commitment: [u8; 32],
+    pub proof: Vec<u8>,
+    pub encrypted_shares: Vec<WireEncryptedShare>,
+    pub share_payloads: Vec<SharePayload>,
+    pub anchor_height: u32,
+    pub shares_hash: [u8; 32],
+    pub share_comms: Vec<[u8; 32]>,
+    pub r_vpk: [u8; 32],
+    pub vote_auth_sig: [u8; 64],
+    pub commitment_bundle_json: String,
 }
 
 /// Committed cast-vote handle for the post-commit lifecycle.
@@ -174,6 +231,41 @@ impl CommittedVote {
             ),
         })?;
         serialize_recovery(&bundle)
+    }
+
+    /// Returns a wire-facing signed commitment bundle for wallet API layers.
+    pub fn signed_commitment(&self, db: &VotingDb) -> Result<SignedVoteCommitment, VotingError> {
+        let recovery = recovery_bundle(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+        )?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={}, bundle={}, proposal={}",
+                self.round_id, self.bundle_index, self.commit.proposal_id
+            ),
+        })?;
+        let commitment_bundle_json = serialize_recovery(&recovery)?;
+
+        Ok(SignedVoteCommitment {
+            proposal_id: self.commit.proposal_id,
+            choice: recovery.vote_decision,
+            vote_round_id: recovery.vote_round_id,
+            van_nullifier: self.commit.van_nullifier,
+            vote_authority_note_new: self.commit.vote_authority_note_new,
+            vote_commitment: self.commit.vote_commitment,
+            proof: self.commit.proof.clone(),
+            encrypted_shares: self.commit.encrypted_shares.clone(),
+            share_payloads: self.commit.share_payloads.clone(),
+            anchor_height: self.commit.anchor_height,
+            shares_hash: recovery.shares_hash,
+            share_comms: recovery.share_comms,
+            r_vpk: self.commit.r_vpk,
+            vote_auth_sig: self.commit.vote_auth_sig,
+            commitment_bundle_json,
+        })
     }
 
     /// Records a helper-share submission using recovery-owned nullifier material.
@@ -1405,6 +1497,23 @@ mod tests {
     }
 
     #[test]
+    fn van_witness_from_wire_validates_length_and_element_size() {
+        let mut auth_path = vec![vec![0xAA; 32]; VAN_AUTH_PATH_LEN];
+        let witness = VanWitness::from_wire(&auth_path, 7, 123).unwrap();
+        assert_eq!(witness.position, 7);
+        assert_eq!(witness.anchor_height, 123);
+        assert_eq!(witness.auth_path[0], [0xAA; 32]);
+
+        auth_path.pop();
+        let wrong_length = VanWitness::from_wire(&auth_path, 7, 123).unwrap_err();
+        assert!(wrong_length.to_string().contains("24 siblings"));
+
+        let wrong_width = vec![vec![0xAA; 31]; VAN_AUTH_PATH_LEN];
+        let wrong_width_err = VanWitness::from_wire(&wrong_width, 7, 123).unwrap_err();
+        assert!(wrong_width_err.to_string().contains("32 bytes"));
+    }
+
+    #[test]
     fn validate_draft_votes_rejects_invalid_inputs_before_db_work() {
         assert!(validate_draft_votes(&[])
             .unwrap_err()
@@ -1826,6 +1935,49 @@ mod tests {
                 .vc_tree_position,
             789
         );
+    }
+
+    #[test]
+    fn signed_commitment_exposes_public_payload_without_reparsing_json() {
+        let db = db_with_vote();
+        let mut recovery = recovery_bundle_fixture();
+        recovery.share_blinds = vec![scalar_bytes(1), scalar_bytes(2)];
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        let recovery_json = serialize_recovery(&recovery).unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &recovery_json,
+        )
+        .unwrap();
+
+        let committed = CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+        let signed = committed.signed_commitment(&db).unwrap();
+
+        assert_eq!(signed.proposal_id, 1);
+        assert_eq!(signed.choice, recovery.vote_decision);
+        assert_eq!(signed.vote_round_id, ROUND_ID);
+        assert_eq!(signed.share_payloads.len(), 2);
+        assert_eq!(signed.encrypted_shares[0].c1, vec![0x21; 32]);
+        assert_eq!(signed.shares_hash, [0x14; 32]);
+        assert_eq!(signed.share_comms[0], [0x51; 32]);
+        assert_eq!(signed.r_vpk, [0x15; 32]);
+        assert_eq!(signed.vote_auth_sig, [0x17; 64]);
+        assert_eq!(signed.commitment_bundle_json, recovery_json);
     }
 
     #[test]

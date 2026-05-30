@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use zcash_voting::prelude::{
     sync_vote_tree, van_witness, CommittedVote, DraftVote, NoopProgressReporter, SharePayload,
-    VanWitness, VoteSigner, VoteSubmission, VotingDb, VotingHotkey,
+    SignedVoteCommitment, VanWitness, VoteSigner, VoteSubmission, VotingDb, VotingHotkey,
 };
 
 /// Inputs for deriving a Merkle witness for one confirmed delegation bundle.
@@ -123,6 +123,19 @@ pub fn committed_vote_payloads<'a>(
             .context("build vote submission")?,
         share_payloads: committed.share_payloads(),
     })
+}
+
+/// Returns a single wallet-facing aggregate for external API boundaries.
+///
+/// This includes chain submission fields, helper-share payloads, and the stored
+/// recovery JSON in one typed object.
+pub fn committed_vote_signed_commitment(
+    voting_db: &VotingDb,
+    committed: &CommittedVote,
+) -> Result<SignedVoteCommitment> {
+    committed
+        .signed_commitment(voting_db)
+        .context("build signed vote commitment")
 }
 
 /// Persists successful vote-chain and helper-share submissions.
