@@ -24,6 +24,21 @@ pub enum DelegationPhase {
     Confirmed,
 }
 
+/// Wallet-facing workflow phase strings used by resume orchestration.
+///
+/// This is a compatibility view that collapses the canonical per-artifact phases
+/// into the stable vocabulary consumed by app state machines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WorkflowPhase {
+    Prepared,
+    Signed,
+    SubmittedDelegation,
+    SubmittedVote,
+    SubmittedShare,
+    Confirmed,
+}
+
 /// Cast-vote lifecycle for one bundle/proposal pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -79,6 +94,48 @@ impl DelegationPhase {
             Self::Proved => "proved",
             Self::Submitted => "submitted",
             Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+impl WorkflowPhase {
+    /// Returns the stable string used by FFI layers and UI state machines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Signed => "signed",
+            Self::SubmittedDelegation => "submitted_delegation",
+            Self::SubmittedVote => "submitted_vote",
+            Self::SubmittedShare => "submitted_share",
+            Self::Confirmed => "confirmed",
+        }
+    }
+
+    /// Converts a canonical delegation phase into the merged workflow phase.
+    pub fn for_delegation(phase: DelegationPhase) -> Self {
+        match phase {
+            DelegationPhase::Prepared => Self::Prepared,
+            DelegationPhase::PcztBuilt | DelegationPhase::Proved => Self::Signed,
+            DelegationPhase::Submitted => Self::SubmittedDelegation,
+            DelegationPhase::Confirmed => Self::Confirmed,
+        }
+    }
+
+    /// Converts a canonical vote phase into the merged workflow phase.
+    pub fn for_vote(phase: VotePhase) -> Self {
+        match phase {
+            VotePhase::Prepared => Self::Prepared,
+            VotePhase::Committed => Self::Signed,
+            VotePhase::Submitted => Self::SubmittedVote,
+            VotePhase::Confirmed => Self::Confirmed,
+        }
+    }
+
+    /// Converts a canonical share phase into the merged workflow phase.
+    pub fn for_share(phase: SharePhase) -> Self {
+        match phase {
+            SharePhase::Submitted => Self::SubmittedShare,
+            SharePhase::Confirmed => Self::Confirmed,
         }
     }
 }
@@ -541,6 +598,56 @@ mod tests {
         assert_eq!(
             db.share_phase(ROUND_ID, 0, 1, 1).unwrap(),
             SharePhase::Confirmed
+        );
+    }
+
+    #[test]
+    fn workflow_phase_mapping_and_strings_are_stable() {
+        assert_eq!(
+            WorkflowPhase::for_delegation(DelegationPhase::Prepared).as_str(),
+            "prepared"
+        );
+        assert_eq!(
+            WorkflowPhase::for_delegation(DelegationPhase::PcztBuilt).as_str(),
+            "signed"
+        );
+        assert_eq!(
+            WorkflowPhase::for_delegation(DelegationPhase::Proved).as_str(),
+            "signed"
+        );
+        assert_eq!(
+            WorkflowPhase::for_delegation(DelegationPhase::Submitted).as_str(),
+            "submitted_delegation"
+        );
+        assert_eq!(
+            WorkflowPhase::for_delegation(DelegationPhase::Confirmed).as_str(),
+            "confirmed"
+        );
+
+        assert_eq!(
+            WorkflowPhase::for_vote(VotePhase::Prepared).as_str(),
+            "prepared"
+        );
+        assert_eq!(
+            WorkflowPhase::for_vote(VotePhase::Committed).as_str(),
+            "signed"
+        );
+        assert_eq!(
+            WorkflowPhase::for_vote(VotePhase::Submitted).as_str(),
+            "submitted_vote"
+        );
+        assert_eq!(
+            WorkflowPhase::for_vote(VotePhase::Confirmed).as_str(),
+            "confirmed"
+        );
+
+        assert_eq!(
+            WorkflowPhase::for_share(SharePhase::Submitted).as_str(),
+            "submitted_share"
+        );
+        assert_eq!(
+            WorkflowPhase::for_share(SharePhase::Confirmed).as_str(),
+            "confirmed"
         );
     }
 }
