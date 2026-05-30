@@ -1,27 +1,44 @@
 use anyhow::{Context, Result};
-use zcash_voting::prelude::{sync_vote_tree, van_witness, VanWitness, VotingDb};
+use zcash_voting::prelude::{
+    commit_vote, sync_vote_tree, van_witness, DraftVote, NoopProgressReporter, VanWitness,
+    VoteCommit, VoteSigner, VotingDb, VotingHotkey,
+};
 
-/// Human-readable VAN-witness stages printed by embedders of this example.
-pub const VAN_WITNESS_FLOW: &[&str] = &[
-    "Sync the on-chain vote-authority-note tree for the round from the vote node.",
-    "Generate the VAN Merkle witness for the confirmed delegation bundle.",
-];
-
-/// Caller-owned inputs needed to derive one bundle's VAN witness.
+/// Inputs for deriving a Merkle witness for one confirmed delegation bundle.
+///
+/// `round_id` and `bundle_index` identify a bundle whose VAN position has
+/// already been recorded after delegation confirmation. `vote_node_url` is the
+/// vote-chain endpoint used to sync the vote-authority-note tree.
 pub struct WalletVanWitnessRequest<'a> {
     pub round_id: &'a str,
     pub bundle_index: u32,
     pub vote_node_url: &'a str,
 }
 
-/// Example wallet-side orchestration for deriving a bundle's VAN witness.
+/// Inputs for committing one cast-vote for one proposal.
 ///
-/// This is the first step of the cast-vote phase. It runs after the delegation
-/// transaction for `bundle_index` has confirmed on the vote chain, and produces
-/// the `VanWitness` that `zcash_voting::vote::commit` requires as input.
+/// `draft` is the wallet's proposal choice. `van_witness` must come from the
+/// confirmed bundle identified by `round_id` and `bundle_index`, and
+/// `voting_hotkey` signs the cast-vote payload.
+pub struct WalletVoteCommitRequest<'a> {
+    pub round_id: &'a str,
+    pub bundle_index: u32,
+    pub draft: &'a DraftVote,
+    pub van_witness: &'a VanWitness,
+    pub voting_hotkey: &'a VotingHotkey,
+}
+
+/// Derives the VAN witness needed to commit votes for one bundle.
 ///
-/// The witness is anchored at the height returned by the tree sync, so the
-/// caller does not need to track an anchor height separately.
+/// Call this after the bundle's delegation transaction is confirmed and its VAN
+/// position is persisted. The returned witness is anchored at the vote-tree
+/// height reached by the sync performed inside this function.
+///
+/// # Errors
+///
+/// Returns an error if the vote tree cannot be synced from `vote_node_url`, the
+/// bundle is unknown, its VAN position is missing, or the witness cannot be
+/// generated at the synced height.
 pub fn derive_vote_van_witness(
     voting_db: &VotingDb,
     request: WalletVanWitnessRequest<'_>,
@@ -39,4 +56,33 @@ pub fn derive_vote_van_witness(
         anchor_height,
     )
     .context("generate VAN witness")
+}
+
+/// Builds, signs, and persists recovery state for one cast-vote.
+///
+/// The returned `VoteCommit` contains the chain-ready cast-vote fields and
+/// helper-share payloads. Repeated calls for the same
+/// `(round_id, bundle_index, proposal_id)` return persisted recovery material
+/// when the stored draft matches the requested draft.
+///
+/// # Errors
+///
+/// Returns an error if the bundle or warmed voting state is missing, the draft
+/// conflicts with stored recovery state, proof generation fails, signing fails,
+/// or recovery state cannot be persisted.
+pub fn commit_vote_bundle(
+    voting_db: &VotingDb,
+    request: WalletVoteCommitRequest<'_>,
+) -> Result<VoteCommit> {
+    let progress = NoopProgressReporter;
+    commit_vote(
+        voting_db,
+        request.round_id,
+        request.bundle_index,
+        request.draft,
+        request.van_witness,
+        VoteSigner::hotkey(request.voting_hotkey),
+        &progress,
+    )
+    .context("commit cast-vote")
 }
