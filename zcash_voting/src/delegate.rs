@@ -341,10 +341,11 @@ pub struct DelegationSetup {
 
 /// Account-scoped data a wallet needs to sign a delegation PCZT locally.
 ///
-/// Wallets should keep root seed material outside this crate. A software wallet
-/// can use `account_index`, `network`, `sighash`, and `alpha` to derive its
-/// account SpendAuth key locally, randomize it, sign `sighash`, and pass the
-/// resulting signature back through [`DelegationSigner::signature`].
+/// A software wallet can either use
+/// [`PreparedSigner::from_wallet_seed`] when this crate runs inside the same
+/// seed trust boundary, or use `account_index`, `network`, `sighash`, and
+/// `alpha` to sign externally and pass the resulting signature back through
+/// [`PreparedSigner::signature`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DelegationSigningRequest {
     /// ZIP-32 account index for the account that owns the delegated notes.
