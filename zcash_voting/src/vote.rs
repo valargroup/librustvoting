@@ -23,14 +23,7 @@ pub const VAN_AUTH_PATH_LEN: usize = 24;
 const VOTE_RECOVERY_FORMAT: &str = "zcash_voting_vote_recovery_v1";
 
 /// Wallet-supplied cast-vote intent for one proposal in one bundle.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DraftVote {
-    pub proposal_id: u32,
-    pub choice: u32,
-    pub num_options: u32,
-    pub single_share: bool,
-    pub vc_tree_position: u64,
-}
+pub use crate::wire::DraftVote;
 
 /// Validates one wallet-supplied cast-vote draft before proof construction.
 pub fn validate_draft_vote(draft: &DraftVote) -> Result<(), VotingError> {

@@ -12,13 +12,7 @@ use crate::{
 };
 
 /// Recoverable vote commitment bundle for one `(bundle_index, proposal_id)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoverableCommitmentBundle {
-    pub bundle_index: u32,
-    pub proposal_id: u32,
-    pub commitment_bundle_json: String,
-    pub vc_tree_position: u64,
-}
+pub use crate::wire::RecoverableCommitmentBundle;
 
 /// Delegation recovery state for one bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]

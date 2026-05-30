@@ -47,12 +47,7 @@ pub struct RoundState {
 }
 
 /// A vote record from the votes table.
-#[derive(Clone, Debug)]
-pub struct VoteRecord {
-    pub proposal_id: u32,
-    pub bundle_index: u32,
-    pub choice: u32,
-}
+pub use crate::wire::VoteRecord;
 
 /// Compact round info for list_rounds().
 #[derive(Clone, Debug)]
@@ -65,13 +60,7 @@ pub struct RoundSummary {
 }
 
 /// A Keystone bundle signature stored in the DB.
-#[derive(Clone, Debug)]
-pub struct KeystoneSignatureRecord {
-    pub bundle_index: u32,
-    pub sig: Vec<u8>,
-    pub sighash: Vec<u8>,
-    pub rk: Vec<u8>,
-}
+pub use crate::wire::KeystoneSignatureRecord;
 
 /// Database handle for voting state. Wraps a SQLite connection and a
 /// wallet identifier that scopes all round data to a single wallet.

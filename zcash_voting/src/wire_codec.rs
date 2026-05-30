@@ -19,19 +19,17 @@ use crate::{
     round::BundleLayout,
     session,
     share_policy::ShareSubmissionPlan,
-    storage::{KeystoneSignatureRecord, VoteRecord},
     types::{NoteRef, SelectedNotes, SharePayload, VotingError, WireEncryptedShare},
-    vote::{DraftVote, SignedVoteCommitment, SignedVoteCommitments, VanWitness},
+    vote::{SignedVoteCommitment, SignedVoteCommitments, VanWitness},
     wire::{
-        BundleSetupResultView, CommitmentBundleRecoveryView, CompletedVoteChoiceView,
-        CompletedVoteDisplayView, DelegationPirPrecomputeResultView, DelegationRecoveryView,
-        DelegationRecoveryWorkView, DelegationStatusView, DelegationSubmissionWire, DraftVoteView,
-        KeystoneDelegationRequestView, KeystoneSignatureRecordView, NextStepView, RoundPlanView,
-        RoundRecoveryStateView, ShareDelegationRecordView, ShareSubmissionPlanView,
+        BundleSetupResultView, CompletedVoteChoiceView, CompletedVoteDisplayView,
+        DelegationPirPrecomputeResultView, DelegationRecoveryView, DelegationRecoveryWorkView,
+        DelegationStatusView, DelegationSubmissionWire, KeystoneDelegationRequestView, NextStepView,
+        RoundPlanView, RoundRecoveryStateView, ShareDelegationRecordView, ShareSubmissionPlanView,
         ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteCommitmentView,
-        SignedVoteCommitmentsView, VanWitnessView, VoteCommitmentWire, VoteRecordView,
-        VoteRecoveryView, VoteRecoveryWorkView, VoteShareWire, VotingNoteRefView,
-        VotingNoteSelectionResultView, WireEncryptedShareJson,
+        SignedVoteCommitmentsView, VanWitnessView, VoteCommitmentWire, VoteRecoveryView,
+        VoteRecoveryWorkView, VoteShareWire, VotingNoteRefView, VotingNoteSelectionResultView,
+        WireEncryptedShareJson,
     },
     BundlePolicy,
 };
@@ -261,35 +259,12 @@ impl From<KeystoneSigningRequest> for KeystoneDelegationRequestView {
     }
 }
 
-impl From<KeystoneSignatureRecord> for KeystoneSignatureRecordView {
-    fn from(record: KeystoneSignatureRecord) -> Self {
-        Self {
-            bundle_index: record.bundle_index,
-            sig: record.sig,
-            sighash: record.sighash,
-            rk: record.rk,
-        }
-    }
-}
-
 impl From<VanWitness> for VanWitnessView {
     fn from(witness: VanWitness) -> Self {
         Self {
             auth_path: witness.auth_path.iter().map(|hash| hash.to_vec()).collect(),
             position: witness.position,
             anchor_height: witness.anchor_height,
-        }
-    }
-}
-
-impl From<DraftVoteView> for DraftVote {
-    fn from(draft: DraftVoteView) -> Self {
-        Self {
-            proposal_id: draft.proposal_id,
-            choice: draft.choice,
-            num_options: draft.num_options,
-            vc_tree_position: draft.vc_tree_position,
-            single_share: draft.single_share,
         }
     }
 }
@@ -324,16 +299,6 @@ impl TryFrom<SignedVoteCommitments> for SignedVoteCommitmentsView {
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>, _>>()?,
         })
-    }
-}
-
-impl From<VoteRecord> for VoteRecordView {
-    fn from(record: VoteRecord) -> Self {
-        Self {
-            proposal_id: record.proposal_id,
-            bundle_index: record.bundle_index,
-            choice: record.choice,
-        }
     }
 }
 
@@ -378,17 +343,6 @@ impl From<recovery::VoteRecovery> for VoteRecoveryView {
     }
 }
 
-impl From<recovery::RecoverableCommitmentBundle> for CommitmentBundleRecoveryView {
-    fn from(record: recovery::RecoverableCommitmentBundle) -> Self {
-        Self {
-            bundle_index: record.bundle_index,
-            proposal_id: record.proposal_id,
-            commitment_bundle_json: record.commitment_bundle_json,
-            vc_tree_position: record.vc_tree_position,
-        }
-    }
-}
-
 impl From<crate::types::ShareDelegationRecord> for ShareDelegationRecordView {
     fn from(record: crate::types::ShareDelegationRecord) -> Self {
         Self {
@@ -428,11 +382,7 @@ impl From<recovery::RoundRecoverySnapshot> for RoundRecoveryStateView {
             bundle_count: state.bundle_count,
             delegation: state.delegation.into_iter().map(Into::into).collect(),
             votes: state.votes.into_iter().map(Into::into).collect(),
-            commitment_bundles: state
-                .commitment_bundles
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            commitment_bundles: state.commitment_bundles,
             shares: state.shares.into_iter().map(Into::into).collect(),
             share_delegations: state
                 .share_delegations
@@ -869,20 +819,19 @@ mod tests {
     }
 
     #[test]
-    fn draft_vote_view_maps_to_core_draft_vote() {
-        let view = DraftVoteView {
+    fn draft_vote_wire_type_has_expected_fields() {
+        let draft = crate::wire::DraftVote {
             proposal_id: 9,
             choice: 2,
             num_options: 4,
             vc_tree_position: 123,
             single_share: true,
         };
-        let core: crate::vote::DraftVote = view.into();
-        assert_eq!(core.proposal_id, 9);
-        assert_eq!(core.choice, 2);
-        assert_eq!(core.num_options, 4);
-        assert_eq!(core.vc_tree_position, 123);
-        assert!(core.single_share);
+        assert_eq!(draft.proposal_id, 9);
+        assert_eq!(draft.choice, 2);
+        assert_eq!(draft.num_options, 4);
+        assert_eq!(draft.vc_tree_position, 123);
+        assert!(draft.single_share);
     }
 
     #[test]

@@ -139,7 +139,7 @@ pub struct KeystoneDelegationRequestView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeystoneSignatureRecordView {
+pub struct KeystoneSignatureRecord {
     pub bundle_index: u32,
     pub sig: Vec<u8>,
     pub sighash: Vec<u8>,
@@ -154,7 +154,7 @@ pub struct VanWitnessView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DraftVoteView {
+pub struct DraftVote {
     pub proposal_id: u32,
     pub choice: u32,
     pub num_options: u32,
@@ -176,7 +176,7 @@ pub struct SignedVoteCommitmentsView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoteRecordView {
+pub struct VoteRecord {
     pub proposal_id: u32,
     pub bundle_index: u32,
     pub choice: u32,
@@ -209,7 +209,7 @@ pub struct VoteRecoveryView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitmentBundleRecoveryView {
+pub struct RecoverableCommitmentBundle {
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub commitment_bundle_json: String,
@@ -244,7 +244,7 @@ pub struct RoundRecoveryStateView {
     pub bundle_count: u32,
     pub delegation: Vec<DelegationRecoveryView>,
     pub votes: Vec<VoteRecoveryView>,
-    pub commitment_bundles: Vec<CommitmentBundleRecoveryView>,
+    pub commitment_bundles: Vec<RecoverableCommitmentBundle>,
     pub shares: Vec<ShareWorkflowRecoveryView>,
     pub share_delegations: Vec<ShareDelegationRecordView>,
     pub unconfirmed_share_delegations: Vec<ShareDelegationRecordView>,
