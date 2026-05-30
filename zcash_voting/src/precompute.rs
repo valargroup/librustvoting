@@ -87,7 +87,7 @@ where
     P: zcash_protocol::consensus::Parameters,
 {
     let witnesses = crate::witness::generate_note_witnesses(db, round_id, notes, wallet_db)?;
-    db.store_witnesses(round_id, bundle_index, &witnesses)?;
+    db.replace_bundle_witnesses(round_id, bundle_index, &witnesses)?;
     Ok(witnesses)
 }
 
