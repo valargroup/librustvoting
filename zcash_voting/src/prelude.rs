@@ -61,7 +61,7 @@ pub use crate::vote::{
     commit as commit_vote, parse_recovery, record_submission as record_vote_submission,
     record_vc_position, recover_commit as recover_vote_commit, recovery_bundle, serialize_recovery,
     submission as vote_submission, validate_draft_vote, validate_draft_votes, CommittedVote,
-    DraftVote, VanWitness, VoteCommit, VoteCommitStage, VoteRecoveryBundle, VoteSigner,
+    DraftVote, SignedVoteCommitment, VanWitness, VoteCommit, VoteCommitStage, VoteRecoveryBundle, VoteSigner,
     VoteSubmission,
 };
 pub use crate::warm_proving_caches;

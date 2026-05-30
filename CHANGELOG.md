@@ -9,6 +9,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added `vote::SignedVoteCommitment` plus
+  `CommittedVote::signed_commitment` as the canonical wallet-facing aggregate
+  for cast-vote outputs. The API now exposes submission fields, helper-share
+  payloads, and persisted recovery JSON through one typed surface with
+  fixed-size cryptographic fields (`[u8; 32]` / `[u8; 64]`) to keep byte-length
+  guarantees inside the shared crate while still supporting boundary adapters.
+- Added `VanWitness::from_wire` to validate and convert wire-friendly witness
+  siblings into the typed `[[u8; 32]; 24]` witness form used by vote
+  commitment APIs.
 - Added `vote::CommittedVote`, a stateful cast-vote handle that mirrors the
   `PreparedDelegationBundle` method flow. Wallet SDKs can now commit/recover a
   vote once, then drive submission and helper-share lifecycle steps through
