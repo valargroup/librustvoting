@@ -564,7 +564,11 @@ impl PreparedDelegationBundle {
         C: Borrow<rusqlite::Connection>,
         P: Parameters,
     {
-        if !voting_db.has_witnesses(&self.round_id, self.bundle_index)? {
+        if !voting_db.has_complete_witnesses(
+            &self.round_id,
+            self.bundle_index,
+            &self.bundle_note_infos,
+        )? {
             crate::precompute::note_witnesses(
                 voting_db,
                 &self.round_id,
@@ -669,6 +673,16 @@ impl PreparedDelegationBundle {
         pczt_bytes: Vec<u8>,
         signer: PreparedSigner,
     ) -> Result<SignedDelegationBundle, VotingError> {
+        if !pczt_bytes.is_empty() {
+            let provided_sighash = pczt_sighash(&pczt_bytes)?;
+            let PreparedSigner::Signature { sighash, .. } = &signer;
+            if provided_sighash != *sighash {
+                return Err(VotingError::InvalidInput {
+                    message: "pczt_bytes sighash does not match delegation signer sighash"
+                        .to_string(),
+                });
+            }
+        }
         let submission = self.submission(voting_db, signer)?;
         Ok(SignedDelegationBundle {
             submission,
@@ -1086,50 +1100,8 @@ mod tests {
     #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
     #[test]
     fn prepare_delegation_bundle_returns_plain_reusable_bundle_state() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn);
-        let account_ref = account_internal_id(&conn, &account_uuid);
+        let (_voting_db, round_params, hotkey, prepared) = prepared_wallet_delegation_fixture();
         let divisor = crate::governance::BALLOT_DIVISOR;
-
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, divisor, 7);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 10, divisor * 2, 3);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 11);
-
-        let wallet_db = WalletDb::from_connection(
-            &conn,
-            ZcashNetwork::TestNetwork,
-            SystemClock,
-            rand::rngs::OsRng,
-        );
-        let voting_db = VotingDb::open_in_memory().unwrap();
-        voting_db.set_wallet_id("prepare-delegation-bundle-test");
-        let hotkey = test_voting_hotkey();
-        let round_params = crate::VotingRoundParams {
-            vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
-                .to_string(),
-            snapshot_height: 12,
-            ea_pk: vec![1; 32],
-            nc_root: vec![2; 32],
-            nullifier_imt_root: vec![3; 32],
-        };
-        let prepared = prepare_delegation_bundle(
-            &voting_db,
-            DelegationLwdInputs {
-                round_params: round_params.clone(),
-                resolved_round_name: "Demo Round".to_string(),
-                anchor_tree_state_bytes: vec![0xAA, 0xBB],
-                branch_id_provider: LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0),
-            },
-            PrepareDelegationBundleParams {
-                wallet_db: &wallet_db,
-                account_uuid: &account_uuid.expose_uuid().to_string(),
-                voting_hotkey: &hotkey,
-                scanned_height: 12,
-                bundle_index: 0,
-                bundle_policy: crate::BundlePolicy::default(),
-            },
-        )
-        .unwrap();
 
         assert_eq!(prepared.round_id, round_params.vote_round_id);
         assert_eq!(prepared.round_params.snapshot_height, 12);
@@ -1150,6 +1122,28 @@ mod tests {
             &prepared.delegation_keys.hotkey_raw_address,
             hotkey.raw_orchard_address()
         );
+    }
+
+    #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+    #[test]
+    fn signed_bundle_rejects_pczt_sighash_mismatch() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        let setup = prepared
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let mut wrong_sighash = setup.pczt_sighash;
+        wrong_sighash[0] ^= 0xFF;
+
+        let err = prepared
+            .signed_bundle(
+                &voting_db,
+                setup.pczt_bytes,
+                PreparedSigner::signature([0; 64], wrong_sighash),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("pczt_bytes sighash does not match delegation signer sighash"));
     }
 
     #[test]
@@ -1280,6 +1274,64 @@ mod tests {
             network: Network::Testnet,
             round_name: "Demo Round".to_string(),
         }
+    }
+
+    #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+    fn prepared_wallet_delegation_fixture() -> (
+        VotingDb,
+        crate::VotingRoundParams,
+        VotingHotkey,
+        PreparedDelegationBundle,
+    ) {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn);
+        let account_ref = account_internal_id(&conn, &account_uuid);
+        let divisor = crate::governance::BALLOT_DIVISOR;
+
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, divisor, 7);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 10, divisor * 2, 3);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 11);
+
+        let wallet_db = WalletDb::from_connection(
+            &conn,
+            ZcashNetwork::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("prepare-delegation-bundle-test");
+        let hotkey = test_voting_hotkey();
+        use group::GroupEncoding;
+        let ea_pk =
+            pasta_curves::pallas::Point::from(voting_circuits::vote_proof::spend_auth_g_affine());
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
+                .to_string(),
+            snapshot_height: 12,
+            ea_pk: ea_pk.to_bytes().to_vec(),
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        let prepared = prepare_delegation_bundle(
+            &voting_db,
+            DelegationLwdInputs {
+                round_params: round_params.clone(),
+                resolved_round_name: "Demo Round".to_string(),
+                anchor_tree_state_bytes: vec![0xAA, 0xBB],
+                branch_id_provider: LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0),
+            },
+            PrepareDelegationBundleParams {
+                wallet_db: &wallet_db,
+                account_uuid: &account_uuid.expose_uuid().to_string(),
+                voting_hotkey: &hotkey,
+                scanned_height: 12,
+                bundle_index: 0,
+                bundle_policy: crate::BundlePolicy::default(),
+            },
+        )
+        .unwrap();
+
+        (voting_db, round_params, hotkey, prepared)
     }
 
     #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
