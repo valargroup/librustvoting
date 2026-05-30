@@ -9,6 +9,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added `DelegationSigningRequest`, `delegation_signing_request`, and generic
+  external delegation signature constructors so wallet SDKs can keep wallet seed
+  material outside `zcash_voting`, sign the PCZT sighash locally with the account
+  SpendAuth key, and pass only the resulting signature back to the crate.
 - Added shared draft vote bounds validation for SDK integrations. The crate now
   exposes proposal and option count bounds plus `vote::validate_draft_vote(s)`,
   and `vote::commit` rejects invalid drafts before proof construction.
@@ -60,13 +64,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   provider traits so wallet SDKs can pass progress and consensus-branch
   resolution into `delegate::setup` and `delegate::prove` without duplicating
   library internals.
-- Added crate-owned voting hotkey derivation with contextual software hotkeys,
-  random hardware hotkeys, raw Orchard delegation-address derivation, and typed
-  `DelegationKeys` / `VoteSigner` helpers so wallet SDKs no longer need to
-  assemble hotkey seed material or pass raw hotkey address bytes by hand.
-  `derive_voting_hotkey`, `generate_random_voting_hotkey`, and
-  `voting_hotkey_from_seed` replace the older raw hotkey generation helpers
-  exposed through `hotkey::generate_hotkey` and `VotingDb::generate_hotkey`.
+- Added voting hotkey helpers for wallet-derived software hotkeys, random hardware
+  hotkeys, raw Orchard delegation-address derivation, and typed
+  `DelegationKeys` / `VoteSigner` helpers. New wallet SDKs should derive scoped
+  hotkey seed material at their wallet boundary and pass that material to
+  `voting_hotkey_from_seed` or `VoteSigner::hotkey_seed`.
+  `generate_random_voting_hotkey` and `voting_hotkey_from_seed` replace the
+  older raw hotkey generation helpers exposed through `hotkey::generate_hotkey`
+  and `VotingDb::generate_hotkey`.
 - Added `delegate::LightwalletdBranchIdProvider` and
   `delegate::branch_id_for_height` so wallet SDKs can resolve delegation
   consensus branches from `lightwalletd_url` plus `Network` without duplicating
@@ -94,7 +99,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Added `delegate::prepare_delegation_bundle` with
   `PrepareDelegationBundleParams` and `PreparedDelegationBundle` so wallet SDKs
   can resolve lightwalletd inputs before opening wallet DB handles, then reuse
-  plain bundle state across witness precompute, PIR warmup, seed signing, and
+  plain bundle state across witness precompute, PIR warmup, signing, and
   Keystone flows.
 - Added `PreparedDelegationBundle` lifecycle methods and `PreparedSigner` so
   precompute, PCZT setup, proof generation, Keystone signing requests, and
@@ -119,6 +124,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- Removed crate-side wallet seed APIs from voting hotkey derivation and
+  delegation signing. Wallet SDKs now derive scoped voting hotkey seed material
+  and delegation signatures locally, then pass only hotkey seeds or signatures
+  to the crate.
 - Delegation PIR warmup no longer constructs or caches a governance PCZT.
   `PreparedDelegationBundle::precompute` now warms witnesses, padded-note
   secrets, and PIR rows only; `delegate::setup` builds the PCZT later from the
@@ -171,7 +180,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   `network_id` are now crate-internal. Wallet callers should use `vote::commit`
   with `VoteSigner`.
 - The wallet delegation example now separates reusable bundle preparation from
-  PIR precompute, seed signing, and Keystone request/submission helpers so resume
+  PIR precompute, software signing, and Keystone request/submission helpers so resume
   flows can share cached bundle state without repeating lightwalletd and wallet
   note-selection work.
 

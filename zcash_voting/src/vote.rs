@@ -1365,22 +1365,17 @@ mod tests {
             network: Network,
             alpha: &pasta_curves::pallas::Scalar,
         ) -> VerificationKey<SpendAuth> {
-            let sk = network
-                .orchard_spending_key_from_seed(seed, crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX)
-                .unwrap();
+            let sk = crate::hotkey::spending_key_from_hotkey_seed(
+                seed,
+                network,
+                crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX,
+            )
+            .unwrap();
             let ask = SpendAuthorizingKey::from(&sk);
             VerificationKey::from(&ask.randomize(alpha))
         }
 
-        let hotkey = crate::hotkey::derive_voting_hotkey(
-            &[0xAB; 64],
-            crate::hotkey::HotkeyDerivationContext {
-                round_id: ROUND_ID,
-                account_id: "account-0",
-            },
-            Network::Regtest,
-        )
-        .unwrap();
+        let hotkey = crate::hotkey::voting_hotkey_from_seed(&[0xAB; 64], Network::Regtest).unwrap();
         let r_vpk = [0x10; 32];
         let van_nullifier = [0x11; 32];
         let vote_authority_note_new = [0x12; 32];

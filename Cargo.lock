@@ -3088,10 +3088,16 @@ name = "zcash-voting-wallet-example"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ff",
+ "orchard",
+ "pasta_curves",
+ "rand",
  "rusqlite",
  "zcash_client_sqlite",
+ "zcash_keys",
  "zcash_protocol",
  "zcash_voting",
+ "zip32",
 ]
 
 [[package]]
