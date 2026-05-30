@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 11;
+pub(crate) const CURRENT_VERSION: u32 = 13;
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
@@ -63,6 +63,11 @@ mod tests {
 
     fn pre_v8_schema() -> String {
         include_str!("migrations/001_init.sql").replace("    note_identity_hashes_blob BLOB,\n", "")
+    }
+
+    fn pre_v13_schema() -> String {
+        include_str!("migrations/001_init.sql")
+            .replace("    delegation_key_binding_hash BLOB,\n", "")
     }
 
     fn test_params() -> VotingRoundParams {
@@ -134,6 +139,37 @@ mod tests {
 
         let columns = table_columns(&conn, "bundles");
         assert!(columns.contains(&"note_identity_hashes_blob".to_string()));
+    }
+
+    #[test]
+    fn test_migrate_from_v12_schema_recreates_delegation_key_binding_column() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&pre_v13_schema()).unwrap();
+        queries::insert_round(&conn, "wallet", &test_params(), None).unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        let columns = table_columns(&conn, "bundles");
+        assert!(columns.contains(&"pczt_bytes".to_string()));
+        assert!(columns.contains(&"pczt_action_index".to_string()));
+        assert!(columns.contains(&"delegation_action_bytes".to_string()));
+        assert!(columns.contains(&"delegation_key_binding_hash".to_string()));
+
+        let round_count: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM rounds WHERE round_id = 'test-round'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(round_count, 0);
     }
 
     #[test]

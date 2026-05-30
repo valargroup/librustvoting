@@ -293,6 +293,13 @@ pub struct DelegationStatusView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationBundlePlanView {
+    pub bundle_count: u32,
+    pub pending_bundle_indexes: Vec<u32>,
+    pub submitted_bundle_indexes: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationRecoveryWorkView {
     pub kind: String,
     pub bundle_index: u32,

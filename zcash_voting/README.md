@@ -116,11 +116,11 @@ The crate no longer accepts root wallet seed material for delegation signing.
   behavior.
 - Use `precompute::note_witnesses` instead of hand-validating cached
   `TreeState` bytes and manually constructing `WitnessData`.
-- Use `delegate::submission` with `DelegationSigner::signature(sig, sighash)`
-  after signing `delegation_signing_request` in the wallet. Signer variants that
-  accepted seeds and Keystone specific signature aliases were removed; software
-  and hardware flows both pass an externally produced SpendAuth signature and the
-  signed sighash.
+- Use `delegate::submission` with `DelegationSigner::signature(sig, sighash)`,
+  or the prepared-bundle `submission`/`signed_bundle` helpers, after signing the
+  stored delegation request. Wallet integrations should normally keep seed
+  material at their own boundary and pass only an externally produced SpendAuth
+  signature plus the signed sighash.
 - Use `voting_hotkey_from_seed` after deriving scoped software hotkey seed
   material in the wallet, or `generate_random_voting_hotkey` for app owned
   hardware wallet hotkeys. The crate no longer derives voting hotkeys from root

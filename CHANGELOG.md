@@ -17,9 +17,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   `VanWitnessView`, `SignedVoteCommitmentView`, `SignedVoteCommitmentsView`,
   and `VoteRecordView`.
 - Added stable resume-plan wire DTOs in `zcash_voting::wire`
-  (`NextStepView`, `RoundPlanView`) so wallet adapters can consume crate-owned
-  `session::resume_plan` outputs directly over FRB without maintaining local
-  `ApiRoundPlan`/`ApiNextStep` mirrors.
+  (`NextStepView`, `RoundPlanView`, and `DelegationBundlePlanView`) so wallet
+  adapters can consume crate-owned `session::resume_plan` and
+  `session::delegation_bundle_plan` outputs directly over FRB without
+  maintaining local `ApiRoundPlan`/`ApiNextStep` mirrors or duplicating
+  pre-vote delegation bundle selection.
 - Added stable recovery/scheduling wire DTOs under `zcash_voting::wire` so wallet
   adapters can share one serde-backed JSON shape for recovery snapshots and
   share submission planning (`ShareSubmissionPlanView`,
@@ -82,6 +84,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   external delegation signature constructors so wallet SDKs can keep wallet seed
   material outside `zcash_voting`, sign the PCZT sighash locally with the account
   SpendAuth key, and pass only the resulting signature back to the crate.
+- Added prepared delegation helpers that persist and replay PCZT setup bytes,
+  validate Keystone signed-PCZT responses, and store Keystone signatures
+  idempotently so wallet SDKs do not need to duplicate retry or signed response
+  handling.
 - Added shared draft vote bounds validation for SDK integrations. The crate now
   exposes proposal and option count bounds plus `vote::validate_draft_vote(s)`,
   and `vote::commit` rejects invalid drafts before proof construction.
