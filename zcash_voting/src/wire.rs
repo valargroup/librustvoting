@@ -144,3 +144,21 @@ pub struct RoundRecoveryStateView {
     pub share_delegations: Vec<ShareDelegationRecordView>,
     pub unconfirmed_share_delegations: Vec<ShareDelegationRecordView>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextStepView {
+    pub kind: String,
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub choice: u32,
+    pub share_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundPlanView {
+    pub round_id: String,
+    pub pending_recovery: bool,
+    pub next_steps: Vec<NextStepView>,
+    pub open_proposals: Vec<u32>,
+    pub all_decided: bool,
+}

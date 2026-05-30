@@ -9,6 +9,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added stable resume-plan wire DTOs in `zcash_voting::wire`
+  (`NextStepView`, `RoundPlanView`) so wallet adapters can consume crate-owned
+  `session::resume_plan` outputs directly over FRB without maintaining local
+  `ApiRoundPlan`/`ApiNextStep` mirrors.
 - Added stable recovery/scheduling wire DTOs under `zcash_voting::wire` so wallet
   adapters can share one serde-backed JSON shape for recovery snapshots and
   share submission planning (`ShareSubmissionPlanView`,

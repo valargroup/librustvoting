@@ -13,14 +13,15 @@ use crate::{
     delegate::DelegationSubmission,
     phases::WorkflowPhase,
     recovery,
+    session,
     share_policy::ShareSubmissionPlan,
     types::{SharePayload, VotingError, WireEncryptedShare},
     vote::SignedVoteCommitment,
     wire::{
         CommitmentBundleRecoveryView, DelegationRecoveryView, DelegationSubmissionWire,
-        RoundRecoveryStateView, ShareDelegationRecordView, ShareSubmissionPlanView,
-        ShareWorkflowRecoveryView, VoteCommitmentWire, VoteRecoveryView, VoteShareWire,
-        WireEncryptedShareJson,
+        NextStepView, RoundPlanView, RoundRecoveryStateView, ShareDelegationRecordView,
+        ShareSubmissionPlanView, ShareWorkflowRecoveryView, VoteCommitmentWire, VoteRecoveryView,
+        VoteShareWire, WireEncryptedShareJson,
     },
 };
 
@@ -254,6 +255,83 @@ impl From<recovery::RoundRecoverySnapshot> for RoundRecoveryStateView {
     }
 }
 
+impl TryFrom<session::NextStep> for NextStepView {
+    type Error = VotingError;
+
+    fn try_from(step: session::NextStep) -> Result<Self, Self::Error> {
+        let kind = step.kind().to_string();
+        match step {
+            session::NextStep::Delegate { bundle_index }
+            | session::NextStep::PollDelegation { bundle_index } => Ok(Self {
+                kind,
+                bundle_index,
+                proposal_id: 0,
+                choice: 0,
+                share_index: 0,
+            }),
+            session::NextStep::CastVote {
+                bundle_index,
+                proposal_id,
+                choice,
+            } => Ok(Self {
+                kind,
+                bundle_index,
+                proposal_id,
+                choice,
+                share_index: 0,
+            }),
+            session::NextStep::SubmitVote {
+                bundle_index,
+                proposal_id,
+            }
+            | session::NextStep::PollVote {
+                bundle_index,
+                proposal_id,
+            } => Ok(Self {
+                kind,
+                bundle_index,
+                proposal_id,
+                choice: 0,
+                share_index: 0,
+            }),
+            session::NextStep::SubmitShares {
+                bundle_index,
+                proposal_id,
+                share_index,
+            }
+            | session::NextStep::ConfirmShare {
+                bundle_index,
+                proposal_id,
+                share_index,
+            } => Ok(Self {
+                kind,
+                bundle_index,
+                proposal_id,
+                choice: 0,
+                share_index,
+            }),
+        }
+    }
+}
+
+impl TryFrom<session::RoundPlan> for RoundPlanView {
+    type Error = VotingError;
+
+    fn try_from(plan: session::RoundPlan) -> Result<Self, Self::Error> {
+        Ok(Self {
+            round_id: plan.round_id,
+            pending_recovery: plan.pending_recovery,
+            next_steps: plan
+                .next_steps
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()?,
+            open_proposals: plan.open_proposals,
+            all_decided: plan.all_decided,
+        })
+    }
+}
+
 fn b64(bytes: impl AsRef<[u8]>) -> String {
     BASE64_STANDARD.encode(bytes.as_ref())
 }
@@ -392,5 +470,70 @@ mod tests {
         assert!(err
             .to_string()
             .contains("field tree_position is too large to encode as JSON integer"));
+    }
+
+    #[test]
+    fn round_plan_view_maps_all_supported_next_steps() {
+        let plan = session::RoundPlan {
+            round_id: "round-1".to_string(),
+            pending_recovery: true,
+            next_steps: vec![
+                session::NextStep::Delegate { bundle_index: 1 },
+                session::NextStep::PollDelegation { bundle_index: 2 },
+                session::NextStep::CastVote {
+                    bundle_index: 3,
+                    proposal_id: 11,
+                    choice: 1,
+                },
+                session::NextStep::SubmitVote {
+                    bundle_index: 4,
+                    proposal_id: 12,
+                },
+                session::NextStep::PollVote {
+                    bundle_index: 5,
+                    proposal_id: 13,
+                },
+                session::NextStep::SubmitShares {
+                    bundle_index: 6,
+                    proposal_id: 14,
+                    share_index: 0,
+                },
+                session::NextStep::ConfirmShare {
+                    bundle_index: 7,
+                    proposal_id: 15,
+                    share_index: 1,
+                },
+            ],
+            open_proposals: vec![11, 12],
+            all_decided: false,
+        };
+
+        let view = RoundPlanView::try_from(plan).unwrap();
+        assert_eq!(view.round_id, "round-1");
+        assert!(view.pending_recovery);
+        assert_eq!(view.open_proposals, vec![11, 12]);
+        assert!(!view.all_decided);
+
+        let kinds = view
+            .next_steps
+            .iter()
+            .map(|step| step.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "delegate",
+                "poll_delegation",
+                "cast_vote",
+                "submit_vote",
+                "poll_vote",
+                "submit_shares",
+                "confirm_share"
+            ]
+        );
+        assert_eq!(view.next_steps[0].bundle_index, 1);
+        assert_eq!(view.next_steps[2].proposal_id, 11);
+        assert_eq!(view.next_steps[2].choice, 1);
+        assert_eq!(view.next_steps[6].share_index, 1);
     }
 }
