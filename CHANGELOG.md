@@ -9,6 +9,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added crate-owned FRB DTO views in `zcash_voting::wire` for wallet API
+  surfaces that previously used local mirrors in `vizor-wallet`:
+  `VotingNoteRefView`, `VotingNoteSelectionResultView`, `BundleSetupResultView`,
+  `DelegationPirPrecomputeResultView`, `SignedDelegationPayloadView`,
+  `KeystoneDelegationRequestView`, `KeystoneSignatureRecordView`, `DraftVoteView`,
+  `VanWitnessView`, `SignedVoteCommitmentView`, `SignedVoteCommitmentsView`,
+  and `VoteRecordView`.
 - Added stable resume-plan wire DTOs in `zcash_voting::wire`
   (`NextStepView`, `RoundPlanView`) so wallet adapters can consume crate-owned
   `session::resume_plan` outputs directly over FRB without maintaining local

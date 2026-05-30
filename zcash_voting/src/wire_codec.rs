@@ -10,19 +10,29 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
 use crate::{
-    delegate::DelegationSubmission,
+    delegate::{
+        DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport,
+        SignedDelegationBundle,
+    },
     phases::WorkflowPhase,
     recovery,
+    round::BundleLayout,
     session,
     share_policy::ShareSubmissionPlan,
-    types::{SharePayload, VotingError, WireEncryptedShare},
-    vote::SignedVoteCommitment,
+    storage::{KeystoneSignatureRecord, VoteRecord},
+    types::{NoteRef, SelectedNotes, SharePayload, VotingError, WireEncryptedShare},
+    vote::{DraftVote, SignedVoteCommitment, SignedVoteCommitments, VanWitness},
     wire::{
-        CommitmentBundleRecoveryView, DelegationRecoveryView, DelegationSubmissionWire,
-        NextStepView, RoundPlanView, RoundRecoveryStateView, ShareDelegationRecordView,
-        ShareSubmissionPlanView, ShareWorkflowRecoveryView, VoteCommitmentWire, VoteRecoveryView,
-        VoteShareWire, WireEncryptedShareJson,
+        BundleSetupResultView, CommitmentBundleRecoveryView, DelegationPirPrecomputeResultView,
+        DelegationRecoveryView, DelegationSubmissionWire, DraftVoteView,
+        KeystoneDelegationRequestView, KeystoneSignatureRecordView, NextStepView, RoundPlanView,
+        RoundRecoveryStateView,
+        ShareDelegationRecordView, ShareSubmissionPlanView, ShareWorkflowRecoveryView,
+        SignedDelegationPayloadView, SignedVoteCommitmentView, SignedVoteCommitmentsView,
+        VanWitnessView, VoteCommitmentWire, VoteRecordView, VoteRecoveryView, VoteShareWire,
+        VotingNoteRefView, VotingNoteSelectionResultView, WireEncryptedShareJson,
     },
+    BundlePolicy,
 };
 
 const MAX_SAFE_JSON_INTEGER: u64 = 0x1f_ffff_ffff_ffff;
@@ -150,6 +160,175 @@ impl SharePayload {
         submit_at: u64,
     ) -> Result<String, VotingError> {
         VoteShareWire::from_payload(self, vc_tree_position, submit_at)?.to_json()
+    }
+}
+
+impl From<NoteRef> for VotingNoteRefView {
+    fn from(note: NoteRef) -> Self {
+        Self {
+            pool: note.pool,
+            txid_hex: note.txid_hex,
+            output_index: note.output_index,
+            value_zatoshi: note.value_zatoshi,
+            voting_weight_zatoshi: note.voting_weight_zatoshi,
+            commitment_tree_position: note.commitment_tree_position,
+            mined_height: note.mined_height,
+            anchor_height: note.anchor_height,
+        }
+    }
+}
+
+impl VotingNoteSelectionResultView {
+    pub fn from_selected(selected: SelectedNotes, bundle_policy: BundlePolicy) -> Result<Self, VotingError> {
+        let note_count = u32::try_from(selected.notes.len()).map_err(|_| VotingError::InvalidInput {
+            message: format!(
+                "Selected note count {} does not fit in u32",
+                selected.notes.len()
+            ),
+        })?;
+        let eligible_weight_zatoshi = crate::voting_power_with_policy(&selected, bundle_policy);
+        let snapshot_height = selected.snapshot_height;
+        let anchor_height = selected.anchor_tree_state.height;
+        let notes = selected.notes.into_iter().map(Into::into).collect();
+        Ok(Self {
+            note_count,
+            eligible_weight_zatoshi,
+            snapshot_height,
+            anchor_height,
+            notes,
+        })
+    }
+}
+
+impl From<BundleLayout> for BundleSetupResultView {
+    fn from(result: BundleLayout) -> Self {
+        Self {
+            bundle_count: result.bundle_count,
+            eligible_weight_zatoshi: result.eligible_weight,
+        }
+    }
+}
+
+impl From<PreparedDelegationReport> for DelegationPirPrecomputeResultView {
+    fn from(result: PreparedDelegationReport) -> Self {
+        Self {
+            cached_count: result.report.cached,
+            fetched_count: result.report.fetched,
+            bundle_count: result.layout.bundle_count,
+            bundle_index: result.bundle_index,
+        }
+    }
+}
+
+impl TryFrom<SignedDelegationBundle> for SignedDelegationPayloadView {
+    type Error = VotingError;
+
+    fn try_from(result: SignedDelegationBundle) -> Result<Self, Self::Error> {
+        let submission = DelegationSubmissionWire::try_from(&result.submission)?;
+        Ok(Self {
+            pczt_bytes: result.pczt_bytes,
+            status: "ready_for_submission".to_string(),
+            message: None,
+            submission,
+            eligible_weight_zatoshi: result.eligible_weight_zatoshi,
+            delegated_weight_zatoshi: result.delegated_weight_zatoshi,
+            bundle_count: result.bundle_count,
+            bundle_index: result.bundle_index,
+        })
+    }
+}
+
+impl From<KeystoneSigningRequest> for KeystoneDelegationRequestView {
+    fn from(result: KeystoneSigningRequest) -> Self {
+        let action_index = u32::try_from(result.setup.action_index).unwrap_or(u32::MAX);
+        Self {
+            pczt_bytes: result.setup.pczt_bytes,
+            redacted_pczt_bytes: result.redacted_pczt_bytes,
+            pczt_sighash: result.setup.pczt_sighash.to_vec(),
+            rk: result.setup.rk.to_vec(),
+            action_index,
+            display_memo: result.display_memo,
+            eligible_weight_zatoshi: result.eligible_weight_zatoshi,
+            delegated_weight_zatoshi: result.delegated_weight_zatoshi,
+            bundle_count: result.bundle_count,
+            bundle_index: result.bundle_index,
+        }
+    }
+}
+
+impl From<KeystoneSignatureRecord> for KeystoneSignatureRecordView {
+    fn from(record: KeystoneSignatureRecord) -> Self {
+        Self {
+            bundle_index: record.bundle_index,
+            sig: record.sig,
+            sighash: record.sighash,
+            rk: record.rk,
+        }
+    }
+}
+
+impl From<VanWitness> for VanWitnessView {
+    fn from(witness: VanWitness) -> Self {
+        Self {
+            auth_path: witness.auth_path.iter().map(|hash| hash.to_vec()).collect(),
+            position: witness.position,
+            anchor_height: witness.anchor_height,
+        }
+    }
+}
+
+impl From<DraftVoteView> for DraftVote {
+    fn from(draft: DraftVoteView) -> Self {
+        Self {
+            proposal_id: draft.proposal_id,
+            choice: draft.choice,
+            num_options: draft.num_options,
+            vc_tree_position: draft.vc_tree_position,
+            single_share: draft.single_share,
+        }
+    }
+}
+
+impl TryFrom<SignedVoteCommitment> for SignedVoteCommitmentView {
+    type Error = VotingError;
+
+    fn try_from(commitment: SignedVoteCommitment) -> Result<Self, Self::Error> {
+        let wire = VoteCommitmentWire::try_from(&commitment)?;
+        let shares = commitment
+            .share_payloads
+            .iter()
+            .map(|payload| VoteShareWire::from_payload(payload, None, 0))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            proposal_id: commitment.proposal_id,
+            wire,
+            shares,
+        })
+    }
+}
+
+impl TryFrom<SignedVoteCommitments> for SignedVoteCommitmentsView {
+    type Error = VotingError;
+
+    fn try_from(commitments: SignedVoteCommitments) -> Result<Self, Self::Error> {
+        Ok(Self {
+            bundle_index: commitments.bundle_index,
+            commitments: commitments
+                .commitments
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl From<VoteRecord> for VoteRecordView {
+    fn from(record: VoteRecord) -> Self {
+        Self {
+            proposal_id: record.proposal_id,
+            bundle_index: record.bundle_index,
+            choice: record.choice,
+        }
     }
 }
 
@@ -357,9 +536,45 @@ fn json_safe_u64(value: u64, field: &str) -> Result<u64, VotingError> {
 mod tests {
     use super::*;
     use crate::vote::SignedVoteCommitment;
+    use zcash_client_backend::proto::service::TreeState;
 
     fn decode_b64(value: &str) -> Vec<u8> {
         BASE64_STANDARD.decode(value).unwrap()
+    }
+
+    fn test_tree_state(height: u64) -> TreeState {
+        TreeState {
+            network: "test".to_string(),
+            height,
+            hash: String::new(),
+            time: 0,
+            sapling_tree: String::new(),
+            orchard_tree: String::new(),
+        }
+    }
+
+    fn test_note_ref(
+        value_zatoshi: u64,
+        voting_weight_zatoshi: u64,
+        commitment_tree_position: u64,
+    ) -> NoteRef {
+        NoteRef {
+            pool: "orchard".to_string(),
+            txid_hex: hex::encode([commitment_tree_position as u8; 32]),
+            output_index: commitment_tree_position as u32,
+            value_zatoshi,
+            voting_weight_zatoshi,
+            commitment: vec![0x01; 32],
+            nullifier: vec![0x02; 32],
+            diversifier: vec![0x03; 11],
+            rho: vec![0x04; 32],
+            rseed: vec![0x05; 32],
+            scope: 0,
+            ufvk_str: String::new(),
+            commitment_tree_position,
+            mined_height: 1,
+            anchor_height: 100,
+        }
     }
 
     #[test]
@@ -470,6 +685,189 @@ mod tests {
         assert!(err
             .to_string()
             .contains("field tree_position is too large to encode as JSON integer"));
+    }
+
+    #[test]
+    fn bundle_setup_result_view_preserves_core_fields() {
+        let view = BundleSetupResultView::from(crate::round::BundleLayout {
+            bundle_count: 2,
+            eligible_weight: 50,
+            dropped_count: 0,
+        });
+        assert_eq!(view.bundle_count, 2);
+        assert_eq!(view.eligible_weight_zatoshi, 50);
+    }
+
+    #[test]
+    fn signed_delegation_payload_view_preserves_core_fields() {
+        let view = SignedDelegationPayloadView::try_from(SignedDelegationBundle {
+            submission: DelegationSubmission {
+                proof: vec![4],
+                rk: [5; 32],
+                nf_signed: [8; 32],
+                cmx_new: [9; 32],
+                gov_comm: [10; 32],
+                gov_nullifiers: [[11; 32]; 5],
+                alpha: [12; 32],
+                vote_round_id: "00010203".to_string(),
+                spend_auth_sig: [6; 64],
+                sighash: [7; 32],
+            },
+            pczt_bytes: vec![1, 2, 3],
+            eligible_weight_zatoshi: 20,
+            delegated_weight_zatoshi: 10,
+            bundle_count: 2,
+            bundle_index: 1,
+        })
+        .unwrap();
+        assert_eq!(view.pczt_bytes, vec![1, 2, 3]);
+        assert_eq!(view.status, "ready_for_submission");
+        assert_eq!(view.message, None);
+        assert_eq!(
+            view.submission.proof,
+            base64::engine::general_purpose::STANDARD.encode(vec![4])
+        );
+        assert_eq!(
+            view.submission.vote_round_id,
+            base64::engine::general_purpose::STANDARD.encode([0, 1, 2, 3])
+        );
+        assert_eq!(view.eligible_weight_zatoshi, 20);
+        assert_eq!(view.delegated_weight_zatoshi, 10);
+        assert_eq!(view.bundle_count, 2);
+        assert_eq!(view.bundle_index, 1);
+    }
+
+    #[test]
+    fn keystone_delegation_request_view_preserves_display_memo() {
+        let view = KeystoneDelegationRequestView::from(KeystoneSigningRequest {
+            setup: crate::delegate::DelegationSetup {
+                pczt_bytes: vec![1],
+                pczt_sighash: [3; 32],
+                rk: [4; 32],
+                action_index: 5,
+                action_bytes: vec![],
+            },
+            redacted_pczt_bytes: vec![2],
+            display_memo: "I am authorizing this hotkey.".to_string(),
+            eligible_weight_zatoshi: 20,
+            delegated_weight_zatoshi: 10,
+            bundle_count: 2,
+            bundle_index: 1,
+        });
+        assert_eq!(view.display_memo, "I am authorizing this hotkey.");
+        assert_eq!(view.bundle_count, 2);
+        assert_eq!(view.bundle_index, 1);
+    }
+
+    #[test]
+    fn van_witness_view_preserves_core_fields() {
+        let mut witness = [[0u8; 32]; crate::vote::VAN_AUTH_PATH_LEN];
+        witness[0] = [1; 32];
+        witness[1] = [2; 32];
+        let view = VanWitnessView::from(VanWitness {
+            auth_path: witness,
+            position: 7,
+            anchor_height: 123,
+        });
+        assert_eq!(view.auth_path[0], vec![1; 32]);
+        assert_eq!(view.auth_path[1], vec![2; 32]);
+        assert_eq!(view.position, 7);
+        assert_eq!(view.anchor_height, 123);
+    }
+
+    #[test]
+    fn draft_vote_view_maps_to_core_draft_vote() {
+        let view = DraftVoteView {
+            proposal_id: 9,
+            choice: 2,
+            num_options: 4,
+            vc_tree_position: 123,
+            single_share: true,
+        };
+        let core: crate::vote::DraftVote = view.into();
+        assert_eq!(core.proposal_id, 9);
+        assert_eq!(core.choice, 2);
+        assert_eq!(core.num_options, 4);
+        assert_eq!(core.vc_tree_position, 123);
+        assert!(core.single_share);
+    }
+
+    #[test]
+    fn signed_vote_commitments_view_preserves_public_wire_fields() {
+        let view = SignedVoteCommitmentsView::try_from(crate::vote::SignedVoteCommitments {
+            bundle_index: 1,
+            commitments: vec![crate::vote::SignedVoteCommitment {
+                proposal_id: 2,
+                choice: 1,
+                vote_round_id: "00".repeat(32),
+                van_nullifier: [1; 32],
+                vote_authority_note_new: [2; 32],
+                vote_commitment: [3; 32],
+                proof: vec![4; 10],
+                encrypted_shares: vec![crate::WireEncryptedShare {
+                    c1: vec![5; 32],
+                    c2: vec![6; 32],
+                    share_index: 0,
+                }],
+                share_payloads: vec![crate::SharePayload {
+                    shares_hash: vec![7; 32],
+                    proposal_id: 2,
+                    vote_decision: 1,
+                    enc_share: crate::WireEncryptedShare {
+                        c1: vec![5; 32],
+                        c2: vec![6; 32],
+                        share_index: 0,
+                    },
+                    tree_position: 9,
+                    all_enc_shares: vec![],
+                    share_comms: vec![vec![8; 32]],
+                    primary_blind: vec![9; 32],
+                }],
+                anchor_height: 100,
+                shares_hash: [7; 32],
+                share_comms: vec![[8; 32]],
+                r_vpk: [10; 32],
+                vote_auth_sig: [9; 64],
+                commitment_bundle_json: "{\"proposal_id\":2}".to_string(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(view.bundle_index, 1);
+        assert_eq!(view.commitments[0].proposal_id, 2);
+        assert_eq!(view.commitments[0].wire.proposal_id, 2);
+        assert_eq!(
+            view.commitments[0].shares[0].encrypted_share.c1,
+            base64::engine::general_purpose::STANDARD.encode(vec![5; 32])
+        );
+        assert_eq!(
+            view.commitments[0].shares[0].primary_blind,
+            base64::engine::general_purpose::STANDARD.encode(vec![9; 32])
+        );
+        assert_eq!(
+            view.commitments[0].wire.vote_auth_sig,
+            base64::engine::general_purpose::STANDARD.encode(vec![9; 64])
+        );
+    }
+
+    #[test]
+    fn voting_note_selection_result_view_preserves_core_fields() {
+        let divisor = crate::governance::BALLOT_DIVISOR;
+        let selected = SelectedNotes {
+            notes: vec![
+                test_note_ref(divisor / 2, divisor / 2, 3),
+                test_note_ref(divisor / 2, divisor / 2, 7),
+            ],
+            snapshot_height: 100,
+            anchor_tree_state: test_tree_state(100),
+        };
+        let view = VotingNoteSelectionResultView::from_selected(selected, BundlePolicy::default()).unwrap();
+        assert_eq!(view.note_count, 2);
+        assert_eq!(view.eligible_weight_zatoshi, divisor);
+        assert_eq!(view.snapshot_height, 100);
+        assert_eq!(view.anchor_height, 100);
+        assert_eq!(view.notes[0].commitment_tree_position, 3);
+        assert_eq!(view.notes[1].value_zatoshi, divisor / 2);
+        assert_eq!(view.notes[1].voting_weight_zatoshi, divisor / 2);
     }
 
     #[test]

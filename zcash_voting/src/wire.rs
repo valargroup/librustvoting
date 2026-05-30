@@ -78,6 +78,111 @@ pub struct VotingRoundParams {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VotingNoteRefView {
+    pub pool: String,
+    pub txid_hex: String,
+    pub output_index: u32,
+    pub value_zatoshi: u64,
+    pub voting_weight_zatoshi: u64,
+    pub commitment_tree_position: u64,
+    pub mined_height: u64,
+    pub anchor_height: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VotingNoteSelectionResultView {
+    pub note_count: u32,
+    pub eligible_weight_zatoshi: u64,
+    pub snapshot_height: u64,
+    pub anchor_height: u64,
+    pub notes: Vec<VotingNoteRefView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleSetupResultView {
+    pub bundle_count: u32,
+    pub eligible_weight_zatoshi: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationPirPrecomputeResultView {
+    pub cached_count: u32,
+    pub fetched_count: u32,
+    pub bundle_count: u32,
+    pub bundle_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedDelegationPayloadView {
+    pub pczt_bytes: Vec<u8>,
+    pub status: String,
+    pub message: Option<String>,
+    pub submission: DelegationSubmissionWire,
+    pub eligible_weight_zatoshi: u64,
+    pub delegated_weight_zatoshi: u64,
+    pub bundle_count: u32,
+    pub bundle_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeystoneDelegationRequestView {
+    pub pczt_bytes: Vec<u8>,
+    pub redacted_pczt_bytes: Vec<u8>,
+    pub pczt_sighash: Vec<u8>,
+    pub rk: Vec<u8>,
+    pub action_index: u32,
+    pub display_memo: String,
+    pub eligible_weight_zatoshi: u64,
+    pub delegated_weight_zatoshi: u64,
+    pub bundle_count: u32,
+    pub bundle_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeystoneSignatureRecordView {
+    pub bundle_index: u32,
+    pub sig: Vec<u8>,
+    pub sighash: Vec<u8>,
+    pub rk: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VanWitnessView {
+    pub auth_path: Vec<Vec<u8>>,
+    pub position: u32,
+    pub anchor_height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftVoteView {
+    pub proposal_id: u32,
+    pub choice: u32,
+    pub num_options: u32,
+    pub vc_tree_position: u64,
+    pub single_share: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedVoteCommitmentView {
+    pub proposal_id: u32,
+    pub wire: VoteCommitmentWire,
+    pub shares: Vec<VoteShareWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedVoteCommitmentsView {
+    pub bundle_index: u32,
+    pub commitments: Vec<SignedVoteCommitmentView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteRecordView {
+    pub proposal_id: u32,
+    pub bundle_index: u32,
+    pub choice: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareSubmissionPlanView {
     pub submit_at: u64,
     pub target_count: u32,
