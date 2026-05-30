@@ -14,6 +14,7 @@ pub use crate::selection::{
 };
 use crate::{
     governance::BUNDLE_NOTE_SLOTS,
+    note_bundling::BundlePolicy,
     precompute::PirPrecomputeReport,
     round::{BundleLayout, VotingDb},
     types::{DelegationProgressReporter, Network, NoteInfo, VotingError, VotingHotkey},
@@ -220,6 +221,33 @@ pub struct DelegationLwdInputs {
     pub branch_id_provider: LightwalletdBranchIdProvider,
 }
 
+/// Parameters for preparing one delegation bundle from caller-owned wallet state.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub struct PrepareDelegationBundleParams<'a, C, P, CL, R> {
+    pub wallet_db: &'a WalletDb<C, P, CL, R>,
+    pub account_uuid: &'a str,
+    pub voting_hotkey: &'a VotingHotkey,
+    pub scanned_height: u64,
+    pub bundle_index: u32,
+    pub bundle_policy: BundlePolicy,
+}
+
+/// Plain delegation bundle state reused by precompute, signing, and submission.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+#[derive(Clone, Debug)]
+pub struct PreparedDelegationBundle {
+    pub round_id: String,
+    pub round_params: crate::VotingRoundParams,
+    pub bundle_index: u32,
+    pub layout: BundleLayout,
+    pub bundle_note_infos: Vec<NoteInfo>,
+    pub delegation_keys: DelegationKeys,
+    pub branch_id_provider: LightwalletdBranchIdProvider,
+    pub anchor_tree_state_bytes: Vec<u8>,
+    pub network: Network,
+    pub round_name: String,
+}
+
 /// Validates round params and resolves lightwalletd anchor and branch state.
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn gather_delegation_lwd_inputs(
@@ -243,6 +271,66 @@ pub async fn gather_delegation_lwd_inputs(
         resolved_round_name,
         anchor_tree_state_bytes,
         branch_id_provider,
+    })
+}
+
+/// Prepares reusable bundle state after lightwalletd inputs are resolved.
+///
+/// Callers should resolve [`DelegationLwdInputs`] before opening a non-`Send`
+/// wallet DB handle in async contexts. This helper keeps wallet DB access and
+/// bundle validation in one place, returning plain data for later operations.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub fn prepare_delegation_bundle<C, P, CL, R>(
+    voting_db: &VotingDb,
+    lwd: DelegationLwdInputs,
+    params: PrepareDelegationBundleParams<'_, C, P, CL, R>,
+) -> Result<PreparedDelegationBundle, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let DelegationLwdInputs {
+        round_params,
+        resolved_round_name,
+        anchor_tree_state_bytes,
+        branch_id_provider,
+    } = lwd;
+    let round_id = round_params.vote_round_id.clone();
+    let round_name = resolved_round_name.clone();
+    let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
+        wallet_db: params.wallet_db,
+        account_uuid: params.account_uuid,
+        voting_hotkey: params.voting_hotkey,
+        snapshot_height: round_params.snapshot_height,
+        scanned_height: params.scanned_height,
+        anchor_tree_state_bytes,
+        resolved_round_name,
+    })?;
+
+    voting_db.ensure_round(&round_params, None)?;
+    let layout = voting_db.ensure_bundles_with_skipped_suffix_with_policy(
+        &round_id,
+        &wallet_inputs.round_note_infos,
+        params.bundle_policy,
+    )?;
+    let bundle_note_infos = crate::round::bundle_notes_for_index_with_policy(
+        &wallet_inputs.round_note_infos,
+        &layout,
+        params.bundle_index,
+        params.bundle_policy,
+    )?;
+
+    Ok(PreparedDelegationBundle {
+        round_id,
+        round_params,
+        bundle_index: params.bundle_index,
+        layout,
+        bundle_note_infos,
+        delegation_keys: wallet_inputs.delegation_keys,
+        branch_id_provider,
+        anchor_tree_state_bytes: wallet_inputs.anchor_tree_state_bytes,
+        network: params.voting_hotkey.network(),
+        round_name,
     })
 }
 
@@ -702,6 +790,75 @@ mod tests {
 
     fn test_voting_hotkey() -> VotingHotkey {
         crate::hotkey::voting_hotkey_from_seed(&[0x77; 64], Network::Testnet).unwrap()
+    }
+
+    #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+    #[test]
+    fn prepare_delegation_bundle_returns_plain_reusable_bundle_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn);
+        let account_ref = account_internal_id(&conn, &account_uuid);
+        let divisor = crate::governance::BALLOT_DIVISOR;
+
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, divisor, 7);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 10, divisor * 2, 3);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 11);
+
+        let wallet_db = WalletDb::from_connection(
+            &conn,
+            ZcashNetwork::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("prepare-delegation-bundle-test");
+        let hotkey = test_voting_hotkey();
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
+                .to_string(),
+            snapshot_height: 12,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        let prepared = prepare_delegation_bundle(
+            &voting_db,
+            DelegationLwdInputs {
+                round_params: round_params.clone(),
+                resolved_round_name: "Demo Round".to_string(),
+                anchor_tree_state_bytes: vec![0xAA, 0xBB],
+                branch_id_provider: LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0),
+            },
+            PrepareDelegationBundleParams {
+                wallet_db: &wallet_db,
+                account_uuid: &account_uuid.expose_uuid().to_string(),
+                voting_hotkey: &hotkey,
+                scanned_height: 12,
+                bundle_index: 0,
+                bundle_policy: crate::BundlePolicy::default(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prepared.round_id, round_params.vote_round_id);
+        assert_eq!(prepared.round_params.snapshot_height, 12);
+        assert_eq!(prepared.bundle_index, 0);
+        assert_eq!(prepared.layout.bundle_count, 1);
+        assert_eq!(prepared.layout.eligible_weight, divisor * 3);
+        assert_eq!(prepared.bundle_note_infos.len(), 2);
+        assert_eq!(prepared.bundle_note_infos[0].position, 3);
+        assert_eq!(prepared.bundle_note_infos[1].position, 7);
+        assert_eq!(prepared.anchor_tree_state_bytes, vec![0xAA, 0xBB]);
+        assert_eq!(prepared.network, Network::Testnet);
+        assert_eq!(prepared.round_name, "Demo Round");
+        assert_eq!(
+            prepared.branch_id_provider.consensus_branch_id().unwrap(),
+            0x4DEC_4DF0
+        );
+        assert_eq!(
+            &prepared.delegation_keys.hotkey_raw_address,
+            hotkey.raw_orchard_address()
+        );
     }
 
     fn setup_test_account(
