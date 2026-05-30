@@ -52,7 +52,11 @@ pub use crate::selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,
     select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
-pub use crate::session::{resume_plan, Decision, NextStep, RoundPlan};
+pub use crate::session::{
+    resume_plan, CompletedVoteChoice, CompletedVoteDisplay, Decision, DelegationRecoveryWork,
+    DelegationRecoveryWorkKind, DelegationStatus, NextStep, RoundPlan, RoundPlanAction,
+    VoteRecoveryWork, VoteRecoveryWorkKind,
+};
 pub use crate::share::{
     add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,
     record as record_share, recover_payload, recover_wire_json, unconfirmed as unconfirmed_shares,

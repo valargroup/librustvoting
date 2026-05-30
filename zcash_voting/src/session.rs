@@ -239,6 +239,126 @@ impl NextStep {
     }
 }
 
+/// High-level work area a wallet should show or resume for a round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RoundPlanAction {
+    /// No crate-owned recovery or submitted vote artifact is present.
+    Idle,
+    /// Delegation must be submitted or polled before fresh vote work can finish.
+    Delegate,
+    /// Cast-vote, vote-submission, vote-polling, or helper-share submission work remains.
+    Vote,
+    /// Only blocking helper-share confirmation work remains.
+    SubmitShares,
+    /// A vote artifact exists and no blocking recovery work remains.
+    Done,
+}
+
+impl RoundPlanAction {
+    /// Returns the stable string discriminator used by FFI layers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Delegate => "delegate",
+            Self::Vote => "vote",
+            Self::SubmitShares => "submit_shares",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// Kind of delegation recovery work grouped from `NextStep`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DelegationRecoveryWorkKind {
+    /// Run the delegation flow for this bundle.
+    Delegate,
+    /// Poll an already-submitted delegation transaction.
+    PollDelegation,
+}
+
+impl DelegationRecoveryWorkKind {
+    /// Returns the stable string discriminator used by FFI layers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delegate => "delegate",
+            Self::PollDelegation => "poll_delegation",
+        }
+    }
+}
+
+/// Grouped delegation recovery work for one bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationRecoveryWork {
+    pub kind: DelegationRecoveryWorkKind,
+    pub bundle_index: u32,
+    pub phase: DelegationPhase,
+    /// Present only when `kind == DelegationRecoveryWorkKind::PollDelegation`.
+    pub tx_hash: Option<String>,
+}
+
+/// Durable delegation state for one eligible bundle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationStatus {
+    pub bundle_index: u32,
+    pub phase: DelegationPhase,
+    pub tx_hash: Option<String>,
+}
+
+/// Kind of vote recovery work grouped from `NextStep`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VoteRecoveryWorkKind {
+    /// Submit a committed vote using persisted recovery material.
+    SubmitVote,
+    /// Poll an already-submitted vote transaction.
+    PollVote,
+    /// Submit one or more missing helper shares for a confirmed vote.
+    SubmitShares,
+}
+
+impl VoteRecoveryWorkKind {
+    /// Returns the stable string discriminator used by FFI layers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SubmitVote => "submit_vote",
+            Self::PollVote => "poll_vote",
+            Self::SubmitShares => "submit_shares",
+        }
+    }
+}
+
+/// Grouped vote recovery work for one `(bundle_index, proposal_id)` key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoteRecoveryWork {
+    pub kind: VoteRecoveryWorkKind,
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    /// Present only when `kind == VoteRecoveryWorkKind::PollVote`.
+    pub tx_hash: Option<String>,
+    /// Present only when `kind == VoteRecoveryWorkKind::SubmitShares`.
+    pub vc_tree_position: Option<u64>,
+    /// Empty unless `kind == VoteRecoveryWorkKind::SubmitShares`.
+    pub share_indexes: Vec<u32>,
+}
+
+/// Display choice for one proposal in a completed round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedVoteChoice {
+    pub proposal_id: u32,
+    /// `None` when the proposal was skipped or bundles disagree.
+    pub choice: Option<u32>,
+}
+
+/// Read-only display summary for a locally completed vote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedVoteDisplay {
+    pub choices: Vec<CompletedVoteChoice>,
+    /// Latest helper-share delegation timestamp, in Unix seconds.
+    pub voted_at: Option<u64>,
+}
+
 /// Derived resume state for one round.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoundPlan {
@@ -254,6 +374,32 @@ pub struct RoundPlan {
     pub open_proposals: Vec<u32>,
     /// Informational: every proposal is either a confirmed Choice or Skipped.
     pub all_decided: bool,
+    /// Durable delegation status for every eligible bundle in the round.
+    pub delegation_statuses: Vec<DelegationStatus>,
+    /// True when the plan contains work that should keep the foreground vote flow open.
+    ///
+    /// Unconfirmed helper shares that were already accepted by at least one helper
+    /// remain in `next_steps` as `ConfirmShare`, but they are non-blocking because
+    /// background polling can complete them later.
+    pub blocking_recovery: bool,
+    /// True when an unconfirmed helper-share row has no accepted helper URL yet.
+    pub blocking_share_work: bool,
+    /// True once round artifacts require the same voting hotkey to be reused.
+    pub hotkey_bound: bool,
+    /// True once the local DB contains a vote or helper-share artifact for the round.
+    pub completed_vote_artifact: bool,
+    /// True when a vote artifact exists and no blocking recovery work remains.
+    pub completed_for_display: bool,
+    /// Display data for a completed vote, present only when `completed_for_display`.
+    pub completed_vote_display: Option<CompletedVoteDisplay>,
+    /// True when a wallet should collect or restore draft choices for open proposals.
+    pub needs_draft_setup: bool,
+    /// Primary work area derived from the crate-owned recovery state.
+    pub primary_action: RoundPlanAction,
+    /// Delegation recovery work grouped from `next_steps` for wallet orchestration.
+    pub recovered_delegation_work: Vec<DelegationRecoveryWork>,
+    /// Vote recovery work grouped from `next_steps` for wallet orchestration.
+    pub recovered_vote_work: Vec<VoteRecoveryWork>,
 }
 
 fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
@@ -289,6 +435,273 @@ fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
     }
 }
 
+fn missing_recovery_field(message: String) -> VotingError {
+    VotingError::Internal { message }
+}
+
+fn delegation_statuses(
+    db: &VotingDb,
+    round_id: &str,
+    delegation: &BTreeMap<u32, DelegationPhase>,
+) -> Result<Vec<DelegationStatus>, VotingError> {
+    delegation
+        .iter()
+        .map(|(&bundle_index, &phase)| {
+            Ok(DelegationStatus {
+                bundle_index,
+                phase,
+                tx_hash: db.get_delegation_tx_hash(round_id, bundle_index)?,
+            })
+        })
+        .collect()
+}
+
+fn recovered_delegation_work_from_steps(
+    db: &VotingDb,
+    round_id: &str,
+    delegation: &BTreeMap<u32, DelegationPhase>,
+    steps: &[NextStep],
+) -> Result<Vec<DelegationRecoveryWork>, VotingError> {
+    let mut work = Vec::<DelegationRecoveryWork>::new();
+    for step in steps {
+        match *step {
+            NextStep::Delegate { bundle_index } => {
+                let phase = delegation.get(&bundle_index).copied().ok_or_else(|| {
+                    missing_recovery_field(format!(
+                        "delegate step missing phase for round={round_id}, bundle={bundle_index}"
+                    ))
+                })?;
+                work.push(DelegationRecoveryWork {
+                    kind: DelegationRecoveryWorkKind::Delegate,
+                    bundle_index,
+                    phase,
+                    tx_hash: None,
+                });
+            }
+            NextStep::PollDelegation { bundle_index } => {
+                let phase = delegation.get(&bundle_index).copied().ok_or_else(|| {
+                    missing_recovery_field(format!(
+                        "poll delegation step missing phase for round={round_id}, bundle={bundle_index}"
+                    ))
+                })?;
+                let tx_hash = db
+                    .get_delegation_tx_hash(round_id, bundle_index)?
+                    .ok_or_else(|| {
+                        missing_recovery_field(format!(
+                            "poll delegation step missing tx_hash for round={round_id}, bundle={bundle_index}"
+                        ))
+                    })?;
+                work.push(DelegationRecoveryWork {
+                    kind: DelegationRecoveryWorkKind::PollDelegation,
+                    bundle_index,
+                    phase,
+                    tx_hash: Some(tx_hash),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(work)
+}
+
+fn recovered_vote_work_from_steps(
+    db: &VotingDb,
+    round_id: &str,
+    blocking_confirm_share_keys: &BTreeSet<(u32, u32, u32)>,
+    steps: &[NextStep],
+) -> Result<Vec<VoteRecoveryWork>, VotingError> {
+    let mut work = Vec::<VoteRecoveryWork>::new();
+    let pending_vote_confirmation_keys = steps
+        .iter()
+        .filter_map(|step| match step {
+            NextStep::PollVote {
+                bundle_index,
+                proposal_id,
+            } => Some((*bundle_index, *proposal_id)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for step in steps {
+        match *step {
+            NextStep::SubmitVote {
+                bundle_index,
+                proposal_id,
+            } => work.push(VoteRecoveryWork {
+                kind: VoteRecoveryWorkKind::SubmitVote,
+                bundle_index,
+                proposal_id,
+                tx_hash: None,
+                vc_tree_position: None,
+                share_indexes: Vec::new(),
+            }),
+            NextStep::PollVote {
+                bundle_index,
+                proposal_id,
+            } => {
+                let tx_hash = db
+                    .get_vote_tx_hash(round_id, bundle_index, proposal_id)?
+                    .ok_or_else(|| {
+                        missing_recovery_field(format!(
+                            "poll vote step missing tx_hash for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+                        ))
+                    })?;
+                work.push(VoteRecoveryWork {
+                    kind: VoteRecoveryWorkKind::PollVote,
+                    bundle_index,
+                    proposal_id,
+                    tx_hash: Some(tx_hash),
+                    vc_tree_position: None,
+                    share_indexes: Vec::new(),
+                });
+            }
+            NextStep::SubmitShares {
+                bundle_index,
+                proposal_id,
+                share_index,
+            } => push_submit_share_work(
+                db,
+                round_id,
+                &mut work,
+                bundle_index,
+                proposal_id,
+                share_index,
+            )?,
+            NextStep::ConfirmShare {
+                bundle_index,
+                proposal_id,
+                share_index,
+            } if blocking_confirm_share_keys.contains(&(
+                bundle_index,
+                proposal_id,
+                share_index,
+            )) && !pending_vote_confirmation_keys.contains(&(bundle_index, proposal_id)) =>
+            {
+                push_submit_share_work(
+                    db,
+                    round_id,
+                    &mut work,
+                    bundle_index,
+                    proposal_id,
+                    share_index,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(work)
+}
+
+fn push_submit_share_work(
+    db: &VotingDb,
+    round_id: &str,
+    work: &mut Vec<VoteRecoveryWork>,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<(), VotingError> {
+    if let Some(existing) = work.iter_mut().find(|item| {
+        item.kind == VoteRecoveryWorkKind::SubmitShares
+            && item.bundle_index == bundle_index
+            && item.proposal_id == proposal_id
+    }) {
+        existing.share_indexes.push(share_index);
+        existing.share_indexes.sort_unstable();
+        existing.share_indexes.dedup();
+        return Ok(());
+    }
+
+    let vc_tree_position = db
+        .get_commitment_bundle(round_id, bundle_index, proposal_id)?
+        .map(|(_, position)| position)
+        .ok_or_else(|| {
+            missing_recovery_field(format!(
+                "submit shares step missing vc_tree_position for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+            ))
+        })?;
+    work.push(VoteRecoveryWork {
+        kind: VoteRecoveryWorkKind::SubmitShares,
+        bundle_index,
+        proposal_id,
+        tx_hash: None,
+        vc_tree_position: Some(vc_tree_position),
+        share_indexes: vec![share_index],
+    });
+    Ok(())
+}
+
+fn select_primary_action(
+    steps: &[NextStep],
+    blocking_recovery: bool,
+    blocking_share_work: bool,
+    completed_for_display: bool,
+) -> RoundPlanAction {
+    if completed_for_display {
+        return RoundPlanAction::Done;
+    }
+    if !blocking_recovery {
+        return RoundPlanAction::Idle;
+    }
+    if steps.iter().any(|step| {
+        matches!(
+            step,
+            NextStep::Delegate { .. } | NextStep::PollDelegation { .. }
+        )
+    }) {
+        return RoundPlanAction::Delegate;
+    }
+    if steps.iter().any(|step| {
+        matches!(
+            step,
+            NextStep::CastVote { .. }
+                | NextStep::SubmitVote { .. }
+                | NextStep::PollVote { .. }
+                | NextStep::SubmitShares { .. }
+        )
+    }) {
+        return RoundPlanAction::Vote;
+    }
+    if blocking_share_work {
+        RoundPlanAction::SubmitShares
+    } else {
+        RoundPlanAction::Idle
+    }
+}
+
+fn completed_vote_display(
+    proposal_ids: &[u32],
+    intents: &BTreeMap<u32, Decision>,
+    vote_choices: &BTreeMap<(u32, u32), u32>,
+    stale_vote_keys: &BTreeSet<(u32, u32)>,
+    voted_at: Option<u64>,
+) -> CompletedVoteDisplay {
+    let choices = proposal_ids
+        .iter()
+        .map(|&proposal_id| {
+            let proposal_choices = vote_choices
+                .iter()
+                .filter_map(|(&(bundle_index, vote_proposal_id), &choice)| {
+                    (vote_proposal_id == proposal_id
+                        && !stale_vote_keys.contains(&(bundle_index, vote_proposal_id)))
+                    .then_some(choice)
+                })
+                .collect::<BTreeSet<_>>();
+            let choice = match intents.get(&proposal_id) {
+                Some(Decision::Skipped) => None,
+                Some(Decision::Choice(_)) if proposal_choices.len() == 1 => {
+                    proposal_choices.first().copied()
+                }
+                _ => None,
+            };
+            CompletedVoteChoice {
+                proposal_id,
+                choice,
+            }
+        })
+        .collect();
+
+    CompletedVoteDisplay { choices, voted_at }
+}
+
 /// Build the resume plan for `round_id`.
 ///
 /// `proposal_ids` is the round's full set of proposal ids (from the wallet's
@@ -318,8 +731,9 @@ pub fn resume_plan(
         .into_iter()
         .map(|vote| ((vote.bundle_index, vote.proposal_id), vote.choice))
         .collect();
-    let shares = db.share_phases(round_id)?;
-    let share_indexes_by_vote = shares.iter().fold(
+    let share_phase_rows = db.share_phases(round_id)?;
+    let share_delegations = db.get_share_delegations(round_id)?;
+    let share_indexes_by_vote = share_phase_rows.iter().fold(
         BTreeMap::<(u32, u32), BTreeSet<u32>>::new(),
         |mut acc, (bundle_index, proposal_id, share_index, _)| {
             acc.entry((*bundle_index, *proposal_id))
@@ -425,6 +839,13 @@ pub fn resume_plan(
                     });
                 }
                 Some(VotePhase::Submitted) => {
+                    if !vote_has_recovery_bundle(db, round_id, b, pid)? {
+                        return Err(VotingError::InvalidInput {
+                            message: format!(
+                                "round {round_id} bundle {b} proposal {pid} has a submitted vote without recovery material"
+                            ),
+                        });
+                    }
                     steps.push(NextStep::PollVote {
                         bundle_index: b,
                         proposal_id: pid,
@@ -461,7 +882,7 @@ pub fn resume_plan(
     }
 
     // Confirm already-submitted helper shares.
-    for (b, p, s, phase) in shares {
+    for &(b, p, s, phase) in &share_phase_rows {
         if stale_vote_keys.contains(&(b, p)) {
             continue;
         }
@@ -479,6 +900,46 @@ pub fn resume_plan(
 
     steps.sort_by_key(step_rank);
 
+    let confirm_share_step_keys = steps
+        .iter()
+        .filter_map(|step| match step {
+            NextStep::ConfirmShare {
+                bundle_index,
+                proposal_id,
+                share_index,
+            } => Some((*bundle_index, *proposal_id, *share_index)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let blocking_confirm_share_keys = db
+        .get_unconfirmed_delegations(round_id)?
+        .into_iter()
+        .filter(|share| share.sent_to_urls.is_empty())
+        .filter(|share| {
+            confirm_share_step_keys.contains(&(
+                share.bundle_index,
+                share.proposal_id,
+                share.share_index,
+            ))
+        })
+        .map(|share| (share.bundle_index, share.proposal_id, share.share_index))
+        .collect::<BTreeSet<_>>();
+    let blocking_share_work = !blocking_confirm_share_keys.is_empty();
+    let blocking_recovery = steps.iter().any(|step| match step {
+        NextStep::ConfirmShare {
+            bundle_index,
+            proposal_id,
+            share_index,
+        } => blocking_confirm_share_keys.contains(&(*bundle_index, *proposal_id, *share_index)),
+        _ => true,
+    });
+
+    let delegation_statuses = delegation_statuses(db, round_id, &delegation)?;
+    let hotkey_bound = delegation
+        .values()
+        .any(|phase| *phase != DelegationPhase::Prepared)
+        || !votes.is_empty()
+        || !share_phase_rows.is_empty();
     let all_decided = proposal_ids.iter().all(|&pid| match intents.get(&pid) {
         Some(Decision::Skipped) => true,
         Some(Decision::Choice(choice)) => {
@@ -491,14 +952,80 @@ pub fn resume_plan(
         }
         None => false,
     });
+    let completed_vote_artifact =
+        vote_choices
+            .iter()
+            .any(|(&(bundle_index, proposal_id), &stored_choice)| {
+                !stale_vote_keys.contains(&(bundle_index, proposal_id))
+                    && matches!(
+                        intents.get(&proposal_id),
+                        Some(Decision::Choice(intent_choice)) if *intent_choice == stored_choice
+                    )
+            })
+            || share_phase_rows
+                .iter()
+                .any(|(bundle_index, proposal_id, _, _)| {
+                    !stale_vote_keys.contains(&(*bundle_index, *proposal_id))
+                        && matches!(intents.get(proposal_id), Some(Decision::Choice(_)))
+                });
+    let completed_for_display = completed_vote_artifact && !blocking_recovery;
+    let voted_at = share_delegations
+        .iter()
+        .map(|share| share.created_at)
+        .filter(|created_at| *created_at > 0)
+        .max();
+    let completed_vote_display = completed_for_display.then(|| {
+        completed_vote_display(
+            proposal_ids,
+            &intents,
+            &vote_choices,
+            &stale_vote_keys,
+            voted_at,
+        )
+    });
+    let pending_recovery = !steps.is_empty();
+    let needs_draft_setup = !blocking_recovery && !all_decided && !open_proposals.is_empty();
+    let primary_action = select_primary_action(
+        &steps,
+        blocking_recovery,
+        blocking_share_work,
+        completed_for_display,
+    );
+    let recovered_delegation_work =
+        recovered_delegation_work_from_steps(db, round_id, &delegation, &steps)?;
+    let recovered_vote_work =
+        recovered_vote_work_from_steps(db, round_id, &blocking_confirm_share_keys, &steps)?;
 
     Ok(RoundPlan {
         round_id: round_id.to_string(),
-        pending_recovery: !steps.is_empty(),
+        pending_recovery,
         next_steps: steps,
         open_proposals,
         all_decided,
+        delegation_statuses,
+        blocking_recovery,
+        blocking_share_work,
+        hotkey_bound,
+        completed_vote_artifact,
+        completed_for_display,
+        completed_vote_display,
+        needs_draft_setup,
+        primary_action,
+        recovered_delegation_work,
+        recovered_vote_work,
     })
+}
+
+fn vote_has_recovery_bundle(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<bool, VotingError> {
+    Ok(matches!(
+        db.get_commitment_bundle_recovery_fields(round_id, bundle_index, proposal_id)?,
+        Some((Some(_), _))
+    ))
 }
 
 fn missing_share_indexes_for_confirmed_vote(
@@ -699,6 +1226,26 @@ mod tests {
             .unwrap();
     }
 
+    fn record_submitted_share_fixture(
+        db: &VotingDb,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        sent_to_urls: &[String],
+    ) {
+        let nullifier = vec![share_index as u8; 32];
+        db.record_share_delegation(
+            ROUND,
+            bundle_index,
+            proposal_id,
+            share_index,
+            sent_to_urls,
+            &nullifier,
+            0,
+        )
+        .unwrap();
+    }
+
     fn record_all_confirmed_share_fixtures(db: &VotingDb, bundle_index: u32, proposal_id: u32) {
         record_confirmed_share_fixture(db, bundle_index, proposal_id, 0);
         record_confirmed_share_fixture(db, bundle_index, proposal_id, 1);
@@ -800,6 +1347,23 @@ mod tests {
         assert!(plan.next_steps.is_empty());
         assert_eq!(plan.open_proposals, vec![1, 2, 3]);
         assert!(!plan.all_decided);
+        assert_eq!(
+            plan.delegation_statuses,
+            vec![DelegationStatus {
+                bundle_index: 0,
+                phase: DelegationPhase::Prepared,
+                tx_hash: None,
+            }]
+        );
+        assert!(!plan.blocking_recovery);
+        assert!(!plan.hotkey_bound);
+        assert!(!plan.completed_vote_artifact);
+        assert!(!plan.completed_for_display);
+        assert_eq!(plan.completed_vote_display, None);
+        assert!(plan.needs_draft_setup);
+        assert_eq!(plan.primary_action, RoundPlanAction::Idle);
+        assert!(plan.recovered_delegation_work.is_empty());
+        assert!(plan.recovered_vote_work.is_empty());
     }
 
     #[test]
@@ -823,6 +1387,15 @@ mod tests {
             ]
         );
         assert_eq!(plan.open_proposals, vec![1, 3]);
+        assert_eq!(
+            plan.recovered_delegation_work,
+            vec![DelegationRecoveryWork {
+                kind: DelegationRecoveryWorkKind::Delegate,
+                bundle_index: 0,
+                phase: DelegationPhase::Prepared,
+                tx_hash: None,
+            }]
+        );
     }
 
     #[test]
@@ -833,6 +1406,7 @@ mod tests {
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
         db.record_vote_submission(ROUND, 0, 2, "vtx").unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert_eq!(
@@ -840,6 +1414,80 @@ mod tests {
             vec![NextStep::PollVote {
                 bundle_index: 0,
                 proposal_id: 2
+            }]
+        );
+        assert_eq!(
+            plan.recovered_vote_work,
+            vec![VoteRecoveryWork {
+                kind: VoteRecoveryWorkKind::PollVote,
+                bundle_index: 0,
+                proposal_id: 2,
+                tx_hash: Some("vtx".to_string()),
+                vc_tree_position: None,
+                share_indexes: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn submitted_vote_without_recovery_bundle_is_invalid() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        db.record_vote_submission(ROUND, 0, 2, "vtx").unwrap();
+
+        let err = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("submitted vote without recovery material"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn blocking_share_retry_waits_for_submitted_vote_confirmation() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+        db.record_vote_submission(ROUND, 0, 2, "vtx").unwrap();
+        record_submitted_share_fixture(&db, 0, 2, 0, &[]);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![
+                NextStep::PollVote {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                },
+                NextStep::ConfirmShare {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                    share_index: 0,
+                },
+            ]
+        );
+        assert!(plan.blocking_recovery);
+        assert!(plan.blocking_share_work);
+        assert_eq!(plan.primary_action, RoundPlanAction::Vote);
+        assert_eq!(
+            plan.recovered_vote_work,
+            vec![VoteRecoveryWork {
+                kind: VoteRecoveryWorkKind::PollVote,
+                bundle_index: 0,
+                proposal_id: 2,
+                tx_hash: Some("vtx".to_string()),
+                vc_tree_position: None,
+                share_indexes: Vec::new(),
             }]
         );
     }
@@ -861,6 +1509,19 @@ mod tests {
             vec![NextStep::SubmitVote {
                 bundle_index: 0,
                 proposal_id: 2
+            }]
+        );
+        assert!(plan.blocking_recovery);
+        assert_eq!(plan.primary_action, RoundPlanAction::Vote);
+        assert_eq!(
+            plan.recovered_vote_work,
+            vec![VoteRecoveryWork {
+                kind: VoteRecoveryWorkKind::SubmitVote,
+                bundle_index: 0,
+                proposal_id: 2,
+                tx_hash: None,
+                vc_tree_position: None,
+                share_indexes: Vec::new(),
             }]
         );
     }
@@ -982,6 +1643,9 @@ mod tests {
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert!(!plan.pending_recovery);
         assert_eq!(plan.open_proposals, vec![1, 3]);
+        assert!(!plan.completed_vote_artifact);
+        assert!(!plan.completed_for_display);
+        assert_eq!(plan.primary_action, RoundPlanAction::Idle);
     }
 
     #[test]
@@ -1125,6 +1789,40 @@ mod tests {
             plan.next_steps,
             vec![NextStep::PollDelegation { bundle_index: 0 }]
         );
+        assert!(plan.hotkey_bound);
+        assert_eq!(
+            plan.recovered_delegation_work,
+            vec![DelegationRecoveryWork {
+                kind: DelegationRecoveryWorkKind::PollDelegation,
+                bundle_index: 0,
+                phase: DelegationPhase::Submitted,
+                tx_hash: Some("dtx".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn confirmed_delegation_without_votes_still_binds_hotkey() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert!(!plan.pending_recovery);
+        assert!(plan.next_steps.is_empty());
+        assert!(plan.hotkey_bound);
+        assert!(!plan.completed_vote_artifact);
+        assert!(plan.needs_draft_setup);
+        assert_eq!(
+            plan.delegation_statuses,
+            vec![DelegationStatus {
+                bundle_index: 0,
+                phase: DelegationPhase::Confirmed,
+                tx_hash: Some("dtx".to_string()),
+            }]
+        );
+        assert!(plan.recovered_delegation_work.is_empty());
     }
 
     #[test]
@@ -1280,6 +1978,17 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(
+            plan.recovered_vote_work,
+            vec![VoteRecoveryWork {
+                kind: VoteRecoveryWorkKind::SubmitShares,
+                bundle_index: 1,
+                proposal_id: 1,
+                tx_hash: None,
+                vc_tree_position: Some(42),
+                share_indexes: vec![0, 1],
+            }]
+        );
     }
 
     #[test]
@@ -1313,6 +2022,35 @@ mod tests {
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
         assert!(plan.next_steps.is_empty(), "got {:?}", plan.next_steps);
+        assert!(plan.completed_vote_artifact);
+        assert!(plan.completed_for_display);
+        assert_eq!(
+            plan.completed_vote_display
+                .as_ref()
+                .map(|display| &display.choices),
+            Some(&vec![
+                CompletedVoteChoice {
+                    proposal_id: 1,
+                    choice: None,
+                },
+                CompletedVoteChoice {
+                    proposal_id: 2,
+                    choice: Some(1),
+                },
+                CompletedVoteChoice {
+                    proposal_id: 3,
+                    choice: None,
+                },
+            ])
+        );
+        assert!(plan
+            .completed_vote_display
+            .as_ref()
+            .and_then(|display| display.voted_at)
+            .is_some());
+        assert!(plan.needs_draft_setup);
+        assert_eq!(plan.primary_action, RoundPlanAction::Done);
+        assert!(plan.recovered_vote_work.is_empty());
     }
 
     #[test]
@@ -1375,6 +2113,77 @@ mod tests {
             }),
             "expected ConfirmShare in steps, got: {:?}",
             plan.next_steps
+        );
+    }
+
+    #[test]
+    fn accepted_helper_share_confirmation_is_nonblocking_display_work() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        confirm_vote_fixture(&db, 0, 2, 1);
+        let mut recovery = recovery_bundle_fixture(0, 2, 1, 42);
+        recovery.single_share = true;
+        store_recovery_bundle_fixture(&db, &recovery, Some(42));
+        record_submitted_share_fixture(&db, 0, 2, 0, &["https://helper.example".to_string()]);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::ConfirmShare {
+                bundle_index: 0,
+                proposal_id: 2,
+                share_index: 0
+            }]
+        );
+        assert!(plan.pending_recovery);
+        assert!(!plan.blocking_recovery);
+        assert!(!plan.blocking_share_work);
+        assert!(plan.completed_vote_artifact);
+        assert!(plan.completed_for_display);
+        assert!(plan.needs_draft_setup);
+        assert_eq!(plan.primary_action, RoundPlanAction::Done);
+    }
+
+    #[test]
+    fn unaccepted_helper_share_confirmation_blocks_foreground_recovery() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        confirm_vote_fixture(&db, 0, 2, 1);
+        let mut recovery = recovery_bundle_fixture(0, 2, 1, 42);
+        recovery.single_share = true;
+        store_recovery_bundle_fixture(&db, &recovery, Some(42));
+        record_submitted_share_fixture(&db, 0, 2, 0, &[]);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::ConfirmShare {
+                bundle_index: 0,
+                proposal_id: 2,
+                share_index: 0
+            }]
+        );
+        assert!(plan.pending_recovery);
+        assert!(plan.blocking_recovery);
+        assert!(plan.blocking_share_work);
+        assert!(plan.completed_vote_artifact);
+        assert!(!plan.completed_for_display);
+        assert!(!plan.needs_draft_setup);
+        assert_eq!(plan.primary_action, RoundPlanAction::SubmitShares);
+        assert_eq!(
+            plan.recovered_vote_work,
+            vec![VoteRecoveryWork {
+                kind: VoteRecoveryWorkKind::SubmitShares,
+                bundle_index: 0,
+                proposal_id: 2,
+                tx_hash: None,
+                vc_tree_position: Some(42),
+                share_indexes: vec![0],
+            }]
         );
     }
 

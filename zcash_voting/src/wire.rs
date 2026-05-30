@@ -260,10 +260,58 @@ pub struct NextStepView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationStatusView {
+    pub bundle_index: u32,
+    pub phase: String,
+    pub tx_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationRecoveryWorkView {
+    pub kind: String,
+    pub bundle_index: u32,
+    pub phase: String,
+    pub tx_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteRecoveryWorkView {
+    pub kind: String,
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub tx_hash: Option<String>,
+    pub vc_tree_position: Option<u64>,
+    pub share_indexes: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedVoteChoiceView {
+    pub proposal_id: u32,
+    pub choice: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedVoteDisplayView {
+    pub choices: Vec<CompletedVoteChoiceView>,
+    pub voted_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundPlanView {
     pub round_id: String,
     pub pending_recovery: bool,
+    pub blocking_recovery: bool,
+    pub blocking_share_work: bool,
+    pub hotkey_bound: bool,
+    pub completed_vote_artifact: bool,
+    pub completed_for_display: bool,
+    pub completed_vote_display: Option<CompletedVoteDisplayView>,
+    pub needs_draft_setup: bool,
+    pub primary_action: String,
     pub next_steps: Vec<NextStepView>,
+    pub delegation_statuses: Vec<DelegationStatusView>,
+    pub recovered_delegation_work: Vec<DelegationRecoveryWorkView>,
+    pub recovered_vote_work: Vec<VoteRecoveryWorkView>,
     pub open_proposals: Vec<u32>,
     pub all_decided: bool,
 }
