@@ -6,7 +6,7 @@ Client-side cryptographic library for Zcash shielded voting. Implements proof ge
 
 | Crate | Description |
 |-------|-------------|
-| **zcash_voting** | Core library: ZKP delegation and vote proofs (Halo2), El Gamal encryption, governance PCZT construction, Merkle witness generation, SQLite round-state persistence |
+| **zcash_voting** | Core library: ZKP delegation and vote proofs (Halo2), El Gamal encryption, governance PCZT construction, Merkle witness generation, chain confirmation parsing, SQLite round-state persistence |
 | **vote-commitment-tree** | Append-only Poseidon Merkle tree for Vote Authority Notes and Vote Commitments |
 | **vote-commitment-tree-client** | HTTP client and CLI for syncing the vote commitment tree from a chain node |
 
@@ -36,8 +36,9 @@ stage-oriented API:
 - `round::*` creates rounds and binds eligible notes into bundles.
 - `precompute::*` prepares Orchard witnesses, delegation PIR inputs, and VAN
   witnesses for vote proofs.
-- `delegate::*` builds delegation PCZTs, proves delegation, and records VAN
-  positions.
+- `delegate::*` builds delegation PCZTs and proves delegation.
+- `confirmation::*` parses delegation and cast-vote tx events, then records tx
+  hashes and tree positions atomically.
 - `vote::*` builds ZKP #2, signs cast-vote payloads, persists the canonical
   `VoteRecoveryBundle`, and reconstructs vote-chain submissions after a crash.
 - `share::*` recovers helper-share payloads, computes share nullifiers, applies
@@ -51,12 +52,15 @@ stage-oriented API:
   transactions, cast remaining votes, or confirm helper shares.
   `CastVote` steps include the recorded choice. `SubmitVote` steps mean a vote
   was already committed locally and should be reconstructed with
-  `vote::recover_commit` rather than rebuilt from a draft. Submit the recovered
-  cast-vote fields and helper-share payloads, persist each accepted helper
-  share with `share::record`, persist the cast-vote tx hash with
-  `vote::record_submission`, then re-run the planner because later work may
-  depend on on-chain confirmations. `open_proposals` contains only
-  proposals with no terminal decision yet.
+  `vote::submission` rather than rebuilt from a draft. Submit those recovered
+  cast-vote fields, persist the cast-vote tx hash with `vote::record_submission`
+  while polling, then record confirmed tx events with
+  `confirmation::confirm_vote_submission`. After confirmation, call
+  `vote::recover_commit` again and use its helper-share payloads so they carry
+  the confirmed VC position. Persist each accepted helper share with
+  `share::record`, and re-run the planner because later work may depend on
+  on-chain confirmations. `open_proposals` contains only proposals with no
+  terminal decision yet.
 
 ## Migrating 0.11 to 0.12
 
@@ -72,12 +76,17 @@ stage-oriented API:
   `VotingDb::{vote_phase, vote_phases, share_phase, share_phases}`.
 - Replace wallet-local "what comes next" recovery planning with
   `session::resume_plan`; fetch execution material through crate APIs such as
-  `vote::recover_commit`, `share::*`, and the tx hash accessors, then keep
-  wallet-specific networking, proof execution, signing, and UI routing at the
-  wallet boundary.
-- Use `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
-  `vote::record_vc_position` for the cast-vote lifecycle. Wallets should not
-  write recovery JSON, submission flags, or vote commitment positions directly.
+  `vote::submission`, `vote::recover_commit`, `share::*`, and the tx hash
+  accessors, then keep wallet-specific networking, proof execution, signing, and
+  UI routing at the wallet boundary.
+- Use `confirmation::{confirm_delegation_submission, confirm_vote_submission}`
+  after chain clients report confirmed delegation or cast-vote tx events. The
+  confirmation API parses the chain `leaf_index` events and records tx hashes,
+  VAN positions, and VC positions atomically.
+- Use `vote::commit`, `vote::submission`, `vote::recover_commit`,
+  `vote::record_submission`, and `vote::record_vc_position` for the cast-vote
+  lifecycle. Wallets should not write recovery JSON, submission flags, or vote
+  commitment positions directly.
 
 Pre-launch wallet databases with older schema versions are reset when opened by
 this branch; callers that need to preserve test data should export it before

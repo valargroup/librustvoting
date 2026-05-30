@@ -188,12 +188,14 @@ pub enum NextStep {
     },
     /// Submit a previously committed vote using persisted recovery material.
     ///
-    /// Wallets should reconstruct the vote with `vote::recover_commit` instead
-    /// of rebuilding it from a caller-supplied draft. Submit the recovered
-    /// cast-vote fields to the vote chain, submit the recovered `share_payloads`
-    /// to helper servers, record each accepted helper share with
-    /// `share::record`, then record the cast-vote tx hash with
-    /// `vote::record_submission`.
+    /// Wallets should reconstruct the cast-vote fields with `vote::submission`
+    /// instead of rebuilding them from a caller-supplied draft. Submit those
+    /// fields to the vote chain, persist the cast-vote tx hash with
+    /// `vote::record_submission` while polling, then call
+    /// `confirmation::confirm_vote_submission` after the transaction confirms.
+    /// Call `vote::recover_commit` again after confirmation before submitting
+    /// helper-share payloads, so they carry the confirmed vote commitment tree
+    /// position.
     SubmitVote {
         bundle_index: u32,
         proposal_id: u32,

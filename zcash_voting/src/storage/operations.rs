@@ -2710,9 +2710,7 @@ mod tests {
         db.init_round(&test_params(), None).unwrap();
         db.ensure_bundles(ROUND_ID, &[identity_test_note()])
             .unwrap();
-        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
-            .unwrap();
-        let recovery_json = crate::vote::serialize_recovery(&crate::vote::VoteRecoveryBundle {
+        let recovery = crate::vote::VoteRecoveryBundle {
             vote_round_id: ROUND_ID.to_string(),
             bundle_index: 0,
             proposal_id: 1,
@@ -2747,8 +2745,17 @@ mod tests {
             ],
             share_blinds: vec![[0x41; 32], [0x42; 32]],
             share_comms: vec![[0x51; 32], [0x52; 32]],
-        })
+        };
+        let commitment = serde_json::to_vec(&serde_json::json!({
+            "van_nullifier": hex::encode(recovery.van_nullifier),
+            "vote_authority_note_new": hex::encode(recovery.vote_authority_note_new),
+            "vote_commitment": hex::encode(recovery.vote_commitment),
+            "proof": hex::encode(&recovery.proof),
+        }))
         .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &commitment)
+            .unwrap();
+        let recovery_json = crate::vote::serialize_recovery(&recovery).unwrap();
         db.conn()
             .execute(
                 "UPDATE votes SET commitment_bundle_json = :json
@@ -2866,6 +2873,15 @@ mod tests {
             .unwrap();
         db.store_delegation_tx_hash(ROUND_ID, 0, "delegation-tx")
             .unwrap();
+        assert_eq!(
+            db.get_delegation_tx_hash(ROUND_ID, 0).unwrap(),
+            Some("delegation-tx".to_string())
+        );
+        assert_invalid_input(
+            db.store_delegation_tx_hash(ROUND_ID, 0, "delegation-tx-2")
+                .expect_err("different delegation tx hash must fail"),
+            "delegation tx hash already recorded",
+        );
         assert_eq!(
             db.get_delegation_tx_hash(ROUND_ID, 0).unwrap(),
             Some("delegation-tx".to_string())

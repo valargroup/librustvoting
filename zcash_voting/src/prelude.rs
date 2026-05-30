@@ -4,6 +4,10 @@
 //! prelude intentionally contains the setup, precompute, and delegation types
 //! needed by mobile SDK boundaries without exposing proof-circuit internals.
 
+pub use crate::confirmation::{
+    confirm_delegation_submission, confirm_vote_submission, DelegationConfirmation, TxEvent,
+    TxEventAttribute, VoteConfirmation,
+};
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::delegate::gather_delegation_lwd_inputs;
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]

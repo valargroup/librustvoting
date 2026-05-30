@@ -189,7 +189,10 @@ impl VotingDb {
     }
 
     /// Opens the voting sidecar database for `wallet_db_path` and binds `wallet_id`.
-    pub fn open_wallet_sidecar(wallet_db_path: &Path, wallet_id: &str) -> Result<Self, VotingError> {
+    pub fn open_wallet_sidecar(
+        wallet_db_path: &Path,
+        wallet_id: &str,
+    ) -> Result<Self, VotingError> {
         let sidecar_path = Self::wallet_sidecar_path(wallet_db_path);
         let db = Self::open_path(&sidecar_path)?;
         db.set_wallet_id(wallet_id);

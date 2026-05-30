@@ -20,19 +20,25 @@ precompute → delegate → vote → share lifecycle:
    feature, `delegation_pir`.
 5. After `delegate::setup`, load `delegation_signing_request` and sign it in
    the wallet. Then prove with `delegate::prove`, assemble submission fields with
-   `delegation_submission` plus `DelegationSigner::signature`, and record chain
-   recovery data with `record_submission` and `record_van_position`.
+   `delegation_submission` plus `DelegationSigner::signature`, submit them
+   through the wallet's chain client, and use `record_submission` while polling
+   plus `confirm_delegation_submission` after confirmation.
 6. Record each terminal ballot decision with `set_ballot_intent`, passing the
    proposal's declared option count so choices are validated before persistence,
-   then use `vote::commit` and `share::*` to submit votes and helper shares.
+   then use `vote::commit` to commit votes locally and submit cast-vote
+   transactions. Submit helper shares after the cast-vote transaction is
+   confirmed.
 7. After restart, call `resume_plan` with the round's full proposal id list and
    execute one returned `NextStep`, persist its result, then call `resume_plan`
    again. `CastVote` includes the recorded choice, and `SubmitVote` resumes an
-   already committed vote through `vote::recover_commit`. For `SubmitVote`,
-   submit the recovered cast-vote fields and helper-share payloads, record each
-   accepted helper share with `share::record`, then record the cast-vote tx hash
-   with `vote::record_submission`. `Decision::Skipped` is terminal, so
-   `open_proposals` contains only proposals that have no recorded decision.
+   already committed vote through `vote::submission`. For `SubmitVote`, submit
+   those recovered cast-vote fields, persist the cast-vote tx hash with
+   `vote::record_submission` while polling, then record confirmed cast-vote
+   events with `confirm_vote_submission`. After confirmation, call
+   `vote::recover_commit` again and use its helper-share payloads so they carry
+   the confirmed VC position, then record each accepted helper share with
+   `share::record`. `Decision::Skipped` is terminal, so `open_proposals`
+   contains only proposals that have no recorded decision.
 
 ## Crate layout
 
@@ -50,6 +56,7 @@ precompute → delegate → vote → share lifecycle:
 | `round` | `VotingDb`, `RoundParams`, `RoundInfo`, idempotent `ensure_bundles`, and policy-aware bundle planning. |
 | `precompute` | Orchard note witness generation and PIR precompute wrappers. |
 | `delegate` | PCZT setup, proof generation, submission assembly, and chain recovery writes. |
+| `confirmation` | Chain tx event parsing plus atomic delegation and cast-vote confirmation recording. |
 | `vote` | ZKP2 construction, cast-vote signing, and vote recovery bundle persistence. |
 | `share` | Helper-share payload recovery, nullifier computation, and share confirmation state. |
 | `session` | Durable ballot intent plus the round-level resume planner. |
@@ -121,13 +128,18 @@ The crate no longer accepts root wallet seed material for delegation signing.
   material in the wallet, or `generate_random_voting_hotkey` for app owned
   hardware wallet hotkeys. The crate no longer derives voting hotkeys from root
   wallet seeds.
+- Use `confirmation::{confirm_delegation_submission, confirm_vote_submission}`
+  after chain clients report confirmed delegation or cast-vote tx events. The
+  confirmation API parses the chain `leaf_index` events and records tx hashes,
+  VAN positions, and VC positions atomically.
 - Use `session::resume_plan` instead of reconstructing what comes next from raw
   delegation, vote, and share phases in wallet code. Fetch step execution
-  material through crate APIs such as `vote::recover_commit`, `share::*`, and
-  the tx hash accessors.
-- Use `vote::commit`, `vote::recover_commit`, `vote::record_submission`, and
-  `vote::record_vc_position` for the cast-vote lifecycle. Wallets should not
-  write recovery JSON, submission flags, or vote commitment positions directly.
+  material through crate APIs such as `vote::submission`,
+  `vote::recover_commit`, `share::*`, and the tx hash accessors.
+- Use `vote::commit`, `vote::submission`, `vote::recover_commit`,
+  `vote::record_submission`, and `vote::record_vc_position` for the cast-vote
+  lifecycle. Wallets should not write recovery JSON, submission flags, or vote
+  commitment positions directly.
 - Pre-launch database migrations reset older schema versions; export local test
   state before opening an older wallet DB with this crate version.
 

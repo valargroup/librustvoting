@@ -26,11 +26,11 @@ use crate::{
         BundleSetupResultView, CommitmentBundleRecoveryView, DelegationPirPrecomputeResultView,
         DelegationRecoveryView, DelegationSubmissionWire, DraftVoteView,
         KeystoneDelegationRequestView, KeystoneSignatureRecordView, NextStepView, RoundPlanView,
-        RoundRecoveryStateView,
-        ShareDelegationRecordView, ShareSubmissionPlanView, ShareWorkflowRecoveryView,
-        SignedDelegationPayloadView, SignedVoteCommitmentView, SignedVoteCommitmentsView,
-        VanWitnessView, VoteCommitmentWire, VoteRecordView, VoteRecoveryView, VoteShareWire,
-        VotingNoteRefView, VotingNoteSelectionResultView, WireEncryptedShareJson,
+        RoundRecoveryStateView, ShareDelegationRecordView, ShareSubmissionPlanView,
+        ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteCommitmentView,
+        SignedVoteCommitmentsView, VanWitnessView, VoteCommitmentWire, VoteRecordView,
+        VoteRecoveryView, VoteShareWire, VotingNoteRefView, VotingNoteSelectionResultView,
+        WireEncryptedShareJson,
     },
     BundlePolicy,
 };
@@ -179,13 +179,17 @@ impl From<NoteRef> for VotingNoteRefView {
 }
 
 impl VotingNoteSelectionResultView {
-    pub fn from_selected(selected: SelectedNotes, bundle_policy: BundlePolicy) -> Result<Self, VotingError> {
-        let note_count = u32::try_from(selected.notes.len()).map_err(|_| VotingError::InvalidInput {
-            message: format!(
-                "Selected note count {} does not fit in u32",
-                selected.notes.len()
-            ),
-        })?;
+    pub fn from_selected(
+        selected: SelectedNotes,
+        bundle_policy: BundlePolicy,
+    ) -> Result<Self, VotingError> {
+        let note_count =
+            u32::try_from(selected.notes.len()).map_err(|_| VotingError::InvalidInput {
+                message: format!(
+                    "Selected note count {} does not fit in u32",
+                    selected.notes.len()
+                ),
+            })?;
         let eligible_weight_zatoshi = crate::voting_power_with_policy(&selected, bundle_policy);
         let snapshot_height = selected.snapshot_height;
         let anchor_height = selected.anchor_tree_state.height;
@@ -336,9 +340,10 @@ impl TryFrom<ShareSubmissionPlan> for ShareSubmissionPlanView {
     type Error = VotingError;
 
     fn try_from(plan: ShareSubmissionPlan) -> Result<Self, Self::Error> {
-        let target_count = u32::try_from(plan.target_count).map_err(|_| VotingError::InvalidInput {
-            message: format!("target_count {} does not fit u32", plan.target_count),
-        })?;
+        let target_count =
+            u32::try_from(plan.target_count).map_err(|_| VotingError::InvalidInput {
+                message: format!("target_count {} does not fit u32", plan.target_count),
+            })?;
         Ok(Self {
             submit_at: plan.submit_at,
             target_count,
@@ -422,9 +427,17 @@ impl From<recovery::RoundRecoverySnapshot> for RoundRecoveryStateView {
             bundle_count: state.bundle_count,
             delegation: state.delegation.into_iter().map(Into::into).collect(),
             votes: state.votes.into_iter().map(Into::into).collect(),
-            commitment_bundles: state.commitment_bundles.into_iter().map(Into::into).collect(),
+            commitment_bundles: state
+                .commitment_bundles
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             shares: state.shares.into_iter().map(Into::into).collect(),
-            share_delegations: state.share_delegations.into_iter().map(Into::into).collect(),
+            share_delegations: state
+                .share_delegations
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             unconfirmed_share_delegations: state
                 .unconfirmed_share_delegations
                 .into_iter()
@@ -860,7 +873,8 @@ mod tests {
             snapshot_height: 100,
             anchor_tree_state: test_tree_state(100),
         };
-        let view = VotingNoteSelectionResultView::from_selected(selected, BundlePolicy::default()).unwrap();
+        let view = VotingNoteSelectionResultView::from_selected(selected, BundlePolicy::default())
+            .unwrap();
         assert_eq!(view.note_count, 2);
         assert_eq!(view.eligible_weight_zatoshi, divisor);
         assert_eq!(view.snapshot_height, 100);
