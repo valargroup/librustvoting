@@ -4,12 +4,10 @@ use anyhow::{Context, Result};
 use zcash_protocol::consensus::Parameters;
 use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
-    delegation_pir, delegation_submission, display_memo, gather_delegation_lwd_inputs,
-    note_witnesses, prepare_delegation_bundle as prepare_bundle_state, raw_bundle_weight,
-    redact_for_signer, setup_delegation, spend_auth_signature, DelegationSigner,
-    DelegationSubmission, KeystoneSigningRequest, NoopCancellation, NoopProgressReporter,
-    PrepareDelegationBundleParams, PreparedDelegationBundle, PreparedDelegationReport, VotingDb,
-    VotingHotkey,
+    gather_delegation_lwd_inputs, prepare_delegation_bundle as prepare_bundle_state,
+    spend_auth_signature, DelegationSubmission, KeystoneSigningRequest, NoopCancellation,
+    NoopProgressReporter, PrepareDelegationBundleParams, PreparedDelegationBundle,
+    PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
 };
 use zcash_voting::{BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams};
 
@@ -94,37 +92,10 @@ where
     P: Parameters,
 {
     let pir_client = connect_pir(pir_server_url)?;
-
-    if !voting_db
-        .has_witnesses(&prepared.round_id, prepared.bundle_index)
-        .context("check cached bundle witnesses")?
-    {
-        note_witnesses(
-            voting_db,
-            &prepared.round_id,
-            prepared.bundle_index,
-            &prepared.anchor_tree_state_bytes,
-            &prepared.bundle_note_infos,
-            wallet_db,
-        )
-        .context("generate bundle witnesses")?;
-    }
-
-    let report = delegation_pir(
-        voting_db,
-        &prepared.round_id,
-        prepared.bundle_index,
-        &prepared.bundle_note_infos,
-        &pir_client,
-        prepared.network,
-    )
-    .context("precompute delegation PIR")?;
-
-    Ok(PreparedDelegationReport {
-        report,
-        layout: prepared.layout.clone(),
-        bundle_index: prepared.bundle_index,
-    })
+    let cancellation = NoopCancellation;
+    prepared
+        .precompute(voting_db, wallet_db, &pir_client, &cancellation)
+        .context("precompute delegation bundle")
 }
 
 /// Proves one precomputed delegation bundle and signs it with the wallet seed.
@@ -145,38 +116,20 @@ pub fn prove_and_submit_delegation_bundle(
     seed: &[u8],
 ) -> Result<DelegationSubmission> {
     let progress = NoopProgressReporter;
-    let _delegation_setup = setup_delegation(
-        voting_db,
-        &prepared.round_id,
-        prepared.bundle_index,
-        &prepared.bundle_note_infos,
-        &prepared.delegation_keys,
-        &prepared.branch_id_provider,
-        &progress,
-    )
-    .context("setup delegation bundle")?;
+    let _delegation_setup = prepared
+        .setup(voting_db, &progress)
+        .context("setup delegation bundle")?;
 
     let pir_client = connect_pir(pir_server_url)?;
-    zcash_voting::delegate::prove(
-        voting_db,
-        &prepared.round_id,
-        prepared.bundle_index,
-        &prepared.bundle_note_infos,
-        &prepared.delegation_keys,
-        &pir_client,
-        &progress,
-    )
-    .context("prove delegation bundle")?;
+    prepared
+        .prove(voting_db, &pir_client, &progress)
+        .context("prove delegation bundle")?;
 
     // Real wallet apps should keep the seed in a secret container; this example
     // reads raw bytes from env.
-    delegation_submission(
-        voting_db,
-        &prepared.round_id,
-        prepared.bundle_index,
-        DelegationSigner::seed(seed, &prepared.delegation_keys),
-    )
-    .context("assemble seed-signed delegation submission")
+    prepared
+        .submission(voting_db, PreparedSigner::Seed { seed })
+        .context("assemble seed-signed delegation submission")
 }
 
 /// Builds the redacted Keystone signing request for one delegation bundle.
@@ -196,32 +149,9 @@ pub fn build_keystone_delegation_request(
     // Build the full governance PCZT. The signer only receives the redacted
     // bytes, but the complete setup is needed for later proof/submission checks.
     let progress = NoopProgressReporter;
-    let setup = setup_delegation(
-        voting_db,
-        &prepared.round_id,
-        prepared.bundle_index,
-        &prepared.bundle_note_infos,
-        &prepared.delegation_keys,
-        &prepared.branch_id_provider,
-        &progress,
-    )
-    .context("setup Keystone delegation bundle")?;
-
-    let redacted_pczt_bytes =
-        redact_for_signer(&setup.pczt_bytes).context("redact PCZT for Keystone signer")?;
-    let delegated_weight_zatoshi = raw_bundle_weight(&prepared.bundle_note_infos)
-        .context("calculate Keystone bundle weight")?;
-    let display_memo = display_memo(&prepared.round_name, delegated_weight_zatoshi);
-
-    Ok(KeystoneSigningRequest {
-        setup,
-        redacted_pczt_bytes,
-        display_memo,
-        eligible_weight_zatoshi: prepared.layout.eligible_weight,
-        delegated_weight_zatoshi,
-        bundle_count: prepared.layout.bundle_count,
-        bundle_index: prepared.bundle_index,
-    })
+    prepared
+        .keystone_request(voting_db, &progress)
+        .context("build Keystone delegation request")
 }
 
 /// Proves a bundle and assembles a submission from a Keystone-signed PCZT.
@@ -245,29 +175,18 @@ pub fn prove_and_submit_keystone_delegation_bundle(
     // rebuilding the PCZT that Keystone already signed.
     let progress = NoopProgressReporter;
     let pir_client = connect_pir(pir_server_url)?;
-    zcash_voting::delegate::prove(
-        voting_db,
-        &prepared.round_id,
-        prepared.bundle_index,
-        &prepared.bundle_note_infos,
-        &prepared.delegation_keys,
-        &pir_client,
-        &progress,
-    )
-    .context("prove delegation bundle")?;
+    prepared
+        .prove(voting_db, &pir_client, &progress)
+        .context("prove delegation bundle")?;
 
     // Pair Keystone's SpendAuth signature with the original setup sighash.
     let sig = spend_auth_signature(signed_pczt_bytes, signing_request.setup.action_index)
         .context("extract Keystone SpendAuth signature")?;
     let sighash = signing_request.setup.pczt_sighash;
 
-    delegation_submission(
-        voting_db,
-        &prepared.round_id,
-        prepared.bundle_index,
-        DelegationSigner::Keystone { sig, sighash },
-    )
-    .context("assemble Keystone-signed delegation submission")
+    prepared
+        .submission(voting_db, PreparedSigner::Keystone { sig, sighash })
+        .context("assemble Keystone-signed delegation submission")
 }
 
 fn connect_pir(pir_server_url: &str) -> Result<PirClientBlocking> {

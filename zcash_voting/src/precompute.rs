@@ -1,9 +1,9 @@
 //! Precomputation APIs for delegation inputs.
 //!
-//! [`precompute_delegation`] is the primary warm-up entry point: round setup,
-//! bundle witnesses, padded-note secret initialization, and PIR-backed nullifier
-//! proofs. Lower-level helpers remain available for callers that already
-//! persisted intermediate state.
+//! Prepared delegation bundles warm witnesses, padded-note secret initialization,
+//! and PIR-backed nullifier proofs through `PreparedDelegationBundle::precompute`.
+//! Lower-level helpers remain available for callers that already persisted
+//! intermediate state.
 //!
 //! See the `zcash-voting-wallet-example` workspace crate for caller-oriented
 //! precompute orchestration that can evolve independently from the library API.
@@ -26,9 +26,8 @@ use crate::{
 #[cfg(feature = "pir")]
 use crate::{
     delegate::PreparedDelegationReport,
-    note_bundling::BundlePolicy,
-    round::{self, BundleLayout},
-    types::{Cancellation, Network, VotingRoundParams},
+    round::BundleLayout,
+    types::{Cancellation, Network},
 };
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
@@ -167,96 +166,11 @@ pub fn delegation_pir(
     })
 }
 
-/// Inputs for [`precompute_delegation`].
-#[cfg(feature = "pir")]
-pub struct PrecomputeDelegationInputs<'a> {
-    pub round_params: &'a VotingRoundParams,
-    pub session_json: Option<&'a str>,
-    pub bundle_index: u32,
-    pub round_note_infos: &'a [NoteInfo],
-    pub anchor_tree_state_bytes: &'a [u8],
-    pub network: Network,
-    pub cancellation: &'a dyn Cancellation,
-}
-
-/// Warms delegation bundle state: round setup, witnesses, padded secrets, and PIR.
-///
-/// Callers supply the full round note selection, the snapshot anchor tree state,
-/// and a wallet database handle for witness generation.
-///
-/// # Errors
-///
-/// Returns [`VotingError::Cancelled`] when `cancellation` is set. Other failures
-/// come from round setup, bundle planning, witness generation, padded-secret
-/// initialization, or PIR precompute.
-#[cfg(feature = "pir")]
-pub fn precompute_delegation<C, P, CL, R>(
-    db: &VotingDb,
-    wallet_db: &WalletDb<C, P, CL, R>,
-    inputs: PrecomputeDelegationInputs<'_>,
-    pir_client: &pir_client::PirClientBlocking,
-) -> Result<PreparedDelegationReport, VotingError>
-where
-    C: Borrow<rusqlite::Connection>,
-    P: zcash_protocol::consensus::Parameters,
-{
-    precompute_delegation_with_policy(db, wallet_db, inputs, pir_client, BundlePolicy::default())
-}
-
-/// Warms delegation bundle state using an explicit note bundle policy.
-#[cfg(feature = "pir")]
-pub fn precompute_delegation_with_policy<C, P, CL, R>(
-    db: &VotingDb,
-    wallet_db: &WalletDb<C, P, CL, R>,
-    inputs: PrecomputeDelegationInputs<'_>,
-    pir_client: &pir_client::PirClientBlocking,
-    bundle_policy: BundlePolicy,
-) -> Result<PreparedDelegationReport, VotingError>
-where
-    C: Borrow<rusqlite::Connection>,
-    P: zcash_protocol::consensus::Parameters,
-{
-    ensure_not_cancelled(inputs.cancellation)?;
-    let round_id = inputs.round_params.vote_round_id.as_str();
-    db.ensure_round(inputs.round_params, inputs.session_json)?;
-
-    let bundle_setup = db.ensure_bundles_with_skipped_suffix_with_policy(
-        round_id,
-        inputs.round_note_infos,
-        bundle_policy,
-    )?;
-    let bundle_note_infos = round::bundle_notes_for_index_with_policy(
-        inputs.round_note_infos,
-        &bundle_setup,
-        inputs.bundle_index,
-        bundle_policy,
-    )?;
-
-    note_witnesses(
-        db,
-        round_id,
-        inputs.bundle_index,
-        inputs.anchor_tree_state_bytes,
-        &bundle_note_infos,
-        wallet_db,
-    )?;
-
-    warm_delegation_pir(
-        db,
-        round_id,
-        inputs.bundle_index,
-        &bundle_note_infos,
-        bundle_setup,
-        pir_client,
-        inputs.network,
-        inputs.cancellation,
-    )
-}
-
 /// Initializes padded-note secrets and runs PIR precompute.
 ///
-/// Witnesses must already be cached for `notes`. Prefer [`precompute_delegation`]
-/// for the full warm-up path from round notes and anchor tree state.
+/// Witnesses must already be cached for `notes`. Prefer
+/// `PreparedDelegationBundle::precompute` for the full warm-up path from
+/// prepared bundle state.
 ///
 /// # Errors
 ///

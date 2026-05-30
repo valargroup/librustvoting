@@ -31,6 +31,50 @@ pub struct DraftVote {
     pub vc_tree_position: u64,
 }
 
+/// Validates wallet-supplied cast-vote intents before any DB or proof work.
+///
+/// This keeps proposal/choice invariants in the voting API instead of each
+/// wallet adapter duplicating the same input checks.
+pub fn validate_draft_votes(draft_votes: &[DraftVote]) -> Result<(), VotingError> {
+    if draft_votes.is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: "draft votes must not be empty".to_string(),
+        });
+    }
+
+    for draft in draft_votes {
+        validate_draft_vote(draft)?;
+    }
+
+    Ok(())
+}
+
+fn validate_draft_vote(draft: &DraftVote) -> Result<(), VotingError> {
+    if draft.proposal_id == 0 {
+        return Err(VotingError::InvalidInput {
+            message: "proposal_id must be non-zero".to_string(),
+        });
+    }
+    if draft.num_options < 2 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "num_options for proposal {} must be at least 2",
+                draft.proposal_id
+            ),
+        });
+    }
+    if draft.choice >= draft.num_options {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "vote_decision {} is out of range for proposal {} with {} options",
+                draft.choice, draft.proposal_id, draft.num_options
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// VAN Merkle witness produced by `precompute::van_witness`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VanWitness {
@@ -221,6 +265,7 @@ pub fn commit(
     signer: VoteSigner<'_>,
     stages: &dyn crate::types::VoteCommitStageReporter,
 ) -> Result<VoteCommit, VotingError> {
+    validate_draft_vote(draft)?;
     if let Some(recovered) = recovery_bundle(db, round_id, bundle_index, draft.proposal_id)? {
         if recovery_matches_draft(&recovered, draft) {
             return commit_from_recovery(&recovered);
@@ -1139,6 +1184,44 @@ mod tests {
             share_blinds: vec![[0x41; 32], [0x42; 32]],
             share_comms: vec![[0x51; 32], [0x52; 32]],
         }
+    }
+
+    #[test]
+    fn validate_draft_votes_rejects_invalid_inputs_before_db_work() {
+        assert!(validate_draft_votes(&[])
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
+        assert!(validate_draft_votes(&[DraftVote {
+            proposal_id: 0,
+            choice: 0,
+            num_options: 2,
+            single_share: false,
+            vc_tree_position: 0,
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("proposal_id"));
+        assert!(validate_draft_votes(&[DraftVote {
+            proposal_id: 1,
+            choice: 0,
+            num_options: 1,
+            single_share: false,
+            vc_tree_position: 0,
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("num_options"));
+        assert!(validate_draft_votes(&[DraftVote {
+            proposal_id: 1,
+            choice: 2,
+            num_options: 2,
+            single_share: false,
+            vc_tree_position: 0,
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("vote_decision"));
     }
 
     #[test]

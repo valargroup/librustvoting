@@ -90,6 +90,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   can resolve lightwalletd inputs before opening wallet DB handles, then reuse
   plain bundle state across witness precompute, PIR warmup, seed signing, and
   Keystone flows.
+- Added `PreparedDelegationBundle` lifecycle methods and `PreparedSigner` so
+  precompute, PCZT setup, proof generation, Keystone signing requests, and
+  submission assembly all consume the same prepared bundle state instead of
+  re-threading loose round IDs, bundle indexes, note lists, and keys.
+- Added `vote::validate_draft_votes` so wallet SDKs can validate canonical
+  `DraftVote` inputs through the shared voting API before DB or proof work.
 - Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
   `VoteCommit`, `VoteSigner`, `VoteSubmission`, and `VoteRecoveryBundle`.
   `vote::commit` now builds ZKP #2, signs the cast-vote payload, persists the
@@ -108,10 +114,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Changed
 - Delegation PIR warmup no longer constructs or caches a governance PCZT.
-  `precompute::precompute_delegation` now warms witnesses, padded-note secrets,
-  and PIR rows only; `delegate::setup` builds the PCZT later from the persisted
-  padded secrets and refuses to overwrite existing padded secrets or
-  `pczt_sighash`.
+  `PreparedDelegationBundle::precompute` now warms witnesses, padded-note
+  secrets, and PIR rows only; `delegate::setup` builds the PCZT later from the
+  persisted padded secrets and refuses to overwrite existing padded secrets or
+  `pczt_sighash`. The old loose `PrecomputeDelegationInputs` entry points were
+  removed in favor of the prepared-bundle lifecycle.
 - Removed the process-local prepared-PCZT cache and its prelude exports now that
   precompute no longer builds PCZT setup material.
 - `DelegationKeys::with_hotkey_bytes` no longer accepts `consensus_branch_id`;

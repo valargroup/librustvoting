@@ -13,7 +13,8 @@ pub use crate::delegate::{
     record_van_position, redact_for_signer, setup as setup_delegation, spend_auth_signature,
     submission as delegation_submission, BranchIdProvider, DelegationAccountKeys, DelegationKeys,
     DelegationPhase, DelegationProgress, DelegationProof, DelegationSetup, DelegationSigner,
-    DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, SignedDelegationBundle,
+    DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, PreparedSigner,
+    SignedDelegationBundle,
 };
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::delegate::{
@@ -56,16 +57,13 @@ pub use crate::types::{
 pub use crate::vote::{
     commit as commit_vote, parse_recovery, record_submission as record_vote_submission,
     record_vc_position, recover_commit as recover_vote_commit, recovery_bundle, serialize_recovery,
-    submission as vote_submission, DraftVote, VanWitness, VoteCommit, VoteCommitStage,
-    VoteRecoveryBundle, VoteSigner, VoteSubmission,
+    submission as vote_submission, validate_draft_votes, DraftVote, VanWitness, VoteCommit,
+    VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
 };
 pub use crate::warm_proving_caches;
 
 #[cfg(feature = "pir")]
-pub use crate::precompute::{
-    delegation_pir, precompute_delegation, precompute_delegation_with_policy,
-    PrecomputeDelegationInputs,
-};
+pub use crate::precompute::delegation_pir;
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::precompute::{reset_vote_tree, sync_vote_tree, van_witness};
