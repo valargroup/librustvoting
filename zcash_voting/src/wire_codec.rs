@@ -24,12 +24,12 @@ use crate::{
     wire::{
         BundleSetupResultView, CompletedVoteChoiceView, CompletedVoteDisplayView,
         DelegationPirPrecomputeResultView, DelegationRecoveryView, DelegationRecoveryWorkView,
-        DelegationStatusView, DelegationSubmissionWire, KeystoneDelegationRequestView, NextStepView,
-        RoundPlanView, RoundRecoveryStateView, ShareDelegationRecordView, ShareSubmissionPlanView,
-        ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteCommitmentView,
-        SignedVoteCommitmentsView, VanWitnessView, VoteCommitmentWire, VoteRecoveryView,
-        VoteRecoveryWorkView, VoteShareWire, VotingNoteRefView, VotingNoteSelectionResultView,
-        WireEncryptedShareJson,
+        DelegationStatusView, DelegationSubmissionWire, KeystoneDelegationRequestView,
+        NextStepView, RoundPlanView, RoundRecoveryStateView, ShareDelegationRecordView,
+        ShareSubmissionPlanView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
+        SignedVoteCommitmentView, SignedVoteCommitmentsView, VanWitnessView, VoteCommitmentWire,
+        VoteRecoveryView, VoteRecoveryWorkView, VoteShareWire, VotingNoteRefView,
+        VotingNoteSelectionResultView, WireEncryptedShareJson,
     },
     BundlePolicy,
 };
