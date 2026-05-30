@@ -156,9 +156,10 @@ impl TryFrom<ShareSubmissionPlan> for ShareSubmissionPlanView {
     type Error = VotingError;
 
     fn try_from(plan: ShareSubmissionPlan) -> Result<Self, Self::Error> {
-        let target_count = u32::try_from(plan.target_count).map_err(|_| VotingError::InvalidInput {
-            message: format!("target_count {} does not fit u32", plan.target_count),
-        })?;
+        let target_count =
+            u32::try_from(plan.target_count).map_err(|_| VotingError::InvalidInput {
+                message: format!("target_count {} does not fit u32", plan.target_count),
+            })?;
         Ok(Self {
             submit_at: plan.submit_at,
             target_count,
@@ -242,9 +243,17 @@ impl From<recovery::RoundRecoverySnapshot> for RoundRecoveryStateView {
             bundle_count: state.bundle_count,
             delegation: state.delegation.into_iter().map(Into::into).collect(),
             votes: state.votes.into_iter().map(Into::into).collect(),
-            commitment_bundles: state.commitment_bundles.into_iter().map(Into::into).collect(),
+            commitment_bundles: state
+                .commitment_bundles
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             shares: state.shares.into_iter().map(Into::into).collect(),
-            share_delegations: state.share_delegations.into_iter().map(Into::into).collect(),
+            share_delegations: state
+                .share_delegations
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             unconfirmed_share_delegations: state
                 .unconfirmed_share_delegations
                 .into_iter()
