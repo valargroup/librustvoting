@@ -256,8 +256,7 @@ pub fn prove_and_submit_keystone_delegation_bundle(
     )
     .context("prove delegation bundle")?;
 
-    // 3. Extract the SpendAuth signature Keystone inserted into the PCZT and
-    // assemble the final chain-ready submission with the original setup sighash.
+    // Pair Keystone's SpendAuth signature with the original setup sighash.
     let sig = spend_auth_signature(signed_pczt_bytes, signing_request.setup.action_index)
         .context("extract Keystone SpendAuth signature")?;
     let sighash = signing_request.setup.pczt_sighash;
