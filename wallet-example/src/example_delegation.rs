@@ -4,99 +4,50 @@ use anyhow::{Context, Result};
 use zcash_protocol::consensus::Parameters;
 use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
-    bundle_notes_for_index, delegation_pir, delegation_submission, display_memo,
-    gather_delegation_lwd_inputs, gather_delegation_wallet_inputs, note_witnesses,
-    raw_bundle_weight, redact_for_signer, setup_delegation, spend_auth_signature, DelegationSigner,
-    DelegationSubmission, GatherDelegationWalletParams, KeystoneSigningRequest, NoopCancellation,
-    NoopProgressReporter, PreparedDelegationReport, VotingDb, VotingHotkey,
+    delegation_pir, delegation_submission, display_memo, gather_delegation_lwd_inputs,
+    note_witnesses, prepare_delegation_bundle as prepare_bundle_state, raw_bundle_weight,
+    redact_for_signer, setup_delegation, spend_auth_signature, DelegationSigner,
+    DelegationSubmission, KeystoneSigningRequest, NoopCancellation, NoopProgressReporter,
+    PrepareDelegationBundleParams, PreparedDelegationBundle, PreparedDelegationReport, VotingDb,
+    VotingHotkey,
 };
-use zcash_voting::{HyperTransport, PirClientBlocking, VotingRoundParams};
+use zcash_voting::{BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams};
 
-/// Inputs for precomputing one delegation bundle.
+/// Inputs for preparing one reusable delegation bundle context.
 ///
 /// `round_params`, `round_name`, and `lightwalletd_url` identify the round and
-/// chain anchor. The wallet database supplies eligible notes for `account_uuid`,
-/// and `pir_server_url` supplies PIR rows for `bundle_index`.
-pub struct WalletPrecomputeRequest<'a> {
+/// chain anchor. The wallet database supplies eligible notes and account keys
+/// for `account_uuid`.
+pub struct PrepareRequest<'a> {
     pub account_uuid: &'a str,
     pub lightwalletd_url: &'a str,
     pub round_params: VotingRoundParams,
     pub round_name: &'a str,
     pub voting_hotkey: &'a VotingHotkey,
     pub scanned_height: u64,
-    pub pir_server_url: &'a str,
     pub bundle_index: u32,
 }
 
-/// Inputs for proving and seed-signing one delegation bundle.
+/// Resolves lightwalletd and wallet inputs for later delegation operations.
 ///
-/// The target bundle must already be precomputed. `seed` is the wallet account
-/// seed used to sign the stored delegation sighash.
-pub struct WalletDelegateRequest<'a> {
-    pub account_uuid: &'a str,
-    pub lightwalletd_url: &'a str,
-    pub round_params: VotingRoundParams,
-    pub round_name: &'a str,
-    pub voting_hotkey: &'a VotingHotkey,
-    pub scanned_height: u64,
-    pub pir_server_url: &'a str,
-    pub bundle_index: u32,
-    pub seed: &'a [u8],
-}
-
-/// Inputs for creating a Keystone signing request for one delegation bundle.
-///
-/// The target bundle must already be precomputed. The returned request contains
-/// redacted PCZT bytes for the device while retaining local setup state.
-pub struct WalletKeystoneRequestRequest<'a> {
-    pub account_uuid: &'a str,
-    pub lightwalletd_url: &'a str,
-    pub round_params: VotingRoundParams,
-    pub round_name: &'a str,
-    pub voting_hotkey: &'a VotingHotkey,
-    pub scanned_height: u64,
-    pub pir_server_url: &'a str,
-    pub bundle_index: u32,
-}
-
-/// Inputs for assembling a Keystone-signed delegation submission.
-///
-/// `signing_request` must be the request used to produce `signed_pczt_bytes`, so
-/// the extracted signature is paired with the original setup sighash.
-pub struct WalletKeystoneSubmitRequest<'a> {
-    pub account_uuid: &'a str,
-    pub lightwalletd_url: &'a str,
-    pub round_params: VotingRoundParams,
-    pub round_name: &'a str,
-    pub voting_hotkey: &'a VotingHotkey,
-    pub scanned_height: u64,
-    pub pir_server_url: &'a str,
-    pub bundle_index: u32,
-    pub signing_request: &'a KeystoneSigningRequest,
-    pub signed_pczt_bytes: &'a [u8],
-}
-
-/// Precomputes persistent artifacts needed to later prove one delegation bundle.
-///
-/// This stores round rows, note witnesses, padded-note secrets, and PIR-backed
-/// nullifier data for `bundle_index`. It does not build a PCZT, prove, sign, or
-/// submit a delegation.
+/// This is the only example entry point that touches lightwalletd. The returned
+/// context is plain data that can be reused by precompute, seed signing, and
+/// Keystone flows.
 ///
 /// # Errors
 ///
 /// Returns an error if lightwalletd inputs cannot be resolved, wallet note
-/// selection fails, the PIR server cannot be reached, the bundle index is
-/// invalid, or precompute state cannot be persisted.
-pub async fn precompute_delegation_bundle<C, P, CL, R>(
+/// selection fails, the wallet is not synced to the snapshot, or bundle rows
+/// cannot be created or validated.
+pub async fn prepare_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
     wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
-    request: WalletPrecomputeRequest<'_>,
-) -> Result<PreparedDelegationReport>
+    request: PrepareRequest<'_>,
+) -> Result<PreparedDelegationBundle>
 where
     C: std::borrow::Borrow<rusqlite::Connection>,
-    P: zcash_protocol::consensus::Parameters,
+    P: Parameters,
 {
-    // 1. Resolve chain-derived inputs once, before touching voting DB state.
     let cancellation = NoopCancellation;
     let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
         lightwalletd_url: request.lightwalletd_url,
@@ -108,78 +59,71 @@ where
     .await
     .context("gather delegation lightwalletd inputs")?;
 
-    let round_params = lwd_inputs.round_params;
-    let resolved_round_name = lwd_inputs.resolved_round_name;
-    let anchor_tree_state_bytes = lwd_inputs.anchor_tree_state_bytes;
-
-    // 2. Select the Orchard notes that were eligible at the round snapshot and
-    // load the account material used by the later delegation signing step.
-    let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
-        wallet_db,
-        account_uuid: request.account_uuid,
-        voting_hotkey: request.voting_hotkey,
-        snapshot_height: round_params.snapshot_height,
-        scanned_height: request.scanned_height,
-        anchor_tree_state_bytes,
-        resolved_round_name,
-    })
-    .context("gather delegation wallet inputs")?;
-
-    // 3. Connect to the PIR endpoint chosen for this round snapshot.
-    let pir_client =
-        PirClientBlocking::with_transport(request.pir_server_url, Arc::new(HyperTransport::new()))
-            .context("connect to PIR server")?;
-
-    // 4. Ensure durable round and bundle rows before warming bundle-specific
-    // artifacts. This mirrors `precompute_delegation` but keeps resume points
-    // visible for wallet SDKs.
-    let round_id = round_params.vote_round_id.as_str();
-    voting_db
-        .ensure_round(&round_params, None)
-        .context("ensure delegation round")?;
-    let layout = voting_db
-        .ensure_bundles_with_skipped_suffix(round_id, &wallet_inputs.round_note_infos)
-        .context("ensure delegation bundles")?;
-    let bundle_note_infos = bundle_notes_for_index(
-        &wallet_inputs.round_note_infos,
-        &layout,
-        request.bundle_index,
+    prepare_bundle_state(
+        voting_db,
+        lwd_inputs,
+        PrepareDelegationBundleParams {
+            wallet_db,
+            account_uuid: request.account_uuid,
+            voting_hotkey: request.voting_hotkey,
+            scanned_height: request.scanned_height,
+            bundle_index: request.bundle_index,
+            bundle_policy: BundlePolicy::default(),
+        },
     )
-    .context("derive delegation bundle notes")?;
+    .context("prepare delegation bundle")
+}
 
-    // 5. Witness generation is the expensive wallet-DB step. A resumed
-    // precompute pass can skip it once this bundle's witnesses are cached.
+/// Precomputes persistent artifacts needed to later prove one delegation bundle.
+///
+/// This stores note witnesses and PIR-backed nullifier data for the prepared
+/// bundle. It does not build a PCZT, prove, sign, or submit a delegation.
+///
+/// # Errors
+///
+/// Returns an error if the PIR server cannot be reached, witnesses cannot be
+/// generated, or precompute state cannot be persisted.
+pub fn precompute_delegation_bundle<C, P, CL, R>(
+    voting_db: &VotingDb,
+    wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
+    prepared: &PreparedDelegationBundle,
+    pir_server_url: &str,
+) -> Result<PreparedDelegationReport>
+where
+    C: std::borrow::Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let pir_client = connect_pir(pir_server_url)?;
+
     if !voting_db
-        .has_witnesses(round_id, request.bundle_index)
+        .has_witnesses(&prepared.round_id, prepared.bundle_index)
         .context("check cached bundle witnesses")?
     {
         note_witnesses(
             voting_db,
-            round_id,
-            request.bundle_index,
-            &wallet_inputs.anchor_tree_state_bytes,
-            &bundle_note_infos,
+            &prepared.round_id,
+            prepared.bundle_index,
+            &prepared.anchor_tree_state_bytes,
+            &prepared.bundle_note_infos,
             wallet_db,
         )
         .context("generate bundle witnesses")?;
     }
 
-    // 6. Warm padded-note secrets and PIR rows used by the later delegation
-    // proof step.
     let report = delegation_pir(
         voting_db,
-        round_id,
-        request.bundle_index,
-        &bundle_note_infos,
+        &prepared.round_id,
+        prepared.bundle_index,
+        &prepared.bundle_note_infos,
         &pir_client,
-        request.voting_hotkey.network(),
+        prepared.network,
     )
     .context("precompute delegation PIR")?;
 
     Ok(PreparedDelegationReport {
         report,
-        layout,
-        bundle_index: request.bundle_index,
+        layout: prepared.layout.clone(),
+        bundle_index: prepared.bundle_index,
     })
 }
 
@@ -192,96 +136,45 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error if chain or wallet inputs cannot be resolved, the bundle is
-/// missing or invalid, setup/proof generation fails, PIR access fails, signing
+/// Returns an error if setup/proof generation fails, PIR access fails, signing
 /// fails, or submission fields cannot be assembled.
-pub async fn prove_and_submit_delegation_bundle<C, P, CL, R>(
+pub fn prove_and_submit_delegation_bundle(
     voting_db: &VotingDb,
-    wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
-    request: WalletDelegateRequest<'_>,
-) -> Result<DelegationSubmission>
-where
-    C: std::borrow::Borrow<rusqlite::Connection>,
-    P: Parameters,
-{
-    // 1. Re-resolve the chain and wallet inputs so this example API can be run
-    // independently after a prior precompute pass.
-    let cancellation = NoopCancellation;
-    let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
-        lightwalletd_url: request.lightwalletd_url,
-        network: request.voting_hotkey.network(),
-        round_params: request.round_params,
-        round_name: request.round_name,
-        cancellation: &cancellation,
-    })
-    .await
-    .context("gather delegation lightwalletd inputs")?;
-
-    let round_params = lwd_inputs.round_params;
-    let round_id = round_params.vote_round_id.clone();
-    let resolved_round_name = lwd_inputs.resolved_round_name;
-    let anchor_tree_state_bytes = lwd_inputs.anchor_tree_state_bytes;
-    let branch_id_provider = lwd_inputs.branch_id_provider;
-
-    let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
-        wallet_db,
-        account_uuid: request.account_uuid,
-        voting_hotkey: request.voting_hotkey,
-        snapshot_height: round_params.snapshot_height,
-        scanned_height: request.scanned_height,
-        anchor_tree_state_bytes,
-        resolved_round_name,
-    })
-    .context("gather delegation wallet inputs")?;
-
-    // 2. Reconstruct the bundle layout and the exact notes represented by this
-    // bundle index. The existing rows are validated against the current inputs.
-    let layout = voting_db
-        .ensure_bundles_with_skipped_suffix(&round_id, &wallet_inputs.round_note_infos)
-        .context("ensure delegation bundles")?;
-    let bundle_note_infos = bundle_notes_for_index(
-        &wallet_inputs.round_note_infos,
-        &layout,
-        request.bundle_index,
-    )
-    .context("derive delegation bundle notes")?;
-
-    // 3. Build the key-dependent PCZT now that the wallet is ready to sign.
+    prepared: &PreparedDelegationBundle,
+    pir_server_url: &str,
+    seed: &[u8],
+) -> Result<DelegationSubmission> {
     let progress = NoopProgressReporter;
     let _delegation_setup = setup_delegation(
         voting_db,
-        &round_id,
-        request.bundle_index,
-        &bundle_note_infos,
-        &wallet_inputs.delegation_keys,
-        &branch_id_provider,
+        &prepared.round_id,
+        prepared.bundle_index,
+        &prepared.bundle_note_infos,
+        &prepared.delegation_keys,
+        &prepared.branch_id_provider,
         &progress,
     )
     .context("setup delegation bundle")?;
 
-    // 4. Generate the proof using the witnesses and PIR rows warmed by
-    // precompute_delegation_bundle.
-    let pir_client =
-        PirClientBlocking::with_transport(request.pir_server_url, Arc::new(HyperTransport::new()))
-            .context("connect to PIR server")?;
+    let pir_client = connect_pir(pir_server_url)?;
     zcash_voting::delegate::prove(
         voting_db,
-        &round_id,
-        request.bundle_index,
-        &bundle_note_infos,
-        &wallet_inputs.delegation_keys,
+        &prepared.round_id,
+        prepared.bundle_index,
+        &prepared.bundle_note_infos,
+        &prepared.delegation_keys,
         &pir_client,
         &progress,
     )
     .context("prove delegation bundle")?;
 
-    // 5. Assemble chain-ready submission fields. Real wallet apps should keep
-    // the seed in a secret container; this example reads raw bytes from env.
+    // Real wallet apps should keep the seed in a secret container; this example
+    // reads raw bytes from env.
     delegation_submission(
         voting_db,
-        &round_id,
-        request.bundle_index,
-        DelegationSigner::seed(request.seed, &wallet_inputs.delegation_keys),
+        &prepared.round_id,
+        prepared.bundle_index,
+        DelegationSigner::seed(seed, &prepared.delegation_keys),
     )
     .context("assemble seed-signed delegation submission")
 }
@@ -294,89 +187,40 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error if chain or wallet inputs cannot be resolved, the bundle is
-/// missing or invalid, PCZT setup fails, redaction fails, or bundle weight cannot
-/// be calculated.
-pub async fn build_keystone_delegation_request<C, P, CL, R>(
+/// Returns an error if PCZT setup fails, redaction fails, or bundle weight
+/// cannot be calculated.
+pub fn build_keystone_delegation_request(
     voting_db: &VotingDb,
-    wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
-    request: WalletKeystoneRequestRequest<'_>,
-) -> Result<KeystoneSigningRequest>
-where
-    C: std::borrow::Borrow<rusqlite::Connection>,
-    P: Parameters,
-{
-    // 1. Re-resolve the same round and wallet inputs that the proof step will
-    // later validate against before submission.
-    let cancellation = NoopCancellation;
-    let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
-        lightwalletd_url: request.lightwalletd_url,
-        network: request.voting_hotkey.network(),
-        round_params: request.round_params,
-        round_name: request.round_name,
-        cancellation: &cancellation,
-    })
-    .await
-    .context("gather delegation lightwalletd inputs")?;
-
-    let round_params = lwd_inputs.round_params;
-    let round_id = round_params.vote_round_id.clone();
-    let resolved_round_name = lwd_inputs.resolved_round_name;
-    let display_round_name = resolved_round_name.clone();
-    let anchor_tree_state_bytes = lwd_inputs.anchor_tree_state_bytes;
-    let branch_id_provider = lwd_inputs.branch_id_provider;
-
-    let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
-        wallet_db,
-        account_uuid: request.account_uuid,
-        voting_hotkey: request.voting_hotkey,
-        snapshot_height: round_params.snapshot_height,
-        scanned_height: request.scanned_height,
-        anchor_tree_state_bytes,
-        resolved_round_name,
-    })
-    .context("gather delegation wallet inputs")?;
-
-    // 2. Reconstruct the bundle layout and exact notes represented by this
-    // bundle before creating the signer-facing PCZT.
-    let layout = voting_db
-        .ensure_bundles_with_skipped_suffix(&round_id, &wallet_inputs.round_note_infos)
-        .context("ensure delegation bundles")?;
-    let bundle_note_infos = bundle_notes_for_index(
-        &wallet_inputs.round_note_infos,
-        &layout,
-        request.bundle_index,
-    )
-    .context("derive delegation bundle notes")?;
-
-    // 3. Build the full governance PCZT. The signer only receives the redacted
+    prepared: &PreparedDelegationBundle,
+) -> Result<KeystoneSigningRequest> {
+    // Build the full governance PCZT. The signer only receives the redacted
     // bytes, but the complete setup is needed for later proof/submission checks.
     let progress = NoopProgressReporter;
     let setup = setup_delegation(
         voting_db,
-        &round_id,
-        request.bundle_index,
-        &bundle_note_infos,
-        &wallet_inputs.delegation_keys,
-        &branch_id_provider,
+        &prepared.round_id,
+        prepared.bundle_index,
+        &prepared.bundle_note_infos,
+        &prepared.delegation_keys,
+        &prepared.branch_id_provider,
         &progress,
     )
     .context("setup Keystone delegation bundle")?;
 
     let redacted_pczt_bytes =
         redact_for_signer(&setup.pczt_bytes).context("redact PCZT for Keystone signer")?;
-    let delegated_weight_zatoshi =
-        raw_bundle_weight(&bundle_note_infos).context("calculate Keystone bundle weight")?;
-    let display_memo = display_memo(&display_round_name, delegated_weight_zatoshi);
+    let delegated_weight_zatoshi = raw_bundle_weight(&prepared.bundle_note_infos)
+        .context("calculate Keystone bundle weight")?;
+    let display_memo = display_memo(&prepared.round_name, delegated_weight_zatoshi);
 
     Ok(KeystoneSigningRequest {
         setup,
         redacted_pczt_bytes,
         display_memo,
-        eligible_weight_zatoshi: layout.eligible_weight,
+        eligible_weight_zatoshi: prepared.layout.eligible_weight,
         delegated_weight_zatoshi,
-        bundle_count: layout.bundle_count,
-        bundle_index: request.bundle_index,
+        bundle_count: prepared.layout.bundle_count,
+        bundle_index: prepared.bundle_index,
     })
 }
 
@@ -388,69 +232,25 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error if chain or wallet inputs cannot be resolved, the bundle is
-/// missing or invalid, proof generation fails, PIR access fails, the signature
+/// Returns an error if proof generation fails, PIR access fails, the signature
 /// cannot be extracted, or submission fields cannot be assembled.
-pub async fn prove_and_submit_keystone_delegation_bundle<C, P, CL, R>(
+pub fn prove_and_submit_keystone_delegation_bundle(
     voting_db: &VotingDb,
-    wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
-    request: WalletKeystoneSubmitRequest<'_>,
-) -> Result<DelegationSubmission>
-where
-    C: std::borrow::Borrow<rusqlite::Connection>,
-    P: Parameters,
-{
-    // 1. Re-resolve chain and wallet inputs so the proof is generated against
-    // the same bundle layout represented by the signed PCZT request.
-    let cancellation = NoopCancellation;
-    let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
-        lightwalletd_url: request.lightwalletd_url,
-        network: request.voting_hotkey.network(),
-        round_params: request.round_params,
-        round_name: request.round_name,
-        cancellation: &cancellation,
-    })
-    .await
-    .context("gather delegation lightwalletd inputs")?;
-
-    let round_params = lwd_inputs.round_params;
-    let round_id = round_params.vote_round_id.clone();
-    let resolved_round_name = lwd_inputs.resolved_round_name;
-    let anchor_tree_state_bytes = lwd_inputs.anchor_tree_state_bytes;
-
-    let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
-        wallet_db,
-        account_uuid: request.account_uuid,
-        voting_hotkey: request.voting_hotkey,
-        snapshot_height: round_params.snapshot_height,
-        scanned_height: request.scanned_height,
-        anchor_tree_state_bytes,
-        resolved_round_name,
-    })
-    .context("gather delegation wallet inputs")?;
-
-    let layout = voting_db
-        .ensure_bundles_with_skipped_suffix(&round_id, &wallet_inputs.round_note_infos)
-        .context("ensure delegation bundles")?;
-    let bundle_note_infos = bundle_notes_for_index(
-        &wallet_inputs.round_note_infos,
-        &layout,
-        request.bundle_index,
-    )
-    .context("derive delegation bundle notes")?;
-
-    // 2. Generate the proof using warmed witnesses and PIR rows, without
+    prepared: &PreparedDelegationBundle,
+    pir_server_url: &str,
+    signing_request: &KeystoneSigningRequest,
+    signed_pczt_bytes: &[u8],
+) -> Result<DelegationSubmission> {
+    // Generate the proof using warmed witnesses and PIR rows, without
     // rebuilding the PCZT that Keystone already signed.
     let progress = NoopProgressReporter;
-    let pir_client =
-        PirClientBlocking::with_transport(request.pir_server_url, Arc::new(HyperTransport::new()))
-            .context("connect to PIR server")?;
+    let pir_client = connect_pir(pir_server_url)?;
     zcash_voting::delegate::prove(
         voting_db,
-        &round_id,
-        request.bundle_index,
-        &bundle_note_infos,
-        &wallet_inputs.delegation_keys,
+        &prepared.round_id,
+        prepared.bundle_index,
+        &prepared.bundle_note_infos,
+        &prepared.delegation_keys,
         &pir_client,
         &progress,
     )
@@ -458,18 +258,20 @@ where
 
     // 3. Extract the SpendAuth signature Keystone inserted into the PCZT and
     // assemble the final chain-ready submission with the original setup sighash.
-    let sig = spend_auth_signature(
-        request.signed_pczt_bytes,
-        request.signing_request.setup.action_index,
-    )
-    .context("extract Keystone SpendAuth signature")?;
-    let sighash = request.signing_request.setup.pczt_sighash;
+    let sig = spend_auth_signature(signed_pczt_bytes, signing_request.setup.action_index)
+        .context("extract Keystone SpendAuth signature")?;
+    let sighash = signing_request.setup.pczt_sighash;
 
     delegation_submission(
         voting_db,
-        &round_id,
-        request.bundle_index,
+        &prepared.round_id,
+        prepared.bundle_index,
         DelegationSigner::Keystone { sig, sighash },
     )
     .context("assemble Keystone-signed delegation submission")
+}
+
+fn connect_pir(pir_server_url: &str) -> Result<PirClientBlocking> {
+    PirClientBlocking::with_transport(pir_server_url, Arc::new(HyperTransport::new()))
+        .context("connect to PIR server")
 }

@@ -15,6 +15,10 @@ pub use crate::delegate::{
     DelegationPhase, DelegationProgress, DelegationProof, DelegationSetup, DelegationSigner,
     DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, SignedDelegationBundle,
 };
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub use crate::delegate::{
+    prepare_delegation_bundle, PrepareDelegationBundleParams, PreparedDelegationBundle,
+};
 pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::hotkey::{

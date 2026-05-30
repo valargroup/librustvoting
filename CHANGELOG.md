@@ -85,6 +85,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   each SDK boundary.
 - Added `VotingDb::has_witnesses` so wallet SDKs can detect already-cached
   bundle witnesses and skip repeat witness generation during precompute resume.
+- Added `delegate::prepare_delegation_bundle` with
+  `PrepareDelegationBundleParams` and `PreparedDelegationBundle` so wallet SDKs
+  can resolve lightwalletd inputs before opening wallet DB handles, then reuse
+  plain bundle state across witness precompute, PIR warmup, seed signing, and
+  Keystone flows.
 - Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
   `VoteCommit`, `VoteSigner`, `VoteSubmission`, and `VoteRecoveryBundle`.
   `vote::commit` now builds ZKP #2, signs the cast-vote payload, persists the
@@ -152,6 +157,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Low-level ZKP2 and cast-vote signing helpers that take raw hotkey seed plus
   `network_id` are now crate-internal. Wallet callers should use `vote::commit`
   with `VoteSigner`.
+- The wallet delegation example now separates reusable bundle preparation from
+  PIR precompute, seed signing, and Keystone request/submission helpers so resume
+  flows can share cached bundle state without repeating lightwalletd and wallet
+  note-selection work.
 
 # 0.10.1
 
