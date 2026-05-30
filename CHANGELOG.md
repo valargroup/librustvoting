@@ -9,6 +9,39 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added a stable `recovery` reporting API so wallets can fetch one typed round
+  snapshot from `zcash_voting` instead of reassembling recovery state with
+  low-level SQL. New exports include `recovery::round_snapshot`,
+  `recovery::recoverable_commitment_bundle`, and `recovery::clear`, plus
+  prelude re-exports and a wallet example (`wallet-example::example_recovery`)
+  that pairs snapshots with `session::resume_plan`.
+- Added `vote::SignedVoteCommitments`, `vote::commit_batch`, and
+  `vote::recover_signed_commitments` so wallet SDKs can commit and recover
+  per-bundle cast-vote batches through one crate-owned entry point instead of
+  reimplementing per-draft loops and recovery wrapping.
+- Added atomic idempotent recovery writers on `VotingDb`:
+  `mark_delegation_submitted`, `mark_delegation_confirmed`,
+  `mark_vote_submitted`, and `mark_vote_confirmed`, including conflict checks
+  for tx hashes and stored vote/delegation positions.
+- Added `vote::SignedVoteCommitment` plus
+  `CommittedVote::signed_commitment` as the canonical wallet-facing aggregate
+  for cast-vote outputs. The API now exposes submission fields, helper-share
+  payloads, and persisted recovery JSON through one typed surface with
+  fixed-size cryptographic fields (`[u8; 32]` / `[u8; 64]`) to keep byte-length
+  guarantees inside the shared crate while still supporting boundary adapters.
+- Added `VanWitness::from_wire` to validate and convert wire-friendly witness
+  siblings into the typed `[[u8; 32]; 24]` witness form used by vote
+  commitment APIs.
+- Added `vote::CommittedVote`, a stateful cast-vote handle that mirrors the
+  `PreparedDelegationBundle` method flow. Wallet SDKs can now commit/recover a
+  vote once, then drive submission and helper-share lifecycle steps through
+  methods (`submission`, `share_payloads`, `record_share`, `confirm_share`,
+  `add_sent_servers`, `record_submission`, `record_vc_position`) without
+  re-threading `(round_id, bundle_index, proposal_id)` across free functions.
+- Added `DelegationSigningRequest`, `delegation_signing_request`, and generic
+  external delegation signature constructors so wallet SDKs can keep wallet seed
+  material outside `zcash_voting`, sign the PCZT sighash locally with the account
+  SpendAuth key, and pass only the resulting signature back to the crate.
 - Added shared draft vote bounds validation for SDK integrations. The crate now
   exposes proposal and option count bounds plus `vote::validate_draft_vote(s)`,
   and `vote::commit` rejects invalid drafts before proof construction.
@@ -64,13 +97,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   provider traits so wallet SDKs can pass progress and consensus-branch
   resolution into `delegate::setup` and `delegate::prove` without duplicating
   library internals.
-- Added crate-owned voting hotkey derivation with contextual software hotkeys,
-  random hardware hotkeys, raw Orchard delegation-address derivation, and typed
-  `DelegationKeys` / `VoteSigner` helpers so wallet SDKs no longer need to
-  assemble hotkey seed material or pass raw hotkey address bytes by hand.
-  `derive_voting_hotkey`, `generate_random_voting_hotkey`, and
-  `voting_hotkey_from_seed` replace the older raw hotkey generation helpers
-  exposed through `hotkey::generate_hotkey` and `VotingDb::generate_hotkey`.
+- Added voting hotkey helpers for wallet-derived software hotkeys, random hardware
+  hotkeys, raw Orchard delegation-address derivation, and typed
+  `DelegationKeys` / `VoteSigner` helpers. New wallet SDKs should derive scoped
+  hotkey seed material at their wallet boundary and pass that material to
+  `voting_hotkey_from_seed` or `VoteSigner::hotkey_seed`.
+  `generate_random_voting_hotkey` and `voting_hotkey_from_seed` replace the
+  older raw hotkey generation helpers exposed through `hotkey::generate_hotkey`
+  and `VotingDb::generate_hotkey`.
 - Added `delegate::LightwalletdBranchIdProvider` and
   `delegate::branch_id_for_height` so wallet SDKs can resolve delegation
   consensus branches from `lightwalletd_url` plus `Network` without duplicating
@@ -95,6 +129,17 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   each SDK boundary.
 - Added `VotingDb::has_witnesses` so wallet SDKs can detect already-cached
   bundle witnesses and skip repeat witness generation during precompute resume.
+- Added `delegate::prepare_delegation_bundle` with
+  `PrepareDelegationBundleParams` and `PreparedDelegationBundle` so wallet SDKs
+  can resolve lightwalletd inputs before opening wallet DB handles, then reuse
+  plain bundle state across witness precompute, PIR warmup, signing, and
+  Keystone flows.
+- Added `PreparedDelegationBundle` lifecycle methods and `PreparedSigner` so
+  precompute, PCZT setup, proof generation, Keystone signing requests, and
+  submission assembly all consume the same prepared bundle state instead of
+  re-threading loose round IDs, bundle indexes, note lists, and keys.
+- Added `vote::validate_draft_votes` so wallet SDKs can validate canonical
+  `DraftVote` inputs through the shared voting API before DB or proof work.
 - Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
   `VoteCommit`, `VoteSigner`, `VoteSubmission`, and `VoteRecoveryBundle`.
   `vote::commit` now builds ZKP #2, signs the cast-vote payload, persists the
@@ -112,11 +157,28 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- Consolidated wallet-facing recovery orchestration into crate-owned APIs:
+  added `phases::WorkflowPhase` with stable resume strings, exposed
+  `workflow_phase()` accessors on recovery records, and updated the wallet
+  recovery example to load snapshot + `resume_plan` together and recover
+  committed-vote payloads directly from planner steps.
+- Consolidated recovery snapshot assembly and pending commitment-bundle
+  semantics into `zcash_voting`, and reduced the wallet-side adapter boundary
+  to FFI shape/phase-string mapping. Added focused unit coverage for pending
+  commitment rows, sidecar reopen behavior, and recovery clearing invariants.
+- The wallet vote example now includes `commit_vote_bundle_batch`, showing the
+  canonical batch cast-vote flow with `vote::commit_batch` and crate-owned
+  cancellation/progress adapters.
+- Removed crate-side wallet seed APIs from voting hotkey derivation and
+  delegation signing. Wallet SDKs now derive scoped voting hotkey seed material
+  and delegation signatures locally, then pass only hotkey seeds or signatures
+  to the crate.
 - Delegation PIR warmup no longer constructs or caches a governance PCZT.
-  `precompute::precompute_delegation` now warms witnesses, padded-note secrets,
-  and PIR rows only; `delegate::setup` builds the PCZT later from the persisted
-  padded secrets and refuses to overwrite existing padded secrets or
-  `pczt_sighash`.
+  `PreparedDelegationBundle::precompute` now warms witnesses, padded-note
+  secrets, and PIR rows only; `delegate::setup` builds the PCZT later from the
+  persisted padded secrets and refuses to overwrite existing padded secrets or
+  `pczt_sighash`. The old loose `PrecomputeDelegationInputs` entry points were
+  removed in favor of the prepared-bundle lifecycle.
 - Removed the process-local prepared-PCZT cache and its prelude exports now that
   precompute no longer builds PCZT setup material.
 - `DelegationKeys::with_hotkey_bytes` no longer accepts `consensus_branch_id`;
@@ -162,6 +224,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Low-level ZKP2 and cast-vote signing helpers that take raw hotkey seed plus
   `network_id` are now crate-internal. Wallet callers should use `vote::commit`
   with `VoteSigner`.
+- The wallet delegation example now separates reusable bundle preparation from
+  PIR precompute, software signing, and Keystone request/submission helpers so resume
+  flows can share cached bundle state without repeating lightwalletd and wallet
+  note-selection work.
 
 # 0.10.1
 

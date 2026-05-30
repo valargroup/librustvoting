@@ -14,12 +14,14 @@ use ff::PrimeField;
 use orchard::{
     keys::FullViewingKey,
     note::{RandomSeed, Rho},
+    primitives::redpallas::{Signature, SpendAuth, VerificationKey},
 };
 use pasta_curves::pallas;
+use rusqlite::{named_params, OptionalExtension, Transaction};
 use voting_circuits::delegation::{synthetic_padding_note_parts, ImtProofData};
 use zcash_keys::keys::UnifiedFullViewingKey;
 
-use crate::delegate::DelegationKeys;
+use crate::delegate::{DelegationKeys, DelegationSigningRequest};
 use crate::governance::BUNDLE_NOTE_SLOTS;
 use crate::note_bundling::ChunkResult;
 use crate::storage::queries;
@@ -81,6 +83,37 @@ fn delegation_nullifier_targets(
     }
 
     Ok(targets)
+}
+
+fn verify_delegation_spend_auth_signature(
+    rk: &[u8],
+    sighash: &[u8],
+    signature: &[u8],
+) -> Result<(), VotingError> {
+    let rk_bytes: [u8; 32] = rk.try_into().map_err(|_| VotingError::Internal {
+        message: format!("rk must be 32 bytes, got {}", rk.len()),
+    })?;
+    let sighash_bytes: [u8; 32] = sighash.try_into().map_err(|_| VotingError::Internal {
+        message: format!("pczt_sighash must be 32 bytes, got {}", sighash.len()),
+    })?;
+    let signature_bytes: [u8; 64] =
+        signature
+            .try_into()
+            .map_err(|_| VotingError::InvalidInput {
+                message: format!("signature must be 64 bytes, got {}", signature.len()),
+            })?;
+
+    let verification_key =
+        VerificationKey::<SpendAuth>::try_from(rk_bytes).map_err(|_| VotingError::Internal {
+            message: "rk is not a valid SpendAuth verification key".to_string(),
+        })?;
+    let sig = Signature::<SpendAuth>::from(signature_bytes);
+    verification_key
+        .verify(&sighash_bytes, &sig)
+        .map_err(|_| VotingError::InvalidInput {
+            message: "signature does not verify against stored delegation rk and sighash"
+                .to_string(),
+        })
 }
 
 #[cfg(any(feature = "pir", feature = "client-pir"))]
@@ -432,6 +465,41 @@ impl VotingDb {
         network: crate::types::Network,
     ) -> Result<VotingHotkey, VotingError> {
         crate::hotkey::voting_hotkey_from_seed(seed, network)
+    }
+
+    /// Load the account-scoped data needed to sign a persisted delegation PCZT.
+    ///
+    /// `keys` must be the same [`DelegationKeys`] used for PCZT setup. The
+    /// prepared-bundle API enforces that by carrying the original keys across
+    /// setup and signing request construction.
+    pub fn get_delegation_signing_request(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        keys: &DelegationKeys,
+    ) -> Result<DelegationSigningRequest, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let sighash = queries::load_pczt_sighash(&conn, round_id, &wallet_id, bundle_index)?;
+        let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
+
+        Ok(DelegationSigningRequest {
+            account_index: keys.account_index,
+            network: keys.network,
+            seed_fingerprint: keys.seed_fingerprint,
+            sighash: sighash
+                .as_slice()
+                .try_into()
+                .map_err(|_| VotingError::Internal {
+                    message: format!("pczt_sighash must be 32 bytes, got {}", sighash.len()),
+                })?,
+            alpha: alpha
+                .as_slice()
+                .try_into()
+                .map_err(|_| VotingError::Internal {
+                    message: format!("alpha must be 32 bytes, got {}", alpha.len()),
+                })?,
+        })
     }
 
     /// Build a governance-specific PCZT for Keystone signing.
@@ -1037,101 +1105,50 @@ impl VotingDb {
         queries::load_van_position(&conn, round_id, &wallet_id, bundle_index)
     }
 
-    /// Reconstruct the full chain-ready delegation TX payload from DB + seed.
+    /// Reconstruct the delegation TX payload using an externally provided signature.
     ///
-    /// After `build_and_prove_delegation` completes, all proof artifacts (proof, rk,
-    /// gov_nullifiers, nf_signed, cmx_new, gov_comm, alpha) are persisted in the DB.
-    /// This method loads them, derives the sender's SpendingKey from seed, loads the
-    /// ZIP-244 sighash (stored during PCZT construction), signs it, and returns
-    /// everything the chain needs.
-    pub fn get_delegation_submission(
+    /// This does not derive account keys or sign. Instead, the caller supplies
+    /// the SpendAuth signature and the ZIP-244 sighash that the wallet signer
+    /// signed.
+    pub fn get_delegation_submission_with_signature(
         &self,
         round_id: &str,
         bundle_index: u32,
-        sender_seed: &[u8],
-        keys: &DelegationKeys,
+        signature: &[u8],
+        sighash: &[u8],
     ) -> Result<DelegationSubmissionData, VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        let data =
-            queries::load_delegation_submission_data(&conn, round_id, &wallet_id, bundle_index)?;
-        let sighash_vec = queries::load_pczt_sighash(&conn, round_id, &wallet_id, bundle_index)?;
-        drop(conn);
-
-        let sighash: [u8; 32] =
-            sighash_vec
-                .as_slice()
-                .try_into()
-                .map_err(|_| VotingError::Internal {
-                    message: format!("pczt_sighash must be 32 bytes, got {}", sighash_vec.len()),
-                })?;
-
-        // Derive sender SpendingKey from the same ZIP-32 account used to build the PCZT.
-        let sk = keys
-            .network
-            .orchard_spending_key_from_seed(sender_seed, keys.account_index)?;
-        let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
-
-        // Deserialize alpha
-        let alpha_arr: [u8; 32] =
-            data.alpha
-                .as_slice()
-                .try_into()
-                .map_err(|_| VotingError::Internal {
-                    message: format!("alpha must be 32 bytes, got {}", data.alpha.len()),
-                })?;
-        let alpha: pasta_curves::pallas::Scalar =
-            Option::from(pasta_curves::pallas::Scalar::from_repr(alpha_arr)).ok_or_else(|| {
-                VotingError::Internal {
-                    message: "alpha is not a valid Pallas scalar".to_string(),
-                }
-            })?;
-
-        // Compute rsk = ask.randomize(alpha)
-        let rsk = ask.randomize(&alpha);
-
-        // Sign the ZIP-244 sighash (extracted from PCZT during Phase 1)
-        let mut rng = rand::rngs::OsRng;
-        let sig = rsk.sign(&mut rng, &sighash);
-        let sig_bytes: [u8; 64] = (&sig).into();
-
-        Ok(DelegationSubmissionData {
-            proof: data.proof,
-            rk: data.rk,
-            nf_signed: data.nf_signed,
-            cmx_new: data.cmx_new,
-            gov_comm: data.gov_comm,
-            gov_nullifiers: data.gov_nullifiers,
-            alpha: data.alpha,
-            vote_round_id: data.vote_round_id,
-            spend_auth_sig: sig_bytes.to_vec(),
-            sighash: sighash.to_vec(),
-        })
+        self.get_delegation_submission_with_checked_signature(
+            round_id,
+            bundle_index,
+            signature,
+            sighash,
+            "signature",
+            "sighash",
+            "sighash does not match stored PCZT sighash",
+        )
     }
 
-    /// Reconstruct the delegation TX payload using a Keystone-provided signature.
-    ///
-    /// Unlike `get_delegation_submission`, this does NOT derive `ask` from a seed
-    /// or re-sign. Instead, it uses the externally-provided Keystone signature
-    /// and the ZIP-244 sighash that Keystone signed.
-    pub fn get_delegation_submission_with_keystone_sig(
+    fn get_delegation_submission_with_checked_signature(
         &self,
         round_id: &str,
         bundle_index: u32,
-        keystone_sig: &[u8],
-        keystone_sighash: &[u8],
+        signature: &[u8],
+        sighash: &[u8],
+        signature_label: &str,
+        sighash_label: &str,
+        mismatch_message: &str,
     ) -> Result<DelegationSubmissionData, VotingError> {
-        if keystone_sig.len() != 64 {
-            return Err(VotingError::InvalidInput {
-                message: format!("keystone_sig must be 64 bytes, got {}", keystone_sig.len()),
-            });
-        }
-        if keystone_sighash.len() != 32 {
+        if signature.len() != 64 {
             return Err(VotingError::InvalidInput {
                 message: format!(
-                    "keystone_sighash must be 32 bytes, got {}",
-                    keystone_sighash.len()
+                    "{signature_label} must be 64 bytes, got {}",
+                    signature.len()
                 ),
+            });
+        }
+        if sighash.len() != 32 {
+            return Err(VotingError::InvalidInput {
+                message: format!("{sighash_label} must be 32 bytes, got {}", sighash.len()),
             });
         }
 
@@ -1148,11 +1165,12 @@ impl VotingDb {
                 ),
             });
         }
-        if stored_sighash.as_slice() != keystone_sighash {
+        if stored_sighash.as_slice() != sighash {
             return Err(VotingError::InvalidInput {
-                message: "keystone_sighash does not match stored PCZT sighash".to_string(),
+                message: mismatch_message.to_string(),
             });
         }
+        verify_delegation_spend_auth_signature(&data.rk, &stored_sighash, signature)?;
 
         Ok(DelegationSubmissionData {
             proof: data.proof,
@@ -1163,7 +1181,7 @@ impl VotingDb {
             gov_nullifiers: data.gov_nullifiers,
             alpha: data.alpha,
             vote_round_id: data.vote_round_id,
-            spend_auth_sig: keystone_sig.to_vec(),
+            spend_auth_sig: signature.to_vec(),
             sighash: stored_sighash,
         })
     }
@@ -1234,6 +1252,121 @@ impl VotingDb {
         )
     }
 
+    /// Atomically records a delegation transaction hash with idempotency checks.
+    pub fn mark_delegation_submitted(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        tx_hash: &str,
+    ) -> Result<(), VotingError> {
+        let wallet_id = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("begin delegation submitted transaction failed: {e}"),
+        })?;
+        let stored = queries::get_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index)?;
+        check_text_conflict(stored.as_deref(), tx_hash, "delegation tx_hash")?;
+        queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit delegation submitted transaction failed: {e}"),
+        })
+    }
+
+    /// Atomically records delegation confirmation with tx hash and VAN position.
+    pub fn mark_delegation_confirmed(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        tx_hash: &str,
+        van_leaf_position: u32,
+    ) -> Result<(), VotingError> {
+        let wallet_id = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("begin delegation confirmed transaction failed: {e}"),
+        })?;
+        let stored_hash = queries::get_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index)?;
+        check_text_conflict(stored_hash.as_deref(), tx_hash, "delegation tx_hash")?;
+        check_i64_conflict(
+            load_bundle_i64(&tx, round_id, &wallet_id, bundle_index, "van_leaf_position")?,
+            i64::from(van_leaf_position),
+            "delegation van_leaf_position",
+        )?;
+        queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
+        queries::store_van_position(&tx, round_id, &wallet_id, bundle_index, van_leaf_position)?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit delegation confirmed transaction failed: {e}"),
+        })
+    }
+
+    /// Atomically records a vote transaction hash with idempotency checks.
+    pub fn mark_vote_submitted(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        tx_hash: &str,
+    ) -> Result<(), VotingError> {
+        let wallet_id = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("begin vote submitted transaction failed: {e}"),
+        })?;
+        let stored = queries::get_vote_tx_hash(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
+        check_text_conflict(stored.as_deref(), tx_hash, "vote tx_hash")?;
+        queries::record_vote_submission(
+            &tx,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            tx_hash,
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit vote submitted transaction failed: {e}"),
+        })
+    }
+
+    /// Atomically records vote confirmation fields and commitment tree position.
+    pub fn mark_vote_confirmed(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        tx_hash: &str,
+        van_position: u32,
+        vc_tree_position: u64,
+    ) -> Result<(), VotingError> {
+        let wallet_id = self.wallet_id();
+        {
+            let mut conn = self.conn();
+            let tx = conn.transaction().map_err(|e| VotingError::Internal {
+                message: format!("begin vote confirmed transaction failed: {e}"),
+            })?;
+            let stored_hash =
+                queries::get_vote_tx_hash(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
+            check_text_conflict(stored_hash.as_deref(), tx_hash, "vote tx_hash")?;
+            let (_, stored_position) =
+                load_vote_recovery_fields(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
+            check_vote_position_conflict(stored_position, vc_tree_position)?;
+            queries::record_vote_submission(
+                &tx,
+                round_id,
+                &wallet_id,
+                bundle_index,
+                proposal_id,
+                tx_hash,
+            )?;
+            queries::store_van_position(&tx, round_id, &wallet_id, bundle_index, van_position)?;
+            tx.commit().map_err(|e| VotingError::Internal {
+                message: format!("commit vote confirmed transaction failed: {e}"),
+            })?;
+        }
+
+        crate::vote::CommittedVote::recover(self, round_id, bundle_index, proposal_id)?
+            .record_vc_position(self, vc_tree_position)
+    }
+
     pub fn get_commitment_bundle(
         &self,
         round_id: &str,
@@ -1243,6 +1376,22 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::get_commitment_bundle(&conn, round_id, &wallet_id, bundle_index, proposal_id)
+    }
+
+    /// Loads raw commitment-bundle recovery columns for one vote key.
+    ///
+    /// Unlike `get_commitment_bundle`, this lenient helper does not require
+    /// `vc_tree_position` to be set. It is intended for recovery reporting code
+    /// that distinguishes "JSON present but position pending" from "no JSON".
+    pub(crate) fn get_commitment_bundle_recovery_fields(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<Option<(Option<String>, Option<i64>)>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::get_commitment_bundle_recovery(&conn, round_id, &wallet_id, bundle_index, proposal_id)
     }
 
     pub fn store_keystone_signature(
@@ -1380,6 +1529,107 @@ impl VotingDb {
     }
 }
 
+/// Loads one nullable integer column from a bundle row inside an existing tx.
+///
+/// The `column` argument must be a trusted static column name, not user input.
+fn load_bundle_i64(
+    tx: &Transaction<'_>,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    column: &str,
+) -> Result<Option<i64>, VotingError> {
+    let sql = format!(
+        "SELECT {column} FROM bundles
+         WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index"
+    );
+    tx.query_row(
+        &sql,
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("load bundle field failed: {e}"),
+    })?
+    .ok_or_else(|| VotingError::InvalidInput {
+        message: format!("bundle_index {bundle_index} not found"),
+    })
+}
+
+/// Loads nullable vote recovery fields for conflict checks inside a transaction.
+fn load_vote_recovery_fields(
+    tx: &Transaction<'_>,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<(Option<String>, Option<i64>), VotingError> {
+    tx.query_row(
+        "SELECT commitment_bundle_json, vc_tree_position FROM votes
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(|e| VotingError::InvalidInput {
+        message: format!(
+            "vote row not found for bundle_index {bundle_index}, proposal_id {proposal_id}: {e}"
+        ),
+    })
+}
+
+/// Accepts missing or matching text fields and rejects conflicting values.
+fn check_text_conflict(existing: Option<&str>, requested: &str, field: &str) -> Result<(), VotingError> {
+    if let Some(existing) = existing {
+        if existing != requested {
+            return Err(VotingError::InvalidInput {
+                message: format!("{field} conflict: stored {existing}, requested {requested}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Accepts missing or matching integer fields and rejects conflicting values.
+fn check_i64_conflict(existing: Option<i64>, requested: i64, field: &str) -> Result<(), VotingError> {
+    if let Some(existing) = existing {
+        if existing != requested {
+            return Err(VotingError::InvalidInput {
+                message: format!("{field} conflict: stored {existing}, requested {requested}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Accepts missing or matching vote tree positions.
+///
+/// Older builds stored `0` as a pre-confirmation placeholder because the
+/// position was not yet available. Treat that value as unset when replacing it
+/// with the chain-confirmed position.
+fn check_vote_position_conflict(existing: Option<i64>, requested: u64) -> Result<(), VotingError> {
+    let requested = i64::try_from(requested).map_err(|_| VotingError::InvalidInput {
+        message: format!("vc_tree_position {requested} does not fit in i64"),
+    })?;
+    match existing {
+        None | Some(0) => Ok(()),
+        Some(existing) if existing == requested => Ok(()),
+        Some(existing) => Err(VotingError::InvalidInput {
+            message: format!("vote vc_tree_position conflict: stored {existing}, requested {requested}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1423,6 +1673,54 @@ mod tests {
             "test-round".to_string(),
         )
         .unwrap()
+    }
+
+    fn test_randomized_spendauth_signature(
+        seed: &[u8],
+        account_index: u32,
+        alpha: &pallas::Scalar,
+        sighash: &[u8; 32],
+    ) -> ([u8; 32], [u8; 64]) {
+        use orchard::{
+            keys::{SpendAuthorizingKey, SpendingKey},
+            primitives::redpallas::{SpendAuth, VerificationKey},
+        };
+        use zcash_keys::keys::UnifiedSpendingKey;
+        use zcash_protocol::consensus::TEST_NETWORK;
+        use zip32::AccountId;
+
+        let account = AccountId::try_from(account_index).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, seed, account).unwrap();
+        let sk: SpendingKey = *usk.orchard();
+        let ask = SpendAuthorizingKey::from(&sk);
+        let rsk = ask.randomize(alpha);
+        let rk: [u8; 32] = (&VerificationKey::<SpendAuth>::from(&rsk)).into();
+        let mut rng = rand::rngs::OsRng;
+        let sig = rsk.sign(&mut rng, sighash);
+
+        (rk, (&sig).into())
+    }
+
+    fn sign_delegation_request(seed: &[u8], request: &DelegationSigningRequest) -> [u8; 64] {
+        use orchard::keys::SpendAuthorizingKey;
+        use zcash_keys::keys::UnifiedSpendingKey;
+        use zip32::{fingerprint::SeedFingerprint, AccountId};
+
+        let seed_fingerprint = SeedFingerprint::from_seed(seed)
+            .expect("test seed length is valid")
+            .to_bytes();
+        assert_eq!(seed_fingerprint, request.seed_fingerprint);
+        let account = AccountId::try_from(request.account_index).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&request.network, seed, account).unwrap();
+        let sk = *usk.orchard();
+        let ask = SpendAuthorizingKey::from(&sk);
+        let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(request.alpha))
+            .expect("test stores a valid alpha scalar");
+        let rsk = ask.randomize(&alpha);
+        let mut rng = rand::rngs::OsRng;
+        let sig = rsk.sign(&mut rng, &request.sighash);
+
+        (&sig).into()
     }
 
     fn identity_test_note() -> NoteInfo {
@@ -2349,6 +2647,193 @@ mod tests {
     }
 
     #[test]
+    fn test_mark_recovery_writes_are_idempotent_and_conflict_checked() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+
+        db.mark_delegation_submitted(ROUND_ID, 0, "delegation-tx")
+            .unwrap();
+        db.mark_delegation_submitted(ROUND_ID, 0, "delegation-tx")
+            .unwrap();
+        let delegation_tx_conflict = db
+            .mark_delegation_submitted(ROUND_ID, 0, "delegation-tx-2")
+            .unwrap_err();
+        assert!(delegation_tx_conflict
+            .to_string()
+            .contains("delegation tx_hash conflict"));
+
+        db.mark_delegation_confirmed(ROUND_ID, 0, "delegation-tx", 7)
+            .unwrap();
+        db.mark_delegation_confirmed(ROUND_ID, 0, "delegation-tx", 7)
+            .unwrap();
+        let delegation_van_conflict = db
+            .mark_delegation_confirmed(ROUND_ID, 0, "delegation-tx", 8)
+            .unwrap_err();
+        assert!(delegation_van_conflict
+            .to_string()
+            .contains("delegation van_leaf_position conflict"));
+
+        db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx").unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx").unwrap();
+        let vote_tx_conflict = db
+            .mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx-2")
+            .unwrap_err();
+        assert!(vote_tx_conflict.to_string().contains("vote tx_hash conflict"));
+    }
+
+    #[test]
+    fn test_mark_vote_confirmed_happy_path_records_all_fields() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        let recovery = crate::vote::VoteRecoveryBundle {
+            vote_round_id: ROUND_ID.to_string(),
+            bundle_index: 0,
+            proposal_id: 1,
+            vote_decision: 0,
+            anchor_height: 123,
+            vc_tree_position: 0,
+            single_share: false,
+            num_options: 2,
+            van_nullifier: [0x10; 32],
+            vote_authority_note_new: [0x11; 32],
+            vote_commitment: [0x12; 32],
+            proof: vec![0x13; 64],
+            shares_hash: [0x14; 32],
+            r_vpk: [0x15; 32],
+            alpha_v: [0x16; 32],
+            vote_auth_sig: [0x17; 64],
+            encrypted_shares: vec![
+                EncryptedShare {
+                    c1: vec![0x21; 32],
+                    c2: vec![0x22; 32],
+                    share_index: 0,
+                    plaintext_value: 5,
+                    randomness: vec![0x23; 32],
+                },
+                EncryptedShare {
+                    c1: vec![0x31; 32],
+                    c2: vec![0x32; 32],
+                    share_index: 1,
+                    plaintext_value: 6,
+                    randomness: vec![0x33; 32],
+                },
+            ],
+            share_blinds: vec![[0x41; 32], [0x42; 32]],
+            share_comms: vec![[0x51; 32], [0x52; 32]],
+        };
+        let commitment = serde_json::to_vec(&serde_json::json!({
+            "van_nullifier": hex::encode(recovery.van_nullifier),
+            "vote_authority_note_new": hex::encode(recovery.vote_authority_note_new),
+            "vote_commitment": hex::encode(recovery.vote_commitment),
+            "proof": hex::encode(&recovery.proof),
+        }))
+        .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &commitment)
+            .unwrap();
+        let recovery_json = crate::vote::serialize_recovery(&recovery).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE votes SET commitment_bundle_json = :json
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                 AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+                rusqlite::named_params! {
+                    ":json": recovery_json,
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": W,
+                    ":bundle_index": 0i64,
+                    ":proposal_id": 1i64,
+                },
+            )
+            .unwrap();
+
+        db.mark_vote_confirmed(ROUND_ID, 0, 1, "vote-tx", 5, 9)
+            .unwrap();
+        db.mark_vote_confirmed(ROUND_ID, 0, 1, "vote-tx", 5, 9)
+            .unwrap();
+
+        assert_eq!(
+            db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
+            Some("vote-tx")
+        );
+        let conn = db.conn();
+        let van_position: Option<i64> = conn
+            .query_row(
+                "SELECT van_leaf_position FROM bundles
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                 AND bundle_index = :bundle_index",
+                rusqlite::named_params! {
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": W,
+                    ":bundle_index": 0i64,
+                },
+                |row| row.get(0),
+            )
+            .unwrap();
+        let vc_position: Option<i64> = conn
+            .query_row(
+                "SELECT vc_tree_position FROM votes
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                 AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+                rusqlite::named_params! {
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": W,
+                    ":bundle_index": 0i64,
+                    ":proposal_id": 1i64,
+                },
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(van_position, Some(5));
+        assert_eq!(vc_position, Some(9));
+    }
+
+    #[test]
+    fn test_get_commitment_bundle_recovery_fields_reports_pending_position() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = NULL
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::named_params! {
+                    ":json": r#"{"bundle":"pending"}"#,
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": W,
+                },
+            )
+            .unwrap();
+
+        let fields = db
+            .get_commitment_bundle_recovery_fields(ROUND_ID, 0, 1)
+            .unwrap();
+
+        assert_eq!(
+            fields,
+            Some((Some(r#"{"bundle":"pending"}"#.to_string()), None))
+        );
+    }
+
+    #[test]
+    fn test_vote_position_conflict_accepts_legacy_zero_placeholder() {
+        check_vote_position_conflict(None, 42).unwrap();
+        check_vote_position_conflict(Some(0), 42).unwrap();
+        check_vote_position_conflict(Some(42), 42).unwrap();
+
+        let err = check_vote_position_conflict(Some(41), 42).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("vote vc_tree_position conflict"));
+    }
+
+    #[test]
     fn test_recovery_stores_require_existing_rows() {
         fn assert_invalid_input(err: VotingError, expected: &str) {
             assert!(matches!(err, VotingError::InvalidInput { .. }), "{err}");
@@ -2469,35 +2954,99 @@ mod tests {
     }
 
     #[test]
-    fn test_get_delegation_submission_uses_account_index_for_seed_signing() {
-        use orchard::{
-            keys::{SpendAuthorizingKey, SpendingKey},
-            primitives::redpallas::{Signature, SpendAuth, VerificationKey},
-        };
+    fn test_delegation_signing_request_signature_path_submits() {
+        use orchard::{note::Rho, value::NoteValue};
+        use rand::rngs::OsRng;
         use zcash_keys::keys::UnifiedSpendingKey;
         use zcash_protocol::consensus::TEST_NETWORK;
-        use zip32::AccountId;
+        use zip32::{fingerprint::SeedFingerprint, AccountId, Scope};
 
-        fn randomized_verification_key(
-            seed: &[u8],
-            account_index: u32,
-            alpha: &pallas::Scalar,
-        ) -> VerificationKey<SpendAuth> {
-            let account = AccountId::try_from(account_index).unwrap();
-            let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, seed, account).unwrap();
-            let sk: SpendingKey = *usk.orchard();
-            let ask = SpendAuthorizingKey::from(&sk);
-            VerificationKey::from(&ask.randomize(alpha))
+        struct StaticBranchId(u32);
+
+        impl crate::delegate::BranchIdProvider for StaticBranchId {
+            fn consensus_branch_id(&self) -> Result<u32, VotingError> {
+                Ok(self.0)
+            }
         }
 
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let sender_seed = [0x42; 64];
+        let sender_seed = [0x42; 32];
+        let account_index = 0;
+        let account = AccountId::try_from(account_index).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &sender_seed, account).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key();
+        let fvk = ufvk.orchard().unwrap().clone();
+        let address = fvk.address_at(0u32, Scope::External);
+        let mut rng = OsRng;
+        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+        let note = orchard::Note::new(
+            address,
+            NoteValue::from_raw(13_000_000),
+            Rho::from_nf_old(parent_note.nullifier(&fvk)),
+            &mut rng,
+        );
+        let note_info =
+            NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &TEST_NETWORK).unwrap();
+        db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
+
+        let voting_hotkey =
+            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
+                .unwrap();
+        let seed_fingerprint = SeedFingerprint::from_seed(&sender_seed).unwrap().to_bytes();
+        let keys = test_delegation_keys(
+            fvk.to_bytes().to_vec(),
+            &voting_hotkey,
+            seed_fingerprint,
+            account_index,
+        );
+        let setup = crate::delegate::setup(
+            &db,
+            ROUND_ID,
+            0,
+            &[note_info],
+            &keys,
+            &StaticBranchId(0xC8E71055),
+            &crate::types::NoopProgressReporter,
+        )
+        .unwrap();
+        queries::store_proof(&db.conn(), ROUND_ID, W, 0, &[0xAC; 96]).unwrap();
+
+        let request = crate::delegate::signing_request(&db, ROUND_ID, 0, &keys).unwrap();
+        assert_eq!(request.account_index, account_index);
+        assert_eq!(request.network, crate::types::Network::Testnet);
+        assert_eq!(request.seed_fingerprint, seed_fingerprint);
+        assert_eq!(request.sighash, setup.pczt_sighash);
+
+        let signature = sign_delegation_request(&sender_seed, &request);
+        let submission = crate::delegate::submission(
+            &db,
+            ROUND_ID,
+            0,
+            crate::delegate::DelegationSigner::signature(signature, request.sighash),
+        )
+        .unwrap();
+
+        assert_eq!(submission.rk, setup.rk);
+        assert_eq!(submission.sighash, setup.pczt_sighash);
+        assert_eq!(submission.spend_auth_sig, signature);
+    }
+
+    #[test]
+    fn test_get_delegation_submission_with_signature_requires_stored_sighash() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+
+        let stored_sighash = [0x99; 32];
+        let wrong_sighash = [0x98; 32];
         let alpha = pallas::Scalar::from(7);
         let alpha_bytes = alpha.to_repr();
-        let sighash = [0x99; 32];
-        let account_1_rk: [u8; 32] = (&randomized_verification_key(&sender_seed, 1, &alpha)).into();
+        let sender_seed = [0x42; 64];
+        let (rk, signature) =
+            test_randomized_spendauth_signature(&sender_seed, 0, &alpha, &stored_sighash);
+        let (_, wrong_signature) =
+            test_randomized_spendauth_signature(&sender_seed, 1, &alpha, &stored_sighash);
 
         {
             let conn = db.conn();
@@ -2514,91 +3063,6 @@ mod tests {
                 &[0x33; 32],
                 &[0x44; 32],
                 &alpha_bytes,
-                &[0x55; 32],
-                &[0x66; 32],
-                &[0x77; 32],
-                1,
-                0,
-                &[],
-                &sighash,
-            )
-            .unwrap();
-            queries::store_proof_result_fields_with_van_comm(
-                &conn,
-                ROUND_ID,
-                W,
-                0,
-                &account_1_rk,
-                &[vec![0x88; 32]],
-                &[0x33; 32],
-                &[0x44; 32],
-                &[0x77; 32],
-            )
-            .unwrap();
-            queries::store_proof(&conn, ROUND_ID, W, 0, &[0xAB; 96]).unwrap();
-        }
-
-        let keys = DelegationKeys::with_hotkey_bytes(
-            vec![0; 96],
-            &[7; 43],
-            [9; 32],
-            1,
-            0,
-            crate::types::Network::Testnet,
-            "test-round".to_string(),
-        )
-        .unwrap();
-        let submission = db
-            .get_delegation_submission(ROUND_ID, 0, &sender_seed, &keys)
-            .unwrap();
-
-        assert_eq!(submission.rk, account_1_rk.to_vec());
-        assert_eq!(submission.sighash, sighash.to_vec());
-
-        let sig_bytes: [u8; 64] = submission
-            .spend_auth_sig
-            .as_slice()
-            .try_into()
-            .expect("signature length was checked by signer");
-        let sig = Signature::<SpendAuth>::from(sig_bytes);
-
-        let returned_rk_bytes: [u8; 32] = submission
-            .rk
-            .as_slice()
-            .try_into()
-            .expect("test stores a 32-byte rk");
-        let returned_rk = VerificationKey::<SpendAuth>::try_from(returned_rk_bytes).unwrap();
-        returned_rk.verify(&submission.sighash, &sig).unwrap();
-
-        let account_0_rk = randomized_verification_key(&sender_seed, 0, &alpha);
-        assert!(account_0_rk.verify(&submission.sighash, &sig).is_err());
-    }
-
-    #[test]
-    fn test_get_delegation_submission_with_keystone_sig_requires_stored_sighash() {
-        let db = test_db();
-        db.init_round(&test_params(), None).unwrap();
-
-        let stored_sighash = [0x99; 32];
-        let wrong_sighash = [0x98; 32];
-        let keystone_sig = [0x42; 64];
-        let rk = [0xAB; 32];
-
-        {
-            let conn = db.conn();
-            queries::insert_bundle(&conn, ROUND_ID, W, 0, &[0]).unwrap();
-            queries::store_delegation_data(
-                &conn,
-                ROUND_ID,
-                W,
-                0,
-                &[0x11; 32],
-                &[],
-                &[0x22; 32],
-                &[],
-                &[0x33; 32],
-                &[0x44; 32],
-                &[0x55; 32],
                 &[0x66; 32],
                 &[0x77; 32],
                 &[0x88; 32],
@@ -2624,22 +3088,30 @@ mod tests {
         }
 
         let err = db
-            .get_delegation_submission_with_keystone_sig(ROUND_ID, 0, &keystone_sig, &wrong_sighash)
+            .get_delegation_submission_with_signature(ROUND_ID, 0, &signature, &wrong_sighash)
             .expect_err("mismatched sighash must fail");
         assert!(matches!(err, VotingError::InvalidInput { .. }));
         assert!(err
             .to_string()
-            .contains("keystone_sighash does not match stored PCZT sighash"));
+            .contains("sighash does not match stored PCZT sighash"));
 
-        let submission = db
-            .get_delegation_submission_with_keystone_sig(
+        let err = db
+            .get_delegation_submission_with_signature(
                 ROUND_ID,
                 0,
-                &keystone_sig,
+                &wrong_signature,
                 &stored_sighash,
             )
+            .expect_err("wrong account signature must fail");
+        assert!(matches!(err, VotingError::InvalidInput { .. }));
+        assert!(err
+            .to_string()
+            .contains("signature does not verify against stored delegation rk and sighash"));
+
+        let submission = db
+            .get_delegation_submission_with_signature(ROUND_ID, 0, &signature, &stored_sighash)
             .unwrap();
-        assert_eq!(submission.spend_auth_sig, keystone_sig.to_vec());
+        assert_eq!(submission.spend_auth_sig, signature.to_vec());
         assert_eq!(submission.sighash, stored_sighash.to_vec());
     }
 

@@ -1,6 +1,6 @@
 # zcash_voting
 
-Client-side library for integrating [Zcash shielded voting](https://github.com/valargroup/vote-sdk) into a wallet. Wraps the Halo 2 ZKPs, hotkey derivation, share construction, and governance-PCZT assembly that a wallet needs to participate in an on-chain voting round.
+Client-side library for integrating [Zcash shielded voting](https://github.com/valargroup/vote-sdk) into a wallet. Wraps the Halo 2 ZKPs, voting hotkey construction from scoped hotkey seed material, share construction, and governance-PCZT assembly that a wallet needs to participate in an on-chain voting round.
 
 ## Usage
 
@@ -17,10 +17,11 @@ precompute → delegate → vote → share lifecycle:
 3. Build the governance PCZT with `setup_delegation`.
 4. Precompute delegation inputs with `note_witnesses` and, with the `pir`
    feature, `delegation_pir`.
-5. Prove with `delegate::prove`, assemble submission fields with
-   `delegation_submission`, submit them through the wallet's chain client, and
-   use `record_submission` while polling plus `confirm_delegation_submission`
-   after confirmation.
+5. After `delegate::setup`, load `delegation_signing_request` and sign it in
+   the wallet. Then prove with `delegate::prove`, assemble submission fields with
+   `delegation_submission` plus `DelegationSigner::signature`, submit them
+   through the wallet's chain client, and use `record_submission` while polling
+   plus `confirm_delegation_submission` after confirmation.
 6. Record each terminal ballot decision with `set_ballot_intent`, passing the
    proposal's declared option count so choices are validated before persistence,
    then use `vote::commit` to commit votes locally and submit cast-vote
@@ -42,7 +43,7 @@ precompute → delegate → vote → share lifecycle:
 
 | Crate | Purpose |
 |---|---|
-| **`zcash_voting`** (this crate) | Stable wallet API: round setup, note bundles, delegation precompute/proving, hotkey derivation, and round-state storage. |
+| **`zcash_voting`** (this crate) | Stable wallet API: round setup, note bundles, delegation precompute/proving, voting hotkey seed reconstruction, and round-state storage. |
 | [`vote-commitment-tree`](../vote-commitment-tree) | Append-only Poseidon Merkle tree for VANs and vote commitments. |
 | [`vote-commitment-tree-client`](../vote-commitment-tree-client) | HTTP client + CLI for syncing the vote commitment tree from a running chain node. |
 
@@ -60,7 +61,7 @@ precompute → delegate → vote → share lifecycle:
 | `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
-| `hotkey` | Canonical contextual and random voting hotkey derivation. |
+| `hotkey` | Voting hotkey reconstruction from scoped seed material plus random app-owned hotkeys. |
 | `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |
 
 Wallet integrations should use the lifecycle modules above instead of writing
@@ -79,6 +80,19 @@ that should stay consistent across SDKs:
 
 Wallet SDKs should provide fresh CSPRNG bytes from their platform RNG and let the
 crate own the sampling and ordering policy.
+
+## Secret boundaries
+
+Wallet seed material should stay in the wallet integration. Derive scoped
+per-account, per-round voting hotkey seed material locally, then pass that
+hotkey seed to `voting_hotkey_from_seed` or `VoteSigner::hotkey_seed`.
+
+Delegation signing follows the same boundary. After `setup_delegation`, call
+`delegation_signing_request` to load the account index, network, seed
+fingerprint, PCZT sighash, and spend auth randomizer. Software wallets should
+derive the account SpendAuth key locally, randomize it with `alpha`, sign the
+sighash, and call `delegation_submission` with `DelegationSigner::signature`.
+The crate no longer accepts root wallet seed material for delegation signing.
 
 ## Dependency notes
 
@@ -104,12 +118,15 @@ crate own the sampling and ordering policy.
   behavior.
 - Use `precompute::note_witnesses` instead of hand-validating cached
   `TreeState` bytes and manually constructing `WitnessData`.
-- Use `delegate::submission` with `DelegationSigner::seed(seed, keys)` or
-  `DelegationSigner::Keystone` instead of separate submission methods.
-- Use `derive_voting_hotkey` for software wallets, `generate_random_voting_hotkey`
-  for hardware wallets, and `voting_hotkey_from_seed` when reconstructing stored
-  hardware hotkey seed material. The crate owns contextual mixing and raw Orchard
-  delegation-address derivation.
+- Use `delegate::submission` with `DelegationSigner::signature(sig, sighash)`
+  after signing `delegation_signing_request` in the wallet. Signer variants that
+  accepted seeds and Keystone specific signature aliases were removed; software
+  and hardware flows both pass an externally produced SpendAuth signature and the
+  signed sighash.
+- Use `voting_hotkey_from_seed` after deriving scoped software hotkey seed
+  material in the wallet, or `generate_random_voting_hotkey` for app owned
+  hardware wallet hotkeys. The crate no longer derives voting hotkeys from root
+  wallet seeds.
 - Use `confirmation::{confirm_delegation_submission, confirm_vote_submission}`
   after chain clients report confirmed delegation or cast-vote tx events. The
   confirmation API parses the chain `leaf_index` events and records tx hashes,

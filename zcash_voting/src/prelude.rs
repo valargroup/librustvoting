@@ -14,19 +14,25 @@ pub use crate::delegate::gather_delegation_lwd_inputs;
 pub use crate::delegate::LightwalletdBranchIdProvider;
 pub use crate::delegate::{
     branch_id_for_height, display_memo, load_account_keys, pczt_sighash, record_submission,
-    record_van_position, redact_for_signer, setup as setup_delegation, spend_auth_signature,
+    record_van_position, redact_for_signer, setup as setup_delegation,
+    signing_request as delegation_signing_request, spend_auth_signature,
     submission as delegation_submission, BranchIdProvider, DelegationAccountKeys, DelegationKeys,
     DelegationPhase, DelegationProgress, DelegationProof, DelegationSetup, DelegationSigner,
-    DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, SignedDelegationBundle,
+    DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
+    PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
+};
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub use crate::delegate::{
+    prepare_delegation_bundle, PrepareDelegationBundleParams, PreparedDelegationBundle,
 };
 pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::hotkey::{
-    derive_voting_hotkey, generate_random_voting_hotkey, voting_hotkey_from_seed,
-    HotkeyDerivationContext, VOTING_HOTKEY_ACCOUNT_INDEX, VOTING_HOTKEY_ADDRESS_INDEX,
+    generate_random_voting_hotkey, voting_hotkey_from_seed, VOTING_HOTKEY_ACCOUNT_INDEX,
+    VOTING_HOTKEY_ADDRESS_INDEX,
 };
 pub use crate::note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
-pub use crate::phases::{SharePhase, VotePhase};
+pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
 pub use crate::pir::{select_pir_endpoint, PirEndpoint};
 pub use crate::precompute::{
     note_witnesses, stored_note_witnesses, verify_witness, PirPrecomputeReport,
@@ -42,6 +48,10 @@ pub use crate::selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,
     select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
+pub use crate::recovery::{
+    clear as clear_recovery, recoverable_commitment_bundle, round_snapshot, DelegationRecovery,
+    RecoverableCommitmentBundle, RoundRecoverySnapshot, ShareWorkflow, VoteRecovery,
+};
 pub use crate::session::{resume_plan, Decision, NextStep, RoundPlan};
 pub use crate::share::{
     add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,
@@ -51,23 +61,21 @@ pub use crate::share::{
 pub use crate::types::{
     validate_proposal_id, validate_vote_decision, validate_vote_options, Cancellation,
     DelegationProgressBridge, DelegationProgressReporter, Network, NoopCancellation,
-    NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter, SelectedNotes,
+    NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter, SelectedNotes, SharePayload,
     VoteCommitStageBridge, VoteCommitStageReporter, VotingHotkey, WitnessData, MAX_PROPOSAL_ID,
     MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID, MIN_VOTE_OPTIONS,
 };
 pub use crate::vote::{
-    commit as commit_vote, parse_recovery, record_submission as record_vote_submission,
-    record_vc_position, recover_commit as recover_vote_commit, recovery_bundle, serialize_recovery,
-    submission as vote_submission, validate_draft_vote, validate_draft_votes, DraftVote,
+    commit as commit_vote, commit_batch, parse_recovery, record_submission as record_vote_submission,
+    record_vc_position, recover_commit as recover_vote_commit, recover_signed_commitments,
+    recovery_bundle, serialize_recovery, submission as vote_submission, validate_draft_vote,
+    validate_draft_votes, CommittedVote, DraftVote, SignedVoteCommitment, SignedVoteCommitments,
     VanWitness, VoteCommit, VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
 };
 pub use crate::warm_proving_caches;
 
 #[cfg(feature = "pir")]
-pub use crate::precompute::{
-    delegation_pir, precompute_delegation, precompute_delegation_with_policy,
-    PrecomputeDelegationInputs,
-};
+pub use crate::precompute::delegation_pir;
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::precompute::{reset_vote_tree, sync_vote_tree, van_witness};

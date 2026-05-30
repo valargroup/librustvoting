@@ -62,6 +62,43 @@ pub struct VanWitness {
     pub anchor_height: u32,
 }
 
+impl VanWitness {
+    /// Builds a typed witness from wire-friendly sibling bytes.
+    pub fn from_wire(
+        auth_path: &[Vec<u8>],
+        position: u32,
+        anchor_height: u32,
+    ) -> Result<Self, VotingError> {
+        if auth_path.len() != VAN_AUTH_PATH_LEN {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "van_auth_path must have {VAN_AUTH_PATH_LEN} siblings, got {}",
+                    auth_path.len()
+                ),
+            });
+        }
+
+        let mut typed_path = [[0u8; 32]; VAN_AUTH_PATH_LEN];
+        for (idx, hash) in auth_path.iter().enumerate() {
+            typed_path[idx] =
+                hash.as_slice()
+                    .try_into()
+                    .map_err(|_| VotingError::InvalidInput {
+                        message: format!(
+                            "van_auth_path[{idx}] must be 32 bytes, got {}",
+                            hash.len()
+                        ),
+                    })?;
+        }
+
+        Ok(Self {
+            auth_path: typed_path,
+            position,
+            anchor_height,
+        })
+    }
+}
+
 /// Result of building, signing, and persisting one cast-vote.
 #[derive(Clone, Debug)]
 pub struct VoteCommit {
@@ -75,6 +112,305 @@ pub struct VoteCommit {
     pub vote_auth_sig: [u8; 64],
     pub encrypted_shares: Vec<WireEncryptedShare>,
     pub share_payloads: Vec<SharePayload>,
+}
+
+/// Wallet-facing aggregate of one committed vote and public helper-share data.
+#[derive(Clone, Debug)]
+pub struct SignedVoteCommitment {
+    pub proposal_id: u32,
+    pub choice: u32,
+    pub vote_round_id: String,
+    pub van_nullifier: [u8; 32],
+    pub vote_authority_note_new: [u8; 32],
+    pub vote_commitment: [u8; 32],
+    pub proof: Vec<u8>,
+    pub encrypted_shares: Vec<WireEncryptedShare>,
+    pub share_payloads: Vec<SharePayload>,
+    pub anchor_height: u32,
+    pub shares_hash: [u8; 32],
+    pub share_comms: Vec<[u8; 32]>,
+    pub r_vpk: [u8; 32],
+    pub vote_auth_sig: [u8; 64],
+    pub commitment_bundle_json: String,
+}
+
+/// Signed vote commitments produced for one delegation bundle.
+#[derive(Clone, Debug)]
+pub struct SignedVoteCommitments {
+    pub bundle_index: u32,
+    pub commitments: Vec<SignedVoteCommitment>,
+}
+
+/// Committed cast-vote handle for the post-commit lifecycle.
+///
+/// This wraps the signed commitment payload with the round and bundle keys used
+/// to recover chain submission fields, track helper shares, and record
+/// confirmation state.
+#[derive(Clone, Debug)]
+pub struct CommittedVote {
+    round_id: String,
+    bundle_index: u32,
+    commit: VoteCommit,
+}
+
+impl CommittedVote {
+    /// Builds, signs, persists, and returns a committed cast-vote handle.
+    pub fn commit(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        draft: &DraftVote,
+        witness: &VanWitness,
+        signer: VoteSigner<'_>,
+        stages: &dyn crate::types::VoteCommitStageReporter,
+    ) -> Result<Self, VotingError> {
+        let commit =
+            crate::vote::commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
+        Ok(Self {
+            round_id: round_id.to_string(),
+            bundle_index,
+            commit,
+        })
+    }
+
+    /// Reconstructs a committed cast-vote handle from persisted recovery state.
+    pub fn recover(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<Self, VotingError> {
+        let commit = recover_commit(db, round_id, bundle_index, proposal_id)?;
+        Ok(Self {
+            round_id: round_id.to_string(),
+            bundle_index,
+            commit,
+        })
+    }
+
+    /// Returns the round identifier for this committed vote.
+    pub fn round_id(&self) -> &str {
+        &self.round_id
+    }
+
+    /// Returns the delegation bundle index that authorized this vote.
+    pub fn bundle_index(&self) -> u32 {
+        self.bundle_index
+    }
+
+    /// Returns the proposal identifier for this committed vote.
+    pub fn proposal_id(&self) -> u32 {
+        self.commit.proposal_id
+    }
+
+    /// Returns the signed commitment payload and public helper-share data.
+    pub fn data(&self) -> &VoteCommit {
+        &self.commit
+    }
+
+    /// Returns helper-server payloads to submit outside the wallet library.
+    pub fn share_payloads(&self) -> &[SharePayload] {
+        &self.commit.share_payloads
+    }
+
+    /// Reconstructs chain-ready cast-vote fields from persisted recovery state.
+    pub fn submission(&self, db: &VotingDb) -> Result<VoteSubmission, VotingError> {
+        submission(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+        )
+    }
+
+    /// Serializes the persisted recovery bundle for this committed vote.
+    pub fn recovery_json(&self, db: &VotingDb) -> Result<String, VotingError> {
+        let bundle = recovery_bundle(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+        )?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={}, bundle={}, proposal={}",
+                self.round_id, self.bundle_index, self.commit.proposal_id
+            ),
+        })?;
+        serialize_recovery(&bundle)
+    }
+
+    /// Returns a wire-facing signed commitment bundle for wallet API layers.
+    pub fn signed_commitment(&self, db: &VotingDb) -> Result<SignedVoteCommitment, VotingError> {
+        let recovery = recovery_bundle(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+        )?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={}, bundle={}, proposal={}",
+                self.round_id, self.bundle_index, self.commit.proposal_id
+            ),
+        })?;
+        let commitment_bundle_json = serialize_recovery(&recovery)?;
+
+        Ok(SignedVoteCommitment {
+            proposal_id: self.commit.proposal_id,
+            choice: recovery.vote_decision,
+            vote_round_id: recovery.vote_round_id,
+            van_nullifier: self.commit.van_nullifier,
+            vote_authority_note_new: self.commit.vote_authority_note_new,
+            vote_commitment: self.commit.vote_commitment,
+            proof: self.commit.proof.clone(),
+            encrypted_shares: self.commit.encrypted_shares.clone(),
+            share_payloads: self.commit.share_payloads.clone(),
+            anchor_height: self.commit.anchor_height,
+            shares_hash: recovery.shares_hash,
+            share_comms: recovery.share_comms,
+            r_vpk: self.commit.r_vpk,
+            vote_auth_sig: self.commit.vote_auth_sig,
+            commitment_bundle_json,
+        })
+    }
+
+    /// Records a helper-share submission using recovery-owned nullifier material.
+    pub fn record_share(
+        &self,
+        db: &VotingDb,
+        share_index: u32,
+        sent_to_urls: &[String],
+        submit_at: u64,
+    ) -> Result<(), VotingError> {
+        crate::share::record(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            share_index,
+            sent_to_urls,
+            submit_at,
+        )
+    }
+
+    /// Marks one helper-share submission confirmed.
+    pub fn confirm_share(&self, db: &VotingDb, share_index: u32) -> Result<(), VotingError> {
+        crate::share::confirm(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            share_index,
+        )
+    }
+
+    /// Adds helper URLs to a previously recorded share submission.
+    pub fn add_sent_servers(
+        &self,
+        db: &VotingDb,
+        share_index: u32,
+        new_urls: &[String],
+    ) -> Result<(), VotingError> {
+        crate::share::add_sent_servers(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            share_index,
+            new_urls,
+        )
+    }
+
+    /// Records the cast-vote transaction hash for this vote.
+    pub fn record_submission(&self, db: &VotingDb, tx_hash: &str) -> Result<(), VotingError> {
+        record_submission(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            tx_hash,
+        )
+    }
+
+    /// Records the confirmed vote-commitment tree position for this vote.
+    pub fn record_vc_position(
+        &self,
+        db: &VotingDb,
+        vc_tree_position: u64,
+    ) -> Result<(), VotingError> {
+        record_vc_position(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            vc_tree_position,
+        )
+    }
+}
+
+fn ensure_not_cancelled(cancellation: &dyn crate::types::Cancellation) -> Result<(), VotingError> {
+    if cancellation.is_cancelled() {
+        Err(VotingError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// Builds signed vote commitments for every draft in one bundle.
+///
+/// This validates the draft list and bundle index once, then commits each draft
+/// in order while honoring cancellation checks between expensive operations.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_batch(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    drafts: &[DraftVote],
+    witness: &VanWitness,
+    signer: VoteSigner<'_>,
+    cancellation: &dyn crate::types::Cancellation,
+    stages: &dyn crate::types::VoteCommitStageReporter,
+) -> Result<SignedVoteCommitments, VotingError> {
+    validate_draft_votes(drafts)?;
+    let bundle_count = db.get_bundle_count(round_id)?;
+    crate::round::validate_bundle_index(bundle_count, bundle_index, "voting")?;
+    ensure_not_cancelled(cancellation)?;
+
+    let mut commitments = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        ensure_not_cancelled(cancellation)?;
+        let committed = CommittedVote::commit(
+            db,
+            round_id,
+            bundle_index,
+            draft,
+            witness,
+            signer,
+            stages,
+        )?;
+        ensure_not_cancelled(cancellation)?;
+        commitments.push(committed.signed_commitment(db)?);
+    }
+
+    Ok(SignedVoteCommitments {
+        bundle_index,
+        commitments,
+    })
+}
+
+/// Recovers one persisted vote commitment as a single-item batch result.
+pub fn recover_signed_commitments(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<SignedVoteCommitments, VotingError> {
+    let committed = CommittedVote::recover(db, round_id, bundle_index, proposal_id)?;
+    Ok(SignedVoteCommitments {
+        bundle_index,
+        commitments: vec![committed.signed_commitment(db)?],
+    })
 }
 
 /// Lifecycle events emitted while building one cast-vote commitment.
@@ -1203,7 +1539,7 @@ mod tests {
     use crate::{
         round::RoundParams,
         storage::{queries, VotingDb},
-        types::{NoopProgressReporter, NoteInfo, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS},
+        types::{Cancellation, NoopCancellation, NoopProgressReporter, NoteInfo, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS},
     };
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -1335,6 +1671,61 @@ mod tests {
     }
 
     #[test]
+    fn van_witness_from_wire_validates_length_and_element_size() {
+        let mut auth_path = vec![vec![0xAA; 32]; VAN_AUTH_PATH_LEN];
+        let witness = VanWitness::from_wire(&auth_path, 7, 123).unwrap();
+        assert_eq!(witness.position, 7);
+        assert_eq!(witness.anchor_height, 123);
+        assert_eq!(witness.auth_path[0], [0xAA; 32]);
+
+        auth_path.pop();
+        let wrong_length = VanWitness::from_wire(&auth_path, 7, 123).unwrap_err();
+        assert!(wrong_length.to_string().contains("24 siblings"));
+
+        let wrong_width = vec![vec![0xAA; 31]; VAN_AUTH_PATH_LEN];
+        let wrong_width_err = VanWitness::from_wire(&wrong_width, 7, 123).unwrap_err();
+        assert!(wrong_width_err.to_string().contains("32 bytes"));
+    }
+
+    #[test]
+    fn validate_draft_votes_rejects_invalid_inputs_before_db_work() {
+        assert!(validate_draft_votes(&[])
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
+        assert!(validate_draft_votes(&[DraftVote {
+            proposal_id: 0,
+            choice: 0,
+            num_options: 2,
+            single_share: false,
+            vc_tree_position: 0,
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("proposal_id"));
+        assert!(validate_draft_votes(&[DraftVote {
+            proposal_id: 1,
+            choice: 0,
+            num_options: 1,
+            single_share: false,
+            vc_tree_position: 0,
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("num_options"));
+        assert!(validate_draft_votes(&[DraftVote {
+            proposal_id: 1,
+            choice: 2,
+            num_options: 2,
+            single_share: false,
+            vc_tree_position: 0,
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("vote_decision"));
+    }
+
+    #[test]
     fn recovery_json_round_trip_preserves_vote_and_share_material() {
         let bundle = recovery_bundle_fixture();
 
@@ -1430,22 +1821,17 @@ mod tests {
             network: Network,
             alpha: &pasta_curves::pallas::Scalar,
         ) -> VerificationKey<SpendAuth> {
-            let sk = network
-                .orchard_spending_key_from_seed(seed, crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX)
-                .unwrap();
+            let sk = crate::hotkey::spending_key_from_hotkey_seed(
+                seed,
+                network,
+                crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX,
+            )
+            .unwrap();
             let ask = SpendAuthorizingKey::from(&sk);
             VerificationKey::from(&ask.randomize(alpha))
         }
 
-        let hotkey = crate::hotkey::derive_voting_hotkey(
-            &[0xAB; 64],
-            crate::hotkey::HotkeyDerivationContext {
-                round_id: ROUND_ID,
-                account_id: "account-0",
-            },
-            Network::Regtest,
-        )
-        .unwrap();
+        let hotkey = crate::hotkey::voting_hotkey_from_seed(&[0xAB; 64], Network::Regtest).unwrap();
         let r_vpk = [0x10; 32];
         let van_nullifier = [0x11; 32];
         let vote_authority_note_new = [0x12; 32];
@@ -1622,6 +2008,277 @@ mod tests {
     }
 
     #[test]
+    fn committed_vote_handle_replays_and_records_lifecycle() {
+        let db = db_with_vote();
+        let mut recovery = recovery_bundle_fixture();
+        recovery.share_blinds = vec![scalar_bytes(1), scalar_bytes(2)];
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &serialize_recovery(&recovery).unwrap(),
+        )
+        .unwrap();
+
+        let committed = CommittedVote::commit(
+            &db,
+            ROUND_ID,
+            0,
+            &DraftVote {
+                proposal_id: 1,
+                choice: 2,
+                num_options: 3,
+                single_share: false,
+                vc_tree_position: 456,
+            },
+            &VanWitness {
+                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                position: 7,
+                anchor_height: 123,
+            },
+            VoteSigner::HotkeySeed {
+                seed: &[0x99; 32],
+                network: Network::Testnet,
+            },
+            &NoopProgressReporter,
+        )
+        .unwrap();
+
+        assert_eq!(committed.round_id(), ROUND_ID);
+        assert_eq!(committed.bundle_index(), 0);
+        assert_eq!(committed.proposal_id(), 1);
+        assert_eq!(committed.data().vote_commitment, [0x12; 32]);
+        assert_eq!(committed.share_payloads().len(), 2);
+        assert_eq!(
+            committed.recovery_json(&db).unwrap(),
+            serialize_recovery(&recovery).unwrap()
+        );
+
+        let recovered = CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+        assert_eq!(
+            recovered.data().vote_commitment,
+            committed.data().vote_commitment
+        );
+        let submission = recovered.submission(&db).unwrap();
+        assert_eq!(submission.vote_round_id, ROUND_ID);
+        assert_eq!(submission.vote_auth_sig, [0x17; 64]);
+
+        recovered
+            .record_share(&db, 0, &["https://helper-a.example".to_string()], 1234)
+            .unwrap();
+        recovered
+            .add_sent_servers(&db, 0, &["https://helper-b.example".to_string()])
+            .unwrap();
+        let shares = crate::share::list(&db, ROUND_ID).unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(
+            shares[0].sent_to_urls,
+            vec![
+                "https://helper-a.example".to_string(),
+                "https://helper-b.example".to_string()
+            ]
+        );
+
+        recovered.confirm_share(&db, 0).unwrap();
+        assert!(crate::share::unconfirmed(&db, ROUND_ID).unwrap().is_empty());
+
+        recovered.record_submission(&db, "vote-tx").unwrap();
+        assert_eq!(
+            db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
+            Some("vote-tx")
+        );
+        recovered.record_vc_position(&db, 789).unwrap();
+        assert_eq!(
+            recovery_bundle(&db, ROUND_ID, 0, 1)
+                .unwrap()
+                .unwrap()
+                .vc_tree_position,
+            789
+        );
+    }
+
+    #[test]
+    fn signed_commitment_exposes_public_payload_without_reparsing_json() {
+        let db = db_with_vote();
+        let mut recovery = recovery_bundle_fixture();
+        recovery.share_blinds = vec![scalar_bytes(1), scalar_bytes(2)];
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        let recovery_json = serialize_recovery(&recovery).unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &recovery_json,
+        )
+        .unwrap();
+
+        let committed = CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+        let signed = committed.signed_commitment(&db).unwrap();
+
+        assert_eq!(signed.proposal_id, 1);
+        assert_eq!(signed.choice, recovery.vote_decision);
+        assert_eq!(signed.vote_round_id, ROUND_ID);
+        assert_eq!(signed.share_payloads.len(), 2);
+        assert_eq!(signed.encrypted_shares[0].c1, vec![0x21; 32]);
+        assert_eq!(signed.shares_hash, [0x14; 32]);
+        assert_eq!(signed.share_comms[0], [0x51; 32]);
+        assert_eq!(signed.r_vpk, [0x15; 32]);
+        assert_eq!(signed.vote_auth_sig, [0x17; 64]);
+        assert_eq!(signed.commitment_bundle_json, recovery_json);
+    }
+
+    #[test]
+    fn commit_batch_returns_signed_commitments_for_bundle() {
+        let db = db_with_vote();
+        let mut recovery = recovery_bundle_fixture();
+        recovery.share_blinds = vec![scalar_bytes(1), scalar_bytes(2)];
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &serialize_recovery(&recovery).unwrap(),
+        )
+        .unwrap();
+
+        let result = commit_batch(
+            &db,
+            ROUND_ID,
+            0,
+            &[DraftVote {
+                proposal_id: 1,
+                choice: 2,
+                num_options: 3,
+                single_share: false,
+                vc_tree_position: 456,
+            }],
+            &VanWitness {
+                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                position: 7,
+                anchor_height: 123,
+            },
+            VoteSigner::HotkeySeed {
+                seed: &[0x99; 32],
+                network: Network::Testnet,
+            },
+            &NoopCancellation,
+            &NoopProgressReporter,
+        )
+        .unwrap();
+
+        assert_eq!(result.bundle_index, 0);
+        assert_eq!(result.commitments.len(), 1);
+        assert_eq!(result.commitments[0].proposal_id, 1);
+        assert_eq!(result.commitments[0].choice, 2);
+    }
+
+    #[test]
+    fn recover_signed_commitments_returns_single_item_batch() {
+        let db = db_with_vote();
+        let mut recovery = recovery_bundle_fixture();
+        recovery.share_blinds = vec![scalar_bytes(1), scalar_bytes(2)];
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        let recovery_json = serialize_recovery(&recovery).unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &recovery_json,
+        )
+        .unwrap();
+
+        let signed = recover_signed_commitments(&db, ROUND_ID, 0, 1).unwrap();
+        assert_eq!(signed.bundle_index, 0);
+        assert_eq!(signed.commitments.len(), 1);
+        assert_eq!(signed.commitments[0].commitment_bundle_json, recovery_json);
+    }
+
+    #[test]
+    fn commit_batch_respects_cancellation() {
+        struct AlwaysCancelled;
+        impl Cancellation for AlwaysCancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+
+        let db = db_with_vote();
+        let err = commit_batch(
+            &db,
+            ROUND_ID,
+            0,
+            &[draft_vote_fixture()],
+            &VanWitness {
+                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                position: 7,
+                anchor_height: 123,
+            },
+            VoteSigner::HotkeySeed {
+                seed: &[0x99; 32],
+                network: Network::Testnet,
+            },
+            &AlwaysCancelled,
+            &NoopProgressReporter,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VotingError::Cancelled));
+    }
+
+    #[test]
     fn recovery_json_write_rejects_replaced_vote_identity() {
         let db = db_with_vote();
         let recovery = recovery_bundle_fixture();
@@ -1703,5 +2360,11 @@ mod tests {
         let err = record_vc_position(&db, ROUND_ID, 0, 99, 321).unwrap_err();
 
         assert!(matches!(err, VotingError::InvalidInput { .. }));
+    }
+
+    fn scalar_bytes(value: u8) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[0] = value;
+        bytes
     }
 }

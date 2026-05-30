@@ -1,15 +1,15 @@
 use std::fmt;
 
-use orchard::{keys::SpendingKey, note::ExtractedNoteCommitment};
+use orchard::note::ExtractedNoteCommitment;
 use subtle::CtOption;
 use thiserror::Error;
 use zcash_client_backend::proto::service::TreeState;
-use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
+use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::{
     self, BlockHeight, Network as ZcashNetwork, NetworkType, NetworkUpgrade, Parameters,
 };
 use zeroize::Zeroizing;
-use zip32::{AccountId, Scope};
+use zip32::Scope;
 
 use crate::governance::BUNDLE_NOTE_SLOTS;
 
@@ -69,38 +69,6 @@ impl Network {
                 message: format!("network_id must be 0 (testnet) or 1 (mainnet), got {id}"),
             }),
         }
-    }
-
-    /// Derives an Orchard spending key from ZIP-32 seed material.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VotingError::InvalidInput`] when `seed` is too short, when
-    /// `account_index` is not a valid ZIP-32 account id, or when the Zcash key
-    /// derivation fails.
-    pub fn orchard_spending_key_from_seed(
-        self,
-        seed: &[u8],
-        account_index: u32,
-    ) -> Result<SpendingKey, VotingError> {
-        if seed.len() < 32 {
-            return Err(VotingError::InvalidInput {
-                message: format!("seed must be at least 32 bytes, got {}", seed.len()),
-            });
-        }
-
-        let account =
-            AccountId::try_from(account_index).map_err(|_| VotingError::InvalidInput {
-                message: format!("invalid account_index {account_index}"),
-            })?;
-
-        let usk = UnifiedSpendingKey::from_seed(&self, seed, account).map_err(|e| {
-            VotingError::InvalidInput {
-                message: format!("failed to derive UnifiedSpendingKey from seed: {e}"),
-            }
-        })?;
-
-        Ok(*usk.orchard())
     }
 }
 
@@ -584,7 +552,10 @@ pub struct DelegationSubmissionData {
     pub gov_nullifiers: Vec<Vec<u8>>,
     pub alpha: Vec<u8>,
     pub vote_round_id: String,
-    /// Spend auth signature over sighash (64 bytes). Computed from seed + alpha.
+    /// Spend auth signature over sighash (64 bytes).
+    ///
+    /// Legacy seed paths compute this from `seed + alpha`; new integrations pass
+    /// an externally produced SpendAuth signature.
     pub spend_auth_sig: Vec<u8>,
     /// Canonical sighash (32 bytes). Blake2b-256 of domain-separated fields.
     pub sighash: Vec<u8>,
