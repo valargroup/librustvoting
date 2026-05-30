@@ -7,7 +7,7 @@
 use crate::{
     round::VotingDb,
     types::{ShareDelegationRecord, SharePayload, VotingError, WireEncryptedShare},
-    vote::VoteRecoveryBundle,
+    vote::{validate_recovery_bundle_vote_fields, VoteRecoveryBundle},
 };
 
 pub use crate::types::ShareDelegationRecord as ShareRecord;
@@ -130,6 +130,8 @@ pub fn recover_payload(
 
 /// Reconstructs all helper-server payloads from a persisted vote recovery bundle.
 pub fn recover_payloads(bundle: &VoteRecoveryBundle) -> Result<Vec<SharePayload>, VotingError> {
+    validate_recovery_bundle_vote_fields(bundle)?;
+
     let all_enc_shares = bundle
         .encrypted_shares
         .iter()
@@ -290,6 +292,17 @@ mod tests {
         assert_eq!(payload.share_comms[1], vec![0x52; 32]);
         assert_eq!(payload.primary_blind, field_bytes(2).to_vec());
         assert_eq!(nullifier.len(), 32);
+    }
+
+    #[test]
+    fn share_recovery_payloads_reject_invalid_vote_bounds() {
+        let mut bundle = recovery_bundle_fixture();
+        bundle.num_options = 1;
+        assert!(recover_payloads(&bundle).is_err());
+
+        let mut bundle = recovery_bundle_fixture();
+        bundle.vote_decision = bundle.num_options;
+        assert!(recover_payloads(&bundle).is_err());
     }
 
     #[test]
