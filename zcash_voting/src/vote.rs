@@ -77,6 +77,179 @@ pub struct VoteCommit {
     pub share_payloads: Vec<SharePayload>,
 }
 
+/// Committed cast-vote handle for the post-commit lifecycle.
+///
+/// This wraps the signed commitment payload with the round and bundle keys used
+/// to recover chain submission fields, track helper shares, and record
+/// confirmation state.
+#[derive(Clone, Debug)]
+pub struct CommittedVote {
+    round_id: String,
+    bundle_index: u32,
+    commit: VoteCommit,
+}
+
+impl CommittedVote {
+    /// Builds, signs, persists, and returns a committed cast-vote handle.
+    pub fn commit(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        draft: &DraftVote,
+        witness: &VanWitness,
+        signer: VoteSigner<'_>,
+        stages: &dyn crate::types::VoteCommitStageReporter,
+    ) -> Result<Self, VotingError> {
+        let commit =
+            crate::vote::commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
+        Ok(Self {
+            round_id: round_id.to_string(),
+            bundle_index,
+            commit,
+        })
+    }
+
+    /// Reconstructs a committed cast-vote handle from persisted recovery state.
+    pub fn recover(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<Self, VotingError> {
+        let commit = recover_commit(db, round_id, bundle_index, proposal_id)?;
+        Ok(Self {
+            round_id: round_id.to_string(),
+            bundle_index,
+            commit,
+        })
+    }
+
+    /// Returns the round identifier for this committed vote.
+    pub fn round_id(&self) -> &str {
+        &self.round_id
+    }
+
+    /// Returns the delegation bundle index that authorized this vote.
+    pub fn bundle_index(&self) -> u32 {
+        self.bundle_index
+    }
+
+    /// Returns the proposal identifier for this committed vote.
+    pub fn proposal_id(&self) -> u32 {
+        self.commit.proposal_id
+    }
+
+    /// Returns the signed commitment payload and public helper-share data.
+    pub fn data(&self) -> &VoteCommit {
+        &self.commit
+    }
+
+    /// Returns helper-server payloads to submit outside the wallet library.
+    pub fn share_payloads(&self) -> &[SharePayload] {
+        &self.commit.share_payloads
+    }
+
+    /// Reconstructs chain-ready cast-vote fields from persisted recovery state.
+    pub fn submission(&self, db: &VotingDb) -> Result<VoteSubmission, VotingError> {
+        submission(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+        )
+    }
+
+    /// Serializes the persisted recovery bundle for this committed vote.
+    pub fn recovery_json(&self, db: &VotingDb) -> Result<String, VotingError> {
+        let bundle = recovery_bundle(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+        )?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={}, bundle={}, proposal={}",
+                self.round_id, self.bundle_index, self.commit.proposal_id
+            ),
+        })?;
+        serialize_recovery(&bundle)
+    }
+
+    /// Records a helper-share submission using recovery-owned nullifier material.
+    pub fn record_share(
+        &self,
+        db: &VotingDb,
+        share_index: u32,
+        sent_to_urls: &[String],
+        submit_at: u64,
+    ) -> Result<(), VotingError> {
+        crate::share::record(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            share_index,
+            sent_to_urls,
+            submit_at,
+        )
+    }
+
+    /// Marks one helper-share submission confirmed.
+    pub fn confirm_share(&self, db: &VotingDb, share_index: u32) -> Result<(), VotingError> {
+        crate::share::confirm(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            share_index,
+        )
+    }
+
+    /// Adds helper URLs to a previously recorded share submission.
+    pub fn add_sent_servers(
+        &self,
+        db: &VotingDb,
+        share_index: u32,
+        new_urls: &[String],
+    ) -> Result<(), VotingError> {
+        crate::share::add_sent_servers(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            share_index,
+            new_urls,
+        )
+    }
+
+    /// Records the cast-vote transaction hash for this vote.
+    pub fn record_submission(&self, db: &VotingDb, tx_hash: &str) -> Result<(), VotingError> {
+        record_submission(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            tx_hash,
+        )
+    }
+
+    /// Records the confirmed vote-commitment tree position for this vote.
+    pub fn record_vc_position(
+        &self,
+        db: &VotingDb,
+        vc_tree_position: u64,
+    ) -> Result<(), VotingError> {
+        record_vc_position(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            vc_tree_position,
+        )
+    }
+}
+
 /// Lifecycle events emitted while building one cast-vote commitment.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
@@ -1552,6 +1725,110 @@ mod tests {
     }
 
     #[test]
+    fn committed_vote_handle_replays_and_records_lifecycle() {
+        let db = db_with_vote();
+        let mut recovery = recovery_bundle_fixture();
+        recovery.share_blinds = vec![scalar_bytes(1), scalar_bytes(2)];
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &serialize_recovery(&recovery).unwrap(),
+        )
+        .unwrap();
+
+        let committed = CommittedVote::commit(
+            &db,
+            ROUND_ID,
+            0,
+            &DraftVote {
+                proposal_id: 1,
+                choice: 2,
+                num_options: 3,
+                single_share: false,
+                vc_tree_position: 456,
+            },
+            &VanWitness {
+                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                position: 7,
+                anchor_height: 123,
+            },
+            VoteSigner::HotkeySeed {
+                seed: &[0x99; 32],
+                network: Network::Testnet,
+            },
+            &NoopProgressReporter,
+        )
+        .unwrap();
+
+        assert_eq!(committed.round_id(), ROUND_ID);
+        assert_eq!(committed.bundle_index(), 0);
+        assert_eq!(committed.proposal_id(), 1);
+        assert_eq!(committed.data().vote_commitment, [0x12; 32]);
+        assert_eq!(committed.share_payloads().len(), 2);
+        assert_eq!(
+            committed.recovery_json(&db).unwrap(),
+            serialize_recovery(&recovery).unwrap()
+        );
+
+        let recovered = CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+        assert_eq!(
+            recovered.data().vote_commitment,
+            committed.data().vote_commitment
+        );
+        let submission = recovered.submission(&db).unwrap();
+        assert_eq!(submission.vote_round_id, ROUND_ID);
+        assert_eq!(submission.vote_auth_sig, [0x17; 64]);
+
+        recovered
+            .record_share(&db, 0, &["https://helper-a.example".to_string()], 1234)
+            .unwrap();
+        recovered
+            .add_sent_servers(&db, 0, &["https://helper-b.example".to_string()])
+            .unwrap();
+        let shares = crate::share::list(&db, ROUND_ID).unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(
+            shares[0].sent_to_urls,
+            vec![
+                "https://helper-a.example".to_string(),
+                "https://helper-b.example".to_string()
+            ]
+        );
+
+        recovered.confirm_share(&db, 0).unwrap();
+        assert!(crate::share::unconfirmed(&db, ROUND_ID).unwrap().is_empty());
+
+        recovered.record_submission(&db, "vote-tx").unwrap();
+        assert_eq!(
+            db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
+            Some("vote-tx")
+        );
+        recovered.record_vc_position(&db, 789).unwrap();
+        assert_eq!(
+            recovery_bundle(&db, ROUND_ID, 0, 1)
+                .unwrap()
+                .unwrap()
+                .vc_tree_position,
+            789
+        );
+    }
+
+    #[test]
     fn recovery_json_write_rejects_replaced_vote_identity() {
         let db = db_with_vote();
         let recovery = recovery_bundle_fixture();
@@ -1633,5 +1910,11 @@ mod tests {
         let err = record_vc_position(&db, ROUND_ID, 0, 99, 321).unwrap_err();
 
         assert!(matches!(err, VotingError::InvalidInput { .. }));
+    }
+
+    fn scalar_bytes(value: u8) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[0] = value;
+        bytes
     }
 }

@@ -9,6 +9,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added `vote::CommittedVote`, a stateful cast-vote handle that mirrors the
+  `PreparedDelegationBundle` method flow. Wallet SDKs can now commit/recover a
+  vote once, then drive submission and helper-share lifecycle steps through
+  methods (`submission`, `share_payloads`, `record_share`, `confirm_share`,
+  `add_sent_servers`, `record_submission`, `record_vc_position`) without
+  re-threading `(round_id, bundle_index, proposal_id)` across free functions.
 - Added `DelegationSigningRequest`, `delegation_signing_request`, and generic
   external delegation signature constructors so wallet SDKs can keep wallet seed
   material outside `zcash_voting`, sign the PCZT sighash locally with the account
