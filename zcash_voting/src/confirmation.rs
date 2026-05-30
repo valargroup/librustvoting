@@ -60,7 +60,8 @@ pub struct VoteConfirmation {
 ///
 /// Returns an error when confirmation parsing fails, the bundle row is missing,
 /// the event round id does not match `round_id`, stored confirmation fields
-/// conflict, or the DB transaction cannot commit.
+/// conflict, multiple same-round delegation events are present, or the DB
+/// transaction cannot commit.
 pub fn confirm_delegation_submission(
     db: &VotingDb,
     round_id: &str,
@@ -132,7 +133,8 @@ fn record_delegation_confirmation(
 ///
 /// Returns an error when confirmation parsing fails, the vote or bundle row is
 /// missing, the event round id does not match `round_id`, stored confirmation
-/// fields conflict, or the DB transaction cannot commit.
+/// fields conflict, multiple same-round cast-vote events are present, or the DB
+/// transaction cannot commit.
 pub fn confirm_vote_submission(
     db: &VotingDb,
     round_id: &str,
@@ -297,17 +299,30 @@ fn required_event_for_round<'a>(
     event_type: &str,
     round_id: &str,
 ) -> Result<&'a TxEvent, VotingError> {
+    let mut matching_event: Option<&TxEvent> = None;
     let mut wrong_round: Option<&str> = None;
     let mut saw_event_without_round = false;
 
     for event in events.iter().filter(|event| event.event_type == event_type) {
         match round_attribute(event) {
-            Some(event_round_id) if event_round_id == round_id => return Ok(event),
+            Some(event_round_id) if event_round_id == round_id => {
+                if matching_event.is_some() {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "ambiguous {event_type} events for round {round_id}; expected exactly one matching event"
+                        ),
+                    });
+                }
+                matching_event = Some(event);
+            }
             Some(event_round_id) => wrong_round = Some(event_round_id),
             None => saw_event_without_round = true,
         }
     }
 
+    if let Some(event) = matching_event {
+        return Ok(event);
+    }
     if let Some(event_round_id) = wrong_round {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -732,6 +747,37 @@ mod tests {
         assert_eq!(
             queries::load_van_position(&db.conn(), ROUND_ID, WALLET_ID, 0).unwrap(),
             42
+        );
+    }
+
+    #[test]
+    fn confirm_delegation_rejects_ambiguous_same_round_events() {
+        let db = test_db();
+        insert_bundle(&db, 0);
+        let err = confirm_delegation_submission(
+            &db,
+            ROUND_ID,
+            0,
+            "tx-1",
+            &[
+                event_with_attrs(
+                    DELEGATE_VOTE_EVENT,
+                    &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "42")],
+                ),
+                event_with_attrs(
+                    DELEGATE_VOTE_EVENT,
+                    &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "43")],
+                ),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous delegate_vote events"));
+        assert_eq!(
+            queries::get_delegation_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0)
+                .unwrap()
+                .as_deref(),
+            None
         );
     }
 
@@ -1169,6 +1215,39 @@ mod tests {
             .unwrap();
         assert_eq!(json.as_deref(), Some(recovery_json.as_str()));
         assert_eq!(pos, None);
+    }
+
+    #[test]
+    fn confirm_vote_rejects_ambiguous_same_round_events() {
+        let db = test_db();
+        insert_bundle(&db, 0);
+        insert_vote(&db, 0, 1);
+        let err = confirm_vote_submission(
+            &db,
+            ROUND_ID,
+            0,
+            1,
+            "tx-1",
+            &[
+                event_with_attrs(
+                    CAST_VOTE_EVENT,
+                    &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "7,789")],
+                ),
+                event_with_attrs(
+                    CAST_VOTE_EVENT,
+                    &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "8,790")],
+                ),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous cast_vote events"));
+        assert_eq!(
+            queries::get_vote_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0, 1)
+                .unwrap()
+                .as_deref(),
+            None
+        );
     }
 
     #[test]
