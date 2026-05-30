@@ -28,8 +28,8 @@ pub use crate::delegate::{
 pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::hotkey::{
-    generate_random_voting_hotkey, voting_hotkey_from_seed, VOTING_HOTKEY_ACCOUNT_INDEX,
-    VOTING_HOTKEY_ADDRESS_INDEX,
+    derive_voting_hotkey, derive_voting_hotkey_seed, generate_random_voting_hotkey,
+    voting_hotkey_from_seed, VOTING_HOTKEY_ACCOUNT_INDEX, VOTING_HOTKEY_ADDRESS_INDEX,
 };
 pub use crate::note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
 pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
@@ -52,7 +52,11 @@ pub use crate::selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,
     select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
-pub use crate::session::{resume_plan, Decision, NextStep, RoundPlan};
+pub use crate::session::{
+    resume_plan, CompletedVoteChoice, CompletedVoteDisplay, Decision, DelegationRecoveryWork,
+    DelegationRecoveryWorkKind, DelegationStatus, NextStep, RoundPlan, RoundPlanAction,
+    VoteRecoveryWork, VoteRecoveryWorkKind,
+};
 pub use crate::share::{
     add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,
     record as record_share, recover_payload, recover_wire_json, unconfirmed as unconfirmed_shares,

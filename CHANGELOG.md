@@ -16,6 +16,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   `KeystoneDelegationRequestView`, `KeystoneSignatureRecordView`, `DraftVoteView`,
   `VanWitnessView`, `SignedVoteCommitmentView`, `SignedVoteCommitmentsView`,
   and `VoteRecordView`.
+- Added crate-owned contextual voting hotkey derivation APIs
+  (`hotkey::derive_voting_hotkey` and `hotkey::derive_voting_hotkey_seed`) so
+  wallets do not need to duplicate the BLAKE2 domain separation and
+  round/account/network binding rules.
 - Added stable resume-plan wire DTOs in `zcash_voting::wire`
   (`NextStepView`, `RoundPlanView`) so wallet adapters can consume crate-owned
   `session::resume_plan` outputs directly over FRB without maintaining local
@@ -31,6 +35,16 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   `VotingDb::wallet_sidecar_path`, `VotingDb::open_wallet_sidecar`,
   `VotingDb::ensure_round_state`, and `delegate::ensure_round_context`
   (`DelegationRoundContext`).
+- Extended `session::RoundPlan` with crate-owned recovery/display projection
+  fields (`blocking_recovery`, `blocking_share_work`,
+  `completed_vote_artifact`, `completed_for_display`, `needs_draft_setup`,
+  `primary_action`, `delegation_statuses`, `completed_vote_display`, grouped
+  `recovered_delegation_work`, and grouped `recovered_vote_work`) so wallet
+  integrations can stop rebuilding foreground-blocking, "voted" display,
+  delegation phase, hotkey reuse, vote recovery completeness, delegation
+  polling, vote polling, recovered vote submission, and blocking share retry
+  decisions from raw recovery snapshots. The same projection is exposed through
+  `wire::RoundPlanView` for FFI consumers.
 - Added canonical wire JSON types in `zcash_voting::wire`
   (`DelegationSubmissionWire`, `VoteCommitmentWire`, `VoteShareWire`,
   `WireEncryptedShareJson`) so wallets can reuse one source of truth for

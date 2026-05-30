@@ -23,14 +23,15 @@ use crate::{
     types::{NoteRef, SelectedNotes, SharePayload, VotingError, WireEncryptedShare},
     vote::{DraftVote, SignedVoteCommitment, SignedVoteCommitments, VanWitness},
     wire::{
-        BundleSetupResultView, CommitmentBundleRecoveryView, DelegationPirPrecomputeResultView,
-        DelegationRecoveryView, DelegationSubmissionWire, DraftVoteView,
+        BundleSetupResultView, CommitmentBundleRecoveryView, CompletedVoteChoiceView,
+        CompletedVoteDisplayView, DelegationPirPrecomputeResultView, DelegationRecoveryView,
+        DelegationRecoveryWorkView, DelegationStatusView, DelegationSubmissionWire, DraftVoteView,
         KeystoneDelegationRequestView, KeystoneSignatureRecordView, NextStepView, RoundPlanView,
         RoundRecoveryStateView, ShareDelegationRecordView, ShareSubmissionPlanView,
         ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteCommitmentView,
         SignedVoteCommitmentsView, VanWitnessView, VoteCommitmentWire, VoteRecordView,
-        VoteRecoveryView, VoteShareWire, VotingNoteRefView, VotingNoteSelectionResultView,
-        WireEncryptedShareJson,
+        VoteRecoveryView, VoteRecoveryWorkView, VoteShareWire, VotingNoteRefView,
+        VotingNoteSelectionResultView, WireEncryptedShareJson,
     },
     BundlePolicy,
 };
@@ -506,6 +507,62 @@ impl TryFrom<session::NextStep> for NextStepView {
     }
 }
 
+impl From<session::DelegationStatus> for DelegationStatusView {
+    fn from(status: session::DelegationStatus) -> Self {
+        Self {
+            bundle_index: status.bundle_index,
+            phase: WorkflowPhase::for_delegation(status.phase)
+                .as_str()
+                .to_string(),
+            tx_hash: status.tx_hash,
+        }
+    }
+}
+
+impl From<session::DelegationRecoveryWork> for DelegationRecoveryWorkView {
+    fn from(work: session::DelegationRecoveryWork) -> Self {
+        Self {
+            kind: work.kind.as_str().to_string(),
+            bundle_index: work.bundle_index,
+            phase: WorkflowPhase::for_delegation(work.phase)
+                .as_str()
+                .to_string(),
+            tx_hash: work.tx_hash,
+        }
+    }
+}
+
+impl From<session::VoteRecoveryWork> for VoteRecoveryWorkView {
+    fn from(work: session::VoteRecoveryWork) -> Self {
+        Self {
+            kind: work.kind.as_str().to_string(),
+            bundle_index: work.bundle_index,
+            proposal_id: work.proposal_id,
+            tx_hash: work.tx_hash,
+            vc_tree_position: work.vc_tree_position,
+            share_indexes: work.share_indexes,
+        }
+    }
+}
+
+impl From<session::CompletedVoteChoice> for CompletedVoteChoiceView {
+    fn from(choice: session::CompletedVoteChoice) -> Self {
+        Self {
+            proposal_id: choice.proposal_id,
+            choice: choice.choice,
+        }
+    }
+}
+
+impl From<session::CompletedVoteDisplay> for CompletedVoteDisplayView {
+    fn from(display: session::CompletedVoteDisplay) -> Self {
+        Self {
+            choices: display.choices.into_iter().map(Into::into).collect(),
+            voted_at: display.voted_at,
+        }
+    }
+}
+
 impl TryFrom<session::RoundPlan> for RoundPlanView {
     type Error = VotingError;
 
@@ -513,11 +570,34 @@ impl TryFrom<session::RoundPlan> for RoundPlanView {
         Ok(Self {
             round_id: plan.round_id,
             pending_recovery: plan.pending_recovery,
+            blocking_recovery: plan.blocking_recovery,
+            blocking_share_work: plan.blocking_share_work,
+            hotkey_bound: plan.hotkey_bound,
+            completed_vote_artifact: plan.completed_vote_artifact,
+            completed_for_display: plan.completed_for_display,
+            completed_vote_display: plan.completed_vote_display.map(Into::into),
+            needs_draft_setup: plan.needs_draft_setup,
+            primary_action: plan.primary_action.as_str().to_string(),
             next_steps: plan
                 .next_steps
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>, _>>()?,
+            delegation_statuses: plan
+                .delegation_statuses
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            recovered_delegation_work: plan
+                .recovered_delegation_work
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            recovered_vote_work: plan
+                .recovered_vote_work
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             open_proposals: plan.open_proposals,
             all_decided: plan.all_decided,
         })
@@ -889,6 +969,20 @@ mod tests {
         let plan = session::RoundPlan {
             round_id: "round-1".to_string(),
             pending_recovery: true,
+            blocking_recovery: true,
+            blocking_share_work: false,
+            hotkey_bound: true,
+            completed_vote_artifact: true,
+            completed_for_display: false,
+            completed_vote_display: Some(session::CompletedVoteDisplay {
+                choices: vec![session::CompletedVoteChoice {
+                    proposal_id: 11,
+                    choice: Some(1),
+                }],
+                voted_at: Some(123),
+            }),
+            needs_draft_setup: false,
+            primary_action: session::RoundPlanAction::Vote,
             next_steps: vec![
                 session::NextStep::Delegate { bundle_index: 1 },
                 session::NextStep::PollDelegation { bundle_index: 2 },
@@ -916,6 +1010,25 @@ mod tests {
                     share_index: 1,
                 },
             ],
+            delegation_statuses: vec![session::DelegationStatus {
+                bundle_index: 2,
+                phase: crate::phases::DelegationPhase::Submitted,
+                tx_hash: Some("delegation-tx".to_string()),
+            }],
+            recovered_delegation_work: vec![session::DelegationRecoveryWork {
+                kind: session::DelegationRecoveryWorkKind::PollDelegation,
+                bundle_index: 2,
+                phase: crate::phases::DelegationPhase::Submitted,
+                tx_hash: Some("delegation-tx".to_string()),
+            }],
+            recovered_vote_work: vec![session::VoteRecoveryWork {
+                kind: session::VoteRecoveryWorkKind::SubmitShares,
+                bundle_index: 6,
+                proposal_id: 14,
+                tx_hash: None,
+                vc_tree_position: Some(99),
+                share_indexes: vec![0, 1],
+            }],
             open_proposals: vec![11, 12],
             all_decided: false,
         };
@@ -923,6 +1036,27 @@ mod tests {
         let view = RoundPlanView::try_from(plan).unwrap();
         assert_eq!(view.round_id, "round-1");
         assert!(view.pending_recovery);
+        assert!(view.blocking_recovery);
+        assert!(!view.blocking_share_work);
+        assert!(view.hotkey_bound);
+        assert!(view.completed_vote_artifact);
+        assert!(!view.completed_for_display);
+        assert_eq!(
+            view.completed_vote_display
+                .as_ref()
+                .unwrap()
+                .choices
+                .first()
+                .unwrap()
+                .choice,
+            Some(1)
+        );
+        assert_eq!(
+            view.completed_vote_display.as_ref().unwrap().voted_at,
+            Some(123)
+        );
+        assert!(!view.needs_draft_setup);
+        assert_eq!(view.primary_action, "vote");
         assert_eq!(view.open_proposals, vec![11, 12]);
         assert!(!view.all_decided);
 
@@ -947,5 +1081,10 @@ mod tests {
         assert_eq!(view.next_steps[2].proposal_id, 11);
         assert_eq!(view.next_steps[2].choice, 1);
         assert_eq!(view.next_steps[6].share_index, 1);
+        assert_eq!(view.delegation_statuses[0].phase, "submitted_delegation");
+        assert_eq!(view.recovered_delegation_work[0].kind, "poll_delegation");
+        assert_eq!(view.recovered_vote_work[0].kind, "submit_shares");
+        assert_eq!(view.recovered_vote_work[0].vc_tree_position, Some(99));
+        assert_eq!(view.recovered_vote_work[0].share_indexes, vec![0, 1]);
     }
 }
