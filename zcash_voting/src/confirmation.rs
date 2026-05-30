@@ -483,7 +483,7 @@ mod tests {
     fn test_db() -> VotingDb {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         db
     }
 
