@@ -13,7 +13,8 @@ pub use crate::delegate::{
     record_van_position, redact_for_signer, setup as setup_delegation, spend_auth_signature,
     submission as delegation_submission, BranchIdProvider, DelegationAccountKeys, DelegationKeys,
     DelegationPhase, DelegationProgress, DelegationProof, DelegationSetup, DelegationSigner,
-    DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, SignedDelegationBundle,
+    DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, PreparedSigner,
+    SignedDelegationBundle,
 };
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::delegate::{
@@ -64,10 +65,7 @@ pub use crate::vote::{
 pub use crate::warm_proving_caches;
 
 #[cfg(feature = "pir")]
-pub use crate::precompute::{
-    delegation_pir, precompute_delegation, precompute_delegation_with_policy,
-    PrecomputeDelegationInputs,
-};
+pub use crate::precompute::delegation_pir;
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::precompute::{reset_vote_tree, sync_vote_tree, van_witness};

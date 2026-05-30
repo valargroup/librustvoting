@@ -1232,6 +1232,44 @@ mod tests {
     }
 
     #[test]
+    fn validate_draft_votes_rejects_invalid_inputs_before_db_work() {
+        assert!(validate_draft_votes(&[])
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
+        assert!(validate_draft_votes(&[DraftVote {
+            proposal_id: 0,
+            choice: 0,
+            num_options: 2,
+            single_share: false,
+            vc_tree_position: 0,
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("proposal_id"));
+        assert!(validate_draft_votes(&[DraftVote {
+            proposal_id: 1,
+            choice: 0,
+            num_options: 1,
+            single_share: false,
+            vc_tree_position: 0,
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("num_options"));
+        assert!(validate_draft_votes(&[DraftVote {
+            proposal_id: 1,
+            choice: 2,
+            num_options: 2,
+            single_share: false,
+            vc_tree_position: 0,
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("vote_decision"));
+    }
+
+    #[test]
     fn recovery_json_round_trip_preserves_vote_and_share_material() {
         let bundle = recovery_bundle_fixture();
 

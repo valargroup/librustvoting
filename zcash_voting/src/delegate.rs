@@ -20,8 +20,6 @@ use crate::{
     types::{DelegationProgressReporter, Network, NoteInfo, VotingError, VotingHotkey},
 };
 
-#[cfg(feature = "pir")]
-pub use crate::precompute::{precompute_delegation, precompute_delegation_with_policy};
 use zcash_client_backend::data_api::{Account, WalletRead};
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_protocol::consensus::{NetworkConstants, Parameters};
@@ -181,8 +179,7 @@ pub struct DelegationBundleContext {
     pub selected_weight_zatoshi: u64,
     pub bundle_note_infos: Vec<NoteInfo>,
     pub delegated_weight_zatoshi: u64,
-    pub account: DelegationAccountKeys,
-    pub voting_hotkey: VotingHotkey,
+    pub delegation_keys: DelegationKeys,
     pub branch_id_provider: LightwalletdBranchIdProvider,
     pub round_name: String,
 }
@@ -400,6 +397,17 @@ impl DelegationSigner<'static> {
     }
 }
 
+/// Signature source for a prepared delegation bundle.
+///
+/// Unlike [`DelegationSigner`], this enum does not require callers to re-pass
+/// bundle keys; [`PreparedDelegationBundle`] supplies them for seed signing.
+pub enum PreparedSigner<'a> {
+    /// Software wallet signer for the prepared bundle's account keys.
+    Seed { seed: &'a [u8] },
+    /// Hardware wallet signer that already signed the stored PCZT sighash.
+    Keystone { sig: [u8; 64], sighash: [u8; 32] },
+}
+
 /// Chain-ready delegation transaction fields for one bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegationSubmission {
@@ -460,6 +468,123 @@ pub struct PreparedDelegationReport {
     pub layout: BundleLayout,
     /// Bundle index warmed by the precompute operation.
     pub bundle_index: u32,
+}
+
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+impl PreparedDelegationBundle {
+    /// Persists bundle witnesses, initializes padded secrets, and warms PIR rows.
+    ///
+    /// This is the prepared-bundle replacement for the older loose
+    /// `PrecomputeDelegationInputs` path. It never recalculates bundle membership;
+    /// the prepared bundle is the source of truth for notes, layout, and network.
+    #[cfg(feature = "pir")]
+    pub fn precompute<C, P, CL, R>(
+        &self,
+        voting_db: &VotingDb,
+        wallet_db: &WalletDb<C, P, CL, R>,
+        pir_client: &pir_client::PirClientBlocking,
+        cancellation: &dyn crate::Cancellation,
+    ) -> Result<PreparedDelegationReport, VotingError>
+    where
+        C: Borrow<rusqlite::Connection>,
+        P: Parameters,
+    {
+        check_cancellation(cancellation)?;
+        if !voting_db.has_witnesses(&self.round_id, self.bundle_index)? {
+            crate::precompute::note_witnesses(
+                voting_db,
+                &self.round_id,
+                self.bundle_index,
+                &self.anchor_tree_state_bytes,
+                &self.bundle_note_infos,
+                wallet_db,
+            )?;
+        }
+
+        crate::precompute::warm_delegation_pir(
+            voting_db,
+            &self.round_id,
+            self.bundle_index,
+            &self.bundle_note_infos,
+            self.layout.clone(),
+            pir_client,
+            self.network,
+            cancellation,
+        )
+    }
+
+    /// Builds and persists the governance PCZT setup for this prepared bundle.
+    pub fn setup(
+        &self,
+        voting_db: &VotingDb,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<DelegationSetup, VotingError> {
+        crate::delegate::setup(
+            voting_db,
+            &self.round_id,
+            self.bundle_index,
+            &self.bundle_note_infos,
+            &self.delegation_keys,
+            &self.branch_id_provider,
+            stages,
+        )
+    }
+
+    /// Generates and persists the delegation proof for this prepared bundle.
+    #[cfg(feature = "pir")]
+    pub fn prove(
+        &self,
+        voting_db: &VotingDb,
+        pir_client: &pir_client::PirClientBlocking,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<DelegationProof, VotingError> {
+        crate::delegate::prove(
+            voting_db,
+            &self.round_id,
+            self.bundle_index,
+            &self.bundle_note_infos,
+            &self.delegation_keys,
+            pir_client,
+            stages,
+        )
+    }
+
+    /// Assembles chain-ready submission fields for this prepared bundle.
+    pub fn submission(
+        &self,
+        voting_db: &VotingDb,
+        signer: PreparedSigner<'_>,
+    ) -> Result<DelegationSubmission, VotingError> {
+        let signer = match signer {
+            PreparedSigner::Seed { seed } => DelegationSigner::seed(seed, &self.delegation_keys),
+            PreparedSigner::Keystone { sig, sighash } => {
+                DelegationSigner::Keystone { sig, sighash }
+            }
+        };
+        crate::delegate::submission(voting_db, &self.round_id, self.bundle_index, signer)
+    }
+
+    /// Builds the redacted Keystone signing request for this prepared bundle.
+    pub fn keystone_request(
+        &self,
+        voting_db: &VotingDb,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<KeystoneSigningRequest, VotingError> {
+        let setup = self.setup(voting_db, stages)?;
+        let redacted_pczt_bytes = redact_for_signer(&setup.pczt_bytes)?;
+        let delegated_weight_zatoshi = crate::round::raw_bundle_weight(&self.bundle_note_infos)?;
+        let display_memo = display_memo(&self.round_name, delegated_weight_zatoshi);
+
+        Ok(KeystoneSigningRequest {
+            setup,
+            redacted_pczt_bytes,
+            display_memo,
+            eligible_weight_zatoshi: self.layout.eligible_weight,
+            delegated_weight_zatoshi,
+            bundle_count: self.layout.bundle_count,
+            bundle_index: self.bundle_index,
+        })
+    }
 }
 
 /// Loads account keys needed by delegation PCZT construction from a wallet DB.
