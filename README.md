@@ -36,7 +36,11 @@ stage-oriented API:
 - `round::*` creates rounds and binds eligible notes into bundles.
 - `precompute::*` prepares Orchard witnesses, delegation PIR inputs, and VAN
   witnesses for vote proofs.
-- `delegate::*` builds delegation PCZTs and proves delegation.
+- `delegate::*` builds delegation PCZTs, proves delegation, prepares signing
+  requests, and assembles signed delegation submissions. Software wallets can
+  pass wallet seed material to `PreparedSigner::from_wallet_seed` when this
+  crate runs inside the same seed trust boundary; callers can still sign
+  externally and pass signature bytes when the signer lives elsewhere.
 - `confirmation::*` parses delegation and cast-vote tx events, then records tx
   hashes and tree positions atomically.
 - `vote::*` builds ZKP #2, signs cast-vote payloads, persists the canonical
@@ -77,8 +81,12 @@ stage-oriented API:
 - Replace wallet-local "what comes next" recovery planning with
   `session::resume_plan`; fetch execution material through crate APIs such as
   `vote::submission`, `vote::recover_commit`, `share::*`, and the tx hash
-  accessors, then keep wallet-specific networking, proof execution, signing, and
-  UI routing at the wallet boundary.
+  accessors, then keep wallet-specific networking, proof execution, and UI
+  routing at the wallet boundary.
+- Replace wallet-local delegation proof and signing orchestration with
+  `delegate::PreparedDelegationBundle`. Callers can use the prepared lifecycle
+  for setup, witness completion, proving, signing request construction, signed
+  payload assembly, and Keystone request construction.
 - Use `confirmation::{confirm_delegation_submission, confirm_vote_submission}`
   after chain clients report confirmed delegation or cast-vote tx events. The
   confirmation API parses the chain `leaf_index` events and records tx hashes,
