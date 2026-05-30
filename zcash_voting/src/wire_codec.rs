@@ -16,12 +16,13 @@ use crate::{
     types::{NoteRef, SelectedNotes, SharePayload, VotingError},
     vote::{SignedVoteCommitment, SignedVoteCommitments},
     wire::{
-        CompletedVoteChoiceView, CompletedVoteDisplayView, DelegationPirPrecomputeResultView,
-        DelegationRecoveryView, DelegationRecoveryWorkView, DelegationStatusView,
-        DelegationSubmissionWire, NextStepView, RoundPlanView, RoundRecoveryStateView,
-        ShareDelegationRecordView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
-        SignedVoteCommitmentView, SignedVoteCommitmentsView, VoteCommitmentWire, VoteRecoveryView,
-        VoteRecoveryWorkView, VoteShareWire, VotingNoteRefView, VotingNoteSelectionResultView,
+        CompletedVoteChoiceView, CompletedVoteDisplayView, DelegationBundlePlanView,
+        DelegationPirPrecomputeResultView, DelegationRecoveryView, DelegationRecoveryWorkView,
+        DelegationStatusView, DelegationSubmissionWire, NextStepView, RoundPlanView,
+        RoundRecoveryStateView, ShareDelegationRecordView, ShareWorkflowRecoveryView,
+        SignedDelegationPayloadView, SignedVoteCommitmentView, SignedVoteCommitmentsView,
+        VoteCommitmentWire, VoteRecoveryView, VoteRecoveryWorkView, VoteShareWire,
+        VotingNoteRefView, VotingNoteSelectionResultView,
     },
     BundlePolicy,
 };
@@ -394,6 +395,16 @@ impl From<session::DelegationStatus> for DelegationStatusView {
                 .as_str()
                 .to_string(),
             tx_hash: status.tx_hash,
+        }
+    }
+}
+
+impl From<session::DelegationBundlePlan> for DelegationBundlePlanView {
+    fn from(plan: session::DelegationBundlePlan) -> Self {
+        Self {
+            bundle_count: plan.bundle_count,
+            pending_bundle_indexes: plan.pending_bundle_indexes,
+            submitted_bundle_indexes: plan.submitted_bundle_indexes,
         }
     }
 }
@@ -1008,5 +1019,19 @@ mod tests {
         assert_eq!(view.recovered_vote_work[0].kind, "submit_shares");
         assert_eq!(view.recovered_vote_work[0].vc_tree_position, Some(99));
         assert_eq!(view.recovered_vote_work[0].share_indexes, vec![0, 1]);
+    }
+
+    #[test]
+    fn delegation_bundle_plan_view_maps_pending_and_submitted_lists() {
+        let view: DelegationBundlePlanView = session::DelegationBundlePlan {
+            bundle_count: 4,
+            pending_bundle_indexes: vec![0, 3],
+            submitted_bundle_indexes: vec![1],
+        }
+        .into();
+
+        assert_eq!(view.bundle_count, 4);
+        assert_eq!(view.pending_bundle_indexes, vec![0, 3]);
+        assert_eq!(view.submitted_bundle_indexes, vec![1]);
     }
 }

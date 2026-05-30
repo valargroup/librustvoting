@@ -308,6 +308,16 @@ pub struct DelegationStatus {
     pub tx_hash: Option<String>,
 }
 
+/// Delegation submission state for every eligible bundle in a round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationBundlePlan {
+    pub bundle_count: u32,
+    /// Bundles that still need local delegation work before a tx is submitted.
+    pub pending_bundle_indexes: Vec<u32>,
+    /// Bundles with a submitted delegation tx that still need confirmation.
+    pub submitted_bundle_indexes: Vec<u32>,
+}
+
 /// Kind of vote recovery work grouped from `NextStep`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1018,6 +1028,58 @@ pub fn resume_plan(
     })
 }
 
+/// Returns the per-bundle delegation work needed before votes can be cast.
+///
+/// This intentionally does not depend on ballot intent. Wallets can use it to
+/// prepare delegation before the voter answers any proposal, while
+/// [`resume_plan`] remains focused on interrupted ballot recovery.
+pub fn delegation_bundle_plan(
+    db: &VotingDb,
+    round_id: &str,
+) -> Result<DelegationBundlePlan, VotingError> {
+    if !db.has_round(round_id)? {
+        return Err(VotingError::InvalidInput {
+            message: format!("round {round_id} is not initialized"),
+        });
+    }
+
+    let bundle_count = db.get_bundle_count(round_id)?;
+    let delegation: BTreeMap<u32, DelegationPhase> =
+        db.delegation_phases(round_id)?.into_iter().collect();
+
+    if delegation.len() != bundle_count as usize {
+        return Err(VotingError::Internal {
+            message: format!(
+                "round {round_id} has {} delegation rows for {bundle_count} bundles",
+                delegation.len()
+            ),
+        });
+    }
+
+    let mut pending_bundle_indexes = Vec::new();
+    let mut submitted_bundle_indexes = Vec::new();
+    for bundle_index in 0..bundle_count {
+        match delegation.get(&bundle_index) {
+            Some(DelegationPhase::Confirmed) => {}
+            Some(DelegationPhase::Submitted) => submitted_bundle_indexes.push(bundle_index),
+            Some(_) => pending_bundle_indexes.push(bundle_index),
+            None => {
+                return Err(VotingError::Internal {
+                    message: format!(
+                        "round {round_id} is missing delegation state for bundle {bundle_index}"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(DelegationBundlePlan {
+        bundle_count,
+        pending_bundle_indexes,
+        submitted_bundle_indexes,
+    })
+}
+
 fn vote_has_recovery_bundle(
     db: &VotingDb,
     round_id: &str,
@@ -1366,6 +1428,62 @@ mod tests {
         assert_eq!(plan.primary_action, RoundPlanAction::Idle);
         assert!(plan.recovered_delegation_work.is_empty());
         assert!(plan.recovered_vote_work.is_empty());
+    }
+
+    #[test]
+    fn delegation_bundle_plan_reports_pre_vote_work() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(W);
+        db.create_round(&round_params(), None).unwrap();
+        let notes = (0..11).map(note).collect::<Vec<_>>();
+        db.ensure_bundles(ROUND, &notes).unwrap();
+        assert_eq!(db.get_bundle_count(ROUND).unwrap(), 3);
+
+        db.store_delegation_tx_hash(ROUND, 1, "submitted-tx")
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 2, "confirmed-tx")
+            .unwrap();
+        db.store_van_position(ROUND, 2, 7).unwrap();
+
+        let plan = delegation_bundle_plan(&db, ROUND).unwrap();
+
+        assert_eq!(
+            plan,
+            DelegationBundlePlan {
+                bundle_count: 3,
+                pending_bundle_indexes: vec![0],
+                submitted_bundle_indexes: vec![1],
+            }
+        );
+    }
+
+    #[test]
+    fn delegation_bundle_plan_allows_empty_round() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(W);
+        db.create_round(&round_params(), None).unwrap();
+
+        assert_eq!(
+            delegation_bundle_plan(&db, ROUND).unwrap(),
+            DelegationBundlePlan {
+                bundle_count: 0,
+                pending_bundle_indexes: vec![],
+                submitted_bundle_indexes: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn delegation_bundle_plan_rejects_missing_round() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(W);
+
+        let err = delegation_bundle_plan(&db, ROUND).unwrap_err();
+
+        assert!(
+            err.to_string().contains("round") && err.to_string().contains("not initialized"),
+            "{err}"
+        );
     }
 
     #[test]
