@@ -125,7 +125,7 @@ pub fn prove_and_submit_delegation_bundle(
     let signing_request = prepared
         .signing_request(voting_db)
         .context("load delegation signing request")?;
-    let (sig, sighash) = sign_delegation_request(seed, signing_request)?;
+    let (sig, sighash) = example_sign_delegation_request(seed, signing_request)?;
 
     let pir_client = connect_pir(pir_server_url)?;
     prepared
@@ -194,10 +194,12 @@ pub fn prove_and_submit_keystone_delegation_bundle(
         .context("assemble Keystone-signed delegation submission")
 }
 
-fn sign_delegation_request(
+fn example_sign_delegation_request(
     seed: &[u8],
     request: DelegationSigningRequest,
 ) -> Result<([u8; 64], [u8; 32])> {
+    // This is example-only signing code. Production wallets should keep their
+    // own seed storage and signing boundary, then return only the signature.
     // Real wallet integrations should route to the seed identified by
     // request.seed_fingerprint before signing. This example verifies that the
     // already selected seed matches the request.
