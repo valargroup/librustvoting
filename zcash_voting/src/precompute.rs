@@ -354,7 +354,7 @@ mod tree_sync_tests {
     fn vote_tree_sync_witness_and_reset_happy_path() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         db.ensure_bundles(ROUND_ID, &[note(0)]).unwrap();
         db.store_van_position(ROUND_ID, 0, 0).unwrap();
         let server = start_tree_server(1, vec![1], 2);

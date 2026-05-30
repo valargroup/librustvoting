@@ -4,13 +4,13 @@
 //! ownership in [`VotingDb`] while hiding the low-level query helpers that back
 //! the SQLite schema.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{named_params, OptionalExtension};
 
 use crate::{
     note_bundling::{chunk_notes_with_policy, BundlePolicy},
-    storage::{queries, VotingDb as InnerVotingDb},
+    storage::{queries, RoundState, VotingDb as InnerVotingDb},
     types::{NoteInfo, VotingError, VotingRoundParams},
 };
 
@@ -178,6 +178,24 @@ pub fn quantized_bundle_set_weight(bundles: &[Vec<NoteInfo>]) -> Result<u64, Vot
 }
 
 impl VotingDb {
+    /// Returns the sidecar voting DB path for a wallet DB path.
+    ///
+    /// The sidecar lives next to the wallet DB with a `.voting` suffix so
+    /// voting migrations cannot affect the wallet DB `user_version`.
+    pub fn wallet_sidecar_path(wallet_db_path: &Path) -> PathBuf {
+        let mut sidecar = wallet_db_path.as_os_str().to_os_string();
+        sidecar.push(".voting");
+        PathBuf::from(sidecar)
+    }
+
+    /// Opens the voting sidecar database for `wallet_db_path` and binds `wallet_id`.
+    pub fn open_wallet_sidecar(wallet_db_path: &Path, wallet_id: &str) -> Result<Self, VotingError> {
+        let sidecar_path = Self::wallet_sidecar_path(wallet_db_path);
+        let db = Self::open_path(&sidecar_path)?;
+        db.set_wallet_id(wallet_id);
+        Ok(db)
+    }
+
     /// Opens or creates a voting database at `path` and runs migrations.
     ///
     /// Call [`VotingDb::set_wallet_id`] before performing wallet-scoped round
@@ -200,9 +218,13 @@ impl VotingDb {
     /// round parameters and is idempotent only at the caller layer; inserting an
     /// already-existing `(wallet_id, round_id)` pair returns an error from the
     /// underlying SQLite constraint.
-    pub fn create_round(&self, params: &RoundParams) -> Result<(), VotingError> {
+    pub fn create_round(
+        &self,
+        params: &RoundParams,
+        session_json: Option<&str>,
+    ) -> Result<(), VotingError> {
         crate::types::validate_round_params(params)?;
-        self.init_round(params, None)
+        self.init_round(params, session_json)
     }
 
     /// Ensures a round exists for `params`, initializing it when absent.
@@ -219,6 +241,19 @@ impl VotingDb {
             return Ok(());
         }
         self.init_round(params, session_json)
+    }
+
+    /// Ensures a round exists and returns its persisted state.
+    ///
+    /// Existing rounds are returned unchanged. Missing rounds are initialized
+    /// with `session_json` and then reloaded.
+    pub fn ensure_round_state(
+        &self,
+        params: &RoundParams,
+        session_json: Option<&str>,
+    ) -> Result<RoundState, VotingError> {
+        self.ensure_round(params, session_json)?;
+        self.get_round_state(&params.vote_round_id)
     }
 
     /// Loads one round summary for the current wallet.
@@ -454,8 +489,37 @@ mod tests {
     fn test_db(wallet_id: &str) -> VotingDb {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(wallet_id);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         db
+    }
+
+    #[test]
+    fn wallet_sidecar_path_appends_voting_suffix() {
+        let path = std::path::Path::new("/tmp/wallet.sqlite");
+        assert_eq!(
+            VotingDb::wallet_sidecar_path(path),
+            std::path::PathBuf::from("/tmp/wallet.sqlite.voting")
+        );
+    }
+
+    #[test]
+    fn open_wallet_sidecar_opens_schema_and_sets_wallet_id() {
+        let wallet_path = std::env::temp_dir().join(format!(
+            "zcash-voting-sidecar-{}.sqlite",
+            std::process::id()
+        ));
+        let sidecar = VotingDb::wallet_sidecar_path(&wallet_path);
+        if sidecar.exists() {
+            std::fs::remove_file(&sidecar).ok();
+        }
+
+        let db = VotingDb::open_wallet_sidecar(&wallet_path, "wallet-sidecar").unwrap();
+
+        assert_eq!(db.wallet_id(), "wallet-sidecar");
+        assert!(db.list_rounds().unwrap().is_empty());
+        assert!(sidecar.exists());
+
+        std::fs::remove_file(sidecar).ok();
     }
 
     fn round_params() -> RoundParams {

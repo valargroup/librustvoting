@@ -300,7 +300,7 @@ mod tests {
             .unwrap();
 
         db.set_wallet_id("wallet-recovery-other");
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         db.ensure_bundles(ROUND_ID, &[test_note_info(0)]).unwrap();
         db.store_delegation_tx_hash(ROUND_ID, 0, "wallet-b-tx")
             .unwrap();
@@ -325,7 +325,7 @@ mod tests {
 
         let db = VotingDb::open(db_path_str).unwrap();
         db.set_wallet_id(WALLET_ID);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         let notes: Vec<_> = (0..6).map(test_note_info).collect();
         db.ensure_bundles(ROUND_ID, &notes).unwrap();
         db.store_delegation_tx_hash(ROUND_ID, 0, "delegation-tx-0")
@@ -435,7 +435,7 @@ mod tests {
     fn db_with_round(wallet_id: &str) -> VotingDb {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(wallet_id);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         let notes: Vec<_> = (0..6).map(test_note_info).collect();
         db.ensure_bundles(ROUND_ID, &notes).unwrap();
         db

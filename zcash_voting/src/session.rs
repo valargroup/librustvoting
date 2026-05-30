@@ -571,7 +571,7 @@ mod tests {
     fn db_with_bundle() -> VotingDb {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(W);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         db.ensure_bundles(ROUND, &[note(0)]).unwrap();
         db
     }
@@ -1105,7 +1105,7 @@ mod tests {
     fn choice_intent_without_bundles_is_invalid() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(W);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
 
@@ -1131,7 +1131,7 @@ mod tests {
     fn multi_bundle_orders_vote_steps_by_proposal() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(W);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         db.ensure_bundles(
             ROUND,
             &[note(0), note(1), note(2), note(3), note(4), note(5)],
@@ -1177,7 +1177,7 @@ mod tests {
     fn interrupted_second_bundle_vote_stays_before_later_proposals() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(W);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         db.ensure_bundles(
             ROUND,
             &[note(0), note(1), note(2), note(3), note(4), note(5)],
@@ -1234,7 +1234,7 @@ mod tests {
     fn confirmed_vote_without_recorded_shares_yields_submit_shares() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(W);
-        db.create_round(&round_params()).unwrap();
+        db.create_round(&round_params(), None).unwrap();
         db.ensure_bundles(
             ROUND,
             &[note(0), note(1), note(2), note(3), note(4), note(5)],
