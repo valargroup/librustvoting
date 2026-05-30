@@ -103,6 +103,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # Error handling
 anyhow = "1"
 thiserror = "2"
+zeroize = "1"
 
 # Single orchard node: every consumer resolves upstream `orchard` from
 # crates.io at 0.13.1. The `unstable-voting-circuits` feature is required by

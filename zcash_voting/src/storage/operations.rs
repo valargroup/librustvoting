@@ -18,8 +18,8 @@ use orchard::{
 use pasta_curves::pallas;
 use voting_circuits::delegation::{synthetic_padding_note_parts, ImtProofData};
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::consensus::Network;
 
+use crate::delegate::DelegationKeys;
 use crate::governance::BUNDLE_NOTE_SLOTS;
 use crate::note_bundling::ChunkResult;
 use crate::storage::queries;
@@ -28,7 +28,7 @@ use crate::storage::{
 };
 use crate::types::{
     DelegationPirPrecomputeResult, DelegationProgressReporter, DelegationProofResult,
-    DelegationSubmissionData, EncryptedShare, GovernancePczt, NoteInfo, ProgressReporter,
+    DelegationSubmissionData, EncryptedShare, GovernancePczt, Network, NoteInfo, ProgressReporter,
     SharePayload, VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
     WireEncryptedShare, WitnessData,
 };
@@ -99,7 +99,7 @@ fn nullifier_imt_root_to_base(bytes: &[u8]) -> Result<pallas::Base, VotingError>
 fn padded_nullifiers_for_circuit(
     notes: &[NoteInfo],
     padded_secrets: &[(Vec<u8>, Vec<u8>)],
-    network_id: u32,
+    network: Network,
 ) -> Result<Vec<Vec<u8>>, VotingError> {
     if padded_secrets.is_empty() {
         return Ok(Vec::new());
@@ -112,17 +112,6 @@ fn padded_nullifiers_for_circuit(
         })?
         .ufvk_str;
 
-    let network = match network_id {
-        0 => Network::TestNetwork,
-        1 => Network::MainNetwork,
-        _ => {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "invalid network_id {network_id}, expected 0 (testnet) or 1 (mainnet)"
-                ),
-            })
-        }
-    };
     let ufvk =
         UnifiedFullViewingKey::decode(&network, first_ufvk).map_err(|e| VotingError::Internal {
             message: format!("failed to decode UFVK while deriving padded nullifiers: {e}"),
@@ -436,10 +425,13 @@ impl VotingDb {
     }
     // --- Phase 1: Delegation setup ---
 
-    /// Generate a voting hotkey from seed bytes. Returns the hotkey (SDK needs address for Keystone flow).
-    /// The seed comes from a BIP39 mnemonic stored in iOS Keychain.
-    pub fn generate_hotkey(&self, seed: &[u8]) -> Result<VotingHotkey, VotingError> {
-        crate::hotkey::generate_hotkey(seed)
+    /// Builds a voting hotkey from stored hotkey seed bytes.
+    pub fn voting_hotkey_from_seed(
+        &self,
+        seed: &[u8],
+        network: crate::types::Network,
+    ) -> Result<VotingHotkey, VotingError> {
+        crate::hotkey::voting_hotkey_from_seed(seed, network)
     }
 
     /// Build a governance-specific PCZT for Keystone signing.
@@ -447,25 +439,15 @@ impl VotingDb {
     /// Computes governance values and builds a PCZT whose single Orchard action
     /// IS the governance dummy action (spend of signed note → output to hotkey).
     ///
-    /// - `fvk_bytes`: 96-byte orchard FullViewingKey (ak[32] || nk[32] || rivk[32])
-    /// - `hotkey_raw_address`: 43-byte hotkey raw orchard address (for output note)
     /// - `consensus_branch_id`: NU6 = 0xC8E71055
-    /// - `coin_type`: 133 (mainnet) or 1 (testnet)
-    /// - `seed_fingerprint`: 32-byte ZIP-32 seed fingerprint for Keystone signing
-    /// - `account_index`: ZIP-32 account index (typically 0)
+    /// - `keys`: wallet account and voting hotkey metadata for the delegation PCZT
     pub fn build_governance_pczt(
         &self,
         round_id: &str,
         bundle_index: u32,
         notes: &[NoteInfo],
-        fvk_bytes: &[u8],
-        hotkey_raw_address: &[u8],
+        keys: &DelegationKeys,
         consensus_branch_id: u32,
-        coin_type: u32,
-        seed_fingerprint: &[u8; 32],
-        account_index: u32,
-        round_name: &str,
-        address_index: u32,
     ) -> Result<GovernancePczt, VotingError> {
         let padded_note_secrets = self.ensure_padded_secrets(round_id, bundle_index, notes)?;
         let conn = self.conn();
@@ -475,13 +457,13 @@ impl VotingDb {
         let result = crate::action::build_governance_pczt(
             notes,
             &params,
-            fvk_bytes,
-            hotkey_raw_address,
+            &keys.fvk_bytes,
+            &keys.hotkey_raw_address,
             consensus_branch_id,
-            coin_type,
-            seed_fingerprint,
-            account_index,
-            round_name,
+            keys.coin_type,
+            &keys.seed_fingerprint,
+            keys.account_index,
+            &keys.round_name,
             &padded_note_secrets,
         )?;
         // Compute total note value from input notes
@@ -509,7 +491,7 @@ impl VotingDb {
             &result.rseed_output,
             &result.van,
             total_note_value,
-            address_index,
+            keys.address_index,
             &result.padded_note_secrets,
             &result.pczt_sighash,
             &result.rk,
@@ -594,7 +576,7 @@ impl VotingDb {
         bundle_index: u32,
         notes: &[NoteInfo],
         pir_client: &pir_client::PirClientBlocking,
-        network_id: u32,
+        network: Network,
     ) -> Result<DelegationPirPrecomputeResult, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
@@ -602,7 +584,7 @@ impl VotingDb {
         queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
         let padded_secrets =
             queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
-        let padded_nullifiers = padded_nullifiers_for_circuit(notes, &padded_secrets, network_id)?;
+        let padded_nullifiers = padded_nullifiers_for_circuit(notes, &padded_secrets, network)?;
         let targets = delegation_nullifier_targets(notes, &padded_nullifiers)?;
 
         let mut cached_count = 0u32;
@@ -694,9 +676,8 @@ impl VotingDb {
         round_id: &str,
         bundle_index: u32,
         notes: &[NoteInfo],
-        hotkey_raw_address: &[u8],
+        keys: &DelegationKeys,
         pir_client: &pir_client::PirClientBlocking,
-        network_id: u32,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationProofResult, VotingError> {
         let total_start = std::time::Instant::now();
@@ -719,7 +700,8 @@ impl VotingDb {
             queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
         // These are the zero-value circuit-side padded nullifiers derived
         // from the Phase 1 padded-note rho/rseed pairs.
-        let padded_nullifiers = padded_nullifiers_for_circuit(notes, &padded_secrets, network_id)?;
+        let padded_nullifiers =
+            padded_nullifiers_for_circuit(notes, &padded_secrets, keys.network)?;
 
         // Align witnesses (keyed by commitment) to notes order
         let witness_count = witnesses.len();
@@ -777,8 +759,13 @@ impl VotingDb {
 
         // Phase 2: Load/fetch IMT exclusion proofs via PIR.
         let pir_start = std::time::Instant::now();
-        let precompute =
-            self.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network_id)?;
+        let precompute = self.precompute_delegation_pir(
+            round_id,
+            bundle_index,
+            notes,
+            pir_client,
+            keys.network,
+        )?;
 
         let conn = self.conn();
         let real_targets = delegation_nullifier_targets(notes, &[])?;
@@ -846,14 +833,14 @@ impl VotingDb {
 
         let result = crate::zkp1::build_and_prove_delegation(
             &notes,
-            hotkey_raw_address,
+            &keys.hotkey_raw_address,
             &alpha,
             &van_comm_rand,
             &vote_round_id_bytes,
             &ordered_witnesses,
             &imt_proofs,
             &extra_imt_proofs,
-            network_id,
+            keys.network,
             stages,
             Some(&precomputed),
         )?;
@@ -917,17 +904,18 @@ impl VotingDb {
     /// Build vote commitment + ZKP #2 for a proposal. Stores vote in db.
     ///
     /// Loads ZKP #2 inputs (gov_comm_rand, total_note_value, address_index, ea_pk,
-    /// voting_round_id) from the DB, derives the SpendingKey from hotkey_seed,
+    /// voting_round_id) from the DB, derives the SpendingKey from hotkey_seed
+    /// using the typed network carried by the vote signer,
     /// and generates a real Halo2 vote proof.
     ///
     /// The builder handles share decomposition and El Gamal encryption internally.
     /// The returned bundle includes the encrypted shares for reveal-share payloads.
-    pub fn build_vote_commitment(
+    pub(crate) fn build_vote_commitment(
         &self,
         round_id: &str,
         bundle_index: u32,
         hotkey_seed: &[u8],
-        network_id: u32,
+        network: crate::Network,
         proposal_id: u32,
         choice: u32,
         num_options: u32,
@@ -952,7 +940,7 @@ impl VotingDb {
 
         let bundle = crate::zkp2::build_vote_commitment(
             hotkey_seed,
-            network_id,
+            network,
             zkp2_data.address_index,
             zkp2_data.total_note_value,
             &zkp2_data.gov_comm_rand,
@@ -1050,8 +1038,7 @@ impl VotingDb {
         round_id: &str,
         bundle_index: u32,
         sender_seed: &[u8],
-        network_id: u32,
-        account_index: u32,
+        keys: &DelegationKeys,
     ) -> Result<DelegationSubmissionData, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
@@ -1069,8 +1056,9 @@ impl VotingDb {
                 })?;
 
         // Derive sender SpendingKey from the same ZIP-32 account used to build the PCZT.
-        let sk =
-            crate::zkp2::derive_spending_key_for_account(sender_seed, network_id, account_index)?;
+        let sk = keys
+            .network
+            .orchard_spending_key_from_seed(sender_seed, keys.account_index)?;
         let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
 
         // Deserialize alpha
@@ -1410,6 +1398,22 @@ mod tests {
         }
     }
 
+    fn test_delegation_keys(
+        fvk_bytes: Vec<u8>,
+        voting_hotkey: &VotingHotkey,
+        seed_fingerprint: [u8; 32],
+        account_index: u32,
+    ) -> DelegationKeys {
+        DelegationKeys::with_voting_hotkey(
+            fvk_bytes,
+            voting_hotkey,
+            seed_fingerprint,
+            account_index,
+            "test-round".to_string(),
+        )
+        .unwrap()
+    }
+
     fn identity_test_note() -> NoteInfo {
         NoteInfo {
             commitment: vec![0x01; 32],
@@ -1550,12 +1554,14 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_hotkey() {
+    fn test_voting_hotkey_from_seed() {
         let db = test_db();
         let seed = [0x42_u8; 64];
-        let hotkey = db.generate_hotkey(&seed).unwrap();
-        assert_eq!(hotkey.secret_key.len(), 32);
-        assert_eq!(hotkey.public_key.len(), 32);
+        let hotkey = db
+            .voting_hotkey_from_seed(&seed, crate::types::Network::Regtest)
+            .unwrap();
+        assert_eq!(hotkey.secret_seed(), seed);
+        assert_eq!(hotkey.raw_orchard_address().len(), 43);
     }
 
     #[cfg(any(feature = "pir", feature = "client-pir"))]
@@ -1572,11 +1578,7 @@ mod tests {
     #[cfg(any(feature = "pir", feature = "client-pir"))]
     #[test]
     fn test_padded_pir_nullifiers_match_persisted_dummy_nullifiers() {
-        use orchard::{
-            keys::{FullViewingKey, SpendingKey},
-            note::Rho,
-            value::NoteValue,
-        };
+        use orchard::{note::Rho, value::NoteValue};
         use rand::rngs::OsRng;
         use zcash_keys::keys::UnifiedSpendingKey;
         use zcash_protocol::consensus::TEST_NETWORK;
@@ -1624,41 +1626,28 @@ mod tests {
             .unwrap();
         assert_eq!(warmed, warmed_again);
         let precompute_nullifiers =
-            padded_nullifiers_for_circuit(&[note_info.clone()], &warmed, 0).unwrap();
+            padded_nullifiers_for_circuit(&[note_info.clone()], &warmed, Network::Testnet).unwrap();
         {
             let conn = db.conn();
             assert!(queries::load_pczt_sighash(&conn, ROUND_ID, W, 0).is_err());
         }
 
-        let hotkey_sk = SpendingKey::from_bytes([0x43; 32]).expect("valid spending key");
-        let hotkey_fvk = FullViewingKey::from(&hotkey_sk);
-        let hotkey_raw_address = hotkey_fvk
-            .address_at(0u32, Scope::External)
-            .to_raw_address_bytes()
-            .to_vec();
+        let voting_hotkey =
+            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
+                .unwrap();
         let seed_fingerprint = [0x42u8; 32];
+        let keys =
+            test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, seed_fingerprint, 0);
 
         let result = db
-            .build_governance_pczt(
-                ROUND_ID,
-                0,
-                &[note_info.clone()],
-                &fvk.to_bytes().to_vec(),
-                &hotkey_raw_address,
-                0xC8E71055,
-                1,
-                &seed_fingerprint,
-                0,
-                "test-round",
-                0,
-            )
+            .build_governance_pczt(ROUND_ID, 0, &[note_info.clone()], &keys, 0xC8E71055)
             .unwrap();
 
         let conn = db.conn();
         let stored_dummy = queries::load_dummy_nullifiers(&conn, ROUND_ID, W, 0).unwrap();
         let padded_secrets = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).unwrap();
         let pir_nullifiers =
-            padded_nullifiers_for_circuit(&[note_info], &padded_secrets, 0).unwrap();
+            padded_nullifiers_for_circuit(&[note_info], &padded_secrets, Network::Testnet).unwrap();
 
         assert_eq!(result.padded_note_secrets, warmed_again);
         assert_eq!(precompute_nullifiers, result.dummy_nullifiers);
@@ -1800,7 +1789,7 @@ mod tests {
 
         db.ensure_padded_secrets(ROUND_ID, 0, &notes).unwrap();
         let result = db
-            .precompute_delegation_pir(ROUND_ID, 0, &notes, &pir_client, 0)
+            .precompute_delegation_pir(ROUND_ID, 0, &notes, &pir_client, Network::Testnet)
             .unwrap();
 
         assert_eq!(result.cached_count, BUNDLE_NOTE_SLOTS as u32);
@@ -2008,7 +1997,6 @@ mod tests {
     #[test]
     fn test_build_governance_pczt_rejects_same_position_note_substitution() {
         use orchard::keys::{FullViewingKey, SpendingKey};
-        use zip32::Scope;
 
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
@@ -2031,28 +2019,15 @@ mod tests {
 
         let sk = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
         let fvk = FullViewingKey::from(&sk);
-        let hotkey_sk = SpendingKey::from_bytes([0x43; 32]).expect("valid spending key");
-        let hotkey_fvk = FullViewingKey::from(&hotkey_sk);
-        let hotkey_raw_address = hotkey_fvk
-            .address_at(0u32, Scope::External)
-            .to_raw_address_bytes()
-            .to_vec();
+        let voting_hotkey =
+            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
+                .unwrap();
         let seed_fingerprint = [0x42u8; 32];
+        let keys =
+            test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, seed_fingerprint, 0);
 
         let err = db
-            .build_governance_pczt(
-                ROUND_ID,
-                0,
-                &substituted_notes,
-                &fvk.to_bytes().to_vec(),
-                &hotkey_raw_address,
-                0xC8E71055,
-                1,
-                &seed_fingerprint,
-                0,
-                "test-round",
-                0,
-            )
+            .build_governance_pczt(ROUND_ID, 0, &substituted_notes, &keys, 0xC8E71055)
             .unwrap_err();
 
         assert!(err.to_string().contains("note identity mismatch"));
@@ -2519,8 +2494,18 @@ mod tests {
             queries::store_proof(&conn, ROUND_ID, W, 0, &[0xAB; 96]).unwrap();
         }
 
+        let keys = DelegationKeys::with_hotkey_bytes(
+            vec![0; 96],
+            &[7; 43],
+            [9; 32],
+            1,
+            0,
+            crate::types::Network::Testnet,
+            "test-round".to_string(),
+        )
+        .unwrap();
         let submission = db
-            .get_delegation_submission(ROUND_ID, 0, &sender_seed, 0, 1)
+            .get_delegation_submission(ROUND_ID, 0, &sender_seed, &keys)
             .unwrap();
 
         assert_eq!(submission.rk, account_1_rk.to_vec());
@@ -2618,7 +2603,6 @@ mod tests {
     #[test]
     fn test_multi_bundle_delegation_and_voting() {
         use orchard::keys::{FullViewingKey, SpendingKey};
-        use zip32::Scope;
 
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
@@ -2663,30 +2647,18 @@ mod tests {
         let sk = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
         let fvk = FullViewingKey::from(&sk);
         let fvk_bytes = fvk.to_bytes().to_vec();
-        let hotkey_sk = SpendingKey::from_bytes([0x43; 32]).expect("valid spending key");
-        let hotkey_fvk = FullViewingKey::from(&hotkey_sk);
-        let hotkey_addr = hotkey_fvk.address_at(0u32, Scope::External);
-        let hotkey_raw_address = hotkey_addr.to_raw_address_bytes().to_vec();
+        let voting_hotkey =
+            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
+                .unwrap();
         let seed_fingerprint = [0x42u8; 32];
+        let keys = test_delegation_keys(fvk_bytes.clone(), &voting_hotkey, seed_fingerprint, 0);
 
         // Build governance PCZT for each bundle independently
         let chunk_result = crate::note_bundling::chunk_notes(&notes);
 
         for (i, chunk) in chunk_result.bundles.iter().enumerate() {
             let result = db
-                .build_governance_pczt(
-                    ROUND_ID,
-                    i as u32,
-                    chunk,
-                    &fvk_bytes,
-                    &hotkey_raw_address,
-                    0xC8E71055, // NU6 consensus branch ID
-                    1,          // testnet coin type
-                    &seed_fingerprint,
-                    0, // account_index
-                    "test-round",
-                    0, // address_index
-                )
+                .build_governance_pczt(ROUND_ID, i as u32, chunk, &keys, 0xC8E71055)
                 .unwrap();
 
             // Each bundle should have valid delegation data

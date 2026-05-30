@@ -16,32 +16,34 @@ use crate::{
     governance::BUNDLE_NOTE_SLOTS,
     precompute::PirPrecomputeReport,
     round::{BundleLayout, VotingDb},
-    types::{DelegationProgressReporter, Network, NoteInfo, VotingError},
+    types::{DelegationProgressReporter, Network, NoteInfo, VotingError, VotingHotkey},
 };
 
 #[cfg(feature = "pir")]
 pub use crate::precompute::{precompute_delegation, precompute_delegation_with_policy};
 use zcash_client_backend::data_api::{Account, WalletRead};
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_protocol::consensus::Parameters;
+use zcash_protocol::consensus::{NetworkConstants, Parameters};
 
 /// Wallet-derived keys and chain parameters needed to build a delegation PCZT.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DelegationKeys {
     /// Orchard full viewing key bytes for the delegating account.
-    pub fvk_bytes: Vec<u8>,
+    pub(crate) fvk_bytes: Vec<u8>,
     /// Raw Orchard address bytes for the hotkey output target.
-    pub hotkey_raw_address: [u8; 43],
+    pub(crate) hotkey_raw_address: [u8; 43],
     /// ZIP-32 seed fingerprint for the account that owns the delegated notes.
-    pub seed_fingerprint: [u8; 32],
+    pub(crate) seed_fingerprint: [u8; 32],
     /// ZIP-32 account index used to derive account-scoped signing keys.
-    pub account_index: u32,
+    pub(crate) account_index: u32,
     /// Address index used for governance PCZT output metadata.
-    pub address_index: u32,
+    pub(crate) address_index: u32,
+    /// Target Zcash network for the hotkey output and proof builders.
+    pub(crate) network: Network,
     /// SLIP-44 coin type for the target Zcash network.
-    pub coin_type: u32,
+    pub(crate) coin_type: u32,
     /// Human-readable round name embedded in PCZT metadata.
-    pub round_name: String,
+    pub(crate) round_name: String,
 }
 
 impl DelegationKeys {
@@ -54,13 +56,13 @@ impl DelegationKeys {
     /// Returns [`VotingError::InvalidInput`] when `hotkey_raw_address` is not
     /// exactly 43 bytes.
     #[allow(clippy::too_many_arguments)]
-    pub fn with_hotkey_bytes(
+    pub(crate) fn with_hotkey_bytes(
         fvk_bytes: Vec<u8>,
         hotkey_raw_address: &[u8],
         seed_fingerprint: [u8; 32],
         account_index: u32,
         address_index: u32,
-        coin_type: u32,
+        network: Network,
         round_name: String,
     ) -> Result<Self, VotingError> {
         Ok(Self {
@@ -69,9 +71,34 @@ impl DelegationKeys {
             seed_fingerprint,
             account_index,
             address_index,
-            coin_type,
+            network,
+            coin_type: network.network_type().coin_type(),
             round_name,
         })
+    }
+
+    /// Builds delegation keys from a crate-derived voting hotkey.
+    ///
+    /// The hotkey supplies the raw Orchard output address and address index used
+    /// by the governance PCZT. Account fingerprint and account index still refer
+    /// to the wallet account that owns the delegated notes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_voting_hotkey(
+        fvk_bytes: Vec<u8>,
+        hotkey: &VotingHotkey,
+        seed_fingerprint: [u8; 32],
+        account_index: u32,
+        round_name: String,
+    ) -> Result<Self, VotingError> {
+        Self::with_hotkey_bytes(
+            fvk_bytes,
+            hotkey.raw_orchard_address(),
+            seed_fingerprint,
+            account_index,
+            hotkey.address_index(),
+            hotkey.network(),
+            round_name,
+        )
     }
 }
 
@@ -154,7 +181,7 @@ pub struct DelegationBundleContext {
     pub bundle_note_infos: Vec<NoteInfo>,
     pub delegated_weight_zatoshi: u64,
     pub account: DelegationAccountKeys,
-    pub hotkey_raw_address: Vec<u8>,
+    pub voting_hotkey: VotingHotkey,
     pub branch_id_provider: LightwalletdBranchIdProvider,
     pub round_name: String,
 }
@@ -179,7 +206,7 @@ pub struct GatherDelegationParams<'a, N> {
     pub round_params: crate::VotingRoundParams,
     pub round_name: &'a str,
     pub account_uuid: &'a str,
-    pub hotkey_raw_address: Vec<u8>,
+    pub voting_hotkey: &'a VotingHotkey,
     pub cancellation: &'a dyn crate::Cancellation,
 }
 
@@ -254,15 +281,20 @@ pub struct DelegationProof {
 
 /// Signature source used when assembling a delegation transaction payload.
 pub enum DelegationSigner<'a> {
+    /// Software wallet signer for the account described by `keys`.
     Seed {
         seed: &'a [u8],
-        network: Network,
-        account_index: u32,
+        keys: &'a DelegationKeys,
     },
-    Keystone {
-        sig: [u8; 64],
-        sighash: [u8; 32],
-    },
+    /// Hardware wallet signer that already signed the stored PCZT sighash.
+    Keystone { sig: [u8; 64], sighash: [u8; 32] },
+}
+
+impl<'a> DelegationSigner<'a> {
+    /// Builds a software delegation signer from the wallet seed and setup keys.
+    pub fn seed(seed: &'a [u8], keys: &'a DelegationKeys) -> Self {
+        Self::Seed { seed, keys }
+    }
 }
 
 impl DelegationSigner<'static> {
@@ -421,19 +453,8 @@ pub fn setup(
 ) -> Result<DelegationSetup, VotingError> {
     let consensus_branch_id = branch_id_provider.consensus_branch_id()?;
     stages.on_progress(DelegationProgress::PcztBuilding);
-    let pczt = db.build_governance_pczt(
-        round_id,
-        bundle_index,
-        notes,
-        &keys.fvk_bytes,
-        &keys.hotkey_raw_address,
-        consensus_branch_id,
-        keys.coin_type,
-        &keys.seed_fingerprint,
-        keys.account_index,
-        &keys.round_name,
-        keys.address_index,
-    )?;
+    let pczt =
+        db.build_governance_pczt(round_id, bundle_index, notes, keys, consensus_branch_id)?;
     stages.on_progress(DelegationProgress::PcztBuilt);
 
     Ok(DelegationSetup {
@@ -455,21 +476,13 @@ pub fn prove(
     round_id: &str,
     bundle_index: u32,
     notes: &[NoteInfo],
-    hotkey_raw_address: &[u8; 43],
+    keys: &DelegationKeys,
     pir_client: &pir_client::PirClientBlocking,
-    network: Network,
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProof, VotingError> {
     stages.on_progress(DelegationProgress::ProofStarting);
-    let proof = db.build_and_prove_delegation(
-        round_id,
-        bundle_index,
-        notes,
-        hotkey_raw_address,
-        pir_client,
-        network.id(),
-        stages,
-    )?;
+    let proof =
+        db.build_and_prove_delegation(round_id, bundle_index, notes, keys, pir_client, stages)?;
     stages.on_progress(DelegationProgress::ProofComplete);
 
     Ok(DelegationProof {
@@ -493,12 +506,8 @@ pub fn submission(
     signer: DelegationSigner<'_>,
 ) -> Result<DelegationSubmission, VotingError> {
     let data = match signer {
-        DelegationSigner::Seed {
-            seed,
-            network,
-            account_index,
-        } => {
-            db.get_delegation_submission(round_id, bundle_index, seed, network.id(), account_index)
+        DelegationSigner::Seed { seed, keys } => {
+            db.get_delegation_submission(round_id, bundle_index, seed, keys)
         }
         DelegationSigner::Keystone { sig, sighash } => {
             db.get_delegation_submission_with_keystone_sig(round_id, bundle_index, &sig, &sighash)
@@ -691,6 +700,10 @@ mod tests {
     };
     use zip32::Scope;
 
+    fn test_voting_hotkey() -> VotingHotkey {
+        crate::hotkey::voting_hotkey_from_seed(&[0x77; 64], Network::Testnet).unwrap()
+    }
+
     fn setup_test_account(
         conn: &mut Connection,
     ) -> (
@@ -837,7 +850,7 @@ mod tests {
             [9; 32],
             0,
             0,
-            1,
+            Network::Testnet,
             "Demo Round".to_string(),
         )
         .unwrap_err()
@@ -897,10 +910,11 @@ mod tests {
             SystemClock,
             rand::rngs::OsRng,
         );
+        let hotkey = test_voting_hotkey();
         let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &db,
             account_uuid: "not-a-uuid",
-            hotkey_raw_address: vec![7; 43],
+            voting_hotkey: &hotkey,
             snapshot_height: 12,
             scanned_height: 12,
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
@@ -920,10 +934,11 @@ mod tests {
             SystemClock,
             rand::rngs::OsRng,
         );
+        let hotkey = test_voting_hotkey();
         let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &db,
             account_uuid: "550e8400-e29b-41d4-a716-446655440000",
-            hotkey_raw_address: vec![7; 43],
+            voting_hotkey: &hotkey,
             snapshot_height: 12,
             scanned_height: 11,
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
@@ -952,10 +967,11 @@ mod tests {
             SystemClock,
             rand::rngs::OsRng,
         );
+        let hotkey = test_voting_hotkey();
         let inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
-            hotkey_raw_address: vec![7; 43],
+            voting_hotkey: &hotkey,
             snapshot_height: 12,
             scanned_height: 12,
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
@@ -967,7 +983,11 @@ mod tests {
         assert_eq!(inputs.round_note_infos.len(), 2);
         assert_eq!(inputs.round_note_infos[0].position, 3);
         assert_eq!(inputs.round_note_infos[1].position, 7);
-        assert_eq!(inputs.delegation_keys.hotkey_raw_address, [7; 43]);
+        assert_eq!(
+            &inputs.delegation_keys.hotkey_raw_address,
+            hotkey.raw_orchard_address()
+        );
+        assert_eq!(inputs.delegation_keys.address_index, hotkey.address_index());
         assert_eq!(
             inputs.delegation_keys.coin_type,
             ZcashNetwork::TestNetwork.network_type().coin_type()
@@ -985,10 +1005,11 @@ mod tests {
             SystemClock,
             rand::rngs::OsRng,
         );
+        let hotkey = test_voting_hotkey();
         let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
-            hotkey_raw_address: vec![7; 43],
+            voting_hotkey: &hotkey,
             snapshot_height: 12,
             scanned_height: 12,
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
@@ -1001,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn gather_delegation_wallet_inputs_validates_hotkey_length() {
+    fn gather_delegation_wallet_inputs_rejects_network_mismatch() {
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, orchard_fvk) = setup_test_account(&mut conn);
         let account_ref = account_internal_id(&conn, &account_uuid);
@@ -1021,10 +1042,11 @@ mod tests {
             SystemClock,
             rand::rngs::OsRng,
         );
+        let hotkey = crate::hotkey::voting_hotkey_from_seed(&[0x77; 64], Network::Mainnet).unwrap();
         let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
-            hotkey_raw_address: vec![7; 42],
+            voting_hotkey: &hotkey,
             snapshot_height: 12,
             scanned_height: 12,
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
@@ -1033,7 +1055,7 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert!(err.contains("hotkey_raw_address must be 43 bytes"));
+        assert!(err.contains("voting hotkey network does not match wallet DB network"));
     }
 
     #[test]

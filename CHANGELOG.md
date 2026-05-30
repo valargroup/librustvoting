@@ -54,6 +54,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   provider traits so wallet SDKs can pass progress and consensus-branch
   resolution into `delegate::setup` and `delegate::prove` without duplicating
   library internals.
+- Added crate-owned voting hotkey derivation with contextual software hotkeys,
+  random hardware hotkeys, raw Orchard delegation-address derivation, and typed
+  `DelegationKeys` / `VoteSigner` helpers so wallet SDKs no longer need to
+  assemble hotkey seed material or pass raw hotkey address bytes by hand.
+  `derive_voting_hotkey`, `generate_random_voting_hotkey`, and
+  `voting_hotkey_from_seed` replace the older raw hotkey generation helpers
+  exposed through `hotkey::generate_hotkey` and `VotingDb::generate_hotkey`.
 - Added `delegate::LightwalletdBranchIdProvider` and
   `delegate::branch_id_for_height` so wallet SDKs can resolve delegation
   consensus branches from `lightwalletd_url` plus `Network` without duplicating
@@ -63,9 +70,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   lifecycle and proof-progress stages without defining local event enums.
 - Added `VotingDb::prepare_delegation_pir` so wallet SDKs can share the
   delegation bundle validation, governance PCZT construction, and PIR precompute
-  sequence while still supplying wallet-specific notes, account metadata, hotkey
-  address, consensus branch, and PIR transport at their own boundaries. Callers
-  that need a non-default bundle policy can use
+  sequence while still supplying wallet-specific notes, account metadata, typed
+  voting hotkey, consensus branch, and PIR transport at their own boundaries.
+  Callers that need a non-default bundle policy can use
   `VotingDb::prepare_delegation_pir_with_policy`.
 - Added `zcash_voting::witness::generate_note_witnesses` for Orchard note
   witness generation from a stored voting round snapshot. The V2 API validates
@@ -131,8 +138,18 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   cast-vote recovery blobs.
 - `tree_sync::VanWitness` now uses the typed `vote::VanWitness` shape with a
   fixed 24-element authentication path.
-- Cast-vote signing can derive the hotkey for an explicit ZIP-32 account index
-  through the new account-aware signing path used by `vote::commit`.
+- `VotingHotkey` now represents the actual hotkey secret seed plus raw Orchard
+  address. The old placeholder Pallas public key and `sv1...` address fields
+  were removed.
+- `VoteSigner::Seed` was renamed to `VoteSigner::HotkeySeed` to make the seed
+  source explicit, and `vote_commitment::sign_cast_vote_for_account` was removed
+  in favor of the canonical voting hotkey account index.
+- Raw-byte `DelegationKeys` construction is no longer public. Wallet callers use
+  `DelegationKeys::with_voting_hotkey`, and the crate derives network-specific
+  metadata from the `VotingHotkey`.
+- Low-level ZKP2 and cast-vote signing helpers that take raw hotkey seed plus
+  `network_id` are now crate-internal. Wallet callers should use `vote::commit`
+  with `VoteSigner`.
 
 # 0.10.1
 
