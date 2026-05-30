@@ -28,7 +28,7 @@ pub use crate::hotkey::{
     VOTING_HOTKEY_ADDRESS_INDEX,
 };
 pub use crate::note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
-pub use crate::phases::{SharePhase, VotePhase};
+pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
 pub use crate::pir::{select_pir_endpoint, PirEndpoint};
 pub use crate::precompute::{
     note_witnesses, stored_note_witnesses, verify_witness, PirPrecomputeReport,

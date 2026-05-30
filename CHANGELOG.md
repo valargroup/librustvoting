@@ -153,6 +153,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- Consolidated wallet-facing recovery orchestration into crate-owned APIs:
+  added `phases::WorkflowPhase` with stable resume strings, exposed
+  `workflow_phase()` accessors on recovery records, and updated the wallet
+  recovery example to load snapshot + `resume_plan` together and recover
+  committed-vote payloads directly from planner steps.
 - Consolidated recovery snapshot assembly and pending commitment-bundle
   semantics into `zcash_voting`, and reduced the wallet-side adapter boundary
   to FFI shape/phase-string mapping. Added focused unit coverage for pending

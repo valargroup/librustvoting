@@ -4,7 +4,7 @@
 //! fetch one typed snapshot instead of querying low-level storage tables.
 
 use crate::{
-    phases::{DelegationPhase, SharePhase, VotePhase},
+    phases::{DelegationPhase, SharePhase, VotePhase, WorkflowPhase},
     round::VotingDb,
     share,
     storage::VoteRecord,
@@ -29,6 +29,13 @@ pub struct DelegationRecovery {
     pub van_leaf_position: Option<u32>,
 }
 
+impl DelegationRecovery {
+    /// Returns the stable merged workflow phase used by wallet orchestration.
+    pub fn workflow_phase(&self) -> WorkflowPhase {
+        WorkflowPhase::for_delegation(self.phase)
+    }
+}
+
 /// Vote recovery state for one vote key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoteRecovery {
@@ -41,6 +48,13 @@ pub struct VoteRecovery {
     pub has_commitment_bundle: bool,
 }
 
+impl VoteRecovery {
+    /// Returns the stable merged workflow phase used by wallet orchestration.
+    pub fn workflow_phase(&self) -> WorkflowPhase {
+        WorkflowPhase::for_vote(self.phase)
+    }
+}
+
 /// Share recovery state for one delegated share.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareWorkflow {
@@ -48,6 +62,13 @@ pub struct ShareWorkflow {
     pub proposal_id: u32,
     pub share_index: u32,
     pub phase: SharePhase,
+}
+
+impl ShareWorkflow {
+    /// Returns the stable merged workflow phase used by wallet orchestration.
+    pub fn workflow_phase(&self) -> WorkflowPhase {
+        WorkflowPhase::for_share(self.phase)
+    }
 }
 
 /// Full read-only recovery snapshot for one round.
@@ -382,6 +403,36 @@ mod tests {
                 && vote.tx_hash.is_none()
                 && vote.vc_tree_position.is_none()
                 && !vote.has_commitment_bundle));
+    }
+
+    #[test]
+    fn recovery_records_expose_stable_workflow_phases() {
+        let delegation = DelegationRecovery {
+            bundle_index: 0,
+            phase: DelegationPhase::Proved,
+            tx_hash: None,
+            van_leaf_position: None,
+        };
+        assert_eq!(delegation.workflow_phase(), WorkflowPhase::Signed);
+
+        let vote = VoteRecovery {
+            bundle_index: 0,
+            proposal_id: 1,
+            choice: 0,
+            phase: VotePhase::Submitted,
+            tx_hash: Some("vtx".to_string()),
+            vc_tree_position: None,
+            has_commitment_bundle: true,
+        };
+        assert_eq!(vote.workflow_phase(), WorkflowPhase::SubmittedVote);
+
+        let share = ShareWorkflow {
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            phase: SharePhase::Submitted,
+        };
+        assert_eq!(share.workflow_phase(), WorkflowPhase::SubmittedShare);
     }
 
     fn db_with_round(wallet_id: &str) -> VotingDb {
