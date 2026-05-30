@@ -11,8 +11,9 @@ use rusqlite::{named_params, OptionalExtension};
 use crate::{
     round::VotingDb,
     types::{
-        CastVoteSignature, EncryptedShare, Network, ProgressReporter, SharePayload,
-        VoteCommitmentBundle, VotingError, VotingHotkey, WireEncryptedShare,
+        validate_proposal_id, validate_vote_decision, CastVoteSignature, EncryptedShare, Network,
+        ProgressReporter, SharePayload, VoteCommitmentBundle, VotingError, VotingHotkey,
+        WireEncryptedShare,
     },
 };
 
@@ -29,6 +30,28 @@ pub struct DraftVote {
     pub num_options: u32,
     pub single_share: bool,
     pub vc_tree_position: u64,
+}
+
+/// Validates one wallet-supplied cast-vote draft before proof construction.
+pub fn validate_draft_vote(draft: &DraftVote) -> Result<(), VotingError> {
+    validate_proposal_id(draft.proposal_id)?;
+    validate_vote_decision(draft.choice, draft.num_options)?;
+    Ok(())
+}
+
+/// Validates a non-empty batch of wallet-supplied cast-vote drafts.
+pub fn validate_draft_votes(draft_votes: &[DraftVote]) -> Result<(), VotingError> {
+    if draft_votes.is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: "draft_votes must not be empty".to_string(),
+        });
+    }
+
+    for draft in draft_votes {
+        validate_draft_vote(draft)?;
+    }
+
+    Ok(())
 }
 
 /// VAN Merkle witness produced by `precompute::van_witness`.
@@ -221,6 +244,8 @@ pub fn commit(
     signer: VoteSigner<'_>,
     stages: &dyn crate::types::VoteCommitStageReporter,
 ) -> Result<VoteCommit, VotingError> {
+    validate_draft_vote(draft)?;
+
     if let Some(recovered) = recovery_bundle(db, round_id, bundle_index, draft.proposal_id)? {
         if recovery_matches_draft(&recovered, draft) {
             return commit_from_recovery(&recovered);
@@ -496,6 +521,7 @@ pub fn recovery_bundle(
 
 /// Serializes a recovery bundle using the library-owned JSON format.
 pub fn serialize_recovery(bundle: &VoteRecoveryBundle) -> Result<String, VotingError> {
+    validate_recovery_bundle_vote_fields(bundle)?;
     serde_json::to_string(&VoteRecoveryJson::from(bundle)).map_err(|e| VotingError::Internal {
         message: format!("failed to serialize vote recovery bundle: {e}"),
     })
@@ -870,6 +896,14 @@ fn recovery_matches_draft(bundle: &VoteRecoveryBundle, draft: &DraftVote) -> boo
         && bundle.vc_tree_position == draft.vc_tree_position
 }
 
+pub(crate) fn validate_recovery_bundle_vote_fields(
+    bundle: &VoteRecoveryBundle,
+) -> Result<(), VotingError> {
+    validate_proposal_id(bundle.proposal_id)?;
+    validate_vote_decision(bundle.vote_decision, bundle.num_options)?;
+    Ok(())
+}
+
 fn ensure_vote_rebuild_allowed(
     db: &VotingDb,
     round_id: &str,
@@ -978,6 +1012,9 @@ impl TryFrom<VoteRecoveryJson> for VoteRecoveryBundle {
     type Error = VotingError;
 
     fn try_from(value: VoteRecoveryJson) -> Result<Self, Self::Error> {
+        validate_proposal_id(value.proposal_id)?;
+        validate_vote_decision(value.vote_decision, value.num_options)?;
+
         Ok(Self {
             vote_round_id: value.vote_round_id,
             bundle_index: value.bundle_index,
@@ -1063,7 +1100,7 @@ mod tests {
     use crate::{
         round::RoundParams,
         storage::{queries, VotingDb},
-        types::{NoopProgressReporter, NoteInfo},
+        types::{NoopProgressReporter, NoteInfo, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS},
     };
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -1141,6 +1178,59 @@ mod tests {
         }
     }
 
+    fn draft_vote_fixture() -> DraftVote {
+        DraftVote {
+            proposal_id: 1,
+            choice: 0,
+            num_options: 2,
+            single_share: false,
+            vc_tree_position: 0,
+        }
+    }
+
+    #[test]
+    fn draft_vote_validation_accepts_valid_bounds() {
+        assert!(validate_draft_vote(&draft_vote_fixture()).is_ok());
+        assert!(validate_draft_vote(&DraftVote {
+            proposal_id: MAX_PROPOSAL_ID,
+            choice: MAX_VOTE_OPTIONS - 1,
+            num_options: MAX_VOTE_OPTIONS,
+            ..draft_vote_fixture()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn draft_vote_validation_rejects_invalid_bounds() {
+        assert!(validate_draft_vote(&DraftVote {
+            proposal_id: 0,
+            ..draft_vote_fixture()
+        })
+        .is_err());
+        assert!(validate_draft_vote(&DraftVote {
+            proposal_id: MAX_PROPOSAL_ID + 1,
+            ..draft_vote_fixture()
+        })
+        .is_err());
+        assert!(validate_draft_vote(&DraftVote {
+            num_options: 1,
+            ..draft_vote_fixture()
+        })
+        .is_err());
+        assert!(validate_draft_vote(&DraftVote {
+            choice: 2,
+            num_options: 2,
+            ..draft_vote_fixture()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn draft_votes_validation_rejects_empty_batches() {
+        assert!(validate_draft_votes(&[]).is_err());
+        assert!(validate_draft_votes(&[draft_vote_fixture()]).is_ok());
+    }
+
     #[test]
     fn recovery_json_round_trip_preserves_vote_and_share_material() {
         let bundle = recovery_bundle_fixture();
@@ -1156,6 +1246,31 @@ mod tests {
         assert_eq!(parsed.encrypted_shares[0].randomness, vec![0x23; 32]);
         assert_eq!(parsed.share_blinds[1], [0x42; 32]);
         assert_eq!(parsed.share_comms[0], [0x51; 32]);
+    }
+
+    #[test]
+    fn recovery_json_rejects_invalid_vote_bounds() {
+        let json = serialize_recovery(&recovery_bundle_fixture()).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        value["proposal_id"] = serde_json::json!(0);
+        assert!(parse_recovery(&value.to_string()).is_err());
+
+        value["proposal_id"] = serde_json::json!(1);
+        value["num_options"] = serde_json::json!(9);
+        assert!(parse_recovery(&value.to_string()).is_err());
+
+        value["num_options"] = serde_json::json!(3);
+        value["vote_decision"] = serde_json::json!(3);
+        assert!(parse_recovery(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn recovery_json_serialization_rejects_invalid_vote_bounds() {
+        let mut bundle = recovery_bundle_fixture();
+        bundle.num_options = 1;
+
+        assert!(serialize_recovery(&bundle).is_err());
     }
 
     #[test]

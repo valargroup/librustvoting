@@ -44,10 +44,11 @@ stage-oriented API:
   share scheduling policy, and records helper-share confirmation state.
 - `session::*` records durable ballot intent and returns a round-level
   `RoundPlan` with ordered `NextStep`s for restart recovery. Wallets should
-  write `Decision::Choice` before starting a cast-vote flow, write
-  `Decision::Skipped` for proposals the user intentionally leaves blank, and
-  use `resume_plan` after restart to decide whether to delegate, poll
-  delegation/vote transactions, cast remaining votes, or confirm helper shares.
+  write `Decision::Choice` with the proposal's declared option count before
+  starting a cast-vote flow, write `Decision::Skipped` with the same option
+  count for proposals the user intentionally leaves blank, and use `resume_plan`
+  after restart to decide whether to delegate, poll delegation/vote
+  transactions, cast remaining votes, or confirm helper shares.
   `CastVote` steps include the recorded choice. `SubmitVote` steps mean a vote
   was already committed locally and should be reconstructed with
   `vote::recover_commit` rather than rebuilt from a draft. Submit the recovered

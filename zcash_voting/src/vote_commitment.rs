@@ -1,6 +1,6 @@
 use crate::types::{
-    validate_encrypted_shares, validate_vote_decision, CastVoteSignature, Network, SharePayload,
-    VoteCommitmentBundle, VotingError, WireEncryptedShare,
+    validate_encrypted_shares, validate_proposal_id, validate_vote_decision, CastVoteSignature,
+    Network, SharePayload, VoteCommitmentBundle, VotingError, WireEncryptedShare,
 };
 
 /// Build payloads for helper server (one per share).
@@ -24,6 +24,7 @@ pub fn build_share_payloads(
     single_share: bool,
 ) -> Result<Vec<SharePayload>, VotingError> {
     validate_encrypted_shares(enc_shares)?;
+    validate_proposal_id(commitment.proposal_id)?;
     validate_vote_decision(vote_decision, num_options)?;
 
     let all_enc_shares: Vec<WireEncryptedShare> = enc_shares.to_vec();
@@ -240,5 +241,45 @@ mod tests {
             .expect_err("missing share blind should fail");
 
         assert!(err.to_string().contains("missing primary blind"), "{err}");
+    }
+
+    #[test]
+    fn test_build_share_payloads_rejects_invalid_vote_bounds() {
+        let commitment = mock_commitment();
+
+        let too_few_options =
+            build_share_payloads(&mock_enc_shares(), &commitment, 0, 1, 42, false)
+                .expect_err("too few options should fail");
+        assert!(
+            too_few_options.to_string().contains("num_options"),
+            "{too_few_options}"
+        );
+
+        let too_many_options =
+            build_share_payloads(&mock_enc_shares(), &commitment, 0, 9, 42, false)
+                .expect_err("too many options should fail");
+        assert!(
+            too_many_options.to_string().contains("num_options"),
+            "{too_many_options}"
+        );
+
+        let out_of_range_choice =
+            build_share_payloads(&mock_enc_shares(), &commitment, 2, 2, 42, false)
+                .expect_err("out of range vote decision should fail");
+        assert!(
+            out_of_range_choice.to_string().contains("vote_decision"),
+            "{out_of_range_choice}"
+        );
+    }
+
+    #[test]
+    fn test_build_share_payloads_rejects_invalid_proposal_id() {
+        let mut commitment = mock_commitment();
+        commitment.proposal_id = 0;
+        assert!(build_share_payloads(&mock_enc_shares(), &commitment, 0, 2, 42, false).is_err());
+
+        let mut commitment = mock_commitment();
+        commitment.proposal_id = 16;
+        assert!(build_share_payloads(&mock_enc_shares(), &commitment, 0, 2, 42, false).is_err());
     }
 }
