@@ -1128,7 +1128,7 @@ mod tests {
         let db = test_db();
         insert_bundle(&db, 0);
         insert_vote(&db, 0, 1);
-        let recovery_json = recovery_json(456, ROUND_ID, 0, 99, 2);
+        let recovery_json = recovery_json(456, ROUND_ID, 0, 2, 2);
         store_recovery_json(&db, 0, 1, &recovery_json);
 
         let err = record_vote_confirmation(

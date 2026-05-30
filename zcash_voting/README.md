@@ -21,9 +21,11 @@ precompute → delegate → vote → share lifecycle:
    `delegation_submission`, submit them through the wallet's chain client, and
    use `record_submission` while polling plus `confirm_delegation_submission`
    after confirmation.
-6. Record each terminal ballot decision with `set_ballot_intent`, then use
-   `vote::commit` to commit votes locally and submit cast-vote transactions.
-   Submit helper shares after the cast-vote transaction is confirmed.
+6. Record each terminal ballot decision with `set_ballot_intent`, passing the
+   proposal's declared option count so choices are validated before persistence,
+   then use `vote::commit` to commit votes locally and submit cast-vote
+   transactions. Submit helper shares after the cast-vote transaction is
+   confirmed.
 7. After restart, call `resume_plan` with the round's full proposal id list and
    execute one returned `NextStep`, persist its result, then call `resume_plan`
    again. `CastVote` includes the recorded choice, and `SubmitVote` resumes an

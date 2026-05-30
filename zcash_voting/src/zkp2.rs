@@ -7,7 +7,7 @@ use voting_circuits::vote_proof::{build_vote_proof_from_delegation, VOTE_COMM_TR
 use crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX;
 use crate::types::{
     ct_option_to_result, validate_vote_decision, EncryptedShare, Network, ProgressReporter,
-    VoteCommitmentBundle, VotingError,
+    VoteCommitmentBundle, VotingError, MAX_PROPOSAL_ID, MIN_PROPOSAL_ID,
 };
 
 // Vote proof build runs circuit synthesis + MockProver + proof generation, which can
@@ -63,7 +63,7 @@ pub(crate) fn build_vote_commitment(
     progress: &dyn ProgressReporter,
 ) -> Result<VoteCommitmentBundle, VotingError> {
     validate_vote_decision(choice, num_options)?;
-    if proposal_id < 1 || proposal_id > 15 {
+    if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_id) {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "proposal_id must be 1..15 (1-indexed, matching on-chain IDs; 0 is the circuit sentinel), got {}",
@@ -274,6 +274,49 @@ mod tests {
             1,
             3, // invalid choice (num_options=2)
             2,
+            &[[0u8; 32]; 24],
+            0,
+            1,
+            65535,
+            false,
+            &TestReporter,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_build_vote_commitment_invalid_option_count() {
+        assert!(build_vote_commitment(
+            &[0x42; 64],
+            Network::Mainnet,
+            0,
+            1_000_000,
+            &[0u8; 32],
+            &[0u8; 32],
+            &[0u8; 32],
+            1,
+            0,
+            1, // fewer than two proposal options
+            &[[0u8; 32]; 24],
+            0,
+            1,
+            65535,
+            false,
+            &TestReporter,
+        )
+        .is_err());
+
+        assert!(build_vote_commitment(
+            &[0x42; 64],
+            Network::Mainnet,
+            0,
+            1_000_000,
+            &[0u8; 32],
+            &[0u8; 32],
+            &[0u8; 32],
+            1,
+            0,
+            9, // more than eight proposal options
             &[[0u8; 32]; 24],
             0,
             1,

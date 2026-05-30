@@ -9,6 +9,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added shared draft vote bounds validation for SDK integrations. The crate now
+  exposes proposal and option count bounds plus `vote::validate_draft_vote(s)`,
+  and `vote::commit` rejects invalid drafts before proof construction.
+  `VotingDb::set_ballot_intent_for_draft_vote` records choice intent through
+  the same validated draft surface, and direct ballot-intent writes now require
+  the proposal's option count so choices are validated before persistence.
 - Added `session::resume_plan` plus a durable `ballot_intent` table (schema v11):
   a pure, I/O-free round-level planner that fuses the per-bundle delegation,
   vote, and share phases with the voter's recorded ballot intent into an ordered
@@ -87,6 +93,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   so wallet SDKs can share the snapshot tree-state persistence, witness
   generation, and bundle witness caching flow while keeping wallet DB opening at
   each SDK boundary.
+- Added `VotingDb::has_witnesses` so wallet SDKs can detect already-cached
+  bundle witnesses and skip repeat witness generation during precompute resume.
 - Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
   `VoteCommit`, `VoteSigner`, `VoteSubmission`, and `VoteRecoveryBundle`.
   `vote::commit` now builds ZKP #2, signs the cast-vote payload, persists the

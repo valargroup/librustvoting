@@ -10,7 +10,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::phases::{DelegationPhase, SharePhase, VotePhase};
 use crate::storage::{queries, VotingDb};
-use crate::types::VotingError;
+use crate::types::{
+    validate_proposal_id, validate_vote_decision, validate_vote_options, VotingError,
+};
+use crate::vote::{validate_draft_vote, DraftVote};
 
 /// The voter's terminal decision for one proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,8 +24,34 @@ pub enum Decision {
 
 impl VotingDb {
     /// Record (insert or replace) the voter's decision for one proposal.
+    ///
+    /// `num_options` must be the proposal's declared option count. Choice
+    /// decisions are validated against it before any durable intent is written.
     /// Written on each selection, before any per-proposal vote artifact exists.
     pub fn set_ballot_intent(
+        &self,
+        round_id: &str,
+        proposal_id: u32,
+        decision: Decision,
+        num_options: u32,
+    ) -> Result<(), VotingError> {
+        validate_proposal_id(proposal_id)?;
+        validate_ballot_intent_decision(decision, num_options)?;
+
+        self.write_ballot_intent(round_id, proposal_id, decision)
+    }
+
+    /// Record a choice intent from a fully validated draft vote.
+    pub fn set_ballot_intent_for_draft_vote(
+        &self,
+        round_id: &str,
+        draft: &DraftVote,
+    ) -> Result<(), VotingError> {
+        validate_draft_vote(draft)?;
+        self.write_ballot_intent(round_id, draft.proposal_id, Decision::Choice(draft.choice))
+    }
+
+    fn write_ballot_intent(
         &self,
         round_id: &str,
         proposal_id: u32,
@@ -115,6 +144,16 @@ impl VotingDb {
             .map_err(|e| VotingError::Internal {
                 message: format!("collect ballot_intents: {e}"),
             })
+    }
+}
+
+fn validate_ballot_intent_decision(
+    decision: Decision,
+    num_options: u32,
+) -> Result<(), VotingError> {
+    match decision {
+        Decision::Choice(choice) => validate_vote_decision(choice, num_options),
+        Decision::Skipped => validate_vote_options(num_options),
     }
 }
 
@@ -248,6 +287,10 @@ pub fn resume_plan(
     round_id: &str,
     proposal_ids: &[u32],
 ) -> Result<RoundPlan, VotingError> {
+    for &proposal_id in proposal_ids {
+        validate_proposal_id(proposal_id)?;
+    }
+
     let delegation: BTreeMap<u32, DelegationPhase> =
         db.delegation_phases(round_id)?.into_iter().collect();
     let votes: BTreeMap<(u32, u32), VotePhase> = db
@@ -481,7 +524,7 @@ mod tests {
     use super::*;
     use crate::round::RoundParams;
     use crate::types::{EncryptedShare, NoteInfo};
-    use crate::vote::VoteRecoveryBundle;
+    use crate::vote::{DraftVote, VoteRecoveryBundle};
 
     const ROUND: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const W: &str = "wallet";
@@ -649,15 +692,89 @@ mod tests {
     #[test]
     fn ballot_intent_round_trip() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 1, Decision::Choice(0)).unwrap();
-        db.set_ballot_intent(ROUND, 2, Decision::Skipped).unwrap();
-        db.set_ballot_intent(ROUND, 1, Decision::Choice(3)).unwrap(); // upsert
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Skipped, 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(3), 4)
+            .unwrap(); // upsert
 
         let intents = db.ballot_intents(ROUND).unwrap();
         assert_eq!(
             intents,
             vec![(1, Decision::Choice(3)), (2, Decision::Skipped)]
         );
+    }
+
+    #[test]
+    fn ballot_intent_rejects_invalid_proposal_id() {
+        let db = db_with_bundle();
+
+        assert!(db
+            .set_ballot_intent(ROUND, 0, Decision::Choice(0), 3)
+            .is_err());
+        assert!(db
+            .set_ballot_intent(ROUND, 16, Decision::Skipped, 3)
+            .is_err());
+    }
+
+    #[test]
+    fn ballot_intent_rejects_choice_outside_proposal_option_count() {
+        let db = db_with_bundle();
+
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(1), 2)
+            .unwrap();
+        assert!(db
+            .set_ballot_intent(ROUND, 1, Decision::Choice(2), 2)
+            .is_err());
+        assert!(db
+            .set_ballot_intent(ROUND, 1, Decision::Choice(0), 1)
+            .is_err());
+    }
+
+    #[test]
+    fn ballot_intent_for_draft_vote_validates_choice_and_options() {
+        let db = db_with_bundle();
+        let draft = DraftVote {
+            proposal_id: 1,
+            choice: 1,
+            num_options: 2,
+            single_share: false,
+            vc_tree_position: 0,
+        };
+
+        db.set_ballot_intent_for_draft_vote(ROUND, &draft).unwrap();
+        assert_eq!(
+            db.ballot_intents(ROUND).unwrap(),
+            vec![(1, Decision::Choice(1))]
+        );
+
+        assert!(db
+            .set_ballot_intent_for_draft_vote(
+                ROUND,
+                &DraftVote {
+                    choice: 2,
+                    ..draft.clone()
+                },
+            )
+            .is_err());
+        assert!(db
+            .set_ballot_intent_for_draft_vote(
+                ROUND,
+                &DraftVote {
+                    num_options: 9,
+                    ..draft
+                },
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn resume_plan_rejects_invalid_proposal_ids() {
+        let db = db_with_bundle();
+
+        assert!(resume_plan(&db, ROUND, &[1, 0]).is_err());
+        assert!(resume_plan(&db, ROUND, &[1, 16]).is_err());
     }
 
     #[test]
@@ -673,7 +790,8 @@ mod tests {
     #[test]
     fn answered_but_uncast_proposal_yields_cast_then_delegate_prereq() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert!(plan.pending_recovery);
         // Bundle 0 is only Prepared, and proposal 2 needs casting on it, so the
@@ -695,7 +813,8 @@ mod tests {
     #[test]
     fn submitted_but_unconfirmed_vote_yields_poll() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
@@ -713,7 +832,8 @@ mod tests {
     #[test]
     fn committed_vote_yields_submit_not_rebuild() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
@@ -762,14 +882,15 @@ mod tests {
     #[test]
     fn conflicting_intent_after_submission_is_rejected_before_share_cleanup() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(0)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         confirm_vote_fixture(&db, 0, 2, 0);
         record_all_confirmed_share_fixtures(&db, 0, 2);
 
         for decision in [Decision::Choice(1), Decision::Skipped] {
-            let err = db.set_ballot_intent(ROUND, 2, decision).unwrap_err();
+            let err = db.set_ballot_intent(ROUND, 2, decision, 3).unwrap_err();
             assert!(
                 err.to_string()
                     .contains("submitted vote that conflicts with ballot intent"),
@@ -795,12 +916,14 @@ mod tests {
     #[test]
     fn stale_vote_submission_after_choice_change_is_rejected() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(0)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
         db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
         db.store_van_position(ROUND, 0, 7).unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
 
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         let err = db
             .record_vote_submission(ROUND, 0, 2, "old-vtx")
             .unwrap_err();
@@ -825,10 +948,12 @@ mod tests {
     #[test]
     fn stale_vote_submission_after_skip_is_rejected() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(0)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
 
-        db.set_ballot_intent(ROUND, 2, Decision::Skipped).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Skipped, 3)
+            .unwrap();
         let err = db
             .record_vote_submission(ROUND, 0, 2, "old-vtx")
             .unwrap_err();
@@ -862,7 +987,8 @@ mod tests {
         )
         .unwrap();
 
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
         assert_eq!(
@@ -893,7 +1019,8 @@ mod tests {
         )
         .unwrap();
 
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xDD; 16]).unwrap();
 
         assert!(
@@ -927,7 +1054,8 @@ mod tests {
         )
         .unwrap();
 
-        db.set_ballot_intent(ROUND, 2, Decision::Skipped).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Skipped, 3)
+            .unwrap();
 
         assert!(db.get_share_delegations(ROUND).unwrap().is_empty());
         let err = db
@@ -951,7 +1079,8 @@ mod tests {
     #[test]
     fn skipped_proposal_is_terminal_not_recovery() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 1, Decision::Skipped).unwrap();
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert!(!plan.pending_recovery);
         assert_eq!(plan.open_proposals, vec![2, 3]);
@@ -962,7 +1091,8 @@ mod tests {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(W);
         db.create_round(&round_params()).unwrap();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
 
         let err = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap_err();
         assert!(
@@ -1003,7 +1133,8 @@ mod tests {
             "expected 6 notes → 2 bundles, got {bundle_count}; adjust this test if bundling rules changed"
         );
 
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
         // Delegation prerequisites come first, then vote work is ordered by
@@ -1043,7 +1174,7 @@ mod tests {
         db.store_van_position(ROUND, 1, 8).unwrap();
 
         for (proposal_id, choice) in [(1, 0), (2, 1), (3, 0)] {
-            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(choice))
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(choice), 3)
                 .unwrap();
         }
         confirm_vote_fixture(&db, 0, 1, 0);
@@ -1100,7 +1231,7 @@ mod tests {
         db.store_van_position(ROUND, 1, 8).unwrap();
 
         for (proposal_id, choice) in [(1, 0), (2, 1)] {
-            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(choice))
+            db.set_ballot_intent(ROUND, proposal_id, Decision::Choice(choice), 3)
                 .unwrap();
         }
         confirm_vote_fixture(&db, 0, 1, 0);
@@ -1139,7 +1270,8 @@ mod tests {
     #[test]
     fn confirmed_vote_with_partial_recorded_shares_yields_submit_shares() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         confirm_vote_fixture(&db, 0, 2, 1);
         record_confirmed_share_fixture(&db, 0, 2, 0);
 
@@ -1158,7 +1290,8 @@ mod tests {
     #[test]
     fn confirmed_vote_with_all_recorded_shares_has_no_share_submission_step() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         confirm_vote_fixture(&db, 0, 2, 1);
         record_all_confirmed_share_fixtures(&db, 0, 2);
 
@@ -1170,7 +1303,8 @@ mod tests {
     #[test]
     fn confirmed_single_share_vote_with_recorded_payload_has_no_share_submission_step() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         confirm_vote_fixture(&db, 0, 2, 1);
         let mut recovery = recovery_bundle_fixture(0, 2, 1, 42);
         recovery.single_share = true;
@@ -1190,7 +1324,8 @@ mod tests {
 
         // Bundle 0 delegation is still only Prepared — but the vote is Confirmed,
         // so no Delegate step should appear and the plan has no work left.
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
         assert!(
@@ -1235,10 +1370,12 @@ mod tests {
         // Proposal 2: drive to Confirmed.
         confirm_vote_fixture(&db, 0, 2, 1);
         record_all_confirmed_share_fixtures(&db, 0, 2);
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1)).unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
 
         // Proposal 1: skipped.
-        db.set_ballot_intent(ROUND, 1, Decision::Skipped).unwrap();
+        db.set_ballot_intent(ROUND, 1, Decision::Skipped, 3)
+            .unwrap();
 
         let plan = resume_plan(&db, ROUND, &[1, 2]).unwrap();
 

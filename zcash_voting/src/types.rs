@@ -13,6 +13,19 @@ use zip32::{AccountId, Scope};
 
 use crate::governance::BUNDLE_NOTE_SLOTS;
 
+/// Lowest valid on-chain proposal identifier. Proposal id 0 is reserved by the
+/// vote circuit.
+pub const MIN_PROPOSAL_ID: u32 = 1;
+
+/// Highest valid on-chain proposal identifier supported by the vote circuit.
+pub const MAX_PROPOSAL_ID: u32 = 15;
+
+/// Minimum number of options a proposal can declare.
+pub const MIN_VOTE_OPTIONS: u32 = 2;
+
+/// Maximum number of options a proposal can declare.
+pub const MAX_VOTE_OPTIONS: u32 = 8;
+
 #[derive(Debug, Error)]
 pub enum VotingError {
     #[error("Invalid input: {message}")]
@@ -794,7 +807,35 @@ pub fn validate_share_index(index: u32) -> Result<(), VotingError> {
     Ok(())
 }
 
+/// Validates that a proposal id is within the vote circuit's on-chain range.
+pub fn validate_proposal_id(proposal_id: u32) -> Result<(), VotingError> {
+    if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_id) {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "proposal_id must be {}..={}, got {}",
+                MIN_PROPOSAL_ID, MAX_PROPOSAL_ID, proposal_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validates the declared option count for a proposal.
+pub fn validate_vote_options(num_options: u32) -> Result<(), VotingError> {
+    if !(MIN_VOTE_OPTIONS..=MAX_VOTE_OPTIONS).contains(&num_options) {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "num_options must be {}..={}, got {}",
+                MIN_VOTE_OPTIONS, MAX_VOTE_OPTIONS, num_options
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a zero-indexed vote decision against the proposal option count.
 pub fn validate_vote_decision(decision: u32, num_options: u32) -> Result<(), VotingError> {
+    validate_vote_options(num_options)?;
     if decision >= num_options {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -864,6 +905,16 @@ mod tests {
             sapling_tree: String::new(),
             orchard_tree: String::new(),
         }
+    }
+
+    #[test]
+    fn vote_decision_validation_rejects_invalid_option_counts() {
+        assert!(validate_vote_decision(0, MIN_VOTE_OPTIONS).is_ok());
+        assert!(validate_vote_decision(MAX_VOTE_OPTIONS - 1, MAX_VOTE_OPTIONS).is_ok());
+
+        assert!(validate_vote_decision(0, MIN_VOTE_OPTIONS - 1).is_err());
+        assert!(validate_vote_decision(0, MAX_VOTE_OPTIONS + 1).is_err());
+        assert!(validate_vote_decision(2, 2).is_err());
     }
 
     #[test]
