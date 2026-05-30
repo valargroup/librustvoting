@@ -48,9 +48,9 @@ pub fn validate_draft_votes(draft_votes: &[DraftVote]) -> Result<(), VotingError
 }
 
 /// VAN Merkle witness produced by `precompute::van_witness`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VanWitness {
-    pub auth_path: [[u8; 32]; VAN_AUTH_PATH_LEN],
+    pub auth_path: Vec<Vec<u8>>,
     pub position: u32,
     pub anchor_height: u32,
 }
@@ -71,8 +71,33 @@ impl VanWitness {
             });
         }
 
-        let mut typed_path = [[0u8; 32]; VAN_AUTH_PATH_LEN];
         for (idx, hash) in auth_path.iter().enumerate() {
+            if hash.len() != 32 {
+                return Err(VotingError::InvalidInput {
+                    message: format!("van_auth_path[{idx}] must be 32 bytes, got {}", hash.len()),
+                });
+            }
+        }
+
+        Ok(Self {
+            auth_path: auth_path.to_vec(),
+            position,
+            anchor_height,
+        })
+    }
+
+    pub fn auth_path_fixed(&self) -> Result<[[u8; 32]; VAN_AUTH_PATH_LEN], VotingError> {
+        if self.auth_path.len() != VAN_AUTH_PATH_LEN {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "van_auth_path must have {VAN_AUTH_PATH_LEN} siblings, got {}",
+                    self.auth_path.len()
+                ),
+            });
+        }
+
+        let mut typed_path = [[0u8; 32]; VAN_AUTH_PATH_LEN];
+        for (idx, hash) in self.auth_path.iter().enumerate() {
             typed_path[idx] =
                 hash.as_slice()
                     .try_into()
@@ -84,11 +109,7 @@ impl VanWitness {
                     })?;
         }
 
-        Ok(Self {
-            auth_path: typed_path,
-            position,
-            anchor_height,
-        })
+        Ok(typed_path)
     }
 }
 
@@ -585,6 +606,7 @@ pub fn commit(
         bundle_index,
         stages,
     };
+    let auth_path = witness.auth_path_fixed()?;
     let bundle = db.build_vote_commitment(
         round_id,
         bundle_index,
@@ -593,7 +615,7 @@ pub fn commit(
         draft.proposal_id,
         draft.choice,
         draft.num_options,
-        &witness.auth_path,
+        &auth_path,
         witness.position,
         witness.anchor_height,
         draft.single_share,
@@ -1946,7 +1968,7 @@ mod tests {
                 vc_tree_position: 456,
             },
             &VanWitness {
-                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                auth_path: vec![vec![0xAA; 32]; VAN_AUTH_PATH_LEN],
                 position: 7,
                 anchor_height: 123,
             },
@@ -2035,7 +2057,7 @@ mod tests {
                 vc_tree_position: 456,
             },
             &VanWitness {
-                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                auth_path: vec![vec![0xAA; 32]; VAN_AUTH_PATH_LEN],
                 position: 7,
                 anchor_height: 123,
             },
@@ -2182,7 +2204,7 @@ mod tests {
                 vc_tree_position: 456,
             }],
             &VanWitness {
-                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                auth_path: vec![vec![0xAA; 32]; VAN_AUTH_PATH_LEN],
                 position: 7,
                 anchor_height: 123,
             },
@@ -2251,7 +2273,7 @@ mod tests {
             0,
             &[draft_vote_fixture()],
             &VanWitness {
-                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                auth_path: vec![vec![0xAA; 32]; VAN_AUTH_PATH_LEN],
                 position: 7,
                 anchor_height: 123,
             },

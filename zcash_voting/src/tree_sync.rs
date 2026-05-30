@@ -17,10 +17,12 @@ use crate::HyperTransport;
 
 impl From<(MerklePath, u32)> for VanWitness {
     fn from((path, anchor_height): (MerklePath, u32)) -> Self {
-        let mut auth_path = [[0u8; 32]; VAN_AUTH_PATH_LEN];
-        for (idx, hash) in path.auth_path().iter().take(VAN_AUTH_PATH_LEN).enumerate() {
-            auth_path[idx] = hash.to_bytes();
-        }
+        let auth_path = path
+            .auth_path()
+            .iter()
+            .take(VAN_AUTH_PATH_LEN)
+            .map(|hash| hash.to_bytes().to_vec())
+            .collect();
         Self {
             auth_path,
             position: path.position(),

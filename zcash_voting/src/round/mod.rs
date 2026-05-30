@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{named_params, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     note_bundling::{chunk_notes_with_policy, BundlePolicy},
@@ -32,10 +33,12 @@ pub struct RoundInfo {
 }
 
 /// Result of idempotently planning or validating note bundles for a round.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleLayout {
     pub bundle_count: u32,
+    #[serde(rename = "eligible_weight_zatoshi")]
     pub eligible_weight: u64,
+    #[serde(default)]
     pub dropped_count: u32,
 }
 
