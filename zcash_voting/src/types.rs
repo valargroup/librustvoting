@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 use zip32::Scope;
 
 use crate::governance::BUNDLE_NOTE_SLOTS;
+pub use crate::wire::VotingRoundParams;
 
 /// Lowest valid on-chain proposal identifier. Proposal id 0 is reserved by the
 /// vote circuit.
@@ -300,16 +301,6 @@ impl SelectedNotes {
             .map(NoteRef::to_voting_note_info)
             .collect()
     }
-}
-
-/// Parameters for a voting round, sourced from vote chain.
-#[derive(Clone, Debug)]
-pub struct VotingRoundParams {
-    pub vote_round_id: String,
-    pub snapshot_height: u64,
-    pub ea_pk: Vec<u8>,
-    pub nc_root: Vec<u8>,
-    pub nullifier_imt_root: Vec<u8>,
 }
 
 /// Delegation action for Keystone signing.
