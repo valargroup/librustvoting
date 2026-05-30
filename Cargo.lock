@@ -3088,10 +3088,7 @@ name = "zcash-voting-wallet-example"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "hex",
- "rand",
  "rusqlite",
- "tokio",
  "zcash_client_sqlite",
  "zcash_protocol",
  "zcash_voting",
