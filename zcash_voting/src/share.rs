@@ -171,6 +171,28 @@ pub fn recover_payloads(bundle: &VoteRecoveryBundle) -> Result<Vec<SharePayload>
         .collect()
 }
 
+/// Reconstructs one helper-server payload from persisted recovery JSON and
+/// serializes it as helper wire JSON.
+pub fn recover_wire_json(
+    commitment_bundle_json: &str,
+    proposal_id: u32,
+    share_index: u32,
+    vc_tree_position: u64,
+    submit_at: u64,
+) -> Result<String, VotingError> {
+    let bundle = crate::vote::parse_recovery(commitment_bundle_json)?;
+    if bundle.proposal_id != proposal_id {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "recovery proposal_id {} does not match requested {proposal_id}",
+                bundle.proposal_id
+            ),
+        });
+    }
+    let payload = recover_payload(&bundle, share_index)?;
+    payload.to_wire_json(Some(vc_tree_position), submit_at)
+}
+
 fn array32(label: &str, value: Vec<u8>) -> Result<[u8; 32], VotingError> {
     value
         .try_into()
@@ -292,6 +314,18 @@ mod tests {
         assert_eq!(payload.share_comms[1], vec![0x52; 32]);
         assert_eq!(payload.primary_blind, field_bytes(2).to_vec());
         assert_eq!(nullifier.len(), 32);
+    }
+
+    #[test]
+    fn recover_wire_json_uses_recovery_bundle_payload() {
+        let bundle = recovery_bundle_fixture();
+        let json = crate::vote::serialize_recovery(&bundle).unwrap();
+        let wire_json = recover_wire_json(&json, 1, 1, 999, 123).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&wire_json).unwrap();
+        assert_eq!(value["proposal_id"].as_u64().unwrap(), 1);
+        assert_eq!(value["share_index"].as_u64().unwrap(), 1);
+        assert_eq!(value["tree_position"].as_u64().unwrap(), 999);
+        assert_eq!(value["submit_at"].as_u64().unwrap(), 123);
     }
 
     #[test]

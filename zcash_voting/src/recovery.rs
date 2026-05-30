@@ -272,7 +272,8 @@ mod tests {
             .unwrap();
         insert_vote(&db, 0, 1, 0, b"vote-0-1");
         insert_vote(&db, 1, 2, 1, b"vote-1-2");
-        db.mark_vote_submitted(ROUND_ID, 1, 2, "vote-tx-1-2").unwrap();
+        db.mark_vote_submitted(ROUND_ID, 1, 2, "vote-tx-1-2")
+            .unwrap();
         store_commitment_bundle(&db, 1, 2, r#"{"bundle":"ok"}"#, Some(77));
 
         let snapshot = round_snapshot(&db, ROUND_ID).unwrap();
@@ -331,7 +332,8 @@ mod tests {
             .unwrap();
 
         insert_vote(&db, 0, 1, 0, b"vote-0-1");
-        db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx-0-1").unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx-0-1")
+            .unwrap();
         store_commitment_bundle(&db, 0, 1, r#"{"bundle":"ok"}"#, Some(9));
         db.record_share_delegation(
             ROUND_ID,
@@ -354,14 +356,11 @@ mod tests {
             .delegation
             .iter()
             .any(|d| d.bundle_index == 0 && d.tx_hash.as_deref() == Some("delegation-tx-0")));
-        assert!(snapshot
-            .votes
-            .iter()
-            .any(|vote| vote.bundle_index == 0
-                && vote.proposal_id == 1
-                && vote.phase == VotePhase::Confirmed
-                && vote.vc_tree_position == Some(9)
-                && vote.has_commitment_bundle));
+        assert!(snapshot.votes.iter().any(|vote| vote.bundle_index == 0
+            && vote.proposal_id == 1
+            && vote.phase == VotePhase::Confirmed
+            && vote.vc_tree_position == Some(9)
+            && vote.has_commitment_bundle));
         assert_eq!(snapshot.share_delegations.len(), 1);
         assert_eq!(snapshot.unconfirmed_share_delegations.len(), 1);
         assert_eq!(
@@ -375,7 +374,8 @@ mod tests {
     fn clear_removes_recovery_artifacts_but_keeps_vote_rows() {
         let db = db_with_round(WALLET_ID);
         insert_vote(&db, 0, 1, 0, b"vote-0-1");
-        db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx-0-1").unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx-0-1")
+            .unwrap();
         store_commitment_bundle(&db, 0, 1, r#"{"bundle":"ok"}"#, Some(11));
         db.record_share_delegation(
             ROUND_ID,
@@ -395,14 +395,11 @@ mod tests {
         assert_eq!(snapshot.commitment_bundles.len(), 0);
         assert_eq!(snapshot.share_delegations.len(), 0);
         assert_eq!(snapshot.unconfirmed_share_delegations.len(), 0);
-        assert!(snapshot
-            .votes
-            .iter()
-            .any(|vote| vote.bundle_index == 0
-                && vote.proposal_id == 1
-                && vote.tx_hash.is_none()
-                && vote.vc_tree_position.is_none()
-                && !vote.has_commitment_bundle));
+        assert!(snapshot.votes.iter().any(|vote| vote.bundle_index == 0
+            && vote.proposal_id == 1
+            && vote.tx_hash.is_none()
+            && vote.vc_tree_position.is_none()
+            && !vote.has_commitment_bundle));
     }
 
     #[test]

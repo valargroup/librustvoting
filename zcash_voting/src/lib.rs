@@ -43,6 +43,7 @@ pub mod tree_sync;
 pub mod types;
 pub mod vote;
 pub mod vote_commitment;
+pub mod wire;
 pub mod witness;
 pub mod zkp1;
 pub mod zkp2;

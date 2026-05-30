@@ -33,6 +33,10 @@ pub use crate::pir::{select_pir_endpoint, PirEndpoint};
 pub use crate::precompute::{
     note_witnesses, stored_note_witnesses, verify_witness, PirPrecomputeReport,
 };
+pub use crate::recovery::{
+    clear as clear_recovery, recoverable_commitment_bundle, round_snapshot, DelegationRecovery,
+    RecoverableCommitmentBundle, RoundRecoverySnapshot, ShareWorkflow, VoteRecovery,
+};
 pub use crate::round::{
     bundle_notes_for_index, bundle_notes_for_index_with_policy, delegation_round_name,
     note_bundles, note_bundles_with_policy, quantized_bundle_set_weight, quantized_bundle_weight,
@@ -44,15 +48,11 @@ pub use crate::selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,
     select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
-pub use crate::recovery::{
-    clear as clear_recovery, recoverable_commitment_bundle, round_snapshot, DelegationRecovery,
-    RecoverableCommitmentBundle, RoundRecoverySnapshot, ShareWorkflow, VoteRecovery,
-};
 pub use crate::session::{resume_plan, Decision, NextStep, RoundPlan};
 pub use crate::share::{
     add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,
-    record as record_share, recover_payload, unconfirmed as unconfirmed_shares, SharePlan,
-    ShareRecord, ShareTimingPolicy, ShareTrackingSummary,
+    record as record_share, recover_payload, recover_wire_json, unconfirmed as unconfirmed_shares,
+    SharePlan, ShareRecord, ShareTimingPolicy, ShareTrackingSummary,
 };
 pub use crate::types::{
     validate_proposal_id, validate_vote_decision, validate_vote_options, Cancellation,
@@ -62,13 +62,15 @@ pub use crate::types::{
     MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID, MIN_VOTE_OPTIONS,
 };
 pub use crate::vote::{
-    commit as commit_vote, commit_batch, parse_recovery, record_submission as record_vote_submission,
-    record_vc_position, recover_commit as recover_vote_commit, recover_signed_commitments,
-    recovery_bundle, serialize_recovery, submission as vote_submission, validate_draft_vote,
-    validate_draft_votes, CommittedVote, DraftVote, SignedVoteCommitment, SignedVoteCommitments,
-    VanWitness, VoteCommit, VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
+    commit as commit_vote, commit_batch, parse_recovery,
+    record_submission as record_vote_submission, record_vc_position,
+    recover_commit as recover_vote_commit, recover_signed_commitments, recovery_bundle,
+    serialize_recovery, submission as vote_submission, validate_draft_vote, validate_draft_votes,
+    CommittedVote, DraftVote, SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteCommit,
+    VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
 };
 pub use crate::warm_proving_caches;
+pub use crate::wire::{DelegationSubmissionWire, VoteCommitmentWire, VoteShareWire};
 
 #[cfg(feature = "pir")]
 pub use crate::precompute::delegation_pir;
