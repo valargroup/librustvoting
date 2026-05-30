@@ -1,7 +1,16 @@
 //! Stable wire-format DTOs for vote-chain and helper endpoints.
 //!
-//! This module is the canonical owner of protocol field names so wallet
-//! integrations do not duplicate payload-shaping logic.
+//! This module is intentionally **struct-only** and is the canonical owner of
+//! protocol field names so wallet integrations do not duplicate payload-shaping
+//! logic.
+//!
+//! FRB scans `zcash_voting::wire` directly from `vizor-wallet` to generate
+//! Dart bindings. Keeping only plain DTO structs in this module prevents FRB
+//! from traversing behavior-level APIs that depend on internal crate types.
+//!
+//! All conversions, validation, and serialization helpers live in
+//! `crate::wire_codec`, while `wire.rs` remains the stable cross-language
+//! schema surface.
 
 use serde::{Deserialize, Serialize};
 

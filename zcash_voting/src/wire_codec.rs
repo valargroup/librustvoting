@@ -1,3 +1,12 @@
+//! Behavioral helpers for `crate::wire` DTOs.
+//!
+//! This module owns conversion/serialization logic (`TryFrom`, `From`,
+//! `to_json`, and payload shaping) that depends on internal crate types such as
+//! `VotingError`, recovery records, and share payload models.
+//!
+//! It is kept separate from `wire.rs` so the FRB-scanned `wire` module can stay
+//! struct-only and expose a clean, stable cross-language schema.
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
 use crate::{
