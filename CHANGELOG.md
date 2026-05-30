@@ -181,7 +181,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Added `PreparedDelegationBundle` lifecycle methods and `PreparedSigner` so
   precompute, PCZT setup, proof generation, Keystone signing requests, and
   submission assembly all consume the same prepared bundle state instead of
-  re-threading loose round IDs, bundle indexes, note lists, and keys.
+  re-threading loose round IDs, bundle indexes, note lists, and keys. The
+  prepared lifecycle now also owns wallet-seed delegation signing, external
+  signature byte validation, witness-cache checks, and signed-payload metadata.
 - Added `vote::validate_draft_votes` so wallet SDKs can validate canonical
   `DraftVote` inputs through the shared voting API before DB or proof work.
 - Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
