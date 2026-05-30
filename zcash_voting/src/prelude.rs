@@ -44,6 +44,10 @@ pub use crate::selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,
     select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
+pub use crate::recovery::{
+    clear as clear_recovery, recoverable_commitment_bundle, round_snapshot, DelegationRecovery,
+    RecoverableCommitmentBundle, RoundRecoverySnapshot, ShareWorkflow, VoteRecovery,
+};
 pub use crate::session::{resume_plan, Decision, NextStep, RoundPlan};
 pub use crate::share::{
     add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,

@@ -29,6 +29,7 @@ pub mod pir;
 pub mod pir_snapshot;
 pub mod precompute;
 pub mod prelude;
+pub mod recovery;
 pub mod round;
 pub mod selection;
 pub mod session;

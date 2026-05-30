@@ -9,6 +9,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added a stable `recovery` reporting API so wallets can fetch one typed round
+  snapshot from `zcash_voting` instead of reassembling recovery state with
+  low-level SQL. New exports include `recovery::round_snapshot`,
+  `recovery::recoverable_commitment_bundle`, and `recovery::clear`, plus
+  prelude re-exports and a wallet example (`wallet-example::example_recovery`)
+  that pairs snapshots with `session::resume_plan`.
 - Added `vote::SignedVoteCommitments`, `vote::commit_batch`, and
   `vote::recover_signed_commitments` so wallet SDKs can commit and recover
   per-bundle cast-vote batches through one crate-owned entry point instead of
@@ -147,6 +153,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- Consolidated recovery snapshot assembly and pending commitment-bundle
+  semantics into `zcash_voting`, and reduced the wallet-side adapter boundary
+  to FFI shape/phase-string mapping. Added focused unit coverage for pending
+  commitment rows, sidecar reopen behavior, and recovery clearing invariants.
 - The wallet vote example now includes `commit_vote_bundle_batch`, showing the
   canonical batch cast-vote flow with `vote::commit_batch` and crate-owned
   cancellation/progress adapters.

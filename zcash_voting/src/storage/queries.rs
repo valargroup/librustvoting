@@ -2306,6 +2306,36 @@ pub fn get_commitment_bundle(
     }
 }
 
+/// Loads raw commitment-bundle recovery columns for one vote key.
+///
+/// This lenient reader returns nullable `commitment_bundle_json` and
+/// `vc_tree_position` exactly as stored, so callers can distinguish in-progress
+/// recovery rows from fully confirmed rows.
+pub(crate) fn get_commitment_bundle_recovery(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Option<(Option<String>, Option<i64>)>, VotingError> {
+    conn.query_row(
+        "SELECT commitment_bundle_json, vc_tree_position FROM votes
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to get commitment bundle recovery fields: {}", e),
+    })
+}
+
 // --- Keystone signatures ---
 
 pub fn store_keystone_signature(
