@@ -185,9 +185,15 @@ pub fn prove_and_submit_keystone_delegation_bundle(
         .context("prove delegation bundle")?;
 
     // Pair Keystone's SpendAuth signature with the original setup sighash.
-    let sig = spend_auth_signature(signed_pczt_bytes, keystone_request.setup.action_index)
+    let action_index = usize::try_from(keystone_request.action_index)
+        .map_err(|_| anyhow::anyhow!("action_index does not fit usize"))?;
+    let sig = spend_auth_signature(signed_pczt_bytes, action_index)
         .context("extract Keystone SpendAuth signature")?;
-    let sighash = keystone_request.setup.pczt_sighash;
+    let sighash: [u8; 32] = keystone_request
+        .pczt_sighash
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("pczt_sighash must be 32 bytes"))?;
 
     prepared
         .submission(voting_db, PreparedSigner::signature(sig, sighash))
