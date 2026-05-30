@@ -1095,7 +1095,6 @@ fn array32_vec(label: &str, values: Vec<Vec<u8>>) -> Result<Vec<[u8; 32]>, Votin
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::{
@@ -1366,9 +1365,12 @@ mod tests {
             network: Network,
             alpha: &pasta_curves::pallas::Scalar,
         ) -> VerificationKey<SpendAuth> {
-            let sk = network
-                .orchard_spending_key_from_seed(seed, crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX)
-                .unwrap();
+            let sk = crate::hotkey::spending_key_from_hotkey_seed(
+                seed,
+                network,
+                crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX,
+            )
+            .unwrap();
             let ask = SpendAuthorizingKey::from(&sk);
             VerificationKey::from(&ask.randomize(alpha))
         }

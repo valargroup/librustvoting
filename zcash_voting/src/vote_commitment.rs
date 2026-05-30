@@ -76,7 +76,6 @@ pub fn build_share_payloads(
 ///             vote_authority_note_new || vote_commitment ||
 ///             proposal_id(4 LE, padded 32) || anchor_height(8 LE, padded 32))
 /// ```
-#[allow(deprecated)]
 pub(crate) fn sign_cast_vote(
     hotkey_seed: &[u8],
     network: Network,
@@ -92,8 +91,11 @@ pub(crate) fn sign_cast_vote(
     use ff::PrimeField;
 
     // Derive the voting hotkey SpendingKey from seed.
-    let sk = network
-        .orchard_spending_key_from_seed(hotkey_seed, crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX)?;
+    let sk = crate::hotkey::spending_key_from_hotkey_seed(
+        hotkey_seed,
+        network,
+        crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX,
+    )?;
     let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
 
     // Deserialize alpha_v

@@ -389,31 +389,12 @@ pub struct DelegationProof {
 }
 
 /// Signature source used when assembling a delegation transaction payload.
-pub enum DelegationSigner<'a> {
-    /// Software wallet signer for the account described by `keys`.
-    #[deprecated(note = "sign locally and use DelegationSigner::signature instead")]
-    Seed {
-        seed: &'a [u8],
-        keys: &'a DelegationKeys,
-    },
-    /// External signer that already signed the stored PCZT sighash.
-    ///
-    /// The Keystone name is retained for source compatibility. New code should
-    /// prefer [`DelegationSigner::signature`] or
-    /// [`DelegationSigner::signature_from_bytes`] to construct this signer.
-    Keystone { sig: [u8; 64], sighash: [u8; 32] },
+pub enum DelegationSigner {
+    /// Signature that already covers the stored PCZT sighash.
+    Signature { sig: [u8; 64], sighash: [u8; 32] },
 }
 
-impl<'a> DelegationSigner<'a> {
-    /// Builds a software delegation signer from the wallet seed and setup keys.
-    #[deprecated(note = "sign locally and use DelegationSigner::signature instead")]
-    #[allow(deprecated)]
-    pub fn seed(seed: &'a [u8], keys: &'a DelegationKeys) -> Self {
-        Self::Seed { seed, keys }
-    }
-}
-
-impl DelegationSigner<'static> {
+impl DelegationSigner {
     /// Builds a delegation signer from an externally produced SpendAuth signature.
     ///
     /// # Errors
@@ -421,7 +402,7 @@ impl DelegationSigner<'static> {
     /// Returns [`VotingError::InvalidInput`] unless `sig` is 64 bytes and
     /// `sighash` is 32 bytes.
     pub fn signature_from_bytes(sig: &[u8], sighash: &[u8]) -> Result<Self, VotingError> {
-        Ok(Self::Keystone {
+        Ok(Self::Signature {
             sig: array64_slice("signature", sig)?,
             sighash: array32_slice("sighash", sighash)?,
         })
@@ -429,44 +410,20 @@ impl DelegationSigner<'static> {
 
     /// Builds a delegation signer from an externally produced SpendAuth signature.
     pub fn signature(sig: [u8; 64], sighash: [u8; 32]) -> Self {
-        Self::Keystone { sig, sighash }
-    }
-
-    /// Builds a Keystone signer from raw signature and sighash bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VotingError::InvalidInput`] unless `sig` is 64 bytes and
-    /// `sighash` is 32 bytes.
-    #[deprecated(note = "use DelegationSigner::signature_from_bytes instead")]
-    pub fn keystone_from_bytes(sig: &[u8], sighash: &[u8]) -> Result<Self, VotingError> {
-        Ok(Self::Keystone {
-            sig: array64_slice("keystone_sig", sig)?,
-            sighash: array32_slice("keystone_sighash", sighash)?,
-        })
+        Self::Signature { sig, sighash }
     }
 }
 
 /// Signature source for a prepared delegation bundle.
-///
-/// Unlike [`DelegationSigner`], this enum can rely on
-/// [`PreparedDelegationBundle`] for compatibility seed signing. New
-/// integrations should use [`PreparedSigner::signature`].
-pub enum PreparedSigner<'a> {
-    /// Software wallet signer for the prepared bundle's account keys.
-    #[deprecated(note = "sign locally and use PreparedSigner::signature instead")]
-    Seed { seed: &'a [u8] },
-    /// External signer that already signed the stored PCZT sighash.
-    ///
-    /// The Keystone name is retained for source compatibility. New code should
-    /// prefer [`PreparedSigner::signature`] to construct this signer.
-    Keystone { sig: [u8; 64], sighash: [u8; 32] },
+pub enum PreparedSigner {
+    /// Signature that already covers the stored PCZT sighash.
+    Signature { sig: [u8; 64], sighash: [u8; 32] },
 }
 
-impl PreparedSigner<'static> {
+impl PreparedSigner {
     /// Builds a prepared signer from an externally produced SpendAuth signature.
     pub fn signature(sig: [u8; 64], sighash: [u8; 32]) -> Self {
-        Self::Keystone { sig, sighash }
+        Self::Signature { sig, sighash }
     }
 }
 
@@ -615,12 +572,10 @@ impl PreparedDelegationBundle {
     pub fn submission(
         &self,
         voting_db: &VotingDb,
-        signer: PreparedSigner<'_>,
+        signer: PreparedSigner,
     ) -> Result<DelegationSubmission, VotingError> {
         let signer = match signer {
-            #[allow(deprecated)]
-            PreparedSigner::Seed { seed } => DelegationSigner::seed(seed, &self.delegation_keys),
-            PreparedSigner::Keystone { sig, sighash } => DelegationSigner::signature(sig, sighash),
+            PreparedSigner::Signature { sig, sighash } => DelegationSigner::signature(sig, sighash),
         };
         crate::delegate::submission(voting_db, &self.round_id, self.bundle_index, signer)
     }
@@ -803,20 +758,15 @@ pub fn prove(
 
 /// Assembles chain-ready delegation submission fields for one bundle.
 ///
-/// Signature signers provide a SpendAuth signature over the stored PCZT sighash.
-/// The seed signer is retained only for migration.
+/// Signers provide a SpendAuth signature over the stored PCZT sighash.
 pub fn submission(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
-    signer: DelegationSigner<'_>,
+    signer: DelegationSigner,
 ) -> Result<DelegationSubmission, VotingError> {
     let data = match signer {
-        #[allow(deprecated)]
-        DelegationSigner::Seed { seed, keys } => {
-            db.get_delegation_submission(round_id, bundle_index, seed, keys)
-        }
-        DelegationSigner::Keystone { sig, sighash } => {
+        DelegationSigner::Signature { sig, sighash } => {
             db.get_delegation_submission_with_signature(round_id, bundle_index, &sig, &sighash)
         }
     }?;
@@ -1247,7 +1197,7 @@ mod tests {
     fn external_signature_signer_validates_signature_shapes() {
         assert!(matches!(
             DelegationSigner::signature_from_bytes(&[1; 64], &[2; 32]).unwrap(),
-            DelegationSigner::Keystone { .. }
+            DelegationSigner::Signature { .. }
         ));
 
         let sig_err = match DelegationSigner::signature_from_bytes(&[1; 63], &[2; 32]) {
@@ -1261,27 +1211,6 @@ mod tests {
 
         assert!(sig_err.contains("signature must be 64 bytes"));
         assert!(sighash_err.contains("sighash must be 32 bytes"));
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn keystone_signer_validates_legacy_signature_shapes() {
-        assert!(matches!(
-            DelegationSigner::keystone_from_bytes(&[1; 64], &[2; 32]).unwrap(),
-            DelegationSigner::Keystone { .. }
-        ));
-
-        let sig_err = match DelegationSigner::keystone_from_bytes(&[1; 63], &[2; 32]) {
-            Ok(_) => panic!("short signature should be rejected"),
-            Err(err) => err.to_string(),
-        };
-        let sighash_err = match DelegationSigner::keystone_from_bytes(&[1; 64], &[2; 31]) {
-            Ok(_) => panic!("short sighash should be rejected"),
-            Err(err) => err.to_string(),
-        };
-
-        assert!(sig_err.contains("keystone_sig must be 64 bytes"));
-        assert!(sighash_err.contains("keystone_sighash must be 32 bytes"));
     }
 
     #[test]

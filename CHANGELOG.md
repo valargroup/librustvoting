@@ -64,14 +64,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   provider traits so wallet SDKs can pass progress and consensus-branch
   resolution into `delegate::setup` and `delegate::prove` without duplicating
   library internals.
-- Added voting hotkey helpers for contextual software hotkeys, random hardware
+- Added voting hotkey helpers for wallet-derived software hotkeys, random hardware
   hotkeys, raw Orchard delegation-address derivation, and typed
   `DelegationKeys` / `VoteSigner` helpers. New wallet SDKs should derive scoped
   hotkey seed material at their wallet boundary and pass that material to
   `voting_hotkey_from_seed` or `VoteSigner::hotkey_seed`.
-  `derive_voting_hotkey`, `generate_random_voting_hotkey`, and
-  `voting_hotkey_from_seed` replace the older raw hotkey generation helpers
-  exposed through `hotkey::generate_hotkey` and `VotingDb::generate_hotkey`.
+  `generate_random_voting_hotkey` and `voting_hotkey_from_seed` replace the
+  older raw hotkey generation helpers exposed through `hotkey::generate_hotkey`
+  and `VotingDb::generate_hotkey`.
 - Added `delegate::LightwalletdBranchIdProvider` and
   `delegate::branch_id_for_height` so wallet SDKs can resolve delegation
   consensus branches from `lightwalletd_url` plus `Network` without duplicating
@@ -124,11 +124,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
-- `derive_voting_hotkey`, `HotkeyDerivationContext`,
-  `Network::orchard_spending_key_from_seed`, `VotingDb::get_delegation_submission`,
-  and seed-based delegation signers are deprecated for new integrations. Wallet
-  SDKs should derive scoped voting hotkey seed material and delegation
-  signatures locally, then pass only hotkey seeds or signatures to the crate.
+- Removed crate-side wallet seed APIs from voting hotkey derivation and
+  delegation signing. Wallet SDKs now derive scoped voting hotkey seed material
+  and delegation signatures locally, then pass only hotkey seeds or signatures
+  to the crate.
 - Delegation PIR warmup no longer constructs or caches a governance PCZT.
   `PreparedDelegationBundle::precompute` now warms witnesses, padded-note
   secrets, and PIR rows only; `delegate::setup` builds the PCZT later from the

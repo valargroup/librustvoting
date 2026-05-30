@@ -44,7 +44,6 @@ const VOTE_PROOF_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// * `anchor_height` - Block height at which the tree was snapshotted.
 /// * `progress` - Callback for proof generation progress.
 #[allow(clippy::too_many_arguments)]
-#[allow(deprecated)]
 pub(crate) fn build_vote_commitment(
     hotkey_seed: &[u8],
     network: Network,
@@ -84,7 +83,11 @@ pub(crate) fn build_vote_commitment(
 
     // Derive the Orchard SpendingKey from the hotkey seed via ZIP-32.
     progress.on_progress(0.05);
-    let sk = network.orchard_spending_key_from_seed(hotkey_seed, VOTING_HOTKEY_ACCOUNT_INDEX)?;
+    let sk = crate::hotkey::spending_key_from_hotkey_seed(
+        hotkey_seed,
+        network,
+        VOTING_HOTKEY_ACCOUNT_INDEX,
+    )?;
 
     // Parse gov_comm_rand → pallas::Base
     let gcr_bytes: [u8; 32] = gov_comm_rand
@@ -229,7 +232,6 @@ pub(crate) fn build_vote_commitment(
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -240,18 +242,19 @@ mod tests {
     }
 
     #[test]
-    fn orchard_spending_key_helper_uses_zip32_account_index() {
+    fn hotkey_spending_key_helper_uses_zip32_account_index() {
         let seed = [0x42; 64];
 
-        let default = Network::Mainnet
-            .orchard_spending_key_from_seed(&seed, VOTING_HOTKEY_ACCOUNT_INDEX)
-            .unwrap();
-        let account_0 = Network::Mainnet
-            .orchard_spending_key_from_seed(&seed, 0)
-            .unwrap();
-        let account_1 = Network::Mainnet
-            .orchard_spending_key_from_seed(&seed, 1)
-            .unwrap();
+        let default = crate::hotkey::spending_key_from_hotkey_seed(
+            &seed,
+            Network::Mainnet,
+            VOTING_HOTKEY_ACCOUNT_INDEX,
+        )
+        .unwrap();
+        let account_0 =
+            crate::hotkey::spending_key_from_hotkey_seed(&seed, Network::Mainnet, 0).unwrap();
+        let account_1 =
+            crate::hotkey::spending_key_from_hotkey_seed(&seed, Network::Mainnet, 1).unwrap();
 
         assert_eq!(
             orchard::keys::FullViewingKey::from(&default).to_bytes(),
