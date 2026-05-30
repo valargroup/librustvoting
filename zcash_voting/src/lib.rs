@@ -46,6 +46,7 @@ pub mod types;
 pub mod vote;
 pub mod vote_commitment;
 pub mod wire;
+mod wire_codec;
 pub mod witness;
 pub mod zkp1;
 pub mod zkp2;

@@ -9,6 +9,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added stable recovery/scheduling wire DTOs under `zcash_voting::wire` so wallet
+  adapters can share one serde-backed JSON shape for recovery snapshots and
+  share submission planning (`ShareSubmissionPlanView`,
+  `DelegationRecoveryView`, `VoteRecoveryView`,
+  `CommitmentBundleRecoveryView`, `ShareWorkflowRecoveryView`,
+  `ShareDelegationRecordView`, and `RoundRecoveryStateView`).
 - Added wallet-sidecar and round-context convenience APIs so SDK adapters can
   reuse crate-owned voting DB/session policy instead of local wrappers:
   `VotingDb::wallet_sidecar_path`, `VotingDb::open_wallet_sidecar`,
@@ -170,6 +176,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- Split wire DTO definitions from codec/conversion logic: `zcash_voting::wire`
+  now owns stable protocol structs only, while serde/base64 conversion helpers
+  and JSON-shaping tests moved into crate-private `wire_codec`.
+- Moved `VotingRoundParams` ownership to `zcash_voting::wire` as the canonical
+  vote-chain payload type, while re-exporting it from `types` for downstream
+  compatibility.
 - Consolidated wallet-facing recovery orchestration into crate-owned APIs:
   added `phases::WorkflowPhase` with stable resume strings, exposed
   `workflow_phase()` accessors on recovery records, and updated the wallet
