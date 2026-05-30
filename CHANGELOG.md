@@ -83,6 +83,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   so wallet SDKs can share the snapshot tree-state persistence, witness
   generation, and bundle witness caching flow while keeping wallet DB opening at
   each SDK boundary.
+- Added `VotingDb::has_witnesses` so wallet SDKs can detect already-cached
+  bundle witnesses and skip repeat witness generation during precompute resume.
 - Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
   `VoteCommit`, `VoteSigner`, `VoteSubmission`, and `VoteRecoveryBundle`.
   `vote::commit` now builds ZKP #2, signs the cast-vote payload, persists the
