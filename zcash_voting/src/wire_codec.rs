@@ -12,8 +12,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use crate::{
     delegate::DelegationSubmission,
     phases::WorkflowPhase,
-    recovery,
-    session,
+    recovery, session,
     share_policy::ShareSubmissionPlan,
     types::{SharePayload, VotingError, WireEncryptedShare},
     vote::SignedVoteCommitment,
