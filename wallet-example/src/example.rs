@@ -4,11 +4,11 @@ use anyhow::{Context, Result};
 use zcash_protocol::consensus::Parameters;
 use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
-    bundle_notes_for_index, delegation_submission, display_memo, gather_delegation_lwd_inputs,
-    gather_delegation_wallet_inputs, precompute_delegation, raw_bundle_weight, redact_for_signer,
-    setup_delegation, spend_auth_signature, DelegationSigner, DelegationSubmission,
-    GatherDelegationWalletParams, KeystoneSigningRequest, NoopCancellation, NoopProgressReporter,
-    PrecomputeDelegationInputs, PreparedDelegationReport, VotingDb, VotingHotkey,
+    bundle_notes_for_index, delegation_pir, delegation_submission, display_memo,
+    gather_delegation_lwd_inputs, gather_delegation_wallet_inputs, note_witnesses,
+    raw_bundle_weight, redact_for_signer, setup_delegation, spend_auth_signature, DelegationSigner,
+    DelegationSubmission, GatherDelegationWalletParams, KeystoneSigningRequest, NoopCancellation,
+    NoopProgressReporter, PreparedDelegationReport, VotingDb, VotingHotkey,
 };
 use zcash_voting::{HyperTransport, PirClientBlocking, VotingRoundParams};
 
@@ -17,8 +17,9 @@ pub const PRECOMPUTE_FLOW: &[&str] = &[
     "Resolve lightwalletd anchor tree state for the round.",
     "Gather snapshot-eligible Orchard notes and account key material from the wallet DB.",
     "Connect to the PIR endpoint selected for the round snapshot.",
-    "Build PrecomputeDelegationInputs with the full round note set and target bundle index.",
-    "Call precompute_delegation to persist witnesses, padded-note secrets, and PIR rows.",
+    "Ensure round and bundle rows exist for the target bundle index.",
+    "Generate note witnesses only when the bundle does not already have cached witnesses.",
+    "Warm padded-note secrets and PIR rows for the target bundle.",
 ];
 
 /// Human-readable seed-signed delegation stages printed by the runnable example.
@@ -144,22 +145,57 @@ where
         PirClientBlocking::with_transport(request.pir_server_url, Arc::new(HyperTransport::new()))
             .context("connect to PIR server")?;
 
-    // 4. Build the high-level precompute request. Pass the full round note set;
-    // the crate will create all bundles and then warm only `bundle_index`.
-    let inputs = PrecomputeDelegationInputs {
-        round_params: &round_params,
-        session_json: None,
-        bundle_index: request.bundle_index,
-        round_note_infos: &wallet_inputs.round_note_infos,
-        anchor_tree_state_bytes: &wallet_inputs.anchor_tree_state_bytes,
-        network: request.voting_hotkey.network(),
-        cancellation: &cancellation,
-    };
+    // 4. Ensure durable round and bundle rows before warming bundle-specific
+    // artifacts. This mirrors `precompute_delegation` but keeps resume points
+    // visible for wallet SDKs.
+    let round_id = round_params.vote_round_id.as_str();
+    voting_db
+        .ensure_round(&round_params, None)
+        .context("ensure delegation round")?;
+    let layout = voting_db
+        .ensure_bundles_with_skipped_suffix(round_id, &wallet_inputs.round_note_infos)
+        .context("ensure delegation bundles")?;
+    let bundle_note_infos = bundle_notes_for_index(
+        &wallet_inputs.round_note_infos,
+        &layout,
+        request.bundle_index,
+    )
+    .context("derive delegation bundle notes")?;
 
-    // 5. Warm persistent artifacts used by the later delegation proof step:
-    // round rows, note witnesses, padded-note secrets, and PIR rows.
-    precompute_delegation(voting_db, wallet_db, inputs, &pir_client)
-        .context("precompute delegation bundle")
+    // 5. Witness generation is the expensive wallet-DB step. A resumed
+    // precompute pass can skip it once this bundle's witnesses are cached.
+    if !voting_db
+        .has_witnesses(round_id, request.bundle_index)
+        .context("check cached bundle witnesses")?
+    {
+        note_witnesses(
+            voting_db,
+            round_id,
+            request.bundle_index,
+            &wallet_inputs.anchor_tree_state_bytes,
+            &bundle_note_infos,
+            wallet_db,
+        )
+        .context("generate bundle witnesses")?;
+    }
+
+    // 6. Warm padded-note secrets and PIR rows used by the later delegation
+    // proof step.
+    let report = delegation_pir(
+        voting_db,
+        round_id,
+        request.bundle_index,
+        &bundle_note_infos,
+        &pir_client,
+        request.voting_hotkey.network(),
+    )
+    .context("precompute delegation PIR")?;
+
+    Ok(PreparedDelegationReport {
+        report,
+        layout,
+        bundle_index: request.bundle_index,
+    })
 }
 
 /// Example wallet-side orchestration for proving and seed-signing one bundle.
