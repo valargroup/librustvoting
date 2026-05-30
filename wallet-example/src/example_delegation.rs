@@ -185,7 +185,7 @@ pub fn prove_and_submit_keystone_delegation_bundle(
 
     // Pair Keystone's SpendAuth signature with the original setup sighash.
     let action_index = usize::try_from(keystone_request.action_index)
-        .map_err(|_| anyhow::anyhow!("action_index does not fit usize"))?;
+        .context("Keystone action index does not fit usize")?;
     let sig = spend_auth_signature(signed_pczt_bytes, action_index)
         .context("extract Keystone SpendAuth signature")?;
     let signer = PreparedSigner::signature_from_bytes(&sig, &keystone_request.pczt_sighash)
