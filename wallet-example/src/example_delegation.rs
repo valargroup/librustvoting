@@ -6,10 +6,11 @@ use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Parameters;
 use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
-    gather_delegation_lwd_inputs, prepare_delegation_bundle as prepare_bundle_state,
-    spend_auth_signature, DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
-    NoopProgressReporter, PrepareDelegationBundleParams, PreparedDelegationBundle,
-    PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
+    accept_keystone_signature, gather_delegation_lwd_inputs,
+    prepare_delegation_bundle as prepare_bundle_state, DelegationSigningRequest,
+    DelegationSubmission, KeystoneSigningRequest, NoopProgressReporter,
+    PrepareDelegationBundleParams, PreparedDelegationBundle, PreparedDelegationReport,
+    PreparedSigner, VotingDb, VotingHotkey,
 };
 use zcash_voting::{BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams};
 use zip32::{fingerprint::SeedFingerprint, AccountId};
@@ -163,9 +164,9 @@ pub fn build_keystone_delegation_request(
 
 /// Proves a bundle and assembles a submission from a Keystone-signed PCZT.
 ///
-/// This function does not rebuild the governance PCZT. It extracts Keystone's
-/// SpendAuth signature from `signed_pczt_bytes` and pairs it with the original
-/// setup sighash from `keystone_request`.
+/// This function does not rebuild the governance PCZT. It validates and stores
+/// Keystone's SpendAuth signature, then pairs the accepted signature with the
+/// original setup sighash from `keystone_request`.
 ///
 /// # Errors
 ///
@@ -186,12 +187,16 @@ pub fn prove_and_submit_keystone_delegation_bundle(
         .prove(voting_db, &pir_client, &progress)
         .context("prove delegation bundle")?;
 
-    // Pair Keystone's SpendAuth signature with the original setup sighash.
-    let action_index = usize::try_from(keystone_request.action_index)
-        .context("Keystone action index does not fit usize")?;
-    let sig = spend_auth_signature(signed_pczt_bytes, action_index)
-        .context("extract Keystone SpendAuth signature")?;
-    let signer = PreparedSigner::signature_from_bytes(&sig, &keystone_request.pczt_sighash)
+    // Validate and persist Keystone's SpendAuth signature before assembling the
+    // chain submission fields.
+    let accepted = accept_keystone_signature(
+        voting_db,
+        &prepared.round_id,
+        keystone_request,
+        signed_pczt_bytes,
+    )
+    .context("accept Keystone signature")?;
+    let signer = PreparedSigner::signature_from_bytes(&accepted.sig, &accepted.sighash)
         .context("validate Keystone signature fields")?;
 
     prepared

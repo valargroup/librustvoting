@@ -602,6 +602,9 @@ pub fn store_delegation_data(
         pczt_sighash,
         None,
         None,
+        None,
+        None,
+        None,
     )
 }
 
@@ -626,6 +629,9 @@ pub(crate) fn store_delegation_data_with_pczt_fields(
     address_index: u32,
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     pczt_sighash: &[u8],
+    pczt_bytes: &[u8],
+    pczt_action_index: usize,
+    delegation_action_bytes: &[u8],
     rk: &[u8],
     gov_nullifiers: &[Vec<u8>],
 ) -> Result<(), VotingError> {
@@ -649,6 +655,9 @@ pub(crate) fn store_delegation_data_with_pczt_fields(
         address_index,
         padded_note_secrets,
         pczt_sighash,
+        Some(pczt_bytes),
+        Some(pczt_action_index),
+        Some(delegation_action_bytes),
         Some(rk),
         Some(gov_nullifiers_blob.as_slice()),
     )
@@ -673,6 +682,9 @@ fn store_delegation_data_inner(
     address_index: u32,
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     pczt_sighash: &[u8],
+    pczt_bytes: Option<&[u8]>,
+    pczt_action_index: Option<usize>,
+    delegation_action_bytes: Option<&[u8]>,
     rk: Option<&[u8]>,
     gov_nullifiers_blob: Option<&[u8]>,
 ) -> Result<(), VotingError> {
@@ -689,22 +701,43 @@ fn store_delegation_data_inner(
     // Serialize padded_note_secrets as flat blob: N * 64 bytes (rho[32] || rseed[32] per entry).
     let secrets_blob = encode_padded_note_secrets(padded_note_secrets);
 
-    let existing: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+    let existing: Option<(
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+    )> = conn
         .query_row(
-            "SELECT padded_note_secrets, pczt_sighash FROM bundles \
+            "SELECT padded_note_secrets, pczt_sighash, pczt_bytes, pczt_action_index, delegation_action_bytes FROM bundles \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(|e| VotingError::Internal {
             message: format!("failed to load existing delegation data: {}", e),
         })?;
-    let Some((existing_secrets, existing_sighash)) = existing else {
+    let Some((
+        existing_secrets,
+        existing_sighash,
+        existing_pczt_bytes,
+        existing_action_index,
+        existing_action_bytes,
+    )) = existing
+    else {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "bundle not found: round={}, bundle={}",
@@ -732,7 +765,38 @@ fn store_delegation_data_inner(
             });
         }
     }
+    if let Some(existing_pczt_bytes) = existing_pczt_bytes {
+        if Some(existing_pczt_bytes.as_slice()) != pczt_bytes {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "refusing to overwrite pczt_bytes for round={}, bundle={}",
+                    round_id, bundle_index
+                ),
+            });
+        }
+    }
+    if let Some(existing_action_index) = existing_action_index {
+        if Some(existing_action_index) != pczt_action_index.map(|index| index as i64) {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "refusing to overwrite pczt_action_index for round={}, bundle={}",
+                    round_id, bundle_index
+                ),
+            });
+        }
+    }
+    if let Some(existing_action_bytes) = existing_action_bytes {
+        if Some(existing_action_bytes.as_slice()) != delegation_action_bytes {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "refusing to overwrite delegation_action_bytes for round={}, bundle={}",
+                    round_id, bundle_index
+                ),
+            });
+        }
+    }
 
+    let pczt_action_index = pczt_action_index.map(|index| index as i64);
     let rows = conn
         .execute(
             "UPDATE bundles SET van_comm_rand = :rand, dummy_nullifiers = :dummies, \
@@ -741,7 +805,10 @@ fn store_delegation_data_inner(
              rseed_output = :rseed_output, gov_comm = :gov_comm, \
              total_note_value = :total_note_value, address_index = :address_index, \
              padded_note_secrets = COALESCE(padded_note_secrets, :secrets), \
+             pczt_bytes = COALESCE(pczt_bytes, :pczt_bytes), \
              pczt_sighash = COALESCE(pczt_sighash, :sighash), \
+             pczt_action_index = COALESCE(pczt_action_index, :pczt_action_index), \
+             delegation_action_bytes = COALESCE(delegation_action_bytes, :delegation_action_bytes), \
              rk = COALESCE(:rk, rk), \
              gov_nullifiers_blob = COALESCE(:gov_nullifiers_blob, gov_nullifiers_blob) \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
@@ -759,7 +826,10 @@ fn store_delegation_data_inner(
                 ":total_note_value": total_note_value as i64,
                 ":address_index": address_index as i64,
                 ":secrets": secrets_blob,
+                ":pczt_bytes": pczt_bytes,
                 ":sighash": pczt_sighash,
+                ":pczt_action_index": pczt_action_index,
+                ":delegation_action_bytes": delegation_action_bytes,
                 ":rk": rk,
                 ":gov_nullifiers_blob": gov_nullifiers_blob,
                 ":round_id": round_id,
@@ -976,6 +1046,98 @@ pub fn load_pczt_sighash(
     .map_err(|e| VotingError::InvalidInput {
         message: format!("no pczt_sighash for round={}, bundle={} ({})", round_id, bundle_index, e),
     })
+}
+
+/// Stored PCZT setup fields for an already prepared delegation bundle.
+pub struct DelegationSetupFields {
+    pub pczt_bytes: Vec<u8>,
+    pub pczt_sighash: Vec<u8>,
+    pub rk: Vec<u8>,
+    pub action_index: usize,
+    pub action_bytes: Vec<u8>,
+}
+
+/// Load persisted PCZT setup fields for a delegation bundle.
+///
+/// Returns `Ok(None)` when setup has not yet been built. Partial setup rows are
+/// treated as corrupt so callers do not silently rebuild randomized PCZT state.
+pub fn load_delegation_setup_data(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Option<DelegationSetupFields>, VotingError> {
+    let row: Option<(
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+    )> = conn
+        .query_row(
+            "SELECT pczt_bytes, pczt_sighash, rk, pczt_action_index, delegation_action_bytes \
+             FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load delegation setup data: {}", e),
+        })?;
+
+    let Some((pczt_bytes, pczt_sighash, rk, action_index, action_bytes)) = row else {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "bundle not found: round={}, bundle={}",
+                round_id, bundle_index
+            ),
+        });
+    };
+
+    if pczt_bytes.is_none()
+        && pczt_sighash.is_none()
+        && rk.is_none()
+        && action_index.is_none()
+        && action_bytes.is_none()
+    {
+        return Ok(None);
+    }
+
+    let (Some(pczt_bytes), Some(pczt_sighash), Some(rk), Some(action_index), Some(action_bytes)) =
+        (pczt_bytes, pczt_sighash, rk, action_index, action_bytes)
+    else {
+        return Err(VotingError::Internal {
+            message: format!(
+                "partial delegation setup data for round={}, bundle={}",
+                round_id, bundle_index
+            ),
+        });
+    };
+
+    if action_index < 0 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "stored pczt_action_index is negative for round={}, bundle={}",
+                round_id, bundle_index
+            ),
+        });
+    }
+
+    Ok(Some(DelegationSetupFields {
+        pczt_bytes,
+        pczt_sighash,
+        rk,
+        action_index: action_index as usize,
+        action_bytes,
+    }))
 }
 
 /// Load the VAN blinding factor for a bundle. Needed as a private witness in ZKP #2.
@@ -2406,7 +2568,7 @@ pub fn store_keystone_signature(
         .unwrap()
         .as_secs();
     conn.execute(
-        "INSERT OR REPLACE INTO keystone_signatures (round_id, wallet_id, bundle_index, sig, sighash, rk, created_at) VALUES (:round_id, :wallet_id, :bundle_index, :sig, :sighash, :rk, :created_at)",
+        "INSERT INTO keystone_signatures (round_id, wallet_id, bundle_index, sig, sighash, rk, created_at) VALUES (:round_id, :wallet_id, :bundle_index, :sig, :sighash, :rk, :created_at)",
         named_params! {
             ":round_id": round_id,
             ":wallet_id": wallet_id,
@@ -2421,6 +2583,35 @@ pub fn store_keystone_signature(
         message: format!("failed to store keystone signature: {}", e),
     })?;
     Ok(())
+}
+
+pub fn get_keystone_signature(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Option<KeystoneSignatureRecord>, VotingError> {
+    conn.query_row(
+        "SELECT bundle_index, sig, sighash, rk FROM keystone_signatures \
+         WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| {
+            Ok(KeystoneSignatureRecord {
+                bundle_index: row.get::<_, i64>(0)? as u32,
+                sig: row.get(1)?,
+                sighash: row.get(2)?,
+                rk: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to load keystone signature: {}", e),
+    })
 }
 
 pub fn get_keystone_signatures(

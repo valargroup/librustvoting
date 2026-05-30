@@ -659,12 +659,8 @@ pub fn extract_pczt_sighash(pczt_bytes: &[u8]) -> Result<[u8; 32], VotingError> 
 /// so a byte-diff between unsigned and signed PCZTs doesn't work. This function parses
 /// the signed PCZT structurally and reads the `spend_auth_sig` field directly.
 ///
-/// Tries `action_index` first, then falls back to scanning all actions. The Builder
-/// shuffles action order, so the governance spend may not end up at the expected index
-/// from Keystone's perspective. Our governance PCZT has exactly 2 actions (1 real +
-/// 1 dummy padding); only the real one gets signed (the dummy lacks zip32_derivation).
-///
-/// Returns the 64-byte SpendAuthSig, or an error if no signed action is found.
+/// Returns the 64-byte SpendAuthSig at `action_index`, or an error if the
+/// requested action is missing or unsigned.
 pub fn extract_spend_auth_sig(
     signed_pczt_bytes: &[u8],
     action_index: usize,
@@ -674,28 +670,23 @@ pub fn extract_spend_auth_sig(
     })?;
 
     let actions = pczt.orchard().actions();
-
-    // Try the expected action index first.
-    if action_index < actions.len() {
-        if let Some(sig) = actions[action_index].spend().spend_auth_sig() {
-            return Ok(*sig);
-        }
+    let action = actions
+        .get(action_index)
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "Orchard action index {} is out of bounds for {} actions in the signed PCZT",
+                action_index,
+                actions.len()
+            ),
+        })?;
+    if let Some(sig) = action.spend().spend_auth_sig() {
+        return Ok(*sig);
     }
 
-    // Fallback: scan all actions for a signature.
-    // The governance PCZT has 2 actions; only the real governance spend gets signed
-    // by Keystone (the padding action has no zip32_derivation so Keystone skips it).
-    // This is safe because there is exactly one signable action.
-    for action in actions {
-        if let Some(sig) = action.spend().spend_auth_sig() {
-            return Ok(*sig);
-        }
-    }
-
-    Err(VotingError::Internal {
+    Err(VotingError::InvalidInput {
         message: format!(
-            "No spend_auth_sig found in any of the {} actions in the signed PCZT",
-            actions.len()
+            "No spend_auth_sig found at Orchard action index {} in the signed PCZT",
+            action_index
         ),
     })
 }
