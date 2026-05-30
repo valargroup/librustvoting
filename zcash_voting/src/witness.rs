@@ -33,7 +33,7 @@ where
 {
     db.store_tree_state(round_id, tree_state_bytes)?;
     let witnesses = generate_note_witnesses(db, round_id, notes, wallet_db)?;
-    db.store_witnesses(round_id, bundle_index, &witnesses)?;
+    db.replace_bundle_witnesses(round_id, bundle_index, &witnesses)?;
     Ok(witnesses)
 }
 
