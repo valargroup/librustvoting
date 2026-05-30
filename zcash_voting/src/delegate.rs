@@ -17,7 +17,7 @@ pub use crate::selection::{
 use crate::{
     governance::BUNDLE_NOTE_SLOTS,
     precompute::PirPrecomputeReport,
-    round::{BundleLayout, VotingDb},
+    round::{BundleLayout, RoundParams, VotingDb},
     types::{DelegationProgressReporter, Network, NoteInfo, VotingError, VotingHotkey},
 };
 
@@ -183,6 +183,29 @@ pub struct DelegationBundleContext {
     pub delegation_keys: DelegationKeys,
     pub branch_id_provider: LightwalletdBranchIdProvider,
     pub round_name: String,
+}
+
+/// Round metadata needed to build delegation PCZT inputs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationRoundContext {
+    pub snapshot_height: u64,
+    pub round_name: String,
+}
+
+/// Ensures the round exists and resolves the display name used in delegation metadata.
+///
+/// An empty `round_name` falls back to `params.vote_round_id`.
+pub fn ensure_round_context(
+    voting_db: &VotingDb,
+    params: &RoundParams,
+    round_name: &str,
+    session_json: Option<&str>,
+) -> Result<DelegationRoundContext, VotingError> {
+    let state = voting_db.ensure_round_state(params, session_json)?;
+    Ok(DelegationRoundContext {
+        snapshot_height: state.snapshot_height,
+        round_name: crate::round::delegation_round_name(params, round_name),
+    })
 }
 
 /// Parameters for resolving lightwalletd-derived delegation inputs.
@@ -959,6 +982,28 @@ mod tests {
 
     fn test_voting_hotkey() -> VotingHotkey {
         crate::hotkey::voting_hotkey_from_seed(&[0x77; 64], Network::Testnet).unwrap()
+    }
+
+    #[test]
+    fn ensure_round_context_initializes_round_and_resolves_round_name() {
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("ensure-round-context");
+        let params = crate::VotingRoundParams {
+            vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
+                .to_string(),
+            snapshot_height: 42,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+
+        let named = ensure_round_context(&voting_db, &params, "Demo Round", Some("{}")).unwrap();
+        let fallback = ensure_round_context(&voting_db, &params, "", None).unwrap();
+
+        assert_eq!(named.snapshot_height, 42);
+        assert_eq!(named.round_name, "Demo Round");
+        assert_eq!(fallback.round_name, params.vote_round_id);
+        assert_eq!(voting_db.list_rounds().unwrap().len(), 1);
     }
 
     #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]

@@ -9,6 +9,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added wallet-sidecar and round-context convenience APIs so SDK adapters can
+  reuse crate-owned voting DB/session policy instead of local wrappers:
+  `VotingDb::wallet_sidecar_path`, `VotingDb::open_wallet_sidecar`,
+  `VotingDb::ensure_round_state`, and `delegate::ensure_round_context`
+  (`DelegationRoundContext`).
 - Added canonical wire JSON types in `zcash_voting::wire`
   (`DelegationSubmissionWire`, `VoteCommitmentWire`, `VoteShareWire`,
   `WireEncryptedShareJson`) so wallets can reuse one source of truth for

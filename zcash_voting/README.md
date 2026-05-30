@@ -7,7 +7,8 @@ Client-side library for integrating [Zcash shielded voting](https://github.com/v
 Wallets should import `zcash_voting::prelude::*` and follow the stable setup →
 precompute → delegate → vote → share lifecycle:
 
-1. Open a `VotingDb`, set the wallet id, and call `create_round`.
+1. Open a `VotingDb`, set the wallet id, and call `create_round` (pass `None`
+   when no round session metadata is available).
 2. Convert eligible Orchard notes into `NoteInfo` with
    `NoteInfo::from_orchard_note`, then call `ensure_bundles`.
    The default `BundlePolicy` fills each bundle up to the circuit note-slot
