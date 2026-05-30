@@ -9,13 +9,11 @@ pub use crate::delegate::gather_delegation_lwd_inputs;
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::delegate::LightwalletdBranchIdProvider;
 pub use crate::delegate::{
-    branch_id_for_height, cache_prepared_setup, clear_prepared_setups, display_memo,
-    load_account_keys, pczt_sighash, prepared_epoch, record_submission, record_van_position,
-    redact_for_signer, setup as setup_delegation, spend_auth_signature,
-    submission as delegation_submission, take_prepared_setup, BranchIdProvider,
-    DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProgress, DelegationProof,
-    DelegationSetup, DelegationSigner, DelegationSubmission, KeystoneSigningRequest,
-    PreparedDelegationReport, SignedDelegationBundle,
+    branch_id_for_height, display_memo, load_account_keys, pczt_sighash, record_submission,
+    record_van_position, redact_for_signer, setup as setup_delegation, spend_auth_signature,
+    submission as delegation_submission, BranchIdProvider, DelegationAccountKeys, DelegationKeys,
+    DelegationPhase, DelegationProgress, DelegationProof, DelegationSetup, DelegationSigner,
+    DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, SignedDelegationBundle,
 };
 pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
