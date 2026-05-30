@@ -1378,6 +1378,22 @@ impl VotingDb {
         queries::get_commitment_bundle(&conn, round_id, &wallet_id, bundle_index, proposal_id)
     }
 
+    /// Loads raw commitment-bundle recovery columns for one vote key.
+    ///
+    /// Unlike `get_commitment_bundle`, this lenient helper does not require
+    /// `vc_tree_position` to be set. It is intended for recovery reporting code
+    /// that distinguishes "JSON present but position pending" from "no JSON".
+    pub(crate) fn get_commitment_bundle_recovery_fields(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+    ) -> Result<Option<(Option<String>, Option<i64>)>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::get_commitment_bundle_recovery(&conn, round_id, &wallet_id, bundle_index, proposal_id)
+    }
+
     pub fn store_keystone_signature(
         &self,
         round_id: &str,
@@ -2766,6 +2782,36 @@ mod tests {
             .unwrap();
         assert_eq!(van_position, Some(5));
         assert_eq!(vc_position, Some(9));
+    }
+
+    #[test]
+    fn test_get_commitment_bundle_recovery_fields_reports_pending_position() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = NULL
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::named_params! {
+                    ":json": r#"{"bundle":"pending"}"#,
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": W,
+                },
+            )
+            .unwrap();
+
+        let fields = db
+            .get_commitment_bundle_recovery_fields(ROUND_ID, 0, 1)
+            .unwrap();
+
+        assert_eq!(
+            fields,
+            Some((Some(r#"{"bundle":"pending"}"#.to_string()), None))
+        );
     }
 
     #[test]
