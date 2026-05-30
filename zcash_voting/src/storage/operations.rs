@@ -21,28 +21,17 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 
 use crate::delegate::DelegationKeys;
 use crate::governance::BUNDLE_NOTE_SLOTS;
-use crate::note_bundling::{BundlePolicy, ChunkResult};
+use crate::note_bundling::ChunkResult;
 use crate::storage::queries;
 use crate::storage::{
     KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb,
 };
 use crate::types::{
     DelegationPirPrecomputeResult, DelegationProgressReporter, DelegationProofResult,
-    DelegationSubmissionData, EncryptedShare, GovernancePczt, Network, NoteInfo,
-    PreparedDelegationPirResult, ProgressReporter, SharePayload, VoteCommitmentBundle, VotingError,
-    VotingHotkey, VotingRoundParams, WireEncryptedShare, WitnessData,
+    DelegationSubmissionData, EncryptedShare, GovernancePczt, Network, NoteInfo, ProgressReporter,
+    SharePayload, VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
+    WireEncryptedShare, WitnessData,
 };
-
-/// Wallet-supplied inputs for shared delegation PCZT and PIR preparation.
-#[cfg(any(feature = "pir", feature = "client-pir"))]
-pub struct PrepareDelegationPirParams<'a> {
-    pub round_id: &'a str,
-    pub bundle_index: u32,
-    pub notes: &'a [NoteInfo],
-    pub keys: &'a DelegationKeys,
-    pub consensus_branch_id: u32,
-    pub pir_client: &'a pir_client::PirClientBlocking,
-}
 
 #[cfg(any(feature = "pir", feature = "client-pir"))]
 fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, VotingError> {
@@ -385,6 +374,55 @@ impl VotingDb {
         queries::get_bundle_count(&conn, round_id, &wallet_id)
     }
 
+    /// Ensure synthetic padded-note secrets exist for a delegation bundle.
+    ///
+    /// These secrets determine the fixed-arity circuit padding nullifiers used
+    /// by PIR precompute. They are sampled once per bundle and then treated as
+    /// authoritative for later PCZT construction and proving.
+    pub fn ensure_padded_secrets(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        notes: &[NoteInfo],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
+        let expected_padded_count = BUNDLE_NOTE_SLOTS.saturating_sub(notes.len());
+
+        if let Some(secrets) =
+            queries::load_padded_note_secrets_optional(&conn, round_id, &wallet_id, bundle_index)?
+        {
+            if secrets.len() != expected_padded_count {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "stored padded_note_secrets count ({}) must match expected padded note count ({expected_padded_count}) for bundle {bundle_index}",
+                        secrets.len()
+                    ),
+                });
+            }
+            return Ok(secrets);
+        }
+
+        let sampled = crate::action::sample_padded_note_secrets(notes.len())?;
+        queries::store_padded_note_secrets_if_absent(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            &sampled,
+        )?;
+        let stored = queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
+        if stored.len() != expected_padded_count {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "stored padded_note_secrets count ({}) changed after initialization; expected {expected_padded_count}",
+                    stored.len()
+                ),
+            });
+        }
+        Ok(stored)
+    }
     // --- Phase 1: Delegation setup ---
 
     /// Builds a voting hotkey from stored hotkey seed bytes.
@@ -411,6 +449,7 @@ impl VotingDb {
         keys: &DelegationKeys,
         consensus_branch_id: u32,
     ) -> Result<GovernancePczt, VotingError> {
+        let padded_note_secrets = self.ensure_padded_secrets(round_id, bundle_index, notes)?;
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
@@ -425,6 +464,7 @@ impl VotingDb {
             &keys.seed_fingerprint,
             keys.account_index,
             &keys.round_name,
+            &padded_note_secrets,
         )?;
         // Compute total note value from input notes
         let total_note_value: u64 = notes
@@ -523,9 +563,8 @@ impl VotingDb {
     /// delegation circuit will fill.
     ///
     /// This is safe to run before submit/auth: it only needs the note metadata
-    /// already in the wallet plus the padded-note rho/rseed pairs that
-    /// `build_governance_pczt` already wrote to the bundles row. No spending
-    /// seed is required.
+    /// already in the wallet plus the write-once padded-note rho/rseed pairs.
+    /// No spending seed is required.
     ///
     /// The padded-slot nullifiers we cache are derived to match what the
     /// circuit builder asks for at proof-gen time (see
@@ -537,7 +576,7 @@ impl VotingDb {
         bundle_index: u32,
         notes: &[NoteInfo],
         pir_client: &pir_client::PirClientBlocking,
-        keys: &DelegationKeys,
+        network: Network,
     ) -> Result<DelegationPirPrecomputeResult, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
@@ -545,8 +584,7 @@ impl VotingDb {
         queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
         let padded_secrets =
             queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
-        let padded_nullifiers =
-            padded_nullifiers_for_circuit(notes, &padded_secrets, keys.network)?;
+        let padded_nullifiers = padded_nullifiers_for_circuit(notes, &padded_secrets, network)?;
         let targets = delegation_nullifier_targets(notes, &padded_nullifiers)?;
 
         let mut cached_count = 0u32;
@@ -615,63 +653,6 @@ impl VotingDb {
         Ok(DelegationPirPrecomputeResult {
             cached_count,
             fetched_count,
-        })
-    }
-
-    /// Build the governance PCZT for one eligible delegation bundle and
-    /// precompute the PIR-backed IMT proofs required by delegation proving.
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
-    pub fn prepare_delegation_pir(
-        &self,
-        params: PrepareDelegationPirParams<'_>,
-    ) -> Result<PreparedDelegationPirResult, VotingError> {
-        self.prepare_delegation_pir_with_policy(params, BundlePolicy::default())
-    }
-
-    /// Build the governance PCZT and delegation PIR data using an explicit bundle policy.
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
-    pub fn prepare_delegation_pir_with_policy(
-        &self,
-        params: PrepareDelegationPirParams<'_>,
-        bundle_policy: BundlePolicy,
-    ) -> Result<PreparedDelegationPirResult, VotingError> {
-        let bundle_setup =
-            self.ensure_bundles_with_policy(params.round_id, params.notes, bundle_policy)?;
-        if bundle_setup.bundle_count == 0 {
-            return Err(VotingError::InvalidInput {
-                message: "no eligible voting bundles were created for delegation PIR preparation"
-                    .to_string(),
-            });
-        }
-
-        let bundle_notes = crate::round::bundle_notes_for_index_with_policy(
-            params.notes,
-            &bundle_setup,
-            params.bundle_index,
-            bundle_policy,
-        )?;
-
-        let governance_pczt = self.build_governance_pczt(
-            params.round_id,
-            params.bundle_index,
-            &bundle_notes,
-            params.keys,
-            params.consensus_branch_id,
-        )?;
-        let precompute = self.precompute_delegation_pir(
-            params.round_id,
-            params.bundle_index,
-            &bundle_notes,
-            params.pir_client,
-            params.keys,
-        )?;
-
-        Ok(PreparedDelegationPirResult {
-            governance_pczt,
-            precompute,
-            bundle_count: bundle_setup.bundle_count,
-            eligible_weight_zatoshi: bundle_setup.eligible_weight,
-            bundle_index: params.bundle_index,
         })
     }
 
@@ -778,8 +759,13 @@ impl VotingDb {
 
         // Phase 2: Load/fetch IMT exclusion proofs via PIR.
         let pir_start = std::time::Instant::now();
-        let precompute =
-            self.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, keys)?;
+        let precompute = self.precompute_delegation_pir(
+            round_id,
+            bundle_index,
+            notes,
+            pir_client,
+            keys.network,
+        )?;
 
         let conn = self.conn();
         let real_targets = delegation_nullifier_targets(notes, &[])?;
@@ -1621,13 +1607,29 @@ mod tests {
         db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
         {
             let conn = db.conn();
-            let err = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0)
-                .expect_err("padded secrets should only exist after PCZT construction");
+            let err = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).expect_err(
+                "padded secrets should only exist after explicit warmup or PCZT construction",
+            );
             assert!(
                 err.to_string().contains("padded_note_secrets")
                     || err.to_string().contains("delegation data"),
                 "{err}"
             );
+        }
+
+        let warmed = db
+            .ensure_padded_secrets(ROUND_ID, 0, &[note_info.clone()])
+            .unwrap();
+        assert_eq!(warmed.len(), 4);
+        let warmed_again = db
+            .ensure_padded_secrets(ROUND_ID, 0, &[note_info.clone()])
+            .unwrap();
+        assert_eq!(warmed, warmed_again);
+        let precompute_nullifiers =
+            padded_nullifiers_for_circuit(&[note_info.clone()], &warmed, Network::Testnet).unwrap();
+        {
+            let conn = db.conn();
+            assert!(queries::load_pczt_sighash(&conn, ROUND_ID, W, 0).is_err());
         }
 
         let voting_hotkey =
@@ -1647,13 +1649,15 @@ mod tests {
         let pir_nullifiers =
             padded_nullifiers_for_circuit(&[note_info], &padded_secrets, Network::Testnet).unwrap();
 
+        assert_eq!(result.padded_note_secrets, warmed_again);
+        assert_eq!(precompute_nullifiers, result.dummy_nullifiers);
         assert_eq!(stored_dummy, result.dummy_nullifiers);
         assert_eq!(pir_nullifiers, result.dummy_nullifiers);
     }
 
     #[cfg(any(feature = "pir", feature = "client-pir"))]
     #[test]
-    fn test_prepare_delegation_pir_builds_pczt_and_reuses_cached_pir_proofs() {
+    fn test_padded_secret_warmup_reuses_cached_pir_proofs_without_pczt() {
         use orchard::{note::Rho, value::NoteValue};
         use rand::rngs::OsRng;
         use voting_circuits::delegation::ImtProvider;
@@ -1777,38 +1781,21 @@ mod tests {
             }
         }
 
-        let voting_hotkey =
-            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
-                .unwrap();
-        let seed_fingerprint = [0x42u8; 32];
-        let keys =
-            test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, seed_fingerprint, 0);
         let pir_client = pir_client::PirClientBlocking::with_transport(
             "https://pir.test",
             std::sync::Arc::new(StaticPirTransport),
         )
         .unwrap();
 
+        db.ensure_padded_secrets(ROUND_ID, 0, &notes).unwrap();
         let result = db
-            .prepare_delegation_pir(PrepareDelegationPirParams {
-                round_id: ROUND_ID,
-                bundle_index: 0,
-                notes: &notes,
-                keys: &keys,
-                consensus_branch_id: 0xC8E71055,
-                pir_client: &pir_client,
-            })
+            .precompute_delegation_pir(ROUND_ID, 0, &notes, &pir_client, Network::Testnet)
             .unwrap();
 
-        assert_eq!(result.bundle_count, 1);
-        assert_eq!(result.bundle_index, 0);
-        assert_eq!(result.precompute.cached_count, BUNDLE_NOTE_SLOTS as u32);
-        assert_eq!(result.precompute.fetched_count, 0);
-        assert_eq!(result.governance_pczt.pczt_bytes.is_empty(), false);
-        assert_eq!(
-            result.governance_pczt.gov_nullifiers.len(),
-            BUNDLE_NOTE_SLOTS
-        );
+        assert_eq!(result.cached_count, BUNDLE_NOTE_SLOTS as u32);
+        assert_eq!(result.fetched_count, 0);
+        let conn = db.conn();
+        assert!(queries::load_pczt_sighash(&conn, ROUND_ID, W, 0).is_err());
     }
 
     #[test]

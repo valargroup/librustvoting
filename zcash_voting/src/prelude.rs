@@ -64,8 +64,6 @@ pub use crate::precompute::{
     delegation_pir, precompute_delegation, precompute_delegation_with_policy,
     PrecomputeDelegationInputs,
 };
-#[cfg(feature = "pir")]
-pub use crate::storage::operations::PrepareDelegationPirParams;
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::precompute::{reset_vote_tree, sync_vote_tree, van_witness};

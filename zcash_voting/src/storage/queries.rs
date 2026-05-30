@@ -65,6 +65,28 @@ fn encode_gov_nullifiers_blob(gov_nullifiers: &[Vec<u8>]) -> Vec<u8> {
         .collect()
 }
 
+fn encode_padded_note_secrets(padded_note_secrets: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    padded_note_secrets
+        .iter()
+        .flat_map(|(rho, rseed)| rho.iter().copied().chain(rseed.iter().copied()))
+        .collect()
+}
+
+fn decode_padded_note_secrets(blob: Vec<u8>) -> Result<Vec<(Vec<u8>, Vec<u8>)>, VotingError> {
+    if blob.len() % 64 != 0 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "corrupt padded_note_secrets blob: length {} is not a multiple of 64",
+                blob.len()
+            ),
+        });
+    }
+    Ok(blob
+        .chunks_exact(64)
+        .map(|c| (c[..32].to_vec(), c[32..].to_vec()))
+        .collect())
+}
+
 // --- Rounds ---
 
 pub fn insert_round(
@@ -665,10 +687,51 @@ fn store_delegation_data_inner(
     let padded_blob: Vec<u8> = padded_cmx.iter().flat_map(|c| c.iter().copied()).collect();
 
     // Serialize padded_note_secrets as flat blob: N * 64 bytes (rho[32] || rseed[32] per entry).
-    let secrets_blob: Vec<u8> = padded_note_secrets
-        .iter()
-        .flat_map(|(rho, rseed)| rho.iter().copied().chain(rseed.iter().copied()))
-        .collect();
+    let secrets_blob = encode_padded_note_secrets(padded_note_secrets);
+
+    let existing: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT padded_note_secrets, pczt_sighash FROM bundles \
+             WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load existing delegation data: {}", e),
+        })?;
+    let Some((existing_secrets, existing_sighash)) = existing else {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "bundle not found: round={}, bundle={}",
+                round_id, bundle_index
+            ),
+        });
+    };
+    if let Some(existing_secrets) = existing_secrets {
+        if existing_secrets != secrets_blob {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "refusing to overwrite padded_note_secrets for round={}, bundle={}",
+                    round_id, bundle_index
+                ),
+            });
+        }
+    }
+    if let Some(existing_sighash) = existing_sighash {
+        if existing_sighash != pczt_sighash {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "refusing to overwrite pczt_sighash for round={}, bundle={}",
+                    round_id, bundle_index
+                ),
+            });
+        }
+    }
 
     let rows = conn
         .execute(
@@ -677,7 +740,8 @@ fn store_delegation_data_inner(
              cmx_new = :cmx_new, alpha = :alpha, rseed_signed = :rseed_signed, \
              rseed_output = :rseed_output, gov_comm = :gov_comm, \
              total_note_value = :total_note_value, address_index = :address_index, \
-             padded_note_secrets = :secrets, pczt_sighash = :sighash, \
+             padded_note_secrets = COALESCE(padded_note_secrets, :secrets), \
+             pczt_sighash = COALESCE(pczt_sighash, :sighash), \
              rk = COALESCE(:rk, rk), \
              gov_nullifiers_blob = COALESCE(:gov_nullifiers_blob, gov_nullifiers_blob) \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
@@ -805,15 +869,68 @@ pub fn load_rseed_output(
     })
 }
 
-/// Load padded note secrets (rho + rseed pairs) for Phase 2 randomness threading.
-/// Returns Vec of (rho[32], rseed[32]) pairs. Deserializes from flat 64-byte-per-entry blob.
-pub fn load_padded_note_secrets(
+/// Write padded note secrets once for a bundle, leaving an existing value intact.
+pub fn store_padded_note_secrets_if_absent(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, VotingError> {
-    let blob: Vec<u8> = conn
+    padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
+) -> Result<(), VotingError> {
+    let secrets_blob = encode_padded_note_secrets(padded_note_secrets);
+    let rows = conn
+        .execute(
+            "UPDATE bundles SET padded_note_secrets = :secrets \
+             WHERE round_id = :round_id AND wallet_id = :wallet_id \
+               AND bundle_index = :bundle_index AND padded_note_secrets IS NULL",
+            named_params! {
+                ":secrets": secrets_blob,
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to store padded_note_secrets: {}", e),
+        })?;
+
+    if rows == 0 {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index as i64,
+                },
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to check bundle existence: {}", e),
+            })?
+            .is_some();
+        if !exists {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "bundle not found: round={}, bundle={}",
+                    round_id, bundle_index
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Load padded note secrets if they have already been initialized for a bundle.
+pub fn load_padded_note_secrets_optional(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>, VotingError> {
+    let blob: Option<Vec<u8>> = conn
         .query_row(
             "SELECT padded_note_secrets FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
@@ -823,18 +940,25 @@ pub fn load_padded_note_secrets(
             message: format!("no padded_note_secrets for round={}, bundle={} ({})", round_id, bundle_index, e),
         })?;
 
-    if blob.len() % 64 != 0 {
-        return Err(VotingError::Internal {
+    blob.map(decode_padded_note_secrets).transpose()
+}
+
+/// Load padded note secrets (rho + rseed pairs) for Phase 2 randomness threading.
+/// Returns Vec of (rho[32], rseed[32]) pairs. Deserializes from flat 64-byte-per-entry blob.
+pub fn load_padded_note_secrets(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, VotingError> {
+    load_padded_note_secrets_optional(conn, round_id, wallet_id, bundle_index)?.ok_or_else(|| {
+        VotingError::InvalidInput {
             message: format!(
-                "corrupt padded_note_secrets blob: length {} is not a multiple of 64",
-                blob.len()
+                "no padded_note_secrets for round={}, bundle={}",
+                round_id, bundle_index
             ),
-        });
-    }
-    Ok(blob
-        .chunks_exact(64)
-        .map(|c| (c[..32].to_vec(), c[32..].to_vec()))
-        .collect())
+        }
+    })
 }
 
 /// Load the ZIP-244 sighash extracted from the PCZT (32 bytes).

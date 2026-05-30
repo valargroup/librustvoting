@@ -100,10 +100,16 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
-- Delegation setup keys now flow through `DelegationKeys`; `delegate::setup`
-  resolves the consensus branch through a caller-supplied `BranchIdProvider`.
-  Delegation proof progress is reported via `DelegationStageReporter`, while
-  generic vote proof progress uses `ProgressReporter`.
+- Delegation PIR warmup no longer constructs or caches a governance PCZT.
+  `precompute::precompute_delegation` now warms witnesses, padded-note secrets,
+  and PIR rows only; `delegate::setup` builds the PCZT later from the persisted
+  padded secrets and refuses to overwrite existing padded secrets or
+  `pczt_sighash`.
+- `DelegationKeys::with_hotkey_bytes` no longer accepts `consensus_branch_id`;
+  `delegate::setup` now resolves it through a caller-supplied
+  `BranchIdProvider`. Delegation proof progress is reported via
+  `DelegationStageReporter`, while generic vote proof progress uses
+  `ProgressReporter`.
 - Vote recovery state is now guarded by durable vote identity. Stale recovery
   JSON, helper-share rows, tx hashes, and vote commitment tree positions cannot
   be attached to a replacement vote after the voter changes intent.

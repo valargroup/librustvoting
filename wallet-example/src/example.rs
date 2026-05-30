@@ -6,26 +6,25 @@ use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
     bundle_notes_for_index, delegation_submission, display_memo, gather_delegation_lwd_inputs,
     gather_delegation_wallet_inputs, precompute_delegation, raw_bundle_weight, redact_for_signer,
-    setup_delegation, spend_auth_signature, take_prepared_setup, DelegationSigner,
-    DelegationSubmission, GatherDelegationWalletParams, KeystoneSigningRequest, NoopCancellation,
-    NoopProgressReporter, PrecomputeDelegationInputs, PreparedDelegationReport, VotingDb,
-    VotingHotkey,
+    setup_delegation, spend_auth_signature, DelegationSigner, DelegationSubmission,
+    GatherDelegationWalletParams, KeystoneSigningRequest, NoopCancellation, NoopProgressReporter,
+    PrecomputeDelegationInputs, PreparedDelegationReport, VotingDb, VotingHotkey,
 };
 use zcash_voting::{HyperTransport, PirClientBlocking, VotingRoundParams};
 
 /// Human-readable precompute stages printed by the runnable example.
 pub const PRECOMPUTE_FLOW: &[&str] = &[
-    "Resolve lightwalletd anchor tree state and consensus branch id for the round.",
+    "Resolve lightwalletd anchor tree state for the round.",
     "Gather snapshot-eligible Orchard notes and account key material from the wallet DB.",
     "Connect to the PIR endpoint selected for the round snapshot.",
     "Build PrecomputeDelegationInputs with the full round note set and target bundle index.",
-    "Call precompute_delegation to persist witnesses, PIR rows, and prepared PCZT state.",
+    "Call precompute_delegation to persist witnesses, padded-note secrets, and PIR rows.",
 ];
 
 /// Human-readable seed-signed delegation stages printed by the runnable example.
 pub const DELEGATION_FLOW: &[&str] = &[
     "Re-resolve lightwalletd and wallet inputs for the selected delegation bundle.",
-    "Reuse the prepared governance PCZT, or build one if the warm cache is cold.",
+    "Build and persist the governance PCZT for the selected delegation bundle.",
     "Generate the delegation proof from stored witnesses and PIR precompute rows.",
     "Sign the stored PCZT sighash with the wallet seed signer.",
     "Assemble the chain-ready DelegationSubmission for the bundle.",
@@ -126,10 +125,9 @@ where
     let round_params = lwd_inputs.round_params;
     let resolved_round_name = lwd_inputs.resolved_round_name;
     let anchor_tree_state_bytes = lwd_inputs.anchor_tree_state_bytes;
-    let branch_id_provider = lwd_inputs.branch_id_provider;
 
     // 2. Select the Orchard notes that were eligible at the round snapshot and
-    // load the account key material needed to build the governance PCZT.
+    // load the account material used by the later delegation signing step.
     let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
         wallet_db,
         account_uuid: request.account_uuid,
@@ -148,28 +146,26 @@ where
 
     // 4. Build the high-level precompute request. Pass the full round note set;
     // the crate will create all bundles and then warm only `bundle_index`.
-    let progress = NoopProgressReporter;
     let inputs = PrecomputeDelegationInputs {
         round_params: &round_params,
         session_json: None,
         bundle_index: request.bundle_index,
         round_note_infos: &wallet_inputs.round_note_infos,
         anchor_tree_state_bytes: &wallet_inputs.anchor_tree_state_bytes,
-        keys: &wallet_inputs.delegation_keys,
-        branch_id_provider: &branch_id_provider,
+        network: request.voting_hotkey.network(),
         cancellation: &cancellation,
     };
 
     // 5. Warm persistent artifacts used by the later delegation proof step:
-    // round rows, note witnesses, PIR rows, and the prepared governance PCZT.
-    precompute_delegation(voting_db, wallet_db, inputs, &pir_client, &progress)
+    // round rows, note witnesses, padded-note secrets, and PIR rows.
+    precompute_delegation(voting_db, wallet_db, inputs, &pir_client)
         .context("precompute delegation bundle")
 }
 
 /// Example wallet-side orchestration for proving and seed-signing one bundle.
 ///
-/// This continues from precomputed voting DB state: witnesses, PIR rows, and the
-/// governance PCZT should already be warmed for the target bundle.
+/// This continues from precomputed voting DB state: witnesses, padded-note
+/// secrets, and PIR rows should already be warmed for the target bundle.
 pub async fn prove_and_submit_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
     wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
@@ -221,30 +217,18 @@ where
     )
     .context("derive delegation bundle notes")?;
 
-    // 3. Consume the warmed PCZT setup if precompute inserted one. Falling back
-    // keeps the example runnable when the process-local cache has expired.
+    // 3. Build the key-dependent PCZT now that the wallet is ready to sign.
     let progress = NoopProgressReporter;
-    let _delegation_setup = match take_prepared_setup(
+    let _delegation_setup = setup_delegation(
         voting_db,
         &round_id,
         request.bundle_index,
-        &wallet_inputs.delegation_keys,
         &bundle_note_infos,
+        &wallet_inputs.delegation_keys,
+        &branch_id_provider,
+        &progress,
     )
-    .context("take prepared delegation setup")?
-    {
-        Some(setup) => setup,
-        None => setup_delegation(
-            voting_db,
-            &round_id,
-            request.bundle_index,
-            &bundle_note_infos,
-            &wallet_inputs.delegation_keys,
-            &branch_id_provider,
-            &progress,
-        )
-        .context("setup delegation bundle")?,
-    };
+    .context("setup delegation bundle")?;
 
     // 4. Generate the proof using the witnesses and PIR rows warmed by
     // precompute_delegation_bundle.
