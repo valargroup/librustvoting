@@ -134,6 +134,13 @@ pub struct SignedVoteCommitment {
     pub commitment_bundle_json: String,
 }
 
+/// Signed vote commitments produced for one delegation bundle.
+#[derive(Clone, Debug)]
+pub struct SignedVoteCommitments {
+    pub bundle_index: u32,
+    pub commitments: Vec<SignedVoteCommitment>,
+}
+
 /// Committed cast-vote handle for the post-commit lifecycle.
 ///
 /// This wraps the signed commitment payload with the round and bundle keys used
@@ -340,6 +347,70 @@ impl CommittedVote {
             vc_tree_position,
         )
     }
+}
+
+fn ensure_not_cancelled(cancellation: &dyn crate::types::Cancellation) -> Result<(), VotingError> {
+    if cancellation.is_cancelled() {
+        Err(VotingError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// Builds signed vote commitments for every draft in one bundle.
+///
+/// This validates the draft list and bundle index once, then commits each draft
+/// in order while honoring cancellation checks between expensive operations.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_batch(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    drafts: &[DraftVote],
+    witness: &VanWitness,
+    signer: VoteSigner<'_>,
+    cancellation: &dyn crate::types::Cancellation,
+    stages: &dyn crate::types::VoteCommitStageReporter,
+) -> Result<SignedVoteCommitments, VotingError> {
+    validate_draft_votes(drafts)?;
+    let bundle_count = db.get_bundle_count(round_id)?;
+    crate::round::validate_bundle_index(bundle_count, bundle_index, "voting")?;
+    ensure_not_cancelled(cancellation)?;
+
+    let mut commitments = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        ensure_not_cancelled(cancellation)?;
+        let committed = CommittedVote::commit(
+            db,
+            round_id,
+            bundle_index,
+            draft,
+            witness,
+            signer,
+            stages,
+        )?;
+        ensure_not_cancelled(cancellation)?;
+        commitments.push(committed.signed_commitment(db)?);
+    }
+
+    Ok(SignedVoteCommitments {
+        bundle_index,
+        commitments,
+    })
+}
+
+/// Recovers one persisted vote commitment as a single-item batch result.
+pub fn recover_signed_commitments(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<SignedVoteCommitments, VotingError> {
+    let committed = CommittedVote::recover(db, round_id, bundle_index, proposal_id)?;
+    Ok(SignedVoteCommitments {
+        bundle_index,
+        commitments: vec![committed.signed_commitment(db)?],
+    })
 }
 
 /// Lifecycle events emitted while building one cast-vote commitment.
@@ -1365,7 +1436,7 @@ mod tests {
     use crate::{
         round::RoundParams,
         storage::{queries, VotingDb},
-        types::{NoopProgressReporter, NoteInfo, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS},
+        types::{Cancellation, NoopCancellation, NoopProgressReporter, NoteInfo, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS},
     };
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -1978,6 +2049,130 @@ mod tests {
         assert_eq!(signed.r_vpk, [0x15; 32]);
         assert_eq!(signed.vote_auth_sig, [0x17; 64]);
         assert_eq!(signed.commitment_bundle_json, recovery_json);
+    }
+
+    #[test]
+    fn commit_batch_returns_signed_commitments_for_bundle() {
+        let db = db_with_vote();
+        let mut recovery = recovery_bundle_fixture();
+        recovery.share_blinds = vec![scalar_bytes(1), scalar_bytes(2)];
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &serialize_recovery(&recovery).unwrap(),
+        )
+        .unwrap();
+
+        let result = commit_batch(
+            &db,
+            ROUND_ID,
+            0,
+            &[DraftVote {
+                proposal_id: 1,
+                choice: 2,
+                num_options: 3,
+                single_share: false,
+                vc_tree_position: 456,
+            }],
+            &VanWitness {
+                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                position: 7,
+                anchor_height: 123,
+            },
+            VoteSigner::HotkeySeed {
+                seed: &[0x99; 32],
+                network: Network::Testnet,
+            },
+            &NoopCancellation,
+            &NoopProgressReporter,
+        )
+        .unwrap();
+
+        assert_eq!(result.bundle_index, 0);
+        assert_eq!(result.commitments.len(), 1);
+        assert_eq!(result.commitments[0].proposal_id, 1);
+        assert_eq!(result.commitments[0].choice, 2);
+    }
+
+    #[test]
+    fn recover_signed_commitments_returns_single_item_batch() {
+        let db = db_with_vote();
+        let mut recovery = recovery_bundle_fixture();
+        recovery.share_blinds = vec![scalar_bytes(1), scalar_bytes(2)];
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        let recovery_json = serialize_recovery(&recovery).unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            recovery.bundle_index,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &recovery_json,
+        )
+        .unwrap();
+
+        let signed = recover_signed_commitments(&db, ROUND_ID, 0, 1).unwrap();
+        assert_eq!(signed.bundle_index, 0);
+        assert_eq!(signed.commitments.len(), 1);
+        assert_eq!(signed.commitments[0].commitment_bundle_json, recovery_json);
+    }
+
+    #[test]
+    fn commit_batch_respects_cancellation() {
+        struct AlwaysCancelled;
+        impl Cancellation for AlwaysCancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+
+        let db = db_with_vote();
+        let err = commit_batch(
+            &db,
+            ROUND_ID,
+            0,
+            &[draft_vote_fixture()],
+            &VanWitness {
+                auth_path: [[0xAA; 32]; VAN_AUTH_PATH_LEN],
+                position: 7,
+                anchor_height: 123,
+            },
+            VoteSigner::HotkeySeed {
+                seed: &[0x99; 32],
+                network: Network::Testnet,
+            },
+            &AlwaysCancelled,
+            &NoopProgressReporter,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VotingError::Cancelled));
     }
 
     #[test]

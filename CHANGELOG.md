@@ -9,6 +9,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added `vote::SignedVoteCommitments`, `vote::commit_batch`, and
+  `vote::recover_signed_commitments` so wallet SDKs can commit and recover
+  per-bundle cast-vote batches through one crate-owned entry point instead of
+  reimplementing per-draft loops and recovery wrapping.
+- Added atomic idempotent recovery writers on `VotingDb`:
+  `mark_delegation_submitted`, `mark_delegation_confirmed`,
+  `mark_vote_submitted`, and `mark_vote_confirmed`, including conflict checks
+  for tx hashes and stored vote/delegation positions.
 - Added `vote::SignedVoteCommitment` plus
   `CommittedVote::signed_commitment` as the canonical wallet-facing aggregate
   for cast-vote outputs. The API now exposes submission fields, helper-share
@@ -139,6 +147,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- The wallet vote example now includes `commit_vote_bundle_batch`, showing the
+  canonical batch cast-vote flow with `vote::commit_batch` and crate-owned
+  cancellation/progress adapters.
 - Removed crate-side wallet seed APIs from voting hotkey derivation and
   delegation signing. Wallet SDKs now derive scoped voting hotkey seed material
   and delegation signatures locally, then pass only hotkey seeds or signatures

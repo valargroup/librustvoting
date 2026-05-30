@@ -17,6 +17,7 @@ use orchard::{
     primitives::redpallas::{Signature, SpendAuth, VerificationKey},
 };
 use pasta_curves::pallas;
+use rusqlite::{named_params, OptionalExtension, Transaction};
 use voting_circuits::delegation::{synthetic_padding_note_parts, ImtProofData};
 use zcash_keys::keys::UnifiedFullViewingKey;
 
@@ -1251,6 +1252,121 @@ impl VotingDb {
         )
     }
 
+    /// Atomically records a delegation transaction hash with idempotency checks.
+    pub fn mark_delegation_submitted(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        tx_hash: &str,
+    ) -> Result<(), VotingError> {
+        let wallet_id = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("begin delegation submitted transaction failed: {e}"),
+        })?;
+        let stored = queries::get_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index)?;
+        check_text_conflict(stored.as_deref(), tx_hash, "delegation tx_hash")?;
+        queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit delegation submitted transaction failed: {e}"),
+        })
+    }
+
+    /// Atomically records delegation confirmation with tx hash and VAN position.
+    pub fn mark_delegation_confirmed(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        tx_hash: &str,
+        van_leaf_position: u32,
+    ) -> Result<(), VotingError> {
+        let wallet_id = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("begin delegation confirmed transaction failed: {e}"),
+        })?;
+        let stored_hash = queries::get_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index)?;
+        check_text_conflict(stored_hash.as_deref(), tx_hash, "delegation tx_hash")?;
+        check_i64_conflict(
+            load_bundle_i64(&tx, round_id, &wallet_id, bundle_index, "van_leaf_position")?,
+            i64::from(van_leaf_position),
+            "delegation van_leaf_position",
+        )?;
+        queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
+        queries::store_van_position(&tx, round_id, &wallet_id, bundle_index, van_leaf_position)?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit delegation confirmed transaction failed: {e}"),
+        })
+    }
+
+    /// Atomically records a vote transaction hash with idempotency checks.
+    pub fn mark_vote_submitted(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        tx_hash: &str,
+    ) -> Result<(), VotingError> {
+        let wallet_id = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("begin vote submitted transaction failed: {e}"),
+        })?;
+        let stored = queries::get_vote_tx_hash(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
+        check_text_conflict(stored.as_deref(), tx_hash, "vote tx_hash")?;
+        queries::record_vote_submission(
+            &tx,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            tx_hash,
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit vote submitted transaction failed: {e}"),
+        })
+    }
+
+    /// Atomically records vote confirmation fields and commitment tree position.
+    pub fn mark_vote_confirmed(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        tx_hash: &str,
+        van_position: u32,
+        vc_tree_position: u64,
+    ) -> Result<(), VotingError> {
+        let wallet_id = self.wallet_id();
+        {
+            let mut conn = self.conn();
+            let tx = conn.transaction().map_err(|e| VotingError::Internal {
+                message: format!("begin vote confirmed transaction failed: {e}"),
+            })?;
+            let stored_hash =
+                queries::get_vote_tx_hash(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
+            check_text_conflict(stored_hash.as_deref(), tx_hash, "vote tx_hash")?;
+            let (_, stored_position) =
+                load_vote_recovery_fields(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
+            check_vote_position_conflict(stored_position, vc_tree_position)?;
+            queries::record_vote_submission(
+                &tx,
+                round_id,
+                &wallet_id,
+                bundle_index,
+                proposal_id,
+                tx_hash,
+            )?;
+            queries::store_van_position(&tx, round_id, &wallet_id, bundle_index, van_position)?;
+            tx.commit().map_err(|e| VotingError::Internal {
+                message: format!("commit vote confirmed transaction failed: {e}"),
+            })?;
+        }
+
+        crate::vote::CommittedVote::recover(self, round_id, bundle_index, proposal_id)?
+            .record_vc_position(self, vc_tree_position)
+    }
+
     pub fn get_commitment_bundle(
         &self,
         round_id: &str,
@@ -1394,6 +1510,107 @@ impl VotingDb {
             share_index,
             new_urls,
         )
+    }
+}
+
+/// Loads one nullable integer column from a bundle row inside an existing tx.
+///
+/// The `column` argument must be a trusted static column name, not user input.
+fn load_bundle_i64(
+    tx: &Transaction<'_>,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    column: &str,
+) -> Result<Option<i64>, VotingError> {
+    let sql = format!(
+        "SELECT {column} FROM bundles
+         WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index"
+    );
+    tx.query_row(
+        &sql,
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("load bundle field failed: {e}"),
+    })?
+    .ok_or_else(|| VotingError::InvalidInput {
+        message: format!("bundle_index {bundle_index} not found"),
+    })
+}
+
+/// Loads nullable vote recovery fields for conflict checks inside a transaction.
+fn load_vote_recovery_fields(
+    tx: &Transaction<'_>,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<(Option<String>, Option<i64>), VotingError> {
+    tx.query_row(
+        "SELECT commitment_bundle_json, vc_tree_position FROM votes
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+        },
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map_err(|e| VotingError::InvalidInput {
+        message: format!(
+            "vote row not found for bundle_index {bundle_index}, proposal_id {proposal_id}: {e}"
+        ),
+    })
+}
+
+/// Accepts missing or matching text fields and rejects conflicting values.
+fn check_text_conflict(existing: Option<&str>, requested: &str, field: &str) -> Result<(), VotingError> {
+    if let Some(existing) = existing {
+        if existing != requested {
+            return Err(VotingError::InvalidInput {
+                message: format!("{field} conflict: stored {existing}, requested {requested}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Accepts missing or matching integer fields and rejects conflicting values.
+fn check_i64_conflict(existing: Option<i64>, requested: i64, field: &str) -> Result<(), VotingError> {
+    if let Some(existing) = existing {
+        if existing != requested {
+            return Err(VotingError::InvalidInput {
+                message: format!("{field} conflict: stored {existing}, requested {requested}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Accepts missing or matching vote tree positions.
+///
+/// Older builds stored `0` as a pre-confirmation placeholder because the
+/// position was not yet available. Treat that value as unset when replacing it
+/// with the chain-confirmed position.
+fn check_vote_position_conflict(existing: Option<i64>, requested: u64) -> Result<(), VotingError> {
+    let requested = i64::try_from(requested).map_err(|_| VotingError::InvalidInput {
+        message: format!("vc_tree_position {requested} does not fit in i64"),
+    })?;
+    match existing {
+        None | Some(0) => Ok(()),
+        Some(existing) if existing == requested => Ok(()),
+        Some(existing) => Err(VotingError::InvalidInput {
+            message: format!("vote vc_tree_position conflict: stored {existing}, requested {requested}"),
+        }),
     }
 }
 
@@ -2411,6 +2628,156 @@ mod tests {
             .record_vote_submission(ROUND_ID, 0, 99, "vote-tx")
             .unwrap_err();
         assert!(matches!(err, VotingError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn test_mark_recovery_writes_are_idempotent_and_conflict_checked() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+
+        db.mark_delegation_submitted(ROUND_ID, 0, "delegation-tx")
+            .unwrap();
+        db.mark_delegation_submitted(ROUND_ID, 0, "delegation-tx")
+            .unwrap();
+        let delegation_tx_conflict = db
+            .mark_delegation_submitted(ROUND_ID, 0, "delegation-tx-2")
+            .unwrap_err();
+        assert!(delegation_tx_conflict
+            .to_string()
+            .contains("delegation tx_hash conflict"));
+
+        db.mark_delegation_confirmed(ROUND_ID, 0, "delegation-tx", 7)
+            .unwrap();
+        db.mark_delegation_confirmed(ROUND_ID, 0, "delegation-tx", 7)
+            .unwrap();
+        let delegation_van_conflict = db
+            .mark_delegation_confirmed(ROUND_ID, 0, "delegation-tx", 8)
+            .unwrap_err();
+        assert!(delegation_van_conflict
+            .to_string()
+            .contains("delegation van_leaf_position conflict"));
+
+        db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx").unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx").unwrap();
+        let vote_tx_conflict = db
+            .mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx-2")
+            .unwrap_err();
+        assert!(vote_tx_conflict.to_string().contains("vote tx_hash conflict"));
+    }
+
+    #[test]
+    fn test_mark_vote_confirmed_happy_path_records_all_fields() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        let recovery_json = crate::vote::serialize_recovery(&crate::vote::VoteRecoveryBundle {
+            vote_round_id: ROUND_ID.to_string(),
+            bundle_index: 0,
+            proposal_id: 1,
+            vote_decision: 0,
+            anchor_height: 123,
+            vc_tree_position: 0,
+            single_share: false,
+            num_options: 2,
+            van_nullifier: [0x10; 32],
+            vote_authority_note_new: [0x11; 32],
+            vote_commitment: [0x12; 32],
+            proof: vec![0x13; 64],
+            shares_hash: [0x14; 32],
+            r_vpk: [0x15; 32],
+            alpha_v: [0x16; 32],
+            vote_auth_sig: [0x17; 64],
+            encrypted_shares: vec![
+                EncryptedShare {
+                    c1: vec![0x21; 32],
+                    c2: vec![0x22; 32],
+                    share_index: 0,
+                    plaintext_value: 5,
+                    randomness: vec![0x23; 32],
+                },
+                EncryptedShare {
+                    c1: vec![0x31; 32],
+                    c2: vec![0x32; 32],
+                    share_index: 1,
+                    plaintext_value: 6,
+                    randomness: vec![0x33; 32],
+                },
+            ],
+            share_blinds: vec![[0x41; 32], [0x42; 32]],
+            share_comms: vec![[0x51; 32], [0x52; 32]],
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE votes SET commitment_bundle_json = :json
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                 AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+                rusqlite::named_params! {
+                    ":json": recovery_json,
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": W,
+                    ":bundle_index": 0i64,
+                    ":proposal_id": 1i64,
+                },
+            )
+            .unwrap();
+
+        db.mark_vote_confirmed(ROUND_ID, 0, 1, "vote-tx", 5, 9)
+            .unwrap();
+        db.mark_vote_confirmed(ROUND_ID, 0, 1, "vote-tx", 5, 9)
+            .unwrap();
+
+        assert_eq!(
+            db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
+            Some("vote-tx")
+        );
+        let conn = db.conn();
+        let van_position: Option<i64> = conn
+            .query_row(
+                "SELECT van_leaf_position FROM bundles
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                 AND bundle_index = :bundle_index",
+                rusqlite::named_params! {
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": W,
+                    ":bundle_index": 0i64,
+                },
+                |row| row.get(0),
+            )
+            .unwrap();
+        let vc_position: Option<i64> = conn
+            .query_row(
+                "SELECT vc_tree_position FROM votes
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                 AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+                rusqlite::named_params! {
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": W,
+                    ":bundle_index": 0i64,
+                    ":proposal_id": 1i64,
+                },
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(van_position, Some(5));
+        assert_eq!(vc_position, Some(9));
+    }
+
+    #[test]
+    fn test_vote_position_conflict_accepts_legacy_zero_placeholder() {
+        check_vote_position_conflict(None, 42).unwrap();
+        check_vote_position_conflict(Some(0), 42).unwrap();
+        check_vote_position_conflict(Some(42), 42).unwrap();
+
+        let err = check_vote_position_conflict(Some(41), 42).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("vote vc_tree_position conflict"));
     }
 
     #[test]
