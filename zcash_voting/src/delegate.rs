@@ -5,6 +5,7 @@
 //! chain submission data, and record chain recovery data.
 
 pub use crate::phases::DelegationPhase;
+use crate::storage::KeystoneSignatureRecord;
 
 use std::borrow::Borrow;
 
@@ -19,6 +20,8 @@ use crate::{
     round::{BundleLayout, RoundParams, VotingDb},
     types::{DelegationProgressReporter, Network, NoteInfo, VotingError, VotingHotkey},
 };
+use orchard::primitives::redpallas::{Signature, SpendAuth, VerificationKey};
+
 use zcash_client_backend::data_api::{Account, WalletRead};
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_protocol::consensus::{NetworkConstants, Parameters};
@@ -97,6 +100,32 @@ impl DelegationKeys {
             hotkey.network(),
             round_name,
         )
+    }
+
+    pub(crate) fn binding_hash(&self, consensus_branch_id: u32) -> [u8; 32] {
+        const DOMAIN: &[u8] = b"zcash-voting-delegation-key-binding-v1";
+
+        fn update_len_prefixed(state: &mut blake2b_simd::State, value: &[u8]) {
+            state.update(&(value.len() as u64).to_le_bytes());
+            state.update(value);
+        }
+
+        let mut state = blake2b_simd::Params::new().hash_length(32).to_state();
+        state.update(DOMAIN);
+        update_len_prefixed(&mut state, &self.fvk_bytes);
+        update_len_prefixed(&mut state, &self.hotkey_raw_address);
+        update_len_prefixed(&mut state, &self.seed_fingerprint);
+        state.update(&self.account_index.to_le_bytes());
+        state.update(&self.address_index.to_le_bytes());
+        state.update(&(self.network as u8).to_le_bytes());
+        state.update(&self.coin_type.to_le_bytes());
+        update_len_prefixed(&mut state, self.round_name.as_bytes());
+        state.update(&consensus_branch_id.to_le_bytes());
+
+        let hash = state.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(hash.as_bytes());
+        out
     }
 }
 
@@ -779,6 +808,12 @@ pub fn setup(
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationSetup, VotingError> {
     let consensus_branch_id = branch_id_provider.consensus_branch_id()?;
+    db.validate_delegation_setup_context(round_id, bundle_index, notes, keys, consensus_branch_id)?;
+    if let Some(setup) = db.get_delegation_setup(round_id, bundle_index)? {
+        stages.on_progress(DelegationProgress::PcztBuilt);
+        return Ok(setup);
+    }
+
     stages.on_progress(DelegationProgress::PcztBuilding);
     let pczt =
         db.build_governance_pczt(round_id, bundle_index, notes, keys, consensus_branch_id)?;
@@ -897,6 +932,109 @@ pub fn spend_auth_signature(
     action_index: usize,
 ) -> Result<[u8; 64], VotingError> {
     crate::action::extract_spend_auth_sig(signed_pczt_bytes, action_index)
+}
+
+/// Validates and stores a Keystone-signed delegation PCZT response.
+///
+/// This helper owns the request/signed-response checks that wallets otherwise
+/// tend to duplicate: it verifies the signed PCZT sighash against the prepared
+/// request and stored setup, extracts the governance SpendAuth signature, and
+/// persists the typed signature record idempotently.
+pub fn accept_keystone_signature(
+    db: &VotingDb,
+    round_id: &str,
+    request: &KeystoneSigningRequest,
+    signed_pczt_bytes: &[u8],
+) -> Result<KeystoneSignatureRecord, VotingError> {
+    let signed_sighash = pczt_sighash(signed_pczt_bytes)?;
+    let request_sighash = array32_slice("request.pczt_sighash", &request.pczt_sighash)?;
+    if signed_sighash != request_sighash {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "signed PCZT sighash does not match delegation request for bundle {}",
+                request.bundle_index
+            ),
+        });
+    }
+
+    let request_rk = array32_slice("request.rk", &request.rk)?;
+    let setup = db
+        .get_delegation_setup(round_id, request.bundle_index)?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "no delegation setup for round={}, bundle={}",
+                round_id, request.bundle_index
+            ),
+        })?;
+    if setup.pczt_sighash != request_sighash {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "delegation request sighash does not match stored setup for bundle {}",
+                request.bundle_index
+            ),
+        });
+    }
+    if setup.rk != request_rk {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "delegation request rk does not match stored setup for bundle {}",
+                request.bundle_index
+            ),
+        });
+    }
+    if setup.action_index != request.action_index as usize {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "delegation request action_index does not match stored setup for bundle {}",
+                request.bundle_index
+            ),
+        });
+    }
+
+    let sig = spend_auth_signature(signed_pczt_bytes, request.action_index as usize)?;
+    verify_spend_auth_signature(&setup.rk, &signed_sighash, &sig)?;
+    for existing in db.get_keystone_signatures(round_id)? {
+        if existing.sighash == signed_sighash {
+            if existing.bundle_index == request.bundle_index && existing.rk.as_slice() == setup.rk {
+                return Ok(existing);
+            }
+            return Err(VotingError::InvalidInput {
+                message: "keystone signature was already accepted for another bundle".to_string(),
+            });
+        }
+    }
+
+    db.store_keystone_signature(
+        round_id,
+        request.bundle_index,
+        &sig,
+        &signed_sighash,
+        &setup.rk,
+    )?;
+
+    Ok(KeystoneSignatureRecord {
+        bundle_index: request.bundle_index,
+        sig: sig.to_vec(),
+        sighash: signed_sighash.to_vec(),
+        rk: setup.rk.to_vec(),
+    })
+}
+
+fn verify_spend_auth_signature(
+    rk: &[u8; 32],
+    sighash: &[u8; 32],
+    signature: &[u8; 64],
+) -> Result<(), VotingError> {
+    let verification_key =
+        VerificationKey::<SpendAuth>::try_from(*rk).map_err(|_| VotingError::Internal {
+            message: "rk is not a valid SpendAuth verification key".to_string(),
+        })?;
+    verification_key
+        .verify(sighash, &Signature::<SpendAuth>::from(*signature))
+        .map_err(|_| VotingError::InvalidInput {
+            message: "signature does not verify against stored delegation rk and sighash"
+                .to_string(),
+        })
 }
 
 /// Redacts delegation PCZT metadata that signer devices do not need.
@@ -1020,6 +1158,7 @@ fn array64_slice(label: &str, value: &[u8]) -> Result<[u8; 64], VotingError> {
 mod tests {
     use super::*;
 
+    use ff::PrimeField;
     use orchard::{
         note::{RandomSeed, Rho},
         value::NoteValue,
@@ -1028,10 +1167,12 @@ mod tests {
     use secrecy::{ExposeSecret, SecretVec};
     use zcash_client_backend::data_api::{chain::ChainState, AccountBirthday, WalletWrite};
     use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db};
+    use zcash_keys::keys::UnifiedSpendingKey;
     use zcash_primitives::block::BlockHash;
     use zcash_protocol::consensus::{
         Network as ZcashNetwork, NetworkConstants, NetworkUpgrade, Parameters,
     };
+    use zip32::AccountId;
     use zip32::Scope;
 
     fn test_voting_hotkey() -> VotingHotkey {
@@ -1058,6 +1199,64 @@ mod tests {
         assert_eq!(named.round_name, "Demo Round");
         assert_eq!(fallback.round_name, params.vote_round_id);
         assert_eq!(voting_db.list_rounds().unwrap().len(), 1);
+    }
+
+    struct TestCryptoRng(u8);
+
+    impl rand::RngCore for TestCryptoRng {
+        fn next_u32(&mut self) -> u32 {
+            u32::from_le_bytes([self.0; 4])
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            u64::from_le_bytes([self.0; 8])
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.fill(self.0);
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl rand::CryptoRng for TestCryptoRng {}
+
+    fn test_spend_auth_signature(
+        seed: &[u8],
+        request: DelegationSigningRequest,
+        rng_byte: u8,
+    ) -> [u8; 64] {
+        let account = AccountId::try_from(request.account_index).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&request.network, seed, account).unwrap();
+        let sk = *usk.orchard();
+        let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
+        let alpha = Option::<pasta_curves::pallas::Scalar>::from(
+            pasta_curves::pallas::Scalar::from_repr(request.alpha),
+        )
+        .unwrap();
+        let rsk = ask.randomize(&alpha);
+        let sig = rsk.sign(&mut TestCryptoRng(rng_byte), &request.sighash);
+        (&sig).into()
+    }
+
+    fn test_signed_pczt_bytes(request: &KeystoneSigningRequest, sig: [u8; 64]) -> Vec<u8> {
+        test_signed_pczt_bytes_at_action_index(request, sig, request.action_index as usize)
+    }
+
+    fn test_signed_pczt_bytes_at_action_index(
+        request: &KeystoneSigningRequest,
+        sig: [u8; 64],
+        action_index: usize,
+    ) -> Vec<u8> {
+        let pczt = pczt::Pczt::parse(&request.pczt_bytes).unwrap();
+        let mut signer = pczt::roles::signer::Signer::new(pczt).unwrap();
+        signer
+            .apply_orchard_signature(action_index, Signature::<SpendAuth>::from(sig))
+            .unwrap();
+        signer.finish().serialize()
     }
 
     #[test]
@@ -1107,6 +1306,167 @@ mod tests {
         assert!(err.contains("pczt_bytes sighash does not match delegation signer sighash"));
     }
 
+    #[test]
+    fn prepared_setup_reuses_persisted_pczt() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        let first = prepared
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let second = prepared
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn prepared_setup_rejects_cached_pczt_with_different_hotkey() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        prepared
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+
+        let other_hotkey =
+            crate::hotkey::voting_hotkey_from_seed(&[0x88; 64], Network::Testnet).unwrap();
+        let mut mismatched = prepared.clone();
+        mismatched.delegation_keys = DelegationKeys::with_voting_hotkey(
+            prepared.delegation_keys.fvk_bytes.clone(),
+            &other_hotkey,
+            prepared.delegation_keys.seed_fingerprint,
+            prepared.delegation_keys.account_index,
+            prepared.delegation_keys.round_name.clone(),
+        )
+        .unwrap();
+
+        let err = mismatched
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("delegation setup key binding mismatch"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn spend_auth_signature_verification_rejects_wrong_sighash() {
+        use orchard::{
+            keys::{SpendAuthorizingKey, SpendingKey},
+            primitives::redpallas::{SpendAuth, VerificationKey},
+        };
+
+        let sk = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
+        let ask = SpendAuthorizingKey::from(&sk);
+        let rsk = ask.randomize(&pasta_curves::pallas::Scalar::from(7));
+        let rk: [u8; 32] = (&VerificationKey::<SpendAuth>::from(&rsk)).into();
+        let signed_sighash = [0xAB; 32];
+        let other_sighash = [0xCD; 32];
+        let mut rng = rand::rngs::OsRng;
+        let sig = rsk.sign(&mut rng, &signed_sighash);
+        let sig: [u8; 64] = (&sig).into();
+
+        verify_spend_auth_signature(&rk, &signed_sighash, &sig).unwrap();
+        let err = verify_spend_auth_signature(&rk, &other_sighash, &sig)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("signature does not verify"), "{err}");
+    }
+
+    #[test]
+    fn accept_keystone_signature_rejects_action_index_mismatch_without_storing() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        let mut request = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        request.action_index += 1;
+
+        let err = accept_keystone_signature(
+            &voting_db,
+            &prepared.round_id,
+            &request,
+            &request.pczt_bytes,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("action_index"), "{err}");
+        assert!(voting_db
+            .get_keystone_signatures(&prepared.round_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn accept_keystone_signature_treats_same_bundle_resignature_as_idempotent() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        let request = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let signing_request = prepared.signing_request(&voting_db).unwrap();
+        assert_eq!(signing_request.sighash.to_vec(), request.pczt_sighash);
+
+        let seed = [7u8; 32];
+        let first_sig = test_spend_auth_signature(&seed, signing_request, 1);
+        let second_sig = test_spend_auth_signature(&seed, signing_request, 2);
+        assert_ne!(first_sig, second_sig);
+
+        let first_pczt = test_signed_pczt_bytes(&request, first_sig);
+        let second_pczt = test_signed_pczt_bytes(&request, second_sig);
+
+        let first =
+            accept_keystone_signature(&voting_db, &prepared.round_id, &request, &first_pczt)
+                .unwrap();
+        let second =
+            accept_keystone_signature(&voting_db, &prepared.round_id, &request, &second_pczt)
+                .unwrap();
+
+        assert_eq!(second, first);
+        let signatures = voting_db
+            .get_keystone_signatures(&prepared.round_id)
+            .unwrap();
+        assert_eq!(signatures, vec![first]);
+    }
+
+    #[test]
+    fn accept_keystone_signature_rejects_signature_missing_at_action_index() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        let request = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let signing_request = prepared.signing_request(&voting_db).unwrap();
+        let sig = test_spend_auth_signature(&[7u8; 32], signing_request, 1);
+        let signed_pczt = test_signed_pczt_bytes(&request, sig);
+        let pczt = pczt::Pczt::parse(&signed_pczt).unwrap();
+        let wrong_pczt = pczt::roles::redactor::Redactor::new(pczt)
+            .redact_orchard_with(|mut redactor| {
+                redactor.redact_action(request.action_index as usize, |mut action| {
+                    action.clear_spend_auth_sig();
+                });
+            })
+            .finish()
+            .serialize();
+
+        let err = accept_keystone_signature(&voting_db, &prepared.round_id, &request, &wrong_pczt)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("action index"), "{err}");
+        assert!(voting_db
+            .get_keystone_signatures(&prepared.round_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn prepared_signer_signature_from_bytes_validates_shape() {
+        let signer = PreparedSigner::signature_from_bytes(&[1; 64], &[2; 32]).unwrap();
+        assert_eq!(signer, PreparedSigner::signature([1; 64], [2; 32]));
+
+        assert!(PreparedSigner::signature_from_bytes(&[1; 63], &[2; 32]).is_err());
+        assert!(PreparedSigner::signature_from_bytes(&[1; 64], &[2; 31]).is_err());
+    }
     #[test]
     fn prepared_bundle_metadata_uses_quantized_weight() {
         let divisor = crate::governance::BALLOT_DIVISOR;

@@ -11,7 +11,7 @@ use rusqlite::{named_params, OptionalExtension, Transaction};
 use voting_circuits::delegation::{synthetic_padding_note_parts, ImtProofData};
 use zcash_keys::keys::UnifiedFullViewingKey;
 
-use crate::delegate::{DelegationKeys, DelegationSigningRequest};
+use crate::delegate::{DelegationKeys, DelegationSetup, DelegationSigningRequest};
 use crate::governance::BUNDLE_NOTE_SLOTS;
 use crate::note_bundling::ChunkResult;
 use crate::storage::queries;
@@ -265,6 +265,24 @@ fn verify_witnesses(witnesses: &[WitnessData]) -> Result<(), VotingError> {
     Ok(())
 }
 
+fn witnesses_equal(left: &[WitnessData], right: &[WitnessData]) -> bool {
+    fn key(witness: &WitnessData) -> (u64, &[u8]) {
+        (witness.position, witness.note_commitment.as_slice())
+    }
+
+    let mut left = left.iter().collect::<Vec<_>>();
+    let mut right = right.iter().collect::<Vec<_>>();
+    left.sort_by(|a, b| key(a).cmp(&key(b)));
+    right.sort_by(|a, b| key(a).cmp(&key(b)));
+
+    left.into_iter().zip(right).all(|(a, b)| {
+        a.position == b.position
+            && a.note_commitment == b.note_commitment
+            && a.root == b.root
+            && a.auth_path == b.auth_path
+    })
+}
+
 impl VotingDb {
     // --- Round management ---
 
@@ -486,6 +504,78 @@ impl VotingDb {
         })
     }
 
+    /// Load a previously persisted PCZT setup for a delegation bundle.
+    pub fn get_delegation_setup(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<Option<DelegationSetup>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let Some(setup) =
+            queries::load_delegation_setup_data(&conn, round_id, &wallet_id, bundle_index)?
+        else {
+            return Ok(None);
+        };
+        if setup.delegation_key_binding_hash.len() != 32 {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "delegation_key_binding_hash must be 32 bytes, got {}",
+                    setup.delegation_key_binding_hash.len()
+                ),
+            });
+        }
+
+        Ok(Some(DelegationSetup {
+            pczt_bytes: setup.pczt_bytes,
+            pczt_sighash: setup.pczt_sighash.as_slice().try_into().map_err(|_| {
+                VotingError::Internal {
+                    message: format!(
+                        "pczt_sighash must be 32 bytes, got {}",
+                        setup.pczt_sighash.len()
+                    ),
+                }
+            })?,
+            rk: setup
+                .rk
+                .as_slice()
+                .try_into()
+                .map_err(|_| VotingError::Internal {
+                    message: format!("rk must be 32 bytes, got {}", setup.rk.len()),
+                })?,
+            action_index: setup.action_index,
+            action_bytes: setup.action_bytes,
+        }))
+    }
+
+    /// Validates caller-owned setup inputs before a cached PCZT setup is reused.
+    pub fn validate_delegation_setup_context(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        notes: &[NoteInfo],
+        keys: &DelegationKeys,
+        consensus_branch_id: u32,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
+        let Some(stored_hash) =
+            queries::load_delegation_key_binding_hash(&conn, round_id, &wallet_id, bundle_index)?
+        else {
+            return Ok(());
+        };
+        let expected_hash = keys.binding_hash(consensus_branch_id);
+        if stored_hash.as_slice() != expected_hash.as_slice() {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "delegation setup key binding mismatch for round={round_id}, bundle={bundle_index}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Build a governance-specific PCZT for Keystone signing.
     /// Loads round params from db. Notes come from caller.
     /// Computes governance values and builds a PCZT whose single Orchard action
@@ -546,8 +636,12 @@ impl VotingDb {
             keys.address_index,
             &result.padded_note_secrets,
             &result.pczt_sighash,
+            &result.pczt_bytes,
+            result.action_index,
+            &result.action_bytes,
             &result.rk,
             &result.gov_nullifiers,
+            &keys.binding_hash(consensus_branch_id),
         )?;
         Ok(result)
     }
@@ -621,12 +715,14 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
 
         let cached_count = queries::witness_count(&conn, round_id, &wallet_id, bundle_index)?;
-        // Return early if already cached
-        if cached_count == witnesses.len() {
-            return Ok(());
-        }
-
         verify_witnesses(witnesses)?;
+
+        if cached_count == witnesses.len() {
+            let cached = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
+            if witnesses_equal(&cached, witnesses) {
+                return Ok(());
+            }
+        }
 
         if cached_count == 0 {
             queries::store_witnesses(&conn, round_id, &wallet_id, bundle_index, witnesses)
@@ -1422,8 +1518,38 @@ impl VotingDb {
         sighash: &[u8],
         rk: &[u8],
     ) -> Result<(), VotingError> {
+        if sig.len() != 64 {
+            return Err(VotingError::InvalidInput {
+                message: format!("sig must be 64 bytes, got {}", sig.len()),
+            });
+        }
+        if sighash.len() != 32 {
+            return Err(VotingError::InvalidInput {
+                message: format!("sighash must be 32 bytes, got {}", sighash.len()),
+            });
+        }
+        if rk.len() != 32 {
+            return Err(VotingError::InvalidInput {
+                message: format!("rk must be 32 bytes, got {}", rk.len()),
+            });
+        }
+
         let conn = self.conn();
         let wallet_id = self.wallet_id();
+        if let Some(existing) =
+            queries::get_keystone_signature(&conn, round_id, &wallet_id, bundle_index)?
+        {
+            if existing.sig == sig && existing.sighash == sighash && existing.rk == rk {
+                return Ok(());
+            }
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "refusing to overwrite keystone signature for round={}, bundle={}",
+                    round_id, bundle_index
+                ),
+            });
+        }
+
         queries::store_keystone_signature(
             &conn,
             round_id,
@@ -1614,6 +1740,11 @@ fn check_text_conflict(
     requested: &str,
     field: &str,
 ) -> Result<(), VotingError> {
+    if requested.trim().is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: format!("{field} must not be empty"),
+        });
+    }
     if let Some(existing) = existing {
         if existing != requested {
             return Err(VotingError::InvalidInput {
@@ -1995,16 +2126,27 @@ mod tests {
             .build_governance_pczt(ROUND_ID, 0, &[note_info.clone()], &keys, 0xC8E71055)
             .unwrap();
 
-        let conn = db.conn();
-        let stored_dummy = queries::load_dummy_nullifiers(&conn, ROUND_ID, W, 0).unwrap();
-        let padded_secrets = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).unwrap();
-        let pir_nullifiers =
-            padded_nullifiers_for_circuit(&[note_info], &padded_secrets, Network::Testnet).unwrap();
+        let (stored_dummy, pir_nullifiers) = {
+            let conn = db.conn();
+            let stored_dummy = queries::load_dummy_nullifiers(&conn, ROUND_ID, W, 0).unwrap();
+            let padded_secrets = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).unwrap();
+            let pir_nullifiers =
+                padded_nullifiers_for_circuit(&[note_info], &padded_secrets, Network::Testnet)
+                    .unwrap();
+            (stored_dummy, pir_nullifiers)
+        };
 
         assert_eq!(result.padded_note_secrets, warmed_again);
         assert_eq!(precompute_nullifiers, result.dummy_nullifiers);
         assert_eq!(stored_dummy, result.dummy_nullifiers);
         assert_eq!(pir_nullifiers, result.dummy_nullifiers);
+
+        let stored_setup = db.get_delegation_setup(ROUND_ID, 0).unwrap().unwrap();
+        assert_eq!(stored_setup.pczt_bytes, result.pczt_bytes);
+        assert_eq!(stored_setup.pczt_sighash.to_vec(), result.pczt_sighash);
+        assert_eq!(stored_setup.rk.to_vec(), result.rk);
+        assert_eq!(stored_setup.action_index, result.action_index);
+        assert_eq!(stored_setup.action_bytes, result.action_bytes);
     }
 
     #[test]
@@ -2417,8 +2559,12 @@ mod tests {
             0,
             &[],
             &[0x06; 32],
+            &[0x07; 64],
+            0,
+            &[0x08; 32],
             &rk,
             &gov_nullifiers,
+            &[0x09; 32],
         )
         .unwrap();
 
@@ -2595,8 +2741,8 @@ mod tests {
             valid_field_tree_witness(0, 7),
             valid_field_tree_witness(1, 8),
         ];
-        // This second store is a no-op because the complete bundle already has cached rows;
-        // replacement below is what actually overwrites the cache.
+        // Same-sized witness sets still need content comparison. A stale cache
+        // is replaced rather than treated as complete.
         db.store_witnesses(ROUND_ID, 0, &ignored).unwrap();
 
         {
@@ -2605,6 +2751,8 @@ mod tests {
             assert_eq!(loaded.len(), 2);
             assert_eq!(loaded[0].position, 0);
             assert_eq!(loaded[1].position, 1);
+            assert_eq!(loaded[0].note_commitment, ignored[0].note_commitment);
+            assert_eq!(loaded[1].note_commitment, ignored[1].note_commitment);
         }
 
         let replacement = vec![
@@ -2651,6 +2799,31 @@ mod tests {
         assert_eq!(loaded[1].position, 1);
         assert_eq!(loaded[0].note_commitment, original[0].note_commitment);
         assert_eq!(loaded[1].note_commitment, original[1].note_commitment);
+    }
+
+    #[test]
+    fn store_keystone_signature_is_idempotent_but_not_replaceable() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+        {
+            let conn = db.conn();
+            queries::insert_bundle(&conn, ROUND_ID, W, 0, &[0]).unwrap();
+        }
+
+        db.store_keystone_signature(ROUND_ID, 0, &[1; 64], &[2; 32], &[3; 32])
+            .unwrap();
+        db.store_keystone_signature(ROUND_ID, 0, &[1; 64], &[2; 32], &[3; 32])
+            .unwrap();
+
+        let err = db
+            .store_keystone_signature(ROUND_ID, 0, &[4; 64], &[2; 32], &[3; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to overwrite keystone signature"));
+
+        let signatures = db.get_keystone_signatures(ROUND_ID).unwrap();
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].sig, vec![1; 64]);
     }
 
     #[test]
@@ -2710,6 +2883,11 @@ mod tests {
             .unwrap();
         db.mark_delegation_submitted(ROUND_ID, 0, "delegation-tx")
             .unwrap();
+        let empty_delegation_tx = db.mark_delegation_submitted(ROUND_ID, 0, "");
+        assert!(empty_delegation_tx
+            .unwrap_err()
+            .to_string()
+            .contains("delegation tx_hash must not be empty"));
         let delegation_tx_conflict = db
             .mark_delegation_submitted(ROUND_ID, 0, "delegation-tx-2")
             .unwrap_err();
@@ -2730,6 +2908,11 @@ mod tests {
 
         db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx").unwrap();
         db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx").unwrap();
+        let empty_vote_tx = db.mark_vote_submitted(ROUND_ID, 0, 1, "");
+        assert!(empty_vote_tx
+            .unwrap_err()
+            .to_string()
+            .contains("vote tx_hash must not be empty"));
         let vote_tx_conflict = db
             .mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx-2")
             .unwrap_err();
