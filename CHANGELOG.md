@@ -9,6 +9,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added canonical wire JSON types in `zcash_voting::wire`
+  (`DelegationSubmissionWire`, `VoteCommitmentWire`, `VoteShareWire`,
+  `WireEncryptedShareJson`) so wallets can reuse one source of truth for
+  protocol field names, serde renames, and base64/JSON-safe shaping instead of
+  reimplementing submission serializers. The wire API now includes
+  `VoteShareWire::with_late_bound` for safely applying runtime
+  `tree_position`/`submit_at` values while preserving the crate-owned JSON
+  integer bounds checks.
 - Added a stable `recovery` reporting API so wallets can fetch one typed round
   snapshot from `zcash_voting` instead of reassembling recovery state with
   low-level SQL. New exports include `recovery::round_snapshot`,

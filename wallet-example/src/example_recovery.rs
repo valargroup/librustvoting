@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use zcash_voting::prelude::{
-    resume_plan, round_snapshot, CommittedVote, NextStep, RoundPlan, RoundRecoverySnapshot, VotingDb,
+    resume_plan, round_snapshot, CommittedVote, NextStep, RoundPlan, RoundRecoverySnapshot,
+    VotingDb,
 };
 
 /// One round-level recovery payload fetched in a single caller entrypoint.

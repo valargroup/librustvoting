@@ -1312,7 +1312,8 @@ impl VotingDb {
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("begin vote submitted transaction failed: {e}"),
         })?;
-        let stored = queries::get_vote_tx_hash(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
+        let stored =
+            queries::get_vote_tx_hash(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
         check_text_conflict(stored.as_deref(), tx_hash, "vote tx_hash")?;
         queries::record_vote_submission(
             &tx,
@@ -1391,7 +1392,13 @@ impl VotingDb {
     ) -> Result<Option<(Option<String>, Option<i64>)>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        queries::get_commitment_bundle_recovery(&conn, round_id, &wallet_id, bundle_index, proposal_id)
+        queries::get_commitment_bundle_recovery(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+        )
     }
 
     pub fn store_keystone_signature(
@@ -1589,7 +1596,11 @@ fn load_vote_recovery_fields(
 }
 
 /// Accepts missing or matching text fields and rejects conflicting values.
-fn check_text_conflict(existing: Option<&str>, requested: &str, field: &str) -> Result<(), VotingError> {
+fn check_text_conflict(
+    existing: Option<&str>,
+    requested: &str,
+    field: &str,
+) -> Result<(), VotingError> {
     if let Some(existing) = existing {
         if existing != requested {
             return Err(VotingError::InvalidInput {
@@ -1601,7 +1612,11 @@ fn check_text_conflict(existing: Option<&str>, requested: &str, field: &str) -> 
 }
 
 /// Accepts missing or matching integer fields and rejects conflicting values.
-fn check_i64_conflict(existing: Option<i64>, requested: i64, field: &str) -> Result<(), VotingError> {
+fn check_i64_conflict(
+    existing: Option<i64>,
+    requested: i64,
+    field: &str,
+) -> Result<(), VotingError> {
     if let Some(existing) = existing {
         if existing != requested {
             return Err(VotingError::InvalidInput {
@@ -1625,7 +1640,9 @@ fn check_vote_position_conflict(existing: Option<i64>, requested: u64) -> Result
         None | Some(0) => Ok(()),
         Some(existing) if existing == requested => Ok(()),
         Some(existing) => Err(VotingError::InvalidInput {
-            message: format!("vote vc_tree_position conflict: stored {existing}, requested {requested}"),
+            message: format!(
+                "vote vc_tree_position conflict: stored {existing}, requested {requested}"
+            ),
         }),
     }
 }
@@ -2650,7 +2667,8 @@ mod tests {
     fn test_mark_recovery_writes_are_idempotent_and_conflict_checked() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
 
@@ -2681,14 +2699,17 @@ mod tests {
         let vote_tx_conflict = db
             .mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx-2")
             .unwrap_err();
-        assert!(vote_tx_conflict.to_string().contains("vote tx_hash conflict"));
+        assert!(vote_tx_conflict
+            .to_string()
+            .contains("vote tx_hash conflict"));
     }
 
     #[test]
     fn test_mark_vote_confirmed_happy_path_records_all_fields() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
         let recovery_json = crate::vote::serialize_recovery(&crate::vote::VoteRecoveryBundle {
@@ -2788,7 +2809,8 @@ mod tests {
     fn test_get_commitment_bundle_recovery_fields_reports_pending_position() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[identity_test_note()]).unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
         db.conn()
@@ -2821,9 +2843,7 @@ mod tests {
         check_vote_position_conflict(Some(42), 42).unwrap();
 
         let err = check_vote_position_conflict(Some(41), 42).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("vote vc_tree_position conflict"));
+        assert!(err.to_string().contains("vote vc_tree_position conflict"));
     }
 
     #[test]
