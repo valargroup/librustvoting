@@ -73,11 +73,16 @@ impl Network {
 
     /// Derives an Orchard spending key from ZIP-32 seed material.
     ///
+    /// Deprecated for wallet account seeds. Wallet integrations should derive
+    /// account keys in wallet-owned code and pass this crate only scoped voting
+    /// hotkey seed material or externally produced delegation signatures.
+    ///
     /// # Errors
     ///
     /// Returns [`VotingError::InvalidInput`] when `seed` is too short, when
     /// `account_index` is not a valid ZIP-32 account id, or when the Zcash key
     /// derivation fails.
+    #[deprecated(note = "derive wallet account keys outside zcash_voting")]
     pub fn orchard_spending_key_from_seed(
         self,
         seed: &[u8],
@@ -584,7 +589,10 @@ pub struct DelegationSubmissionData {
     pub gov_nullifiers: Vec<Vec<u8>>,
     pub alpha: Vec<u8>,
     pub vote_round_id: String,
-    /// Spend auth signature over sighash (64 bytes). Computed from seed + alpha.
+    /// Spend auth signature over sighash (64 bytes).
+    ///
+    /// Legacy seed paths compute this from `seed + alpha`; new integrations pass
+    /// an externally produced SpendAuth signature.
     pub spend_auth_sig: Vec<u8>,
     /// Canonical sighash (32 bytes). Blake2b-256 of domain-separated fields.
     pub sighash: Vec<u8>,

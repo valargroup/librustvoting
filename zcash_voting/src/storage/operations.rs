@@ -14,12 +14,13 @@ use ff::PrimeField;
 use orchard::{
     keys::FullViewingKey,
     note::{RandomSeed, Rho},
+    primitives::redpallas::{Signature, SpendAuth, VerificationKey},
 };
 use pasta_curves::pallas;
 use voting_circuits::delegation::{synthetic_padding_note_parts, ImtProofData};
 use zcash_keys::keys::UnifiedFullViewingKey;
 
-use crate::delegate::DelegationKeys;
+use crate::delegate::{DelegationKeys, DelegationSigningRequest};
 use crate::governance::BUNDLE_NOTE_SLOTS;
 use crate::note_bundling::ChunkResult;
 use crate::storage::queries;
@@ -81,6 +82,37 @@ fn delegation_nullifier_targets(
     }
 
     Ok(targets)
+}
+
+fn verify_delegation_spend_auth_signature(
+    rk: &[u8],
+    sighash: &[u8],
+    signature: &[u8],
+) -> Result<(), VotingError> {
+    let rk_bytes: [u8; 32] = rk.try_into().map_err(|_| VotingError::Internal {
+        message: format!("rk must be 32 bytes, got {}", rk.len()),
+    })?;
+    let sighash_bytes: [u8; 32] = sighash.try_into().map_err(|_| VotingError::Internal {
+        message: format!("pczt_sighash must be 32 bytes, got {}", sighash.len()),
+    })?;
+    let signature_bytes: [u8; 64] =
+        signature
+            .try_into()
+            .map_err(|_| VotingError::InvalidInput {
+                message: format!("signature must be 64 bytes, got {}", signature.len()),
+            })?;
+
+    let verification_key =
+        VerificationKey::<SpendAuth>::try_from(rk_bytes).map_err(|_| VotingError::Internal {
+            message: "rk is not a valid SpendAuth verification key".to_string(),
+        })?;
+    let sig = Signature::<SpendAuth>::from(signature_bytes);
+    verification_key
+        .verify(&sighash_bytes, &sig)
+        .map_err(|_| VotingError::InvalidInput {
+            message: "signature does not verify against stored delegation rk and sighash"
+                .to_string(),
+        })
 }
 
 #[cfg(any(feature = "pir", feature = "client-pir"))]
@@ -432,6 +464,41 @@ impl VotingDb {
         network: crate::types::Network,
     ) -> Result<VotingHotkey, VotingError> {
         crate::hotkey::voting_hotkey_from_seed(seed, network)
+    }
+
+    /// Load the account-scoped data needed to sign a persisted delegation PCZT.
+    ///
+    /// `keys` must be the same [`DelegationKeys`] used for PCZT setup. The
+    /// prepared-bundle API enforces that by carrying the original keys across
+    /// setup and signing request construction.
+    pub fn get_delegation_signing_request(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        keys: &DelegationKeys,
+    ) -> Result<DelegationSigningRequest, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let sighash = queries::load_pczt_sighash(&conn, round_id, &wallet_id, bundle_index)?;
+        let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
+
+        Ok(DelegationSigningRequest {
+            account_index: keys.account_index,
+            network: keys.network,
+            seed_fingerprint: keys.seed_fingerprint,
+            sighash: sighash
+                .as_slice()
+                .try_into()
+                .map_err(|_| VotingError::Internal {
+                    message: format!("pczt_sighash must be 32 bytes, got {}", sighash.len()),
+                })?,
+            alpha: alpha
+                .as_slice()
+                .try_into()
+                .map_err(|_| VotingError::Internal {
+                    message: format!("alpha must be 32 bytes, got {}", alpha.len()),
+                })?,
+        })
     }
 
     /// Build a governance-specific PCZT for Keystone signing.
@@ -1044,6 +1111,8 @@ impl VotingDb {
     /// This method loads them, derives the sender's SpendingKey from seed, loads the
     /// ZIP-244 sighash (stored during PCZT construction), signs it, and returns
     /// everything the chain needs.
+    #[deprecated(note = "sign locally and use get_delegation_submission_with_signature instead")]
+    #[allow(deprecated)]
     pub fn get_delegation_submission(
         &self,
         round_id: &str,
@@ -1109,29 +1178,50 @@ impl VotingDb {
         })
     }
 
-    /// Reconstruct the delegation TX payload using a Keystone-provided signature.
+    /// Reconstruct the delegation TX payload using an externally provided signature.
     ///
     /// Unlike `get_delegation_submission`, this does NOT derive `ask` from a seed
-    /// or re-sign. Instead, it uses the externally-provided Keystone signature
-    /// and the ZIP-244 sighash that Keystone signed.
-    pub fn get_delegation_submission_with_keystone_sig(
+    /// or re-sign. Instead, it uses the externally provided SpendAuth signature
+    /// and the ZIP-244 sighash that the wallet signer signed.
+    pub fn get_delegation_submission_with_signature(
         &self,
         round_id: &str,
         bundle_index: u32,
-        keystone_sig: &[u8],
-        keystone_sighash: &[u8],
+        signature: &[u8],
+        sighash: &[u8],
     ) -> Result<DelegationSubmissionData, VotingError> {
-        if keystone_sig.len() != 64 {
-            return Err(VotingError::InvalidInput {
-                message: format!("keystone_sig must be 64 bytes, got {}", keystone_sig.len()),
-            });
-        }
-        if keystone_sighash.len() != 32 {
+        self.get_delegation_submission_with_checked_signature(
+            round_id,
+            bundle_index,
+            signature,
+            sighash,
+            "signature",
+            "sighash",
+            "sighash does not match stored PCZT sighash",
+        )
+    }
+
+    fn get_delegation_submission_with_checked_signature(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        signature: &[u8],
+        sighash: &[u8],
+        signature_label: &str,
+        sighash_label: &str,
+        mismatch_message: &str,
+    ) -> Result<DelegationSubmissionData, VotingError> {
+        if signature.len() != 64 {
             return Err(VotingError::InvalidInput {
                 message: format!(
-                    "keystone_sighash must be 32 bytes, got {}",
-                    keystone_sighash.len()
+                    "{signature_label} must be 64 bytes, got {}",
+                    signature.len()
                 ),
+            });
+        }
+        if sighash.len() != 32 {
+            return Err(VotingError::InvalidInput {
+                message: format!("{sighash_label} must be 32 bytes, got {}", sighash.len()),
             });
         }
 
@@ -1148,11 +1238,12 @@ impl VotingDb {
                 ),
             });
         }
-        if stored_sighash.as_slice() != keystone_sighash {
+        if stored_sighash.as_slice() != sighash {
             return Err(VotingError::InvalidInput {
-                message: "keystone_sighash does not match stored PCZT sighash".to_string(),
+                message: mismatch_message.to_string(),
             });
         }
+        verify_delegation_spend_auth_signature(&data.rk, &stored_sighash, signature)?;
 
         Ok(DelegationSubmissionData {
             proof: data.proof,
@@ -1163,9 +1254,31 @@ impl VotingDb {
             gov_nullifiers: data.gov_nullifiers,
             alpha: data.alpha,
             vote_round_id: data.vote_round_id,
-            spend_auth_sig: keystone_sig.to_vec(),
+            spend_auth_sig: signature.to_vec(),
             sighash: stored_sighash,
         })
+    }
+
+    /// Reconstruct the delegation TX payload using a Keystone-provided signature.
+    ///
+    /// Deprecated alias for [`VotingDb::get_delegation_submission_with_signature`].
+    #[deprecated(note = "use get_delegation_submission_with_signature instead")]
+    pub fn get_delegation_submission_with_keystone_sig(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        keystone_sig: &[u8],
+        keystone_sighash: &[u8],
+    ) -> Result<DelegationSubmissionData, VotingError> {
+        self.get_delegation_submission_with_checked_signature(
+            round_id,
+            bundle_index,
+            keystone_sig,
+            keystone_sighash,
+            "keystone_sig",
+            "keystone_sighash",
+            "keystone_sighash does not match stored PCZT sighash",
+        )
     }
 
     /// Delete bundle rows with index >= `keep_count`, so that only the first
@@ -1381,6 +1494,7 @@ impl VotingDb {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -1423,6 +1537,54 @@ mod tests {
             "test-round".to_string(),
         )
         .unwrap()
+    }
+
+    fn test_randomized_spendauth_signature(
+        seed: &[u8],
+        account_index: u32,
+        alpha: &pallas::Scalar,
+        sighash: &[u8; 32],
+    ) -> ([u8; 32], [u8; 64]) {
+        use orchard::{
+            keys::{SpendAuthorizingKey, SpendingKey},
+            primitives::redpallas::{SpendAuth, VerificationKey},
+        };
+        use zcash_keys::keys::UnifiedSpendingKey;
+        use zcash_protocol::consensus::TEST_NETWORK;
+        use zip32::AccountId;
+
+        let account = AccountId::try_from(account_index).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, seed, account).unwrap();
+        let sk: SpendingKey = *usk.orchard();
+        let ask = SpendAuthorizingKey::from(&sk);
+        let rsk = ask.randomize(alpha);
+        let rk: [u8; 32] = (&VerificationKey::<SpendAuth>::from(&rsk)).into();
+        let mut rng = rand::rngs::OsRng;
+        let sig = rsk.sign(&mut rng, sighash);
+
+        (rk, (&sig).into())
+    }
+
+    fn sign_delegation_request(seed: &[u8], request: &DelegationSigningRequest) -> [u8; 64] {
+        use orchard::keys::SpendAuthorizingKey;
+        use zcash_keys::keys::UnifiedSpendingKey;
+        use zip32::{fingerprint::SeedFingerprint, AccountId};
+
+        let seed_fingerprint = SeedFingerprint::from_seed(seed)
+            .expect("test seed length is valid")
+            .to_bytes();
+        assert_eq!(seed_fingerprint, request.seed_fingerprint);
+        let account = AccountId::try_from(request.account_index).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&request.network, seed, account).unwrap();
+        let sk = *usk.orchard();
+        let ask = SpendAuthorizingKey::from(&sk);
+        let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(request.alpha))
+            .expect("test stores a valid alpha scalar");
+        let rsk = ask.randomize(&alpha);
+        let mut rng = rand::rngs::OsRng;
+        let sig = rsk.sign(&mut rng, &request.sighash);
+
+        (&sig).into()
     }
 
     fn identity_test_note() -> NoteInfo {
@@ -2566,14 +2728,99 @@ mod tests {
     }
 
     #[test]
-    fn test_get_delegation_submission_with_keystone_sig_requires_stored_sighash() {
+    fn test_delegation_signing_request_signature_path_submits() {
+        use orchard::{note::Rho, value::NoteValue};
+        use rand::rngs::OsRng;
+        use zcash_keys::keys::UnifiedSpendingKey;
+        use zcash_protocol::consensus::TEST_NETWORK;
+        use zip32::{fingerprint::SeedFingerprint, AccountId, Scope};
+
+        struct StaticBranchId(u32);
+
+        impl crate::delegate::BranchIdProvider for StaticBranchId {
+            fn consensus_branch_id(&self) -> Result<u32, VotingError> {
+                Ok(self.0)
+            }
+        }
+
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+
+        let sender_seed = [0x42; 32];
+        let account_index = 0;
+        let account = AccountId::try_from(account_index).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &sender_seed, account).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key();
+        let fvk = ufvk.orchard().unwrap().clone();
+        let address = fvk.address_at(0u32, Scope::External);
+        let mut rng = OsRng;
+        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+        let note = orchard::Note::new(
+            address,
+            NoteValue::from_raw(13_000_000),
+            Rho::from_nf_old(parent_note.nullifier(&fvk)),
+            &mut rng,
+        );
+        let note_info =
+            NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &TEST_NETWORK).unwrap();
+        db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
+
+        let voting_hotkey =
+            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
+                .unwrap();
+        let seed_fingerprint = SeedFingerprint::from_seed(&sender_seed).unwrap().to_bytes();
+        let keys = test_delegation_keys(
+            fvk.to_bytes().to_vec(),
+            &voting_hotkey,
+            seed_fingerprint,
+            account_index,
+        );
+        let setup = crate::delegate::setup(
+            &db,
+            ROUND_ID,
+            0,
+            &[note_info],
+            &keys,
+            &StaticBranchId(0xC8E71055),
+            &crate::types::NoopProgressReporter,
+        )
+        .unwrap();
+        queries::store_proof(&db.conn(), ROUND_ID, W, 0, &[0xAC; 96]).unwrap();
+
+        let request = crate::delegate::signing_request(&db, ROUND_ID, 0, &keys).unwrap();
+        assert_eq!(request.account_index, account_index);
+        assert_eq!(request.network, crate::types::Network::Testnet);
+        assert_eq!(request.seed_fingerprint, seed_fingerprint);
+        assert_eq!(request.sighash, setup.pczt_sighash);
+
+        let signature = sign_delegation_request(&sender_seed, &request);
+        let submission = crate::delegate::submission(
+            &db,
+            ROUND_ID,
+            0,
+            crate::delegate::DelegationSigner::signature(signature, request.sighash),
+        )
+        .unwrap();
+
+        assert_eq!(submission.rk, setup.rk);
+        assert_eq!(submission.sighash, setup.pczt_sighash);
+        assert_eq!(submission.spend_auth_sig, signature);
+    }
+
+    #[test]
+    fn test_get_delegation_submission_with_signature_requires_stored_sighash() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
         let stored_sighash = [0x99; 32];
         let wrong_sighash = [0x98; 32];
-        let keystone_sig = [0x42; 64];
-        let rk = [0xAB; 32];
+        let alpha = pallas::Scalar::from(7);
+        let alpha_bytes = alpha.to_repr();
+        let sender_seed = [0x42; 64];
+        let (rk, signature) =
+            test_randomized_spendauth_signature(&sender_seed, 0, &alpha, &stored_sighash);
+        let (_, wrong_signature) =
+            test_randomized_spendauth_signature(&sender_seed, 1, &alpha, &stored_sighash);
 
         {
             let conn = db.conn();
@@ -2589,7 +2836,7 @@ mod tests {
                 &[],
                 &[0x33; 32],
                 &[0x44; 32],
-                &[0x55; 32],
+                &alpha_bytes,
                 &[0x66; 32],
                 &[0x77; 32],
                 &[0x88; 32],
@@ -2615,22 +2862,55 @@ mod tests {
         }
 
         let err = db
-            .get_delegation_submission_with_keystone_sig(ROUND_ID, 0, &keystone_sig, &wrong_sighash)
+            .get_delegation_submission_with_signature(ROUND_ID, 0, &signature, &wrong_sighash)
             .expect_err("mismatched sighash must fail");
         assert!(matches!(err, VotingError::InvalidInput { .. }));
         assert!(err
             .to_string()
-            .contains("keystone_sighash does not match stored PCZT sighash"));
+            .contains("sighash does not match stored PCZT sighash"));
 
-        let submission = db
-            .get_delegation_submission_with_keystone_sig(
+        #[allow(deprecated)]
+        {
+            let err = db
+                .get_delegation_submission_with_keystone_sig(
+                    ROUND_ID,
+                    0,
+                    &signature[..63],
+                    &stored_sighash,
+                )
+                .expect_err("legacy short signature label must be preserved");
+            assert!(err.to_string().contains("keystone_sig must be 64 bytes"));
+
+            let err = db
+                .get_delegation_submission_with_keystone_sig(
+                    ROUND_ID,
+                    0,
+                    &signature,
+                    &wrong_sighash,
+                )
+                .expect_err("legacy mismatched sighash label must be preserved");
+            assert!(err
+                .to_string()
+                .contains("keystone_sighash does not match stored PCZT sighash"));
+        }
+
+        let err = db
+            .get_delegation_submission_with_signature(
                 ROUND_ID,
                 0,
-                &keystone_sig,
+                &wrong_signature,
                 &stored_sighash,
             )
+            .expect_err("wrong account signature must fail");
+        assert!(matches!(err, VotingError::InvalidInput { .. }));
+        assert!(err
+            .to_string()
+            .contains("signature does not verify against stored delegation rk and sighash"));
+
+        let submission = db
+            .get_delegation_submission_with_signature(ROUND_ID, 0, &signature, &stored_sighash)
             .unwrap();
-        assert_eq!(submission.spend_auth_sig, keystone_sig.to_vec());
+        assert_eq!(submission.spend_auth_sig, signature.to_vec());
         assert_eq!(submission.sighash, stored_sighash.to_vec());
     }
 

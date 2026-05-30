@@ -10,11 +10,12 @@ pub use crate::delegate::gather_delegation_lwd_inputs;
 pub use crate::delegate::LightwalletdBranchIdProvider;
 pub use crate::delegate::{
     branch_id_for_height, display_memo, load_account_keys, pczt_sighash, record_submission,
-    record_van_position, redact_for_signer, setup as setup_delegation, spend_auth_signature,
+    record_van_position, redact_for_signer, setup as setup_delegation,
+    signing_request as delegation_signing_request, spend_auth_signature,
     submission as delegation_submission, BranchIdProvider, DelegationAccountKeys, DelegationKeys,
     DelegationPhase, DelegationProgress, DelegationProof, DelegationSetup, DelegationSigner,
-    DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport, PreparedSigner,
-    SignedDelegationBundle,
+    DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
+    PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
 };
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::delegate::{
@@ -22,9 +23,11 @@ pub use crate::delegate::{
 };
 pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
+#[allow(deprecated)]
+pub use crate::hotkey::{derive_voting_hotkey, HotkeyDerivationContext};
 pub use crate::hotkey::{
-    derive_voting_hotkey, generate_random_voting_hotkey, voting_hotkey_from_seed,
-    HotkeyDerivationContext, VOTING_HOTKEY_ACCOUNT_INDEX, VOTING_HOTKEY_ADDRESS_INDEX,
+    generate_random_voting_hotkey, voting_hotkey_from_seed, VOTING_HOTKEY_ACCOUNT_INDEX,
+    VOTING_HOTKEY_ADDRESS_INDEX,
 };
 pub use crate::note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
 pub use crate::phases::{SharePhase, VotePhase};

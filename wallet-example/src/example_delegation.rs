@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use ff::PrimeField;
+use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Parameters;
 use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
     gather_delegation_lwd_inputs, prepare_delegation_bundle as prepare_bundle_state,
-    spend_auth_signature, DelegationSubmission, KeystoneSigningRequest, NoopCancellation,
-    NoopProgressReporter, PrepareDelegationBundleParams, PreparedDelegationBundle,
-    PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
+    spend_auth_signature, DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
+    NoopCancellation, NoopProgressReporter, PrepareDelegationBundleParams,
+    PreparedDelegationBundle, PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
 };
 use zcash_voting::{BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams};
+use zip32::{fingerprint::SeedFingerprint, AccountId};
 
 /// Inputs for preparing one reusable delegation bundle context.
 ///
@@ -29,7 +32,7 @@ pub struct PrepareRequest<'a> {
 /// Resolves lightwalletd and wallet inputs for later delegation operations.
 ///
 /// This is the only example entry point that touches lightwalletd. The returned
-/// context is plain data that can be reused by precompute, seed signing, and
+/// context is plain data that can be reused by precompute, software signing, and
 /// Keystone flows.
 ///
 /// # Errors
@@ -98,7 +101,7 @@ where
         .context("precompute delegation bundle")
 }
 
-/// Proves one precomputed delegation bundle and signs it with the wallet seed.
+/// Proves one precomputed delegation bundle and signs it in wallet-owned code.
 ///
 /// The returned `DelegationSubmission` contains the chain-ready fields for the
 /// selected bundle. The function expects the target bundle's witnesses,
@@ -119,17 +122,19 @@ pub fn prove_and_submit_delegation_bundle(
     let _delegation_setup = prepared
         .setup(voting_db, &progress)
         .context("setup delegation bundle")?;
+    let signing_request = prepared
+        .signing_request(voting_db)
+        .context("load delegation signing request")?;
+    let (sig, sighash) = sign_delegation_request(seed, signing_request)?;
 
     let pir_client = connect_pir(pir_server_url)?;
     prepared
         .prove(voting_db, &pir_client, &progress)
         .context("prove delegation bundle")?;
 
-    // Real wallet apps should keep the seed in a secret container; this example
-    // reads raw bytes from env.
     prepared
-        .submission(voting_db, PreparedSigner::Seed { seed })
-        .context("assemble seed-signed delegation submission")
+        .submission(voting_db, PreparedSigner::signature(sig, sighash))
+        .context("assemble signed delegation submission")
 }
 
 /// Builds the redacted Keystone signing request for one delegation bundle.
@@ -158,7 +163,7 @@ pub fn build_keystone_delegation_request(
 ///
 /// This function does not rebuild the governance PCZT. It extracts Keystone's
 /// SpendAuth signature from `signed_pczt_bytes` and pairs it with the original
-/// setup sighash from `signing_request`.
+/// setup sighash from `keystone_request`.
 ///
 /// # Errors
 ///
@@ -168,7 +173,7 @@ pub fn prove_and_submit_keystone_delegation_bundle(
     voting_db: &VotingDb,
     prepared: &PreparedDelegationBundle,
     pir_server_url: &str,
-    signing_request: &KeystoneSigningRequest,
+    keystone_request: &KeystoneSigningRequest,
     signed_pczt_bytes: &[u8],
 ) -> Result<DelegationSubmission> {
     // Generate the proof using warmed witnesses and PIR rows, without
@@ -180,13 +185,44 @@ pub fn prove_and_submit_keystone_delegation_bundle(
         .context("prove delegation bundle")?;
 
     // Pair Keystone's SpendAuth signature with the original setup sighash.
-    let sig = spend_auth_signature(signed_pczt_bytes, signing_request.setup.action_index)
+    let sig = spend_auth_signature(signed_pczt_bytes, keystone_request.setup.action_index)
         .context("extract Keystone SpendAuth signature")?;
-    let sighash = signing_request.setup.pczt_sighash;
+    let sighash = keystone_request.setup.pczt_sighash;
 
     prepared
-        .submission(voting_db, PreparedSigner::Keystone { sig, sighash })
+        .submission(voting_db, PreparedSigner::signature(sig, sighash))
         .context("assemble Keystone-signed delegation submission")
+}
+
+fn sign_delegation_request(
+    seed: &[u8],
+    request: DelegationSigningRequest,
+) -> Result<([u8; 64], [u8; 32])> {
+    // Real wallet integrations should route to the seed identified by
+    // request.seed_fingerprint before signing. This example verifies that the
+    // already selected seed matches the request.
+    let seed_fingerprint = SeedFingerprint::from_seed(seed)
+        .ok_or_else(|| anyhow::anyhow!("wallet seed length is not valid for ZIP-32"))?;
+    if seed_fingerprint.to_bytes() != request.seed_fingerprint {
+        return Err(anyhow::anyhow!(
+            "wallet seed fingerprint does not match delegation signing request"
+        ));
+    }
+
+    let account = AccountId::try_from(request.account_index)
+        .map_err(|_| anyhow::anyhow!("invalid account_index {}", request.account_index))?;
+    let usk = UnifiedSpendingKey::from_seed(&request.network, seed, account)
+        .context("derive account unified spending key")?;
+    let sk = *usk.orchard();
+    let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
+    let alpha = Option::<pasta_curves::pallas::Scalar>::from(
+        pasta_curves::pallas::Scalar::from_repr(request.alpha),
+    )
+    .ok_or_else(|| anyhow::anyhow!("delegation alpha is not a valid Pallas scalar"))?;
+    let rsk = ask.randomize(&alpha);
+    let mut rng = rand::rngs::OsRng;
+    let sig = rsk.sign(&mut rng, &request.sighash);
+    Ok(((&sig).into(), request.sighash))
 }
 
 fn connect_pir(pir_server_url: &str) -> Result<PirClientBlocking> {

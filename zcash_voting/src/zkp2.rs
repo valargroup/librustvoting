@@ -44,6 +44,7 @@ const VOTE_PROOF_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// * `anchor_height` - Block height at which the tree was snapshotted.
 /// * `progress` - Callback for proof generation progress.
 #[allow(clippy::too_many_arguments)]
+#[allow(deprecated)]
 pub(crate) fn build_vote_commitment(
     hotkey_seed: &[u8],
     network: Network,
@@ -228,6 +229,7 @@ pub(crate) fn build_vote_commitment(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

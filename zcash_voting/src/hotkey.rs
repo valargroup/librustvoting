@@ -17,7 +17,12 @@ pub const VOTING_HOTKEY_ACCOUNT_INDEX: u32 = 0;
 pub const VOTING_HOTKEY_ADDRESS_INDEX: u32 = 0;
 
 /// Context that binds a software wallet seed to one voting hotkey.
+///
+/// Deprecated with [`derive_voting_hotkey`]. Wallets should keep wallet seed
+/// material outside this crate, derive scoped voting hotkey seed material
+/// locally, and pass it to [`voting_hotkey_from_seed`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[deprecated(note = "derive hotkey seed material in the wallet and use voting_hotkey_from_seed")]
 pub struct HotkeyDerivationContext<'a> {
     pub round_id: &'a str,
     pub account_id: &'a str,
@@ -35,6 +40,8 @@ pub struct HotkeyDerivationContext<'a> {
 /// Returns [`VotingError::InvalidInput`] when the wallet seed is too short, a
 /// context field cannot be length-prefixed, or the derived seed cannot produce
 /// an Orchard key for `network`.
+#[deprecated(note = "derive hotkey seed material in the wallet and use voting_hotkey_from_seed")]
+#[allow(deprecated)]
 pub fn derive_voting_hotkey(
     wallet_seed: &[u8],
     context: HotkeyDerivationContext<'_>,
@@ -89,6 +96,7 @@ pub fn voting_hotkey_from_seed(seed: &[u8], network: Network) -> Result<VotingHo
     ))
 }
 
+#[allow(deprecated)]
 fn derive_contextual_hotkey_seed(
     wallet_seed: &[u8],
     context: HotkeyDerivationContext<'_>,
@@ -126,6 +134,7 @@ fn network_tag(network: Network) -> &'static [u8] {
     }
 }
 
+#[allow(deprecated)]
 fn raw_orchard_address_from_seed(
     seed: &[u8],
     network: Network,
@@ -149,6 +158,7 @@ fn append_context_part(material: &mut Vec<u8>, part: &[u8]) -> Result<(), Voting
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

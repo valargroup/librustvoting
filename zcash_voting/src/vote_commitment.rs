@@ -76,6 +76,7 @@ pub fn build_share_payloads(
 ///             vote_authority_note_new || vote_commitment ||
 ///             proposal_id(4 LE, padded 32) || anchor_height(8 LE, padded 32))
 /// ```
+#[allow(deprecated)]
 pub(crate) fn sign_cast_vote(
     hotkey_seed: &[u8],
     network: Network,
