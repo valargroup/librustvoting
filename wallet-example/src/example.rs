@@ -7,8 +7,8 @@ use zcash_voting::prelude::{
     bundle_notes_for_index, delegation_submission, display_memo, gather_delegation_lwd_inputs,
     gather_delegation_wallet_inputs, precompute_delegation, raw_bundle_weight, redact_for_signer,
     setup_delegation, spend_auth_signature, DelegationSigner, DelegationSubmission,
-    GatherDelegationWalletParams, KeystoneSigningRequest, Network, NoopCancellation,
-    NoopProgressReporter, PrecomputeDelegationInputs, PreparedDelegationReport, VotingDb,
+    GatherDelegationWalletParams, KeystoneSigningRequest, NoopCancellation, NoopProgressReporter,
+    PrecomputeDelegationInputs, PreparedDelegationReport, VotingDb, VotingHotkey,
 };
 use zcash_voting::{HyperTransport, PirClientBlocking, VotingRoundParams};
 
@@ -52,9 +52,8 @@ pub struct WalletPrecomputeRequest<'a> {
     pub lightwalletd_url: &'a str,
     pub round_params: VotingRoundParams,
     pub round_name: &'a str,
-    pub hotkey_raw_address: Vec<u8>,
+    pub voting_hotkey: &'a VotingHotkey,
     pub scanned_height: u64,
-    pub network: Network,
     pub pir_server_url: &'a str,
     pub bundle_index: u32,
 }
@@ -65,9 +64,8 @@ pub struct WalletDelegateRequest<'a> {
     pub lightwalletd_url: &'a str,
     pub round_params: VotingRoundParams,
     pub round_name: &'a str,
-    pub hotkey_raw_address: Vec<u8>,
+    pub voting_hotkey: &'a VotingHotkey,
     pub scanned_height: u64,
-    pub network: Network,
     pub pir_server_url: &'a str,
     pub bundle_index: u32,
     pub seed: &'a [u8],
@@ -79,9 +77,8 @@ pub struct WalletKeystoneRequestRequest<'a> {
     pub lightwalletd_url: &'a str,
     pub round_params: VotingRoundParams,
     pub round_name: &'a str,
-    pub hotkey_raw_address: Vec<u8>,
+    pub voting_hotkey: &'a VotingHotkey,
     pub scanned_height: u64,
-    pub network: Network,
     pub pir_server_url: &'a str,
     pub bundle_index: u32,
 }
@@ -92,9 +89,8 @@ pub struct WalletKeystoneSubmitRequest<'a> {
     pub lightwalletd_url: &'a str,
     pub round_params: VotingRoundParams,
     pub round_name: &'a str,
-    pub hotkey_raw_address: Vec<u8>,
+    pub voting_hotkey: &'a VotingHotkey,
     pub scanned_height: u64,
-    pub network: Network,
     pub pir_server_url: &'a str,
     pub bundle_index: u32,
     pub signing_request: &'a KeystoneSigningRequest,
@@ -118,7 +114,7 @@ where
     let cancellation = NoopCancellation;
     let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
         lightwalletd_url: request.lightwalletd_url,
-        network: request.network,
+        network: request.voting_hotkey.network(),
         round_params: request.round_params,
         round_name: request.round_name,
         cancellation: &cancellation,
@@ -135,7 +131,7 @@ where
     let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
         wallet_db,
         account_uuid: request.account_uuid,
-        hotkey_raw_address: request.hotkey_raw_address,
+        voting_hotkey: request.voting_hotkey,
         snapshot_height: round_params.snapshot_height,
         scanned_height: request.scanned_height,
         anchor_tree_state_bytes,
@@ -156,7 +152,7 @@ where
         bundle_index: request.bundle_index,
         round_note_infos: &wallet_inputs.round_note_infos,
         anchor_tree_state_bytes: &wallet_inputs.anchor_tree_state_bytes,
-        network: request.network,
+        network: request.voting_hotkey.network(),
         cancellation: &cancellation,
     };
 
@@ -184,7 +180,7 @@ where
     let cancellation = NoopCancellation;
     let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
         lightwalletd_url: request.lightwalletd_url,
-        network: request.network,
+        network: request.voting_hotkey.network(),
         round_params: request.round_params,
         round_name: request.round_name,
         cancellation: &cancellation,
@@ -201,7 +197,7 @@ where
     let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
         wallet_db,
         account_uuid: request.account_uuid,
-        hotkey_raw_address: request.hotkey_raw_address,
+        voting_hotkey: request.voting_hotkey,
         snapshot_height: round_params.snapshot_height,
         scanned_height: request.scanned_height,
         anchor_tree_state_bytes,
@@ -244,9 +240,8 @@ where
         &round_id,
         request.bundle_index,
         &bundle_note_infos,
-        &wallet_inputs.delegation_keys.hotkey_raw_address,
+        &wallet_inputs.delegation_keys,
         &pir_client,
-        request.network,
         &progress,
     )
     .context("prove delegation bundle")?;
@@ -257,11 +252,7 @@ where
         voting_db,
         &round_id,
         request.bundle_index,
-        DelegationSigner::Seed {
-            seed: request.seed,
-            network: request.network,
-            account_index: wallet_inputs.delegation_keys.account_index,
-        },
+        DelegationSigner::seed(request.seed, &wallet_inputs.delegation_keys),
     )
     .context("assemble seed-signed delegation submission")
 }
@@ -285,7 +276,7 @@ where
     let cancellation = NoopCancellation;
     let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
         lightwalletd_url: request.lightwalletd_url,
-        network: request.network,
+        network: request.voting_hotkey.network(),
         round_params: request.round_params,
         round_name: request.round_name,
         cancellation: &cancellation,
@@ -296,13 +287,14 @@ where
     let round_params = lwd_inputs.round_params;
     let round_id = round_params.vote_round_id.clone();
     let resolved_round_name = lwd_inputs.resolved_round_name;
+    let display_round_name = resolved_round_name.clone();
     let anchor_tree_state_bytes = lwd_inputs.anchor_tree_state_bytes;
     let branch_id_provider = lwd_inputs.branch_id_provider;
 
     let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
         wallet_db,
         account_uuid: request.account_uuid,
-        hotkey_raw_address: request.hotkey_raw_address,
+        voting_hotkey: request.voting_hotkey,
         snapshot_height: round_params.snapshot_height,
         scanned_height: request.scanned_height,
         anchor_tree_state_bytes,
@@ -340,10 +332,7 @@ where
         redact_for_signer(&setup.pczt_bytes).context("redact PCZT for Keystone signer")?;
     let delegated_weight_zatoshi =
         raw_bundle_weight(&bundle_note_infos).context("calculate Keystone bundle weight")?;
-    let display_memo = display_memo(
-        &wallet_inputs.delegation_keys.round_name,
-        delegated_weight_zatoshi,
-    );
+    let display_memo = display_memo(&display_round_name, delegated_weight_zatoshi);
 
     Ok(KeystoneSigningRequest {
         setup,
@@ -375,7 +364,7 @@ where
     let cancellation = NoopCancellation;
     let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
         lightwalletd_url: request.lightwalletd_url,
-        network: request.network,
+        network: request.voting_hotkey.network(),
         round_params: request.round_params,
         round_name: request.round_name,
         cancellation: &cancellation,
@@ -391,7 +380,7 @@ where
     let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
         wallet_db,
         account_uuid: request.account_uuid,
-        hotkey_raw_address: request.hotkey_raw_address,
+        voting_hotkey: request.voting_hotkey,
         snapshot_height: round_params.snapshot_height,
         scanned_height: request.scanned_height,
         anchor_tree_state_bytes,
@@ -420,9 +409,8 @@ where
         &round_id,
         request.bundle_index,
         &bundle_note_infos,
-        &wallet_inputs.delegation_keys.hotkey_raw_address,
+        &wallet_inputs.delegation_keys,
         &pir_client,
-        request.network,
         &progress,
     )
     .context("prove delegation bundle")?;

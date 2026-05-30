@@ -52,7 +52,7 @@ precompute → delegate → vote → share lifecycle:
 | `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
-| `hotkey` | Primitive hotkey derivation from caller-supplied seed bytes. |
+| `hotkey` | Canonical contextual and random voting hotkey derivation. |
 | `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |
 
 Wallet integrations should use the lifecycle modules above instead of writing
@@ -96,10 +96,12 @@ crate own the sampling and ordering policy.
   behavior.
 - Use `precompute::note_witnesses` instead of hand-validating cached
   `TreeState` bytes and manually constructing `WitnessData`.
-- Use `delegate::submission` with `DelegationSigner::Seed` or
+- Use `delegate::submission` with `DelegationSigner::seed(seed, keys)` or
   `DelegationSigner::Keystone` instead of separate submission methods.
-- Treat contextual hotkey mixing as wallet policy. The library intentionally
-  keeps `generate_hotkey(seed)` primitive.
+- Use `derive_voting_hotkey` for software wallets, `generate_random_voting_hotkey`
+  for hardware wallets, and `voting_hotkey_from_seed` when reconstructing stored
+  hardware hotkey seed material. The crate owns contextual mixing and raw Orchard
+  delegation-address derivation.
 - Use `session::resume_plan` instead of reconstructing what comes next from raw
   delegation, vote, and share phases in wallet code. Fetch step execution
   material through crate APIs such as `vote::recover_commit`, `share::*`, and

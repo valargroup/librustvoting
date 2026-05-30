@@ -11,8 +11,8 @@ use rusqlite::{named_params, OptionalExtension};
 use crate::{
     round::VotingDb,
     types::{
-        EncryptedShare, Network, ProgressReporter, SharePayload, VoteCommitmentBundle, VotingError,
-        WireEncryptedShare,
+        CastVoteSignature, EncryptedShare, Network, ProgressReporter, SharePayload,
+        VoteCommitmentBundle, VotingError, VotingHotkey, WireEncryptedShare,
     },
 };
 
@@ -78,13 +78,62 @@ pub enum VoteCommitStage {
 }
 
 /// Cast-vote signing source.
+#[derive(Clone, Copy)]
 #[non_exhaustive]
 pub enum VoteSigner<'a> {
-    Seed {
-        seed: &'a [u8],
-        network: Network,
-        account_index: u32,
-    },
+    /// Stored voting hotkey seed material, not the wallet account seed.
+    HotkeySeed { seed: &'a [u8], network: Network },
+    /// Crate-owned voting hotkey material.
+    Hotkey { hotkey: &'a VotingHotkey },
+}
+
+impl<'a> VoteSigner<'a> {
+    /// Builds a vote signer from stored voting hotkey seed material.
+    pub fn hotkey_seed(seed: &'a [u8], network: Network) -> Self {
+        Self::HotkeySeed { seed, network }
+    }
+
+    /// Builds a vote signer from crate-owned voting hotkey material.
+    pub fn hotkey(hotkey: &'a VotingHotkey) -> Self {
+        Self::Hotkey { hotkey }
+    }
+}
+
+struct CastVoteSigningFields<'a> {
+    vote_round_id: &'a str,
+    r_vpk_bytes: &'a [u8],
+    van_nullifier: &'a [u8],
+    vote_authority_note_new: &'a [u8],
+    vote_commitment: &'a [u8],
+    proposal_id: u32,
+    anchor_height: u32,
+    alpha_v: &'a [u8],
+}
+
+fn signer_seed_and_network<'a>(signer: VoteSigner<'a>) -> (&'a [u8], Network) {
+    match signer {
+        VoteSigner::HotkeySeed { seed, network } => (seed, network),
+        VoteSigner::Hotkey { hotkey } => (hotkey.secret_seed(), hotkey.network()),
+    }
+}
+
+fn sign_cast_vote_with_signer(
+    signer: VoteSigner<'_>,
+    fields: CastVoteSigningFields<'_>,
+) -> Result<CastVoteSignature, VotingError> {
+    let (seed, network) = signer_seed_and_network(signer);
+    crate::vote_commitment::sign_cast_vote(
+        seed,
+        network,
+        fields.vote_round_id,
+        fields.r_vpk_bytes,
+        fields.van_nullifier,
+        fields.vote_authority_note_new,
+        fields.vote_commitment,
+        fields.proposal_id,
+        fields.anchor_height,
+        fields.alpha_v,
+    )
 }
 
 /// Chain-ready cast-vote submission fields for the vote chain.
@@ -179,13 +228,7 @@ pub fn commit(
     }
     ensure_vote_rebuild_allowed(db, round_id, bundle_index, draft.proposal_id)?;
 
-    let (seed, network, account_index) = match signer {
-        VoteSigner::Seed {
-            seed,
-            network,
-            account_index,
-        } => (seed, network, account_index),
-    };
+    let (seed, network) = signer_seed_and_network(signer);
     stages.on_stage(VoteCommitStage::ProofStarting {
         proposal_id: draft.proposal_id,
         bundle_index,
@@ -199,7 +242,7 @@ pub fn commit(
         round_id,
         bundle_index,
         seed,
-        network.id(),
+        network,
         draft.proposal_id,
         draft.choice,
         draft.num_options,
@@ -230,18 +273,18 @@ pub fn commit(
         proposal_id: draft.proposal_id,
         bundle_index,
     });
-    let signature = crate::vote_commitment::sign_cast_vote_for_account(
-        seed,
-        network.id(),
-        account_index,
-        &bundle.vote_round_id,
-        &bundle.r_vpk_bytes,
-        &bundle.van_nullifier,
-        &bundle.vote_authority_note_new,
-        &bundle.vote_commitment,
-        bundle.proposal_id,
-        bundle.anchor_height,
-        &bundle.alpha_v,
+    let signature = sign_cast_vote_with_signer(
+        signer,
+        CastVoteSigningFields {
+            vote_round_id: &bundle.vote_round_id,
+            r_vpk_bytes: &bundle.r_vpk_bytes,
+            van_nullifier: &bundle.van_nullifier,
+            vote_authority_note_new: &bundle.vote_authority_note_new,
+            vote_commitment: &bundle.vote_commitment,
+            proposal_id: bundle.proposal_id,
+            anchor_height: bundle.anchor_height,
+            alpha_v: &bundle.alpha_v,
+        },
     )?;
     let vote_auth_sig = array64("vote_auth_sig", signature.vote_auth_sig)?;
     let recovery = VoteRecoveryBundle::from_parts(bundle_index, draft, bundle, vote_auth_sig)?;
@@ -1158,6 +1201,93 @@ mod tests {
     }
 
     #[test]
+    fn typed_hotkey_signer_signs_cast_vote_payload_with_its_network() {
+        use orchard::{
+            keys::SpendAuthorizingKey,
+            primitives::redpallas::{Signature, SpendAuth, VerificationKey},
+        };
+
+        fn randomized_verification_key(
+            seed: &[u8],
+            network: Network,
+            alpha: &pasta_curves::pallas::Scalar,
+        ) -> VerificationKey<SpendAuth> {
+            let sk = network
+                .orchard_spending_key_from_seed(seed, crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX)
+                .unwrap();
+            let ask = SpendAuthorizingKey::from(&sk);
+            VerificationKey::from(&ask.randomize(alpha))
+        }
+
+        let hotkey = crate::hotkey::derive_voting_hotkey(
+            &[0xAB; 64],
+            crate::hotkey::HotkeyDerivationContext {
+                round_id: ROUND_ID,
+                account_id: "account-0",
+            },
+            Network::Regtest,
+        )
+        .unwrap();
+        let r_vpk = [0x10; 32];
+        let van_nullifier = [0x11; 32];
+        let vote_authority_note_new = [0x12; 32];
+        let vote_commitment = [0x13; 32];
+        let mut alpha_v = [0u8; 32];
+        alpha_v[0] = 7;
+        let fields = || CastVoteSigningFields {
+            vote_round_id: ROUND_ID,
+            r_vpk_bytes: &r_vpk,
+            van_nullifier: &van_nullifier,
+            vote_authority_note_new: &vote_authority_note_new,
+            vote_commitment: &vote_commitment,
+            proposal_id: 1,
+            anchor_height: 123,
+            alpha_v: &alpha_v,
+        };
+
+        let typed_sig = sign_cast_vote_with_signer(VoteSigner::hotkey(&hotkey), fields()).unwrap();
+        assert_eq!(typed_sig.vote_auth_sig.len(), 64);
+
+        let seed_sig = sign_cast_vote_with_signer(
+            VoteSigner::hotkey_seed(hotkey.secret_seed(), hotkey.network()),
+            fields(),
+        )
+        .unwrap();
+        assert_eq!(seed_sig.vote_auth_sig.len(), 64);
+
+        let sighash = crate::vote_commitment::cast_vote_sighash(
+            ROUND_ID,
+            &r_vpk,
+            &van_nullifier,
+            &vote_authority_note_new,
+            &vote_commitment,
+            1,
+            123,
+        )
+        .unwrap();
+        let alpha = pasta_curves::pallas::Scalar::from(7);
+        let regtest_key =
+            randomized_verification_key(hotkey.secret_seed(), Network::Regtest, &alpha);
+
+        let typed_sig_bytes: [u8; 64] = typed_sig.vote_auth_sig.as_slice().try_into().unwrap();
+        regtest_key
+            .verify(&sighash, &Signature::<SpendAuth>::from(typed_sig_bytes))
+            .unwrap();
+
+        let seed_sig_bytes: [u8; 64] = seed_sig.vote_auth_sig.as_slice().try_into().unwrap();
+        regtest_key
+            .verify(&sighash, &Signature::<SpendAuth>::from(seed_sig_bytes))
+            .unwrap();
+
+        // The legacy numeric id cannot preserve Regtest. Vote signing and proof
+        // generation must keep the typed network through the internal calls.
+        assert_eq!(
+            Network::from_id(Network::Regtest.id()).unwrap(),
+            Network::Testnet
+        );
+    }
+
+    #[test]
     fn submitted_vote_rebuild_is_rejected() {
         let db = db_with_vote();
         db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
@@ -1227,10 +1357,9 @@ mod tests {
                 position: 7,
                 anchor_height: 123,
             },
-            VoteSigner::Seed {
+            VoteSigner::HotkeySeed {
                 seed: &[0x99; 32],
                 network: Network::Testnet,
-                account_index: 0,
             },
             &NoopProgressReporter,
         )

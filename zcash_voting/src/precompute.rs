@@ -160,7 +160,7 @@ pub fn delegation_pir(
     network: Network,
 ) -> Result<PirPrecomputeReport, VotingError> {
     let result =
-        db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network.id())?;
+        db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network)?;
     Ok(PirPrecomputeReport {
         cached: result.cached_count,
         fetched: result.fetched_count,
@@ -298,7 +298,7 @@ fn ensure_not_cancelled(cancellation: &dyn Cancellation) -> Result<(), VotingErr
 mod pir_tests {
     use super::*;
     use crate::round::BundleLayout;
-    use crate::types::{Cancellation, NoteInfo};
+    use crate::types::{Cancellation, Network, NoteInfo};
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 

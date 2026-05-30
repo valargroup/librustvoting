@@ -22,12 +22,11 @@ use voting_circuits::delegation::{
     PrecomputedRandomness, RealNoteInput,
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::consensus::Network;
 
 use crate::governance::BUNDLE_NOTE_SLOTS;
 use crate::types::{
     ct_option_to_result, validate_32_bytes, DelegationProgressReporter, DelegationProofResult,
-    NoteInfo, VotingError, WitnessData,
+    Network, NoteInfo, VotingError, WitnessData,
 };
 
 // ================================================================
@@ -293,7 +292,7 @@ fn delegation_cached_keys_large_stack() -> Result<&'static DelegationKeys, Votin
 /// - `imt_proofs`: Pre-fetched IMT exclusion proofs (one per real note, from PIR client).
 /// - `extra_imt_proofs`: Additional pre-fetched IMT proofs keyed by nullifier,
 ///   currently used for padded dummy notes.
-/// - `network_id`: 0 = testnet, 1 = mainnet (for UFVK decoding; matches the SDK / wallet DB).
+/// - `network`: network used for UFVK decoding; matches the SDK / wallet DB.
 /// - `progress`: Progress callback.
 #[allow(clippy::too_many_arguments)]
 pub fn build_and_prove_delegation(
@@ -305,7 +304,7 @@ pub fn build_and_prove_delegation(
     merkle_witnesses: &[WitnessData],
     imt_proofs: &[ImtProofData],
     extra_imt_proofs: &[([u8; 32], ImtProofData)],
-    network_id: u32,
+    network: Network,
     progress: &dyn DelegationProgressReporter,
     precomputed_randomness: Option<&PrecomputedRandomness>,
 ) -> Result<DelegationProofResult, VotingError> {
@@ -331,18 +330,6 @@ pub fn build_and_prove_delegation(
             ),
         });
     }
-
-    let network = match network_id {
-        0 => Network::TestNetwork,
-        1 => Network::MainNetwork,
-        _ => {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "invalid network_id {network_id}, expected 0 (testnet) or 1 (mainnet)"
-                ),
-            })
-        }
-    };
 
     // Parse scalar/field inputs.
     let alpha = bytes_to_scalar(alpha_bytes, "alpha")?;
@@ -632,7 +619,7 @@ mod tests {
             &[],
             &[],
             &[],
-            0,
+            Network::Testnet,
             &reporter,
             None,
         );
@@ -641,6 +628,46 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains(&format!("1..={BUNDLE_NOTE_SLOTS} notes")));
+    }
+
+    #[test]
+    fn reconstruct_note_accepts_regtest_network() {
+        use zcash_keys::keys::UnifiedSpendingKey;
+        use zip32::AccountId;
+
+        let network = Network::Regtest;
+        let seed = [0x42u8; 64];
+        let account = AccountId::try_from(0u32).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&network, &seed, account).unwrap();
+        let ufvk = usk.to_unified_full_viewing_key();
+        let ufvk_str = ufvk.encode(&network);
+        let fvk = ufvk.orchard().unwrap().clone();
+        let address = fvk.address_at(0u32, Scope::External);
+
+        let mut rng = OsRng;
+        let (_, _, dummy_parent) = orchard::Note::dummy(&mut rng, None);
+        let note = orchard::Note::new(
+            address,
+            NoteValue::from_raw(1),
+            Rho::from_nf_old(dummy_parent.nullifier(&fvk)),
+            &mut rng,
+        );
+        let cmx: ExtractedNoteCommitment = note.commitment().into();
+        let full_note = NoteInfo {
+            commitment: cmx.to_bytes().to_vec(),
+            diversifier: note.recipient().diversifier().as_array().to_vec(),
+            value: 1,
+            rho: note.rho().to_bytes().to_vec(),
+            rseed: note.rseed().as_bytes().to_vec(),
+            nullifier: note.nullifier(&fvk).to_bytes().to_vec(),
+            position: 0,
+            scope: 0,
+            ufvk_str,
+        };
+
+        let (rebuilt, rebuilt_fvk) = reconstruct_note(&full_note, &network).unwrap();
+
+        assert_eq!(rebuilt.nullifier(&rebuilt_fvk), note.nullifier(&fvk));
     }
 
     /// Real Halo2 delegation proof end-to-end test.
@@ -822,7 +849,7 @@ mod tests {
             &merkle_witnesses,
             &imt_proofs,
             &[],
-            1, // mainnet (SDK convention: 0=testnet, 1=mainnet)
+            Network::Mainnet,
             &reporter,
             None,
         )
