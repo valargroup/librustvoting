@@ -31,7 +31,7 @@ use crate::{
     },
     note_bundling::BundlePolicy,
     round::{self, BundleLayout},
-    types::{Cancellation, DelegationProgressReporter, Network, VotingRoundParams},
+    types::{Cancellation, DelegationProgressReporter, VotingRoundParams},
 };
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
@@ -172,10 +172,9 @@ pub fn delegation_pir(
     bundle_index: u32,
     notes: &[NoteInfo],
     pir_client: &pir_client::PirClientBlocking,
-    network: Network,
+    keys: &DelegationKeys,
 ) -> Result<PirPrecomputeReport, VotingError> {
-    let result =
-        db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, network.id())?;
+    let result = db.precompute_delegation_pir(round_id, bundle_index, notes, pir_client, keys)?;
     Ok(PirPrecomputeReport {
         cached: result.cached_count,
         fetched: result.fetched_count,
@@ -192,7 +191,6 @@ pub struct PrecomputeDelegationInputs<'a> {
     pub anchor_tree_state_bytes: &'a [u8],
     pub keys: &'a DelegationKeys,
     pub branch_id_provider: &'a dyn BranchIdProvider,
-    pub network: Network,
     pub cancellation: &'a dyn Cancellation,
 }
 
@@ -277,7 +275,6 @@ where
         bundle_setup,
         inputs.branch_id_provider,
         pir_client,
-        inputs.network,
         inputs.cancellation,
         stages,
     )
@@ -304,7 +301,6 @@ pub(crate) fn warm_delegation_pir(
     layout: BundleLayout,
     branch_id_provider: &dyn BranchIdProvider,
     pir_client: &pir_client::PirClientBlocking,
-    network: Network,
     cancellation: &dyn Cancellation,
     stages: &dyn DelegationProgressReporter,
 ) -> Result<PreparedDelegationReport, VotingError> {
@@ -320,7 +316,7 @@ pub(crate) fn warm_delegation_pir(
         stages,
     )?;
     ensure_not_cancelled(cancellation)?;
-    let report = delegation_pir(db, round_id, bundle_index, notes, pir_client, network)?;
+    let report = delegation_pir(db, round_id, bundle_index, notes, pir_client, keys)?;
     ensure_not_cancelled(cancellation)?;
     let _cached = cache_prepared_setup(
         db,
@@ -353,7 +349,7 @@ mod pir_tests {
     use super::*;
     use crate::delegate::{BranchIdProvider, DelegationKeys};
     use crate::round::BundleLayout;
-    use crate::types::{Cancellation, NoopProgressReporter, NoteInfo};
+    use crate::types::{Cancellation, Network, NoopProgressReporter, NoteInfo};
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
@@ -453,7 +449,7 @@ mod pir_tests {
             [9; 32],
             0,
             0,
-            1,
+            Network::Testnet,
             "Demo Round".to_string(),
         )
         .unwrap();
@@ -490,7 +486,6 @@ mod pir_tests {
             layout,
             &branch_id,
             &pir_client,
-            Network::Testnet,
             &AlwaysCancelled,
             &stages,
         )

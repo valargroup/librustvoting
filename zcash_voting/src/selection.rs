@@ -6,7 +6,7 @@ use std::borrow::Borrow;
 use crate::storage::VotingDb;
 use crate::{
     delegate::{load_account_keys, DelegationKeys},
-    types::{Network, NoteInfo, NoteRef, SelectedNotes, VotingError},
+    types::{Network, NoteInfo, NoteRef, SelectedNotes, VotingError, VotingHotkey},
 };
 
 use zcash_client_backend::{
@@ -16,7 +16,7 @@ use zcash_client_backend::{
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_protocol::consensus::{BlockHeight, NetworkConstants, Parameters};
+use zcash_protocol::consensus::{BlockHeight, Parameters};
 
 const POOL_ORCHARD: &str = "orchard";
 
@@ -32,7 +32,7 @@ pub struct DelegationWalletInputs {
 pub struct GatherDelegationWalletParams<'a, C, P, CL, R> {
     pub wallet_db: &'a WalletDb<C, P, CL, R>,
     pub account_uuid: &'a str,
-    pub hotkey_raw_address: Vec<u8>,
+    pub voting_hotkey: &'a VotingHotkey,
     pub snapshot_height: u64,
     pub scanned_height: u64,
     pub anchor_tree_state_bytes: Vec<u8>,
@@ -150,9 +150,9 @@ where
 /// # Errors
 ///
 /// Returns [`VotingError::InvalidInput`] for malformed account IDs, missing
-/// account/key material, invalid hotkey bytes, empty note selections, unsynced
-/// wallets, or snapshot heights outside the librustzcash height range. Wallet
-/// DB read failures are returned as [`VotingError::Internal`].
+/// account/key material, a hotkey for the wrong network, empty note selections,
+/// unsynced wallets, or snapshot heights outside the librustzcash height range.
+/// Wallet DB read failures are returned as [`VotingError::Internal`].
 pub fn gather_delegation_wallet_inputs<C, P, CL, R>(
     params: GatherDelegationWalletParams<'_, C, P, CL, R>,
 ) -> Result<DelegationWalletInputs, VotingError>
@@ -168,6 +168,11 @@ where
             ),
         });
     }
+    if params.wallet_db.params().network_type() != params.voting_hotkey.network().network_type() {
+        return Err(VotingError::InvalidInput {
+            message: "voting hotkey network does not match wallet DB network".to_string(),
+        });
+    }
 
     let round_note_infos = select_snapshot_note_infos(
         params.wallet_db,
@@ -175,13 +180,11 @@ where
         params.snapshot_height,
     )?;
     let account = load_account_keys(params.wallet_db, params.account_uuid)?;
-    let delegation_keys = DelegationKeys::with_hotkey_bytes(
+    let delegation_keys = DelegationKeys::with_voting_hotkey(
         account.orchard_fvk_bytes.to_vec(),
-        &params.hotkey_raw_address,
+        params.voting_hotkey,
         account.seed_fingerprint,
         account.account_index,
-        0,
-        params.wallet_db.params().network_type().coin_type(),
         params.resolved_round_name,
     )?;
 

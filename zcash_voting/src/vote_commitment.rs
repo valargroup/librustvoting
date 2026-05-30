@@ -1,5 +1,5 @@
 use crate::types::{
-    validate_encrypted_shares, validate_vote_decision, CastVoteSignature, SharePayload,
+    validate_encrypted_shares, validate_vote_decision, CastVoteSignature, Network, SharePayload,
     VoteCommitmentBundle, VotingError, WireEncryptedShare,
 };
 
@@ -67,7 +67,7 @@ pub fn build_share_payloads(
 /// This is a pure computation — no DB access needed. Takes the fields from
 /// `VoteCommitmentBundle` plus the hotkey seed for signing.
 ///
-/// `network_id`: 0 = testnet, 1 = mainnet (matches the wallet SDK).
+/// `network`: Zcash network used to derive the hotkey spending key.
 ///
 /// The canonical sighash must match Go's `ComputeCastVoteSighash`:
 /// ```text
@@ -75,39 +75,9 @@ pub fn build_share_payloads(
 ///             vote_authority_note_new || vote_commitment ||
 ///             proposal_id(4 LE, padded 32) || anchor_height(8 LE, padded 32))
 /// ```
-pub fn sign_cast_vote(
+pub(crate) fn sign_cast_vote(
     hotkey_seed: &[u8],
-    network_id: u32,
-    vote_round_id_hex: &str,
-    r_vpk_bytes: &[u8],
-    van_nullifier: &[u8],
-    vote_authority_note_new: &[u8],
-    vote_commitment: &[u8],
-    proposal_id: u32,
-    anchor_height: u32,
-    alpha_v: &[u8],
-) -> Result<CastVoteSignature, VotingError> {
-    sign_cast_vote_for_account(
-        hotkey_seed,
-        network_id,
-        0,
-        vote_round_id_hex,
-        r_vpk_bytes,
-        van_nullifier,
-        vote_authority_note_new,
-        vote_commitment,
-        proposal_id,
-        anchor_height,
-        alpha_v,
-    )
-}
-
-/// Compute the canonical cast-vote sighash and sign it for a ZIP-32 account.
-#[allow(clippy::too_many_arguments)]
-pub fn sign_cast_vote_for_account(
-    hotkey_seed: &[u8],
-    network_id: u32,
-    account_index: u32,
+    network: Network,
     vote_round_id_hex: &str,
     r_vpk_bytes: &[u8],
     van_nullifier: &[u8],
@@ -119,8 +89,9 @@ pub fn sign_cast_vote_for_account(
 ) -> Result<CastVoteSignature, VotingError> {
     use ff::PrimeField;
 
-    // Derive hotkey SpendingKey from seed
-    let sk = crate::zkp2::derive_spending_key_for_account(hotkey_seed, network_id, account_index)?;
+    // Derive the voting hotkey SpendingKey from seed.
+    let sk = network
+        .orchard_spending_key_from_seed(hotkey_seed, crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX)?;
     let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
 
     // Deserialize alpha_v
@@ -144,38 +115,15 @@ pub fn sign_cast_vote_for_account(
         });
     }
 
-    // Decode vote_round_id from hex to bytes
-    let vote_round_id_bytes =
-        hex::decode(vote_round_id_hex).map_err(|e| VotingError::Internal {
-            message: format!("invalid vote_round_id hex: {e}"),
-        })?;
-
-    // Compute canonical sighash (must match Go's ComputeCastVoteSighash)
-    const CAST_VOTE_SIGHASH_DOMAIN: &[u8] = b"SVOTE_CAST_VOTE_SIGHASH_V0";
-    let mut canonical = Vec::new();
-    canonical.extend_from_slice(CAST_VOTE_SIGHASH_DOMAIN);
-    // vote_round_id: pad to 32 bytes
-    extend_padded32(&mut canonical, &vote_round_id_bytes);
-    // r_vpk: already 32 bytes (compressed)
-    canonical.extend_from_slice(r_vpk_bytes);
-    // van_nullifier: pad to 32 bytes
-    extend_padded32(&mut canonical, van_nullifier);
-    // vote_authority_note_new: pad to 32 bytes
-    extend_padded32(&mut canonical, vote_authority_note_new);
-    // vote_commitment: pad to 32 bytes
-    extend_padded32(&mut canonical, vote_commitment);
-    // proposal_id: 4 bytes LE, padded to 32 bytes
-    let mut pid_buf = [0u8; 32];
-    pid_buf[..4].copy_from_slice(&proposal_id.to_le_bytes());
-    canonical.extend_from_slice(&pid_buf);
-    // anchor_height: 8 bytes LE, padded to 32 bytes
-    let mut ah_buf = [0u8; 32];
-    ah_buf[..8].copy_from_slice(&(anchor_height as u64).to_le_bytes());
-    canonical.extend_from_slice(&ah_buf);
-
-    let sighash_full = blake2b_simd::Params::new().hash_length(32).hash(&canonical);
-    let mut sighash = [0u8; 32];
-    sighash.copy_from_slice(sighash_full.as_bytes());
+    let sighash = cast_vote_sighash(
+        vote_round_id_hex,
+        r_vpk_bytes,
+        van_nullifier,
+        vote_authority_note_new,
+        vote_commitment,
+        proposal_id,
+        anchor_height,
+    )?;
 
     // Sign
     let mut rng = rand::rngs::OsRng;
@@ -185,6 +133,43 @@ pub fn sign_cast_vote_for_account(
     Ok(CastVoteSignature {
         vote_auth_sig: sig_bytes.to_vec(),
     })
+}
+
+pub(crate) fn cast_vote_sighash(
+    vote_round_id_hex: &str,
+    r_vpk_bytes: &[u8],
+    van_nullifier: &[u8],
+    vote_authority_note_new: &[u8],
+    vote_commitment: &[u8],
+    proposal_id: u32,
+    anchor_height: u32,
+) -> Result<[u8; 32], VotingError> {
+    let vote_round_id_bytes =
+        hex::decode(vote_round_id_hex).map_err(|e| VotingError::Internal {
+            message: format!("invalid vote_round_id hex: {e}"),
+        })?;
+
+    const CAST_VOTE_SIGHASH_DOMAIN: &[u8] = b"SVOTE_CAST_VOTE_SIGHASH_V0";
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(CAST_VOTE_SIGHASH_DOMAIN);
+    extend_padded32(&mut canonical, &vote_round_id_bytes);
+    canonical.extend_from_slice(r_vpk_bytes);
+    extend_padded32(&mut canonical, van_nullifier);
+    extend_padded32(&mut canonical, vote_authority_note_new);
+    extend_padded32(&mut canonical, vote_commitment);
+
+    let mut pid_buf = [0u8; 32];
+    pid_buf[..4].copy_from_slice(&proposal_id.to_le_bytes());
+    canonical.extend_from_slice(&pid_buf);
+
+    let mut ah_buf = [0u8; 32];
+    ah_buf[..8].copy_from_slice(&(anchor_height as u64).to_le_bytes());
+    canonical.extend_from_slice(&ah_buf);
+
+    let sighash_full = blake2b_simd::Params::new().hash_length(32).hash(&canonical);
+    let mut sighash = [0u8; 32];
+    sighash.copy_from_slice(sighash_full.as_bytes());
+    Ok(sighash)
 }
 
 /// Append exactly 32 bytes to `out` from `b` (pad with zeros if shorter).

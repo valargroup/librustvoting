@@ -67,6 +67,8 @@ pub use selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,
     select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
+#[cfg(feature = "pir")]
+pub use storage::operations::PrepareDelegationPirParams;
 pub use types::{
     validate_round_params, Cancellation, CastVoteSignature, DelegationAction,
     DelegationPirPrecomputeResult, DelegationProgressBridge, DelegationProgressReporter,
