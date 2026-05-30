@@ -12,42 +12,11 @@ use zcash_voting::prelude::{
 };
 use zcash_voting::{HyperTransport, PirClientBlocking, VotingRoundParams};
 
-/// Human-readable precompute stages printed by the runnable example.
-pub const PRECOMPUTE_FLOW: &[&str] = &[
-    "Resolve lightwalletd anchor tree state for the round.",
-    "Gather snapshot-eligible Orchard notes and account key material from the wallet DB.",
-    "Connect to the PIR endpoint selected for the round snapshot.",
-    "Ensure round and bundle rows exist for the target bundle index.",
-    "Generate note witnesses only when the bundle does not already have cached witnesses.",
-    "Warm padded-note secrets and PIR rows for the target bundle.",
-];
-
-/// Human-readable seed-signed delegation stages printed by the runnable example.
-pub const DELEGATION_FLOW: &[&str] = &[
-    "Re-resolve lightwalletd and wallet inputs for the selected delegation bundle.",
-    "Build and persist the governance PCZT for the selected delegation bundle.",
-    "Generate the delegation proof from stored witnesses and PIR precompute rows.",
-    "Sign the stored PCZT sighash with the wallet seed signer.",
-    "Assemble the chain-ready DelegationSubmission for the bundle.",
-];
-
-/// Human-readable Keystone request stages printed by embedders of this example.
-pub const KEYSTONE_REQUEST_FLOW: &[&str] = &[
-    "Re-resolve lightwalletd and wallet inputs for the selected delegation bundle.",
-    "Build and persist the governance PCZT that Keystone will sign.",
-    "Redact signer-irrelevant PCZT metadata before QR or hardware transport.",
-    "Build the display memo and KeystoneSigningRequest for the device.",
-];
-
-/// Human-readable Keystone submit stages printed by embedders of this example.
-pub const KEYSTONE_SUBMIT_FLOW: &[&str] = &[
-    "Re-resolve lightwalletd and wallet inputs for the selected delegation bundle.",
-    "Generate the delegation proof from stored witnesses and PIR precompute rows.",
-    "Extract the SpendAuth signature from the Keystone-signed PCZT.",
-    "Assemble the chain-ready DelegationSubmission with the Keystone signature.",
-];
-
-/// Caller-owned inputs needed to warm one delegation bundle.
+/// Inputs for precomputing one delegation bundle.
+///
+/// `round_params`, `round_name`, and `lightwalletd_url` identify the round and
+/// chain anchor. The wallet database supplies eligible notes for `account_uuid`,
+/// and `pir_server_url` supplies PIR rows for `bundle_index`.
 pub struct WalletPrecomputeRequest<'a> {
     pub account_uuid: &'a str,
     pub lightwalletd_url: &'a str,
@@ -59,7 +28,10 @@ pub struct WalletPrecomputeRequest<'a> {
     pub bundle_index: u32,
 }
 
-/// Caller-owned inputs needed to prove and seed-sign one delegation bundle.
+/// Inputs for proving and seed-signing one delegation bundle.
+///
+/// The target bundle must already be precomputed. `seed` is the wallet account
+/// seed used to sign the stored delegation sighash.
 pub struct WalletDelegateRequest<'a> {
     pub account_uuid: &'a str,
     pub lightwalletd_url: &'a str,
@@ -72,7 +44,10 @@ pub struct WalletDelegateRequest<'a> {
     pub seed: &'a [u8],
 }
 
-/// Caller-owned inputs needed to build one Keystone signing request.
+/// Inputs for creating a Keystone signing request for one delegation bundle.
+///
+/// The target bundle must already be precomputed. The returned request contains
+/// redacted PCZT bytes for the device while retaining local setup state.
 pub struct WalletKeystoneRequestRequest<'a> {
     pub account_uuid: &'a str,
     pub lightwalletd_url: &'a str,
@@ -84,7 +59,10 @@ pub struct WalletKeystoneRequestRequest<'a> {
     pub bundle_index: u32,
 }
 
-/// Caller-owned inputs needed to prove and submit one Keystone-signed bundle.
+/// Inputs for assembling a Keystone-signed delegation submission.
+///
+/// `signing_request` must be the request used to produce `signed_pczt_bytes`, so
+/// the extracted signature is paired with the original setup sighash.
 pub struct WalletKeystoneSubmitRequest<'a> {
     pub account_uuid: &'a str,
     pub lightwalletd_url: &'a str,
@@ -98,10 +76,17 @@ pub struct WalletKeystoneSubmitRequest<'a> {
     pub signed_pczt_bytes: &'a [u8],
 }
 
-/// Example wallet-side orchestration for warming one delegation bundle.
+/// Precomputes persistent artifacts needed to later prove one delegation bundle.
 ///
-/// Lightwalletd supplies the round anchor and branch id. The wallet DB supplies
-/// the account notes, account keys, and the local fully-scanned height.
+/// This stores round rows, note witnesses, padded-note secrets, and PIR-backed
+/// nullifier data for `bundle_index`. It does not build a PCZT, prove, sign, or
+/// submit a delegation.
+///
+/// # Errors
+///
+/// Returns an error if lightwalletd inputs cannot be resolved, wallet note
+/// selection fails, the PIR server cannot be reached, the bundle index is
+/// invalid, or precompute state cannot be persisted.
 pub async fn precompute_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
     wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
@@ -198,10 +183,18 @@ where
     })
 }
 
-/// Example wallet-side orchestration for proving and seed-signing one bundle.
+/// Proves one precomputed delegation bundle and signs it with the wallet seed.
 ///
-/// This continues from precomputed voting DB state: witnesses, padded-note
-/// secrets, and PIR rows should already be warmed for the target bundle.
+/// The returned `DelegationSubmission` contains the chain-ready fields for the
+/// selected bundle. The function expects the target bundle's witnesses,
+/// padded-note secrets, and PIR rows to have been warmed by
+/// `precompute_delegation_bundle`.
+///
+/// # Errors
+///
+/// Returns an error if chain or wallet inputs cannot be resolved, the bundle is
+/// missing or invalid, setup/proof generation fails, PIR access fails, signing
+/// fails, or submission fields cannot be assembled.
 pub async fn prove_and_submit_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
     wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
@@ -293,11 +286,17 @@ where
     .context("assemble seed-signed delegation submission")
 }
 
-/// Example wallet-side orchestration for building one Keystone signing request.
+/// Builds the redacted Keystone signing request for one delegation bundle.
 ///
-/// The returned `redacted_pczt_bytes` are the bytes a wallet would UR-encode for
-/// Keystone. The full setup remains in Rust-side voting state and in the request
-/// so the later submit step can verify the exact sighash that was signed.
+/// The returned request includes signer-facing redacted PCZT bytes, display
+/// metadata, bundle weights, and the local setup needed to verify and submit the
+/// later signed PCZT.
+///
+/// # Errors
+///
+/// Returns an error if chain or wallet inputs cannot be resolved, the bundle is
+/// missing or invalid, PCZT setup fails, redaction fails, or bundle weight cannot
+/// be calculated.
 pub async fn build_keystone_delegation_request<C, P, CL, R>(
     voting_db: &VotingDb,
     wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
@@ -381,11 +380,17 @@ where
     })
 }
 
-/// Example wallet-side orchestration for proving and submitting a Keystone bundle.
+/// Proves a bundle and assembles a submission from a Keystone-signed PCZT.
 ///
-/// This function intentionally does not rebuild the governance PCZT. It extracts
-/// Keystone's SpendAuth signature from the signed PCZT and pairs it with the
-/// original setup sighash that the device was asked to sign.
+/// This function does not rebuild the governance PCZT. It extracts Keystone's
+/// SpendAuth signature from `signed_pczt_bytes` and pairs it with the original
+/// setup sighash from `signing_request`.
+///
+/// # Errors
+///
+/// Returns an error if chain or wallet inputs cannot be resolved, the bundle is
+/// missing or invalid, proof generation fails, PIR access fails, the signature
+/// cannot be extracted, or submission fields cannot be assembled.
 pub async fn prove_and_submit_keystone_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
     wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
