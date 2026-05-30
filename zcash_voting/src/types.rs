@@ -1,6 +1,7 @@
 use std::fmt;
 
 use orchard::note::ExtractedNoteCommitment;
+use serde::{Deserialize, Serialize};
 use subtle::CtOption;
 use thiserror::Error;
 use zcash_client_backend::proto::service::TreeState;
@@ -455,9 +456,11 @@ pub struct VoteCommitmentBundle {
 
 /// Wire-safe encrypted share — contains only the public ciphertext components.
 /// Secrets (`plaintext_value`, `randomness`) are kept inside Rust and never cross the FFI boundary.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireEncryptedShare {
+    #[serde(with = "crate::wire::serde_base64_bytes")]
     pub c1: Vec<u8>,
+    #[serde(with = "crate::wire::serde_base64_bytes")]
     pub c2: Vec<u8>,
     pub share_index: u32,
 }

@@ -6,6 +6,7 @@
 //! network/proof/sign plumbing.
 
 use rusqlite::named_params;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::phases::{DelegationPhase, SharePhase, VotePhase};
@@ -167,7 +168,8 @@ fn now_secs() -> i64 {
 /// One unit of remaining work for a round. Ordered deterministically within a
 /// `RoundPlan`, so a restart yields the same sequence.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NextStep {
     Delegate {
         bundle_index: u32,

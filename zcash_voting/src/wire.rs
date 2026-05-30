@@ -12,14 +12,55 @@
 //! `crate::wire_codec`, while `wire.rs` remains the stable cross-language
 //! schema surface.
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireEncryptedShareJson {
-    pub c1: String,
-    pub c2: String,
-    pub share_index: u32,
+pub mod serde_base64_bytes {
+    use super::*;
+
+    pub fn serialize<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&BASE64_STANDARD.encode(value))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        BASE64_STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BoundedU32(pub u32);
+
+impl TryFrom<usize> for BoundedU32 {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Ok(Self(u32::try_from(value)?))
+    }
+}
+
+impl TryFrom<u64> for BoundedU32 {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Ok(Self(u32::try_from(value)?))
+    }
+}
+
+pub use crate::delegate::KeystoneSigningRequest;
+pub use crate::round::BundleLayout;
+pub use crate::share_policy::ShareSubmissionPlan;
+pub use crate::types::WireEncryptedShare;
+pub use crate::vote::VanWitness;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationSubmissionWire {
@@ -56,12 +97,12 @@ pub struct VoteShareWire {
     pub proposal_id: u32,
     pub vote_decision: u32,
     #[serde(rename = "enc_share")]
-    pub encrypted_share: WireEncryptedShareJson,
+    pub encrypted_share: WireEncryptedShare,
     pub share_index: u32,
     #[serde(rename = "tree_position")]
     pub vc_tree_position: u64,
     #[serde(rename = "all_enc_shares")]
-    pub all_encrypted_shares: Vec<WireEncryptedShareJson>,
+    pub all_encrypted_shares: Vec<WireEncryptedShare>,
     pub share_comms: Vec<String>,
     pub primary_blind: String,
     pub submit_at: u64,
@@ -99,12 +140,6 @@ pub struct VotingNoteSelectionResultView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BundleSetupResultView {
-    pub bundle_count: u32,
-    pub eligible_weight_zatoshi: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationPirPrecomputeResultView {
     pub cached_count: u32,
     pub fetched_count: u32,
@@ -125,32 +160,11 @@ pub struct SignedDelegationPayloadView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeystoneDelegationRequestView {
-    pub pczt_bytes: Vec<u8>,
-    pub redacted_pczt_bytes: Vec<u8>,
-    pub pczt_sighash: Vec<u8>,
-    pub rk: Vec<u8>,
-    pub action_index: u32,
-    pub display_memo: String,
-    pub eligible_weight_zatoshi: u64,
-    pub delegated_weight_zatoshi: u64,
-    pub bundle_count: u32,
-    pub bundle_index: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeystoneSignatureRecord {
     pub bundle_index: u32,
     pub sig: Vec<u8>,
     pub sighash: Vec<u8>,
     pub rk: Vec<u8>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VanWitnessView {
-    pub auth_path: Vec<Vec<u8>>,
-    pub position: u32,
-    pub anchor_height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,13 +194,6 @@ pub struct VoteRecord {
     pub proposal_id: u32,
     pub bundle_index: u32,
     pub choice: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShareSubmissionPlanView {
-    pub submit_at: u64,
-    pub target_count: u32,
-    pub target_servers: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +244,14 @@ pub struct ShareWorkflowRecoveryView {
     pub share_index: u32,
     pub phase: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextStepView {
+    pub kind: String,
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub choice: u32,
+    pub share_index: u32,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundRecoveryStateView {
@@ -248,15 +263,6 @@ pub struct RoundRecoveryStateView {
     pub shares: Vec<ShareWorkflowRecoveryView>,
     pub share_delegations: Vec<ShareDelegationRecordView>,
     pub unconfirmed_share_delegations: Vec<ShareDelegationRecordView>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NextStepView {
-    pub kind: String,
-    pub bundle_index: u32,
-    pub proposal_id: u32,
-    pub choice: u32,
-    pub share_index: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -10,26 +10,18 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
 use crate::{
-    delegate::{
-        DelegationSubmission, KeystoneSigningRequest, PreparedDelegationReport,
-        SignedDelegationBundle,
-    },
+    delegate::{DelegationSubmission, PreparedDelegationReport, SignedDelegationBundle},
     phases::WorkflowPhase,
-    recovery,
-    round::BundleLayout,
-    session,
-    share_policy::ShareSubmissionPlan,
-    types::{NoteRef, SelectedNotes, SharePayload, VotingError, WireEncryptedShare},
-    vote::{SignedVoteCommitment, SignedVoteCommitments, VanWitness},
+    recovery, session,
+    types::{NoteRef, SelectedNotes, SharePayload, VotingError},
+    vote::{SignedVoteCommitment, SignedVoteCommitments},
     wire::{
-        BundleSetupResultView, CompletedVoteChoiceView, CompletedVoteDisplayView,
-        DelegationPirPrecomputeResultView, DelegationRecoveryView, DelegationRecoveryWorkView,
-        DelegationStatusView, DelegationSubmissionWire, KeystoneDelegationRequestView, NextStepView,
-        RoundPlanView, RoundRecoveryStateView, ShareDelegationRecordView, ShareSubmissionPlanView,
-        ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteCommitmentView,
-        SignedVoteCommitmentsView, VanWitnessView, VoteCommitmentWire, VoteRecoveryView,
+        CompletedVoteChoiceView, CompletedVoteDisplayView, DelegationPirPrecomputeResultView,
+        DelegationRecoveryView, DelegationRecoveryWorkView, DelegationStatusView,
+        DelegationSubmissionWire, NextStepView, RoundPlanView, RoundRecoveryStateView,
+        ShareDelegationRecordView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
+        SignedVoteCommitmentView, SignedVoteCommitmentsView, VoteCommitmentWire, VoteRecoveryView,
         VoteRecoveryWorkView, VoteShareWire, VotingNoteRefView, VotingNoteSelectionResultView,
-        WireEncryptedShareJson,
     },
     BundlePolicy,
 };
@@ -62,13 +54,13 @@ impl VoteShareWire {
             shares_hash: b64(&payload.shares_hash),
             proposal_id: payload.proposal_id,
             vote_decision: payload.vote_decision,
-            encrypted_share: (&payload.enc_share).into(),
+            encrypted_share: payload.enc_share.clone(),
             share_index: payload.enc_share.share_index,
             vc_tree_position: json_safe_u64(
                 vc_tree_position.unwrap_or(payload.tree_position),
                 "tree_position",
             )?,
-            all_encrypted_shares: payload.all_enc_shares.iter().map(Into::into).collect(),
+            all_encrypted_shares: payload.all_enc_shares.clone(),
             share_comms: payload.share_comms.iter().map(b64).collect(),
             primary_blind: b64(&payload.primary_blind),
             submit_at: json_safe_u64(submit_at, "submit_at")?,
@@ -91,16 +83,6 @@ impl VoteShareWire {
         }
         self.submit_at = json_safe_u64(submit_at, "submit_at")?;
         Ok(self)
-    }
-}
-
-impl From<&WireEncryptedShare> for WireEncryptedShareJson {
-    fn from(share: &WireEncryptedShare) -> Self {
-        Self {
-            c1: b64(&share.c1),
-            c2: b64(&share.c2),
-            share_index: share.share_index,
-        }
     }
 }
 
@@ -203,15 +185,6 @@ impl VotingNoteSelectionResultView {
     }
 }
 
-impl From<BundleLayout> for BundleSetupResultView {
-    fn from(result: BundleLayout) -> Self {
-        Self {
-            bundle_count: result.bundle_count,
-            eligible_weight_zatoshi: result.eligible_weight,
-        }
-    }
-}
-
 impl From<PreparedDelegationReport> for DelegationPirPrecomputeResultView {
     fn from(result: PreparedDelegationReport) -> Self {
         Self {
@@ -238,34 +211,6 @@ impl TryFrom<SignedDelegationBundle> for SignedDelegationPayloadView {
             bundle_count: result.bundle_count,
             bundle_index: result.bundle_index,
         })
-    }
-}
-
-impl From<KeystoneSigningRequest> for KeystoneDelegationRequestView {
-    fn from(result: KeystoneSigningRequest) -> Self {
-        let action_index = u32::try_from(result.setup.action_index).unwrap_or(u32::MAX);
-        Self {
-            pczt_bytes: result.setup.pczt_bytes,
-            redacted_pczt_bytes: result.redacted_pczt_bytes,
-            pczt_sighash: result.setup.pczt_sighash.to_vec(),
-            rk: result.setup.rk.to_vec(),
-            action_index,
-            display_memo: result.display_memo,
-            eligible_weight_zatoshi: result.eligible_weight_zatoshi,
-            delegated_weight_zatoshi: result.delegated_weight_zatoshi,
-            bundle_count: result.bundle_count,
-            bundle_index: result.bundle_index,
-        }
-    }
-}
-
-impl From<VanWitness> for VanWitnessView {
-    fn from(witness: VanWitness) -> Self {
-        Self {
-            auth_path: witness.auth_path.iter().map(|hash| hash.to_vec()).collect(),
-            position: witness.position,
-            anchor_height: witness.anchor_height,
-        }
     }
 }
 
@@ -298,22 +243,6 @@ impl TryFrom<SignedVoteCommitments> for SignedVoteCommitmentsView {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
-}
-
-impl TryFrom<ShareSubmissionPlan> for ShareSubmissionPlanView {
-    type Error = VotingError;
-
-    fn try_from(plan: ShareSubmissionPlan) -> Result<Self, Self::Error> {
-        let target_count =
-            u32::try_from(plan.target_count).map_err(|_| VotingError::InvalidInput {
-                message: format!("target_count {} does not fit u32", plan.target_count),
-            })?;
-        Ok(Self {
-            submit_at: plan.submit_at,
-            target_count,
-            target_servers: plan.target_servers,
         })
     }
 }
@@ -684,13 +613,13 @@ mod tests {
             shares_hash: vec![0x21; 32],
             proposal_id: 9,
             vote_decision: 2,
-            enc_share: WireEncryptedShare {
+            enc_share: crate::WireEncryptedShare {
                 c1: vec![0x22; 32],
                 c2: vec![0x23; 32],
                 share_index: 1,
             },
             tree_position: 99,
-            all_enc_shares: vec![WireEncryptedShare {
+            all_enc_shares: vec![crate::WireEncryptedShare {
                 c1: vec![0x24; 32],
                 c2: vec![0x25; 32],
                 share_index: 1,
@@ -713,7 +642,7 @@ mod tests {
             shares_hash: vec![0x21; 32],
             proposal_id: 1,
             vote_decision: 1,
-            enc_share: WireEncryptedShare {
+            enc_share: crate::WireEncryptedShare {
                 c1: vec![0x22; 32],
                 c2: vec![0x23; 32],
                 share_index: 0,
@@ -731,14 +660,61 @@ mod tests {
     }
 
     #[test]
-    fn bundle_setup_result_view_preserves_core_fields() {
-        let view = BundleSetupResultView::from(crate::round::BundleLayout {
+    fn bundle_layout_preserves_core_fields() {
+        let view = crate::round::BundleLayout {
             bundle_count: 2,
             eligible_weight: 50,
             dropped_count: 0,
-        });
+        };
         assert_eq!(view.bundle_count, 2);
-        assert_eq!(view.eligible_weight_zatoshi, 50);
+        assert_eq!(view.eligible_weight, 50);
+    }
+
+    #[test]
+    fn wire_encrypted_share_serde_roundtrip_preserves_base64_shape() {
+        let share = crate::WireEncryptedShare {
+            c1: vec![0xAA, 0xBB],
+            c2: vec![0xCC, 0xDD],
+            share_index: 7,
+        };
+        let json = serde_json::to_value(&share).unwrap();
+        assert_eq!(json["c1"], "qrs=");
+        assert_eq!(json["c2"], "zN0=");
+        let decoded: crate::WireEncryptedShare = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, share);
+    }
+
+    #[test]
+    fn van_witness_serde_roundtrip_preserves_auth_path() {
+        let witness = crate::vote::VanWitness {
+            auth_path: vec![vec![1; 32], vec![2; 32]],
+            position: 9,
+            anchor_height: 101,
+        };
+        let json = serde_json::to_value(&witness).unwrap();
+        assert_eq!(json["auth_path"][0].as_array().unwrap().len(), 32);
+        let decoded: crate::vote::VanWitness = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.position, 9);
+        assert_eq!(decoded.anchor_height, 101);
+        assert_eq!(decoded.auth_path[0], vec![1; 32]);
+    }
+
+    #[test]
+    fn share_submission_plan_serde_roundtrip_preserves_fields() {
+        let plan = crate::share_policy::ShareSubmissionPlan {
+            submit_at: 123,
+            target_count: 2,
+            target_servers: vec![
+                "https://helper-1.example".to_string(),
+                "https://helper-2.example".to_string(),
+            ],
+        };
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["target_count"].as_u64().unwrap(), 2);
+        assert_eq!(json["target_servers"].as_array().unwrap().len(), 2);
+        let decoded: crate::share_policy::ShareSubmissionPlan =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, plan);
     }
 
     #[test]
@@ -781,37 +757,34 @@ mod tests {
     }
 
     #[test]
-    fn keystone_delegation_request_view_preserves_display_memo() {
-        let view = KeystoneDelegationRequestView::from(KeystoneSigningRequest {
-            setup: crate::delegate::DelegationSetup {
-                pczt_bytes: vec![1],
-                pczt_sighash: [3; 32],
-                rk: [4; 32],
-                action_index: 5,
-                action_bytes: vec![],
-            },
+    fn keystone_signing_request_preserves_display_memo() {
+        let view = crate::delegate::KeystoneSigningRequest {
+            pczt_bytes: vec![1],
             redacted_pczt_bytes: vec![2],
+            pczt_sighash: vec![3; 32],
+            rk: vec![4; 32],
+            action_index: 5,
             display_memo: "I am authorizing this hotkey.".to_string(),
             eligible_weight_zatoshi: 20,
             delegated_weight_zatoshi: 10,
             bundle_count: 2,
             bundle_index: 1,
-        });
+        };
         assert_eq!(view.display_memo, "I am authorizing this hotkey.");
         assert_eq!(view.bundle_count, 2);
         assert_eq!(view.bundle_index, 1);
     }
 
     #[test]
-    fn van_witness_view_preserves_core_fields() {
-        let mut witness = [[0u8; 32]; crate::vote::VAN_AUTH_PATH_LEN];
-        witness[0] = [1; 32];
-        witness[1] = [2; 32];
-        let view = VanWitnessView::from(VanWitness {
+    fn van_witness_preserves_core_fields() {
+        let mut witness = vec![vec![0u8; 32]; crate::vote::VAN_AUTH_PATH_LEN];
+        witness[0] = vec![1; 32];
+        witness[1] = vec![2; 32];
+        let view = crate::vote::VanWitness {
             auth_path: witness,
             position: 7,
             anchor_height: 123,
-        });
+        };
         assert_eq!(view.auth_path[0], vec![1; 32]);
         assert_eq!(view.auth_path[1], vec![2; 32]);
         assert_eq!(view.position, 7);
@@ -879,7 +852,7 @@ mod tests {
         assert_eq!(view.commitments[0].wire.proposal_id, 2);
         assert_eq!(
             view.commitments[0].shares[0].encrypted_share.c1,
-            base64::engine::general_purpose::STANDARD.encode(vec![5; 32])
+            vec![5; 32]
         );
         assert_eq!(
             view.commitments[0].shares[0].primary_blind,

@@ -2,7 +2,10 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ShareDelegationRecord, VotingError};
+use crate::{
+    types::{ShareDelegationRecord, VotingError},
+    wire::BoundedU32,
+};
 
 /// Seconds to wait after helper submission time before polling share status.
 pub const SHARE_STATUS_CHECK_GRACE_SECONDS: u64 = 10;
@@ -53,7 +56,7 @@ pub struct ShareSubmissionPlan {
     /// Unix seconds when helpers should submit the share, or 0 for immediate.
     pub submit_at: u64,
     /// Number of helpers each share should reach.
-    pub target_count: u64,
+    pub target_count: u32,
     /// Helper targets selected for initial share submission.
     pub target_servers: Vec<String>,
 }
@@ -514,7 +517,11 @@ pub fn plan_share_submission(
 
     Ok(ShareSubmissionPlan {
         submit_at,
-        target_count: target_count as u64,
+        target_count: BoundedU32::try_from(target_count)
+            .map_err(|_| VotingError::InvalidInput {
+                message: format!("target_count {target_count} does not fit u32"),
+            })?
+            .0,
         target_servers,
     })
 }
@@ -641,7 +648,11 @@ fn plan_share_submission_with_targets(
 
     Ok(ShareSubmissionPlan {
         submit_at,
-        target_count: target_count as u64,
+        target_count: BoundedU32::try_from(target_count)
+            .map_err(|_| VotingError::InvalidInput {
+                message: format!("target_count {target_count} does not fit u32"),
+            })?
+            .0,
         target_servers,
     })
 }

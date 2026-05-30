@@ -486,9 +486,15 @@ pub struct SignedDelegationBundle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeystoneSigningRequest {
     /// Full setup output persisted for later proof and submission assembly.
-    pub setup: DelegationSetup,
+    pub pczt_bytes: Vec<u8>,
     /// Redacted PCZT bytes safe to send to the signer role.
     pub redacted_pczt_bytes: Vec<u8>,
+    /// ZIP-244 sighash extracted from the setup PCZT.
+    pub pczt_sighash: Vec<u8>,
+    /// Randomized verification key (rk) for signature verification.
+    pub rk: Vec<u8>,
+    /// Orchard action index containing the governance spend/output.
+    pub action_index: u32,
     /// Human-readable memo shown to the signer.
     pub display_memo: String,
     /// Total eligible round weight after bundle quantization.
@@ -629,10 +635,18 @@ impl PreparedDelegationBundle {
         let redacted_pczt_bytes = redact_for_signer(&setup.pczt_bytes)?;
         let delegated_weight_zatoshi = crate::round::raw_bundle_weight(&self.bundle_note_infos)?;
         let display_memo = display_memo(&self.round_name, delegated_weight_zatoshi);
+        let action_index = crate::wire::BoundedU32::try_from(setup.action_index).map_err(|_| {
+            VotingError::InvalidInput {
+                message: format!("action_index {} does not fit u32", setup.action_index),
+            }
+        })?;
 
         Ok(KeystoneSigningRequest {
-            setup,
+            pczt_bytes: setup.pczt_bytes,
             redacted_pczt_bytes,
+            pczt_sighash: setup.pczt_sighash.to_vec(),
+            rk: setup.rk.to_vec(),
+            action_index: action_index.0,
             display_memo,
             eligible_weight_zatoshi: self.layout.eligible_weight,
             delegated_weight_zatoshi,
