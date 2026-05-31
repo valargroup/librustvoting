@@ -227,10 +227,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   material and delegation signatures locally, then pass only hotkey seed bytes
   or SpendAuth signatures into the crate.
 - Removed unused legacy APIs left behind by the wallet integration refactor:
-  the direct share decomposition module, the public share-tracking nullifier
-  module, `VotingDb::voting_hotkey_from_seed`, confirmed-state writer shims,
-  legacy `Network` numeric converters, and the mainnet-only consensus branch ID
-  helper.
+  direct share decomposition/encryption modules, the public share-tracking
+  nullifier module, `VotingDb::voting_hotkey_from_seed`, confirmed-state writer
+  shims, legacy `Network` numeric converters, and the mainnet-only consensus
+  branch ID helper.
 - Delegation PIR warmup no longer constructs or caches a governance PCZT.
   `PreparedDelegationBundle::precompute` now warms witnesses, padded-note
   secrets, and PIR rows only; `delegate::setup` builds the PCZT later from the

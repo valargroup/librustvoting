@@ -12,7 +12,6 @@
 pub mod action;
 pub mod confirmation;
 pub mod delegate;
-pub mod elgamal;
 pub mod error;
 pub mod governance;
 pub mod hotkey;
