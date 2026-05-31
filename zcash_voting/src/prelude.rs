@@ -63,11 +63,10 @@ pub use crate::share::{
     SharePlan, ShareRecord, ShareTimingPolicy, ShareTrackingSummary,
 };
 pub use crate::types::{
-    validate_proposal_id, validate_vote_decision, validate_vote_options, Cancellation,
-    DelegationProgressBridge, DelegationProgressReporter, Network, NoopCancellation,
-    NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter, SelectedNotes, SharePayload,
-    VoteCommitStageBridge, VoteCommitStageReporter, VotingHotkey, WitnessData, MAX_PROPOSAL_ID,
-    MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID, MIN_VOTE_OPTIONS,
+    validate_proposal_id, validate_vote_decision, validate_vote_options, DelegationProgressBridge,
+    DelegationProgressReporter, Network, NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter,
+    SelectedNotes, SharePayload, VoteCommitStageBridge, VoteCommitStageReporter, VotingHotkey,
+    WitnessData, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID, MIN_VOTE_OPTIONS,
 };
 pub use crate::vote::{
     commit as commit_vote, commit_batch, parse_recovery,

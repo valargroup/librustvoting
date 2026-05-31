@@ -363,18 +363,10 @@ impl CommittedVote {
     }
 }
 
-fn ensure_not_cancelled(cancellation: &dyn crate::types::Cancellation) -> Result<(), VotingError> {
-    if cancellation.is_cancelled() {
-        Err(VotingError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
 /// Builds signed vote commitments for every draft in one bundle.
 ///
 /// This validates the draft list and bundle index once, then commits each draft
-/// in order while honoring cancellation checks between expensive operations.
+/// in order while reporting commit progress.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_batch(
     db: &VotingDb,
@@ -383,20 +375,16 @@ pub fn commit_batch(
     drafts: &[DraftVote],
     witness: &VanWitness,
     signer: VoteSigner<'_>,
-    cancellation: &dyn crate::types::Cancellation,
     stages: &dyn crate::types::VoteCommitStageReporter,
 ) -> Result<SignedVoteCommitments, VotingError> {
     validate_draft_votes(drafts)?;
     let bundle_count = db.get_bundle_count(round_id)?;
     crate::round::validate_bundle_index(bundle_count, bundle_index, "voting")?;
-    ensure_not_cancelled(cancellation)?;
 
     let mut commitments = Vec::with_capacity(drafts.len());
     for draft in drafts {
-        ensure_not_cancelled(cancellation)?;
         let committed =
             CommittedVote::commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
-        ensure_not_cancelled(cancellation)?;
         commitments.push(committed.signed_commitment(db)?);
     }
 
@@ -1547,10 +1535,7 @@ mod tests {
     use crate::{
         round::RoundParams,
         storage::{queries, VotingDb},
-        types::{
-            Cancellation, NoopCancellation, NoopProgressReporter, NoteInfo, MAX_PROPOSAL_ID,
-            MAX_VOTE_OPTIONS,
-        },
+        types::{NoopProgressReporter, NoteInfo, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS},
     };
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -2212,7 +2197,6 @@ mod tests {
                 seed: &[0x99; 32],
                 network: Network::Testnet,
             },
-            &NoopCancellation,
             &NoopProgressReporter,
         )
         .unwrap();
@@ -2255,38 +2239,6 @@ mod tests {
         assert_eq!(signed.bundle_index, 0);
         assert_eq!(signed.commitments.len(), 1);
         assert_eq!(signed.commitments[0].commitment_bundle_json, recovery_json);
-    }
-
-    #[test]
-    fn commit_batch_respects_cancellation() {
-        struct AlwaysCancelled;
-        impl Cancellation for AlwaysCancelled {
-            fn is_cancelled(&self) -> bool {
-                true
-            }
-        }
-
-        let db = db_with_vote();
-        let err = commit_batch(
-            &db,
-            ROUND_ID,
-            0,
-            &[draft_vote_fixture()],
-            &VanWitness {
-                auth_path: vec![vec![0xAA; 32]; VAN_AUTH_PATH_LEN],
-                position: 7,
-                anchor_height: 123,
-            },
-            VoteSigner::HotkeySeed {
-                seed: &[0x99; 32],
-                network: Network::Testnet,
-            },
-            &AlwaysCancelled,
-            &NoopProgressReporter,
-        )
-        .unwrap_err();
-
-        assert!(matches!(err, VotingError::Cancelled));
     }
 
     #[test]

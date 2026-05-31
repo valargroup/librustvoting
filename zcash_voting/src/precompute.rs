@@ -24,11 +24,7 @@ use crate::{
 };
 
 #[cfg(feature = "pir")]
-use crate::{
-    delegate::PreparedDelegationReport,
-    round::BundleLayout,
-    types::{Cancellation, Network},
-};
+use crate::{delegate::PreparedDelegationReport, round::BundleLayout, types::Network};
 
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::vote::VanWitness;
@@ -174,8 +170,7 @@ pub fn delegation_pir(
 ///
 /// # Errors
 ///
-/// Returns [`VotingError::Cancelled`] when `cancellation` is set. Other
-/// failures come from padded-secret initialization or PIR precompute.
+/// Failures come from padded-secret initialization or PIR precompute.
 #[cfg(feature = "pir")]
 pub(crate) fn warm_delegation_pir(
     db: &VotingDb,
@@ -185,11 +180,8 @@ pub(crate) fn warm_delegation_pir(
     layout: BundleLayout,
     pir_client: &pir_client::PirClientBlocking,
     network: Network,
-    cancellation: &dyn Cancellation,
 ) -> Result<PreparedDelegationReport, VotingError> {
-    ensure_not_cancelled(cancellation)?;
     db.ensure_padded_secrets(round_id, bundle_index, notes)?;
-    ensure_not_cancelled(cancellation)?;
     let report = delegation_pir(db, round_id, bundle_index, notes, pir_client, network)?;
 
     Ok(PreparedDelegationReport {
@@ -199,33 +191,16 @@ pub(crate) fn warm_delegation_pir(
     })
 }
 
-#[cfg(feature = "pir")]
-fn ensure_not_cancelled(cancellation: &dyn Cancellation) -> Result<(), VotingError> {
-    if cancellation.is_cancelled() {
-        Err(VotingError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(all(test, feature = "pir"))]
 mod pir_tests {
     use super::*;
     use crate::round::BundleLayout;
-    use crate::types::{Cancellation, Network, NoteInfo};
+    use crate::types::{Network, NoteInfo};
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
     #[test]
-    fn warm_delegation_pir_honours_cancellation() {
-        struct AlwaysCancelled;
-
-        impl Cancellation for AlwaysCancelled {
-            fn is_cancelled(&self) -> bool {
-                true
-            }
-        }
-
+    fn warm_delegation_pir_runs_precompute_transport_path() {
         struct StaticPirTransport;
 
         impl pir_client::Transport for StaticPirTransport {
@@ -273,7 +248,7 @@ mod pir_tests {
             fn post<'a>(&'a self, url: &'a str, _body: Vec<u8>) -> pir_client::TransportFuture<'a> {
                 Box::pin(async move {
                     Err(anyhow::anyhow!(
-                        "unexpected POST {}; warm path should cancel first",
+                        "unexpected POST {}; warm path reached transport",
                         request_path(url)
                     ))
                 })
@@ -309,6 +284,18 @@ mod pir_tests {
             scope: 0,
             ufvk_str: "uviewtest".to_string(),
         }];
+        db.create_round(
+            &crate::round::RoundParams {
+                vote_round_id: ROUND_ID.to_string(),
+                snapshot_height: 100,
+                ea_pk: vec![1; 32],
+                nc_root: vec![2; 32],
+                nullifier_imt_root: vec![3; 32],
+            },
+            None,
+        )
+        .unwrap();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
         let layout = BundleLayout {
             bundle_count: 1,
             eligible_weight: 42,
@@ -328,11 +315,15 @@ mod pir_tests {
             layout,
             &pir_client,
             Network::Testnet,
-            &AlwaysCancelled,
         )
         .unwrap_err();
 
-        assert!(matches!(err, VotingError::Cancelled));
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to decode UFVK while deriving padded nullifiers")
+                || message.contains("unexpected POST"),
+            "unexpected warm_delegation_pir error: {message}",
+        );
     }
 }
 

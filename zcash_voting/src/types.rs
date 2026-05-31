@@ -32,8 +32,6 @@ pub const MAX_VOTE_OPTIONS: u32 = 8;
 pub enum VotingError {
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
-    #[error("Voting work cancelled")]
-    Cancelled,
     #[error("Proof generation failed: {message}")]
     ProofFailed { message: String },
     #[error("Internal error: {message}")]
@@ -590,20 +588,6 @@ pub struct WitnessData {
     pub position: u64,
     pub root: Vec<u8>,
     pub auth_path: Vec<Vec<u8>>,
-}
-
-/// Lets long-running library operations early-exit on caller-driven cancellation.
-pub trait Cancellation: Send + Sync {
-    fn is_cancelled(&self) -> bool;
-}
-
-/// Cancellation handle for callers that do not support cancellation.
-pub struct NoopCancellation;
-
-impl Cancellation for NoopCancellation {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
 }
 
 /// Callback for delegation workflow progress events.
