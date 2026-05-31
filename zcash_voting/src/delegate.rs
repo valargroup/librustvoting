@@ -686,7 +686,7 @@ impl PreparedDelegationBundle {
         stages: &dyn DelegationProgressReporter,
     ) -> Result<KeystoneSigningRequest, VotingError> {
         let setup = self.setup(voting_db, stages)?;
-        let redacted_pczt_bytes = redact_for_signer(&setup.pczt_bytes)?;
+        let redacted_pczt_bytes = redact_delegation_pczt_for_signer(&setup.pczt_bytes)?;
         let display_weight_zatoshi = crate::round::raw_bundle_weight(&self.bundle_note_infos)?;
         let display_memo = display_memo(&self.round_name, display_weight_zatoshi);
         let action_index = crate::wire::BoundedU32::try_from(setup.action_index).map_err(|_| {
@@ -899,15 +899,11 @@ pub fn spend_auth_signature(
     crate::action::extract_spend_auth_sig(signed_pczt_bytes, action_index)
 }
 
-/// Redacts PCZT metadata that signer devices do not need.
+/// Redacts delegation PCZT metadata that signer devices do not need.
 ///
 /// The output preserves signing-relevant transaction data while removing
 /// witness and wallet-proprietary metadata before QR or hardware transport.
-///
-/// # Errors
-///
-/// Returns [`VotingError::InvalidInput`] when `pczt_bytes` cannot be parsed.
-pub fn redact_for_signer(pczt_bytes: &[u8]) -> Result<Vec<u8>, VotingError> {
+fn redact_delegation_pczt_for_signer(pczt_bytes: &[u8]) -> Result<Vec<u8>, VotingError> {
     use pczt::roles::redactor::Redactor;
 
     let pczt = pczt::Pczt::parse(pczt_bytes).map_err(|e| VotingError::InvalidInput {
@@ -1582,8 +1578,10 @@ mod tests {
     }
 
     #[test]
-    fn redact_for_signer_rejects_invalid_pczt_bytes() {
-        let err = redact_for_signer(&[0xFF, 0x00]).unwrap_err().to_string();
+    fn redact_delegation_pczt_for_signer_rejects_invalid_pczt_bytes() {
+        let err = redact_delegation_pczt_for_signer(&[0xFF, 0x00])
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("parse PCZT failed"));
     }

@@ -282,6 +282,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   PIR precompute, software signing, and Keystone request/submission helpers so resume
   flows can share cached bundle state without repeating lightwalletd and wallet
   note-selection work.
+- `delegate::redact_for_signer` is no longer exported as a generic wallet-facing
+  helper. Delegation Keystone requests still redact their PCZT internally;
+  generic wallet send PCZT redaction belongs in the wallet SDK boundary.
 
 # 0.10.1
 
