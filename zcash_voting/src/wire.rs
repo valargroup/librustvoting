@@ -108,6 +108,26 @@ pub struct VoteShareWire {
     pub submit_at: u64,
 }
 
+/// Parsed confirmation data for a submitted delegation transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationConfirmation {
+    /// Confirmed transaction hash.
+    pub tx_hash: String,
+    /// Confirmed vote-authority-note leaf position.
+    pub van_leaf_position: u32,
+}
+
+/// Parsed confirmation data for a submitted cast-vote transaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteConfirmation {
+    /// Confirmed transaction hash.
+    pub tx_hash: String,
+    /// Confirmed vote-authority-note leaf position.
+    pub van_leaf_position: u32,
+    /// Confirmed vote commitment tree position.
+    pub vc_tree_position: u64,
+}
+
 /// Parameters for a voting round, sourced from vote chain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotingRoundParams {
