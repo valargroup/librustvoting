@@ -22,11 +22,7 @@ use crate::{
     types::{NoteInfo, VotingError, WitnessData},
 };
 
-use crate::{
-    delegate::PreparedDelegationReport,
-    round::BundleLayout,
-    types::Network,
-};
+use crate::{delegate::PreparedDelegationReport, round::BundleLayout, types::Network};
 
 pub use crate::vote::VanWitness;
 

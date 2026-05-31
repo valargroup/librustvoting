@@ -12,12 +12,11 @@ pub use crate::delegate::gather_delegation_lwd_inputs;
 pub use crate::delegate::LightwalletdBranchIdProvider;
 pub use crate::delegate::{
     branch_id_for_height, display_memo, load_account_keys, pczt_sighash, record_submission,
-    record_van_position, redact_for_signer, setup as setup_delegation,
-    signing_request as delegation_signing_request, spend_auth_signature,
-    submission as delegation_submission, BranchIdProvider, DelegationAccountKeys, DelegationKeys,
-    DelegationPhase, DelegationProgress, DelegationProof, DelegationSetup, DelegationSigner,
-    DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
-    PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
+    record_van_position, setup as setup_delegation, signing_request as delegation_signing_request,
+    spend_auth_signature, submission as delegation_submission, BranchIdProvider,
+    DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProgress, DelegationProof,
+    DelegationSetup, DelegationSigner, DelegationSigningRequest, DelegationSubmission,
+    KeystoneSigningRequest, PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
 };
 pub use crate::delegate::{
     prepare_delegation_bundle, PrepareDelegationBundleParams, PreparedDelegationBundle,
