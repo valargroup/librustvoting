@@ -35,7 +35,6 @@ use crate::types::{
 
 /// Convert an IMT proof from the PIR data crate into the circuit-crate `ImtProofData`.
 /// Both use the K=2 punctured-range format with `nf_bounds = [nf_lo, nf_mid, nf_hi]`.
-#[cfg(any(feature = "pir", feature = "client-pir"))]
 pub fn convert_pir_proof(pir: pir_client::ImtProofData) -> ImtProofData {
     ImtProofData {
         root: pir.root,
@@ -49,7 +48,6 @@ fn base_hex(value: pallas::Base) -> String {
     hex::encode(value.to_repr())
 }
 
-#[cfg(any(feature = "pir", feature = "client-pir"))]
 fn validate_pir_proof_raw(
     proof: &pir_client::ImtProofData,
     nullifier: pallas::Base,
@@ -71,7 +69,6 @@ fn validate_pir_proof_raw(
     Ok(())
 }
 
-#[cfg(any(feature = "pir", feature = "client-pir"))]
 pub fn validate_and_convert_pir_proof(
     proof: pir_client::ImtProofData,
     nullifier: pallas::Base,
@@ -548,7 +545,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
     fn raw_pir_proof(proof: ImtProofData) -> pir_client::ImtProofData {
         pir_client::ImtProofData {
             root: proof.root,
@@ -558,7 +554,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
     #[test]
     fn validate_and_convert_pir_proof_accepts_valid_proof() {
         let imt = SpacedLeafImtProvider::new();
@@ -571,7 +566,6 @@ mod tests {
         assert_eq!(converted.root, root);
     }
 
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
     #[test]
     fn validate_and_convert_pir_proof_rejects_unverified_path() {
         let imt = SpacedLeafImtProvider::new();
@@ -588,7 +582,6 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
     #[test]
     fn validate_and_convert_pir_proof_rejects_wrong_root() {
         let imt = SpacedLeafImtProvider::new();

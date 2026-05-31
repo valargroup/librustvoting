@@ -7,49 +7,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/valargroup/zcash_voting"
 readme = "README.md"
 
-[features]
-default = ["pir", "tree-sync"]
-# PIR client surface for fetching IMT non-membership proofs over direct
-# Hyper/Rustls HTTP.
-pir = [
-    "dep:imt-tree",
-    "dep:pir-client",
-    "dep:pir-types",
-    "dep:valar-spiral-rs",
-    "dep:valar-ypir",
-    "dep:bytes",
-    "dep:http",
-    "dep:http-body-util",
-    "dep:hyper",
-    "dep:hyper-rustls",
-    "dep:hyper-util",
-]
-# Vote commitment tree HTTP sync surface for VAN witness generation.
-tree-sync = [
-    "dep:imt-tree",
-    "dep:vote-commitment-tree",
-    "dep:vote-commitment-tree-client",
-    "dep:bytes",
-    "dep:http",
-    "dep:http-body-util",
-    "dep:hyper",
-    "dep:hyper-rustls",
-    "dep:hyper-util",
-    "dep:rustls",
-    "dep:tonic",
-    "dep:tokio",
-    "zcash_client_backend/lightwalletd-tonic",
-    "zcash_client_backend/lightwalletd-tonic-tls-webpki-roots",
-]
-# Legacy feature names kept as aliases during the wallet migration window.
-client-pir = ["pir"]
-client-tree-sync = ["tree-sync"]
-# Backwards-compatible aggregate for consumers that already enable `client`.
-client = ["pir", "tree-sync"]
-# Downstream test-only helpers for setting up persisted voting state without
-# depending on SQLite schema details.
-test-fixtures = []
-
 [dependencies]
 # Curves (same as Orchard/Zcash)
 pasta_curves = "0.5"
@@ -72,30 +29,27 @@ serde_json = "1"
 prost = "0.14"
 
 # PIR (private nullifier exclusion proofs).
-pir-client = { version = "=0.2.0", default-features = false, optional = true }
+pir-client = { version = "=0.2.0", default-features = false }
 # Supply-chain pins for the Valar-owned PIR/tree dependency surface. These
-# direct optional dependencies constrain the versions Cargo may resolve when
-# the client features are enabled; they do not change whether upstream build
-# scripts execute.
-pir-types = { version = "=0.1.0", default-features = false, optional = true }
-valar-spiral-rs = { version = "=0.5.2", default-features = false, optional = true }
-valar-ypir = { version = "=0.1.5", default-features = false, optional = true }
-imt-tree = { version = "=0.1.1", optional = true }
+# direct dependencies constrain the versions Cargo may resolve, but they do not
+# change whether upstream build scripts execute.
+pir-types = { version = "=0.1.0", default-features = false }
+valar-spiral-rs = { version = "=0.5.2", default-features = false }
+valar-ypir = { version = "=0.1.5", default-features = false }
+imt-tree = { version = "=0.1.1" }
 
-# Direct Hyper/Rustls HTTP transport. Behind `client-pir` and `client-tree-sync`.
-bytes = { version = "1", optional = true }
-http = { version = "1", optional = true }
-http-body-util = { version = "0.1", optional = true }
-hyper = { version = "1", features = ["client", "http1", "http2"], optional = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots"], optional = true }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
-tonic = { version = "0.14", features = ["channel", "tls-webpki-roots", "tls-ring"], optional = true }
+bytes = { version = "1" }
+http = { version = "1" }
+http-body-util = { version = "0.1" }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tonic = { version = "0.14", features = ["channel", "tls-webpki-roots", "tls-ring"] }
 
-# Vote commitment tree (VAN witness generation). Behind `client-tree-sync`.
-vote-commitment-tree = { path = "../vote-commitment-tree", version = "=0.3.1", optional = true }
-vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "=0.5.1", features = ["http"], optional = true }
+vote-commitment-tree = { path = "../vote-commitment-tree", version = "=0.3.1" }
+vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "=0.5.1", features = ["http"] }
 
 # Storage
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -117,7 +71,7 @@ zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
 zcash_protocol = "0.8"
-zcash_client_backend = { version = "0.22", default-features = false, features = ["orchard"] }
+zcash_client_backend = { version = "0.22", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
 zcash_client_sqlite = { version = "0.20", default-features = false, features = ["orchard"] }
 zcash_keys = { version = "0.13", features = ["orchard"] }
 pczt = { version = "0.6", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }

@@ -8,9 +8,7 @@ pub use crate::confirmation::{
     confirm_delegation_submission, confirm_vote_submission, DelegationConfirmation, TxEvent,
     TxEventAttribute, VoteConfirmation,
 };
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::delegate::gather_delegation_lwd_inputs;
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::delegate::LightwalletdBranchIdProvider;
 pub use crate::delegate::{
     branch_id_for_height, display_memo, load_account_keys, pczt_sighash, record_submission,
@@ -21,7 +19,6 @@ pub use crate::delegate::{
     DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
     PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
 };
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::delegate::{
     prepare_delegation_bundle, PrepareDelegationBundleParams, PreparedDelegationBundle,
 };
@@ -46,7 +43,6 @@ pub use crate::round::{
     note_bundles, note_bundles_with_policy, quantized_bundle_set_weight, quantized_bundle_weight,
     raw_bundle_weight, validate_bundle_index, BundleLayout, RoundInfo, RoundParams, VotingDb,
 };
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::selection::select_notes_with_lwd;
 pub use crate::selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_note_infos,
@@ -79,8 +75,6 @@ pub use crate::vote::{
 pub use crate::warm_proving_caches;
 pub use crate::wire::{DelegationSubmissionWire, VoteCommitmentWire, VoteShareWire};
 
-#[cfg(feature = "pir")]
 pub use crate::precompute::delegation_pir;
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::precompute::{reset_vote_tree, sync_vote_tree, van_witness};

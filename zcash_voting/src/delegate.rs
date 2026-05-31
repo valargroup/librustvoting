@@ -9,7 +9,6 @@ pub use crate::phases::DelegationPhase;
 use std::borrow::Borrow;
 
 pub use crate::lwd::branch_id_for_height;
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 use crate::note_bundling::BundlePolicy;
 pub use crate::selection::{
     gather_delegation_wallet_inputs, DelegationWalletInputs, GatherDelegationWalletParams,
@@ -128,13 +127,11 @@ pub trait BranchIdProvider {
 }
 
 /// Branch-id provider backed by a lightwalletd tip lookup.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 #[derive(Clone, Debug)]
 pub struct LightwalletdBranchIdProvider {
     resolved: u32,
 }
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 impl LightwalletdBranchIdProvider {
     /// Fetches the current lightwalletd tip and resolves the active branch id.
     pub async fn resolve(lightwalletd_url: &str, network: Network) -> Result<Self, VotingError> {
@@ -151,7 +148,6 @@ impl LightwalletdBranchIdProvider {
     }
 }
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 impl BranchIdProvider for LightwalletdBranchIdProvider {
     fn consensus_branch_id(&self) -> Result<u32, VotingError> {
         Ok(self.resolved)
@@ -169,6 +165,19 @@ pub struct DelegationAccountKeys {
     pub seed_fingerprint: [u8; 32],
 }
 
+/// Delegation bundle state assembled by wallet integrations before signing.
+pub struct DelegationBundleContext {
+    pub voting_db: VotingDb,
+    pub round_id: String,
+    pub bundle_index: u32,
+    pub bundle_setup: BundleLayout,
+    pub selected_weight_zatoshi: u64,
+    pub bundle_note_infos: Vec<NoteInfo>,
+    pub delegated_weight_zatoshi: u64,
+    pub delegation_keys: DelegationKeys,
+    pub branch_id_provider: LightwalletdBranchIdProvider,
+    pub round_name: String,
+}
 /// Round metadata needed to build delegation PCZT inputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegationRoundContext {
@@ -193,7 +202,6 @@ pub fn ensure_round_context(
 }
 
 /// Parameters for resolving lightwalletd-derived delegation inputs.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub struct ResolveDelegationLwdParams<'a> {
     pub lightwalletd_url: &'a str,
     pub network: Network,
@@ -202,7 +210,6 @@ pub struct ResolveDelegationLwdParams<'a> {
 }
 
 /// Parameters for gathering delegation inputs from wallet and lightwalletd state.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub struct GatherDelegationParams<'a, N> {
     pub db_path: &'a str,
     pub lightwalletd_url: &'a str,
@@ -214,7 +221,6 @@ pub struct GatherDelegationParams<'a, N> {
     pub voting_hotkey: &'a VotingHotkey,
 }
 /// Lightwalletd-derived inputs for delegation precompute.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 #[derive(Clone, Debug)]
 pub struct DelegationLwdInputs {
     pub round_params: crate::VotingRoundParams,
@@ -224,7 +230,6 @@ pub struct DelegationLwdInputs {
 }
 
 /// Parameters for preparing one delegation bundle from caller-owned wallet state.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub struct PrepareDelegationBundleParams<'a, C, P, CL, R> {
     pub wallet_db: &'a WalletDb<C, P, CL, R>,
     pub account_uuid: &'a str,
@@ -235,7 +240,6 @@ pub struct PrepareDelegationBundleParams<'a, C, P, CL, R> {
 }
 
 /// Plain delegation bundle state reused by precompute, signing, and submission.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 #[derive(Clone, Debug)]
 pub struct PreparedDelegationBundle {
     pub round_id: String,
@@ -251,7 +255,6 @@ pub struct PreparedDelegationBundle {
 }
 
 /// Validates round params and resolves lightwalletd anchor and branch state.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn gather_delegation_lwd_inputs(
     params: ResolveDelegationLwdParams<'_>,
 ) -> Result<DelegationLwdInputs, VotingError> {
@@ -279,7 +282,6 @@ pub async fn gather_delegation_lwd_inputs(
 /// Callers should resolve [`DelegationLwdInputs`] before opening a non-`Send`
 /// wallet DB handle in async contexts. This helper keeps wallet DB access and
 /// bundle validation in one place, returning plain data for later operations.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub fn prepare_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
     lwd: DelegationLwdInputs,
@@ -334,6 +336,16 @@ where
     })
 }
 
+/// Inputs gathered from lightwalletd and the wallet before voting-DB work.
+#[derive(Clone, Debug)]
+pub struct DelegationInputs {
+    pub account_uuid: String,
+    pub round_params: crate::VotingRoundParams,
+    pub anchor_tree_state_bytes: Vec<u8>,
+    pub round_note_infos: Vec<NoteInfo>,
+    pub branch_id_provider: LightwalletdBranchIdProvider,
+    pub delegation_keys: DelegationKeys,
+}
 /// PCZT setup output that callers hand to a signer or QR encoder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegationSetup {
@@ -499,7 +511,6 @@ pub struct PreparedDelegationReport {
     pub bundle_index: u32,
 }
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 impl PreparedDelegationBundle {
     /// Returns the quantized weight represented by this prepared bundle.
     ///
@@ -549,7 +560,6 @@ impl PreparedDelegationBundle {
     /// This is the prepared-bundle replacement for the older loose
     /// `PrecomputeDelegationInputs` path. It never recalculates bundle membership;
     /// the prepared bundle is the source of truth for notes, layout, and network.
-    #[cfg(feature = "pir")]
     pub fn precompute<C, P, CL, R>(
         &self,
         voting_db: &VotingDb,
@@ -591,7 +601,6 @@ impl PreparedDelegationBundle {
     }
 
     /// Generates and persists the delegation proof for this prepared bundle.
-    #[cfg(feature = "pir")]
     pub fn prove(
         &self,
         voting_db: &VotingDb,
@@ -756,6 +765,13 @@ fn parse_account_uuid(account_uuid: &str) -> Result<AccountUuid, VotingError> {
     Ok(AccountUuid::from_uuid(uuid))
 }
 
+fn check_cancellation(cancellation: &dyn crate::Cancellation) -> Result<(), VotingError> {
+    if cancellation.is_cancelled() {
+        Err(VotingError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
 /// Builds and persists a governance PCZT for one bundle.
 ///
 /// The bundle must already exist via [`VotingDb::ensure_bundles`]. The returned
@@ -804,7 +820,6 @@ pub fn signing_request(
 ///
 /// Witnesses and PIR proof precompute data must already be present. The proof
 /// result is checked against PCZT-derived public fields before persistence.
-#[cfg(feature = "pir")]
 pub fn prove(
     db: &VotingDb,
     round_id: &str,
@@ -1056,7 +1071,6 @@ mod tests {
         assert_eq!(voting_db.list_rounds().unwrap().len(), 1);
     }
 
-    #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
     #[test]
     fn prepare_delegation_bundle_returns_plain_reusable_bundle_state() {
         let (_voting_db, round_params, hotkey, prepared) = prepared_wallet_delegation_fixture();
@@ -1381,7 +1395,6 @@ mod tests {
         assert!(err.contains("hotkey_raw_address must be 43 bytes"));
     }
 
-    #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
     #[test]
     fn lightwalletd_branch_id_provider_resolved_returns_branch_id() {
         let provider = LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0);
