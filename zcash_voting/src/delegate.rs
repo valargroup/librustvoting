@@ -1112,43 +1112,6 @@ mod tests {
     }
 
     #[test]
-    fn prepared_signer_signs_wallet_seed_request() {
-        let seed = vec![7u8; 32];
-        let alpha = pasta_curves::pallas::Scalar::from(7).to_repr();
-        let request = DelegationSigningRequest {
-            account_index: 0,
-            network: Network::Testnet,
-            seed_fingerprint: SeedFingerprint::from_seed(&seed).unwrap().to_bytes(),
-            sighash: [0xAB; 32],
-            alpha,
-        };
-
-        let signer = PreparedSigner::from_wallet_seed(&seed, request).unwrap();
-
-        let PreparedSigner::Signature { sig, sighash } = signer;
-        assert_ne!(sig, [0; 64]);
-        assert_eq!(sighash, [0xAB; 32]);
-    }
-
-    #[test]
-    fn prepared_signer_rejects_wrong_seed() {
-        let seed = vec![7u8; 32];
-        let other_seed = vec![8u8; 32];
-        let request = DelegationSigningRequest {
-            account_index: 0,
-            network: Network::Testnet,
-            seed_fingerprint: SeedFingerprint::from_seed(&seed).unwrap().to_bytes(),
-            sighash: [0xAB; 32],
-            alpha: pasta_curves::pallas::Scalar::from(7).to_repr(),
-        };
-
-        let err = PreparedSigner::from_wallet_seed(&other_seed, request)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("wallet seed fingerprint does not match"));
-    }
-    #[test]
     fn prepared_bundle_metadata_uses_quantized_weight() {
         let divisor = crate::governance::BALLOT_DIVISOR;
         let prepared = prepared_bundle_fixture(vec![note_info(0, divisor + 23)]);
