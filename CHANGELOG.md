@@ -16,10 +16,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   `KeystoneDelegationRequestView`, `KeystoneSignatureRecordView`, `DraftVoteView`,
   `VanWitnessView`, `SignedVoteCommitmentView`, `SignedVoteCommitmentsView`,
   and `VoteRecordView`.
-- Added crate-owned contextual voting hotkey derivation APIs
-  (`hotkey::derive_voting_hotkey` and `hotkey::derive_voting_hotkey_seed`) so
-  wallets do not need to duplicate the BLAKE2 domain separation and
-  round/account/network binding rules.
 - Added stable resume-plan wire DTOs in `zcash_voting::wire`
   (`NextStepView`, `RoundPlanView`) so wallet adapters can consume crate-owned
   `session::resume_plan` outputs directly over FRB without maintaining local
@@ -222,11 +218,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - The wallet vote example now includes `commit_vote_bundle_batch`, showing the
   canonical batch cast-vote flow with `vote::commit_batch` and crate-owned
   cancellation/progress adapters.
-- Removed crate-side wallet seed APIs from voting hotkey derivation. Wallet SDKs
-  now derive scoped voting hotkey seed material locally and can either sign
-  delegation requests at their own wallet boundary or call
-  `PreparedSigner::from_wallet_seed` when the crate runs inside that same seed
-  trust boundary.
+- Removed crate-side wallet seed APIs from voting hotkey derivation and
+  prepared delegation signing. Wallet SDKs now derive scoped voting hotkey seed
+  material and delegation signatures locally, then pass only hotkey seed bytes
+  or SpendAuth signatures into the crate.
 - Delegation PIR warmup no longer constructs or caches a governance PCZT.
   `PreparedDelegationBundle::precompute` now warms witnesses, padded-note
   secrets, and PIR rows only; `delegate::setup` builds the PCZT later from the
