@@ -73,13 +73,13 @@ pub use selection::{
 };
 pub use types::{
     validate_proposal_id, validate_round_params, validate_vote_decision, validate_vote_options,
-    Cancellation, CastVoteSignature, DelegationAction, DelegationPirPrecomputeResult,
-    DelegationProgressBridge, DelegationProgressReporter, DelegationProofResult,
-    DelegationSubmissionData, EncryptedShare, GovernancePczt, Network, NoopCancellation,
-    NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter, SelectedNotes,
-    ShareDelegationRecord, SharePayload, VoteCommitStageBridge, VoteCommitStageReporter,
-    VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams, WireEncryptedShare,
-    WitnessData, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID, MIN_VOTE_OPTIONS,
+    CastVoteSignature, DelegationAction, DelegationPirPrecomputeResult, DelegationProgressBridge,
+    DelegationProgressReporter, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
+    GovernancePczt, Network, NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter,
+    SelectedNotes, ShareDelegationRecord, SharePayload, VoteCommitStageBridge,
+    VoteCommitStageReporter, VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
+    WireEncryptedShare, WitnessData, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID,
+    MIN_VOTE_OPTIONS,
 };
 
 /// Warm process-lifetime proving-key caches used by on-device voting proofs.

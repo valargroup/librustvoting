@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use zcash_voting::prelude::{
-    commit_batch, sync_vote_tree, van_witness, CommittedVote, DraftVote, NoopCancellation,
-    NoopProgressReporter, SharePayload, SignedVoteCommitment, SignedVoteCommitments, VanWitness,
-    VoteSigner, VoteSubmission, VotingDb, VotingHotkey,
+    commit_batch, sync_vote_tree, van_witness, CommittedVote, DraftVote, NoopProgressReporter,
+    SharePayload, SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteSigner,
+    VoteSubmission, VotingDb, VotingHotkey,
 };
 
 /// Inputs for deriving a Merkle witness for one confirmed delegation bundle.
@@ -127,7 +127,6 @@ pub fn commit_vote_bundle_batch(
     request: WalletVoteCommitBatchRequest<'_>,
 ) -> Result<SignedVoteCommitments> {
     let progress = NoopProgressReporter;
-    let cancellation = NoopCancellation;
     commit_batch(
         voting_db,
         request.round_id,
@@ -135,7 +134,6 @@ pub fn commit_vote_bundle_batch(
         request.drafts,
         request.van_witness,
         VoteSigner::hotkey(request.voting_hotkey),
-        &cancellation,
         &progress,
     )
     .context("commit cast-vote batch")

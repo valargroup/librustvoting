@@ -203,9 +203,20 @@ pub struct ResolveDelegationLwdParams<'a> {
     pub network: Network,
     pub round_params: crate::VotingRoundParams,
     pub round_name: &'a str,
-    pub cancellation: &'a dyn crate::Cancellation,
 }
 
+/// Parameters for gathering delegation inputs from wallet and lightwalletd state.
+#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
+pub struct GatherDelegationParams<'a, N> {
+    pub db_path: &'a str,
+    pub lightwalletd_url: &'a str,
+    pub wallet_network: N,
+    pub network: Network,
+    pub round_params: crate::VotingRoundParams,
+    pub round_name: &'a str,
+    pub account_uuid: &'a str,
+    pub voting_hotkey: &'a VotingHotkey,
+}
 /// Lightwalletd-derived inputs for delegation precompute.
 #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 #[derive(Clone, Debug)]
@@ -248,7 +259,6 @@ pub struct PreparedDelegationBundle {
 pub async fn gather_delegation_lwd_inputs(
     params: ResolveDelegationLwdParams<'_>,
 ) -> Result<DelegationLwdInputs, VotingError> {
-    check_cancellation(params.cancellation)?;
     crate::validate_round_params(&params.round_params)?;
     let resolved_round_name =
         crate::round::delegation_round_name(&params.round_params, params.round_name);
@@ -257,7 +267,6 @@ pub async fn gather_delegation_lwd_inputs(
         params.round_params.snapshot_height,
     )
     .await?;
-    check_cancellation(params.cancellation)?;
     let branch_id_provider =
         LightwalletdBranchIdProvider::resolve(params.lightwalletd_url, params.network).await?;
 
@@ -599,13 +608,11 @@ impl PreparedDelegationBundle {
         voting_db: &VotingDb,
         wallet_db: &WalletDb<C, P, CL, R>,
         pir_client: &pir_client::PirClientBlocking,
-        cancellation: &dyn crate::Cancellation,
     ) -> Result<PreparedDelegationReport, VotingError>
     where
         C: Borrow<rusqlite::Connection>,
         P: Parameters,
     {
-        check_cancellation(cancellation)?;
         self.ensure_witnesses(voting_db, wallet_db)?;
 
         crate::precompute::warm_delegation_pir(
@@ -616,7 +623,6 @@ impl PreparedDelegationBundle {
             self.layout.clone(),
             pir_client,
             self.network,
-            cancellation,
         )
     }
 
@@ -801,15 +807,6 @@ fn parse_account_uuid(account_uuid: &str) -> Result<AccountUuid, VotingError> {
         message: format!("invalid account UUID: {e}"),
     })?;
     Ok(AccountUuid::from_uuid(uuid))
-}
-
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
-fn check_cancellation(cancellation: &dyn crate::Cancellation) -> Result<(), VotingError> {
-    if cancellation.is_cancelled() {
-        Err(VotingError::Cancelled)
-    } else {
-        Ok(())
-    }
 }
 
 /// Builds and persists a governance PCZT for one bundle.
