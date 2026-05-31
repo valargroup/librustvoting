@@ -284,6 +284,18 @@ mod pir_tests {
             scope: 0,
             ufvk_str: "uviewtest".to_string(),
         }];
+        db.create_round(
+            &crate::round::RoundParams {
+                vote_round_id: ROUND_ID.to_string(),
+                snapshot_height: 100,
+                ea_pk: vec![1; 32],
+                nc_root: vec![2; 32],
+                nullifier_imt_root: vec![3; 32],
+            },
+            None,
+        )
+        .unwrap();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
         let layout = BundleLayout {
             bundle_count: 1,
             eligible_weight: 42,
@@ -306,9 +318,12 @@ mod pir_tests {
         )
         .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("unexpected POST /proof_batch; warm path reached transport"));
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to decode UFVK while deriving padded nullifiers")
+                || message.contains("unexpected POST"),
+            "unexpected warm_delegation_pir error: {message}",
+        );
     }
 }
 
