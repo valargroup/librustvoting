@@ -20,13 +20,9 @@ use crate::{
     round::{BundleLayout, RoundParams, VotingDb},
     types::{DelegationProgressReporter, Network, NoteInfo, VotingError, VotingHotkey},
 };
-use ff::PrimeField;
-
 use zcash_client_backend::data_api::{Account, WalletRead};
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::{NetworkConstants, Parameters};
-use zip32::{fingerprint::SeedFingerprint, AccountId};
 
 /// Wallet-derived keys and chain parameters needed to build a delegation PCZT.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -350,11 +346,10 @@ pub struct DelegationSetup {
 
 /// Account-scoped data a wallet needs to sign a delegation PCZT locally.
 ///
-/// A software wallet can either use
-/// [`PreparedSigner::from_wallet_seed`] when this crate runs inside the same
-/// seed trust boundary, or use `account_index`, `network`, `sighash`, and
-/// `alpha` to sign externally and pass the resulting signature back through
-/// [`PreparedSigner::signature`].
+/// Wallets should keep root seed material outside this crate. A software wallet
+/// can use `account_index`, `network`, `sighash`, and `alpha` to derive its
+/// account SpendAuth key locally, randomize it, sign `sighash`, and pass the
+/// resulting signature back through [`PreparedSigner::signature`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DelegationSigningRequest {
     /// ZIP-32 account index for the account that owns the delegated notes.
@@ -433,54 +428,6 @@ impl PreparedSigner {
             sig: array64_slice("signature", sig)?,
             sighash: array32_slice("sighash", sighash)?,
         })
-    }
-
-    /// Signs a prepared delegation request with a software wallet seed.
-    ///
-    /// The request's stored seed fingerprint must match `seed`, and the request's
-    /// account index is used to derive the Orchard SpendAuth key before applying
-    /// the PCZT randomizer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VotingError::InvalidInput`] if the seed does not match the
-    /// request, account derivation fails, or the stored randomizer is malformed.
-    pub fn from_wallet_seed(
-        seed: &[u8],
-        request: DelegationSigningRequest,
-    ) -> Result<Self, VotingError> {
-        let seed_fingerprint =
-            SeedFingerprint::from_seed(seed).ok_or_else(|| VotingError::InvalidInput {
-                message: "wallet seed length is not valid for ZIP-32".to_string(),
-            })?;
-        if seed_fingerprint.to_bytes() != request.seed_fingerprint {
-            return Err(VotingError::InvalidInput {
-                message: "wallet seed fingerprint does not match delegation signing request"
-                    .to_string(),
-            });
-        }
-
-        let account =
-            AccountId::try_from(request.account_index).map_err(|_| VotingError::InvalidInput {
-                message: format!("invalid account_index {}", request.account_index),
-            })?;
-        let usk = UnifiedSpendingKey::from_seed(&request.network, seed, account).map_err(|e| {
-            VotingError::InvalidInput {
-                message: format!("derive account unified spending key failed: {e}"),
-            }
-        })?;
-        let sk = *usk.orchard();
-        let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
-        let alpha = Option::<pasta_curves::pallas::Scalar>::from(
-            pasta_curves::pallas::Scalar::from_repr(request.alpha),
-        )
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: "delegation alpha is not a valid Pallas scalar".to_string(),
-        })?;
-        let rsk = ask.randomize(&alpha);
-        let mut rng = rand::rngs::OsRng;
-        let sig = rsk.sign(&mut rng, &request.sighash);
-        Ok(Self::signature((&sig).into(), request.sighash))
     }
 }
 
@@ -1081,7 +1028,7 @@ mod tests {
     use zcash_protocol::consensus::{
         Network as ZcashNetwork, NetworkConstants, NetworkUpgrade, Parameters,
     };
-    use zip32::{fingerprint::SeedFingerprint, Scope};
+    use zip32::Scope;
 
     fn test_voting_hotkey() -> VotingHotkey {
         crate::hotkey::voting_hotkey_from_seed(&[0x77; 64], Network::Testnet).unwrap()
@@ -1156,44 +1103,6 @@ mod tests {
             .to_string();
 
         assert!(err.contains("pczt_bytes sighash does not match delegation signer sighash"));
-    }
-
-    #[test]
-    fn prepared_signer_signs_wallet_seed_request() {
-        let seed = vec![7u8; 32];
-        let alpha = pasta_curves::pallas::Scalar::from(7).to_repr();
-        let request = DelegationSigningRequest {
-            account_index: 0,
-            network: Network::Testnet,
-            seed_fingerprint: SeedFingerprint::from_seed(&seed).unwrap().to_bytes(),
-            sighash: [0xAB; 32],
-            alpha,
-        };
-
-        let signer = PreparedSigner::from_wallet_seed(&seed, request).unwrap();
-
-        let PreparedSigner::Signature { sig, sighash } = signer;
-        assert_ne!(sig, [0; 64]);
-        assert_eq!(sighash, [0xAB; 32]);
-    }
-
-    #[test]
-    fn prepared_signer_rejects_wrong_seed() {
-        let seed = vec![7u8; 32];
-        let other_seed = vec![8u8; 32];
-        let request = DelegationSigningRequest {
-            account_index: 0,
-            network: Network::Testnet,
-            seed_fingerprint: SeedFingerprint::from_seed(&seed).unwrap().to_bytes(),
-            sighash: [0xAB; 32],
-            alpha: pasta_curves::pallas::Scalar::from(7).to_repr(),
-        };
-
-        let err = PreparedSigner::from_wallet_seed(&other_seed, request)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("wallet seed fingerprint does not match"));
     }
 
     #[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]

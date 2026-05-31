@@ -37,10 +37,9 @@ stage-oriented API:
 - `precompute::*` prepares Orchard witnesses, delegation PIR inputs, and VAN
   witnesses for vote proofs.
 - `delegate::*` builds delegation PCZTs, proves delegation, prepares signing
-  requests, and assembles signed delegation submissions. Software wallets can
-  pass wallet seed material to `PreparedSigner::from_wallet_seed` when this
-  crate runs inside the same seed trust boundary; callers can still sign
-  externally and pass signature bytes when the signer lives elsewhere.
+  requests, and assembles signed delegation submissions. Wallets keep root seed
+  material outside this crate, sign requests at the wallet boundary, and pass
+  only signature bytes back through `PreparedSigner::signature`.
 - `confirmation::*` parses delegation and cast-vote tx events, then records tx
   hashes and tree positions atomically.
 - `vote::*` builds ZKP #2, signs cast-vote payloads, persists the canonical

@@ -28,8 +28,8 @@ pub use crate::delegate::{
 pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::hotkey::{
-    derive_voting_hotkey, derive_voting_hotkey_seed, generate_random_voting_hotkey,
-    voting_hotkey_from_seed, VOTING_HOTKEY_ACCOUNT_INDEX, VOTING_HOTKEY_ADDRESS_INDEX,
+    generate_random_voting_hotkey, voting_hotkey_from_seed, VOTING_HOTKEY_ACCOUNT_INDEX,
+    VOTING_HOTKEY_ADDRESS_INDEX,
 };
 pub use crate::note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
 pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};

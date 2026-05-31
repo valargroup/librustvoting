@@ -1,4 +1,3 @@
-use blake2b_simd::Params;
 use orchard::keys::{FullViewingKey, SpendingKey};
 use rand::RngCore;
 use zcash_keys::keys::UnifiedSpendingKey;
@@ -7,8 +6,6 @@ use zip32::{AccountId, Scope};
 
 use crate::types::{Network, VotingError, VotingHotkey};
 
-const HOTKEY_CONTEXT_PREFIX: &[u8] = b"ZcashVotingHotkeyV1";
-const HOTKEY_SEED_PERSONALIZATION: &[u8] = b"ZcashVotingHotKy";
 const HOTKEY_SEED_LEN: usize = 64;
 
 /// ZIP-32 account index used for voting hotkey signing keys.
@@ -34,77 +31,10 @@ pub fn generate_random_voting_hotkey(network: Network) -> Result<VotingHotkey, V
     voting_hotkey_from_seed(&seed, network)
 }
 
-/// Derives the scoped voting hotkey for a wallet account in a voting round.
-///
-/// The root wallet seed is domain separated from the voting context before it
-/// is used to derive the Orchard hotkey. The same `(wallet_seed, round_id,
-/// account_id, network)` tuple always returns the same hotkey; changing any
-/// field returns independent material.
-///
-/// Wallets should prefer this function over reimplementing hotkey derivation
-/// locally. Hardware wallets that cannot expose a wallet seed should use
-/// [`generate_random_voting_hotkey`] once and persist
-/// [`VotingHotkey::secret_seed`] in platform secure storage.
-///
-/// # Errors
-///
-/// Returns [`VotingError::InvalidInput`] when `wallet_seed` is too short, the
-/// context is too large to encode, or the scoped seed cannot produce an Orchard
-/// key for `network`.
-pub fn derive_voting_hotkey(
-    wallet_seed: &[u8],
-    round_id: &str,
-    account_id: &str,
-    network: Network,
-) -> Result<VotingHotkey, VotingError> {
-    let seed = derive_voting_hotkey_seed(wallet_seed, round_id, account_id, network)?;
-    voting_hotkey_from_seed(&seed, network)
-}
-
-/// Derives the storable scoped seed bytes for a voting hotkey.
-///
-/// This is useful for FFI boundaries that persist or return hotkey seed bytes
-/// rather than the typed [`VotingHotkey`] wrapper. New Rust integrations should
-/// prefer [`derive_voting_hotkey`].
-///
-/// # Errors
-///
-/// Returns [`VotingError::InvalidInput`] when `wallet_seed` is too short or a
-/// context part is too large to encode.
-pub fn derive_voting_hotkey_seed(
-    wallet_seed: &[u8],
-    round_id: &str,
-    account_id: &str,
-    network: Network,
-) -> Result<Vec<u8>, VotingError> {
-    if wallet_seed.len() < 32 {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "wallet_seed must be at least 32 bytes, got {}",
-                wallet_seed.len()
-            ),
-        });
-    }
-
-    let mut material = Zeroizing::new(Vec::new());
-    material.extend_from_slice(HOTKEY_CONTEXT_PREFIX);
-    append_context_part(&mut material, wallet_seed)?;
-    append_context_part(&mut material, round_id.as_bytes())?;
-    append_context_part(&mut material, account_id.as_bytes())?;
-    append_context_part(&mut material, network_tag(network))?;
-
-    let hash = Params::new()
-        .hash_length(HOTKEY_SEED_LEN)
-        .personal(HOTKEY_SEED_PERSONALIZATION)
-        .hash(&material);
-
-    Ok(hash.as_bytes().to_vec())
-}
-
 /// Reconstructs a voting hotkey from previously stored hotkey seed bytes.
 ///
-/// Wallets that start with a root seed should use [`derive_voting_hotkey`] or
-/// [`derive_voting_hotkey_seed`], then pass only that scoped seed to this
+/// Wallets that start with a root seed should derive scoped voting hotkey seed
+/// material at the wallet boundary, then pass only that scoped seed to this
 /// function when reconstruction is needed.
 ///
 /// # Errors
@@ -170,31 +100,9 @@ fn raw_orchard_address_from_seed(
     Ok(address.to_raw_address_bytes())
 }
 
-fn append_context_part(material: &mut Vec<u8>, part: &[u8]) -> Result<(), VotingError> {
-    let len = u32::try_from(part.len()).map_err(|_| VotingError::InvalidInput {
-        message: "voting hotkey context part length exceeds u32::MAX".to_string(),
-    })?;
-    material.extend_from_slice(&len.to_be_bytes());
-    material.extend_from_slice(part);
-    Ok(())
-}
-
-fn network_tag(network: Network) -> &'static [u8] {
-    match network {
-        Network::Mainnet => b"mainnet",
-        Network::Testnet => b"testnet",
-        Network::Regtest => b"regtest",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const ACCOUNT_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
-    const OTHER_ACCOUNT_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
-    const ROUND_ID: &str = "round-1";
-    const OTHER_ROUND_ID: &str = "round-2";
 
     #[test]
     fn stored_hotkey_seed_reconstructs_address() {
@@ -227,62 +135,6 @@ mod tests {
         assert_eq!(first.secret_seed().len(), HOTKEY_SEED_LEN);
         assert_eq!(second.secret_seed().len(), HOTKEY_SEED_LEN);
         assert_ne!(first.secret_seed(), second.secret_seed());
-    }
-
-    #[test]
-    fn contextual_hotkey_derivation_is_deterministic() {
-        let expected =
-            derive_voting_hotkey(&[0xAB; 64], ROUND_ID, ACCOUNT_ID, Network::Regtest).unwrap();
-
-        for _ in 0..100 {
-            let hotkey =
-                derive_voting_hotkey(&[0xAB; 64], ROUND_ID, ACCOUNT_ID, Network::Regtest).unwrap();
-            assert_eq!(hotkey.secret_seed(), expected.secret_seed());
-            assert_eq!(hotkey.raw_orchard_address(), expected.raw_orchard_address());
-        }
-    }
-
-    #[test]
-    fn contextual_hotkey_is_bound_to_round_account_and_network() {
-        let base =
-            derive_voting_hotkey_seed(&[0xAB; 64], ROUND_ID, ACCOUNT_ID, Network::Regtest).unwrap();
-
-        assert_ne!(
-            base,
-            derive_voting_hotkey_seed(&[0xAB; 64], OTHER_ROUND_ID, ACCOUNT_ID, Network::Regtest)
-                .unwrap()
-        );
-        assert_ne!(
-            base,
-            derive_voting_hotkey_seed(&[0xAB; 64], ROUND_ID, OTHER_ACCOUNT_ID, Network::Regtest)
-                .unwrap()
-        );
-        assert_ne!(
-            base,
-            derive_voting_hotkey_seed(&[0xAB; 64], ROUND_ID, ACCOUNT_ID, Network::Mainnet).unwrap()
-        );
-    }
-
-    #[test]
-    fn contextual_hotkey_seed_matches_legacy_vector() {
-        let seed =
-            derive_voting_hotkey_seed(&[0xAB; 64], ROUND_ID, ACCOUNT_ID, Network::Regtest).unwrap();
-        let expected = hex::decode(
-            "20e3dada1183f1ef8c797348fd543c7e8f63d9f776ec84183f66845ee2a0b0ec\
-             0a6efc9c803785bb8f07106428e71e1f65066e40052b15844813a1de82f65c7c",
-        )
-        .unwrap();
-
-        assert_eq!(seed, expected);
-    }
-
-    #[test]
-    fn short_wallet_seed_is_rejected() {
-        let err = derive_voting_hotkey_seed(&[0x01; 16], ROUND_ID, ACCOUNT_ID, Network::Regtest)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("wallet_seed must be at least 32 bytes"));
     }
 
     #[test]
