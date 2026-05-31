@@ -765,13 +765,6 @@ fn parse_account_uuid(account_uuid: &str) -> Result<AccountUuid, VotingError> {
     Ok(AccountUuid::from_uuid(uuid))
 }
 
-fn check_cancellation(cancellation: &dyn crate::Cancellation) -> Result<(), VotingError> {
-    if cancellation.is_cancelled() {
-        Err(VotingError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
 /// Builds and persists a governance PCZT for one bundle.
 ///
 /// The bundle must already exist via [`VotingDb::ensure_bundles`]. The returned

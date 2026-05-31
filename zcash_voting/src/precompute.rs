@@ -25,7 +25,7 @@ use crate::{
 use crate::{
     delegate::PreparedDelegationReport,
     round::BundleLayout,
-    types::{Cancellation, Network},
+    types::Network,
 };
 
 pub use crate::vote::VanWitness;
@@ -165,8 +165,7 @@ pub fn delegation_pir(
 ///
 /// # Errors
 ///
-/// Returns [`VotingError::Cancelled`] when `cancellation` is set. Other
-/// failures come from padded-secret initialization or PIR precompute.
+/// Failures come from padded-secret initialization or PIR precompute.
 pub(crate) fn warm_delegation_pir(
     db: &VotingDb,
     round_id: &str,
@@ -175,11 +174,8 @@ pub(crate) fn warm_delegation_pir(
     layout: BundleLayout,
     pir_client: &pir_client::PirClientBlocking,
     network: Network,
-    cancellation: &dyn Cancellation,
 ) -> Result<PreparedDelegationReport, VotingError> {
-    ensure_not_cancelled(cancellation)?;
     db.ensure_padded_secrets(round_id, bundle_index, notes)?;
-    ensure_not_cancelled(cancellation)?;
     let report = delegation_pir(db, round_id, bundle_index, notes, pir_client, network)?;
 
     Ok(PreparedDelegationReport {
@@ -187,14 +183,6 @@ pub(crate) fn warm_delegation_pir(
         layout,
         bundle_index,
     })
-}
-
-fn ensure_not_cancelled(cancellation: &dyn Cancellation) -> Result<(), VotingError> {
-    if cancellation.is_cancelled() {
-        Err(VotingError::Cancelled)
-    } else {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
