@@ -23,7 +23,6 @@ pub fn select_pir_endpoint(
     select_pir_snapshot_endpoint(diagnostics, snapshot_height, match_index)
 }
 
-#[cfg(feature = "pir")]
 pub use pir_client::{
     ImtProofData, PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };

@@ -17,12 +17,6 @@ pub mod elgamal;
 pub mod error;
 pub mod governance;
 pub mod hotkey;
-#[cfg(any(
-    feature = "pir",
-    feature = "tree-sync",
-    feature = "client-pir",
-    feature = "client-tree-sync"
-))]
 mod http_transport;
 pub mod lwd;
 pub mod note_bundling;
@@ -40,7 +34,6 @@ pub mod share_policy;
 pub mod share_tracking;
 pub mod storage;
 pub mod transport;
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub mod tree_sync;
 pub mod types;
 pub mod vote;
@@ -51,14 +44,7 @@ pub mod witness;
 pub mod zkp1;
 pub mod zkp2;
 
-#[cfg(any(
-    feature = "pir",
-    feature = "tree-sync",
-    feature = "client-pir",
-    feature = "client-tree-sync"
-))]
 pub use http_transport::HyperTransport;
-#[cfg(any(feature = "pir", feature = "client-pir"))]
 pub use pir_client::{
     ImtProofData, PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
@@ -66,7 +52,6 @@ pub use pir_client::{
 pub use governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
 pub use round::validate_bundle_index;
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_notes,
     DelegationWalletInputs, GatherDelegationWalletParams,

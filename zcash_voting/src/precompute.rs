@@ -10,7 +10,6 @@
 
 use std::borrow::Borrow;
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
@@ -23,13 +22,10 @@ use crate::{
     types::{NoteInfo, VotingError, WitnessData},
 };
 
-#[cfg(feature = "pir")]
 use crate::{delegate::PreparedDelegationReport, round::BundleLayout, types::Network};
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub use crate::vote::VanWitness;
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 static VOTE_TREE_SYNCS: OnceLock<Mutex<HashMap<String, Arc<crate::tree_sync::VoteTreeSync>>>> =
     OnceLock::new();
 
@@ -105,13 +101,11 @@ pub fn verify_witness(witness: &WitnessData) -> Result<(), VotingError> {
 }
 
 /// Syncs the vote commitment tree for one round and returns the latest height.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub fn sync_vote_tree(db: &VotingDb, round_id: &str, node_url: &str) -> Result<u32, VotingError> {
     vote_tree_sync_for(db)?.sync(db, round_id, node_url)
 }
 
 /// Generates the VAN witness needed by `vote::commit`.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub fn van_witness(
     db: &VotingDb,
     round_id: &str,
@@ -122,12 +116,10 @@ pub fn van_witness(
 }
 
 /// Drops cached vote tree state for one round, or all rounds when `round_id` is empty.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError> {
     vote_tree_sync_for(db)?.reset(round_id)
 }
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 fn vote_tree_sync_for(db: &VotingDb) -> Result<Arc<crate::tree_sync::VoteTreeSync>, VotingError> {
     let wallet_id = db.wallet_id();
     let mut guard = VOTE_TREE_SYNCS
@@ -145,7 +137,6 @@ fn vote_tree_sync_for(db: &VotingDb) -> Result<Arc<crate::tree_sync::VoteTreeSyn
 /// Fetches and persists PIR-backed IMT non-membership proofs for one bundle.
 ///
 /// This must run after padded-note secrets have been initialized for the bundle.
-#[cfg(feature = "pir")]
 pub fn delegation_pir(
     db: &VotingDb,
     round_id: &str,
@@ -171,7 +162,6 @@ pub fn delegation_pir(
 /// # Errors
 ///
 /// Failures come from padded-secret initialization or PIR precompute.
-#[cfg(feature = "pir")]
 pub(crate) fn warm_delegation_pir(
     db: &VotingDb,
     round_id: &str,
@@ -191,7 +181,7 @@ pub(crate) fn warm_delegation_pir(
     })
 }
 
-#[cfg(all(test, feature = "pir"))]
+#[cfg(test)]
 mod pir_tests {
     use super::*;
     use crate::round::BundleLayout;
@@ -327,7 +317,7 @@ mod pir_tests {
     }
 }
 
-#[cfg(all(test, any(feature = "tree-sync", feature = "client-tree-sync")))]
+#[cfg(test)]
 mod tree_sync_tests {
     use super::*;
     use pasta_curves::Fp;

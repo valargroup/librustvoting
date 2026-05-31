@@ -1,13 +1,3 @@
-// The PIR-RPC helpers and orchestration methods at the top of this file are
-// gated behind the `client` feature. When that feature is off, several
-// imports below are only reachable from `#[cfg(test)]` code, which is fine
-// for `cargo test` but trips `unused_imports` on `cargo check`. Silence that
-// narrow case rather than fragment the imports along feature/test lines.
-#![cfg_attr(
-    not(any(feature = "pir", feature = "client-pir")),
-    allow(unused_imports, dead_code)
-)]
-
 use std::collections::HashMap;
 
 use ff::PrimeField;
@@ -35,7 +25,6 @@ use crate::types::{
     WireEncryptedShare, WitnessData,
 };
 
-#[cfg(any(feature = "pir", feature = "client-pir"))]
 fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, VotingError> {
     let nf_bytes: [u8; 32] = bytes.try_into().map_err(|_| VotingError::Internal {
         message: format!("{label} nullifier must be 32 bytes, got {}", bytes.len()),
@@ -45,7 +34,6 @@ fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, Vo
     })
 }
 
-#[cfg(any(feature = "pir", feature = "client-pir"))]
 fn delegation_nullifier_targets(
     notes: &[NoteInfo],
     dummy_nullifiers: &[Vec<u8>],
@@ -116,7 +104,6 @@ fn verify_delegation_spend_auth_signature(
         })
 }
 
-#[cfg(any(feature = "pir", feature = "client-pir"))]
 fn nullifier_imt_root_to_base(bytes: &[u8]) -> Result<pallas::Base, VotingError> {
     let root_bytes: [u8; 32] = bytes.try_into().map_err(|_| VotingError::Internal {
         message: format!("nullifier_imt_root must be 32 bytes, got {}", bytes.len()),
@@ -128,7 +115,6 @@ fn nullifier_imt_root_to_base(bytes: &[u8]) -> Result<pallas::Base, VotingError>
 
 /// Derive padded-slot nullifiers with the same synthetic padding points used by
 /// the delegation circuit builder.
-#[cfg(any(feature = "pir", feature = "client-pir"))]
 fn padded_nullifiers_for_circuit(
     notes: &[NoteInfo],
     padded_secrets: &[(Vec<u8>, Vec<u8>)],
@@ -197,7 +183,6 @@ fn padded_nullifiers_for_circuit(
     Ok(out)
 }
 
-#[cfg(any(feature = "pir", feature = "client-pir"))]
 fn precomputed_randomness_from_stored(
     notes_len: usize,
     padded_secrets: &[(Vec<u8>, Vec<u8>)],
@@ -337,9 +322,8 @@ impl VotingDb {
     /// full vote proof builder.
     ///
     /// This is intended for downstream FFI tests that need recovery-state rows
-    /// backed by a vote. It is only compiled for this crate's tests or when the
-    /// `test-fixtures` feature is explicitly enabled.
-    #[cfg(any(test, feature = "test-fixtures"))]
+    /// backed by a vote. It is only compiled for this crate's tests.
+    #[cfg(test)]
     pub fn insert_vote_fixture(
         &self,
         round_id: &str,
@@ -679,7 +663,6 @@ impl VotingDb {
     /// The padded-slot nullifiers we cache are derived to match what the
     /// circuit builder asks for at proof-gen time (see
     /// `padded_nullifiers_for_circuit`).
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
     pub fn precompute_delegation_pir(
         &self,
         round_id: &str,
@@ -780,7 +763,6 @@ impl VotingDb {
     /// For padded notes (< 5 real notes), the prover fetches proofs internally via PIR.
     ///
     /// Stores the proof result and advances phase to `DelegationProved`.
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
     pub fn build_and_prove_delegation(
         &self,
         round_id: &str,
@@ -1936,7 +1918,6 @@ mod tests {
         assert_eq!(hotkey.raw_orchard_address().len(), 43);
     }
 
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
     #[test]
     fn test_precomputed_randomness_requires_stored_rseeds() {
         let err = match precomputed_randomness_from_stored(5, &[], &[], &[0x11; 32], 0) {
@@ -1947,7 +1928,6 @@ mod tests {
         assert!(err.to_string().contains("rseed_signed"), "{err}");
     }
 
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
     #[test]
     fn test_padded_pir_nullifiers_match_persisted_dummy_nullifiers() {
         use orchard::{note::Rho, value::NoteValue};
@@ -2027,7 +2007,6 @@ mod tests {
         assert_eq!(pir_nullifiers, result.dummy_nullifiers);
     }
 
-    #[cfg(any(feature = "pir", feature = "client-pir"))]
     #[test]
     fn test_padded_secret_warmup_reuses_cached_pir_proofs_without_pczt() {
         use orchard::{note::Rho, value::NoteValue};

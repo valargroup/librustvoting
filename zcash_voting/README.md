@@ -16,8 +16,7 @@ precompute → delegate → vote → share lifecycle:
    `*_with_policy` variants with `BundlePolicy::new(...)`; proof construction
    still pads each bundle to the same fixed circuit slot count.
 3. Build the governance PCZT with `setup_delegation`.
-4. Precompute delegation inputs with `note_witnesses` and, with the `pir`
-   feature, `delegation_pir`.
+4. Precompute delegation inputs with `note_witnesses` and `delegation_pir`.
 5. After `delegate::setup`, load `delegation_signing_request` and sign it in
    the wallet. Then prove with `delegate::prove`, assemble submission fields with
    `delegation_submission` plus `DelegationSigner::signature`, submit them
@@ -109,9 +108,7 @@ The crate no longer accepts root wallet seed material for delegation signing.
 
 ## Migrating from 0.10
 
-- Enable `pir` and `tree-sync` instead of `client-pir` and
-  `client-tree-sync`. The old feature names remain aliases for existing
-  consumers during migration.
+- PIR and tree-sync APIs are now always compiled; no feature flags are required.
 - Prefer `VotingDb::create_round`, `VotingDb::ensure_bundles`, and
   `VotingDb::delegation_phases` over direct `storage::queries` calls.
 - Use `BundlePolicy` plus the `*_with_policy` APIs when an integration needs
