@@ -1,18 +1,15 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ff::PrimeField;
-use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Parameters;
 use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
     gather_delegation_lwd_inputs, prepare_delegation_bundle as prepare_bundle_state,
-    spend_auth_signature, DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
-    NoopCancellation, NoopProgressReporter, PrepareDelegationBundleParams,
-    PreparedDelegationBundle, PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
+    spend_auth_signature, DelegationSubmission, KeystoneSigningRequest, NoopCancellation,
+    NoopProgressReporter, PrepareDelegationBundleParams, PreparedDelegationBundle,
+    PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
 };
 use zcash_voting::{BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams};
-use zip32::{fingerprint::SeedFingerprint, AccountId};
 
 /// Inputs for preparing one reusable delegation bundle context.
 ///
@@ -125,7 +122,8 @@ pub fn prove_and_submit_delegation_bundle(
     let signing_request = prepared
         .signing_request(voting_db)
         .context("load delegation signing request")?;
-    let (sig, sighash) = example_sign_delegation_request(seed, signing_request)?;
+    let signer = PreparedSigner::from_wallet_seed(seed, signing_request)
+        .context("sign delegation bundle")?;
 
     let pir_client = connect_pir(pir_server_url)?;
     prepared
@@ -133,7 +131,8 @@ pub fn prove_and_submit_delegation_bundle(
         .context("prove delegation bundle")?;
 
     prepared
-        .submission(voting_db, PreparedSigner::signature(sig, sighash))
+        .signed_bundle(voting_db, _delegation_setup.pczt_bytes, signer)
+        .map(|bundle| bundle.submission)
         .context("assemble signed delegation submission")
 }
 
@@ -186,51 +185,16 @@ pub fn prove_and_submit_keystone_delegation_bundle(
 
     // Pair Keystone's SpendAuth signature with the original setup sighash.
     let action_index = usize::try_from(keystone_request.action_index)
-        .map_err(|_| anyhow::anyhow!("action_index does not fit usize"))?;
+        .context("Keystone action index does not fit usize")?;
     let sig = spend_auth_signature(signed_pczt_bytes, action_index)
         .context("extract Keystone SpendAuth signature")?;
-    let sighash: [u8; 32] = keystone_request
-        .pczt_sighash
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("pczt_sighash must be 32 bytes"))?;
+    let signer = PreparedSigner::signature_from_bytes(&sig, &keystone_request.pczt_sighash)
+        .context("validate Keystone signature fields")?;
 
     prepared
-        .submission(voting_db, PreparedSigner::signature(sig, sighash))
+        .signed_bundle(voting_db, Vec::new(), signer)
+        .map(|bundle| bundle.submission)
         .context("assemble Keystone-signed delegation submission")
-}
-
-fn example_sign_delegation_request(
-    seed: &[u8],
-    request: DelegationSigningRequest,
-) -> Result<([u8; 64], [u8; 32])> {
-    // This is example-only signing code. Production wallets should keep their
-    // own seed storage and signing boundary, then return only the signature.
-    // Real wallet integrations should route to the seed identified by
-    // request.seed_fingerprint before signing. This example verifies that the
-    // already selected seed matches the request.
-    let seed_fingerprint = SeedFingerprint::from_seed(seed)
-        .ok_or_else(|| anyhow::anyhow!("wallet seed length is not valid for ZIP-32"))?;
-    if seed_fingerprint.to_bytes() != request.seed_fingerprint {
-        return Err(anyhow::anyhow!(
-            "wallet seed fingerprint does not match delegation signing request"
-        ));
-    }
-
-    let account = AccountId::try_from(request.account_index)
-        .map_err(|_| anyhow::anyhow!("invalid account_index {}", request.account_index))?;
-    let usk = UnifiedSpendingKey::from_seed(&request.network, seed, account)
-        .context("derive account unified spending key")?;
-    let sk = *usk.orchard();
-    let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
-    let alpha = Option::<pasta_curves::pallas::Scalar>::from(
-        pasta_curves::pallas::Scalar::from_repr(request.alpha),
-    )
-    .ok_or_else(|| anyhow::anyhow!("delegation alpha is not a valid Pallas scalar"))?;
-    let rsk = ask.randomize(&alpha);
-    let mut rng = rand::rngs::OsRng;
-    let sig = rsk.sign(&mut rng, &request.sighash);
-    Ok(((&sig).into(), request.sighash))
 }
 
 fn connect_pir(pir_server_url: &str) -> Result<PirClientBlocking> {

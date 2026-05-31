@@ -1480,10 +1480,20 @@ pub fn has_witnesses(
     wallet_id: &str,
     bundle_index: u32,
 ) -> Result<bool, VotingError> {
+    witness_count(conn, round_id, wallet_id, bundle_index).map(|count| count > 0)
+}
+
+/// Count cached witnesses for a bundle.
+pub fn witness_count(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<usize, VotingError> {
     conn.query_row(
         "SELECT COUNT(*) FROM witnesses WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
-        |row| row.get::<_, i64>(0).map(|c| c > 0),
+        |row| row.get::<_, i64>(0).map(|c| c as usize),
     )
     .map_err(|e| VotingError::Internal {
         message: format!("failed to check witnesses: {}", e),

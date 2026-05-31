@@ -181,7 +181,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Added `PreparedDelegationBundle` lifecycle methods and `PreparedSigner` so
   precompute, PCZT setup, proof generation, Keystone signing requests, and
   submission assembly all consume the same prepared bundle state instead of
-  re-threading loose round IDs, bundle indexes, note lists, and keys.
+  re-threading loose round IDs, bundle indexes, note lists, and keys. The
+  prepared lifecycle now also owns software-wallet delegation signing for
+  callers that choose to pass a seed to the crate, external signature byte
+  validation, witness-cache checks, and signed-payload metadata.
 - Added `vote::validate_draft_votes` so wallet SDKs can validate canonical
   `DraftVote` inputs through the shared voting API before DB or proof work.
 - Added the stable `vote::*` cast-vote API with `DraftVote`, `VanWitness`,
@@ -219,10 +222,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - The wallet vote example now includes `commit_vote_bundle_batch`, showing the
   canonical batch cast-vote flow with `vote::commit_batch` and crate-owned
   cancellation/progress adapters.
-- Removed crate-side wallet seed APIs from voting hotkey derivation and
-  delegation signing. Wallet SDKs now derive scoped voting hotkey seed material
-  and delegation signatures locally, then pass only hotkey seeds or signatures
-  to the crate.
+- Removed crate-side wallet seed APIs from voting hotkey derivation. Wallet SDKs
+  now derive scoped voting hotkey seed material locally and can either sign
+  delegation requests at their own wallet boundary or call
+  `PreparedSigner::from_wallet_seed` when the crate runs inside that same seed
+  trust boundary.
 - Delegation PIR warmup no longer constructs or caches a governance PCZT.
   `PreparedDelegationBundle::precompute` now warms witnesses, padded-note
   secrets, and PIR rows only; `delegate::setup` builds the PCZT later from the
