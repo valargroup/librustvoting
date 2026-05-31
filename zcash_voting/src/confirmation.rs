@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::{queries, VotingDb};
 use crate::types::VotingError;
+pub use crate::wire::{DelegationConfirmation, VoteConfirmation};
 
 const DELEGATE_VOTE_EVENT: &str = "delegate_vote";
 const CAST_VOTE_EVENT: &str = "cast_vote";
@@ -32,26 +33,6 @@ pub struct TxEventAttribute {
     pub key: String,
     /// Attribute value.
     pub value: String,
-}
-
-/// Parsed confirmation data for a submitted delegation transaction.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DelegationConfirmation {
-    /// Confirmed transaction hash.
-    pub tx_hash: String,
-    /// Confirmed vote-authority-note leaf position.
-    pub van_leaf_position: u32,
-}
-
-/// Parsed confirmation data for a submitted cast-vote transaction.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VoteConfirmation {
-    /// Confirmed transaction hash.
-    pub tx_hash: String,
-    /// Confirmed vote-authority-note leaf position.
-    pub van_leaf_position: u32,
-    /// Confirmed vote commitment tree position.
-    pub vc_tree_position: u64,
 }
 
 /// Parses and records a confirmed delegation transaction in one durable step.
