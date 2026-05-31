@@ -128,6 +128,25 @@ pub struct VoteConfirmation {
     pub vc_tree_position: u64,
 }
 
+/// One chain transaction event returned by a wallet's chain client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxEvent {
+    /// Event type, for example `delegate_vote` or `cast_vote`.
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// Event attributes in the order returned by the chain client.
+    pub attributes: Vec<TxEventAttribute>,
+}
+
+/// One key/value attribute inside a chain transaction event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxEventAttribute {
+    /// Attribute key.
+    pub key: String,
+    /// Attribute value.
+    pub value: String,
+}
+
 /// Parameters for a voting round, sourced from vote chain.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotingRoundParams {
@@ -207,6 +226,29 @@ pub struct SignedVoteCommitmentView {
 pub struct SignedVoteCommitmentsView {
     pub bundle_index: u32,
     pub commitments: Vec<SignedVoteCommitmentView>,
+}
+
+/// Lifecycle events emitted while building one cast-vote commitment.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum VoteCommitStage {
+    ProofStarting {
+        proposal_id: u32,
+        bundle_index: u32,
+    },
+    ProofProgress {
+        proposal_id: u32,
+        bundle_index: u32,
+        progress: f64,
+    },
+    SharePayloadsBuilding {
+        proposal_id: u32,
+        bundle_index: u32,
+    },
+    Signing {
+        proposal_id: u32,
+        bundle_index: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

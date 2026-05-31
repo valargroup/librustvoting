@@ -409,27 +409,7 @@ pub fn recover_signed_commitments(
 }
 
 /// Lifecycle events emitted while building one cast-vote commitment.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[non_exhaustive]
-pub enum VoteCommitStage {
-    ProofStarting {
-        proposal_id: u32,
-        bundle_index: u32,
-    },
-    ProofProgress {
-        proposal_id: u32,
-        bundle_index: u32,
-        progress: f64,
-    },
-    SharePayloadsBuilding {
-        proposal_id: u32,
-        bundle_index: u32,
-    },
-    Signing {
-        proposal_id: u32,
-        bundle_index: u32,
-    },
-}
+pub use crate::wire::VoteCommitStage;
 
 /// Cast-vote signing source.
 #[derive(Clone, Copy)]

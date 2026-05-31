@@ -5,35 +5,15 @@
 //! back into voting DB state.
 
 use rusqlite::{named_params, OptionalExtension};
-use serde::{Deserialize, Serialize};
 
 use crate::storage::{queries, VotingDb};
 use crate::types::VotingError;
-pub use crate::wire::{DelegationConfirmation, VoteConfirmation};
+pub use crate::wire::{DelegationConfirmation, TxEvent, TxEventAttribute, VoteConfirmation};
 
 const DELEGATE_VOTE_EVENT: &str = "delegate_vote";
 const CAST_VOTE_EVENT: &str = "cast_vote";
 const LEAF_INDEX_ATTRIBUTE: &str = "leaf_index";
 const ROUND_ID_ATTRIBUTES: [&str; 2] = ["vote_round_id", "round_id"];
-
-/// One chain transaction event returned by a wallet's chain client.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TxEvent {
-    /// Event type, for example `delegate_vote` or `cast_vote`.
-    #[serde(rename = "type")]
-    pub event_type: String,
-    /// Event attributes in the order returned by the chain client.
-    pub attributes: Vec<TxEventAttribute>,
-}
-
-/// One key/value attribute inside a chain transaction event.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TxEventAttribute {
-    /// Attribute key.
-    pub key: String,
-    /// Attribute value.
-    pub value: String,
-}
 
 /// Parses and records a confirmed delegation transaction in one durable step.
 ///
