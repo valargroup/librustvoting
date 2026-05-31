@@ -50,28 +50,6 @@ pub enum Network {
     Regtest,
 }
 
-impl Network {
-    /// Returns the legacy numeric network id used by existing proof builders.
-    pub fn id(self) -> u32 {
-        match self {
-            Self::Testnet => 0,
-            Self::Mainnet => 1,
-            Self::Regtest => 0,
-        }
-    }
-
-    /// Converts a legacy network id into a typed network selector.
-    pub fn from_id(id: u32) -> Result<Self, VotingError> {
-        match id {
-            0 => Ok(Self::Testnet),
-            1 => Ok(Self::Mainnet),
-            _ => Err(VotingError::InvalidInput {
-                message: format!("network_id must be 0 (testnet) or 1 (mainnet), got {id}"),
-            }),
-        }
-    }
-}
-
 impl Parameters for Network {
     fn network_type(&self) -> NetworkType {
         match self {

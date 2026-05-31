@@ -60,9 +60,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   per-bundle cast-vote batches through one crate-owned entry point instead of
   reimplementing per-draft loops and recovery wrapping.
 - Added atomic idempotent recovery writers on `VotingDb`:
-  `mark_delegation_submitted`, `mark_delegation_confirmed`,
-  `mark_vote_submitted`, and `mark_vote_confirmed`, including conflict checks
-  for tx hashes and stored vote/delegation positions.
+  `mark_delegation_submitted` and `mark_vote_submitted`, including conflict
+  checks for tx hashes.
 - Added `vote::SignedVoteCommitment` plus
   `CommittedVote::signed_commitment` as the canonical wallet-facing aggregate
   for cast-vote outputs. The API now exposes submission fields, helper-share
@@ -227,6 +226,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   prepared delegation signing. Wallet SDKs now derive scoped voting hotkey seed
   material and delegation signatures locally, then pass only hotkey seed bytes
   or SpendAuth signatures into the crate.
+- Removed unused legacy APIs left behind by the wallet integration refactor:
+  direct share decomposition/encryption modules, the public share-tracking
+  nullifier module, `VotingDb::voting_hotkey_from_seed`, confirmed-state writer
+  shims, legacy `Network` numeric converters, and the mainnet-only consensus
+  branch ID helper.
 - Delegation PIR warmup no longer constructs or caches a governance PCZT.
   `PreparedDelegationBundle::precompute` now warms witnesses, padded-note
   secrets, and PIR rows only; `delegate::setup` builds the PCZT later from the

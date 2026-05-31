@@ -167,12 +167,6 @@ pub async fn anchor_tree_state_bytes_with_retry(
     )
 }
 
-/// Resolves the Zcash mainnet consensus branch id from the lightwalletd tip.
-pub async fn mainnet_consensus_branch_id(lightwalletd_url: &str) -> Result<u32, VotingError> {
-    let height = latest_block_height(lightwalletd_url).await?;
-    branch_id_for_height(Network::Mainnet, height)
-}
-
 /// Resolves the consensus branch ID active at `height` for `network`.
 pub fn branch_id_for_height(network: Network, height: u64) -> Result<u32, VotingError> {
     let height = u32::try_from(height)

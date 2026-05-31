@@ -1879,12 +1879,7 @@ mod tests {
             .verify(&sighash, &Signature::<SpendAuth>::from(seed_sig_bytes))
             .unwrap();
 
-        // The legacy numeric id cannot preserve Regtest. Vote signing and proof
-        // generation must keep the typed network through the internal calls.
-        assert_eq!(
-            Network::from_id(Network::Regtest.id()).unwrap(),
-            Network::Testnet
-        );
+        assert_ne!(Network::Regtest, Network::Testnet);
     }
 
     #[test]
