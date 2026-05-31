@@ -2,7 +2,6 @@
 
 use std::borrow::Borrow;
 
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 use crate::storage::VotingDb;
 use crate::{
     delegate::{load_account_keys, DelegationKeys},
@@ -13,7 +12,6 @@ use zcash_client_backend::{
     data_api::{wallet::ConfirmationsPolicy, Account, WalletRead},
     proto::service::TreeState,
 };
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_protocol::consensus::{BlockHeight, Parameters};
@@ -74,7 +72,6 @@ where
 ///
 /// Returns an error if lightwalletd cannot provide the snapshot anchor, the
 /// wallet DB cannot be opened, or [`select_notes_with_wallet_db`] fails.
-#[cfg(any(feature = "tree-sync", feature = "client-tree-sync"))]
 pub async fn select_notes_with_lwd(
     voting_db: &VotingDb,
     db_path: &str,

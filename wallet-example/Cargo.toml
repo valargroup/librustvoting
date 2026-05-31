@@ -14,5 +14,5 @@ rusqlite = "0.37"
 zcash_client_sqlite = { version = "0.20", default-features = false, features = ["orchard"] }
 zcash_keys = { version = "0.13", features = ["orchard"] }
 zcash_protocol = "0.8"
-zcash_voting = { path = "../zcash_voting", features = ["pir", "tree-sync"] }
+zcash_voting = { path = "../zcash_voting" }
 zip32 = "0.2"

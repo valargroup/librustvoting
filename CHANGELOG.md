@@ -200,6 +200,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- The default feature set now enables both `pir` and `tree-sync`, so the
+  built-in network client surface is available without extra feature flags.
+- `zcash_voting::transport::HyperTransport` is now exported unconditionally.
+  Callers no longer need to enable `pir`, `tree-sync`, `client-pir`, or
+  `client-tree-sync` just to access the transport re-export.
 - Split wire DTO definitions from codec/conversion logic: `zcash_voting::wire`
   now owns stable protocol structs only, while serde/base64 conversion helpers
   and JSON-shaping tests moved into crate-private `wire_codec`.

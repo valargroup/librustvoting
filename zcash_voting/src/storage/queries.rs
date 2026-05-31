@@ -1250,7 +1250,6 @@ pub fn store_proof_result_fields(
 }
 
 /// Persist proof public inputs and compare the proof VAN against the stored PCZT VAN.
-#[cfg_attr(not(any(feature = "pir", feature = "client-pir")), allow(dead_code))]
 pub(crate) fn store_proof_result_fields_with_van_comm(
     conn: &Connection,
     round_id: &str,
