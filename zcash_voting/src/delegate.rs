@@ -19,7 +19,7 @@ use crate::{
     round::{BundleLayout, RoundParams, VotingDb},
     types::{DelegationProgressReporter, Network, NoteInfo, VotingError, VotingHotkey},
 };
-use zcash_client_backend::data_api::{Account, WalletRead};
+use zcash_client_backend::data_api::{wallet::ConfirmationsPolicy, Account, WalletRead};
 use zcash_client_sqlite::{AccountUuid, WalletDb};
 use zcash_protocol::consensus::{NetworkConstants, Parameters};
 
@@ -230,11 +230,12 @@ pub struct DelegationLwdInputs {
 }
 
 /// Parameters for preparing one delegation bundle from caller-owned wallet state.
-pub struct PrepareDelegationBundleParams<'a, C, P, CL, R> {
-    pub wallet_db: &'a WalletDb<C, P, CL, R>,
+pub struct PrepareDelegationBundleParams<'a> {
+    pub lwd: DelegationLwdInputs,
+    pub session_json: Option<&'a str>,
     pub account_uuid: &'a str,
-    pub voting_hotkey: &'a VotingHotkey,
-    pub scanned_height: u64,
+    pub network: Network,
+    pub hotkey_seed: &'a [u8],
     pub bundle_index: u32,
     pub bundle_policy: BundlePolicy,
 }
@@ -277,20 +278,35 @@ pub async fn gather_delegation_lwd_inputs(
     })
 }
 
-/// Prepares reusable bundle state after lightwalletd inputs are resolved.
+/// Prepares one delegation bundle from caller-owned DB handles and LWD inputs.
 ///
 /// Callers should resolve [`DelegationLwdInputs`] before opening a non-`Send`
-/// wallet DB handle in async contexts. This helper keeps wallet DB access and
-/// bundle validation in one place, returning plain data for later operations.
+/// wallet DB handle in async contexts. This validates/persists round metadata,
+/// snapshots wallet state at the current scanned height, and ensures required
+/// witnesses exist for the selected bundle.
+///
+/// # Errors
+///
+/// Returns an error if round context initialization, wallet access, bundle
+/// preparation, or witness persistence fails.
 pub fn prepare_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
-    lwd: DelegationLwdInputs,
-    params: PrepareDelegationBundleParams<'_, C, P, CL, R>,
+    wallet_db: &WalletDb<C, P, CL, R>,
+    params: PrepareDelegationBundleParams<'_>,
 ) -> Result<PreparedDelegationBundle, VotingError>
 where
     C: Borrow<rusqlite::Connection>,
     P: Parameters,
 {
+    let lwd = params.lwd;
+    let session_json = params.session_json;
+    // Ensure the round is present in the voting database.
+    ensure_round_context(
+        voting_db,
+        &lwd.round_params,
+        &lwd.resolved_round_name,
+        session_json,
+    )?;
     let DelegationLwdInputs {
         round_params,
         resolved_round_name,
@@ -299,17 +315,33 @@ where
     } = lwd;
     let round_id = round_params.vote_round_id.clone();
     let round_name = resolved_round_name.clone();
+    // Get the voting hotkey from the seed.
+    let voting_hotkey = crate::hotkey::voting_hotkey_from_seed(params.hotkey_seed, params.network)?;
+   
+   // Get the scanned height from the wallet.
+    let scanned_height = match wallet_db
+        .get_wallet_summary(ConfirmationsPolicy::default())
+        .map_err(|e| VotingError::Internal {
+            message: format!("wallet summary lookup failed: {e}"),
+        })? {
+        Some(summary) => u32::from(summary.fully_scanned_height()) as u64,
+        None => 0,
+    };
+
+    // Gather the wallet inputs.
     let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
-        wallet_db: params.wallet_db,
+        wallet_db,
         account_uuid: params.account_uuid,
-        voting_hotkey: params.voting_hotkey,
+        voting_hotkey: &voting_hotkey,
         snapshot_height: round_params.snapshot_height,
-        scanned_height: params.scanned_height,
+        scanned_height,
         anchor_tree_state_bytes,
         resolved_round_name,
     })?;
 
+    // Ensure the round is present in the voting database.
     voting_db.ensure_round(&round_params, None)?;
+    // Ensure the bundles are present in the voting database.
     let layout = voting_db.ensure_bundles_with_skipped_suffix_with_policy(
         &round_id,
         &wallet_inputs.round_note_infos,
@@ -322,7 +354,7 @@ where
         params.bundle_policy,
     )?;
 
-    Ok(PreparedDelegationBundle {
+    let prepared = PreparedDelegationBundle {
         round_id,
         round_params,
         bundle_index: params.bundle_index,
@@ -331,9 +363,14 @@ where
         delegation_keys: wallet_inputs.delegation_keys,
         branch_id_provider,
         anchor_tree_state_bytes: wallet_inputs.anchor_tree_state_bytes,
-        network: params.voting_hotkey.network(),
+        network: voting_hotkey.network(),
         round_name,
-    })
+    };
+
+    // Ensure witnesses are present in the voting database.
+    prepared.ensure_witnesses(voting_db, wallet_db)?;
+
+    Ok(prepared)
 }
 
 /// Inputs gathered from lightwalletd and the wallet before voting-DB work.
@@ -1232,24 +1269,49 @@ mod tests {
             nc_root: vec![2; 32],
             nullifier_imt_root: vec![3; 32],
         };
-        let prepared = prepare_delegation_bundle(
-            &voting_db,
-            DelegationLwdInputs {
-                round_params: round_params.clone(),
-                resolved_round_name: "Demo Round".to_string(),
-                anchor_tree_state_bytes: vec![0xAA, 0xBB],
-                branch_id_provider: LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0),
-            },
-            PrepareDelegationBundleParams {
-                wallet_db: &wallet_db,
-                account_uuid: &account_uuid.expose_uuid().to_string(),
-                voting_hotkey: &hotkey,
-                scanned_height: 12,
-                bundle_index: 0,
-                bundle_policy: crate::BundlePolicy::default(),
-            },
+        let lwd = DelegationLwdInputs {
+            round_params: round_params.clone(),
+            resolved_round_name: "Demo Round".to_string(),
+            anchor_tree_state_bytes: vec![0xAA, 0xBB],
+            branch_id_provider: LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0),
+        };
+        let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
+            wallet_db: &wallet_db,
+            account_uuid: &account_uuid.expose_uuid().to_string(),
+            voting_hotkey: &hotkey,
+            snapshot_height: round_params.snapshot_height,
+            scanned_height: 12,
+            anchor_tree_state_bytes: lwd.anchor_tree_state_bytes.clone(),
+            resolved_round_name: lwd.resolved_round_name.clone(),
+        })
+        .unwrap();
+        voting_db.ensure_round(&round_params, None).unwrap();
+        let layout = voting_db
+            .ensure_bundles_with_skipped_suffix_with_policy(
+                round_params.vote_round_id.as_str(),
+                &wallet_inputs.round_note_infos,
+                crate::BundlePolicy::default(),
+            )
+            .unwrap();
+        let bundle_note_infos = crate::round::bundle_notes_for_index_with_policy(
+            &wallet_inputs.round_note_infos,
+            &layout,
+            0,
+            crate::BundlePolicy::default(),
         )
         .unwrap();
+        let prepared = PreparedDelegationBundle {
+            round_id: round_params.vote_round_id.clone(),
+            round_params: lwd.round_params,
+            bundle_index: 0,
+            layout,
+            bundle_note_infos,
+            delegation_keys: wallet_inputs.delegation_keys,
+            branch_id_provider: lwd.branch_id_provider,
+            anchor_tree_state_bytes: wallet_inputs.anchor_tree_state_bytes,
+            network: hotkey.network(),
+            round_name: lwd.resolved_round_name,
+        };
 
         (voting_db, round_params, hotkey, prepared)
     }

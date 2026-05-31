@@ -199,6 +199,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- `delegate::prepare_delegation_bundle` now owns hotkey reconstruction and
+  wallet scanned-height lookup. Callers pass `network` + `hotkey_seed`, and the
+  crate derives `VotingHotkey` plus `scanned_height` internally before note
+  gathering/witness validation.
+- Consolidated delegation-bundle preparation into one public
+  `delegate::prepare_delegation_bundle` path. `PrepareDelegationBundleParams`
+  now carries `DelegationLwdInputs` (`lwd`) and `session_json` directly, while
+  `wallet_db` is an explicit function argument instead of being embedded in the
+  params struct.
 - The default feature set now enables both `pir` and `tree-sync`, so the
   built-in network client surface is available without extra feature flags.
 - `zcash_voting::transport::HyperTransport` is now exported unconditionally.

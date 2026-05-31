@@ -8,8 +8,8 @@ use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
     gather_delegation_lwd_inputs, prepare_delegation_bundle as prepare_bundle_state,
     spend_auth_signature, DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
-    NoopProgressReporter, PrepareDelegationBundleParams, PreparedDelegationBundle,
-    PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
+    Network, NoopProgressReporter, PrepareDelegationBundleParams, PreparedDelegationBundle,
+    PreparedDelegationReport, PreparedSigner, VotingDb,
 };
 use zcash_voting::{BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams};
 use zip32::{fingerprint::SeedFingerprint, AccountId};
@@ -22,11 +22,13 @@ use zip32::{fingerprint::SeedFingerprint, AccountId};
 pub struct PrepareRequest<'a> {
     pub account_uuid: &'a str,
     pub lightwalletd_url: &'a str,
+    pub network: Network,
     pub round_params: VotingRoundParams,
     pub round_name: &'a str,
-    pub voting_hotkey: &'a VotingHotkey,
-    pub scanned_height: u64,
+    pub hotkey_seed: &'a [u8],
+    pub session_json: Option<&'a str>,
     pub bundle_index: u32,
+    pub bundle_policy: BundlePolicy,
 }
 
 /// Resolves lightwalletd and wallet inputs for later delegation operations.
@@ -51,7 +53,7 @@ where
 {
     let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
         lightwalletd_url: request.lightwalletd_url,
-        network: request.voting_hotkey.network(),
+        network: request.network,
         round_params: request.round_params,
         round_name: request.round_name,
     })
@@ -60,17 +62,18 @@ where
 
     prepare_bundle_state(
         voting_db,
-        lwd_inputs,
+        wallet_db,
         PrepareDelegationBundleParams {
-            wallet_db,
+            lwd: lwd_inputs,
+            session_json: request.session_json,
             account_uuid: request.account_uuid,
-            voting_hotkey: request.voting_hotkey,
-            scanned_height: request.scanned_height,
+            network: request.network,
+            hotkey_seed: request.hotkey_seed,
             bundle_index: request.bundle_index,
-            bundle_policy: BundlePolicy::default(),
+            bundle_policy: request.bundle_policy,
         },
     )
-    .context("prepare delegation bundle")
+    .context("prepare delegation bundle with witnesses")
 }
 
 /// Precomputes persistent artifacts needed to later prove one delegation bundle.
