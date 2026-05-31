@@ -17,12 +17,6 @@ pub mod elgamal;
 pub mod error;
 pub mod governance;
 pub mod hotkey;
-#[cfg(any(
-    feature = "pir",
-    feature = "tree-sync",
-    feature = "client-pir",
-    feature = "client-tree-sync"
-))]
 mod http_transport;
 pub mod lwd;
 pub mod note_bundling;
@@ -51,12 +45,6 @@ pub mod witness;
 pub mod zkp1;
 pub mod zkp2;
 
-#[cfg(any(
-    feature = "pir",
-    feature = "tree-sync",
-    feature = "client-pir",
-    feature = "client-tree-sync"
-))]
 pub use http_transport::HyperTransport;
 #[cfg(any(feature = "pir", feature = "client-pir"))]
 pub use pir_client::{

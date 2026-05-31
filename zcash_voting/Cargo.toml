@@ -8,7 +8,7 @@ repository = "https://github.com/valargroup/zcash_voting"
 readme = "README.md"
 
 [features]
-default = []
+default = ["pir", "tree-sync"]
 # PIR client surface for fetching IMT non-membership proofs over direct
 # Hyper/Rustls HTTP.
 pir = [
