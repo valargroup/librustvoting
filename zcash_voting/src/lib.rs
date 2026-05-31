@@ -11,9 +11,7 @@
 
 pub mod action;
 pub mod confirmation;
-pub mod decompose;
 pub mod delegate;
-pub mod elgamal;
 pub mod error;
 pub mod governance;
 pub mod hotkey;
@@ -31,7 +29,6 @@ pub mod selection;
 pub mod session;
 pub mod share;
 pub mod share_policy;
-pub mod share_tracking;
 pub mod storage;
 pub mod transport;
 pub mod tree_sync;

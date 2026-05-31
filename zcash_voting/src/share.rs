@@ -6,9 +6,13 @@
 
 use crate::{
     round::VotingDb,
-    types::{ShareDelegationRecord, SharePayload, VotingError, WireEncryptedShare},
+    types::{
+        ct_option_to_result, ShareDelegationRecord, SharePayload, VotingError, WireEncryptedShare,
+    },
     vote::{validate_recovery_bundle_vote_fields, VoteRecoveryBundle},
 };
+use ff::PrimeField;
+use pasta_curves::pallas;
 
 pub use crate::types::ShareDelegationRecord as ShareRecord;
 
@@ -37,16 +41,26 @@ pub fn compute_nullifier(
     share_index: u32,
     primary_blind: &[u8; 32],
 ) -> Result<[u8; 32], VotingError> {
-    let bytes = crate::share_tracking::compute_share_nullifier(
-        vote_commitment,
-        share_index,
-        primary_blind,
+    if share_index > 15 {
+        return Err(VotingError::InvalidInput {
+            message: format!("share_index must be 0..15, got {share_index}"),
+        });
+    }
+
+    let vc = ct_option_to_result(
+        pallas::Base::from_repr(*vote_commitment),
+        "invalid vote_commitment field element",
     )?;
-    bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| VotingError::Internal {
-            message: format!("share nullifier must be 32 bytes, got {}", bytes.len()),
-        })
+    let blind = ct_option_to_result(
+        pallas::Base::from_repr(*primary_blind),
+        "invalid primary_blind field element",
+    )?;
+    let nullifier = voting_circuits::share_reveal::share_nullifier_hash(
+        vc,
+        pallas::Base::from(share_index as u64),
+        blind,
+    );
+    Ok(nullifier.to_repr())
 }
 
 /// Records a helper-share submission using nullifier material from recovery state.
