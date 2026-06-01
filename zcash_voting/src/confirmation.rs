@@ -456,7 +456,9 @@ mod tests {
     use crate::round::{RoundParams, VotingDb};
     use crate::storage::queries;
 
-    const ROUND_ID: &str = "round-1";
+    const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const OTHER_ROUND_ID: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
     const WALLET_ID: &str = "wallet-1";
 
     fn event(event_type: &str, key: &str, value: &str) -> TxEvent {
@@ -687,12 +689,12 @@ mod tests {
     #[test]
     fn tx_event_decodes_chain_json_shape() {
         let events: Vec<TxEvent> = serde_json::from_str(
-            r#"[{"type":"delegate_vote","attributes":[{"key":"vote_round_id","value":"round-1"},{"key":"leaf_index","value":"42"}]}]"#,
+            r#"[{"type":"delegate_vote","attributes":[{"key":"vote_round_id","value":"1111111111111111111111111111111111111111111111111111111111111111"},{"key":"leaf_index","value":"42"}]}]"#,
         )
         .unwrap();
 
         assert_eq!(
-            parse_delegation_confirmation_for_round("tx-1", "round-1", &events)
+            parse_delegation_confirmation_for_round("tx-1", ROUND_ID, &events)
                 .unwrap()
                 .van_leaf_position,
             42
@@ -712,7 +714,7 @@ mod tests {
                 event_with_attrs(
                     DELEGATE_VOTE_EVENT,
                     &[
-                        ("vote_round_id", "other-round"),
+                        ("vote_round_id", OTHER_ROUND_ID),
                         (LEAF_INDEX_ATTRIBUTE, "99"),
                     ],
                 ),
@@ -1247,7 +1249,7 @@ mod tests {
             "vote-tx",
             &[event_with_attrs(
                 CAST_VOTE_EVENT,
-                &[("round_id", "other-round"), (LEAF_INDEX_ATTRIBUTE, "8,789")],
+                &[("round_id", OTHER_ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "8,789")],
             )],
         )
         .unwrap_err();

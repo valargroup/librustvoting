@@ -2,6 +2,8 @@ use std::fmt;
 
 use orchard::note::ExtractedNoteCommitment;
 use serde::{Deserialize, Serialize};
+use ff::PrimeField;
+use pasta_curves::pallas;
 use subtle::CtOption;
 use thiserror::Error;
 use zcash_client_backend::proto::service::TreeState;
@@ -791,9 +793,57 @@ pub fn validate_notes(notes: &[NoteInfo]) -> Result<(), VotingError> {
 }
 
 pub fn validate_round_params(params: &VotingRoundParams) -> Result<(), VotingError> {
+    validate_vote_round_id_hex(&params.vote_round_id)?;
     validate_32_bytes(&params.ea_pk, "ea_pk")?;
     validate_32_bytes(&params.nc_root, "nc_root")?;
     validate_32_bytes(&params.nullifier_imt_root, "nullifier_imt_root")?;
+    Ok(())
+}
+
+/// Validate a hex-encoded voting round id.
+///
+/// A valid round id is exactly 32 bytes encoded as lowercase hex, and those
+/// bytes must be a canonical little-endian [`pallas::Base`] encoding. This
+/// validates the round-id representation accepted by the voting circuits; it
+/// does not recompute the on-chain Poseidon preimage for the round id.
+pub fn validate_vote_round_id_hex(vote_round_id: &str) -> Result<(), VotingError> {
+    if vote_round_id.len() != 64 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "vote_round_id must be 64 lowercase hex characters, got {}",
+                vote_round_id.len()
+            ),
+        });
+    }
+    if !vote_round_id
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(VotingError::InvalidInput {
+            message: "vote_round_id must be lowercase hex".to_string(),
+        });
+    }
+    let bytes = hex::decode(vote_round_id).map_err(|e| VotingError::InvalidInput {
+        message: format!("vote_round_id is not valid hex: {e}"),
+    })?;
+    validate_vote_round_id_bytes(&bytes)
+}
+
+/// Validate raw voting round-id bytes as a canonical Pallas base-field element.
+pub fn validate_vote_round_id_bytes(vote_round_id: &[u8]) -> Result<(), VotingError> {
+    let bytes: [u8; 32] = vote_round_id
+        .try_into()
+        .map_err(|_| VotingError::InvalidInput {
+            message: format!(
+                "vote_round_id must be 32 bytes, got {}",
+                vote_round_id.len()
+            ),
+        })?;
+    Option::<pallas::Base>::from(pallas::Base::from_repr(bytes)).ok_or_else(|| {
+        VotingError::InvalidInput {
+            message: "vote_round_id is not a canonical Pallas field element".to_string(),
+        }
+    })?;
     Ok(())
 }
 
@@ -977,6 +1027,20 @@ mod tests {
         assert_eq!(note_info.rseed, note.rseed().as_bytes().to_vec());
         assert_eq!(note_info.scope, 0);
         assert_eq!(note_info.ufvk_str, ufvk.encode(&TEST_NETWORK));
+    }
+    #[test]
+    fn validate_vote_round_id_accepts_canonical_lowercase_hex() {
+        assert!(validate_vote_round_id_hex(&"01".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn validate_vote_round_id_rejects_non_canonical_field_encoding() {
+        assert!(validate_vote_round_id_hex(&"ff".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn validate_vote_round_id_rejects_uppercase_hex() {
+        assert!(validate_vote_round_id_hex(&"AA".repeat(32)).is_err());
     }
 }
 

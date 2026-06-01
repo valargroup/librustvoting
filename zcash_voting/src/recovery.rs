@@ -238,7 +238,7 @@ mod tests {
     use super::*;
     use crate::{round::RoundParams, storage::queries, types::NoteInfo};
 
-    const ROUND_ID: &str = "round-recovery";
+    const ROUND_ID: &str = "3333333333333333333333333333333333333333333333333333333333333333";
     const WALLET_ID: &str = "wallet-recovery";
 
     #[test]
