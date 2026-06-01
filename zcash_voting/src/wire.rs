@@ -56,6 +56,12 @@ impl TryFrom<u64> for BoundedU32 {
     }
 }
 
+pub use crate::config::{
+    ConfigCondition, ConfigConditionKind, ConfigSwitchDecision, ConfigSwitchKind,
+    PinnedConfigSource, ResolveVotingConfigOptions, ResolvedVotingConfig,
+    ResolvedVotingConfigSummary, ServiceEndpoint, SupportedVersions, VotingConfigError,
+    WalletCapabilities,
+};
 pub use crate::delegate::KeystoneSigningRequest;
 pub use crate::round::BundleLayout;
 pub use crate::share_policy::ShareSubmissionPlan;

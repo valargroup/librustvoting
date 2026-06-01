@@ -195,6 +195,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   can derive vote/share recovery state without querying SQLite tables directly.
 - Added `precompute::{sync_vote_tree, van_witness, reset_vote_tree}` as the
   public vote commitment tree sync and VAN witness surface.
+- Added a `zcash_voting::config` voting-service config resolution API
+  (`resolve_static_voting_config`, `resolve_voting_config`, `resolve_config`,
+  and `decide_config_switch`) so wallets can authenticate static/dynamic config
+  bytes with their own transport and classify the resulting config switch. A
+  `wallet-example::example_config` module pairs `resolve_config` with a
+  direct-HTTPS `DirectHttpsFetcher` and persists the resolved summary used for
+  later switch decisions.
 - Added `examples/end_to_end_vote.rs` and README notes for moving from the
   delegation-oriented V2 API to the new vote/share API.
 
