@@ -457,8 +457,7 @@ mod tests {
     use crate::storage::queries;
 
     const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    const OTHER_ROUND_ID: &str =
-        "2222222222222222222222222222222222222222222222222222222222222222";
+    const OTHER_ROUND_ID: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const WALLET_ID: &str = "wallet-1";
 
     fn event(event_type: &str, key: &str, value: &str) -> TxEvent {
@@ -1249,7 +1248,10 @@ mod tests {
             "vote-tx",
             &[event_with_attrs(
                 CAST_VOTE_EVENT,
-                &[("round_id", OTHER_ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "8,789")],
+                &[
+                    ("round_id", OTHER_ROUND_ID),
+                    (LEAF_INDEX_ATTRIBUTE, "8,789"),
+                ],
             )],
         )
         .unwrap_err();

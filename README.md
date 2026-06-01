@@ -23,9 +23,9 @@ zcash_voting
 
 The config resolver itself is transport-agnostic. Wallets choose the static
 config source and network transport, fetch bytes, and pass those bytes into
-`zcash_voting::config`. The `zcash_voting/examples/config_fetcher.rs` example
-shows a direct HTTPS implementation for Rust consumers that do not need a
-custom transport.
+`zcash_voting::config`. The `wallet-example::example_config` module shows a
+direct HTTPS implementation for Rust consumers that do not need a custom
+transport.
 
 ## Building
 

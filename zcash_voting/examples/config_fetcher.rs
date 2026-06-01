@@ -9,8 +9,8 @@ use hyper_util::{
 };
 use serde::{Deserialize, Serialize};
 use std::{fs, io::ErrorKind, path::PathBuf};
-use zcash_voting::config::{
-    decide_config_switch, resolve_static_voting_config, resolve_voting_config,
+use zcash_voting::config::{decide_config_switch, resolve_config, ResolveConfigError};
+use zcash_voting::wire::{
     ResolveVotingConfigOptions, ResolvedVotingConfig, ResolvedVotingConfigSummary,
 };
 
@@ -24,12 +24,12 @@ async fn main() -> Result<()> {
 
     match command {
         Command::Resolve { source } => {
-            let resolved = resolve_config(&fetcher, &source).await?;
+            let resolved = fetch_resolved_config(&fetcher, &source).await?;
             print_resolved_config(&resolved);
         }
         Command::CheckSwitch { state_path, source } => {
             let previous = read_state(&state_path)?;
-            let resolved = resolve_config(&fetcher, &source).await?;
+            let resolved = fetch_resolved_config(&fetcher, &source).await?;
             let next_summary = ResolvedVotingConfigSummary::from(&resolved);
             let decision = decide_config_switch(
                 previous.as_ref().map(|state| state.summary.clone()),
@@ -85,23 +85,19 @@ struct StoredConfigState {
     authenticated_round_ids: Vec<String>,
 }
 
-async fn resolve_config(
+async fn fetch_resolved_config(
     fetcher: &DirectHttpsFetcher,
     source: &str,
 ) -> Result<ResolvedVotingConfig> {
-    let static_bytes = fetcher.fetch_bytes(source).await?;
-    let resolved_static = resolve_static_voting_config(source, &static_bytes)?;
-
-    let dynamic_bytes = fetcher
-        .fetch_bytes(&resolved_static.dynamic_config_url)
-        .await?;
-    let resolved = resolve_voting_config(
-        resolved_static,
-        &dynamic_bytes,
-        ResolveVotingConfigOptions::default(),
-    )?;
-
-    Ok(resolved)
+    resolve_config(source, ResolveVotingConfigOptions::default(), |url| {
+        let fetcher = fetcher;
+        async move { fetcher.fetch_bytes(&url).await }
+    })
+    .await
+    .map_err(|e| match e {
+        ResolveConfigError::Transport(err) => err,
+        ResolveConfigError::Config(err) => err.into(),
+    })
 }
 
 fn print_resolved_config(resolved: &ResolvedVotingConfig) {

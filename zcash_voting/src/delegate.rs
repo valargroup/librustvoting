@@ -317,8 +317,8 @@ where
     let round_name = resolved_round_name.clone();
     // Get the voting hotkey from the seed.
     let voting_hotkey = crate::hotkey::voting_hotkey_from_seed(params.hotkey_seed, params.network)?;
-   
-   // Get the scanned height from the wallet.
+
+    // Get the scanned height from the wallet.
     let scanned_height = match wallet_db
         .get_wallet_summary(ConfirmationsPolicy::default())
         .map_err(|e| VotingError::Internal {

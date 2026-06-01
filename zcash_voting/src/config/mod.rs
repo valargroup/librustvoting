@@ -44,10 +44,13 @@
 //! - platform code owns URL choice and network transport;
 //! - [`resolve_static_voting_config`] authenticates the static trust anchor;
 //! - [`resolve_voting_config`] authenticates and validates the dynamic config;
+//! - [`resolve_config`] orchestrates static and dynamic resolution with
+//!   wallet-owned transport;
 //! - [`decide_config_switch`] classifies the config change so the wallet can
 //!   choose the correct state transition.
 //!
 use std::collections::BTreeMap;
+use std::future::Future;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -136,6 +139,7 @@ pub struct ResolvedVotingConfig {
     pub pir_endpoints: Vec<ServiceEndpoint>,
     pub supported_versions: SupportedVersions,
     pub authenticated_round_ids: Vec<String>,
+    pub skipped_round_ids: Vec<String>,
     pub conditions: Vec<ConfigCondition>,
 }
 
@@ -238,6 +242,13 @@ pub enum VotingConfigError {
     RemoteAuthenticationFailed { message: String },
 }
 
+/// Error while orchestrating static + dynamic config resolution.
+#[derive(Debug)]
+pub enum ResolveConfigError<E> {
+    Transport(E),
+    Config(VotingConfigError),
+}
+
 /// Parse and authenticate the static config bytes selected by the wallet.
 pub fn resolve_static_voting_config(
     source: &str,
@@ -283,8 +294,11 @@ pub fn resolve_voting_config(
             message: format!("dynamic config decode failed: {e}"),
         })?;
     validate_dynamic_config(&dynamic_config, &options.capabilities)?;
-    let authenticated_round_ids =
-        authenticate_dynamic_rounds(&dynamic_config.rounds, &resolved_static.trusted_keys)?;
+    let authenticated_rounds =
+        authenticate_dynamic_rounds(&dynamic_config.rounds, &resolved_static.trusted_keys);
+
+    let authenticated_count = authenticated_rounds.authenticated_round_ids.len();
+    let skipped_count = authenticated_rounds.skipped_round_ids.len();
 
     Ok(ResolvedVotingConfig {
         source_fingerprint: resolved_static.source_fingerprint,
@@ -293,7 +307,8 @@ pub fn resolve_voting_config(
         vote_servers: dynamic_config.vote_servers,
         pir_endpoints: dynamic_config.pir_endpoints,
         supported_versions: dynamic_config.supported_versions,
-        authenticated_round_ids,
+        authenticated_round_ids: authenticated_rounds.authenticated_round_ids,
+        skipped_round_ids: authenticated_rounds.skipped_round_ids.clone(),
         conditions: vec![
             ConfigCondition {
                 kind: ConfigConditionKind::StaticHashPinVerified,
@@ -308,7 +323,10 @@ pub fn resolve_voting_config(
             ConfigCondition {
                 kind: ConfigConditionKind::DynamicSignaturesVerified,
                 status: true,
-                message: "dynamic round signatures verified".to_string(),
+                message: format!(
+                    "dynamic round signatures verified: authenticated={}, skipped={}",
+                    authenticated_count, skipped_count
+                ),
             },
             ConfigCondition {
                 kind: ConfigConditionKind::VersionsSupported,
@@ -317,6 +335,30 @@ pub fn resolve_voting_config(
             },
         ],
     })
+}
+
+/// Fetch static and dynamic bytes using wallet-owned transport, then fully
+/// resolve and authenticate voting config.
+pub async fn resolve_config<F, Fut, E>(
+    source: &str,
+    options: ResolveVotingConfigOptions,
+    fetch_bytes: F,
+) -> Result<ResolvedVotingConfig, ResolveConfigError<E>>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, E>>,
+{
+    let parsed_source = PinnedConfigSource::parse(source).map_err(ResolveConfigError::Config)?;
+    let static_bytes = fetch_bytes(parsed_source.url)
+        .await
+        .map_err(ResolveConfigError::Transport)?;
+    let resolved_static =
+        resolve_static_voting_config(source, &static_bytes).map_err(ResolveConfigError::Config)?;
+    let dynamic_bytes = fetch_bytes(resolved_static.dynamic_config_url.clone())
+        .await
+        .map_err(ResolveConfigError::Transport)?;
+    resolve_voting_config(resolved_static, &dynamic_bytes, options)
+        .map_err(ResolveConfigError::Config)
 }
 
 /// Classify the wallet transition required to switch to `next`.
@@ -517,22 +559,29 @@ fn validate_dynamic_config(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthenticatedRounds {
+    authenticated_round_ids: Vec<String>,
+    skipped_round_ids: Vec<String>,
+}
+
 fn authenticate_dynamic_rounds(
     rounds: &BTreeMap<String, RoundEntry>,
     trusted_keys: &[TrustedKey],
-) -> Result<Vec<String>, VotingConfigError> {
-    let mut round_ids = Vec::new();
+) -> AuthenticatedRounds {
+    let mut authenticated_round_ids = Vec::new();
+    let mut skipped_round_ids = Vec::new();
     for (round_id, entry) in rounds {
         if !verify_round_entry(entry, trusted_keys) {
-            return Err(VotingConfigError::RemoteAuthenticationFailed {
-                message: format!(
-                    "dynamic config signature verification failed for round {round_id}"
-                ),
-            });
+            skipped_round_ids.push(round_id.clone());
+            continue;
         }
-        round_ids.push(round_id.clone());
+        authenticated_round_ids.push(round_id.clone());
     }
-    Ok(round_ids)
+    AuthenticatedRounds {
+        authenticated_round_ids,
+        skipped_round_ids,
+    }
 }
 
 fn verify_round_entry(entry: &RoundEntry, trusted_keys: &[TrustedKey]) -> bool {
@@ -659,8 +708,10 @@ mod base64_bytes {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use std::sync::{Arc, Mutex};
 
     const ROUND_ID: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+    const ROUND_ID_2: &str = "0000000000000000000000000000000000000000000000000000000000000002";
 
     fn source() -> String {
         "https://example.com/static.json".to_string()
@@ -682,9 +733,24 @@ mod tests {
         .into_bytes()
     }
 
-    fn dynamic_bytes(signing_key: &SigningKey) -> Vec<u8> {
-        let ea_pk = [7u8; 32];
-        let sig = signing_key.sign(&ea_pk).to_bytes();
+    fn dynamic_bytes_with_round_signers(round_signers: &[(&str, &SigningKey)]) -> Vec<u8> {
+        let mut rounds = serde_json::Map::new();
+        for (round_id, signing_key) in round_signers {
+            let ea_pk = [7u8; 32];
+            let sig = signing_key.sign(&ea_pk).to_bytes();
+            rounds.insert(
+                (*round_id).to_string(),
+                serde_json::json!({
+                    "auth_version": 1,
+                    "ea_pk": BASE64.encode(ea_pk),
+                    "signatures": [{
+                        "key_id": "k1",
+                        "alg": "ed25519",
+                        "sig": BASE64.encode(sig)
+                    }]
+                }),
+            );
+        }
         serde_json::json!({
             "config_version": 1,
             "vote_servers": [{"url": "https://vote.example.com", "label": "vote"}],
@@ -695,20 +761,14 @@ mod tests {
                 "tally": "v0",
                 "vote_server": "v1"
             },
-            "rounds": {
-                ROUND_ID: {
-                    "auth_version": 1,
-                    "ea_pk": BASE64.encode(ea_pk),
-                    "signatures": [{
-                        "key_id": "k1",
-                        "alg": "ed25519",
-                        "sig": BASE64.encode(sig)
-                    }]
-                }
-            }
+            "rounds": rounds
         })
         .to_string()
         .into_bytes()
+    }
+
+    fn dynamic_bytes(signing_key: &SigningKey) -> Vec<u8> {
+        dynamic_bytes_with_round_signers(&[(ROUND_ID, signing_key)])
     }
 
     #[test]
@@ -756,26 +816,123 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.authenticated_round_ids, vec![ROUND_ID.to_string()]);
+        assert!(resolved.skipped_round_ids.is_empty());
     }
 
     #[test]
-    fn dynamic_resolution_reports_remote_authentication_for_bad_signature() {
+    fn dynamic_resolution_skips_rounds_with_bad_signature() {
         let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
         let bad_key = SigningKey::from_bytes(&[4u8; 32]);
         let static_resolved =
             resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
 
-        let err = resolve_voting_config(
+        let resolved = resolve_voting_config(
             static_resolved,
             &dynamic_bytes(&bad_key),
             ResolveVotingConfigOptions::default(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(
-            err,
-            VotingConfigError::RemoteAuthenticationFailed { .. }
-        ));
+        assert!(resolved.authenticated_round_ids.is_empty());
+        assert_eq!(resolved.skipped_round_ids, vec![ROUND_ID.to_string()]);
+    }
+
+    #[test]
+    fn dynamic_resolution_partitions_authenticated_and_skipped_rounds() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let bad_key = SigningKey::from_bytes(&[4u8; 32]);
+        let static_resolved =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+
+        let resolved = resolve_voting_config(
+            static_resolved,
+            &dynamic_bytes_with_round_signers(&[(ROUND_ID, &trusted_key), (ROUND_ID_2, &bad_key)]),
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.authenticated_round_ids, vec![ROUND_ID.to_string()]);
+        assert_eq!(resolved.skipped_round_ids, vec![ROUND_ID_2.to_string()]);
+    }
+
+    #[test]
+    fn summary_fingerprint_ignores_skipped_round_ids() {
+        let base = ResolvedVotingConfig {
+            source_fingerprint: "src".to_string(),
+            trusted_key_fingerprint: "keys".to_string(),
+            dynamic_config_fingerprint: "dyn".to_string(),
+            vote_servers: vec![ServiceEndpoint {
+                url: "https://vote.example.com".to_string(),
+                label: "vote".to_string(),
+            }],
+            pir_endpoints: vec![ServiceEndpoint {
+                url: "https://pir.example.com".to_string(),
+                label: "pir".to_string(),
+            }],
+            supported_versions: SupportedVersions {
+                pir: vec!["v0".to_string()],
+                vote_protocol: "v0".to_string(),
+                tally: "v0".to_string(),
+                vote_server: "v1".to_string(),
+            },
+            authenticated_round_ids: vec![ROUND_ID.to_string()],
+            skipped_round_ids: vec![ROUND_ID_2.to_string()],
+            conditions: vec![],
+        };
+        let mut with_different_skips = base.clone();
+        with_different_skips.skipped_round_ids = vec!["f".repeat(64)];
+
+        let summary_base = ResolvedVotingConfigSummary::from(&base);
+        let summary_with_different_skips = ResolvedVotingConfigSummary::from(&with_different_skips);
+        assert_eq!(
+            summary_base.authenticated_round_set_fingerprint,
+            summary_with_different_skips.authenticated_round_set_fingerprint
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_config_orchestrates_wallet_transport() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let static_config = static_bytes(&trusted_key);
+        let source_url = format!(
+            "{}?checksum=sha256:{}",
+            source(),
+            fingerprint_bytes(&static_config)
+        );
+        let source_for_fetch = source();
+        let dynamic_config = dynamic_bytes(&trusted_key);
+        let requested_urls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let resolved = resolve_config(&source_url, ResolveVotingConfigOptions::default(), {
+            let requested_urls = Arc::clone(&requested_urls);
+            move |url| {
+                let source_url = source_for_fetch.clone();
+                let static_config = static_config.clone();
+                let dynamic_config = dynamic_config.clone();
+                let requested_urls = Arc::clone(&requested_urls);
+                async move {
+                    requested_urls.lock().unwrap().push(url.clone());
+                    if url == source_url {
+                        Ok(static_config)
+                    } else if url == "https://example.com/dynamic.json" {
+                        Ok(dynamic_config)
+                    } else {
+                        Err("unexpected url")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.authenticated_round_ids, vec![ROUND_ID.to_string()]);
+        assert_eq!(
+            requested_urls.lock().unwrap().as_slice(),
+            &[
+                "https://example.com/static.json".to_string(),
+                "https://example.com/dynamic.json".to_string()
+            ]
+        );
     }
 
     #[test]

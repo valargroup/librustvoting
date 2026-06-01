@@ -114,20 +114,18 @@ Authenticated round-set changes should reload and reselect the active round
 context, but do not by themselves require wiping hotkeys or vote commitments
 for old round ids.
 
-A direct-HTTPS example is available as:
+A direct-HTTPS reference transport lives in the `wallet-example` crate as
+`example_config`. It pairs `resolve_config` with a `DirectHttpsFetcher` and
+shows how to persist the resolved summary used for future switch decisions:
 
-```bash
-cargo run -p zcash_voting --example config_fetcher -- "https://example.com/static.json?checksum=sha256:..."
-```
-
-The example can also persist the resolved summary used for future switch
-decisions. The state is written to the path passed after `check-switch`. Run it
-once to create the state file, then run it again after the user changes the
-static source or the remote config changes:
-
-```bash
-cargo run -p zcash_voting --example config_fetcher -- check-switch /tmp/voting-config-state.json "https://example.com/static.json?checksum=sha256:..."
-```
+- `resolve_voting_config_over_https` fetches the static and dynamic config and
+  returns the authenticated `ResolvedVotingConfig`.
+- `resolve_config_switch` resolves the config and classifies it against the
+  previously stored summary, returning the `ConfigSwitchDecision` plus the
+  `StoredConfigState` to persist for the next run.
+- `read_config_state` / `write_config_state` load and save that state, so the
+  first run reports an initial load and later runs detect service, round-set,
+  or protocol changes.
 
 ## Crates.io diagram
 

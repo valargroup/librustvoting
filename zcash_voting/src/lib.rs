@@ -10,8 +10,8 @@
 //! directly.
 
 pub mod action;
-pub mod confirmation;
 pub mod config;
+pub mod confirmation;
 pub mod delegate;
 pub mod error;
 pub mod governance;
