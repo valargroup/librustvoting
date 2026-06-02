@@ -1790,8 +1790,7 @@ mod tests {
         }
 
         let voting_hotkey =
-            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
-                .unwrap();
+            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Testnet).unwrap();
         let seed_fingerprint = [0x42u8; 32];
         let keys =
             test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, seed_fingerprint, 0);
@@ -2176,8 +2175,7 @@ mod tests {
         let sk = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
         let fvk = FullViewingKey::from(&sk);
         let voting_hotkey =
-            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
-                .unwrap();
+            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Testnet).unwrap();
         let seed_fingerprint = [0x42u8; 32];
         let keys =
             test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, seed_fingerprint, 0);
@@ -2711,8 +2709,7 @@ mod tests {
         db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
 
         let voting_hotkey =
-            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
-                .unwrap();
+            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Testnet).unwrap();
         let seed_fingerprint = SeedFingerprint::from_seed(&sender_seed).unwrap().to_bytes();
         let keys = test_delegation_keys(
             fvk.to_bytes().to_vec(),
@@ -2883,8 +2880,7 @@ mod tests {
         let fvk = FullViewingKey::from(&sk);
         let fvk_bytes = fvk.to_bytes().to_vec();
         let voting_hotkey =
-            crate::hotkey::voting_hotkey_from_seed(&[0x43; 64], crate::types::Network::Testnet)
-                .unwrap();
+            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Testnet).unwrap();
         let seed_fingerprint = [0x42u8; 32];
         let keys = test_delegation_keys(fvk_bytes.clone(), &voting_hotkey, seed_fingerprint, 0);
 

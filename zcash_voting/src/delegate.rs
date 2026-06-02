@@ -234,8 +234,7 @@ pub struct PrepareDelegationBundleParams<'a> {
     pub lwd: DelegationLwdInputs,
     pub session_json: Option<&'a str>,
     pub account_uuid: &'a str,
-    pub network: Network,
-    pub hotkey_seed: &'a [u8],
+    pub voting_hotkey: &'a VotingHotkey,
     pub bundle_index: u32,
     pub bundle_policy: BundlePolicy,
 }
@@ -315,8 +314,6 @@ where
     } = lwd;
     let round_id = round_params.vote_round_id.clone();
     let round_name = resolved_round_name.clone();
-    // Get the voting hotkey from the seed.
-    let voting_hotkey = crate::hotkey::voting_hotkey_from_seed(params.hotkey_seed, params.network)?;
 
     // Get the scanned height from the wallet.
     let scanned_height = match wallet_db
@@ -332,7 +329,7 @@ where
     let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
         wallet_db,
         account_uuid: params.account_uuid,
-        voting_hotkey: &voting_hotkey,
+        voting_hotkey: params.voting_hotkey,
         snapshot_height: round_params.snapshot_height,
         scanned_height,
         anchor_tree_state_bytes,
@@ -363,7 +360,7 @@ where
         delegation_keys: wallet_inputs.delegation_keys,
         branch_id_provider,
         anchor_tree_state_bytes: wallet_inputs.anchor_tree_state_bytes,
-        network: voting_hotkey.network(),
+        network: params.voting_hotkey.network(),
         round_name,
     };
 
@@ -1072,7 +1069,7 @@ mod tests {
     use zip32::Scope;
 
     fn test_voting_hotkey() -> VotingHotkey {
-        crate::hotkey::voting_hotkey_from_seed(&[0x77; 64], Network::Testnet).unwrap()
+        VotingHotkey::from_stored_secret(&[0x77; 64], Network::Testnet).unwrap()
     }
 
     #[test]
@@ -1623,7 +1620,7 @@ mod tests {
             SystemClock,
             rand::rngs::OsRng,
         );
-        let hotkey = crate::hotkey::voting_hotkey_from_seed(&[0x77; 64], Network::Mainnet).unwrap();
+        let hotkey = VotingHotkey::from_stored_secret(&[0x77; 64], Network::Mainnet).unwrap();
         let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &db,
             account_uuid: &account_uuid.expose_uuid().to_string(),

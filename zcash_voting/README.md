@@ -164,11 +164,11 @@ crate own the sampling and ordering policy.
 
 Wallet seed material should stay in the wallet integration. For v2 integrations,
 generate a random app-owned voting hotkey with `generate_random_voting_hotkey`,
-store `VotingHotkey::secret_seed()` in platform secure storage, and pass the
-stored hotkey seed back to `voting_hotkey_from_seed` or `VoteSigner::hotkey_seed`
-when reconstruction is needed. Software and hardware wallets should follow the
-same random hotkey model. The hotkey is not deterministic across fresh installs
-unless the stored hotkey seed is restored.
+store `VotingHotkey::stored_secret()` in platform secure storage, and
+reconstruct a typed hotkey with `VotingHotkey::from_stored_secret` when needed.
+Software and hardware wallets should follow the same random hotkey model. The
+hotkey is not deterministic across fresh installs unless the stored hotkey
+secret is restored.
 
 Delegation signing follows the same boundary. After `setup_delegation`, call
 `delegation_signing_request` to load the account index, network, seed
@@ -205,9 +205,9 @@ The crate no longer accepts root wallet seed material for delegation signing.
   and hardware flows both pass an externally produced SpendAuth signature and the
   signed sighash.
 - Use `generate_random_voting_hotkey` to create app-owned voting hotkeys for
-  both software and hardware wallets, persist `VotingHotkey::secret_seed()`, and
-  use `voting_hotkey_from_seed` to reconstruct the same hotkey later. The crate
-  no longer derives voting hotkeys from root wallet seeds.
+  both software and hardware wallets, persist `VotingHotkey::stored_secret()`,
+  and use `VotingHotkey::from_stored_secret` to reconstruct the same hotkey
+  later. The crate no longer derives voting hotkeys from root wallet seeds.
 - Use `confirmation::{confirm_delegation_submission, confirm_vote_submission}`
   after chain clients report confirmed delegation or cast-vote tx events. The
   confirmation API parses the chain `leaf_index` events and records tx hashes,

@@ -435,18 +435,11 @@ pub enum VoteCommitStage {
 #[derive(Clone, Copy)]
 #[non_exhaustive]
 pub enum VoteSigner<'a> {
-    /// Stored voting hotkey seed material, not the wallet account seed.
-    HotkeySeed { seed: &'a [u8], network: Network },
     /// Crate-owned voting hotkey material.
     Hotkey { hotkey: &'a VotingHotkey },
 }
 
 impl<'a> VoteSigner<'a> {
-    /// Builds a vote signer from stored voting hotkey seed material.
-    pub fn hotkey_seed(seed: &'a [u8], network: Network) -> Self {
-        Self::HotkeySeed { seed, network }
-    }
-
     /// Builds a vote signer from crate-owned voting hotkey material.
     pub fn hotkey(hotkey: &'a VotingHotkey) -> Self {
         Self::Hotkey { hotkey }
@@ -464,10 +457,9 @@ struct CastVoteSigningFields<'a> {
     alpha_v: &'a [u8],
 }
 
-fn signer_seed_and_network<'a>(signer: VoteSigner<'a>) -> (&'a [u8], Network) {
+fn signer_secret_and_network<'a>(signer: VoteSigner<'a>) -> (&'a [u8], Network) {
     match signer {
-        VoteSigner::HotkeySeed { seed, network } => (seed, network),
-        VoteSigner::Hotkey { hotkey } => (hotkey.secret_seed(), hotkey.network()),
+        VoteSigner::Hotkey { hotkey } => (hotkey.stored_secret(), hotkey.network()),
     }
 }
 
@@ -475,9 +467,9 @@ fn sign_cast_vote_with_signer(
     signer: VoteSigner<'_>,
     fields: CastVoteSigningFields<'_>,
 ) -> Result<CastVoteSignature, VotingError> {
-    let (seed, network) = signer_seed_and_network(signer);
+    let (secret, network) = signer_secret_and_network(signer);
     crate::vote_commitment::sign_cast_vote(
-        seed,
+        secret,
         network,
         fields.vote_round_id,
         fields.r_vpk_bytes,
@@ -584,7 +576,7 @@ pub fn commit(
     }
     ensure_vote_rebuild_allowed(db, round_id, bundle_index, draft.proposal_id)?;
 
-    let (seed, network) = signer_seed_and_network(signer);
+    let (secret, network) = signer_secret_and_network(signer);
     stages.on_stage(VoteCommitStage::ProofStarting {
         proposal_id: draft.proposal_id,
         bundle_index,
@@ -598,7 +590,7 @@ pub fn commit(
     let bundle = db.build_vote_commitment(
         round_id,
         bundle_index,
-        seed,
+        secret,
         network,
         draft.proposal_id,
         draft.choice,
@@ -1827,7 +1819,7 @@ mod tests {
             VerificationKey::from(&ask.randomize(alpha))
         }
 
-        let hotkey = crate::hotkey::voting_hotkey_from_seed(&[0xAB; 64], Network::Regtest).unwrap();
+        let hotkey = VotingHotkey::from_stored_secret(&[0xAB; 64], Network::Regtest).unwrap();
         let r_vpk = [0x10; 32];
         let van_nullifier = [0x11; 32];
         let vote_authority_note_new = [0x12; 32];
@@ -1848,13 +1840,6 @@ mod tests {
         let typed_sig = sign_cast_vote_with_signer(VoteSigner::hotkey(&hotkey), fields()).unwrap();
         assert_eq!(typed_sig.vote_auth_sig.len(), 64);
 
-        let seed_sig = sign_cast_vote_with_signer(
-            VoteSigner::hotkey_seed(hotkey.secret_seed(), hotkey.network()),
-            fields(),
-        )
-        .unwrap();
-        assert_eq!(seed_sig.vote_auth_sig.len(), 64);
-
         let sighash = crate::vote_commitment::cast_vote_sighash(
             ROUND_ID,
             &r_vpk,
@@ -1867,16 +1852,11 @@ mod tests {
         .unwrap();
         let alpha = pasta_curves::pallas::Scalar::from(7);
         let regtest_key =
-            randomized_verification_key(hotkey.secret_seed(), Network::Regtest, &alpha);
+            randomized_verification_key(hotkey.stored_secret(), Network::Regtest, &alpha);
 
         let typed_sig_bytes: [u8; 64] = typed_sig.vote_auth_sig.as_slice().try_into().unwrap();
         regtest_key
             .verify(&sighash, &Signature::<SpendAuth>::from(typed_sig_bytes))
-            .unwrap();
-
-        let seed_sig_bytes: [u8; 64] = seed_sig.vote_auth_sig.as_slice().try_into().unwrap();
-        regtest_key
-            .verify(&sighash, &Signature::<SpendAuth>::from(seed_sig_bytes))
             .unwrap();
 
         assert_ne!(Network::Regtest, Network::Testnet);
@@ -1952,10 +1932,9 @@ mod tests {
                 position: 7,
                 anchor_height: 123,
             },
-            VoteSigner::HotkeySeed {
-                seed: &[0x99; 32],
-                network: Network::Testnet,
-            },
+            VoteSigner::hotkey(
+                &VotingHotkey::from_stored_secret(&[0x99; 32], Network::Testnet).unwrap(),
+            ),
             &NoopProgressReporter,
         )
         .unwrap();
@@ -2041,10 +2020,9 @@ mod tests {
                 position: 7,
                 anchor_height: 123,
             },
-            VoteSigner::HotkeySeed {
-                seed: &[0x99; 32],
-                network: Network::Testnet,
-            },
+            VoteSigner::hotkey(
+                &VotingHotkey::from_stored_secret(&[0x99; 32], Network::Testnet).unwrap(),
+            ),
             &NoopProgressReporter,
         )
         .unwrap();
@@ -2188,10 +2166,9 @@ mod tests {
                 position: 7,
                 anchor_height: 123,
             },
-            VoteSigner::HotkeySeed {
-                seed: &[0x99; 32],
-                network: Network::Testnet,
-            },
+            VoteSigner::hotkey(
+                &VotingHotkey::from_stored_secret(&[0x99; 32], Network::Testnet).unwrap(),
+            ),
             &NoopProgressReporter,
         )
         .unwrap();

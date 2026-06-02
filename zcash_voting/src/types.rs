@@ -93,35 +93,48 @@ pub fn ct_option_to_result<T>(opt: CtOption<T>, msg: &str) -> Result<T, VotingEr
 /// Voting hotkey material used as the delegation output target and vote signer.
 #[derive(PartialEq, Eq)]
 pub struct VotingHotkey {
-    secret_seed: Zeroizing<Vec<u8>>,
+    stored_secret: Zeroizing<Vec<u8>>,
     raw_orchard_address: [u8; 43],
     address_index: u32,
     network: Network,
 }
 
 impl VotingHotkey {
-    /// Builds a voting hotkey from crate-derived secret seed and address bytes.
+    /// Reconstructs a voting hotkey from previously stored hotkey secret bytes.
+    ///
+    /// `stored_secret` must be material previously returned by
+    /// [`VotingHotkey::stored_secret`] after [`crate::hotkey::generate_random_voting_hotkey`].
+    /// It is not wallet seed or mnemonic-derived material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when `stored_secret` is too short or
+    /// cannot produce an Orchard key for `network`.
+    pub fn from_stored_secret(stored_secret: &[u8], network: Network) -> Result<Self, VotingError> {
+        crate::hotkey::voting_hotkey_from_stored_secret(stored_secret, network)
+    }
+
+    /// Builds a voting hotkey from crate-derived secret material and address bytes.
     pub(crate) fn from_parts(
-        secret_seed: Vec<u8>,
+        stored_secret: Vec<u8>,
         raw_orchard_address: [u8; 43],
         address_index: u32,
         network: Network,
     ) -> Self {
         Self {
-            secret_seed: Zeroizing::new(secret_seed),
+            stored_secret: Zeroizing::new(stored_secret),
             raw_orchard_address,
             address_index,
             network,
         }
     }
 
-    /// Returns the secret seed material used for hotkey signing.
+    /// Returns the opaque hotkey secret that should be stored for later reuse.
     ///
-    /// Callers that persist hardware hotkeys should store these bytes in their
-    /// platform secret store and reconstruct the hotkey with
-    /// `hotkey::voting_hotkey_from_seed`.
-    pub fn secret_seed(&self) -> &[u8] {
-        self.secret_seed.as_slice()
+    /// Wallet integrations should treat these bytes as an opaque app-owned
+    /// voting hotkey secret, not as wallet seed material.
+    pub fn stored_secret(&self) -> &[u8] {
+        self.stored_secret.as_slice()
     }
 
     /// Returns the raw Orchard address bytes used as the delegation PCZT output.
@@ -143,7 +156,7 @@ impl VotingHotkey {
 impl Clone for VotingHotkey {
     fn clone(&self) -> Self {
         Self::from_parts(
-            self.secret_seed.as_slice().to_vec(),
+            self.stored_secret.as_slice().to_vec(),
             self.raw_orchard_address,
             self.address_index,
             self.network,
@@ -154,7 +167,7 @@ impl Clone for VotingHotkey {
 impl fmt::Debug for VotingHotkey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VotingHotkey")
-            .field("secret_seed_len", &self.secret_seed.len())
+            .field("stored_secret_len", &self.stored_secret.len())
             .field("raw_orchard_address", &self.raw_orchard_address)
             .field("address_index", &self.address_index)
             .field("network", &self.network)
