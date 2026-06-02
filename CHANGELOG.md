@@ -9,6 +9,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added the public `VOTING_HOTKEY_SEED_LEN` constant and updated v2 hotkey
+  guidance so software and hardware wallets both use app-owned random hotkeys
+  instead of deriving software hotkeys from wallet seed material.
 - Added crate-owned FRB DTO views in `zcash_voting::wire` for wallet API
   surfaces that previously used local mirrors in `vizor-wallet`:
   `VotingNoteRefView`, `VotingNoteSelectionResultView`, `BundleSetupResultView`,
@@ -136,11 +139,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   provider traits so wallet SDKs can pass progress and consensus-branch
   resolution into `delegate::setup` and `delegate::prove` without duplicating
   library internals.
-- Added voting hotkey helpers for wallet-derived software hotkeys, random hardware
-  hotkeys, raw Orchard delegation-address derivation, and typed
-  `DelegationKeys` / `VoteSigner` helpers. New wallet SDKs should derive scoped
-  hotkey seed material at their wallet boundary and pass that material to
-  `voting_hotkey_from_seed` or `VoteSigner::hotkey_seed`.
+- Added voting hotkey helpers for app-owned random hotkeys, stored hotkey seed
+  reconstruction, raw Orchard delegation-address derivation, and typed
+  `DelegationKeys` / `VoteSigner` helpers. New wallet SDKs should generate a
+  random hotkey once, store `VotingHotkey::secret_seed()`, and pass that material
+  to `voting_hotkey_from_seed` or `VoteSigner::hotkey_seed`.
   `generate_random_voting_hotkey` and `voting_hotkey_from_seed` replace the
   older raw hotkey generation helpers exposed through `hotkey::generate_hotkey`
   and `VotingDb::generate_hotkey`.
@@ -242,9 +245,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   canonical batch cast-vote flow with `vote::commit_batch` and crate-owned
   cancellation/progress adapters.
 - Removed crate-side wallet seed APIs from voting hotkey derivation and
-  prepared delegation signing. Wallet SDKs now derive scoped voting hotkey seed
-  material and delegation signatures locally, then pass only hotkey seed bytes
-  or SpendAuth signatures into the crate.
+  prepared delegation signing. Wallet SDKs now generate app-owned random hotkeys
+  and delegation signatures locally, then pass only hotkey seed bytes or
+  SpendAuth signatures into the crate.
 - Removed unused legacy APIs left behind by the wallet integration refactor:
   direct share decomposition/encryption modules, the public share-tracking
   nullifier module, `VotingDb::voting_hotkey_from_seed`, confirmed-state writer

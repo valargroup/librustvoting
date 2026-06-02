@@ -25,7 +25,7 @@ pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::hotkey::{
     generate_random_voting_hotkey, voting_hotkey_from_seed, VOTING_HOTKEY_ACCOUNT_INDEX,
-    VOTING_HOTKEY_ADDRESS_INDEX,
+    VOTING_HOTKEY_ADDRESS_INDEX, VOTING_HOTKEY_SEED_LEN,
 };
 pub use crate::note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
 pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};

@@ -178,9 +178,7 @@ impl ResolvedVotingConfig {
         }
         if nullifier_imt_root.len() != ROUND_PARAM_BYTE_LEN {
             return Err(VotingConfigError::InvalidInput {
-                message: format!(
-                    "nullifier_imt_root must be exactly {ROUND_PARAM_BYTE_LEN} bytes"
-                ),
+                message: format!("nullifier_imt_root must be exactly {ROUND_PARAM_BYTE_LEN} bytes"),
             });
         }
 
@@ -359,8 +357,8 @@ pub fn resolve_dynamic_voting_config(
     dynamic_bytes: &[u8],
     options: ResolveVotingConfigOptions,
 ) -> Result<ResolvedVotingConfig, VotingConfigError> {
-    let dynamic_config: WireVotingServiceConfig = serde_json::from_slice(dynamic_bytes)
-        .map_err(|e| VotingConfigError::DecodeFailed {
+    let dynamic_config: WireVotingServiceConfig =
+        serde_json::from_slice(dynamic_bytes).map_err(|e| VotingConfigError::DecodeFailed {
             message: format!("dynamic config decode failed: {e}"),
         })?;
     validate_dynamic_config(&dynamic_config, &options.capabilities)?;
@@ -1024,7 +1022,9 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, VotingConfigError::InvalidInput { .. }));
-        assert!(err.to_string().contains("nullifier_imt_root must be exactly"));
+        assert!(err
+            .to_string()
+            .contains("nullifier_imt_root must be exactly"));
     }
 
     #[test]
@@ -1049,8 +1049,7 @@ mod tests {
             fingerprint_bytes(&static_config)
         );
         let dynamic_config = dynamic_bytes(&trusted_key);
-        let resolved_static =
-            resolve_static_voting_config(&source_url, &static_config).unwrap();
+        let resolved_static = resolve_static_voting_config(&source_url, &static_config).unwrap();
 
         let resolved = resolve_dynamic_voting_config(
             resolved_static,
