@@ -9,7 +9,7 @@ use zcash_voting::prelude::{
     gather_delegation_lwd_inputs, prepare_delegation_bundle as prepare_bundle_state,
     spend_auth_signature, DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
     Network, NoopProgressReporter, PrepareDelegationBundleParams, PreparedDelegationBundle,
-    PreparedDelegationReport, PreparedSigner, VotingDb,
+    PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
 };
 use zcash_voting::{BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams};
 use zip32::{fingerprint::SeedFingerprint, AccountId};
@@ -25,7 +25,7 @@ pub struct PrepareRequest<'a> {
     pub network: Network,
     pub round_params: VotingRoundParams,
     pub round_name: &'a str,
-    pub hotkey_seed: &'a [u8],
+    pub voting_hotkey: &'a VotingHotkey,
     pub session_json: Option<&'a str>,
     pub bundle_index: u32,
     pub bundle_policy: BundlePolicy,
@@ -67,8 +67,7 @@ where
             lwd: lwd_inputs,
             session_json: request.session_json,
             account_uuid: request.account_uuid,
-            network: request.network,
-            hotkey_seed: request.hotkey_seed,
+            voting_hotkey: request.voting_hotkey,
             bundle_index: request.bundle_index,
             bundle_policy: request.bundle_policy,
         },

@@ -1,6 +1,6 @@
 # zcash_voting
 
-Client-side library for integrating [Zcash shielded voting](https://github.com/valargroup/vote-sdk) into a wallet. Wraps the Halo 2 ZKPs, voting hotkey construction from scoped hotkey seed material, share construction, and governance-PCZT assembly that a wallet needs to participate in an on-chain voting round.
+Client-side library for integrating [Zcash shielded voting](https://github.com/valargroup/vote-sdk) into a wallet. Wraps the Halo 2 ZKPs, voting hotkey construction from stored app-owned secret material, share construction, and governance-PCZT assembly that a wallet needs to participate in an on-chain voting round.
 
 ## Usage
 
@@ -43,7 +43,7 @@ precompute → delegate → vote → share lifecycle:
 
 | Crate | Purpose |
 |---|---|
-| **`zcash_voting`** (this crate) | Stable wallet API: round setup, note bundles, delegation precompute/proving, voting hotkey seed reconstruction, and round-state storage. |
+| **`zcash_voting`** (this crate) | Stable wallet API: round setup, note bundles, delegation precompute/proving, voting hotkey reconstruction from stored app-owned secret material, and round-state storage. |
 | [`vote-commitment-tree`](../vote-commitment-tree) | Append-only Poseidon Merkle tree for VANs and vote commitments. |
 | [`vote-commitment-tree-client`](../vote-commitment-tree-client) | HTTP client + CLI for syncing the vote commitment tree from a running chain node. |
 
@@ -62,7 +62,7 @@ precompute → delegate → vote → share lifecycle:
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `config` | Static and dynamic voting config validation, signature checks, and switch decisions. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
-| `hotkey` | Voting hotkey reconstruction from scoped seed material plus random app-owned hotkeys. |
+| `hotkey` | Voting hotkey reconstruction from stored app-owned secret material plus random app-owned hotkeys. |
 | `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |
 
 Wallet integrations should use the lifecycle modules above instead of writing
@@ -162,9 +162,13 @@ crate own the sampling and ordering policy.
 
 ## Secret boundaries
 
-Wallet seed material should stay in the wallet integration. Derive scoped
-per-account, per-round voting hotkey seed material locally, then pass that
-hotkey seed to `voting_hotkey_from_seed` or `VoteSigner::hotkey_seed`.
+Wallet seed material should stay in the wallet integration. For v2 integrations,
+generate a random app-owned voting hotkey with `generate_random_voting_hotkey`,
+store `VotingHotkey::stored_secret()` in platform secure storage, and
+reconstruct a typed hotkey with `VotingHotkey::from_stored_secret` when needed.
+Software and hardware wallets should follow the same random hotkey model. The
+hotkey is not deterministic across fresh installs unless the stored hotkey
+secret is restored.
 
 Delegation signing follows the same boundary. After `setup_delegation`, call
 `delegation_signing_request` to load the account index, network, seed
@@ -200,10 +204,10 @@ The crate no longer accepts root wallet seed material for delegation signing.
   accepted seeds and Keystone specific signature aliases were removed; software
   and hardware flows both pass an externally produced SpendAuth signature and the
   signed sighash.
-- Use `voting_hotkey_from_seed` after deriving scoped software hotkey seed
-  material in the wallet, or `generate_random_voting_hotkey` for app owned
-  hardware wallet hotkeys. The crate no longer derives voting hotkeys from root
-  wallet seeds.
+- Use `generate_random_voting_hotkey` to create app-owned voting hotkeys for
+  both software and hardware wallets, persist `VotingHotkey::stored_secret()`,
+  and use `VotingHotkey::from_stored_secret` to reconstruct the same hotkey
+  later. The crate no longer derives voting hotkeys from root wallet seeds.
 - Use `confirmation::{confirm_delegation_submission, confirm_vote_submission}`
   after chain clients report confirmed delegation or cast-vote tx events. The
   confirmation API parses the chain `leaf_index` events and records tx hashes,
