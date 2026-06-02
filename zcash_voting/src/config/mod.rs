@@ -50,15 +50,14 @@
 //! The intended integration boundary is:
 //!
 //! - platform code owns URL choice and network transport;
-//! - [`resolve_static_voting_config`] authenticates the static trust anchor;
-//! - [`resolve_voting_config`] authenticates and validates the dynamic config;
-//! - [`resolve_config`] orchestrates static and dynamic resolution with
-//!   wallet-owned transport;
+//! - [`resolve_static_voting_config`] authenticates the static trust anchor and
+//!   exposes the `dynamic_config_url` to fetch next;
+//! - [`resolve_dynamic_voting_config`] takes that resolved static config plus
+//!   the dynamic config bytes and returns a [`ResolvedVotingConfig`];
 //! - [`decide_config_switch`] classifies the config change so the wallet can
 //!   choose the correct state transition.
 //!
 use std::collections::BTreeMap;
-use std::future::Future;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -314,13 +313,6 @@ pub enum VotingConfigError {
     RemoteAuthenticationFailed { message: String },
 }
 
-/// Error while orchestrating static + dynamic config resolution.
-#[derive(Debug)]
-pub enum ResolveConfigError<E> {
-    Transport(E),
-    Config(VotingConfigError),
-}
-
 /// Parse and authenticate the static config bytes selected by the wallet.
 pub fn resolve_static_voting_config(
     source: &str,
@@ -355,13 +347,19 @@ pub fn resolve_static_voting_config(
     })
 }
 
-/// Parse, validate, and authenticate dynamic config bytes.
-pub fn resolve_voting_config(
+/// Resolve and authenticate the dynamic voting config from supplied bytes.
+///
+/// The static trust anchor must already be resolved through a separate
+/// [`resolve_static_voting_config`] call. Given that authenticated static config
+/// and the dynamic config bytes the wallet fetched from
+/// `resolved_static.dynamic_config_url`, this validates advertised versions and
+/// authenticates round entries against the static trusted keys.
+pub fn resolve_dynamic_voting_config(
     resolved_static: ResolvedStaticVotingConfig,
-    dynamic_config_bytes: &[u8],
+    dynamic_bytes: &[u8],
     options: ResolveVotingConfigOptions,
 ) -> Result<ResolvedVotingConfig, VotingConfigError> {
-    let dynamic_config: WireVotingServiceConfig = serde_json::from_slice(dynamic_config_bytes)
+    let dynamic_config: WireVotingServiceConfig = serde_json::from_slice(dynamic_bytes)
         .map_err(|e| VotingConfigError::DecodeFailed {
             message: format!("dynamic config decode failed: {e}"),
         })?;
@@ -375,7 +373,7 @@ pub fn resolve_voting_config(
     Ok(ResolvedVotingConfig {
         source_fingerprint: resolved_static.source_fingerprint,
         trusted_key_fingerprint: resolved_static.trusted_key_fingerprint,
-        dynamic_config_fingerprint: fingerprint_bytes(dynamic_config_bytes),
+        dynamic_config_fingerprint: fingerprint_bytes(dynamic_bytes),
         vote_servers: dynamic_config.vote_servers,
         pir_endpoints: dynamic_config.pir_endpoints,
         supported_versions: dynamic_config.supported_versions,
@@ -407,30 +405,6 @@ pub fn resolve_voting_config(
             },
         ],
     })
-}
-
-/// Fetch static and dynamic bytes using wallet-owned transport, then fully
-/// resolve and authenticate voting config.
-pub async fn resolve_config<F, Fut, E>(
-    source: &str,
-    options: ResolveVotingConfigOptions,
-    fetch_bytes: F,
-) -> Result<ResolvedVotingConfig, ResolveConfigError<E>>
-where
-    F: Fn(String) -> Fut,
-    Fut: Future<Output = Result<Vec<u8>, E>>,
-{
-    let parsed_source = PinnedConfigSource::parse(source).map_err(ResolveConfigError::Config)?;
-    let static_bytes = fetch_bytes(parsed_source.url)
-        .await
-        .map_err(ResolveConfigError::Transport)?;
-    let resolved_static =
-        resolve_static_voting_config(source, &static_bytes).map_err(ResolveConfigError::Config)?;
-    let dynamic_bytes = fetch_bytes(resolved_static.dynamic_config_url.clone())
-        .await
-        .map_err(ResolveConfigError::Transport)?;
-    resolve_voting_config(resolved_static, &dynamic_bytes, options)
-        .map_err(ResolveConfigError::Config)
 }
 
 /// Classify the wallet transition required to switch to `next`.
@@ -783,7 +757,6 @@ mod base64_bytes {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use std::sync::{Arc, Mutex};
 
     const ROUND_ID: &str = "0000000000000000000000000000000000000000000000000000000000000001";
     const ROUND_ID_2: &str = "0000000000000000000000000000000000000000000000000000000000000002";
@@ -880,11 +853,11 @@ mod tests {
     #[test]
     fn dynamic_resolution_verifies_round_signatures() {
         let signing_key = SigningKey::from_bytes(&[3u8; 32]);
-        let static_resolved =
+        let resolved_static =
             resolve_static_voting_config(&source(), &static_bytes(&signing_key)).unwrap();
 
-        let resolved = resolve_voting_config(
-            static_resolved,
+        let resolved = resolve_dynamic_voting_config(
+            resolved_static,
             &dynamic_bytes(&signing_key),
             ResolveVotingConfigOptions::default(),
         )
@@ -904,11 +877,11 @@ mod tests {
     fn dynamic_resolution_skips_rounds_with_bad_signature() {
         let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
         let bad_key = SigningKey::from_bytes(&[4u8; 32]);
-        let static_resolved =
+        let resolved_static =
             resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
 
-        let resolved = resolve_voting_config(
-            static_resolved,
+        let resolved = resolve_dynamic_voting_config(
+            resolved_static,
             &dynamic_bytes(&bad_key),
             ResolveVotingConfigOptions::default(),
         )
@@ -922,11 +895,11 @@ mod tests {
     fn dynamic_resolution_partitions_authenticated_and_skipped_rounds() {
         let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
         let bad_key = SigningKey::from_bytes(&[4u8; 32]);
-        let static_resolved =
+        let resolved_static =
             resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
 
-        let resolved = resolve_voting_config(
-            static_resolved,
+        let resolved = resolve_dynamic_voting_config(
+            resolved_static,
             &dynamic_bytes_with_round_signers(&[(ROUND_ID, &trusted_key), (ROUND_ID_2, &bad_key)]),
             ResolveVotingConfigOptions::default(),
         )
@@ -1066,8 +1039,8 @@ mod tests {
         assert!(err.to_string().contains("has invalid ea_pk length"));
     }
 
-    #[tokio::test]
-    async fn resolve_config_orchestrates_wallet_transport() {
+    #[test]
+    fn resolve_dynamic_voting_config_resolves_dynamic_bytes() {
         let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
         let static_config = static_bytes(&trusted_key);
         let source_url = format!(
@@ -1075,30 +1048,15 @@ mod tests {
             source(),
             fingerprint_bytes(&static_config)
         );
-        let source_for_fetch = source();
         let dynamic_config = dynamic_bytes(&trusted_key);
-        let requested_urls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let resolved_static =
+            resolve_static_voting_config(&source_url, &static_config).unwrap();
 
-        let resolved = resolve_config(&source_url, ResolveVotingConfigOptions::default(), {
-            let requested_urls = Arc::clone(&requested_urls);
-            move |url| {
-                let source_url = source_for_fetch.clone();
-                let static_config = static_config.clone();
-                let dynamic_config = dynamic_config.clone();
-                let requested_urls = Arc::clone(&requested_urls);
-                async move {
-                    requested_urls.lock().unwrap().push(url.clone());
-                    if url == source_url {
-                        Ok(static_config)
-                    } else if url == "https://example.com/dynamic.json" {
-                        Ok(dynamic_config)
-                    } else {
-                        Err("unexpected url")
-                    }
-                }
-            }
-        })
-        .await
+        let resolved = resolve_dynamic_voting_config(
+            resolved_static,
+            &dynamic_config,
+            ResolveVotingConfigOptions::default(),
+        )
         .unwrap();
 
         assert_eq!(
@@ -1107,13 +1065,6 @@ mod tests {
                 round_id: ROUND_ID.to_string(),
                 ea_pk: vec![7u8; 32],
             }]
-        );
-        assert_eq!(
-            requested_urls.lock().unwrap().as_slice(),
-            &[
-                "https://example.com/static.json".to_string(),
-                "https://example.com/dynamic.json".to_string()
-            ]
         );
     }
 

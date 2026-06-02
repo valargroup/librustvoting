@@ -196,12 +196,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Added `precompute::{sync_vote_tree, van_witness, reset_vote_tree}` as the
   public vote commitment tree sync and VAN witness surface.
 - Added a `zcash_voting::config` voting-service config resolution API
-  (`resolve_static_voting_config`, `resolve_voting_config`, `resolve_config`,
-  and `decide_config_switch`) so wallets can authenticate static/dynamic config
-  bytes with their own transport and classify the resulting config switch. A
-  `wallet-example::example_config` module pairs `resolve_config` with a
-  direct-HTTPS `DirectHttpsFetcher` and persists the resolved summary used for
-  later switch decisions.
+  (`resolve_static_voting_config`, `resolve_dynamic_voting_config`, and
+  `decide_config_switch`) so wallets can authenticate static/dynamic config
+  bytes with their own transport and classify the resulting config switch.
+  `resolve_static_voting_config(source, static_bytes)` authenticates the static
+  trust anchor and exposes the `dynamic_config_url` to fetch next;
+  `resolve_dynamic_voting_config(resolved_static, dynamic_bytes, options)` then
+  authenticates the dynamic config against it. A `wallet-example::example_config`
+  module pairs these with a direct-HTTPS `DirectHttpsFetcher` and persists the
+  resolved summary used for later switch decisions.
 - Added `examples/end_to_end_vote.rs` and README notes for moving from the
   delegation-oriented V2 API to the new vote/share API.
 

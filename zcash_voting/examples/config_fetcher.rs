@@ -10,7 +10,8 @@ use hyper_util::{
 use serde::{Deserialize, Serialize};
 use std::{fs, io::ErrorKind, path::PathBuf};
 use zcash_voting::config::{
-    decide_config_switch, resolve_config, AuthenticatedRound, ResolveConfigError,
+    decide_config_switch, resolve_dynamic_voting_config, resolve_static_voting_config,
+    AuthenticatedRound, PinnedConfigSource,
 };
 use zcash_voting::wire::{
     ResolveVotingConfigOptions, ResolvedVotingConfig, ResolvedVotingConfigSummary,
@@ -91,15 +92,21 @@ async fn fetch_resolved_config(
     fetcher: &DirectHttpsFetcher,
     source: &str,
 ) -> Result<ResolvedVotingConfig> {
-    resolve_config(source, ResolveVotingConfigOptions::default(), |url| {
-        let fetcher = fetcher;
-        async move { fetcher.fetch_bytes(&url).await }
-    })
-    .await
-    .map_err(|e| match e {
-        ResolveConfigError::Transport(err) => err,
-        ResolveConfigError::Config(err) => err.into(),
-    })
+    let static_url = PinnedConfigSource::parse(source)
+        .map_err(|e| anyhow!("parse static config source failed: {e}"))?
+        .url;
+    let static_bytes = fetcher.fetch_bytes(&static_url).await?;
+    let resolved_static = resolve_static_voting_config(source, &static_bytes)
+        .map_err(|e| anyhow!("resolve static config failed: {e}"))?;
+    let dynamic_bytes = fetcher
+        .fetch_bytes(&resolved_static.dynamic_config_url)
+        .await?;
+    resolve_dynamic_voting_config(
+        resolved_static,
+        &dynamic_bytes,
+        ResolveVotingConfigOptions::default(),
+    )
+    .map_err(|e| anyhow!("resolve voting config failed: {e}"))
 }
 
 fn print_resolved_config(resolved: &ResolvedVotingConfig) {

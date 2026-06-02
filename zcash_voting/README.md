@@ -77,17 +77,20 @@ schema validation:
 
 ```rust
 use zcash_voting::config::{
-    decide_config_switch, resolve_static_voting_config, resolve_voting_config,
+    decide_config_switch, resolve_dynamic_voting_config, resolve_static_voting_config,
     ResolveVotingConfigOptions,
 };
 
 # fn example(static_bytes: &[u8], dynamic_bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
 let source = "https://example.com/static.json?checksum=sha256:...";
-let resolved_static = resolve_static_voting_config(source, static_bytes)?;
 
-// The wallet fetches `resolved_static.dynamic_config_url` using its chosen
-// transport, then passes the response body back to Rust.
-let resolved = resolve_voting_config(
+// The wallet resolves the static trust anchor, learns the dynamic config URL
+// from it, fetches that with its chosen transport, then resolves the dynamic
+// config bytes against the authenticated static config.
+let resolved_static = resolve_static_voting_config(source, static_bytes)?;
+let _dynamic_config_url = &resolved_static.dynamic_config_url;
+
+let resolved = resolve_dynamic_voting_config(
     resolved_static,
     dynamic_bytes,
     ResolveVotingConfigOptions::default(),
@@ -115,8 +118,9 @@ context, but do not by themselves require wiping hotkeys or vote commitments
 for old round ids.
 
 A direct-HTTPS reference transport lives in the `wallet-example` crate as
-`example_config`. It pairs `resolve_config` with a `DirectHttpsFetcher` and
-shows how to persist the resolved summary used for future switch decisions:
+`example_config`. It pairs the `resolve_static_voting_config` /
+`resolve_dynamic_voting_config` calls with a `DirectHttpsFetcher` and shows how
+to persist the resolved summary used for future switch decisions:
 
 - `resolve_voting_config_over_https` fetches the static and dynamic config and
   returns the authenticated `ResolvedVotingConfig`.

@@ -13,7 +13,8 @@ use hyper_util::{
 };
 use serde::{Deserialize, Serialize};
 use zcash_voting::config::{
-    decide_config_switch, resolve_config, AuthenticatedRound, ResolveConfigError,
+    decide_config_switch, resolve_dynamic_voting_config, resolve_static_voting_config,
+    AuthenticatedRound, PinnedConfigSource,
 };
 use zcash_voting::wire::{
     ConfigSwitchDecision, ResolveVotingConfigOptions, ResolvedVotingConfig,
@@ -84,12 +85,13 @@ pub fn build_trusted_round_params_from_status(
 
 /// Resolves and authenticates voting config from a static source URL.
 ///
-/// This drives the crate-owned [`resolve_config`] orchestrator with the example
-/// HTTPS transport, fetching the static trust anchor and then the dynamic config
-/// it points at. During resolution, round entries are authenticated against the
-/// trusted static keys before `ResolvedVotingConfig` is returned. Transport and
-/// config errors are flattened into one `anyhow` chain so example callers can
-/// surface a single message.
+/// This fetches the static trust anchor with the example HTTPS transport and
+/// resolves it via [`resolve_static_voting_config`], learns the dynamic config
+/// URL it points at, fetches that too, and then resolves it via
+/// [`resolve_dynamic_voting_config`]. During resolution, round entries are
+/// authenticated against the trusted static keys before `ResolvedVotingConfig`
+/// is returned. Transport and config errors are flattened into one `anyhow`
+/// chain so example callers can surface a single message.
 ///
 /// # Errors
 ///
@@ -99,16 +101,23 @@ pub async fn resolve_voting_config_over_https(
     fetcher: &DirectHttpsFetcher,
     source: &str,
 ) -> Result<ResolvedVotingConfig> {
-    resolve_config(
-        source,
+    // The hash-pin checksum lives in the source query but is not part of the
+    // fetch URL, so resolve it once to learn where to GET the static bytes.
+    let static_url = PinnedConfigSource::parse(source)
+        .map_err(|e| anyhow!("parse static config source failed: {e}"))?
+        .url;
+    let static_bytes = fetcher.fetch_bytes(&static_url).await?;
+    let resolved_static = resolve_static_voting_config(source, &static_bytes)
+        .map_err(|e| anyhow!("resolve static config failed: {e}"))?;
+    let dynamic_bytes = fetcher
+        .fetch_bytes(&resolved_static.dynamic_config_url)
+        .await?;
+    resolve_dynamic_voting_config(
+        resolved_static,
+        &dynamic_bytes,
         ResolveVotingConfigOptions::default(),
-        |url| async move { fetcher.fetch_bytes(&url).await },
     )
-    .await
-    .map_err(|e| match e {
-        ResolveConfigError::Transport(err) => err,
-        ResolveConfigError::Config(err) => err.into(),
-    })
+    .map_err(|e| anyhow!("resolve voting config failed: {e}"))
 }
 
 /// Resolves config and classifies the switch against previously stored state.
