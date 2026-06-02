@@ -1933,7 +1933,7 @@ mod tests {
                 anchor_height: 123,
             },
             VoteSigner::hotkey(
-                &VotingHotkey::from_stored_secret(&[0x99; 32], Network::Testnet).unwrap(),
+                &VotingHotkey::from_stored_secret(&[0x99; 64], Network::Testnet).unwrap(),
             ),
             &NoopProgressReporter,
         )
@@ -2021,7 +2021,7 @@ mod tests {
                 anchor_height: 123,
             },
             VoteSigner::hotkey(
-                &VotingHotkey::from_stored_secret(&[0x99; 32], Network::Testnet).unwrap(),
+                &VotingHotkey::from_stored_secret(&[0x99; 64], Network::Testnet).unwrap(),
             ),
             &NoopProgressReporter,
         )
@@ -2167,7 +2167,7 @@ mod tests {
                 anchor_height: 123,
             },
             VoteSigner::hotkey(
-                &VotingHotkey::from_stored_secret(&[0x99; 32], Network::Testnet).unwrap(),
+                &VotingHotkey::from_stored_secret(&[0x99; 64], Network::Testnet).unwrap(),
             ),
             &NoopProgressReporter,
         )

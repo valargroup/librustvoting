@@ -1,6 +1,6 @@
 # zcash_voting
 
-Client-side library for integrating [Zcash shielded voting](https://github.com/valargroup/vote-sdk) into a wallet. Wraps the Halo 2 ZKPs, voting hotkey construction from scoped hotkey seed material, share construction, and governance-PCZT assembly that a wallet needs to participate in an on-chain voting round.
+Client-side library for integrating [Zcash shielded voting](https://github.com/valargroup/vote-sdk) into a wallet. Wraps the Halo 2 ZKPs, voting hotkey construction from stored app-owned secret material, share construction, and governance-PCZT assembly that a wallet needs to participate in an on-chain voting round.
 
 ## Usage
 
@@ -43,7 +43,7 @@ precompute → delegate → vote → share lifecycle:
 
 | Crate | Purpose |
 |---|---|
-| **`zcash_voting`** (this crate) | Stable wallet API: round setup, note bundles, delegation precompute/proving, voting hotkey seed reconstruction, and round-state storage. |
+| **`zcash_voting`** (this crate) | Stable wallet API: round setup, note bundles, delegation precompute/proving, voting hotkey reconstruction from stored app-owned secret material, and round-state storage. |
 | [`vote-commitment-tree`](../vote-commitment-tree) | Append-only Poseidon Merkle tree for VANs and vote commitments. |
 | [`vote-commitment-tree-client`](../vote-commitment-tree-client) | HTTP client + CLI for syncing the vote commitment tree from a running chain node. |
 
@@ -62,7 +62,7 @@ precompute → delegate → vote → share lifecycle:
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `config` | Static and dynamic voting config validation, signature checks, and switch decisions. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
-| `hotkey` | Voting hotkey reconstruction from scoped seed material plus random app-owned hotkeys. |
+| `hotkey` | Voting hotkey reconstruction from stored app-owned secret material plus random app-owned hotkeys. |
 | `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |
 
 Wallet integrations should use the lifecycle modules above instead of writing

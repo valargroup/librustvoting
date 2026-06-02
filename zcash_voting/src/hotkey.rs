@@ -38,11 +38,12 @@ pub(crate) fn voting_hotkey_from_stored_secret(
     stored_secret: &[u8],
     network: Network,
 ) -> Result<VotingHotkey, VotingError> {
-    if stored_secret.len() < 32 {
+    if stored_secret.len() != VOTING_HOTKEY_STORED_SECRET_LEN {
         return Err(VotingError::InvalidInput {
             message: format!(
-                "stored hotkey secret must be at least 32 bytes, got {}",
-                stored_secret.len()
+                "stored hotkey secret must be exactly {} bytes, got {}",
+                VOTING_HOTKEY_STORED_SECRET_LEN,
+                stored_secret.len(),
             ),
         });
     }
@@ -193,6 +194,15 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("stored hotkey secret must be at least 32 bytes"));
+        assert!(err.contains("stored hotkey secret must be exactly 64 bytes"));
+    }
+
+    #[test]
+    fn long_stored_hotkey_secret_is_rejected() {
+        let err = VotingHotkey::from_stored_secret(&[0x01; 65], Network::Regtest)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("stored hotkey secret must be exactly 64 bytes"));
     }
 }

@@ -108,8 +108,9 @@ impl VotingHotkey {
     ///
     /// # Errors
     ///
-    /// Returns [`VotingError::InvalidInput`] when `stored_secret` is too short or
-    /// cannot produce an Orchard key for `network`.
+    /// Returns [`VotingError::InvalidInput`] when `stored_secret` is not the
+    /// expected stored hotkey length or cannot produce an Orchard key for
+    /// `network`.
     pub fn from_stored_secret(stored_secret: &[u8], network: Network) -> Result<Self, VotingError> {
         crate::hotkey::voting_hotkey_from_stored_secret(stored_secret, network)
     }
