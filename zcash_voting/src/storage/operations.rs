@@ -12,7 +12,9 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 
 use crate::delegate::{DelegationKeys, DelegationSigningRequest};
 use crate::governance::BUNDLE_NOTE_SLOTS;
-use crate::note_bundling::ChunkResult;
+use crate::note_bundling::{
+    minimum_voting_eligibility_error, ChunkResult, MinimumVotingEligibilityStatus,
+};
 use crate::storage::queries;
 use crate::storage::{
     KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb,
@@ -263,6 +265,33 @@ fn verify_witnesses(witnesses: &[WitnessData]) -> Result<(), VotingError> {
     Ok(())
 }
 
+fn validate_persisted_setup_minimum_voting_eligibility(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<(), VotingError> {
+    let Some((distinct_note_count, eligible_weight)) =
+        queries::load_bundle_setup_eligibility(conn, round_id, wallet_id)?
+    else {
+        return Err(VotingError::InvalidInput {
+            message:
+                "minimum voting eligibility could not be verified from persisted setup metadata"
+                    .to_string(),
+        });
+    };
+    let status = MinimumVotingEligibilityStatus {
+        distinct_note_count,
+        eligible_weight,
+    };
+    if status.distinct_note_count >= crate::MINIMUM_VOTING_NOTE_COUNT
+        && status.eligible_weight >= crate::MINIMUM_VOTING_WEIGHT_ZATOSHI
+    {
+        Ok(())
+    } else {
+        Err(minimum_voting_eligibility_error(status))
+    }
+}
+
 impl VotingDb {
     // --- Round management ---
 
@@ -361,6 +390,7 @@ impl VotingDb {
         &self,
         round_id: &str,
         plan: &ChunkResult,
+        eligibility: MinimumVotingEligibilityStatus,
     ) -> Result<(u32, u64), VotingError> {
         let mut conn = self.conn();
         let wallet_id = self.wallet_id();
@@ -376,6 +406,13 @@ impl VotingDb {
         for (i, chunk) in plan.bundles.iter().enumerate() {
             queries::insert_bundle_notes(&tx, round_id, &wallet_id, i as u32, chunk)?;
         }
+        queries::store_bundle_setup_eligibility(
+            &tx,
+            round_id,
+            &wallet_id,
+            eligibility.distinct_note_count,
+            eligibility.eligible_weight,
+        )?;
         tx.commit().map_err(|e| VotingError::Internal {
             message: format!("failed to commit bundle setup transaction: {e}"),
         })?;
@@ -403,6 +440,7 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
+        validate_persisted_setup_minimum_voting_eligibility(&conn, round_id, &wallet_id)?;
         let expected_padded_count = BUNDLE_NOTE_SLOTS.saturating_sub(notes.len());
 
         if let Some(secrets) =
@@ -494,8 +532,7 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
-        queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
-        let result = crate::action::build_governance_pczt(
+        let result = crate::action::build_governance_pczt_for_bundle(
             notes,
             &params,
             &keys.fvk_bytes,
@@ -769,6 +806,7 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
         queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
+        validate_persisted_setup_minimum_voting_eligibility(&conn, round_id, &wallet_id)?;
         let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
         let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, &wallet_id, bundle_index)?;
         let witnesses = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
@@ -912,7 +950,7 @@ impl VotingDb {
             bundle_index,
         )?;
 
-        let result = crate::zkp1::build_and_prove_delegation(
+        let result = crate::zkp1::build_and_prove_delegation_for_bundle(
             &notes,
             &keys.hotkey_raw_address,
             &alpha,
@@ -1490,6 +1528,7 @@ fn check_text_conflict(
 mod tests {
     use super::*;
     use crate::types::VotingHotkey;
+    use zcash_protocol::consensus::{NetworkConstants, Parameters};
 
     // 64 hex chars = 32 bytes when decoded. Required because build_governance_pczt
     // hex-decodes vote_round_id and validates it as exactly 32 bytes (a Pallas field element).
@@ -1760,22 +1799,28 @@ mod tests {
         let address = fvk.address_at(0u32, Scope::External);
 
         let mut rng = OsRng;
-        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
-        let note = orchard::Note::new(
-            address,
-            NoteValue::from_raw(13_000_000),
-            Rho::from_nf_old(parent_note.nullifier(&fvk)),
-            &mut rng,
-        );
-        let note_info =
-            NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &TEST_NETWORK).unwrap();
+        let mut note_infos = Vec::new();
+        for position in 0..6 {
+            let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+            let note = orchard::Note::new(
+                address,
+                NoteValue::from_raw(13_000_000),
+                Rho::from_nf_old(parent_note.nullifier(&fvk)),
+                &mut rng,
+            );
+            note_infos.push(
+                NoteInfo::from_orchard_note(&note, position, Scope::External, &ufvk, &TEST_NETWORK)
+                    .unwrap(),
+            );
+        }
+        let bundle_note = note_infos[5].clone();
 
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
+        db.ensure_bundles(ROUND_ID, &note_infos).unwrap();
         {
             let conn = db.conn();
-            let err = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).expect_err(
+            let err = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 1).expect_err(
                 "padded secrets should only exist after explicit warmup or PCZT construction",
             );
             assert!(
@@ -1786,18 +1831,22 @@ mod tests {
         }
 
         let warmed = db
-            .ensure_padded_secrets(ROUND_ID, 0, &[note_info.clone()])
+            .ensure_padded_secrets(ROUND_ID, 1, std::slice::from_ref(&bundle_note))
             .unwrap();
         assert_eq!(warmed.len(), 4);
         let warmed_again = db
-            .ensure_padded_secrets(ROUND_ID, 0, &[note_info.clone()])
+            .ensure_padded_secrets(ROUND_ID, 1, std::slice::from_ref(&bundle_note))
             .unwrap();
         assert_eq!(warmed, warmed_again);
-        let precompute_nullifiers =
-            padded_nullifiers_for_circuit(&[note_info.clone()], &warmed, Network::Testnet).unwrap();
+        let precompute_nullifiers = padded_nullifiers_for_circuit(
+            std::slice::from_ref(&bundle_note),
+            &warmed,
+            Network::Testnet,
+        )
+        .unwrap();
         {
             let conn = db.conn();
-            assert!(queries::load_pczt_sighash(&conn, ROUND_ID, W, 0).is_err());
+            assert!(queries::load_pczt_sighash(&conn, ROUND_ID, W, 1).is_err());
         }
 
         let voting_hotkey =
@@ -1807,14 +1856,21 @@ mod tests {
             test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, seed_fingerprint, 0);
 
         let result = db
-            .build_governance_pczt(ROUND_ID, 0, &[note_info.clone()], &keys, 0xC8E71055)
+            .build_governance_pczt(
+                ROUND_ID,
+                1,
+                std::slice::from_ref(&bundle_note),
+                &keys,
+                0xC8E71055,
+            )
             .unwrap();
 
         let conn = db.conn();
-        let stored_dummy = queries::load_dummy_nullifiers(&conn, ROUND_ID, W, 0).unwrap();
-        let padded_secrets = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).unwrap();
+        let stored_dummy = queries::load_dummy_nullifiers(&conn, ROUND_ID, W, 1).unwrap();
+        let padded_secrets = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 1).unwrap();
         let pir_nullifiers =
-            padded_nullifiers_for_circuit(&[note_info], &padded_secrets, Network::Testnet).unwrap();
+            padded_nullifiers_for_circuit(&[bundle_note], &padded_secrets, Network::Testnet)
+                .unwrap();
 
         assert_eq!(result.padded_note_secrets, warmed_again);
         assert_eq!(precompute_nullifiers, result.dummy_nullifiers);
@@ -2068,8 +2124,13 @@ mod tests {
         }
 
         let plan = crate::note_bundling::chunk_notes(&notes);
+        let eligibility = crate::note_bundling::minimum_voting_eligibility_status_for_notes(
+            &notes,
+            crate::note_bundling::BundlePolicy::default(),
+        )
+        .unwrap();
         let err = db
-            .persist_bundle_plan(ROUND_ID, &plan)
+            .persist_bundle_plan(ROUND_ID, &plan, eligibility)
             .expect_err("bundle index conflict should fail setup");
         assert!(err.to_string().contains("failed to insert bundle"));
 
@@ -2196,6 +2257,160 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("note identity mismatch"));
+    }
+
+    #[test]
+    fn test_build_governance_pczt_rejects_below_minimum_voting_eligibility() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+
+        let notes = vec![NoteInfo {
+            commitment: vec![0x01; 32],
+            nullifier: vec![0x02; 32],
+            value: crate::governance::BALLOT_DIVISOR,
+            position: 0,
+            diversifier: vec![0; 11],
+            rho: vec![0; 32],
+            rseed: vec![0; 32],
+            scope: 0,
+            ufvk_str: String::new(),
+        }];
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        let keys = DelegationKeys {
+            fvk_bytes: vec![0; 96],
+            hotkey_raw_address: [0; 43],
+            seed_fingerprint: [0; 32],
+            account_index: 0,
+            address_index: 0,
+            network: Network::Testnet,
+            coin_type: Network::Testnet.network_type().coin_type(),
+            round_name: "Demo Round".to_string(),
+        };
+
+        let err = db
+            .build_governance_pczt(ROUND_ID, 0, &notes, &keys, 0xC8E71055)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("at least 5 eligible notes"),
+            "{err}"
+        );
+        let conn = db.conn();
+        assert!(
+            queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).is_err(),
+            "minimum eligibility failure should not sample padded secrets"
+        );
+    }
+
+    #[test]
+    fn test_build_governance_pczt_rejects_duplicate_nullifier_eligibility() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+
+        let notes = (0..crate::MINIMUM_VOTING_NOTE_COUNT)
+            .map(|i| NoteInfo {
+                commitment: vec![i as u8 + 1; 32],
+                nullifier: vec![0x02; 32],
+                value: crate::governance::BALLOT_DIVISOR,
+                position: i as u64,
+                diversifier: vec![i as u8; 11],
+                rho: vec![i as u8; 32],
+                rseed: vec![i as u8 + 3; 32],
+                scope: 0,
+                ufvk_str: format!("uview-{i}"),
+            })
+            .collect::<Vec<_>>();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        let keys = DelegationKeys {
+            fvk_bytes: vec![0; 96],
+            hotkey_raw_address: [0; 43],
+            seed_fingerprint: [0; 32],
+            account_index: 0,
+            address_index: 0,
+            network: Network::Testnet,
+            coin_type: Network::Testnet.network_type().coin_type(),
+            round_name: "Demo Round".to_string(),
+        };
+
+        let err = db
+            .build_governance_pczt(ROUND_ID, 0, &notes, &keys, 0xC8E71055)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("selected 1 distinct eligible notes"),
+            "{err}"
+        );
+        let conn = db.conn();
+        assert!(
+            queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).is_err(),
+            "duplicate-nullifier eligibility failure should not sample padded secrets"
+        );
+    }
+
+    #[test]
+    fn test_bundle_setup_metadata_deduplicates_nullifiers_for_eligibility() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+
+        let notes = (0..crate::MINIMUM_VOTING_NOTE_COUNT)
+            .map(|i| NoteInfo {
+                commitment: vec![i as u8 + 1; 32],
+                nullifier: vec![0x02; 32],
+                value: crate::MINIMUM_VOTING_WEIGHT_ZATOSHI,
+                position: i as u64,
+                diversifier: vec![i as u8; 11],
+                rho: vec![i as u8; 32],
+                rseed: vec![i as u8 + 3; 32],
+                scope: 0,
+                ufvk_str: format!("uview-{i}"),
+            })
+            .collect::<Vec<_>>();
+
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+
+        let conn = db.conn();
+        let (distinct_note_count, eligible_weight) =
+            queries::load_bundle_setup_eligibility(&conn, ROUND_ID, W)
+                .unwrap()
+                .expect("bundle setup stores eligibility metadata");
+        assert_eq!(distinct_note_count, 1);
+        assert_eq!(eligible_weight, crate::MINIMUM_VOTING_WEIGHT_ZATOSHI);
+    }
+
+    #[test]
+    fn test_build_governance_pczt_rejects_legacy_position_only_setup() {
+        let db = test_db();
+        db.init_round(&test_params(), None).unwrap();
+
+        let notes = (0..crate::MINIMUM_VOTING_NOTE_COUNT)
+            .map(|i| identity_note_with_position(i as u8))
+            .collect::<Vec<_>>();
+        {
+            let conn = db.conn();
+            let positions = notes.iter().map(|note| note.position).collect::<Vec<_>>();
+            queries::insert_bundle(&conn, ROUND_ID, W, 0, &positions).unwrap();
+        }
+        let keys = DelegationKeys {
+            fvk_bytes: vec![0; 96],
+            hotkey_raw_address: [0; 43],
+            seed_fingerprint: [0; 32],
+            account_index: 0,
+            address_index: 0,
+            network: Network::Testnet,
+            coin_type: Network::Testnet.network_type().coin_type(),
+            round_name: "Demo Round".to_string(),
+        };
+
+        let err = db
+            .build_governance_pczt(ROUND_ID, 0, &notes, &keys, 0xC8E71055)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("minimum voting eligibility could not be verified"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2708,16 +2923,20 @@ mod tests {
         let fvk = ufvk.orchard().unwrap().clone();
         let address = fvk.address_at(0u32, Scope::External);
         let mut rng = OsRng;
-        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
-        let note = orchard::Note::new(
-            address,
-            NoteValue::from_raw(13_000_000),
-            Rho::from_nf_old(parent_note.nullifier(&fvk)),
-            &mut rng,
-        );
-        let note_info =
-            NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &TEST_NETWORK).unwrap();
-        db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
+        let note_infos = (0..5)
+            .map(|i| {
+                let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+                let note = orchard::Note::new(
+                    address,
+                    NoteValue::from_raw(13_000_000),
+                    Rho::from_nf_old(parent_note.nullifier(&fvk)),
+                    &mut rng,
+                );
+                NoteInfo::from_orchard_note(&note, 7 + i, Scope::External, &ufvk, &TEST_NETWORK)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        db.ensure_bundles(ROUND_ID, &note_infos).unwrap();
 
         let voting_hotkey =
             VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Testnet).unwrap();
@@ -2732,7 +2951,7 @@ mod tests {
             &db,
             ROUND_ID,
             0,
-            &[note_info],
+            &note_infos,
             &keys,
             &StaticBranchId(0xC8E71055),
             &crate::types::NoopProgressReporter,

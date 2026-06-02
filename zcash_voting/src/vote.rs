@@ -895,6 +895,64 @@ pub fn parse_recovery(json: &str) -> Result<VoteRecoveryBundle, VotingError> {
     VoteRecoveryBundle::try_from(parsed)
 }
 
+/// Inserts a vote recovery row for downstream integration tests.
+///
+/// This helper is only available in this crate's own tests or when the
+/// `test-helpers` feature is enabled. Production callers should create recovery
+/// rows through `commit` or `commit_batch`. The supplied `notes` must be the
+/// wallet note set used for the round so the helper can enforce the same
+/// minimum voting eligibility and bundle identity checks as the production
+/// setup path.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn insert_recovery_fixture(
+    db: &VotingDb,
+    bundle: &VoteRecoveryBundle,
+    notes: &[crate::types::NoteInfo],
+) -> Result<(), VotingError> {
+    crate::note_bundling::validate_minimum_voting_eligibility_for_notes(
+        notes,
+        crate::note_bundling::BundlePolicy::default(),
+    )?;
+    let layout = db.ensure_bundles(&bundle.vote_round_id, notes)?;
+    crate::validate_bundle_index(
+        layout.bundle_count,
+        bundle.bundle_index,
+        "vote recovery fixture",
+    )?;
+
+    let commitment = stored_vote_commitment_bytes(bundle)?;
+    {
+        let conn = db.conn();
+        let wallet_id = db.wallet_id();
+        crate::storage::queries::store_vote(
+            &conn,
+            &bundle.vote_round_id,
+            &wallet_id,
+            bundle.bundle_index,
+            bundle.proposal_id,
+            bundle.vote_decision,
+            &commitment,
+        )?;
+    }
+    let recovery_json = serialize_recovery(bundle)?;
+    store_recovery_json_for_vote(
+        db,
+        &bundle.vote_round_id,
+        bundle.bundle_index,
+        bundle.proposal_id,
+        bundle.vote_decision,
+        Some(&commitment),
+        &recovery_json,
+    )?;
+    record_vc_position(
+        db,
+        &bundle.vote_round_id,
+        bundle.bundle_index,
+        bundle.proposal_id,
+        bundle.vc_tree_position,
+    )
+}
+
 fn store_recovery_json_for_vote(
     db: &VotingDb,
     round_id: &str,
@@ -1542,6 +1600,13 @@ mod tests {
         db
     }
 
+    fn db_without_vote(wallet_id: &str) -> VotingDb {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(wallet_id);
+        db.create_round(&round_params(), None).unwrap();
+        db
+    }
+
     fn round_params() -> RoundParams {
         RoundParams {
             vote_round_id: ROUND_ID.to_string(),
@@ -1564,6 +1629,17 @@ mod tests {
             scope: 0,
             ufvk_str: "uview1test".to_string(),
         }
+    }
+
+    fn minimum_eligible_notes() -> Vec<NoteInfo> {
+        (0..crate::governance::BUNDLE_NOTE_SLOTS)
+            .map(|i| {
+                let mut note = note(i as u64);
+                note.commitment[0] = 0x10 + i as u8;
+                note.nullifier[0] = 0x20 + i as u8;
+                note
+            })
+            .collect()
     }
 
     fn recovery_bundle_fixture() -> VoteRecoveryBundle {
@@ -2211,6 +2287,33 @@ mod tests {
         assert_eq!(signed.bundle_index, 0);
         assert_eq!(signed.commitments.len(), 1);
         assert_eq!(signed.commitments[0].commitment_bundle_json, recovery_json);
+    }
+
+    #[test]
+    fn insert_recovery_fixture_seeds_recoverable_vote() {
+        let db = db_without_vote("wallet-recovery-fixture");
+        let recovery = recovery_bundle_fixture();
+        let recovery_json = serialize_recovery(&recovery).unwrap();
+        let notes = minimum_eligible_notes();
+
+        insert_recovery_fixture(&db, &recovery, &notes).unwrap();
+
+        let signed = recover_signed_commitments(&db, ROUND_ID, 0, 1).unwrap();
+        assert_eq!(signed.bundle_index, 0);
+        assert_eq!(signed.commitments.len(), 1);
+        assert_eq!(signed.commitments[0].commitment_bundle_json, recovery_json);
+    }
+
+    #[test]
+    fn insert_recovery_fixture_rejects_below_minimum_voting_eligibility() {
+        let db = db_without_vote("wallet-recovery-fixture-ineligible");
+        let recovery = recovery_bundle_fixture();
+        let err = insert_recovery_fixture(&db, &recovery, &[note(0)]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("minimum voting eligibility"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 mod migrations;
 pub mod operations;
-pub mod queries;
+pub(crate) mod queries;
 
 use std::sync::Mutex;
 
@@ -115,8 +115,8 @@ impl VotingDb {
         id
     }
 
-    /// Get a lock on the underlying connection for query execution.
-    pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    /// Get a lock on the underlying connection for crate-internal query execution.
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("database mutex poisoned")
     }
 }
@@ -149,7 +149,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 13);
     }
 
     #[test]

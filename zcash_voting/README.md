@@ -10,7 +10,8 @@ precompute → delegate → vote → share lifecycle:
 1. Open a `VotingDb`, set the wallet id, and call `create_round` (pass `None`
    when no round session metadata is available).
 2. Convert eligible Orchard notes into `NoteInfo` with
-   `NoteInfo::from_orchard_note`, then call `ensure_bundles`.
+   `NoteInfo::from_orchard_note`, call
+   `validate_minimum_voting_eligibility_for_notes`, then call `ensure_bundles`.
    The default `BundlePolicy` fills each bundle up to the circuit note-slot
    count. Wallets that need fewer real notes per bundle can call the
    `*_with_policy` variants with `BundlePolicy::new(...)`; proof construction
@@ -195,7 +196,7 @@ The crate no longer accepts root wallet seed material for delegation signing.
 
 - PIR and tree-sync APIs are now always compiled; no feature flags are required.
 - Prefer `VotingDb::create_round`, `VotingDb::ensure_bundles`, and
-  `VotingDb::delegation_phases` over direct `storage::queries` calls.
+  `VotingDb::delegation_phases` over direct storage row manipulation.
 - Use `BundlePolicy` plus the `*_with_policy` APIs when an integration needs
   fewer real notes per bundle. Omit the policy for the default circuit-slot
   behavior.

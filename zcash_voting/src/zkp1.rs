@@ -311,6 +311,50 @@ pub fn build_and_prove_delegation(
             message: format!("expected 1..={BUNDLE_NOTE_SLOTS} notes, got {n}"),
         });
     }
+    crate::note_bundling::validate_minimum_voting_eligibility_for_notes(
+        full_notes,
+        crate::note_bundling::BundlePolicy::default(),
+    )?;
+
+    build_and_prove_delegation_for_bundle(
+        full_notes,
+        hotkey_raw_address,
+        alpha_bytes,
+        van_comm_rand_bytes,
+        vote_round_id_bytes,
+        merkle_witnesses,
+        imt_proofs,
+        extra_imt_proofs,
+        network,
+        progress,
+        precomputed_randomness,
+    )
+}
+
+/// Build and prove one already authorized delegation bundle.
+///
+/// Callers must validate minimum voting eligibility for the full selected note
+/// set before reaching this per-bundle proof builder.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_and_prove_delegation_for_bundle(
+    full_notes: &[NoteInfo],
+    hotkey_raw_address: &[u8],
+    alpha_bytes: &[u8],
+    van_comm_rand_bytes: &[u8],
+    vote_round_id_bytes: &[u8],
+    merkle_witnesses: &[WitnessData],
+    imt_proofs: &[ImtProofData],
+    extra_imt_proofs: &[([u8; 32], ImtProofData)],
+    network: Network,
+    progress: &dyn DelegationProgressReporter,
+    precomputed_randomness: Option<&PrecomputedRandomness>,
+) -> Result<DelegationProofResult, VotingError> {
+    let n = full_notes.len();
+    if n == 0 || n > BUNDLE_NOTE_SLOTS {
+        return Err(VotingError::InvalidInput {
+            message: format!("expected 1..={BUNDLE_NOTE_SLOTS} notes, got {n}"),
+        });
+    }
     if merkle_witnesses.len() != n {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -621,6 +665,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains(&format!("1..={BUNDLE_NOTE_SLOTS} notes")));
+
+        let one_note = NoteInfo {
+            commitment: vec![0x01; 32],
+            diversifier: vec![0; 11],
+            value: crate::governance::BALLOT_DIVISOR,
+            rho: vec![0; 32],
+            rseed: vec![0; 32],
+            nullifier: vec![0x02; 32],
+            position: 0,
+            scope: 0,
+            ufvk_str: String::new(),
+        };
+        let result = build_and_prove_delegation(
+            &[one_note],
+            &[0u8; 43],
+            &[0u8; 32],
+            &[0u8; 32],
+            &[0u8; 32],
+            &[],
+            &[],
+            &[],
+            Network::Testnet,
+            &reporter,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("minimum voting eligibility"));
     }
 
     #[test]

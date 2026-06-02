@@ -284,17 +284,23 @@ mod pir_tests {
 
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id("warm-delegation-cancel");
-        let notes = vec![NoteInfo {
-            commitment: vec![1; 32],
-            nullifier: vec![2; 32],
-            value: crate::governance::BALLOT_DIVISOR,
-            position: 42,
-            diversifier: vec![3; 11],
-            rho: vec![4; 32],
-            rseed: vec![5; 32],
-            scope: 0,
-            ufvk_str: "uviewtest".to_string(),
-        }];
+        let notes = (0..crate::MINIMUM_VOTING_NOTE_COUNT)
+            .map(|i| {
+                let mut nullifier = vec![0; 32];
+                nullifier[0] = i as u8 + 1;
+                NoteInfo {
+                    commitment: vec![i as u8 + 1; 32],
+                    nullifier,
+                    value: crate::governance::BALLOT_DIVISOR,
+                    position: i as u64,
+                    diversifier: vec![i as u8 + 3; 11],
+                    rho: vec![i as u8 + 4; 32],
+                    rseed: vec![i as u8 + 5; 32],
+                    scope: 0,
+                    ufvk_str: "uviewtest".to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
         db.create_round(
             &crate::round::RoundParams {
                 vote_round_id: ROUND_ID.to_string(),
@@ -309,7 +315,8 @@ mod pir_tests {
         db.ensure_bundles(ROUND_ID, &notes).unwrap();
         let layout = BundleLayout {
             bundle_count: 1,
-            eligible_weight: 42,
+            eligible_weight: crate::governance::BALLOT_DIVISOR
+                * crate::MINIMUM_VOTING_NOTE_COUNT as u64,
             dropped_count: 0,
         };
         let pir_client = pir_client::PirClientBlocking::with_transport(

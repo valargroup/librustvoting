@@ -9,6 +9,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added public minimum voting eligibility helpers and constants so wallet
+  integrations can check the shared 5 eligible notes / 0.125 ZEC minimum before
+  allowing users to vote.
+- Added persisted bundle setup eligibility metadata so storage-backed artifact
+  builders enforce the same distinct-note and voting-weight minimum after setup.
+- Added a `test-helpers` feature with vote recovery fixture insertion for
+  downstream integration tests that need crate-owned recovery rows without raw
+  storage access.
 - Added shared last-moment round timing helpers in `share_policy` so wallet
   integrations can derive the same helper-share buffer, deadline, and
   `single_share` decision from ceremony start and vote end times.
@@ -227,6 +235,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   UTF-8-safe byte boundaries when the memo approaches the 512-byte signer limit,
   so hardware-wallet displays no longer clip the trailing ZEC amount. Governance
   PCZT memo bytes now reuse the same formatter.
+- Delegation setup now rejects note selections or persisted bundle rows that do
+  not meet the shared minimum voting eligibility rule before persisting or
+  signing delegation state.
+- Persisted bundle rows now store note nullifiers and raw storage internals are
+  crate-internal, so callers cannot bypass the shared eligibility guard through
+  direct row writes.
 - `delegate::prepare_delegation_bundle` now takes a typed `VotingHotkey` and
   owns wallet scanned-height lookup. Callers no longer pass hotkey seed bytes
   through delegation preparation.

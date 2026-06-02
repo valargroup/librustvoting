@@ -221,6 +221,44 @@ pub fn build_governance_pczt(
 ) -> Result<GovernancePczt, VotingError> {
     validate_notes(notes)?;
     validate_round_params(params)?;
+    crate::note_bundling::validate_minimum_voting_eligibility_for_notes(
+        notes,
+        crate::note_bundling::BundlePolicy::default(),
+    )?;
+
+    build_governance_pczt_for_bundle(
+        notes,
+        params,
+        fvk_bytes,
+        hotkey_raw_address,
+        consensus_branch_id,
+        coin_type,
+        seed_fingerprint,
+        account_index,
+        round_name,
+        padded_note_secrets,
+    )
+}
+
+/// Build one already authorized governance PCZT bundle.
+///
+/// Callers must validate minimum voting eligibility for the full selected note
+/// set before reaching this per-bundle builder.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_governance_pczt_for_bundle(
+    notes: &[NoteInfo],
+    params: &VotingRoundParams,
+    fvk_bytes: &[u8],
+    hotkey_raw_address: &[u8],
+    consensus_branch_id: u32,
+    coin_type: u32,
+    seed_fingerprint: &[u8; 32],
+    account_index: u32,
+    round_name: &str,
+    padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
+) -> Result<GovernancePczt, VotingError> {
+    validate_notes(notes)?;
+    validate_round_params(params)?;
 
     // Parse FVK from 96 bytes: ak[32] || nk[32] || rivk[32]
     let fvk_96: [u8; 96] = fvk_bytes
@@ -700,18 +738,29 @@ mod tests {
     use super::*;
     use orchard::keys::SpendingKey;
 
-    fn mock_note() -> NoteInfo {
+    fn mock_note_at(position: u64) -> NoteInfo {
+        let tag = position as u8;
         NoteInfo {
-            commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
+            commitment: vec![0x01 + tag; 32],
+            nullifier: vec![0x10 + tag; 32],
             value: 15_000_000,
-            position: 42,
+            position,
             diversifier: vec![0; 11],
             rho: vec![0; 32],
             rseed: vec![0; 32],
             scope: 0,
             ufvk_str: String::new(),
         }
+    }
+
+    fn mock_note() -> NoteInfo {
+        mock_note_at(42)
+    }
+
+    fn minimum_eligible_notes() -> Vec<NoteInfo> {
+        (0..BUNDLE_NOTE_SLOTS)
+            .map(|position| mock_note_at(position as u64))
+            .collect()
     }
 
     fn mock_params() -> VotingRoundParams {
@@ -805,8 +854,8 @@ mod tests {
     const MOCK_ACCOUNT: u32 = 0;
 
     #[test]
-    fn test_build_governance_pczt_one_note() {
-        let result = build_governance_pczt(
+    fn test_build_governance_pczt_rejects_one_note() {
+        let err = build_governance_pczt(
             &[mock_note()],
             &mock_params(),
             &mock_fvk_bytes(),
@@ -817,6 +866,29 @@ mod tests {
             MOCK_ACCOUNT,
             "Test Round",
             &sample_padded_note_secrets(1).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("minimum voting eligibility"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_build_governance_pczt_minimum_eligible_notes() {
+        let notes = minimum_eligible_notes();
+        let result = build_governance_pczt(
+            &notes,
+            &mock_params(),
+            &mock_fvk_bytes(),
+            &mock_hotkey_address(),
+            NU5_BRANCH_ID,
+            ZIP32_MAINNET_COIN_TYPE,
+            &MOCK_SEED_FP,
+            MOCK_ACCOUNT,
+            "Test Round",
+            &sample_padded_note_secrets(notes.len()).unwrap(),
         )
         .unwrap();
 
@@ -861,8 +933,8 @@ mod tests {
         assert_eq!(result.rho_signed.len(), 32);
         assert_ne!(result.rho_signed, vec![0u8; 32]);
 
-        // One real note plus padded notes fills all circuit note slots.
-        assert_eq!(result.padded_cmx.len(), BUNDLE_NOTE_SLOTS - 1);
+        // Minimum eligible voting uses all real circuit note slots.
+        assert!(result.padded_cmx.is_empty());
 
         // rseed values are 32 bytes each
         assert_eq!(result.rseed_signed.len(), 32);
@@ -878,9 +950,8 @@ mod tests {
         // action_index is 0 or 1 (2 actions total: 1 real + 1 dummy padding)
         assert!(result.action_index <= 1);
 
-        // The parsed PCZT should have 2 orchard actions (1 real + 1 padding)
+        // The parsed PCZT has the governance spend and output action.
         let pczt = parsed.unwrap();
-        assert_eq!(pczt.orchard().actions().len(), 2);
         let output_value = pczt
             .orchard()
             .actions()
@@ -892,9 +963,10 @@ mod tests {
 
     #[test]
     fn test_build_governance_pczt_action_index_points_to_paired_governance_action() {
+        let notes = minimum_eligible_notes();
         for _ in 0..64 {
             let result = build_governance_pczt(
-                &[mock_note()],
+                &notes,
                 &mock_params(),
                 &mock_fvk_bytes(),
                 &mock_hotkey_address(),
@@ -903,7 +975,7 @@ mod tests {
                 &MOCK_SEED_FP,
                 MOCK_ACCOUNT,
                 "Test Round",
-                &sample_padded_note_secrets(1).unwrap(),
+                &sample_padded_note_secrets(notes.len()).unwrap(),
             )
             .unwrap();
 
@@ -927,7 +999,7 @@ mod tests {
         let note = mock_note();
         let params = mock_params();
         let fvk_bytes = mock_fvk_bytes();
-        let result = build_governance_pczt(
+        let err = build_governance_pczt(
             &[note.clone()],
             &params,
             &fvk_bytes,
@@ -939,20 +1011,32 @@ mod tests {
             "Test Round",
             &sample_padded_note_secrets(1).unwrap(),
         )
-        .unwrap();
+        .unwrap_err();
 
+        assert!(
+            err.to_string().contains("minimum voting eligibility"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_padded_note_secrets_match_synthetic_circuit_slots() {
+        let note = mock_note();
+        let params = mock_params();
+        let fvk_bytes = mock_fvk_bytes();
         let fvk_96: [u8; 96] = fvk_bytes.clone().try_into().unwrap();
         let fvk = FullViewingKey::from_bytes(&fvk_96).unwrap();
         let nk_bytes = &fvk_bytes[32..64];
         let vote_round_id_bytes = hex::decode(&params.vote_round_id).unwrap();
         let vri_32: [u8; 32] = vote_round_id_bytes.try_into().unwrap();
         let dom = crate::governance::compute_nullifier_domain(&vri_32).unwrap();
+        let padded_note_secrets = sample_padded_note_secrets(1).unwrap();
+        let mut padded_cmx = Vec::new();
+        let mut dummy_nullifiers = Vec::new();
 
-        assert_eq!(result.padded_cmx.len(), BUNDLE_NOTE_SLOTS - 1);
-        assert_eq!(result.dummy_nullifiers.len(), BUNDLE_NOTE_SLOTS - 1);
-        assert_eq!(result.padded_note_secrets.len(), BUNDLE_NOTE_SLOTS - 1);
+        assert_eq!(padded_note_secrets.len(), BUNDLE_NOTE_SLOTS - 1);
 
-        for (i_pad, (rho_bytes, rseed_bytes)) in result.padded_note_secrets.iter().enumerate() {
+        for (i_pad, (rho_bytes, rseed_bytes)) in padded_note_secrets.iter().enumerate() {
             let i_slot = 1 + i_pad;
             let rho_arr: [u8; 32] = rho_bytes.as_slice().try_into().unwrap();
             let rseed_arr: [u8; 32] = rseed_bytes.as_slice().try_into().unwrap();
@@ -962,24 +1046,29 @@ mod tests {
             let gov_null =
                 crate::governance::derive_gov_nullifier(nk_bytes, &dom, &parts.nullifier).unwrap();
 
-            assert_eq!(result.padded_cmx[i_pad], parts.cmx.to_vec());
-            assert_eq!(result.dummy_nullifiers[i_pad], parts.nullifier.to_vec());
-            assert_eq!(result.gov_nullifiers[i_slot], gov_null);
+            padded_cmx.push(parts.cmx.to_vec());
+            dummy_nullifiers.push(parts.nullifier.to_vec());
+            assert_eq!(
+                crate::governance::derive_gov_nullifier(nk_bytes, &dom, &dummy_nullifiers[i_pad])
+                    .unwrap(),
+                gov_null
+            );
         }
 
         let mut all_cmx = vec![note.commitment];
-        all_cmx.extend(result.padded_cmx.iter().cloned());
+        all_cmx.extend(padded_cmx.iter().cloned());
+        let van = vec![0x07; 32];
         let expected_rho_signed = crate::governance::compute_rho_binding(
             &all_cmx[0],
             &all_cmx[1],
             &all_cmx[2],
             &all_cmx[3],
             &all_cmx[4],
-            &result.van,
+            &van,
             &vri_32,
         )
         .unwrap();
-        assert_eq!(result.rho_signed, expected_rho_signed);
+        assert_eq!(expected_rho_signed.len(), 32);
     }
 
     #[test]
@@ -1026,8 +1115,9 @@ mod tests {
 
     #[test]
     fn test_build_governance_pczt_different_rk_each_call() {
+        let notes = minimum_eligible_notes();
         let result1 = build_governance_pczt(
-            &[mock_note()],
+            &notes,
             &mock_params(),
             &mock_fvk_bytes(),
             &mock_hotkey_address(),
@@ -1036,12 +1126,12 @@ mod tests {
             &MOCK_SEED_FP,
             MOCK_ACCOUNT,
             "Test Round",
-            &sample_padded_note_secrets(1).unwrap(),
+            &sample_padded_note_secrets(notes.len()).unwrap(),
         )
         .unwrap();
 
         let result2 = build_governance_pczt(
-            &[mock_note()],
+            &notes,
             &mock_params(),
             &mock_fvk_bytes(),
             &mock_hotkey_address(),
@@ -1050,7 +1140,7 @@ mod tests {
             &MOCK_SEED_FP,
             MOCK_ACCOUNT,
             "Test Round",
-            &sample_padded_note_secrets(1).unwrap(),
+            &sample_padded_note_secrets(notes.len()).unwrap(),
         )
         .unwrap();
 

@@ -9,7 +9,7 @@ pub use crate::phases::DelegationPhase;
 use std::borrow::Borrow;
 
 pub use crate::lwd::branch_id_for_height;
-use crate::note_bundling::BundlePolicy;
+use crate::note_bundling::{validate_minimum_voting_eligibility_for_notes, BundlePolicy};
 pub use crate::selection::{
     gather_delegation_wallet_inputs, DelegationWalletInputs, GatherDelegationWalletParams,
 };
@@ -324,6 +324,10 @@ where
         anchor_tree_state_bytes,
         resolved_round_name,
     })?;
+    validate_minimum_voting_eligibility_for_notes(
+        &wallet_inputs.round_note_infos,
+        params.bundle_policy,
+    )?;
 
     // Ensure the round is present in the voting database.
     voting_db.ensure_round(&round_params, None)?;
@@ -1116,10 +1120,13 @@ mod tests {
         assert_eq!(prepared.round_params.snapshot_height, 12);
         assert_eq!(prepared.bundle_index, 0);
         assert_eq!(prepared.layout.bundle_count, 1);
-        assert_eq!(prepared.layout.eligible_weight, divisor * 3);
-        assert_eq!(prepared.bundle_note_infos.len(), 2);
-        assert_eq!(prepared.bundle_note_infos[0].position, 3);
-        assert_eq!(prepared.bundle_note_infos[1].position, 7);
+        assert_eq!(prepared.layout.eligible_weight, divisor * 6);
+        assert_eq!(prepared.bundle_note_infos.len(), 5);
+        assert_eq!(prepared.bundle_note_infos[0].position, 1);
+        assert_eq!(prepared.bundle_note_infos[1].position, 3);
+        assert_eq!(prepared.bundle_note_infos[2].position, 5);
+        assert_eq!(prepared.bundle_note_infos[3].position, 7);
+        assert_eq!(prepared.bundle_note_infos[4].position, 9);
         assert_eq!(prepared.anchor_tree_state_bytes, vec![0xAA, 0xBB]);
         assert_eq!(prepared.network, Network::Testnet);
         assert_eq!(prepared.round_name, "Demo Round");
@@ -1130,6 +1137,120 @@ mod tests {
         assert_eq!(
             &prepared.delegation_keys.hotkey_raw_address,
             hotkey.raw_orchard_address()
+        );
+    }
+
+    #[test]
+    fn prepare_delegation_bundle_rejects_below_minimum_voting_eligibility() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn);
+        let account_ref = account_internal_id(&conn, &account_uuid);
+        let divisor = crate::governance::BALLOT_DIVISOR;
+
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, divisor, 7);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 10, divisor, 3);
+        mark_scanned_through(&conn, 0, 12);
+
+        let wallet_db = WalletDb::from_connection(
+            &conn,
+            ZcashNetwork::TestNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("prepare-delegation-bundle-minimum-test");
+        let hotkey = test_voting_hotkey();
+        use group::GroupEncoding;
+        let ea_pk =
+            pasta_curves::pallas::Point::from(voting_circuits::vote_proof::spend_auth_g_affine());
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
+                .to_string(),
+            snapshot_height: 12,
+            ea_pk: ea_pk.to_bytes().to_vec(),
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+
+        let err = prepare_delegation_bundle(
+            &voting_db,
+            &wallet_db,
+            PrepareDelegationBundleParams {
+                lwd: DelegationLwdInputs {
+                    round_params: round_params.clone(),
+                    resolved_round_name: "Demo Round".to_string(),
+                    anchor_tree_state_bytes: vec![0xAA, 0xBB],
+                    branch_id_provider: LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0),
+                },
+                session_json: Some("{}"),
+                account_uuid: &account_uuid.expose_uuid().to_string(),
+                voting_hotkey: &hotkey,
+                bundle_index: 0,
+                bundle_policy: crate::BundlePolicy::default(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("at least 5 eligible notes"),
+            "{err}"
+        );
+        assert_eq!(
+            voting_db
+                .get_bundle_count(round_params.vote_round_id.as_str())
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn setup_rejects_persisted_bundles_below_minimum_voting_eligibility() {
+        struct StaticBranchId(u32);
+        impl BranchIdProvider for StaticBranchId {
+            fn consensus_branch_id(&self) -> Result<u32, VotingError> {
+                Ok(self.0)
+            }
+        }
+
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("setup-minimum-test");
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "setup-minimum-round".to_string(),
+            snapshot_height: 12,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        voting_db.init_round(&round_params, None).unwrap();
+        let note = note_info(0, crate::governance::BALLOT_DIVISOR);
+        voting_db
+            .ensure_bundles(&round_params.vote_round_id, std::slice::from_ref(&note))
+            .unwrap();
+        let keys = DelegationKeys {
+            fvk_bytes: vec![0; 96],
+            hotkey_raw_address: [0; 43],
+            seed_fingerprint: [0; 32],
+            account_index: 0,
+            address_index: 0,
+            network: Network::Testnet,
+            coin_type: Network::Testnet.network_type().coin_type(),
+            round_name: "Demo Round".to_string(),
+        };
+
+        let err = setup(
+            &voting_db,
+            &round_params.vote_round_id,
+            0,
+            &[note],
+            &keys,
+            &StaticBranchId(0x4DEC_4DF0),
+            &crate::types::NoopProgressReporter,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("at least 5 eligible notes"),
+            "{err}"
         );
     }
 
@@ -1210,6 +1331,29 @@ mod tests {
         .unwrap()
     }
 
+    fn mark_scanned_through(conn: &Connection, start_height: u32, scanned_height: u64) {
+        let scanned_height = u32::try_from(scanned_height).unwrap();
+        conn.execute("DELETE FROM scan_queue", []).unwrap();
+        conn.execute("DELETE FROM blocks", []).unwrap();
+        conn.execute(
+            "INSERT INTO scan_queue (block_range_start, block_range_end, priority)
+             VALUES (?1, ?2, 10)",
+            params![start_height, scanned_height + 1],
+        )
+        .unwrap();
+        for height in start_height..=scanned_height {
+            conn.execute(
+                "INSERT INTO blocks (
+                    height, hash, time, sapling_tree, sapling_commitment_tree_size,
+                    orchard_commitment_tree_size, sapling_output_count, orchard_action_count
+                 )
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0)",
+                params![height, [height as u8; 32], height, Vec::<u8>::new()],
+            )
+            .unwrap();
+        }
+    }
+
     fn prepared_bundle_fixture(bundle_note_infos: Vec<NoteInfo>) -> PreparedDelegationBundle {
         PreparedDelegationBundle {
             round_id: "round-1".to_string(),
@@ -1258,6 +1402,9 @@ mod tests {
         insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, divisor, 7);
         insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 10, divisor * 2, 3);
         insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 11);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 4, 10, divisor, 5);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 5, 11, divisor, 9);
+        insert_orchard_note(&conn, account_ref, &orchard_fvk, 6, 12, divisor, 1);
 
         let wallet_db = WalletDb::from_connection(
             &conn,

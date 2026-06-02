@@ -6,6 +6,8 @@ CREATE TABLE rounds (
     nc_root             BLOB NOT NULL,
     nullifier_imt_root  BLOB NOT NULL,
     session_json        TEXT,
+    setup_distinct_note_count INTEGER,
+    setup_eligible_weight_zatoshi INTEGER,
     phase               INTEGER NOT NULL DEFAULT 0,
     created_at          INTEGER NOT NULL,
     PRIMARY KEY (round_id, wallet_id)
@@ -17,6 +19,7 @@ CREATE TABLE bundles (
     bundle_index        INTEGER NOT NULL,
     note_positions_blob BLOB,
     note_identity_hashes_blob BLOB,
+    note_nullifiers_blob BLOB,
     van_comm_rand       BLOB,
     dummy_nullifiers    BLOB,
     rho_signed          BLOB,

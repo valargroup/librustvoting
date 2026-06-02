@@ -10,7 +10,9 @@ use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    note_bundling::{chunk_notes_with_policy, BundlePolicy},
+    note_bundling::{
+        chunk_notes_with_policy, minimum_voting_eligibility_status_for_notes, BundlePolicy,
+    },
     storage::{queries, RoundState, VotingDb as InnerVotingDb},
     types::{NoteInfo, VotingError, VotingRoundParams},
 };
@@ -341,13 +343,14 @@ impl VotingDb {
         notes: &[NoteInfo],
         policy: BundlePolicy,
     ) -> Result<BundleLayout, VotingError> {
-        crate::types::validate_notes_for_round(notes)?;
+        let eligibility = minimum_voting_eligibility_status_for_notes(notes, policy)?;
         let plan = chunk_notes_with_policy(notes, policy);
         let expected_count = plan.bundles.len() as u32;
         let existing_count = self.get_bundle_count(round_id)?;
 
         if existing_count == 0 {
-            let (bundle_count, eligible_weight) = self.persist_bundle_plan(round_id, &plan)?;
+            let (bundle_count, eligible_weight) =
+                self.persist_bundle_plan(round_id, &plan, eligibility)?;
             return Ok(BundleLayout {
                 bundle_count,
                 eligible_weight,

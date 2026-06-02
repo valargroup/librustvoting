@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 11;
+const CURRENT_VERSION: u32 = 13;
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
@@ -62,7 +62,11 @@ mod tests {
     use crate::VotingRoundParams;
 
     fn pre_v8_schema() -> String {
-        include_str!("migrations/001_init.sql").replace("    note_identity_hashes_blob BLOB,\n", "")
+        include_str!("migrations/001_init.sql")
+            .replace("    setup_distinct_note_count INTEGER,\n", "")
+            .replace("    setup_eligible_weight_zatoshi INTEGER,\n", "")
+            .replace("    note_identity_hashes_blob BLOB,\n", "")
+            .replace("    note_nullifiers_blob BLOB,\n", "")
     }
 
     fn test_params() -> VotingRoundParams {
@@ -134,6 +138,10 @@ mod tests {
 
         let columns = table_columns(&conn, "bundles");
         assert!(columns.contains(&"note_identity_hashes_blob".to_string()));
+        assert!(columns.contains(&"note_nullifiers_blob".to_string()));
+        let round_columns = table_columns(&conn, "rounds");
+        assert!(round_columns.contains(&"setup_distinct_note_count".to_string()));
+        assert!(round_columns.contains(&"setup_eligible_weight_zatoshi".to_string()));
     }
 
     #[test]

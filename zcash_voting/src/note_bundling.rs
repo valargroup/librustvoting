@@ -1,9 +1,17 @@
 //! Smart note bundle planning for voting rounds.
 
+use std::collections::HashSet;
+
 use crate::{
     governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS},
     types::{validate_notes_for_round, NoteInfo, SelectedNotes, VotingError},
 };
+
+/// Minimum selected notes required before a wallet can vote.
+pub const MINIMUM_VOTING_NOTE_COUNT: usize = BUNDLE_NOTE_SLOTS;
+
+/// Minimum quantized voting weight in zatoshi required before a wallet can vote.
+pub const MINIMUM_VOTING_WEIGHT_ZATOSHI: u64 = BALLOT_DIVISOR;
 
 /// Controls how many real wallet notes are placed into each voting bundle.
 ///
@@ -94,6 +102,82 @@ pub fn voting_power_with_policy(notes: &SelectedNotes, policy: BundlePolicy) -> 
         return 0;
     }
     chunk_notes_with_policy(&note_infos, policy).eligible_weight
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MinimumVotingEligibilityStatus {
+    pub distinct_note_count: usize,
+    pub eligible_weight: u64,
+}
+
+/// Validates the minimum selected-note and voting-weight requirement for voting.
+///
+/// The note count is checked on the full selected note set, while weight is
+/// checked after the same bundle-policy quantization used for delegation. This
+/// keeps deliberately underfilled bundle policies usable while rejecting wallets
+/// that do not hold at least five eligible notes or enough voting weight at the
+/// snapshot.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] when the note set is malformed or when
+/// the selected note set does not meet the minimum voting requirement.
+pub fn validate_minimum_voting_eligibility(
+    notes: &SelectedNotes,
+    policy: BundlePolicy,
+) -> Result<(), VotingError> {
+    let note_infos = notes.voting_note_infos();
+    validate_minimum_voting_eligibility_for_notes(&note_infos, policy)
+}
+
+/// Validates minimum voting eligibility for an already converted note set.
+///
+/// This is useful for callers that already operate on [`NoteInfo`] values.
+pub fn validate_minimum_voting_eligibility_for_notes(
+    note_infos: &[NoteInfo],
+    policy: BundlePolicy,
+) -> Result<(), VotingError> {
+    let status = minimum_voting_eligibility_status_for_notes(note_infos, policy)?;
+    if status.distinct_note_count >= MINIMUM_VOTING_NOTE_COUNT
+        && status.eligible_weight >= MINIMUM_VOTING_WEIGHT_ZATOSHI
+    {
+        return Ok(());
+    }
+
+    Err(minimum_voting_eligibility_error(status))
+}
+
+pub(crate) fn minimum_voting_eligibility_status_for_notes(
+    note_infos: &[NoteInfo],
+    policy: BundlePolicy,
+) -> Result<MinimumVotingEligibilityStatus, VotingError> {
+    validate_notes_for_round(note_infos)?;
+    let mut seen_nullifiers = HashSet::new();
+    let distinct_note_infos = note_infos
+        .iter()
+        .filter(|note| seen_nullifiers.insert(note.nullifier.as_slice()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let distinct_note_count = distinct_note_infos.len();
+    let eligible_weight = chunk_notes_with_policy(&distinct_note_infos, policy).eligible_weight;
+    Ok(MinimumVotingEligibilityStatus {
+        distinct_note_count,
+        eligible_weight,
+    })
+}
+
+pub(crate) fn minimum_voting_eligibility_error(
+    status: MinimumVotingEligibilityStatus,
+) -> VotingError {
+    let MinimumVotingEligibilityStatus {
+        distinct_note_count,
+        eligible_weight,
+    } = status;
+    VotingError::InvalidInput {
+        message: format!(
+            "minimum voting eligibility requires at least {MINIMUM_VOTING_NOTE_COUNT} eligible notes and {MINIMUM_VOTING_WEIGHT_ZATOSHI} zatoshi voting weight; selected {distinct_note_count} distinct eligible notes with {eligible_weight} zatoshi voting weight"
+        ),
+    }
 }
 
 /// Split notes into value-aware bundles using the default policy.
@@ -200,14 +284,15 @@ mod tests {
     }
 
     fn test_note_ref(value_zatoshi: u64, voting_weight_zatoshi: u64, position: u64) -> NoteRef {
+        let tag = position as u8;
         NoteRef {
             pool: "orchard".to_string(),
             txid_hex: hex::encode([position as u8; 32]),
             output_index: position as u32,
             value_zatoshi,
             voting_weight_zatoshi,
-            commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
+            commitment: vec![tag; 32],
+            nullifier: vec![tag.wrapping_add(1); 32],
             diversifier: vec![0x03; 11],
             rho: vec![0x04; 32],
             rseed: vec![0x05; 32],
@@ -278,6 +363,107 @@ mod tests {
             voting_power_with_policy(&selected, BundlePolicy::new(1).unwrap()),
             0
         );
+    }
+
+    #[test]
+    fn minimum_voting_eligibility_rejects_one_large_note() {
+        let selected = SelectedNotes {
+            notes: vec![test_note_ref(BALLOT_DIVISOR * 10, BALLOT_DIVISOR * 10, 1)],
+            snapshot_height: 100,
+            anchor_tree_state: placeholder_tree_state(100),
+        };
+
+        let err =
+            validate_minimum_voting_eligibility(&selected, BundlePolicy::default()).unwrap_err();
+
+        assert!(matches!(err, VotingError::InvalidInput { .. }));
+        assert!(err.to_string().contains("at least 5 eligible notes"));
+    }
+
+    #[test]
+    fn minimum_voting_eligibility_accepts_five_notes_at_threshold() {
+        let note_value = BALLOT_DIVISOR / BUNDLE_NOTE_SLOTS as u64;
+        let selected = SelectedNotes {
+            notes: (0..BUNDLE_NOTE_SLOTS)
+                .map(|position| test_note_ref(note_value, note_value, position as u64 + 1))
+                .collect(),
+            snapshot_height: 100,
+            anchor_tree_state: placeholder_tree_state(100),
+        };
+
+        validate_minimum_voting_eligibility(&selected, BundlePolicy::default()).unwrap();
+    }
+
+    #[test]
+    fn minimum_voting_eligibility_rejects_five_notes_below_threshold() {
+        let note_value = (BALLOT_DIVISOR / BUNDLE_NOTE_SLOTS as u64) - 1;
+        let selected = SelectedNotes {
+            notes: (0..BUNDLE_NOTE_SLOTS)
+                .map(|position| test_note_ref(note_value, note_value, position as u64 + 1))
+                .collect(),
+            snapshot_height: 100,
+            anchor_tree_state: placeholder_tree_state(100),
+        };
+
+        let err =
+            validate_minimum_voting_eligibility(&selected, BundlePolicy::default()).unwrap_err();
+
+        assert!(matches!(err, VotingError::InvalidInput { .. }));
+        assert!(err.to_string().contains("12500000 zatoshi voting weight"));
+    }
+
+    #[test]
+    fn minimum_voting_eligibility_rejects_duplicate_notes() {
+        let note = test_note_ref(BALLOT_DIVISOR, BALLOT_DIVISOR, 1);
+        let selected = SelectedNotes {
+            notes: vec![note; BUNDLE_NOTE_SLOTS],
+            snapshot_height: 100,
+            anchor_tree_state: placeholder_tree_state(100),
+        };
+
+        let err =
+            validate_minimum_voting_eligibility(&selected, BundlePolicy::default()).unwrap_err();
+
+        assert!(matches!(err, VotingError::InvalidInput { .. }));
+        assert!(err
+            .to_string()
+            .contains("selected 1 distinct eligible notes"));
+    }
+
+    #[test]
+    fn minimum_voting_eligibility_ignores_duplicate_weight() {
+        let high_note = test_note_ref(BALLOT_DIVISOR - 5, BALLOT_DIVISOR - 5, 1);
+        let mut notes = vec![high_note.clone(), high_note];
+        notes.extend(
+            (0..(BUNDLE_NOTE_SLOTS - 1)).map(|position| test_note_ref(1, 1, position as u64 + 2)),
+        );
+        let selected = SelectedNotes {
+            notes,
+            snapshot_height: 100,
+            anchor_tree_state: placeholder_tree_state(100),
+        };
+
+        let err =
+            validate_minimum_voting_eligibility(&selected, BundlePolicy::default()).unwrap_err();
+
+        assert!(matches!(err, VotingError::InvalidInput { .. }));
+        assert!(err
+            .to_string()
+            .contains("selected 5 distinct eligible notes with 0 zatoshi"));
+    }
+
+    #[test]
+    fn minimum_voting_eligibility_preserves_underfilled_bundle_policy() {
+        let selected = SelectedNotes {
+            notes: (0..BUNDLE_NOTE_SLOTS)
+                .map(|position| test_note_ref(BALLOT_DIVISOR, BALLOT_DIVISOR, position as u64 + 1))
+                .collect(),
+            snapshot_height: 100,
+            anchor_tree_state: placeholder_tree_state(100),
+        };
+        let policy = BundlePolicy::new(1).unwrap();
+
+        validate_minimum_voting_eligibility(&selected, policy).unwrap();
     }
 
     #[test]

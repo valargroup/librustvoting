@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use ff::PrimeField;
 use pasta_curves::pallas;
 use rusqlite::{named_params, Connection, OptionalExtension};
@@ -55,6 +57,13 @@ fn note_identity_hashes_blob(notes: &[NoteInfo]) -> Vec<u8> {
     notes
         .iter()
         .flat_map(|note| note_identity_hash(note))
+        .collect()
+}
+
+fn note_nullifiers_blob(notes: &[NoteInfo]) -> Vec<u8> {
+    notes
+        .iter()
+        .flat_map(|note| note.nullifier.iter().copied())
         .collect()
 }
 
@@ -354,8 +363,9 @@ pub fn clear_round(conn: &Connection, round_id: &str, wallet_id: &str) -> Result
 ///
 /// Retained for SDK/FFI compatibility with callers that cannot provide full
 /// notes at insertion time. Rows written this way have a NULL
-/// `note_identity_hashes_blob`, so `require_bundle_notes` can only enforce the
-/// legacy position check until callers migrate to `insert_bundle_notes`.
+/// `note_identity_hashes_blob` or `note_nullifiers_blob`, so
+/// `require_bundle_notes` can only enforce the legacy position check until
+/// callers migrate to `insert_bundle_notes`.
 pub fn insert_bundle(
     conn: &Connection,
     round_id: &str,
@@ -392,16 +402,18 @@ pub fn insert_bundle_notes(
 ) -> Result<(), VotingError> {
     let positions_blob = note_positions_blob_for_notes(notes);
     let identity_hashes_blob = note_identity_hashes_blob(notes);
+    let nullifiers_blob = note_nullifiers_blob(notes);
 
     conn.execute(
-        "INSERT INTO bundles (round_id, wallet_id, bundle_index, note_positions_blob, note_identity_hashes_blob)
-         VALUES (:round_id, :wallet_id, :bundle_index, :note_positions_blob, :note_identity_hashes_blob)",
+        "INSERT INTO bundles (round_id, wallet_id, bundle_index, note_positions_blob, note_identity_hashes_blob, note_nullifiers_blob)
+         VALUES (:round_id, :wallet_id, :bundle_index, :note_positions_blob, :note_identity_hashes_blob, :note_nullifiers_blob)",
         named_params! {
             ":round_id": round_id,
             ":wallet_id": wallet_id,
             ":bundle_index": bundle_index as i64,
             ":note_positions_blob": positions_blob,
             ":note_identity_hashes_blob": identity_hashes_blob,
+            ":note_nullifiers_blob": nullifiers_blob,
         },
     )
     .map_err(|e| VotingError::Internal {
@@ -409,6 +421,94 @@ pub fn insert_bundle_notes(
     })?;
 
     Ok(())
+}
+
+pub fn store_bundle_setup_eligibility(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    distinct_note_count: usize,
+    eligible_weight_zatoshi: u64,
+) -> Result<(), VotingError> {
+    let rows = conn
+        .execute(
+            "UPDATE rounds
+         SET setup_distinct_note_count = :setup_distinct_note_count,
+             setup_eligible_weight_zatoshi = :setup_eligible_weight_zatoshi
+         WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":setup_distinct_note_count": i64::try_from(distinct_note_count)
+                    .map_err(|_| VotingError::InvalidInput {
+                        message: format!(
+                            "setup distinct note count is too large: {distinct_note_count}"
+                        ),
+                    })?,
+                ":setup_eligible_weight_zatoshi": i64::try_from(eligible_weight_zatoshi)
+                    .map_err(|_| VotingError::InvalidInput {
+                        message: format!(
+                            "setup eligible weight is too large: {eligible_weight_zatoshi}"
+                        ),
+                    })?,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to store bundle setup eligibility: {e}"),
+        })?;
+    if rows == 0 {
+        return Err(VotingError::InvalidInput {
+            message: format!("round not found: round={round_id}, wallet={wallet_id}"),
+        });
+    }
+
+    Ok(())
+}
+
+pub fn load_bundle_setup_eligibility(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Option<(usize, u64)>, VotingError> {
+    let eligibility = conn
+        .query_row(
+            "SELECT setup_distinct_note_count, setup_eligible_weight_zatoshi
+             FROM rounds
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+            },
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(|e| VotingError::InvalidInput {
+            message: format!(
+                "round not found: round={}, wallet={} ({})",
+                round_id, wallet_id, e
+            ),
+        })?;
+
+    match eligibility {
+        (Some(distinct_note_count), Some(eligible_weight_zatoshi)) => {
+            let distinct_note_count =
+                usize::try_from(distinct_note_count).map_err(|_| VotingError::Internal {
+                    message: format!(
+                        "stored setup distinct note count is negative: {distinct_note_count}"
+                    ),
+                })?;
+            let eligible_weight_zatoshi =
+                u64::try_from(eligible_weight_zatoshi).map_err(|_| VotingError::Internal {
+                    message: format!(
+                        "stored setup eligible weight is negative: {eligible_weight_zatoshi}"
+                    ),
+                })?;
+            Ok(Some((distinct_note_count, eligible_weight_zatoshi)))
+        }
+        (None, None) => Ok(None),
+        _ => Err(VotingError::Internal {
+            message: "round row has incomplete bundle setup eligibility metadata".to_string(),
+        }),
+    }
 }
 
 fn decode_note_positions_blob(blob: &[u8]) -> Result<Vec<u64>, VotingError> {
@@ -474,15 +574,19 @@ pub fn require_bundle_notes(
     bundle_index: u32,
     notes: &[NoteInfo],
 ) -> Result<(), VotingError> {
-    let (positions_blob, identity_hashes_blob): (Vec<u8>, Option<Vec<u8>>) = conn
+    let (positions_blob, identity_hashes_blob, nullifiers_blob): (
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    ) = conn
         .query_row(
-            "SELECT note_positions_blob, note_identity_hashes_blob FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+            "SELECT note_positions_blob, note_identity_hashes_blob, note_nullifiers_blob FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| VotingError::InvalidInput {
             message: format!(
@@ -502,14 +606,16 @@ pub fn require_bundle_notes(
         });
     }
 
-    // Legacy carve-out: bundles persisted before 0.5.8 were ALTER-migrated to
-    // v8 with a NULL `note_identity_hashes_blob` because the original
-    // `NoteInfo` payloads cannot be backfilled. For those rows we fall back to
-    // the position-only check above; identity verification only applies to
-    // bundles set up under 0.5.8 or later.
+    // Legacy carve-out: old bundle rows can have NULL note identity/nullifier
+    // blobs because the original `NoteInfo` payloads cannot be backfilled. For
+    // those rows we fall back to the position-only check above; identity
+    // verification only applies to rows set up through `insert_bundle_notes`.
     let Some(identity_hashes_blob) = identity_hashes_blob else {
         return Ok(());
     };
+    let nullifiers_blob = nullifiers_blob.ok_or_else(|| VotingError::Internal {
+        message: "bundle row has note identity hashes without note nullifiers".to_string(),
+    })?;
 
     if identity_hashes_blob.len() % NOTE_IDENTITY_HASH_BYTES != 0 {
         return Err(VotingError::Internal {
@@ -517,6 +623,16 @@ pub fn require_bundle_notes(
                 "corrupt note_identity_hashes_blob: length {} is not a multiple of {}",
                 identity_hashes_blob.len(),
                 NOTE_IDENTITY_HASH_BYTES
+            ),
+        });
+    }
+
+    if nullifiers_blob.len() != notes.len() * NOTE_IDENTITY_HASH_BYTES {
+        return Err(VotingError::Internal {
+            message: format!(
+                "corrupt note_nullifiers_blob: length {} does not match {} notes",
+                nullifiers_blob.len(),
+                notes.len()
             ),
         });
     }
@@ -540,6 +656,20 @@ pub fn require_bundle_notes(
             return Err(VotingError::InvalidInput {
                 message: format!(
                     "bundle_index {bundle_index} note identity mismatch at index {index}"
+                ),
+            });
+        }
+    }
+
+    for (index, (stored_nullifier, note)) in nullifiers_blob
+        .chunks_exact(NOTE_IDENTITY_HASH_BYTES)
+        .zip(notes.iter())
+        .enumerate()
+    {
+        if stored_nullifier != note.nullifier.as_slice() {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "bundle_index {bundle_index} note nullifier mismatch at index {index}"
                 ),
             });
         }
