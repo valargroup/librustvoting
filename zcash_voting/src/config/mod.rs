@@ -22,13 +22,21 @@
 //!     │dynamic bytes │
 //!     └──────┬───────┘
 //!            ▼
-//!     ┌──────────────┐      bad signature / unsupported version
-//!     │Resolve voting├──────────────────────┐
-//!     │    config    │                      │
+//!     ┌──────────────┐
+//!     │Resolve voting│
+//!     │    config    │
+//!     └──────┬───────┘
+//!            │
+//!            ▼
+//!     ┌──────────────┐      bad signature
+//!     │Authenticate  ├──────────────────────┐
+//!     │ round entries│                      │
 //!     └──────┬───────┘                      ▼
 //!            │                       .───────────────.
-//!            ▼                      ( Config error   )
-//!     ┌──────────────┐               `───────────────'
+//!            │ unsupported version  ( Config error   )
+//!            ├─────────────────────> `───────────────'
+//!            ▼
+//!     ┌──────────────┐
 //!     │Plan config   │
 //!     │   switch     │
 //!     └──────┬───────┘
@@ -68,6 +76,7 @@ const CHECKSUM_QUERY_NAME: &str = "checksum";
 const SHA256_CHECKSUM_PREFIX: &str = "sha256:";
 const VERSION_V0: &str = "v0";
 const VOTE_SERVER_VERSION_V1: &str = "v1";
+const ROUND_PARAM_BYTE_LEN: usize = 32;
 
 /// Versions of each voting-protocol component implemented by this crate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,9 +147,67 @@ pub struct ResolvedVotingConfig {
     pub vote_servers: Vec<ServiceEndpoint>,
     pub pir_endpoints: Vec<ServiceEndpoint>,
     pub supported_versions: SupportedVersions,
-    pub authenticated_round_ids: Vec<String>,
+    pub authenticated_rounds: Vec<AuthenticatedRound>,
     pub skipped_round_ids: Vec<String>,
     pub conditions: Vec<ConfigCondition>,
+}
+
+/// Dynamic round metadata authenticated by trusted static keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticatedRound {
+    pub round_id: String,
+    #[serde(with = "base64_bytes")]
+    pub ea_pk: Vec<u8>,
+}
+
+impl ResolvedVotingConfig {
+    /// Build round params from server metadata while binding trusted `ea_pk`.
+    ///
+    /// Dynamic server fields (`snapshot_height`, roots) are accepted as inputs,
+    /// but `ea_pk` is always sourced from authenticated dynamic config material.
+    pub fn trusted_voting_round_params(
+        &self,
+        round_id: String,
+        snapshot_height: u64,
+        nc_root: Vec<u8>,
+        nullifier_imt_root: Vec<u8>,
+    ) -> Result<crate::wire::VotingRoundParams, VotingConfigError> {
+        if nc_root.len() != ROUND_PARAM_BYTE_LEN {
+            return Err(VotingConfigError::InvalidInput {
+                message: format!("nc_root must be exactly {ROUND_PARAM_BYTE_LEN} bytes"),
+            });
+        }
+        if nullifier_imt_root.len() != ROUND_PARAM_BYTE_LEN {
+            return Err(VotingConfigError::InvalidInput {
+                message: format!(
+                    "nullifier_imt_root must be exactly {ROUND_PARAM_BYTE_LEN} bytes"
+                ),
+            });
+        }
+
+        let trusted_round = self
+            .authenticated_rounds
+            .iter()
+            .find(|round| round.round_id == round_id)
+            .ok_or_else(|| VotingConfigError::RemoteAuthenticationFailed {
+                message: format!("round {round_id} is not authenticated in resolved voting config"),
+            })?;
+        if trusted_round.ea_pk.len() != ROUND_PARAM_BYTE_LEN {
+            return Err(VotingConfigError::InvalidInput {
+                message: format!(
+                    "authenticated round {round_id} has invalid ea_pk length: expected {ROUND_PARAM_BYTE_LEN} bytes"
+                ),
+            });
+        }
+
+        Ok(crate::wire::VotingRoundParams {
+            vote_round_id: round_id,
+            snapshot_height,
+            ea_pk: trusted_round.ea_pk.clone(),
+            nc_root,
+            nullifier_imt_root,
+        })
+    }
 }
 
 /// Structured status emitted while resolving a voting config.
@@ -180,11 +247,16 @@ pub struct ResolvedVotingConfigSummary {
 
 impl From<&ResolvedVotingConfig> for ResolvedVotingConfigSummary {
     fn from(config: &ResolvedVotingConfig) -> Self {
+        let authenticated_round_ids = config
+            .authenticated_rounds
+            .iter()
+            .map(|round| round.round_id.clone())
+            .collect::<Vec<_>>();
         Self {
             trusted_key_fingerprint: config.trusted_key_fingerprint.clone(),
             vote_server_fingerprint: fingerprint_json(&config.vote_servers),
             pir_endpoint_fingerprint: fingerprint_json(&config.pir_endpoints),
-            authenticated_round_set_fingerprint: fingerprint_json(&config.authenticated_round_ids),
+            authenticated_round_set_fingerprint: fingerprint_json(&authenticated_round_ids),
             protocol_versions: config.supported_versions.clone(),
         }
     }
@@ -297,7 +369,7 @@ pub fn resolve_voting_config(
     let authenticated_rounds =
         authenticate_dynamic_rounds(&dynamic_config.rounds, &resolved_static.trusted_keys);
 
-    let authenticated_count = authenticated_rounds.authenticated_round_ids.len();
+    let authenticated_count = authenticated_rounds.authenticated_rounds.len();
     let skipped_count = authenticated_rounds.skipped_round_ids.len();
 
     Ok(ResolvedVotingConfig {
@@ -307,7 +379,7 @@ pub fn resolve_voting_config(
         vote_servers: dynamic_config.vote_servers,
         pir_endpoints: dynamic_config.pir_endpoints,
         supported_versions: dynamic_config.supported_versions,
-        authenticated_round_ids: authenticated_rounds.authenticated_round_ids,
+        authenticated_rounds: authenticated_rounds.authenticated_rounds,
         skipped_round_ids: authenticated_rounds.skipped_round_ids.clone(),
         conditions: vec![
             ConfigCondition {
@@ -561,7 +633,7 @@ fn validate_dynamic_config(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AuthenticatedRounds {
-    authenticated_round_ids: Vec<String>,
+    authenticated_rounds: Vec<AuthenticatedRound>,
     skipped_round_ids: Vec<String>,
 }
 
@@ -569,17 +641,20 @@ fn authenticate_dynamic_rounds(
     rounds: &BTreeMap<String, RoundEntry>,
     trusted_keys: &[TrustedKey],
 ) -> AuthenticatedRounds {
-    let mut authenticated_round_ids = Vec::new();
+    let mut authenticated_rounds = Vec::new();
     let mut skipped_round_ids = Vec::new();
     for (round_id, entry) in rounds {
         if !verify_round_entry(entry, trusted_keys) {
             skipped_round_ids.push(round_id.clone());
             continue;
         }
-        authenticated_round_ids.push(round_id.clone());
+        authenticated_rounds.push(AuthenticatedRound {
+            round_id: round_id.clone(),
+            ea_pk: entry.ea_pk.clone(),
+        });
     }
     AuthenticatedRounds {
-        authenticated_round_ids,
+        authenticated_rounds,
         skipped_round_ids,
     }
 }
@@ -815,7 +890,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolved.authenticated_round_ids, vec![ROUND_ID.to_string()]);
+        assert_eq!(
+            resolved.authenticated_rounds,
+            vec![AuthenticatedRound {
+                round_id: ROUND_ID.to_string(),
+                ea_pk: vec![7u8; 32],
+            }]
+        );
         assert!(resolved.skipped_round_ids.is_empty());
     }
 
@@ -833,7 +914,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(resolved.authenticated_round_ids.is_empty());
+        assert!(resolved.authenticated_rounds.is_empty());
         assert_eq!(resolved.skipped_round_ids, vec![ROUND_ID.to_string()]);
     }
 
@@ -851,7 +932,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolved.authenticated_round_ids, vec![ROUND_ID.to_string()]);
+        assert_eq!(
+            resolved.authenticated_rounds,
+            vec![AuthenticatedRound {
+                round_id: ROUND_ID.to_string(),
+                ea_pk: vec![7u8; 32],
+            }]
+        );
         assert_eq!(resolved.skipped_round_ids, vec![ROUND_ID_2.to_string()]);
     }
 
@@ -875,7 +962,10 @@ mod tests {
                 tally: "v0".to_string(),
                 vote_server: "v1".to_string(),
             },
-            authenticated_round_ids: vec![ROUND_ID.to_string()],
+            authenticated_rounds: vec![AuthenticatedRound {
+                round_id: ROUND_ID.to_string(),
+                ea_pk: vec![7u8; 32],
+            }],
             skipped_round_ids: vec![ROUND_ID_2.to_string()],
             conditions: vec![],
         };
@@ -888,6 +978,92 @@ mod tests {
             summary_base.authenticated_round_set_fingerprint,
             summary_with_different_skips.authenticated_round_set_fingerprint
         );
+    }
+
+    fn resolved_config_with_authenticated_round(ea_pk: Vec<u8>) -> ResolvedVotingConfig {
+        ResolvedVotingConfig {
+            source_fingerprint: "src".to_string(),
+            trusted_key_fingerprint: "keys".to_string(),
+            dynamic_config_fingerprint: "dyn".to_string(),
+            vote_servers: vec![],
+            pir_endpoints: vec![],
+            supported_versions: SupportedVersions {
+                pir: vec!["v0".to_string()],
+                vote_protocol: "v0".to_string(),
+                tally: "v0".to_string(),
+                vote_server: "v1".to_string(),
+            },
+            authenticated_rounds: vec![AuthenticatedRound {
+                round_id: ROUND_ID.to_string(),
+                ea_pk,
+            }],
+            skipped_round_ids: vec![],
+            conditions: vec![],
+        }
+    }
+
+    #[test]
+    fn trusted_voting_round_params_uses_authenticated_ea_pk() {
+        let config = resolved_config_with_authenticated_round(vec![7u8; 32]);
+
+        let params = config
+            .trusted_voting_round_params(ROUND_ID.to_string(), 123, vec![2u8; 32], vec![3u8; 32])
+            .unwrap();
+
+        assert_eq!(params.vote_round_id, ROUND_ID);
+        assert_eq!(params.snapshot_height, 123);
+        assert_eq!(params.ea_pk, vec![7u8; 32]);
+        assert_eq!(params.nc_root, vec![2u8; 32]);
+        assert_eq!(params.nullifier_imt_root, vec![3u8; 32]);
+    }
+
+    #[test]
+    fn trusted_voting_round_params_rejects_unauthenticated_round() {
+        let config = resolved_config_with_authenticated_round(vec![7u8; 32]);
+
+        let err = config
+            .trusted_voting_round_params("f".repeat(64), 123, vec![2u8; 32], vec![3u8; 32])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            VotingConfigError::RemoteAuthenticationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn trusted_voting_round_params_rejects_invalid_nc_root_length() {
+        let config = resolved_config_with_authenticated_round(vec![7u8; 32]);
+
+        let err = config
+            .trusted_voting_round_params(ROUND_ID.to_string(), 123, vec![2u8; 31], vec![3u8; 32])
+            .unwrap_err();
+
+        assert!(matches!(err, VotingConfigError::InvalidInput { .. }));
+        assert!(err.to_string().contains("nc_root must be exactly"));
+    }
+
+    #[test]
+    fn trusted_voting_round_params_rejects_invalid_nullifier_imt_root_length() {
+        let config = resolved_config_with_authenticated_round(vec![7u8; 32]);
+
+        let err = config
+            .trusted_voting_round_params(ROUND_ID.to_string(), 123, vec![2u8; 32], vec![3u8; 31])
+            .unwrap_err();
+
+        assert!(matches!(err, VotingConfigError::InvalidInput { .. }));
+        assert!(err.to_string().contains("nullifier_imt_root must be exactly"));
+    }
+
+    #[test]
+    fn trusted_voting_round_params_rejects_invalid_authenticated_ea_pk_length() {
+        let config = resolved_config_with_authenticated_round(vec![7u8; 31]);
+
+        let err = config
+            .trusted_voting_round_params(ROUND_ID.to_string(), 123, vec![2u8; 32], vec![3u8; 32])
+            .unwrap_err();
+
+        assert!(matches!(err, VotingConfigError::InvalidInput { .. }));
+        assert!(err.to_string().contains("has invalid ea_pk length"));
     }
 
     #[tokio::test]
@@ -925,7 +1101,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(resolved.authenticated_round_ids, vec![ROUND_ID.to_string()]);
+        assert_eq!(
+            resolved.authenticated_rounds,
+            vec![AuthenticatedRound {
+                round_id: ROUND_ID.to_string(),
+                ea_pk: vec![7u8; 32],
+            }]
+        );
         assert_eq!(
             requested_urls.lock().unwrap().as_slice(),
             &[
