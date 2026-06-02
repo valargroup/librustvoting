@@ -19,7 +19,8 @@ pub use crate::types::ShareDelegationRecord as ShareRecord;
 /// Share scheduling and retry policy helpers.
 pub mod policy {
     pub use crate::share_policy::{
-        is_share_ready_for_status_check, next_tracking_delay_seconds, overdue_threshold_seconds,
+        is_last_moment, is_share_ready_for_status_check, last_moment_buffer_seconds,
+        last_moment_deadline_seconds, next_tracking_delay_seconds, overdue_threshold_seconds,
         plan_share_submission, plan_share_submission_from_order, plan_share_submissions,
         resubmission_server_order, resubmission_server_order_from_configured_order,
         resubmission_server_order_from_groups, resubmission_server_order_random_bytes_required,
@@ -29,7 +30,8 @@ pub mod policy {
         share_submission_random_bytes_required, share_submission_target_count,
         share_submit_at_random_bytes_required, should_resubmit_share, shuffled_share_server_order,
         summarize_share_tracking, ShareSubmissionPlan, ShareSubmissionRandomBytesRequired,
-        ShareTimingPolicy, ShareTrackingSummary,
+        ShareTimingPolicy, ShareTrackingSummary, LAST_MOMENT_BUFFER_FRACTION_DENOMINATOR,
+        LAST_MOMENT_BUFFER_FRACTION_NUMERATOR, LAST_MOMENT_BUFFER_MAX_SECONDS,
     };
 }
 

@@ -151,6 +151,8 @@ zcash_voting
 The `share_policy` module contains pure helpers for wallet-side voting behavior
 that should stay consistent across SDKs:
 
+- last-moment helper-share window, deadline, and mode decisions from round
+  timing
 - delayed helper-share `submit_at` scheduling
 - helper target counts and randomized helper ordering
 - batch share planning with independent entropy per share
