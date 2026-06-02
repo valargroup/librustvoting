@@ -9,6 +9,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added shared last-moment round timing helpers in `share_policy` so wallet
+  integrations can derive the same helper-share buffer, deadline, and
+  `single_share` decision from ceremony start and vote end times.
 - Added the public `VOTING_HOTKEY_STORED_SECRET_LEN` constant and updated v2
   hotkey guidance so software and hardware wallets both use app-owned random
   hotkeys instead of deriving software hotkeys from wallet seed material.
