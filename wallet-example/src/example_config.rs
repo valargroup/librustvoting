@@ -12,7 +12,9 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use serde::{Deserialize, Serialize};
-use zcash_voting::config::{decide_config_switch, resolve_config, ResolveConfigError};
+use zcash_voting::config::{
+    decide_config_switch, resolve_config, AuthenticatedRound, ResolveConfigError,
+};
 use zcash_voting::wire::{
     ConfigSwitchDecision, ResolveVotingConfigOptions, ResolvedVotingConfig,
     ResolvedVotingConfigSummary,
@@ -32,7 +34,7 @@ type HyperClient = Client<HttpsConnector<HttpConnector>, RequestBody>;
 pub struct StoredConfigState {
     pub summary: ResolvedVotingConfigSummary,
     pub dynamic_config_fingerprint: String,
-    pub authenticated_round_ids: Vec<String>,
+    pub authenticated_rounds: Vec<AuthenticatedRound>,
 }
 
 impl StoredConfigState {
@@ -41,7 +43,7 @@ impl StoredConfigState {
         Self {
             summary: ResolvedVotingConfigSummary::from(resolved),
             dynamic_config_fingerprint: resolved.dynamic_config_fingerprint.clone(),
-            authenticated_round_ids: resolved.authenticated_round_ids.clone(),
+            authenticated_rounds: resolved.authenticated_rounds.clone(),
         }
     }
 }
@@ -57,12 +59,37 @@ pub struct ConfigSwitchOutcome {
     pub next_state: StoredConfigState,
 }
 
+/// Builds trusted round params from resolved config and server round metadata.
+///
+/// This is the intended session-path usage of
+/// [`ResolvedVotingConfig::trusted_voting_round_params`]: use server-provided
+/// dynamic fields (`snapshot_height`, roots), but always bind `ea_pk` from the
+/// authenticated dynamic config embedded in `resolved`.
+///
+/// # Errors
+///
+/// Returns an error if the requested round is not authenticated in
+/// `resolved` or if any binary field has an invalid length.
+pub fn build_trusted_round_params_from_status(
+    resolved: &ResolvedVotingConfig,
+    round_id: String,
+    snapshot_height: u64,
+    nc_root: Vec<u8>,
+    nullifier_imt_root: Vec<u8>,
+) -> Result<zcash_voting::wire::VotingRoundParams> {
+    resolved
+        .trusted_voting_round_params(round_id, snapshot_height, nc_root, nullifier_imt_root)
+        .map_err(|e| anyhow!("build trusted round params failed: {e}"))
+}
+
 /// Resolves and authenticates voting config from a static source URL.
 ///
 /// This drives the crate-owned [`resolve_config`] orchestrator with the example
 /// HTTPS transport, fetching the static trust anchor and then the dynamic config
-/// it points at. Transport and config errors are flattened into one `anyhow`
-/// chain so example callers can surface a single message.
+/// it points at. During resolution, round entries are authenticated against the
+/// trusted static keys before `ResolvedVotingConfig` is returned. Transport and
+/// config errors are flattened into one `anyhow` chain so example callers can
+/// surface a single message.
 ///
 /// # Errors
 ///

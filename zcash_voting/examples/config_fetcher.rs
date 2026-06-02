@@ -9,7 +9,9 @@ use hyper_util::{
 };
 use serde::{Deserialize, Serialize};
 use std::{fs, io::ErrorKind, path::PathBuf};
-use zcash_voting::config::{decide_config_switch, resolve_config, ResolveConfigError};
+use zcash_voting::config::{
+    decide_config_switch, resolve_config, AuthenticatedRound, ResolveConfigError,
+};
 use zcash_voting::wire::{
     ResolveVotingConfigOptions, ResolvedVotingConfig, ResolvedVotingConfigSummary,
 };
@@ -43,7 +45,7 @@ async fn main() -> Result<()> {
             let next_state = StoredConfigState {
                 summary: next_summary,
                 dynamic_config_fingerprint: resolved.dynamic_config_fingerprint,
-                authenticated_round_ids: resolved.authenticated_round_ids,
+                authenticated_rounds: resolved.authenticated_rounds,
             };
             write_state(&state_path, &next_state)?;
             println!("state written: {}", state_path.display());
@@ -82,7 +84,7 @@ impl Command {
 struct StoredConfigState {
     summary: ResolvedVotingConfigSummary,
     dynamic_config_fingerprint: String,
-    authenticated_round_ids: Vec<String>,
+    authenticated_rounds: Vec<AuthenticatedRound>,
 }
 
 async fn fetch_resolved_config(
@@ -105,7 +107,7 @@ fn print_resolved_config(resolved: &ResolvedVotingConfig) {
     println!("PIR endpoints: {}", resolved.pir_endpoints.len());
     println!(
         "authenticated rounds: {}",
-        resolved.authenticated_round_ids.len()
+        resolved.authenticated_rounds.len()
     );
 }
 
