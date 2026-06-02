@@ -209,17 +209,6 @@ pub struct ResolveDelegationLwdParams<'a> {
     pub round_name: &'a str,
 }
 
-/// Parameters for gathering delegation inputs from wallet and lightwalletd state.
-pub struct GatherDelegationParams<'a, N> {
-    pub db_path: &'a str,
-    pub lightwalletd_url: &'a str,
-    pub wallet_network: N,
-    pub network: Network,
-    pub round_params: crate::VotingRoundParams,
-    pub round_name: &'a str,
-    pub account_uuid: &'a str,
-    pub voting_hotkey: &'a VotingHotkey,
-}
 /// Lightwalletd-derived inputs for delegation precompute.
 #[derive(Clone, Debug)]
 pub struct DelegationLwdInputs {
