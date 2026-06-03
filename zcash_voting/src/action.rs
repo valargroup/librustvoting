@@ -412,12 +412,7 @@ pub fn build_governance_pczt(
     // note for cmx_new, so Phase 1 must use the same value and rseed.
     let ovk = fvk.to_ovk(Scope::External);
     let memo = {
-        let zec_whole = total_weight / 100_000_000;
-        let zec_frac = total_weight % 100_000_000;
-        let memo_str = format!(
-            "I am authorizing this hotkey managed by my wallet to vote on {} with {}.{:08} ZEC.",
-            round_name, zec_whole, zec_frac
-        );
+        let memo_str = crate::delegate::display_memo(round_name, total_weight);
         let mut buf = [0u8; 512];
         let bytes = memo_str.as_bytes();
         let len = bytes.len().min(512);
