@@ -364,7 +364,7 @@ mod tree_sync_tests {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
         db.create_round(&round_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[note(0)]).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes(5)).unwrap();
         db.store_van_position(ROUND_ID, 0, 0).unwrap();
         let server = start_tree_server(1, vec![1], 2);
 
@@ -510,17 +510,22 @@ mod tree_sync_tests {
     }
 
     fn note(position: u64) -> NoteInfo {
+        let byte = position as u8;
         NoteInfo {
-            commitment: vec![1; 32],
-            nullifier: vec![2; 32],
+            commitment: vec![byte.wrapping_add(1); 32],
+            nullifier: vec![byte.wrapping_add(11); 32],
             value: crate::governance::BALLOT_DIVISOR,
             position,
-            diversifier: vec![3; 11],
-            rho: vec![4; 32],
-            rseed: vec![5; 32],
+            diversifier: vec![byte.wrapping_add(21); 11],
+            rho: vec![byte.wrapping_add(31); 32],
+            rseed: vec![byte.wrapping_add(41); 32],
             scope: 0,
             ufvk_str: "uviewtest".to_string(),
         }
+    }
+
+    fn notes(count: u64) -> Vec<NoteInfo> {
+        (0..count).map(note).collect()
     }
 }
 
@@ -575,7 +580,7 @@ mod session_reset_tests {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
         db.create_round(&round_params(ROUND_ID), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[note(0), note(1)]).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes(6)).unwrap();
         seed_unsigned_setup_fields(&db, ROUND_ID, 0);
         seed_unsigned_setup_fields(&db, ROUND_ID, 1);
 
@@ -590,7 +595,7 @@ mod session_reset_tests {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
         db.create_round(&round_params(ROUND_ID), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[note(0), note(1)]).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes(6)).unwrap();
         seed_unsigned_setup_fields(&db, ROUND_ID, 0);
         seed_unsigned_setup_fields(&db, ROUND_ID, 1);
         db.store_keystone_signature(ROUND_ID, 0, &[0x11; 64], &[0xAA; 32], &[0x22; 32])
@@ -607,10 +612,11 @@ mod session_reset_tests {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
         db.create_round(&round_params(ROUND_ID), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[note(0), note(1)]).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes(6)).unwrap();
         seed_unsigned_setup_fields(&db, ROUND_ID, 0);
         seed_unsigned_setup_fields(&db, ROUND_ID, 1);
-        db.store_delegation_tx_hash(ROUND_ID, 0, "submitted-tx").unwrap();
+        db.store_delegation_tx_hash(ROUND_ID, 0, "submitted-tx")
+            .unwrap();
 
         reset_voting_session_state(&db, ROUND_ID).unwrap();
 
@@ -623,9 +629,10 @@ mod session_reset_tests {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
         db.create_round(&round_params(ROUND_ID), None).unwrap();
-        db.create_round(&round_params(OTHER_ROUND_ID), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[note(0)]).unwrap();
-        db.ensure_bundles(OTHER_ROUND_ID, &[note(0)]).unwrap();
+        db.create_round(&round_params(OTHER_ROUND_ID), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &notes(5)).unwrap();
+        db.ensure_bundles(OTHER_ROUND_ID, &notes(5)).unwrap();
         seed_unsigned_setup_fields(&db, ROUND_ID, 0);
         seed_unsigned_setup_fields(&db, OTHER_ROUND_ID, 0);
 
@@ -636,16 +643,21 @@ mod session_reset_tests {
     }
 
     fn note(position: u64) -> NoteInfo {
+        let byte = position as u8;
         NoteInfo {
-            commitment: vec![1; 32],
-            nullifier: vec![2; 32],
+            commitment: vec![byte.wrapping_add(1); 32],
+            nullifier: vec![byte.wrapping_add(11); 32],
             value: crate::governance::BALLOT_DIVISOR,
             position,
-            diversifier: vec![3; 11],
-            rho: vec![4; 32],
-            rseed: vec![5; 32],
+            diversifier: vec![byte.wrapping_add(21); 11],
+            rho: vec![byte.wrapping_add(31); 32],
+            rseed: vec![byte.wrapping_add(41); 32],
             scope: 0,
             ufvk_str: "uviewtest".to_string(),
         }
+    }
+
+    fn notes(count: u64) -> Vec<NoteInfo> {
+        (0..count).map(note).collect()
     }
 }

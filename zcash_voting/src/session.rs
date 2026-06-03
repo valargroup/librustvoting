@@ -1084,24 +1084,29 @@ mod tests {
     }
 
     fn note(position: u64) -> NoteInfo {
+        let byte = position as u8;
         NoteInfo {
-            commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
+            commitment: vec![byte.wrapping_add(0x01); 32],
+            nullifier: vec![byte.wrapping_add(0x11); 32],
             value: crate::governance::BALLOT_DIVISOR,
             position,
-            diversifier: vec![0x03; 11],
-            rho: vec![0x04; 32],
-            rseed: vec![0x05; 32],
+            diversifier: vec![byte.wrapping_add(0x21); 11],
+            rho: vec![byte.wrapping_add(0x31); 32],
+            rseed: vec![byte.wrapping_add(0x41); 32],
             scope: 0,
             ufvk_str: "uview1test".to_string(),
         }
+    }
+
+    fn notes(count: u64) -> Vec<NoteInfo> {
+        (0..count).map(note).collect()
     }
 
     fn db_with_bundle() -> VotingDb {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(W);
         db.create_round(&round_params(), None).unwrap();
-        db.ensure_bundles(ROUND, &[note(0)]).unwrap();
+        db.ensure_bundles(ROUND, &notes(5)).unwrap();
         db
     }
 

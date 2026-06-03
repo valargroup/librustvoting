@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     note_bundling::{
-        chunk_notes_with_policy, minimum_voting_eligibility_status_for_notes, BundlePolicy,
+        chunk_notes_with_policy, minimum_voting_eligibility_error,
+        minimum_voting_eligibility_status_for_notes, BundlePolicy, MINIMUM_VOTING_NOTE_COUNT,
+        MINIMUM_VOTING_WEIGHT_ZATOSHI,
     },
     storage::{queries, RoundState, VotingDb as InnerVotingDb},
     types::{NoteInfo, VotingError, VotingRoundParams},
@@ -349,6 +351,11 @@ impl VotingDb {
         let existing_count = self.get_bundle_count(round_id)?;
 
         if existing_count == 0 {
+            if eligibility.distinct_note_count < MINIMUM_VOTING_NOTE_COUNT
+                || eligibility.eligible_weight < MINIMUM_VOTING_WEIGHT_ZATOSHI
+            {
+                return Err(minimum_voting_eligibility_error(eligibility));
+            }
             let (bundle_count, eligible_weight) =
                 self.persist_bundle_plan(round_id, &plan, eligibility)?;
             return Ok(BundleLayout {
@@ -555,6 +562,10 @@ mod tests {
         }
     }
 
+    fn notes(count: u64, value: u64) -> Vec<NoteInfo> {
+        (0..count).map(|position| note(position, value)).collect()
+    }
+
     #[test]
     fn validate_bundle_index_rejects_out_of_range() {
         assert!(validate_bundle_index(2, 0, "voting").is_ok());
@@ -570,24 +581,37 @@ mod tests {
     #[test]
     fn ensure_bundles_creates_and_validates_idempotently() {
         let db = test_db("wallet-a");
-        let notes = vec![note(0, crate::governance::BALLOT_DIVISOR)];
+        let notes = notes(5, crate::governance::BALLOT_DIVISOR);
 
         let created = db.ensure_bundles(ROUND_ID, &notes).unwrap();
         let reused = db.ensure_bundles(ROUND_ID, &notes).unwrap();
 
         assert_eq!(created.bundle_count, 1);
-        assert_eq!(created.eligible_weight, crate::governance::BALLOT_DIVISOR);
+        assert_eq!(
+            created.eligible_weight,
+            5 * crate::governance::BALLOT_DIVISOR
+        );
         assert_eq!(reused, created);
+    }
+
+    #[test]
+    fn ensure_bundles_rejects_below_minimum_voting_eligibility() {
+        let db = test_db("wallet-ineligible");
+        let err = db
+            .ensure_bundles(ROUND_ID, &[note(0, crate::governance::BALLOT_DIVISOR)])
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("minimum voting eligibility"),
+            "{err}"
+        );
+        assert_eq!(db.round(ROUND_ID).unwrap().unwrap().bundle_count, 0);
     }
 
     #[test]
     fn ensure_bundles_uses_custom_real_note_capacity() {
         let db = test_db("wallet-policy");
-        let notes = vec![
-            note(0, crate::governance::BALLOT_DIVISOR),
-            note(1, crate::governance::BALLOT_DIVISOR),
-            note(2, crate::governance::BALLOT_DIVISOR),
-        ];
+        let notes = notes(5, crate::governance::BALLOT_DIVISOR);
         let policy = BundlePolicy::new(1).unwrap();
 
         let layout = db
@@ -595,10 +619,10 @@ mod tests {
             .unwrap();
         let bundles = note_bundles_with_policy(&notes, policy).unwrap();
 
-        assert_eq!(layout.bundle_count, 3);
+        assert_eq!(layout.bundle_count, 5);
         assert_eq!(
             layout.eligible_weight,
-            3 * crate::governance::BALLOT_DIVISOR
+            5 * crate::governance::BALLOT_DIVISOR
         );
         assert!(bundles.iter().all(|bundle| bundle.len() == 1));
         assert_eq!(
@@ -637,13 +661,13 @@ mod tests {
     #[test]
     fn ensure_bundles_rejects_changed_existing_bundle_identity() {
         let db = test_db("wallet-b");
-        db.ensure_bundles(ROUND_ID, &[note(0, crate::governance::BALLOT_DIVISOR)])
-            .unwrap();
+        let notes = notes(5, crate::governance::BALLOT_DIVISOR);
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
 
-        let mut substituted = note(0, crate::governance::BALLOT_DIVISOR);
-        substituted.nullifier[0] ^= 0x01;
+        let mut substituted = notes;
+        substituted[0].nullifier[0] ^= 0x01;
 
-        let err = db.ensure_bundles(ROUND_ID, &[substituted]).unwrap_err();
+        let err = db.ensure_bundles(ROUND_ID, &substituted).unwrap_err();
 
         assert!(err.to_string().contains("note identity mismatch"), "{err}");
     }
@@ -703,11 +727,7 @@ mod tests {
     #[test]
     fn ensure_bundles_with_skipped_suffix_uses_custom_policy() {
         let db = test_db("wallet-policy-skip");
-        let notes = vec![
-            note(0, crate::governance::BALLOT_DIVISOR),
-            note(1, crate::governance::BALLOT_DIVISOR),
-            note(2, crate::governance::BALLOT_DIVISOR),
-        ];
+        let notes = notes(5, crate::governance::BALLOT_DIVISOR);
         let policy = BundlePolicy::new(1).unwrap();
         db.ensure_bundles_with_policy(ROUND_ID, &notes, policy)
             .unwrap();

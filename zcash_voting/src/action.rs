@@ -221,10 +221,6 @@ pub fn build_governance_pczt(
 ) -> Result<GovernancePczt, VotingError> {
     validate_notes(notes)?;
     validate_round_params(params)?;
-    crate::note_bundling::validate_minimum_voting_eligibility_for_notes(
-        notes,
-        crate::note_bundling::BundlePolicy::default(),
-    )?;
 
     build_governance_pczt_for_bundle(
         notes,
@@ -854,8 +850,8 @@ mod tests {
     const MOCK_ACCOUNT: u32 = 0;
 
     #[test]
-    fn test_build_governance_pczt_rejects_one_note() {
-        let err = build_governance_pczt(
+    fn test_build_governance_pczt_allows_underfilled_bundle() {
+        let result = build_governance_pczt(
             &[mock_note()],
             &mock_params(),
             &mock_fvk_bytes(),
@@ -867,12 +863,11 @@ mod tests {
             "Test Round",
             &sample_padded_note_secrets(1).unwrap(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.to_string().contains("minimum voting eligibility"),
-            "{err}"
-        );
+        assert_eq!(result.gov_nullifiers.len(), BUNDLE_NOTE_SLOTS);
+        assert_eq!(result.padded_cmx.len(), BUNDLE_NOTE_SLOTS - 1);
+        assert_eq!(result.dummy_nullifiers.len(), BUNDLE_NOTE_SLOTS - 1);
     }
 
     #[test]
@@ -999,7 +994,7 @@ mod tests {
         let note = mock_note();
         let params = mock_params();
         let fvk_bytes = mock_fvk_bytes();
-        let err = build_governance_pczt(
+        let result = build_governance_pczt(
             &[note.clone()],
             &params,
             &fvk_bytes,
@@ -1011,12 +1006,11 @@ mod tests {
             "Test Round",
             &sample_padded_note_secrets(1).unwrap(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.to_string().contains("minimum voting eligibility"),
-            "{err}"
-        );
+        assert_eq!(result.gov_nullifiers.len(), BUNDLE_NOTE_SLOTS);
+        assert_eq!(result.padded_cmx.len(), BUNDLE_NOTE_SLOTS - 1);
+        assert_eq!(result.dummy_nullifiers.len(), BUNDLE_NOTE_SLOTS - 1);
     }
 
     #[test]

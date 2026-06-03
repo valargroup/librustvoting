@@ -1647,6 +1647,10 @@ mod tests {
         }
     }
 
+    fn identity_test_notes(count: u8) -> Vec<NoteInfo> {
+        (0..count).map(identity_note_with_position).collect()
+    }
+
     fn note_info_for_witness(witness: &WitnessData) -> NoteInfo {
         let position = u8::try_from(witness.position).expect("test fixture position fits in u8");
         NoteInfo {
@@ -2028,8 +2032,8 @@ mod tests {
         // A full slot count of 13M notes fits in one default bundle.
         let notes: Vec<NoteInfo> = (0..BUNDLE_NOTE_SLOTS)
             .map(|i| NoteInfo {
-                commitment: vec![0x01; 32],
-                nullifier: vec![0x02; 32],
+                commitment: vec![i as u8 + 1; 32],
+                nullifier: vec![i as u8 + 0x11; 32],
                 value: 13_000_000,
                 position: i as u64,
                 diversifier: vec![0; 11],
@@ -2051,7 +2055,7 @@ mod tests {
     fn test_ensure_bundles_creates_once_then_reuses_matching_rows() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        let notes = vec![identity_test_note()];
+        let notes = identity_test_notes(5);
 
         let created = db.ensure_bundles(ROUND_ID, &notes).unwrap();
         let reused = db.ensure_bundles(ROUND_ID, &notes).unwrap();
@@ -2065,21 +2069,11 @@ mod tests {
     fn test_ensure_bundles_rejects_current_note_selection_drift() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
-            .unwrap();
+        let notes = identity_test_notes(5);
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
 
         let shape_err = db
-            .ensure_bundles(
-                ROUND_ID,
-                &[
-                    identity_test_note(),
-                    identity_note_with_position(1),
-                    identity_note_with_position(2),
-                    identity_note_with_position(3),
-                    identity_note_with_position(4),
-                    identity_note_with_position(5),
-                ],
-            )
+            .ensure_bundles(ROUND_ID, &identity_test_notes(6))
             .expect_err("different bundle count must not match persisted rows");
         assert!(
             shape_err
@@ -2088,10 +2082,10 @@ mod tests {
             "{shape_err}"
         );
 
-        let mut substituted = identity_test_note();
-        substituted.nullifier[0] ^= 0x01;
+        let mut substituted = notes;
+        substituted[0].nullifier[0] ^= 0x01;
         let identity_err = db
-            .ensure_bundles(ROUND_ID, &[substituted])
+            .ensure_bundles(ROUND_ID, &substituted)
             .expect_err("same-position note substitution must be rejected");
         assert!(
             identity_err.to_string().contains("note identity mismatch"),
@@ -2228,17 +2222,19 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let notes = vec![NoteInfo {
-            commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
-            value: 13_000_000,
-            position: 0,
-            diversifier: vec![0; 11],
-            rho: vec![0; 32],
-            rseed: vec![0; 32],
-            scope: 0,
-            ufvk_str: String::new(),
-        }];
+        let notes = (0..crate::MINIMUM_VOTING_NOTE_COUNT)
+            .map(|i| NoteInfo {
+                commitment: vec![i as u8 + 1; 32],
+                nullifier: vec![i as u8 + 0x11; 32],
+                value: 13_000_000,
+                position: i as u64,
+                diversifier: vec![0; 11],
+                rho: vec![0; 32],
+                rseed: vec![0; 32],
+                scope: 0,
+                ufvk_str: String::new(),
+            })
+            .collect::<Vec<_>>();
         db.ensure_bundles(ROUND_ID, &notes).unwrap();
 
         let mut substituted_notes = notes.clone();
@@ -2275,21 +2271,7 @@ mod tests {
             scope: 0,
             ufvk_str: String::new(),
         }];
-        db.ensure_bundles(ROUND_ID, &notes).unwrap();
-        let keys = DelegationKeys {
-            fvk_bytes: vec![0; 96],
-            hotkey_raw_address: [0; 43],
-            seed_fingerprint: [0; 32],
-            account_index: 0,
-            address_index: 0,
-            network: Network::Testnet,
-            coin_type: Network::Testnet.network_type().coin_type(),
-            round_name: "Demo Round".to_string(),
-        };
-
-        let err = db
-            .build_governance_pczt(ROUND_ID, 0, &notes, &keys, 0xC8E71055)
-            .unwrap_err();
+        let err = db.ensure_bundles(ROUND_ID, &notes).unwrap_err();
 
         assert!(
             err.to_string().contains("at least 5 eligible notes"),
@@ -2320,21 +2302,7 @@ mod tests {
                 ufvk_str: format!("uview-{i}"),
             })
             .collect::<Vec<_>>();
-        db.ensure_bundles(ROUND_ID, &notes).unwrap();
-        let keys = DelegationKeys {
-            fvk_bytes: vec![0; 96],
-            hotkey_raw_address: [0; 43],
-            seed_fingerprint: [0; 32],
-            account_index: 0,
-            address_index: 0,
-            network: Network::Testnet,
-            coin_type: Network::Testnet.network_type().coin_type(),
-            round_name: "Demo Round".to_string(),
-        };
-
-        let err = db
-            .build_governance_pczt(ROUND_ID, 0, &notes, &keys, 0xC8E71055)
-            .unwrap_err();
+        let err = db.ensure_bundles(ROUND_ID, &notes).unwrap_err();
 
         assert!(
             err.to_string()
@@ -2353,10 +2321,14 @@ mod tests {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
 
-        let notes = (0..crate::MINIMUM_VOTING_NOTE_COUNT)
+        let notes = (0..=crate::MINIMUM_VOTING_NOTE_COUNT)
             .map(|i| NoteInfo {
                 commitment: vec![i as u8 + 1; 32],
-                nullifier: vec![0x02; 32],
+                nullifier: if i == crate::MINIMUM_VOTING_NOTE_COUNT {
+                    vec![0x01; 32]
+                } else {
+                    vec![i as u8 + 1; 32]
+                },
                 value: crate::MINIMUM_VOTING_WEIGHT_ZATOSHI,
                 position: i as u64,
                 diversifier: vec![i as u8; 11],
@@ -2374,8 +2346,11 @@ mod tests {
             queries::load_bundle_setup_eligibility(&conn, ROUND_ID, W)
                 .unwrap()
                 .expect("bundle setup stores eligibility metadata");
-        assert_eq!(distinct_note_count, 1);
-        assert_eq!(eligible_weight, crate::MINIMUM_VOTING_WEIGHT_ZATOSHI);
+        assert_eq!(distinct_note_count, crate::MINIMUM_VOTING_NOTE_COUNT);
+        assert_eq!(
+            eligible_weight,
+            crate::MINIMUM_VOTING_NOTE_COUNT as u64 * crate::MINIMUM_VOTING_WEIGHT_ZATOSHI
+        );
     }
 
     #[test]
@@ -2686,21 +2661,8 @@ mod tests {
     fn test_record_vote_submission() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(
-            ROUND_ID,
-            &[NoteInfo {
-                commitment: vec![0x01; 32],
-                nullifier: vec![0x02; 32],
-                value: 13_000_000,
-                position: 0,
-                diversifier: vec![0; 11],
-                rho: vec![0; 32],
-                rseed: vec![0; 32],
-                scope: 0,
-                ufvk_str: String::new(),
-            }],
-        )
-        .unwrap();
+        db.ensure_bundles(ROUND_ID, &identity_test_notes(5))
+            .unwrap();
 
         db.insert_vote_fixture(ROUND_ID, 0, 0, 0, &[0xAA; 32])
             .unwrap();
@@ -2719,7 +2681,7 @@ mod tests {
     fn test_mark_recovery_submission_writes_are_idempotent_and_conflict_checked() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+        db.ensure_bundles(ROUND_ID, &identity_test_notes(5))
             .unwrap();
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
@@ -2749,7 +2711,7 @@ mod tests {
     fn test_get_commitment_bundle_recovery_fields_reports_pending_position() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+        db.ensure_bundles(ROUND_ID, &identity_test_notes(5))
             .unwrap();
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
@@ -2792,7 +2754,7 @@ mod tests {
             "no bundle found",
         );
 
-        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+        db.ensure_bundles(ROUND_ID, &identity_test_notes(5))
             .unwrap();
         db.store_delegation_tx_hash(ROUND_ID, 0, "delegation-tx")
             .unwrap();
@@ -2847,7 +2809,7 @@ mod tests {
     fn test_clear_recovery_state_resets_vote_recovery() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+        db.ensure_bundles(ROUND_ID, &identity_test_notes(5))
             .unwrap();
         db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
             .unwrap();
@@ -2870,21 +2832,8 @@ mod tests {
     fn test_insert_vote_fixture() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(
-            ROUND_ID,
-            &[NoteInfo {
-                commitment: vec![0x01; 32],
-                nullifier: vec![0x02; 32],
-                value: 13_000_000,
-                position: 0,
-                diversifier: vec![0; 11],
-                rho: vec![0; 32],
-                rseed: vec![0; 32],
-                scope: 0,
-                ufvk_str: String::new(),
-            }],
-        )
-        .unwrap();
+        db.ensure_bundles(ROUND_ID, &identity_test_notes(5))
+            .unwrap();
 
         db.insert_vote_fixture(ROUND_ID, 0, 7, 1, &[0xAA; 32])
             .unwrap();
@@ -3191,21 +3140,8 @@ mod tests {
     fn test_share_delegation_lifecycle() {
         let db = test_db();
         db.init_round(&test_params(), None).unwrap();
-        db.ensure_bundles(
-            ROUND_ID,
-            &[NoteInfo {
-                commitment: vec![0x01; 32],
-                nullifier: vec![0x02; 32],
-                value: 13_000_000,
-                position: 0,
-                diversifier: vec![0; 11],
-                rho: vec![0; 32],
-                rseed: vec![0; 32],
-                scope: 0,
-                ufvk_str: String::new(),
-            }],
-        )
-        .unwrap();
+        db.ensure_bundles(ROUND_ID, &identity_test_notes(5))
+            .unwrap();
 
         let urls_a = vec!["https://helper-a.example".to_string()];
         let urls_b = vec!["https://helper-b.example".to_string()];

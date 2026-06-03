@@ -977,10 +977,9 @@ pub fn display_memo(round_name: &str, total_weight_zatoshi: u64) -> String {
     // ASCII round-name capacity with a 13-digit whole ZEC amount:
     // 512 - len(prefix=61) - len(".\nAmount:"=9) - len(" {whole13}.{frac8} ZEC."=28) = 414.
     // For ASCII input, this byte budget equals the maximum character count.
-    let round_name_budget = DISPLAY_MEMO_MAX_BYTES
-        .saturating_sub(
-            DISPLAY_MEMO_PREFIX.len() + DISPLAY_MEMO_ROUND_SUFFIX.len() + amount_suffix.len(),
-        );
+    let round_name_budget = DISPLAY_MEMO_MAX_BYTES.saturating_sub(
+        DISPLAY_MEMO_PREFIX.len() + DISPLAY_MEMO_ROUND_SUFFIX.len() + amount_suffix.len(),
+    );
     let round_name_visible = truncate_utf8_prefix(round_name, round_name_budget);
     let memo = format!(
         "{}{}{}{}",
@@ -1204,14 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_rejects_persisted_bundles_below_minimum_voting_eligibility() {
-        struct StaticBranchId(u32);
-        impl BranchIdProvider for StaticBranchId {
-            fn consensus_branch_id(&self) -> Result<u32, VotingError> {
-                Ok(self.0)
-            }
-        }
-
+    fn round_setup_rejects_bundles_below_minimum_voting_eligibility() {
         let voting_db = VotingDb::open_in_memory().unwrap();
         voting_db.set_wallet_id("setup-minimum-test");
         let round_params = crate::VotingRoundParams {
@@ -1223,30 +1215,9 @@ mod tests {
         };
         voting_db.init_round(&round_params, None).unwrap();
         let note = note_info(0, crate::governance::BALLOT_DIVISOR);
-        voting_db
+        let err = voting_db
             .ensure_bundles(&round_params.vote_round_id, std::slice::from_ref(&note))
-            .unwrap();
-        let keys = DelegationKeys {
-            fvk_bytes: vec![0; 96],
-            hotkey_raw_address: [0; 43],
-            seed_fingerprint: [0; 32],
-            account_index: 0,
-            address_index: 0,
-            network: Network::Testnet,
-            coin_type: Network::Testnet.network_type().coin_type(),
-            round_name: "Demo Round".to_string(),
-        };
-
-        let err = setup(
-            &voting_db,
-            &round_params.vote_round_id,
-            0,
-            &[note],
-            &keys,
-            &StaticBranchId(0x4DEC_4DF0),
-            &crate::types::NoopProgressReporter,
-        )
-        .unwrap_err();
+            .unwrap_err();
 
         assert!(
             err.to_string().contains("at least 5 eligible notes"),
@@ -1614,8 +1585,11 @@ mod tests {
 
         for amount in amount_cases {
             let memo = display_memo("Poll", amount);
-            let expected_amount_line =
-                format!("Amount: {}.{:08} ZEC.", amount / 100_000_000, amount % 100_000_000);
+            let expected_amount_line = format!(
+                "Amount: {}.{:08} ZEC.",
+                amount / 100_000_000,
+                amount % 100_000_000
+            );
 
             assert!(memo.contains("\nAmount: "));
             assert!(

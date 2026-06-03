@@ -311,10 +311,6 @@ pub fn build_and_prove_delegation(
             message: format!("expected 1..={BUNDLE_NOTE_SLOTS} notes, got {n}"),
         });
     }
-    crate::note_bundling::validate_minimum_voting_eligibility_for_notes(
-        full_notes,
-        crate::note_bundling::BundlePolicy::default(),
-    )?;
 
     build_and_prove_delegation_for_bundle(
         full_notes,
@@ -694,7 +690,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("minimum voting eligibility"));
+            .contains("merkle_witnesses count (0) must match notes count (1)"));
     }
 
     #[test]

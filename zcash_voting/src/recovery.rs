@@ -295,7 +295,8 @@ mod tests {
 
         db.set_wallet_id("wallet-recovery-other");
         db.create_round(&round_params(), None).unwrap();
-        db.ensure_bundles(ROUND_ID, &[test_note_info(0)]).unwrap();
+        let notes: Vec<_> = (0..5).map(test_note_info).collect();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
         db.store_delegation_tx_hash(ROUND_ID, 0, "wallet-b-tx")
             .unwrap();
 
@@ -492,14 +493,15 @@ mod tests {
     }
 
     fn test_note_info(position: u64) -> NoteInfo {
+        let byte = position as u8;
         NoteInfo {
-            commitment: vec![1; 32],
-            nullifier: vec![2; 32],
+            commitment: vec![byte.wrapping_add(1); 32],
+            nullifier: vec![byte.wrapping_add(11); 32],
             value: crate::governance::BALLOT_DIVISOR,
             position,
-            diversifier: vec![3; 11],
-            rho: vec![4; 32],
-            rseed: vec![5; 32],
+            diversifier: vec![byte.wrapping_add(21); 11],
+            rho: vec![byte.wrapping_add(31); 32],
+            rseed: vec![byte.wrapping_add(41); 32],
             scope: 0,
             ufvk_str: "uviewtest".to_string(),
         }
