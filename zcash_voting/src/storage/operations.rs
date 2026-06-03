@@ -1363,6 +1363,17 @@ impl VotingDb {
         queries::clear_recovery_state(&conn, round_id, &wallet_id)
     }
 
+    /// Clears unsigned delegation setup fields for one round while preserving
+    /// submitted bundles and bundles with persisted Keystone signatures.
+    pub fn clear_unsigned_delegation_setup_fields(
+        &self,
+        round_id: &str,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::clear_unsigned_delegation_setup_fields(&conn, round_id, &wallet_id)
+    }
+
     // --- Share delegation tracking ---
 
     /// Record a share delegation after sending to helper servers.
