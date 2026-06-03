@@ -2,7 +2,8 @@ use ff::{Field, PrimeField};
 use group::{Curve, Group, GroupEncoding};
 use pasta_curves::pallas;
 
-use voting_circuits::vote_proof::{build_vote_proof_from_delegation, VOTE_COMM_TREE_DEPTH};
+use voting_circuits::VOTE_COMM_TREE_DEPTH;
+use voting_circuits::vote_proof::build_vote_proof_from_delegation;
 
 use crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX;
 use crate::types::{

@@ -1,6 +1,6 @@
 [package]
 name = "vote-commitment-tree"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Append-only Poseidon Merkle tree for Vote Authority Notes and Vote Commitments in the Zcash shielded-voting protocol."
 license = "MIT OR Apache-2.0"
@@ -8,7 +8,7 @@ repository = "https://github.com/valargroup/zcash_voting"
 readme = "README.md"
 
 [dependencies]
-imt-tree = "=0.1.1"
+imt-tree = "=0.2.0"
 pasta_curves = "0.5"
 ff = "0.13"
 halo2_gadgets = { version = "0.4", default-features = false }
@@ -20,5 +20,5 @@ libc = "0.2"
 
 [dev-dependencies]
 rand = "0.8"
-orchard = { version = "=0.13.1", features = ["unstable-voting-circuits"] }
-voting-circuits = "0.6.0"
+orchard = { version = "=0.14.0", features = ["unstable-voting-circuits"] }
+voting-circuits = "=0.8.0"
