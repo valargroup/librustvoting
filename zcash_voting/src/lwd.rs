@@ -230,7 +230,7 @@ mod tests {
         );
         assert_eq!(
             branch_id_for_height(Network::Regtest, 1).unwrap(),
-            0x4DEC_4DF0
+            0x5437_F330
         );
     }
 }
