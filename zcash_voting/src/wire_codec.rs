@@ -530,14 +530,15 @@ mod tests {
         voting_weight_zatoshi: u64,
         commitment_tree_position: u64,
     ) -> NoteRef {
+        let tag = commitment_tree_position as u8;
         NoteRef {
             pool: "orchard".to_string(),
-            txid_hex: hex::encode([commitment_tree_position as u8; 32]),
+            txid_hex: hex::encode([tag; 32]),
             output_index: commitment_tree_position as u32,
             value_zatoshi,
             voting_weight_zatoshi,
-            commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
+            commitment: vec![tag; 32],
+            nullifier: vec![tag.wrapping_add(1); 32],
             diversifier: vec![0x03; 11],
             rho: vec![0x04; 32],
             rseed: vec![0x05; 32],

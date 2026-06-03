@@ -98,10 +98,9 @@ pub fn voting_power(notes: &SelectedNotes) -> u64 {
 /// Returns quantized zatoshi voting power under an explicit bundle policy.
 pub fn voting_power_with_policy(notes: &SelectedNotes, policy: BundlePolicy) -> u64 {
     let note_infos = notes.voting_note_infos();
-    if validate_notes_for_round(&note_infos).is_err() {
-        return 0;
-    }
-    chunk_notes_with_policy(&note_infos, policy).eligible_weight
+    minimum_voting_eligibility_status_and_plan_for_notes(&note_infos, policy)
+        .map(|(_, plan)| plan.eligible_weight)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +150,14 @@ pub(crate) fn minimum_voting_eligibility_status_for_notes(
     note_infos: &[NoteInfo],
     policy: BundlePolicy,
 ) -> Result<MinimumVotingEligibilityStatus, VotingError> {
+    let (status, _) = minimum_voting_eligibility_status_and_plan_for_notes(note_infos, policy)?;
+    Ok(status)
+}
+
+pub(crate) fn minimum_voting_eligibility_status_and_plan_for_notes(
+    note_infos: &[NoteInfo],
+    policy: BundlePolicy,
+) -> Result<(MinimumVotingEligibilityStatus, ChunkResult), VotingError> {
     validate_notes_for_round(note_infos)?;
     let mut seen_nullifiers = HashSet::new();
     let distinct_note_infos = note_infos
@@ -159,11 +166,12 @@ pub(crate) fn minimum_voting_eligibility_status_for_notes(
         .cloned()
         .collect::<Vec<_>>();
     let distinct_note_count = distinct_note_infos.len();
-    let eligible_weight = chunk_notes_with_policy(&distinct_note_infos, policy).eligible_weight;
-    Ok(MinimumVotingEligibilityStatus {
+    let plan = chunk_notes_with_policy(&distinct_note_infos, policy);
+    let status = MinimumVotingEligibilityStatus {
         distinct_note_count,
-        eligible_weight,
-    })
+        eligible_weight: plan.eligible_weight,
+    };
+    Ok((status, plan))
 }
 
 pub(crate) fn minimum_voting_eligibility_error(
@@ -344,6 +352,23 @@ mod tests {
 
         assert_eq!(
             voting_power_with_policy(&selected, policy),
+            BUNDLE_NOTE_SLOTS as u64 * BALLOT_DIVISOR
+        );
+    }
+
+    #[test]
+    fn voting_power_deduplicates_notes_by_nullifier() {
+        let mut selected = SelectedNotes {
+            notes: (0..BUNDLE_NOTE_SLOTS)
+                .map(|position| test_note_ref(BALLOT_DIVISOR, BALLOT_DIVISOR, position as u64))
+                .collect(),
+            snapshot_height: 100,
+            anchor_tree_state: placeholder_tree_state(100),
+        };
+        selected.notes.push(selected.notes[0].clone());
+
+        assert_eq!(
+            voting_power(&selected),
             BUNDLE_NOTE_SLOTS as u64 * BALLOT_DIVISOR
         );
     }

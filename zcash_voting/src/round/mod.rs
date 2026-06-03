@@ -11,9 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     note_bundling::{
-        chunk_notes_with_policy, minimum_voting_eligibility_error,
-        minimum_voting_eligibility_status_for_notes, BundlePolicy, MINIMUM_VOTING_NOTE_COUNT,
-        MINIMUM_VOTING_WEIGHT_ZATOSHI,
+        minimum_voting_eligibility_error, minimum_voting_eligibility_status_and_plan_for_notes,
+        BundlePolicy, MINIMUM_VOTING_NOTE_COUNT, MINIMUM_VOTING_WEIGHT_ZATOSHI,
     },
     storage::{queries, RoundState, VotingDb as InnerVotingDb},
     types::{NoteInfo, VotingError, VotingRoundParams},
@@ -137,8 +136,8 @@ pub fn note_bundles_with_policy(
     notes: &[NoteInfo],
     policy: BundlePolicy,
 ) -> Result<Vec<Vec<NoteInfo>>, VotingError> {
-    crate::types::validate_notes_for_round(notes)?;
-    Ok(chunk_notes_with_policy(notes, policy).bundles)
+    let (_, plan) = minimum_voting_eligibility_status_and_plan_for_notes(notes, policy)?;
+    Ok(plan.bundles)
 }
 
 /// Returns the unquantized zatoshi value for a bundle.
@@ -345,8 +344,8 @@ impl VotingDb {
         notes: &[NoteInfo],
         policy: BundlePolicy,
     ) -> Result<BundleLayout, VotingError> {
-        let eligibility = minimum_voting_eligibility_status_for_notes(notes, policy)?;
-        let plan = chunk_notes_with_policy(notes, policy);
+        let (eligibility, plan) =
+            minimum_voting_eligibility_status_and_plan_for_notes(notes, policy)?;
         let expected_count = plan.bundles.len() as u32;
         let existing_count = self.get_bundle_count(round_id)?;
 
@@ -591,6 +590,27 @@ mod tests {
             created.eligible_weight,
             5 * crate::governance::BALLOT_DIVISOR
         );
+        assert_eq!(reused, created);
+    }
+
+    #[test]
+    fn ensure_bundles_deduplicates_notes_before_persisting_plan() {
+        let db = test_db("wallet-duplicate-notes");
+        let mut notes = notes(5, crate::governance::BALLOT_DIVISOR);
+        notes.push(notes[0].clone());
+
+        let created = db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        let bundles = note_bundles(&notes).unwrap();
+        let reused = db.ensure_bundles(ROUND_ID, &notes).unwrap();
+
+        assert_eq!(created.bundle_count, 1);
+        assert_eq!(
+            created.eligible_weight,
+            5 * crate::governance::BALLOT_DIVISOR
+        );
+        assert_eq!(created.dropped_count, 0);
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].len(), 5);
         assert_eq!(reused, created);
     }
 
