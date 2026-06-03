@@ -120,8 +120,9 @@ pub fn voting_power_with_policy(notes: &SelectedNotes, policy: BundlePolicy) -> 
 
 /// Returns whether `notes` satisfy the minimum voting rule under `policy`.
 ///
-/// The note count is checked after de-duplicating nullifiers. The weight uses
-/// the same smart bundle quantization used for delegation setup.
+/// The note count is checked after de-duplicating nullifiers and applying the
+/// supplied bundle policy. The weight uses the same smart bundle quantization
+/// used for delegation setup.
 ///
 /// # Errors
 ///
@@ -156,11 +157,21 @@ pub(crate) fn minimum_voting_eligibility_and_plan_for_notes(
     notes: &[NoteInfo],
     policy: BundlePolicy,
 ) -> Result<(MinimumVotingEligibility, ChunkResult), VotingError> {
+    if notes.is_empty() {
+        return Ok((
+            MinimumVotingEligibility {
+                distinct_note_count: 0,
+                eligible_weight: 0,
+            },
+            chunk_notes_with_policy(notes, policy),
+        ));
+    }
     validate_notes_for_round(notes)?;
     let distinct_notes = distinct_notes_by_nullifier(notes);
     let plan = chunk_notes_with_policy(&distinct_notes, policy);
+    let surviving_note_count = plan.bundles.iter().map(Vec::len).sum();
     let eligibility = MinimumVotingEligibility {
-        distinct_note_count: distinct_notes.len(),
+        distinct_note_count: surviving_note_count,
         eligible_weight: plan.eligible_weight,
     };
     Ok((eligibility, plan))
@@ -385,6 +396,15 @@ mod tests {
     }
 
     #[test]
+    fn minimum_voting_eligibility_reports_empty_notes_as_ineligible_status() {
+        let status = minimum_voting_eligibility_for_notes(&[], BundlePolicy::default()).unwrap();
+
+        assert!(!status.is_eligible());
+        assert_eq!(status.distinct_note_count, 0);
+        assert_eq!(status.eligible_weight, 0);
+    }
+
+    #[test]
     fn minimum_voting_eligibility_rejects_single_large_note() {
         let notes = vec![make_note(BALLOT_DIVISOR * 4, 0)];
 
@@ -403,6 +423,19 @@ mod tests {
         let notes = vec![note; BUNDLE_NOTE_SLOTS];
 
         let status = minimum_voting_eligibility_for_notes(&notes, BundlePolicy::default()).unwrap();
+
+        assert!(!status.is_eligible());
+        assert_eq!(status.distinct_note_count, 1);
+        assert_eq!(status.eligible_weight, BALLOT_DIVISOR);
+    }
+
+    #[test]
+    fn minimum_voting_eligibility_counts_only_surviving_bundle_notes() {
+        let mut notes = vec![make_note(BALLOT_DIVISOR, 0)];
+        notes.extend((1..BUNDLE_NOTE_SLOTS).map(|i| make_note(100, i as u64)));
+
+        let status =
+            minimum_voting_eligibility_for_notes(&notes, BundlePolicy::new(1).unwrap()).unwrap();
 
         assert!(!status.is_eligible());
         assert_eq!(status.distinct_note_count, 1);
