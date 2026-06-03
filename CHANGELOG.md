@@ -215,6 +215,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation-oriented V2 API to the new vote/share API.
 
 ### Changed
+- Keystone delegation memo display (`delegate::display_memo`) now puts voting
+  power on its own `Amount:` line and truncates only the round name with
+  UTF-8-safe byte boundaries when the memo approaches the 512-byte signer limit,
+  so hardware-wallet displays no longer clip the trailing ZEC amount. Governance
+  PCZT memo bytes now reuse the same formatter.
 - `delegate::prepare_delegation_bundle` now takes a typed `VotingHotkey` and
   owns wallet scanned-height lookup. Callers no longer pass hotkey seed bytes
   through delegation preparation.

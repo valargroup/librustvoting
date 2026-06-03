@@ -962,18 +962,42 @@ fn redact_delegation_pczt_for_signer(pczt_bytes: &[u8]) -> Result<Vec<u8>, Votin
 /// `total_weight_zatoshi` is displayed with exact 8-decimal ZEC precision. The
 /// returned string is capped at 512 bytes to fit signer display constraints.
 pub fn display_memo(round_name: &str, total_weight_zatoshi: u64) -> String {
+    const DISPLAY_MEMO_MAX_BYTES: usize = 512;
+    const DISPLAY_MEMO_PREFIX: &str =
+        "I am authorizing this hotkey managed by my wallet to vote on ";
+    const DISPLAY_MEMO_ROUND_SUFFIX: &str = ".\nAmount:";
+
     let zec_whole = total_weight_zatoshi / 100_000_000;
     let zec_frac = total_weight_zatoshi % 100_000_000;
+    let amount_suffix = format!(" {}.{:08} ZEC.", zec_whole, zec_frac);
+    // ASCII round-name capacity with a 13-digit whole ZEC amount:
+    // 512 - len(prefix=61) - len(".\nAmount:"=9) - len(" {whole13}.{frac8} ZEC."=28) = 414.
+    // For ASCII input, this byte budget equals the maximum character count.
+    let round_name_budget = DISPLAY_MEMO_MAX_BYTES
+        .saturating_sub(
+            DISPLAY_MEMO_PREFIX.len() + DISPLAY_MEMO_ROUND_SUFFIX.len() + amount_suffix.len(),
+        );
+    let round_name_visible = truncate_utf8_prefix(round_name, round_name_budget);
     let memo = format!(
-        "I am authorizing this hotkey managed by my wallet to vote on {} with {}.{:08} ZEC.",
-        round_name, zec_whole, zec_frac
+        "{}{}{}{}",
+        DISPLAY_MEMO_PREFIX, round_name_visible, DISPLAY_MEMO_ROUND_SUFFIX, amount_suffix
     );
 
-    if memo.len() <= 512 {
-        memo
-    } else {
-        String::from_utf8_lossy(&memo.as_bytes()[..512]).into_owned()
+    debug_assert!(memo.len() <= DISPLAY_MEMO_MAX_BYTES);
+    memo
+}
+
+fn truncate_utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
     }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+
+    &value[..end]
 }
 
 fn array32(label: &str, value: Vec<u8>) -> Result<[u8; 32], VotingError> {
@@ -1398,16 +1422,115 @@ mod tests {
     fn display_memo_uses_raw_zec_precision() {
         assert_eq!(
             display_memo("Poll", 123_456_789),
-            "I am authorizing this hotkey managed by my wallet to vote on Poll with 1.23456789 ZEC."
+            "I am authorizing this hotkey managed by my wallet to vote on Poll.\nAmount: 1.23456789 ZEC."
         );
     }
 
     #[test]
     fn display_memo_truncates_long_messages() {
         let memo = display_memo(&"A".repeat(600), crate::governance::BALLOT_DIVISOR);
+        let expected_suffix = format!(
+            ".\nAmount: {}.{:08} ZEC.",
+            crate::governance::BALLOT_DIVISOR / 100_000_000,
+            crate::governance::BALLOT_DIVISOR % 100_000_000
+        );
 
         assert_eq!(memo.len(), 512);
         assert!(memo.starts_with("I am authorizing this hotkey"));
+        assert!(memo.ends_with(&expected_suffix));
+    }
+
+    #[test]
+    fn display_memo_truncation_preserves_utf8_boundaries() {
+        let memo = display_memo(&"é".repeat(300), crate::governance::BALLOT_DIVISOR);
+        let expected_suffix = format!(
+            ".\nAmount: {}.{:08} ZEC.",
+            crate::governance::BALLOT_DIVISOR / 100_000_000,
+            crate::governance::BALLOT_DIVISOR % 100_000_000
+        );
+
+        assert!(memo.len() <= 512);
+        assert!(memo.ends_with(&expected_suffix));
+        assert!(memo.is_char_boundary(memo.len()));
+    }
+
+    #[test]
+    fn display_memo_keeps_amount_line_for_varied_amount_magnitudes() {
+        let amount_cases = [
+            0_u64,
+            1_u64,
+            99_999_999_u64,
+            100_000_000_u64,
+            1_234_567_890_123_456_u64,
+            u64::MAX,
+        ];
+
+        for amount in amount_cases {
+            let memo = display_memo("Poll", amount);
+            let expected_amount_line =
+                format!("Amount: {}.{:08} ZEC.", amount / 100_000_000, amount % 100_000_000);
+
+            assert!(memo.contains("\nAmount: "));
+            assert!(
+                memo.ends_with(&expected_amount_line),
+                "memo should preserve amount line for amount={amount}, memo={memo}"
+            );
+            assert!(memo.len() <= 512);
+        }
+    }
+
+    #[test]
+    fn display_memo_allows_full_ascii_title_when_exactly_at_budget() {
+        const DISPLAY_MEMO_MAX_BYTES: usize = 512;
+        const DISPLAY_MEMO_PREFIX: &str =
+            "I am authorizing this hotkey managed by my wallet to vote on ";
+        const DISPLAY_MEMO_ROUND_SUFFIX: &str = ".\nAmount:";
+
+        let amount = 9_999_999_999_999_999_u64;
+        let amount_suffix = format!(" {}.{:08} ZEC.", amount / 100_000_000, amount % 100_000_000);
+        let title_budget = DISPLAY_MEMO_MAX_BYTES
+            - DISPLAY_MEMO_PREFIX.len()
+            - DISPLAY_MEMO_ROUND_SUFFIX.len()
+            - amount_suffix.len();
+        let title = "A".repeat(title_budget);
+
+        let memo = display_memo(&title, amount);
+        assert_eq!(memo.len(), 512);
+        assert!(memo.contains(&format!("vote on {}", title)));
+        assert!(memo.ends_with(&format!("Amount:{amount_suffix}")));
+    }
+
+    #[test]
+    fn display_memo_truncates_over_budget_ascii_title_only() {
+        const DISPLAY_MEMO_MAX_BYTES: usize = 512;
+        const DISPLAY_MEMO_PREFIX: &str =
+            "I am authorizing this hotkey managed by my wallet to vote on ";
+        const DISPLAY_MEMO_ROUND_SUFFIX: &str = ".\nAmount:";
+
+        let amount = 9_999_999_999_999_999_u64;
+        let amount_suffix = format!(" {}.{:08} ZEC.", amount / 100_000_000, amount % 100_000_000);
+        let title_budget = DISPLAY_MEMO_MAX_BYTES
+            - DISPLAY_MEMO_PREFIX.len()
+            - DISPLAY_MEMO_ROUND_SUFFIX.len()
+            - amount_suffix.len();
+        let title = "B".repeat(title_budget + 20);
+
+        let memo = display_memo(&title, amount);
+        assert_eq!(memo.len(), 512);
+        assert!(memo.contains(&format!("vote on {}", "B".repeat(title_budget))));
+        assert!(memo.ends_with(&format!("Amount:{amount_suffix}")));
+    }
+
+    #[test]
+    fn display_memo_truncates_unicode_title_without_breaking_utf8() {
+        let title = "🙂".repeat(300);
+        let amount = 42_u64;
+
+        let memo = display_memo(&title, amount);
+        assert!(memo.len() <= 512);
+        assert!(memo.is_char_boundary(memo.len()));
+        assert!(memo.contains("\nAmount: "));
+        assert!(memo.ends_with("Amount: 0.00000042 ZEC."));
     }
 
     #[test]
