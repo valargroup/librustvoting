@@ -9,6 +9,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added an optional `BundlePolicy` threshold that starts a new bundle when
+  adding a note would push the current bundle over the threshold.
 - Added shared last-moment round timing helpers in `share_policy` so wallet
   integrations can derive the same helper-share buffer, deadline, and
   `single_share` decision from ceremony start and vote end times.
