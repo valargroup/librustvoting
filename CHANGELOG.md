@@ -9,6 +9,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## V2 API
 
 ### Added
+- Added an optional `BundlePolicy` threshold for isolating large notes into
+  one-real-note bundles while keeping normal packing for smaller notes.
 - Added shared last-moment round timing helpers in `share_policy` so wallet
   integrations can derive the same helper-share buffer, deadline, and
   `single_share` decision from ceremony start and vote end times.

@@ -21,6 +21,7 @@ pub const MINIMUM_VOTING_WEIGHT_ZATOSHI: u64 = BALLOT_DIVISOR;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BundlePolicy {
     max_real_notes_per_bundle: usize,
+    isolate_notes_at_or_above_zatoshi: Option<u64>,
 }
 
 impl BundlePolicy {
@@ -34,6 +35,7 @@ impl BundlePolicy {
         if (1..=BUNDLE_NOTE_SLOTS).contains(&max_real_notes_per_bundle) {
             Ok(Self {
                 max_real_notes_per_bundle,
+                isolate_notes_at_or_above_zatoshi: None,
             })
         } else {
             Err(VotingError::InvalidInput {
@@ -68,12 +70,27 @@ impl BundlePolicy {
     pub fn max_real_notes_per_bundle(self) -> usize {
         self.max_real_notes_per_bundle
     }
+
+    /// Returns a copy of this policy that isolates notes at or above `threshold_zatoshi`.
+    ///
+    /// Isolated notes are planned as one-real-note bundles. Notes below the
+    /// threshold continue to use the normal bundle packing policy.
+    pub fn with_isolated_note_threshold(mut self, threshold_zatoshi: u64) -> Self {
+        self.isolate_notes_at_or_above_zatoshi = Some(threshold_zatoshi);
+        self
+    }
+
+    /// Returns the optional note value threshold for isolated bundles.
+    pub fn isolated_note_threshold(self) -> Option<u64> {
+        self.isolate_notes_at_or_above_zatoshi
+    }
 }
 
 impl Default for BundlePolicy {
     fn default() -> Self {
         Self {
             max_real_notes_per_bundle: BUNDLE_NOTE_SLOTS,
+            isolate_notes_at_or_above_zatoshi: None,
         }
     }
 }
@@ -206,10 +223,11 @@ pub fn chunk_notes(notes: &[NoteInfo]) -> ChunkResult {
 ///
 /// Algorithm:
 /// 1. Sort notes by value DESC, then position ASC as tiebreaker
-/// 2. Fill bundles sequentially to policy capacity
-/// 3. Drop bundles with total < BALLOT_DIVISOR
-/// 4. Re-sort notes within each surviving bundle by position
-/// 5. Sort surviving bundles by total value DESC (min position as tiebreaker)
+/// 2. Isolate notes at or above the optional threshold
+/// 3. Fill remaining bundles sequentially to policy capacity
+/// 4. Drop bundles with total < BALLOT_DIVISOR
+/// 5. Re-sort notes within each surviving bundle by position
+/// 6. Sort surviving bundles by total value DESC (min position as tiebreaker)
 ///
 /// Sequential packing concentrates high-value notes in early bundles, maximizing
 /// per-bundle VAN weight and minimizing quantization loss. Dust notes naturally
@@ -229,22 +247,40 @@ pub fn chunk_notes_with_policy(notes: &[NoteInfo], policy: BundlePolicy) -> Chun
     let mut sorted = notes.to_vec();
     sorted.sort_by(|a, b| b.value.cmp(&a.value).then(a.position.cmp(&b.position)));
 
-    // Step 2: Fill bundles sequentially to the configured real-note capacity.
+    // Step 2: Isolate threshold-sized notes, then fill the rest sequentially
+    // to the configured real-note capacity.
     let mut bundle_notes: Vec<Vec<NoteInfo>> = Vec::new();
     let mut bundle_totals: Vec<u64> = Vec::new();
     let max_real_notes = policy.max_real_notes_per_bundle();
+    let isolated_note_threshold = policy.isolated_note_threshold();
+    let mut packable_notes = Vec::new();
 
     for note in &sorted {
-        if bundle_notes.is_empty() || bundle_notes.last().unwrap().len() >= max_real_notes {
-            bundle_notes.push(Vec::new());
-            bundle_totals.push(0);
+        if isolated_note_threshold.is_some_and(|threshold| note.value >= threshold) {
+            bundle_notes.push(vec![note.clone()]);
+            bundle_totals.push(note.value);
+        } else {
+            packable_notes.push(note.clone());
         }
-        let last = bundle_notes.len() - 1;
-        bundle_totals[last] += note.value;
-        bundle_notes[last].push(note.clone());
     }
 
-    // Step 3: Drop bundles with total < BALLOT_DIVISOR.
+    let mut current_packable_bundle: Option<usize> = None;
+    for note in packable_notes {
+        let needs_new_bundle = match current_packable_bundle {
+            Some(index) => bundle_notes[index].len() >= max_real_notes,
+            None => true,
+        };
+        if needs_new_bundle {
+            bundle_notes.push(Vec::new());
+            bundle_totals.push(0);
+            current_packable_bundle = Some(bundle_notes.len() - 1);
+        }
+        let last = current_packable_bundle.expect("packable bundle index was just initialized");
+        bundle_totals[last] += note.value;
+        bundle_notes[last].push(note);
+    }
+
+    // Step 4: Drop bundles with total < BALLOT_DIVISOR.
     let total_notes: usize = bundle_notes.iter().map(|b| b.len()).sum();
     let mut surviving: Vec<(u64, Vec<NoteInfo>)> = Vec::new();
     let mut eligible_weight: u64 = 0;
@@ -649,6 +685,76 @@ mod tests {
         assert_eq!(result.bundles[0].len(), 2);
         assert_eq!(result.dropped_count, 3);
         assert_eq!(result.eligible_weight, 25_000_000);
+    }
+
+    #[test]
+    fn test_chunk_notes_isolates_threshold_notes_and_packs_smaller_notes() {
+        let threshold = 500 * BALLOT_DIVISOR;
+        let notes = vec![
+            make_note(500 * BALLOT_DIVISOR, 0),
+            make_note(400 * BALLOT_DIVISOR, 1),
+            make_note(200 * BALLOT_DIVISOR, 2),
+        ];
+        let policy = BundlePolicy::default().with_isolated_note_threshold(threshold);
+
+        let result = chunk_notes_with_policy(&notes, policy);
+        let bundle_positions: Vec<Vec<u64>> = result
+            .bundles
+            .iter()
+            .map(|bundle| bundle.iter().map(|note| note.position).collect())
+            .collect();
+
+        assert_eq!(result.bundles.len(), 2);
+        assert_eq!(result.dropped_count, 0);
+        assert_eq!(result.eligible_weight, 1_100 * BALLOT_DIVISOR);
+        assert!(bundle_positions.contains(&vec![0]));
+        assert!(bundle_positions.contains(&vec![1, 2]));
+    }
+
+    #[test]
+    fn test_chunk_notes_does_not_isolate_small_notes_by_total_balance() {
+        let threshold = 500 * BALLOT_DIVISOR;
+        let notes: Vec<NoteInfo> = (0..(BUNDLE_NOTE_SLOTS * 2))
+            .map(|i| make_note(100 * BALLOT_DIVISOR, i as u64))
+            .collect();
+        let policy = BundlePolicy::default().with_isolated_note_threshold(threshold);
+
+        let result = chunk_notes_with_policy(&notes, policy);
+
+        assert_eq!(result.bundles.len(), 2);
+        assert_eq!(result.dropped_count, 0);
+        assert_eq!(result.eligible_weight, 1_000 * BALLOT_DIVISOR);
+        assert!(result
+            .bundles
+            .iter()
+            .all(|bundle| bundle.len() == BUNDLE_NOTE_SLOTS));
+    }
+
+    #[test]
+    fn test_chunk_notes_isolates_multiple_threshold_notes() {
+        let threshold = 500 * BALLOT_DIVISOR;
+        let mut notes = vec![
+            make_note(800 * BALLOT_DIVISOR, 0),
+            make_note(600 * BALLOT_DIVISOR, 1),
+        ];
+        notes.extend(
+            (2..(2 + BUNDLE_NOTE_SLOTS)).map(|i| make_note(100 * BALLOT_DIVISOR, i as u64)),
+        );
+        let policy = BundlePolicy::default().with_isolated_note_threshold(threshold);
+
+        let result = chunk_notes_with_policy(&notes, policy);
+        let bundle_positions: Vec<Vec<u64>> = result
+            .bundles
+            .iter()
+            .map(|bundle| bundle.iter().map(|note| note.position).collect())
+            .collect();
+
+        assert_eq!(result.bundles.len(), 3);
+        assert_eq!(result.dropped_count, 0);
+        assert_eq!(result.eligible_weight, 1_900 * BALLOT_DIVISOR);
+        assert!(bundle_positions.contains(&vec![0]));
+        assert!(bundle_positions.contains(&vec![1]));
+        assert!(bundle_positions.contains(&vec![2, 3, 4, 5, 6]));
     }
 
     #[test]
