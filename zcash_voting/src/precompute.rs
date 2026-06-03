@@ -120,6 +120,27 @@ pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError>
     vote_tree_sync_for(db)?.reset(round_id)
 }
 
+/// Drops cached vote tree state and, for round-scoped resets, clears unsigned
+/// delegation setup fields so interrupted Keystone requests can be rebuilt safely.
+///
+/// Round-scoped cleanup is mainly for the restart mid-signing case: if the app
+/// dies after `build_governance_pczt` persisted `pczt_sighash` (and related
+/// setup columns) but before the user finishes signing, the next startup tries
+/// to rebuild the Keystone request and `store_delegation_data` refuses to
+/// overwrite those fields. Clearing unsigned setup for that round lets setup
+/// run again without touching bundles that already have Keystone signatures or
+/// a stored `delegation_tx_hash`.
+///
+/// When `round_id` is empty, only the process-local vote tree cache is reset
+/// account-wide; no persisted delegation setup columns are cleared.
+pub fn reset_voting_session_state(db: &VotingDb, round_id: &str) -> Result<(), VotingError> {
+    reset_vote_tree(db, round_id)?;
+    if !round_id.is_empty() {
+        db.clear_unsigned_delegation_setup_fields(round_id)?;
+    }
+    Ok(())
+}
+
 fn vote_tree_sync_for(db: &VotingDb) -> Result<Arc<crate::tree_sync::VoteTreeSync>, VotingError> {
     let wallet_id = db.wallet_id();
     let mut guard = VOTE_TREE_SYNCS
@@ -479,6 +500,132 @@ mod tree_sync_tests {
             nc_root: vec![2; 32],
             nullifier_imt_root: vec![3; 32],
         }
+    }
+
+    fn note(position: u64) -> NoteInfo {
+        NoteInfo {
+            commitment: vec![1; 32],
+            nullifier: vec![2; 32],
+            value: crate::governance::BALLOT_DIVISOR,
+            position,
+            diversifier: vec![3; 11],
+            rho: vec![4; 32],
+            rseed: vec![5; 32],
+            scope: 0,
+            ufvk_str: "uviewtest".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_reset_tests {
+    use super::*;
+    use crate::storage::queries;
+
+    const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    const OTHER_ROUND_ID: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+    const WALLET_ID: &str = "wallet-session-reset";
+
+    fn round_params(round_id: &str) -> crate::round::RoundParams {
+        crate::round::RoundParams {
+            vote_round_id: round_id.to_string(),
+            snapshot_height: 100,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        }
+    }
+
+    fn seed_unsigned_setup_fields(db: &VotingDb, round_id: &str, bundle_index: u32) {
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE bundles
+             SET pczt_sighash = :sighash,
+                 padded_note_secrets = :secrets,
+                 padded_note_data = :padded
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index",
+            rusqlite::named_params! {
+                ":round_id": round_id,
+                ":wallet_id": WALLET_ID,
+                ":bundle_index": bundle_index,
+                ":sighash": vec![0xAAu8; 32],
+                ":secrets": vec![0xBBu8; 64],
+                ":padded": vec![0xCCu8; 32],
+            },
+        )
+        .unwrap();
+    }
+
+    fn has_unsigned_setup_fields(db: &VotingDb, round_id: &str, bundle_index: u32) -> bool {
+        let conn = db.conn();
+        queries::load_pczt_sighash(&conn, round_id, WALLET_ID, bundle_index).is_ok()
+    }
+
+    #[test]
+    fn reset_voting_session_state_clears_unsigned_setup_fields() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.create_round(&round_params(ROUND_ID), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[note(0), note(1)]).unwrap();
+        seed_unsigned_setup_fields(&db, ROUND_ID, 0);
+        seed_unsigned_setup_fields(&db, ROUND_ID, 1);
+
+        reset_voting_session_state(&db, ROUND_ID).unwrap();
+
+        assert!(!has_unsigned_setup_fields(&db, ROUND_ID, 0));
+        assert!(!has_unsigned_setup_fields(&db, ROUND_ID, 1));
+    }
+
+    #[test]
+    fn reset_voting_session_state_preserves_keystone_signed_bundles() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.create_round(&round_params(ROUND_ID), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[note(0), note(1)]).unwrap();
+        seed_unsigned_setup_fields(&db, ROUND_ID, 0);
+        seed_unsigned_setup_fields(&db, ROUND_ID, 1);
+        db.store_keystone_signature(ROUND_ID, 0, &[0x11; 64], &[0xAA; 32], &[0x22; 32])
+            .unwrap();
+
+        reset_voting_session_state(&db, ROUND_ID).unwrap();
+
+        assert!(has_unsigned_setup_fields(&db, ROUND_ID, 0));
+        assert!(!has_unsigned_setup_fields(&db, ROUND_ID, 1));
+    }
+
+    #[test]
+    fn reset_voting_session_state_preserves_submitted_bundles() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.create_round(&round_params(ROUND_ID), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[note(0), note(1)]).unwrap();
+        seed_unsigned_setup_fields(&db, ROUND_ID, 0);
+        seed_unsigned_setup_fields(&db, ROUND_ID, 1);
+        db.store_delegation_tx_hash(ROUND_ID, 0, "submitted-tx").unwrap();
+
+        reset_voting_session_state(&db, ROUND_ID).unwrap();
+
+        assert!(has_unsigned_setup_fields(&db, ROUND_ID, 0));
+        assert!(!has_unsigned_setup_fields(&db, ROUND_ID, 1));
+    }
+
+    #[test]
+    fn reset_voting_session_state_is_round_scoped() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.create_round(&round_params(ROUND_ID), None).unwrap();
+        db.create_round(&round_params(OTHER_ROUND_ID), None).unwrap();
+        db.ensure_bundles(ROUND_ID, &[note(0)]).unwrap();
+        db.ensure_bundles(OTHER_ROUND_ID, &[note(0)]).unwrap();
+        seed_unsigned_setup_fields(&db, ROUND_ID, 0);
+        seed_unsigned_setup_fields(&db, OTHER_ROUND_ID, 0);
+
+        reset_voting_session_state(&db, ROUND_ID).unwrap();
+
+        assert!(!has_unsigned_setup_fields(&db, ROUND_ID, 0));
+        assert!(has_unsigned_setup_fields(&db, OTHER_ROUND_ID, 0));
     }
 
     fn note(position: u64) -> NoteInfo {

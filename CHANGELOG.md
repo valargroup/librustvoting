@@ -201,6 +201,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   can derive vote/share recovery state without querying SQLite tables directly.
 - Added `precompute::{sync_vote_tree, van_witness, reset_vote_tree}` as the
   public vote commitment tree sync and VAN witness surface.
+- Added `precompute::reset_voting_session_state` and
+  `VotingDb::clear_unsigned_delegation_setup_fields` so wallet integrations can
+  recover from interrupted Keystone delegation setup after process restart.
+  Round-scoped reset drops process-local vote-tree cache and clears unsigned
+  delegation setup columns (`pczt_sighash`, padded-note secrets, and related
+  transient fields) while preserving bundles with Keystone signatures or a
+  stored `delegation_tx_hash`.
 - Added a `zcash_voting::config` voting-service config resolution API
   (`resolve_static_voting_config`, `resolve_dynamic_voting_config`, and
   `decide_config_switch`) so wallets can authenticate static/dynamic config

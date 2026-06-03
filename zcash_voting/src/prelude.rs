@@ -76,4 +76,6 @@ pub use crate::wire::{DelegationSubmissionWire, VoteCommitmentWire, VoteShareWir
 
 pub use crate::precompute::delegation_pir;
 
-pub use crate::precompute::{reset_vote_tree, sync_vote_tree, van_witness};
+pub use crate::precompute::{
+    reset_vote_tree, reset_voting_session_state, sync_vote_tree, van_witness,
+};

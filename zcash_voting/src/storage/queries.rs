@@ -2457,6 +2457,49 @@ pub fn get_keystone_signatures(
         })
 }
 
+// --- Session reset cleanup ---
+
+/// Clears unsigned delegation setup fields for one round while preserving
+/// submitted bundles and bundles with persisted Keystone signatures.
+pub fn clear_unsigned_delegation_setup_fields(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "UPDATE bundles
+         SET van_comm_rand = NULL,
+             dummy_nullifiers = NULL,
+             rho_signed = NULL,
+             padded_note_data = NULL,
+             nf_signed = NULL,
+             cmx_new = NULL,
+             alpha = NULL,
+             rseed_signed = NULL,
+             rseed_output = NULL,
+             gov_comm = NULL,
+             total_note_value = NULL,
+             address_index = NULL,
+             rk = NULL,
+             gov_nullifiers_blob = NULL,
+             padded_note_secrets = NULL,
+             pczt_sighash = NULL
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND delegation_tx_hash IS NULL
+           AND bundle_index NOT IN (
+               SELECT bundle_index
+               FROM keystone_signatures
+               WHERE round_id = :round_id AND wallet_id = :wallet_id
+           )",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear unsigned delegation setup fields: {e}"),
+    })?;
+    Ok(())
+}
+
 // --- Recovery state cleanup ---
 
 pub fn clear_recovery_state(
