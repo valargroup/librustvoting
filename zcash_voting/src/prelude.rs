@@ -27,7 +27,11 @@ pub use crate::hotkey::{
     generate_random_voting_hotkey, VOTING_HOTKEY_ACCOUNT_INDEX, VOTING_HOTKEY_ADDRESS_INDEX,
     VOTING_HOTKEY_STORED_SECRET_LEN,
 };
-pub use crate::note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
+pub use crate::note_bundling::{
+    minimum_voting_eligibility_for_notes, validate_minimum_voting_eligibility_for_notes,
+    voting_power, voting_power_with_policy, BundlePolicy, MinimumVotingEligibility,
+    MINIMUM_VOTING_NOTE_COUNT, MINIMUM_VOTING_WEIGHT_ZATOSHI,
+};
 pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
 pub use crate::pir::{select_pir_endpoint, PirEndpoint};
 pub use crate::precompute::{

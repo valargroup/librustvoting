@@ -537,7 +537,7 @@ mod tests {
             value_zatoshi,
             voting_weight_zatoshi,
             commitment: vec![0x01; 32],
-            nullifier: vec![0x02; 32],
+            nullifier: vec![commitment_tree_position as u8; 32],
             diversifier: vec![0x03; 11],
             rho: vec![0x04; 32],
             rseed: vec![0x05; 32],

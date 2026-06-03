@@ -48,7 +48,11 @@ pub use pir_client::{
 };
 
 pub use governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
-pub use note_bundling::{voting_power, voting_power_with_policy, BundlePolicy};
+pub use note_bundling::{
+    minimum_voting_eligibility_for_notes, validate_minimum_voting_eligibility_for_notes,
+    voting_power, voting_power_with_policy, BundlePolicy, MinimumVotingEligibility,
+    MINIMUM_VOTING_NOTE_COUNT, MINIMUM_VOTING_WEIGHT_ZATOSHI,
+};
 pub use round::validate_bundle_index;
 pub use selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_notes,
