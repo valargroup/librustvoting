@@ -7,7 +7,8 @@ use crate::{
     types::{validate_notes_for_round, NoteInfo, SelectedNotes, VotingError},
 };
 
-/// Minimum distinct notes required before a wallet can vote.
+/// Default full bundle size. Eligibility depends on quantized voting weight,
+/// not on requiring this many real notes.
 pub const MINIMUM_VOTING_NOTE_COUNT: usize = BUNDLE_NOTE_SLOTS;
 
 /// Minimum quantized voting weight in zatoshi required before a wallet can vote.
@@ -120,8 +121,7 @@ pub struct MinimumVotingEligibility {
 impl MinimumVotingEligibility {
     /// Returns whether the note set satisfies the minimum voting rule.
     pub fn is_eligible(self) -> bool {
-        self.distinct_note_count >= MINIMUM_VOTING_NOTE_COUNT
-            && self.eligible_weight >= MINIMUM_VOTING_WEIGHT_ZATOSHI
+        self.eligible_weight >= MINIMUM_VOTING_WEIGHT_ZATOSHI
     }
 }
 
@@ -140,9 +140,9 @@ pub fn voting_power_with_policy(notes: &SelectedNotes, policy: BundlePolicy) -> 
 
 /// Returns whether `notes` satisfy the minimum voting rule under `policy`.
 ///
-/// The note count is checked after de-duplicating nullifiers and applying the
-/// supplied bundle policy. The weight uses the same smart bundle quantization
-/// used for delegation setup.
+/// The weight uses the same smart bundle quantization used for delegation
+/// setup. Distinct note count is reported for diagnostics, but bundle padding
+/// means it is not itself an eligibility requirement.
 ///
 /// # Errors
 ///
@@ -160,7 +160,7 @@ pub fn minimum_voting_eligibility_for_notes(
 /// # Errors
 ///
 /// Returns [`VotingError::InvalidInput`] if notes are malformed or if the note
-/// set does not include enough distinct notes and quantized voting weight.
+/// set does not include enough quantized voting weight.
 pub fn validate_minimum_voting_eligibility_for_notes(
     notes: &[NoteInfo],
     policy: BundlePolicy,
@@ -202,7 +202,7 @@ pub(crate) fn minimum_voting_eligibility_error(
 ) -> VotingError {
     VotingError::InvalidInput {
         message: format!(
-            "minimum voting eligibility requires at least {MINIMUM_VOTING_NOTE_COUNT} eligible notes and {MINIMUM_VOTING_WEIGHT_ZATOSHI} zatoshi voting weight; selected {} distinct eligible notes with {} zatoshi voting weight",
+            "minimum voting eligibility requires at least one eligible voting bundle with {MINIMUM_VOTING_WEIGHT_ZATOSHI} zatoshi voting weight; selected {} distinct notes across eligible bundles with {} zatoshi eligible bundle weight",
             eligibility.distinct_note_count, eligibility.eligible_weight
         ),
     }
@@ -442,6 +442,42 @@ mod tests {
     }
 
     #[test]
+    fn minimum_voting_eligibility_accepts_underfilled_padded_bundle() {
+        let notes = vec![
+            make_note(BALLOT_DIVISOR / 2, 0),
+            make_note(BALLOT_DIVISOR / 2, 1),
+        ];
+
+        let status =
+            validate_minimum_voting_eligibility_for_notes(&notes, BundlePolicy::default()).unwrap();
+
+        assert!(status.is_eligible());
+        assert_eq!(status.distinct_note_count, 2);
+        assert_eq!(status.eligible_weight, BALLOT_DIVISOR);
+    }
+
+    #[test]
+    fn minimum_voting_eligibility_rejects_many_notes_without_threshold_bundle() {
+        let notes: Vec<NoteInfo> = (0..20).map(|i| make_note(2_000_000, i)).collect();
+
+        let status = minimum_voting_eligibility_for_notes(&notes, BundlePolicy::default()).unwrap();
+        let err = validate_minimum_voting_eligibility_for_notes(&notes, BundlePolicy::default())
+            .unwrap_err();
+
+        assert!(!status.is_eligible());
+        assert_eq!(status.distinct_note_count, 0);
+        assert_eq!(status.eligible_weight, 0);
+        assert!(err
+            .to_string()
+            .contains("at least one eligible voting bundle"));
+
+        let plan = chunk_notes(&notes);
+        assert!(plan.bundles.is_empty());
+        assert_eq!(plan.dropped_count, 20);
+        assert_eq!(plan.eligible_weight, 0);
+    }
+
+    #[test]
     fn minimum_voting_eligibility_reports_empty_notes_as_ineligible_status() {
         let status = minimum_voting_eligibility_for_notes(&[], BundlePolicy::default()).unwrap();
 
@@ -451,16 +487,15 @@ mod tests {
     }
 
     #[test]
-    fn minimum_voting_eligibility_rejects_single_large_note() {
+    fn minimum_voting_eligibility_accepts_single_large_note() {
         let notes = vec![make_note(BALLOT_DIVISOR * 4, 0)];
 
-        let err = validate_minimum_voting_eligibility_for_notes(&notes, BundlePolicy::default())
-            .unwrap_err();
+        let status =
+            validate_minimum_voting_eligibility_for_notes(&notes, BundlePolicy::default()).unwrap();
 
-        assert!(err.to_string().contains("at least 5 eligible notes"));
-        assert!(err
-            .to_string()
-            .contains("selected 1 distinct eligible notes"));
+        assert!(status.is_eligible());
+        assert_eq!(status.distinct_note_count, 1);
+        assert_eq!(status.eligible_weight, BALLOT_DIVISOR * 4);
     }
 
     #[test]
@@ -470,7 +505,7 @@ mod tests {
 
         let status = minimum_voting_eligibility_for_notes(&notes, BundlePolicy::default()).unwrap();
 
-        assert!(!status.is_eligible());
+        assert!(status.is_eligible());
         assert_eq!(status.distinct_note_count, 1);
         assert_eq!(status.eligible_weight, BALLOT_DIVISOR);
     }
@@ -483,7 +518,7 @@ mod tests {
         let status =
             minimum_voting_eligibility_for_notes(&notes, BundlePolicy::new(1).unwrap()).unwrap();
 
-        assert!(!status.is_eligible());
+        assert!(status.is_eligible());
         assert_eq!(status.distinct_note_count, 1);
         assert_eq!(status.eligible_weight, BALLOT_DIVISOR);
     }
