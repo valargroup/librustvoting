@@ -10,7 +10,7 @@ use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    note_bundling::{chunk_notes_with_policy, BundlePolicy},
+    note_bundling::{canonical_note_bundle_plan_for_notes, BundlePolicy},
     storage::{queries, RoundState, VotingDb as InnerVotingDb},
     types::{NoteInfo, VotingError, VotingRoundParams},
 };
@@ -124,6 +124,9 @@ pub fn bundle_notes_for_index_with_policy(
 /// This is the read-only counterpart to [`VotingDb::ensure_bundles`]. Wallets
 /// that need to operate on one bundle after setup can use this instead of
 /// depending on the lower-level chunking internals.
+///
+/// Duplicate nullifiers are collapsed before chunking so each spendable note can
+/// appear in at most one bundle.
 pub fn note_bundles(notes: &[NoteInfo]) -> Result<Vec<Vec<NoteInfo>>, VotingError> {
     note_bundles_with_policy(notes, BundlePolicy::default())
 }
@@ -133,8 +136,7 @@ pub fn note_bundles_with_policy(
     notes: &[NoteInfo],
     policy: BundlePolicy,
 ) -> Result<Vec<Vec<NoteInfo>>, VotingError> {
-    crate::types::validate_notes_for_round(notes)?;
-    Ok(chunk_notes_with_policy(notes, policy).bundles)
+    Ok(canonical_note_bundle_plan_for_notes(notes, policy)?.bundles)
 }
 
 /// Returns the unquantized zatoshi value for a bundle.
@@ -319,9 +321,10 @@ impl VotingDb {
 
     /// Creates bundle rows for `notes`, or validates existing bundle rows.
     ///
-    /// The note ordering and weight quantization are the canonical library
-    /// policy. On first call, surviving bundles are persisted. On later calls,
-    /// the same notes must reproduce the stored bundle identities.
+    /// The note ordering, duplicate-nullifier handling, and weight quantization
+    /// are the canonical library policy. On first call, surviving bundles are
+    /// persisted. On later calls, the same notes must reproduce the stored
+    /// bundle identities.
     pub fn ensure_bundles(
         &self,
         round_id: &str,
@@ -332,17 +335,17 @@ impl VotingDb {
 
     /// Creates bundle rows for `notes`, or validates existing rows under `policy`.
     ///
-    /// The note ordering and weight quantization are controlled by `policy`. On
-    /// first call, surviving bundles are persisted. On later calls, the same
-    /// notes and policy must reproduce the stored bundle identities.
+    /// The note ordering, duplicate-nullifier handling, and weight quantization
+    /// are controlled by `policy`. On first call, surviving bundles are
+    /// persisted. On later calls, the same notes and policy must reproduce the
+    /// stored bundle identities.
     pub fn ensure_bundles_with_policy(
         &self,
         round_id: &str,
         notes: &[NoteInfo],
         policy: BundlePolicy,
     ) -> Result<BundleLayout, VotingError> {
-        crate::types::validate_notes_for_round(notes)?;
-        let plan = chunk_notes_with_policy(notes, policy);
+        let plan = canonical_note_bundle_plan_for_notes(notes, policy)?;
         let expected_count = plan.bundles.len() as u32;
         let existing_count = self.get_bundle_count(round_id)?;
 
@@ -604,6 +607,30 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn note_bundles_deduplicates_duplicate_nullifiers() {
+        let base_note = note(0, crate::governance::BALLOT_DIVISOR);
+        let notes = vec![base_note.clone(); crate::governance::BUNDLE_NOTE_SLOTS];
+
+        let bundles = note_bundles(&notes).unwrap();
+
+        assert_eq!(bundles, vec![vec![base_note]]);
+    }
+
+    #[test]
+    fn ensure_bundles_persists_canonical_deduplicated_notes() {
+        let db = test_db("wallet-duplicate-nullifiers");
+        let base_note = note(0, crate::governance::BALLOT_DIVISOR);
+        let notes = vec![base_note.clone(); crate::governance::BUNDLE_NOTE_SLOTS];
+
+        let layout = db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        let bundle = bundle_notes_for_index(&notes, &layout, 0).unwrap();
+
+        assert_eq!(layout.bundle_count, 1);
+        assert_eq!(layout.eligible_weight, crate::governance::BALLOT_DIVISOR);
+        assert_eq!(bundle, vec![base_note]);
     }
 
     #[test]
