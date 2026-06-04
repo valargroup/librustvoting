@@ -18,7 +18,7 @@ rand = "0.8"
 
 # Hashing
 blake2b_simd = "1"
-halo2_gadgets = "0.4"
+halo2_gadgets = "=0.5.0"
 halo2_proofs = "0.3"
 sinsemilla = "0.1"
 
@@ -63,11 +63,11 @@ thiserror = "2"
 zeroize = "1"
 
 # Single orchard node: every consumer resolves upstream `orchard` from
-# crates.io at 0.14.0. The `unstable-voting-circuits` feature is required by
+# crates.io at 0.14. The `unstable-voting-circuits` feature is required by
 # integration tests in `zkp1.rs` (`Note::new`, `Note::dummy`,
 # `Rho::from_nf_old`).
 subtle = "2.6"
-orchard = { version = "=0.14.0", features = ["unstable-voting-circuits"] }
+orchard = { version = "0.14", features = ["unstable-voting-circuits"] }
 voting-circuits = "=0.8.0"
 nonempty = "0.11"
 zip32 = "0.2"

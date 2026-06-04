@@ -183,9 +183,9 @@ The crate no longer accepts root wallet seed material for delegation signing.
 
 `zcash_voting` tracks the upstream Zcash crates directly:
 
-- **`orchard 0.13.1`** from crates.io, with the
+- **`orchard 0.14`** from crates.io, with the
   `unstable-voting-circuits` feature enabled for the governance proof paths.
-- **`voting-circuits 0.6.0`** for the delegation and vote proof circuits.
+- **`voting-circuits 0.8`** for the delegation and vote proof circuits.
 - **`vote-commitment-tree 0.3`** and **`vote-commitment-tree-client 0.5`** for
   vote commitment tree state and optional HTTP sync.
 - **`pczt`, `zcash_keys`, `zcash_primitives`, and `zcash_protocol`** from the

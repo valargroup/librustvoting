@@ -983,26 +983,6 @@ dependencies = [
 
 [[package]]
 name = "halo2_gadgets"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45824ce0dd12e91ec0c68ebae2a7ed8ae19b70946624c849add59f1d1a62a143"
-dependencies = [
- "arrayvec",
- "bitvec",
- "ff",
- "group",
- "halo2_poseidon",
- "halo2_proofs",
- "lazy_static",
- "pasta_curves",
- "rand",
- "sinsemilla",
- "subtle",
- "uint",
-]
-
-[[package]]
-name = "halo2_gadgets"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb2a697cad929f706b7987fe804ad57d43622cd37463ba7e4d662a926fdcfea3"
@@ -1258,7 +1238,7 @@ checksum = "1d0a4887bb71d68b3d0c5db9d42bb76df38b0dff4d261b863dada6383b6c2012"
 dependencies = [
  "anyhow",
  "ff",
- "halo2_gadgets 0.5.0",
+ "halo2_gadgets",
  "hex",
  "pasta_curves",
  "rayon",
@@ -1557,7 +1537,7 @@ dependencies = [
  "fpe",
  "getset",
  "group",
- "halo2_gadgets 0.5.0",
+ "halo2_gadgets",
  "halo2_poseidon",
  "halo2_proofs",
  "hex",
@@ -2845,7 +2825,7 @@ version = "0.3.2"
 dependencies = [
  "anyhow",
  "ff",
- "halo2_gadgets 0.4.0",
+ "halo2_gadgets",
  "imt-tree",
  "incrementalmerkletree",
  "lazy_static",
@@ -2887,7 +2867,7 @@ dependencies = [
  "blake2b_simd",
  "ff",
  "group",
- "halo2_gadgets 0.5.0",
+ "halo2_gadgets",
  "halo2_poseidon",
  "halo2_proofs",
  "incrementalmerkletree",
@@ -3509,7 +3489,7 @@ dependencies = [
  "ed25519-dalek",
  "ff",
  "group",
- "halo2_gadgets 0.4.0",
+ "halo2_gadgets",
  "halo2_proofs",
  "hex",
  "http",

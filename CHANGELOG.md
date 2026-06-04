@@ -328,6 +328,24 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   helper. Delegation Keystone requests still redact their PCZT internally;
   generic wallet send PCZT redaction belongs in the wallet SDK boundary.
 
+# 0.11.0
+
+## Changed
+- Bumped `zcash_voting` to `0.11.0`, `vote-commitment-tree` to `0.3.2`,
+  and `vote-commitment-tree-client` to `0.5.2`.
+- Bumped the Orchard dependency line to `orchard 0.14`,
+  `halo2_gadgets =0.5.0`, `pczt 0.7`, `zcash_keys 0.14`,
+  `zcash_primitives 0.28`, and `zcash_protocol 0.9`.
+- Bumped the circuit and nullifier dependencies to published
+  `voting-circuits 0.8.0`, `imt-tree 0.2.0`, `pir-types 0.2.0`, and
+  `pir-client 0.3.0`.
+
+# 0.10.2
+
+## Security
+- Bumped `voting-circuits` to `0.7.0`, which rejects Halo2 proofs that verify
+  but leave trailing unread transcript bytes.
+
 # 0.10.1
 
 ## Security
