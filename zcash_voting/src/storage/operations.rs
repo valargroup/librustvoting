@@ -1596,7 +1596,7 @@ mod tests {
     fn identity_note_with_position(position: u8) -> NoteInfo {
         NoteInfo {
             commitment: vec![position; 32],
-            nullifier: vec![position.wrapping_add(1); 32],
+            nullifier: vec![position.wrapping_add(10); 32],
             value: 13_000_000,
             position: u64::from(position),
             diversifier: vec![0x03; 11],
@@ -1972,7 +1972,7 @@ mod tests {
         let notes: Vec<NoteInfo> = (0..BUNDLE_NOTE_SLOTS)
             .map(|i| NoteInfo {
                 commitment: vec![0x01; 32],
-                nullifier: vec![0x02; 32],
+                nullifier: vec![i as u8 + 0x02; 32],
                 value: 13_000_000,
                 position: i as u64,
                 diversifier: vec![0; 11],

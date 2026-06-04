@@ -186,9 +186,7 @@ pub(crate) fn minimum_voting_eligibility_and_plan_for_notes(
             chunk_notes_with_policy(notes, policy),
         ));
     }
-    validate_notes_for_round(notes)?;
-    let distinct_notes = distinct_notes_by_nullifier(notes);
-    let plan = chunk_notes_with_policy(&distinct_notes, policy);
+    let plan = canonical_note_bundle_plan_for_notes(notes, policy)?;
     let surviving_note_count = plan.bundles.iter().map(Vec::len).sum();
     let eligibility = MinimumVotingEligibility {
         distinct_note_count: surviving_note_count,
@@ -206,6 +204,19 @@ pub(crate) fn minimum_voting_eligibility_error(
             eligibility.distinct_note_count, eligibility.eligible_weight
         ),
     }
+}
+
+/// Returns the canonical bundle plan for wallet-facing round APIs.
+///
+/// Duplicate nullifiers are collapsed before chunking so eligibility checks and
+/// bundle construction cannot disagree about whether a note is spendable once.
+pub(crate) fn canonical_note_bundle_plan_for_notes(
+    notes: &[NoteInfo],
+    policy: BundlePolicy,
+) -> Result<ChunkResult, VotingError> {
+    validate_notes_for_round(notes)?;
+    let distinct_notes = distinct_notes_by_nullifier(notes);
+    Ok(chunk_notes_with_policy(&distinct_notes, policy))
 }
 
 fn distinct_notes_by_nullifier(notes: &[NoteInfo]) -> Vec<NoteInfo> {

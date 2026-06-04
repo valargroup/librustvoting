@@ -494,7 +494,7 @@ mod tests {
     fn test_note_info(position: u64) -> NoteInfo {
         NoteInfo {
             commitment: vec![1; 32],
-            nullifier: vec![2; 32],
+            nullifier: vec![position as u8 + 2; 32],
             value: crate::governance::BALLOT_DIVISOR,
             position,
             diversifier: vec![3; 11],
