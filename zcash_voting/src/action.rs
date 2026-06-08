@@ -6,6 +6,8 @@ use rand::RngCore;
 use subtle::CtOption;
 
 use orchard::builder::{Builder, BundleType};
+#[cfg(feature = "ironwood-orchard")]
+use orchard::builder::BundleProtocol;
 use orchard::keys::FullViewingKey;
 use orchard::note::{RandomSeed, Rho};
 use orchard::pczt::Zip32Derivation;
@@ -435,6 +437,9 @@ pub fn build_governance_pczt(
     };
 
     for _ in 0..MAX_PCZT_LAYOUT_ATTEMPTS {
+        #[cfg(feature = "ironwood-orchard")]
+        let mut builder = Builder::new(BundleProtocol::Orchard, BundleType::DEFAULT, anchor);
+        #[cfg(not(feature = "ironwood-orchard"))]
         let mut builder = Builder::new(BundleType::DEFAULT, anchor);
 
         // Add the governance signed note as a spend.

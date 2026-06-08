@@ -81,6 +81,12 @@ pczt = { version = "0.7", features = ["orchard", "io-finalizer", "signer", "zcp-
 zcash_primitives = "0.28"
 uuid = "1.23.1"
 
+[features]
+ironwood-orchard = []
+
 [dev-dependencies]
 secrecy = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu7"))'] }

@@ -75,6 +75,8 @@ impl Parameters for Network {
                 | NetworkUpgrade::Nu6
                 | NetworkUpgrade::Nu6_1
                 | NetworkUpgrade::Nu6_2 => Some(BlockHeight::from_u32(1)),
+                #[cfg(zcash_unstable = "nu7")]
+                NetworkUpgrade::Nu7 => Some(BlockHeight::from_u32(1)),
             },
         }
     }
