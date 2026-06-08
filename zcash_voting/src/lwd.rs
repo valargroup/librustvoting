@@ -228,9 +228,15 @@ mod tests {
             branch_id_for_height(Network::Testnet, 3_536_500).unwrap(),
             0x4DEC_4DF0
         );
-        assert_eq!(
-            branch_id_for_height(Network::Regtest, 1).unwrap(),
-            0x5437_F330
-        );
+        assert_eq!(branch_id_for_height(Network::Regtest, 1).unwrap(), {
+            #[cfg(zcash_unstable = "nu7")]
+            {
+                0xFFFF_FFFF
+            }
+            #[cfg(not(zcash_unstable = "nu7"))]
+            {
+                0x5437_F330
+            }
+        });
     }
 }
