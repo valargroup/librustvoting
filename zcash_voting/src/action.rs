@@ -5,9 +5,8 @@ use pasta_curves::pallas;
 use rand::RngCore;
 use subtle::CtOption;
 
-use orchard::builder::{Builder, BundleType};
-#[cfg(feature = "ironwood-orchard")]
 use orchard::builder::BundleProtocol;
+use orchard::builder::{Builder, BundleType};
 use orchard::keys::FullViewingKey;
 use orchard::note::{RandomSeed, Rho};
 use orchard::pczt::Zip32Derivation;
@@ -437,10 +436,7 @@ pub fn build_governance_pczt(
     };
 
     for _ in 0..MAX_PCZT_LAYOUT_ATTEMPTS {
-        #[cfg(feature = "ironwood-orchard")]
         let mut builder = Builder::new(BundleProtocol::Orchard, BundleType::DEFAULT, anchor);
-        #[cfg(not(feature = "ironwood-orchard"))]
-        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
 
         // Add the governance signed note as a spend.
         builder
@@ -557,6 +553,8 @@ pub fn build_governance_pczt(
             transparent: None,
             sapling: None,
             orchard: Some(orchard_pczt_bundle),
+            #[cfg(zcash_unstable = "nu7")]
+            ironwood: None,
         };
         let pczt = pczt::roles::creator::Creator::build_from_parts(parts).ok_or_else(|| {
             VotingError::Internal {
