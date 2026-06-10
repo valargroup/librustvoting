@@ -290,6 +290,7 @@ mod tests {
             time: 0,
             sapling_tree: String::new(),
             orchard_tree: hex::encode(orchard_tree_bytes),
+            ironwood_tree: String::new(),
         }
     }
 
@@ -451,6 +452,7 @@ mod tests {
             time: 0,
             sapling_tree: String::new(),
             orchard_tree: String::new(),
+            ironwood_tree: String::new(),
         };
 
         let err = store_tree_state_and_generate_note_witnesses(

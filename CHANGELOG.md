@@ -6,6 +6,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 # Unreleased
 
+## Changed
+- Aligned the workspace's Zcash and Orchard dependency graph with the
+  Ironwood-capable Zcash crates so wallet integrations resolve one Orchard/PCZT
+  stack.
+
 ## v1.0.0
 
 ### Added

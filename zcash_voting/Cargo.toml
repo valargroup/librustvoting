@@ -62,25 +62,28 @@ anyhow = "1"
 thiserror = "2"
 zeroize = "1"
 
-# Single orchard node: every consumer resolves upstream `orchard` from
-# crates.io at 0.14. The `unstable-voting-circuits` feature is required by
+# Single Ironwood Orchard node: every consumer resolves Orchard from the
+# Ironwood branch. The `unstable-voting-circuits` feature is required by
 # integration tests in `zkp1.rs` (`Note::new`, `Note::dummy`,
 # `Rho::from_nf_old`).
 subtle = "2.6"
-orchard = { version = "0.14", features = ["unstable-voting-circuits"] }
-voting-circuits = "=0.8.0"
+orchard = { version = "0.14", git = "https://github.com/valargroup/qr_orchard", branch = "ironwood-qr", features = ["unstable-voting-circuits"] }
+voting-circuits = { version = "=0.8.0", git = "https://github.com/valargroup/voting-circuits", rev = "418ea519f4fca04c1bff06442edf920a3e1e41f3" }
 nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
-zcash_protocol = "0.9"
-zcash_client_backend = { version = "0.23", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zcash_client_sqlite = { version = "0.21", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.14", features = ["orchard"] }
-pczt = { version = "0.7", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_primitives = "0.28"
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "88c6b8e2a85ad8c9b7b6bc25918f05d9f83cb4c9" }
+zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "88c6b8e2a85ad8c9b7b6bc25918f05d9f83cb4c9", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "88c6b8e2a85ad8c9b7b6bc25918f05d9f83cb4c9", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "88c6b8e2a85ad8c9b7b6bc25918f05d9f83cb4c9", features = ["orchard"] }
+pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "88c6b8e2a85ad8c9b7b6bc25918f05d9f83cb4c9", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "88c6b8e2a85ad8c9b7b6bc25918f05d9f83cb4c9" }
 uuid = "1.23.1"
 
 [dev-dependencies]
 secrecy = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(zcash_unstable, values("nu7"))'] }
