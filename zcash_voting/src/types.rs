@@ -30,6 +30,9 @@ pub const MIN_VOTE_OPTIONS: u32 = 2;
 /// Maximum number of options a proposal can declare.
 pub const MAX_VOTE_OPTIONS: u32 = 8;
 
+#[cfg(zcash_unstable = "nu7")]
+const REGTEST_NU7_ACTIVATION_HEIGHT: u32 = 10;
+
 #[derive(Debug, Error)]
 pub enum VotingError {
     #[error("Invalid input: {message}")]
@@ -76,7 +79,7 @@ impl Parameters for Network {
                 | NetworkUpgrade::Nu6_1
                 | NetworkUpgrade::Nu6_2 => Some(BlockHeight::from_u32(1)),
                 #[cfg(zcash_unstable = "nu7")]
-                NetworkUpgrade::Nu7 => Some(BlockHeight::from_u32(1)),
+                NetworkUpgrade::Nu7 => Some(BlockHeight::from_u32(REGTEST_NU7_ACTIVATION_HEIGHT)),
             },
         }
     }
