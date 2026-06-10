@@ -7,7 +7,7 @@ use subtle::CtOption;
 
 use orchard::builder::{Builder, BundleProtocol, BundleType};
 use orchard::keys::FullViewingKey;
-use orchard::note::{RandomSeed, Rho};
+use orchard::note::{NoteVersion, RandomSeed, Rho};
 use orchard::pczt::Zip32Derivation;
 use orchard::tree::{MerkleHashOrchard, MerklePath};
 use orchard::value::NoteValue;
@@ -31,6 +31,57 @@ const ZIP32_MAINNET_COIN_TYPE: u32 = 133;
 
 /// Orchard key diversification personalization for DiversifyHash^Orchard.
 const ORCHARD_GD_PERSONALIZATION: &str = "z.cash:Orchard-gd";
+
+fn bundle_protocol_for_branch(_branch_id: BranchId) -> BundleProtocol {
+    #[cfg(zcash_unstable = "nu7")]
+    if matches!(_branch_id, BranchId::Nu7) {
+        return BundleProtocol::Ironwood;
+    }
+
+    BundleProtocol::Orchard
+}
+
+fn bundle_protocol_name(protocol: BundleProtocol) -> &'static str {
+    match protocol {
+        BundleProtocol::Orchard => "Orchard",
+        BundleProtocol::Ironwood => "Ironwood",
+    }
+}
+
+fn note_version_for_bundle_protocol(protocol: BundleProtocol) -> NoteVersion {
+    match protocol {
+        BundleProtocol::Orchard => NoteVersion::V2,
+        BundleProtocol::Ironwood => NoteVersion::V3,
+    }
+}
+
+#[cfg(zcash_unstable = "nu7")]
+fn pczt_actions_for_protocol(
+    pczt: &pczt::Pczt,
+    protocol: BundleProtocol,
+) -> &[pczt::orchard::Action] {
+    match protocol {
+        BundleProtocol::Orchard => pczt.orchard().actions(),
+        BundleProtocol::Ironwood => pczt.ironwood().actions(),
+    }
+}
+
+#[cfg(not(zcash_unstable = "nu7"))]
+fn pczt_actions_for_protocol(
+    pczt: &pczt::Pczt,
+    _protocol: BundleProtocol,
+) -> &[pczt::orchard::Action] {
+    pczt.orchard().actions()
+}
+
+fn signed_pczt_actions(pczt: &pczt::Pczt) -> (&[pczt::orchard::Action], &'static str) {
+    #[cfg(zcash_unstable = "nu7")]
+    if !pczt.ironwood().actions().is_empty() {
+        return (pczt.ironwood().actions(), "Ironwood");
+    }
+
+    (pczt.orchard().actions(), "Orchard")
+}
 
 /// Extract the affine x-coordinate bytes from a non-identity Pallas point.
 fn point_x_bytes(point: &pallas::Point) -> Result<[u8; 32], VotingError> {
@@ -128,9 +179,10 @@ fn make_note(
     value: NoteValue,
     rho: Rho,
     rng: &mut impl RngCore,
+    version: NoteVersion,
 ) -> Result<(orchard::Note, [u8; 32]), VotingError> {
     let (rseed, rseed_bytes) = random_rseed(rng, &rho);
-    let note = orchard::Note::from_parts(addr, value, rho, rseed);
+    let note = orchard::Note::from_parts_with_version(addr, value, rho, rseed, version);
     if !bool::from(note.is_some()) {
         return Err(VotingError::Internal {
             message: "failed to construct note".to_string(),
@@ -146,8 +198,15 @@ fn make_dummy_note(
     addr: Address,
     rho: Rho,
     rng: &mut impl RngCore,
+    protocol: BundleProtocol,
 ) -> Result<(orchard::Note, [u8; 32]), VotingError> {
-    make_note(addr, NoteValue::from_raw(1), rho, rng)
+    make_note(
+        addr,
+        NoteValue::from_raw(1),
+        rho,
+        rng,
+        note_version_for_bundle_protocol(protocol),
+    )
 }
 
 /// Canonical delegate action payload encoding for external signing.
@@ -264,6 +323,14 @@ pub fn build_governance_pczt(
         .expect("validated as 32 bytes above");
 
     let mut rng = rand::thread_rng();
+    let branch_id =
+        BranchId::try_from(consensus_branch_id).map_err(|e| VotingError::InvalidInput {
+            message: format!(
+                "invalid consensus_branch_id 0x{:08X}: {}",
+                consensus_branch_id, e
+            ),
+        })?;
+    let bundle_protocol = bundle_protocol_for_branch(branch_id);
 
     // --- Compute governance nullifiers ---
     let dom = governance::compute_nullifier_domain(&vri_32)?;
@@ -388,7 +455,7 @@ pub fn build_governance_pczt(
         })?;
     let sender_address = fvk.address_at(0u32, Scope::External);
     let (signed_note, rseed_signed_bytes) =
-        make_dummy_note(sender_address, rho_for_note, &mut rng)?;
+        make_dummy_note(sender_address, rho_for_note, &mut rng, bundle_protocol)?;
 
     // --- Build PCZT using orchard Builder ---
     // Dummy MerklePath: all-zero siblings, position 0.
@@ -420,22 +487,15 @@ pub fn build_governance_pczt(
         buf
     };
     // --- Serialize to full PCZT ---
-    // Use Creator::build_from_parts to construct the PCZT with the orchard bundle,
-    // matching the same path the wallet transaction builder uses.
-    let branch_id =
-        BranchId::try_from(consensus_branch_id).map_err(|e| VotingError::InvalidInput {
-            message: format!(
-                "invalid consensus_branch_id 0x{:08X}: {}",
-                consensus_branch_id, e
-            ),
-        })?;
+    // Use Creator::build_from_parts to construct the PCZT with the selected
+    // Orchard or Ironwood bundle, matching the wallet transaction builder path.
     let network = match coin_type {
         ZIP32_MAINNET_COIN_TYPE => Network::MainNetwork,
         _ => Network::TestNetwork,
     };
 
     for _ in 0..MAX_PCZT_LAYOUT_ATTEMPTS {
-        let mut builder = Builder::new(BundleProtocol::Orchard, BundleType::DEFAULT, anchor);
+        let mut builder = Builder::new(bundle_protocol, BundleType::DEFAULT, anchor);
 
         // Add the governance signed note as a spend.
         builder
@@ -458,7 +518,7 @@ pub fn build_governance_pczt(
         // Build the PCZT bundle. The Orchard builder pads and shuffles spends
         // and outputs independently, so retry until the governance spend and
         // governance output are paired in the same action slot.
-        let (mut orchard_pczt_bundle, bundle_meta) =
+        let (mut pczt_bundle, bundle_meta) =
             builder
                 .build_for_pczt(&mut rng)
                 .map_err(|e| VotingError::Internal {
@@ -483,7 +543,7 @@ pub fn build_governance_pczt(
         }
 
         let action_index = spend_idx;
-        let governance_action = &orchard_pczt_bundle.actions()[action_index];
+        let governance_action = &pczt_bundle.actions()[action_index];
         let nf_signed_bytes: [u8; 32] = governance_action.spend().nullifier().to_bytes();
         let rk_bytes: [u8; 32] = governance_action.spend().rk().into();
         let alpha = governance_action
@@ -530,7 +590,7 @@ pub fn build_governance_pczt(
         .map_err(|e| VotingError::Internal {
             message: format!("Zip32Derivation::parse failed: {:?}", e),
         })?;
-        orchard_pczt_bundle
+        pczt_bundle
             .update_with(|mut updater| {
                 updater.update_action_with(action_index, |mut action_updater| {
                     action_updater.set_spend_zip32_derivation(zip32_deriv);
@@ -541,19 +601,27 @@ pub fn build_governance_pczt(
                 message: format!("PCZT updater failed: {:?}", e),
             })?;
 
+        #[cfg(zcash_unstable = "nu7")]
+        let (orchard_bundle, ironwood_bundle) = match bundle_protocol {
+            BundleProtocol::Orchard => (Some(pczt_bundle), None),
+            BundleProtocol::Ironwood => (None, Some(pczt_bundle)),
+        };
+        #[cfg(not(zcash_unstable = "nu7"))]
+        let orchard_bundle = Some(pczt_bundle);
+
         let parts = PcztParts {
             params: network,
             version: TxVersion::suggested_for_branch(branch_id),
             consensus_branch_id: branch_id,
-            // Keystone's determine_lock_time returns global.lock_time() for pure-Orchard PCZTs
+            // Keystone's determine_lock_time returns global.lock_time() for shielded-only PCZTs
             // (no transparent inputs). Without a lock_time, it returns None → error.
             lock_time: 0,
             expiry_height: BlockHeight::from_u32(0), // no expiry (never broadcast)
             transparent: None,
             sapling: None,
-            orchard: Some(orchard_pczt_bundle),
+            orchard: orchard_bundle,
             #[cfg(zcash_unstable = "nu7")]
-            ironwood: None,
+            ironwood: ironwood_bundle,
         };
         let pczt = pczt::roles::creator::Creator::build_from_parts(parts).ok_or_else(|| {
             VotingError::Internal {
@@ -573,17 +641,18 @@ pub fn build_governance_pczt(
         let parsed_pczt = pczt::Pczt::parse(&pczt_bytes).map_err(|e| VotingError::Internal {
             message: format!("Failed to parse returned PCZT: {:?}", e),
         })?;
-        let indexed_action = parsed_pczt
-            .orchard()
-            .actions()
-            .get(action_index)
-            .ok_or_else(|| VotingError::Internal {
-                message: format!(
-                    "GovernancePczt action_index {} is out of bounds for {} Orchard actions",
-                    action_index,
-                    parsed_pczt.orchard().actions().len()
-                ),
-            })?;
+        let indexed_actions = pczt_actions_for_protocol(&parsed_pczt, bundle_protocol);
+        let indexed_action =
+            indexed_actions
+                .get(action_index)
+                .ok_or_else(|| VotingError::Internal {
+                    message: format!(
+                        "GovernancePczt action_index {} is out of bounds for {} {} actions",
+                        action_index,
+                        indexed_actions.len(),
+                        bundle_protocol_name(bundle_protocol)
+                    ),
+                })?;
         if *indexed_action.spend().nullifier() != nf_signed_bytes
             || *indexed_action.output().cmx() != cmx_new_bytes
         {
@@ -670,7 +739,7 @@ pub fn extract_spend_auth_sig(
         message: format!("Failed to parse signed PCZT: {:?}", e),
     })?;
 
-    let actions = pczt.orchard().actions();
+    let (actions, protocol_name) = signed_pczt_actions(&pczt);
 
     // Try the expected action index first.
     if action_index < actions.len() {
@@ -691,8 +760,9 @@ pub fn extract_spend_auth_sig(
 
     Err(VotingError::Internal {
         message: format!(
-            "No spend_auth_sig found in any of the {} actions in the signed PCZT",
-            actions.len()
+            "No spend_auth_sig found in any of the {} {} actions in the signed PCZT",
+            actions.len(),
+            protocol_name
         ),
     })
 }
@@ -801,6 +871,9 @@ mod tests {
 
     /// NU5 mainnet consensus branch ID
     const NU5_BRANCH_ID: u32 = 0xC2D6D0B4;
+    /// Valar NU7 placeholder consensus branch ID
+    #[cfg(zcash_unstable = "nu7")]
+    const NU7_BRANCH_ID: u32 = 0xFFFF_FFFF;
     /// Mock seed fingerprint (32 bytes)
     const MOCK_SEED_FP: [u8; 32] = [0xAA; 32];
     /// Mock account index
@@ -922,6 +995,40 @@ mod tests {
             );
             assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
         }
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    #[test]
+    fn test_build_governance_pczt_uses_ironwood_for_nu7() {
+        let result = build_governance_pczt(
+            &[mock_note()],
+            &mock_params(),
+            &mock_fvk_bytes(),
+            &mock_hotkey_address(),
+            NU7_BRANCH_ID,
+            ZIP32_MAINNET_COIN_TYPE,
+            &MOCK_SEED_FP,
+            MOCK_ACCOUNT,
+            "Test Round",
+            &sample_padded_note_secrets(1).unwrap(),
+        )
+        .unwrap();
+
+        let pczt = pczt::Pczt::parse(&result.pczt_bytes).unwrap();
+        assert!(pczt.orchard().actions().is_empty());
+        assert_eq!(pczt.ironwood().actions().len(), 2);
+
+        let indexed_action = pczt
+            .ironwood()
+            .actions()
+            .get(result.action_index)
+            .expect("action_index should point to an Ironwood action");
+
+        assert_eq!(
+            indexed_action.spend().nullifier().to_vec(),
+            result.nf_signed
+        );
+        assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
     }
 
     #[test]
