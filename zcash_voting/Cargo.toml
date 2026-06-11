@@ -73,12 +73,12 @@ nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
-zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "501c9cc9f139f7d43b05ed504e31262b35183a4d" }
-zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "501c9cc9f139f7d43b05ed504e31262b35183a4d", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "501c9cc9f139f7d43b05ed504e31262b35183a4d", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "501c9cc9f139f7d43b05ed504e31262b35183a4d", features = ["orchard"] }
-pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "501c9cc9f139f7d43b05ed504e31262b35183a4d", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "501c9cc9f139f7d43b05ed504e31262b35183a4d" }
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "0882c0c03acccb2d30063f7283b2e884786607a1" }
+zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "0882c0c03acccb2d30063f7283b2e884786607a1", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "0882c0c03acccb2d30063f7283b2e884786607a1", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "0882c0c03acccb2d30063f7283b2e884786607a1", features = ["orchard"] }
+pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "0882c0c03acccb2d30063f7283b2e884786607a1", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "0882c0c03acccb2d30063f7283b2e884786607a1" }
 uuid = "1.23.1"
 
 [dev-dependencies]
