@@ -19,8 +19,8 @@ rand = "0.8"
 rusqlite = "0.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "5a7f5c41d4e22453b10130557796a76cfabebbcd", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "5a7f5c41d4e22453b10130557796a76cfabebbcd", features = ["orchard"] }
-zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "5a7f5c41d4e22453b10130557796a76cfabebbcd" }
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "501c9cc9f139f7d43b05ed504e31262b35183a4d", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "501c9cc9f139f7d43b05ed504e31262b35183a4d", features = ["orchard"] }
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "501c9cc9f139f7d43b05ed504e31262b35183a4d" }
 zcash_voting = { path = "../zcash_voting" }
 zip32 = "0.2"
