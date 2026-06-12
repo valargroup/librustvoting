@@ -2,41 +2,20 @@
 
 use std::borrow::Borrow;
 
+use crate::shielded_protocol::VotingShieldedProtocol;
 use crate::storage::VotingDb;
 use crate::{
     delegate::{load_account_keys, DelegationKeys},
     types::{Network, NoteInfo, NoteRef, SelectedNotes, VotingError, VotingHotkey},
 };
 
-use orchard::note::NoteVersion;
 use zcash_client_backend::{
     data_api::{wallet::ConfirmationsPolicy, Account, WalletRead},
     proto::service::TreeState,
 };
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-#[cfg(zcash_unstable = "nu7")]
-use zcash_protocol::consensus::BranchId;
 use zcash_protocol::consensus::{BlockHeight, Parameters};
-
-const POOL_ORCHARD: &str = "orchard";
-const POOL_IRONWOOD: &str = "ironwood";
-
-fn voting_note_version_for_height<P: Parameters>(_params: &P, _height: BlockHeight) -> NoteVersion {
-    #[cfg(zcash_unstable = "nu7")]
-    if matches!(BranchId::for_height(_params, _height), BranchId::Nu7) {
-        return NoteVersion::V3;
-    }
-
-    NoteVersion::V2
-}
-
-fn pool_for_note_version(version: NoteVersion) -> &'static str {
-    match version {
-        NoteVersion::V2 => POOL_ORCHARD,
-        NoteVersion::V3 => POOL_IRONWOOD,
-    }
-}
 
 /// Wallet-derived notes, anchor, and keys needed for delegation precompute.
 #[derive(Clone, Debug)]
@@ -245,7 +224,8 @@ where
         });
     }
 
-    let voting_note_version = voting_note_version_for_height(db.params(), snapshot_block_height);
+    let voting_protocol = VotingShieldedProtocol::for_height(db.params(), snapshot_block_height);
+    let voting_note_version = voting_protocol.note_version();
     let selected = db
         .get_unspent_orchard_notes_at_historical_height(account.id(), snapshot_block_height)
         .map_err(|e| VotingError::Internal {
@@ -269,7 +249,7 @@ where
             db.params(),
         )?;
         let note_ref = NoteRef {
-            pool: pool_for_note_version(voting_note_version).to_string(),
+            pool: voting_protocol.pool().to_string(),
             txid_hex: note.txid().to_string(),
             output_index,
             value_zatoshi: value,
@@ -436,7 +416,7 @@ mod tests {
         assert_eq!(selected.notes[2].commitment_tree_position, 8);
         assert_eq!(selected.notes[2].value_zatoshi, divisor - 1);
         assert_eq!(crate::voting_power(&selected), divisor * 4);
-        assert!(selected.notes.iter().all(|note| note.pool == POOL_ORCHARD));
+        assert!(selected.notes.iter().all(|note| note.pool == "orchard"));
         assert!(selected.notes.iter().all(|note| note.scope == 0));
         assert!(selected.notes.iter().all(|note| !note.ufvk_str.is_empty()));
     }
@@ -466,7 +446,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected.notes.len(), 1);
-        assert_eq!(selected.notes[0].pool, POOL_IRONWOOD);
+        assert_eq!(selected.notes[0].pool, "ironwood");
         assert_eq!(selected.notes[0].commitment_tree_position, 4);
         assert_eq!(selected.notes[0].value_zatoshi, divisor * 2);
         assert_eq!(crate::voting_power(&selected), divisor * 2);

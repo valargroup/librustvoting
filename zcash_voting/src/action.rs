@@ -19,6 +19,7 @@ use zcash_protocol::consensus::{BlockHeight, BranchId, Network};
 use zip32::Scope;
 
 use crate::governance::{self, BUNDLE_NOTE_SLOTS};
+use crate::shielded_protocol::VotingShieldedProtocol;
 use crate::types::{
     validate_notes, validate_round_params, GovernancePczt, NoteInfo, VotingError, VotingRoundParams,
 };
@@ -31,29 +32,6 @@ const ZIP32_MAINNET_COIN_TYPE: u32 = 133;
 
 /// Orchard key diversification personalization for DiversifyHash^Orchard.
 const ORCHARD_GD_PERSONALIZATION: &str = "z.cash:Orchard-gd";
-
-fn bundle_protocol_for_branch(_branch_id: BranchId) -> BundleProtocol {
-    #[cfg(zcash_unstable = "nu7")]
-    if matches!(_branch_id, BranchId::Nu7) {
-        return BundleProtocol::Ironwood;
-    }
-
-    BundleProtocol::Orchard
-}
-
-fn bundle_protocol_name(protocol: BundleProtocol) -> &'static str {
-    match protocol {
-        BundleProtocol::Orchard => "Orchard",
-        BundleProtocol::Ironwood => "Ironwood",
-    }
-}
-
-fn note_version_for_bundle_protocol(protocol: BundleProtocol) -> NoteVersion {
-    match protocol {
-        BundleProtocol::Orchard => NoteVersion::V2,
-        BundleProtocol::Ironwood => NoteVersion::V3,
-    }
-}
 
 #[cfg(zcash_unstable = "nu7")]
 fn pczt_actions_for_protocol(
@@ -225,15 +203,9 @@ fn make_dummy_note(
     addr: Address,
     rho: Rho,
     rng: &mut impl RngCore,
-    protocol: BundleProtocol,
+    protocol: VotingShieldedProtocol,
 ) -> Result<(orchard::Note, [u8; 32]), VotingError> {
-    make_note(
-        addr,
-        NoteValue::from_raw(1),
-        rho,
-        rng,
-        note_version_for_bundle_protocol(protocol),
-    )
+    make_note(addr, NoteValue::from_raw(1), rho, rng, protocol.note_version())
 }
 
 /// Canonical delegate action payload encoding for external signing.
@@ -357,7 +329,8 @@ pub fn build_governance_pczt(
                 consensus_branch_id, e
             ),
         })?;
-    let bundle_protocol = bundle_protocol_for_branch(branch_id);
+    let shielded_protocol = VotingShieldedProtocol::for_branch_id(branch_id);
+    let bundle_protocol = shielded_protocol.bundle_protocol();
 
     // --- Compute governance nullifiers ---
     let dom = governance::compute_nullifier_domain(&vri_32)?;
@@ -482,7 +455,7 @@ pub fn build_governance_pczt(
         })?;
     let sender_address = fvk.address_at(0u32, Scope::External);
     let (signed_note, rseed_signed_bytes) =
-        make_dummy_note(sender_address, rho_for_note, &mut rng, bundle_protocol)?;
+        make_dummy_note(sender_address, rho_for_note, &mut rng, shielded_protocol)?;
 
     // --- Build PCZT using orchard Builder ---
     // Dummy MerklePath: all-zero siblings, position 0.
@@ -677,7 +650,7 @@ pub fn build_governance_pczt(
                         "GovernancePczt action_index {} is out of bounds for {} {} actions",
                         action_index,
                         indexed_actions.len(),
-                        bundle_protocol_name(bundle_protocol)
+                        shielded_protocol.name()
                     ),
                 })?;
         if *indexed_action.spend().nullifier() != nf_signed_bytes
