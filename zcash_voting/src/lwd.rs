@@ -15,6 +15,8 @@ use zcash_client_backend::proto::service::{
 };
 use zcash_protocol::consensus::{BlockHeight, BranchId};
 
+#[cfg(zcash_unstable = "nu7")]
+use crate::types::REGTEST_NU7_ACTIVATION_HEIGHT;
 use crate::types::{Network, VotingError};
 
 const LIGHTWALLETD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -234,13 +236,14 @@ mod tests {
         );
         #[cfg(zcash_unstable = "nu7")]
         {
+            let nu7_activation_height = u64::from(REGTEST_NU7_ACTIVATION_HEIGHT);
             assert_eq!(
-                branch_id_for_height(Network::Regtest, 9).unwrap(),
+                branch_id_for_height(Network::Regtest, nu7_activation_height - 1).unwrap(),
                 0x5437_F330
             );
             assert_eq!(
-                branch_id_for_height(Network::Regtest, 10).unwrap(),
-                0xFFFF_FFFF
+                branch_id_for_height(Network::Regtest, nu7_activation_height).unwrap(),
+                u32::from(BranchId::Nu7)
             );
         }
     }

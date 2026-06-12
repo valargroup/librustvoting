@@ -31,7 +31,7 @@ pub const MIN_VOTE_OPTIONS: u32 = 2;
 pub const MAX_VOTE_OPTIONS: u32 = 8;
 
 #[cfg(zcash_unstable = "nu7")]
-const REGTEST_NU7_ACTIVATION_HEIGHT: u32 = 10;
+pub(crate) const REGTEST_NU7_ACTIVATION_HEIGHT: u32 = 10;
 
 #[derive(Debug, Error)]
 pub enum VotingError {

@@ -871,9 +871,6 @@ mod tests {
 
     /// NU5 mainnet consensus branch ID
     const NU5_BRANCH_ID: u32 = 0xC2D6D0B4;
-    /// Valar NU7 placeholder consensus branch ID
-    #[cfg(zcash_unstable = "nu7")]
-    const NU7_BRANCH_ID: u32 = 0xFFFF_FFFF;
     /// Mock seed fingerprint (32 bytes)
     const MOCK_SEED_FP: [u8; 32] = [0xAA; 32];
     /// Mock account index
@@ -1005,7 +1002,7 @@ mod tests {
             &mock_params(),
             &mock_fvk_bytes(),
             &mock_hotkey_address(),
-            NU7_BRANCH_ID,
+            u32::from(BranchId::Nu7),
             ZIP32_MAINNET_COIN_TYPE,
             &MOCK_SEED_FP,
             MOCK_ACCOUNT,
