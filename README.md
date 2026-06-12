@@ -109,11 +109,21 @@ The workspace depends on the private [valargroup/voting-circuits](https://github
 
 ## Dependency Strategy
 
-This workspace uses `[patch.crates-io]` (in the root `Cargo.toml`) to override two dependency trees:
+This workspace temporarily pins the Ironwood dependency stack through the root
+manifest and member manifests:
 
-- **orchard 0.11** — Resolved from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits), which bundles an orchard fork with public visibility for `constants`, `spec`, and a `shared_primitives::spend_authority` gadget.
+- **orchard 0.14** — Resolved from [valargroup/qr_orchard](https://github.com/valargroup/qr_orchard)
+  branch `ironwood-qr`, with `unstable-voting-circuits` enabled for governance
+  proof paths.
 
-- **librustzcash crates** (pczt, zcash_keys, zcash_client_sqlite, etc.) — Resolved from [valargroup/librustzcash](https://github.com/valargroup/librustzcash) branch `valargroup/pczt-governance-extensions-0.11`. Adds public getters and methods needed for governance PCZT construction and Merkle witness generation.
+- **librustzcash crates** (`pczt`, `zcash_keys`, `zcash_client_sqlite`,
+  `zcash_client_backend`, `zcash_primitives`, and `zcash_protocol`) — Resolved
+  from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
+  rev `d91d9720f08f0e7d586e463ae0949d7337394146` for the Ironwood/NU7 wallet,
+  PCZT, and protocol APIs used by this branch.
+
+- **voting-circuits 0.8** — Resolved from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
+  for the delegation and vote proof circuits.
 
 ## FFI
 
