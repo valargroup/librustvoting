@@ -8,12 +8,12 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-orchard = { version = "0.14", git = "https://github.com/valargroup/qr_orchard", branch = "ironwood-qr", features = ["unstable-voting-circuits"] }
-voting-circuits = { version = "=0.8.0", git = "https://github.com/valargroup/voting-circuits", rev = "418ea519f4fca04c1bff06442edf920a3e1e41f3" }
+orchard = { version = "0.14", git = "https://github.com/valargroup/qr_orchard", rev = "2b531b9d61a564a11cbdd9418a9788d1dd7d20de", features = ["unstable-voting-circuits"] }
+voting-circuits = { version = "=0.8.0", git = "https://github.com/valargroup/voting-circuits", rev = "76b31e2b19be43a67567db3aaf2c29df91206016" }
 
-pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "a82bfcc5dcd682928de1f692bee3a2e8788f3a26", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "a82bfcc5dcd682928de1f692bee3a2e8788f3a26", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "a82bfcc5dcd682928de1f692bee3a2e8788f3a26", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "a82bfcc5dcd682928de1f692bee3a2e8788f3a26", features = ["orchard"] }
-zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "a82bfcc5dcd682928de1f692bee3a2e8788f3a26" }
-zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "a82bfcc5dcd682928de1f692bee3a2e8788f3a26" }
+pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae", features = ["orchard"] }
+zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae" }
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae" }

@@ -184,14 +184,15 @@ The crate no longer accepts root wallet seed material for delegation signing.
 `zcash_voting` currently follows a temporary Ironwood dependency stack:
 
 - **`orchard 0.14`** from [valargroup/qr_orchard](https://github.com/valargroup/qr_orchard)
-  branch `ironwood-qr`, with `unstable-voting-circuits` enabled for the
+  rev `2b531b9d61a564a11cbdd9418a9788d1dd7d20de`, with
+  `unstable-voting-circuits` enabled for the
   governance proof paths.
 - **`voting-circuits 0.8`** for the delegation and vote proof circuits.
 - **`vote-commitment-tree 0.3`** and **`vote-commitment-tree-client 0.5`** for
   vote commitment tree state and optional HTTP sync.
 - **`pczt`, `zcash_keys`, `zcash_client_backend`, `zcash_client_sqlite`,
   `zcash_primitives`, and `zcash_protocol`** from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
-  rev `d91d9720f08f0e7d586e463ae0949d7337394146`.
+  rev `a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae`.
 
 ## Migrating from 0.10
 
