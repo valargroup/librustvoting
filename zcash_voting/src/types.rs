@@ -336,8 +336,8 @@ pub struct DelegationAction {
 
 /// Governance PCZT for Keystone signing.
 ///
-/// Contains a serialized PCZT whose single Orchard action IS the governance
-/// dummy action (spend of signed note → output to hotkey). The PCZT's rk and
+/// Contains a serialized PCZT whose governance action belongs to the selected
+/// shielded protocol (Orchard before NU7, Ironwood at NU7). The PCZT's rk and
 /// ZIP-244 sighash are internally consistent, so Keystone's SpendAuth signature
 /// will verify against them.
 #[derive(Clone, Debug)]

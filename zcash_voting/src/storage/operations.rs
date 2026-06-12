@@ -477,8 +477,8 @@ impl VotingDb {
 
     /// Build a governance-specific PCZT for Keystone signing.
     /// Loads round params from db. Notes come from caller.
-    /// Computes governance values and builds a PCZT whose single Orchard action
-    /// IS the governance dummy action (spend of signed note → output to hotkey).
+    /// Computes governance values and builds a PCZT whose governance action
+    /// belongs to the selected shielded protocol.
     ///
     /// - `consensus_branch_id`: NU6 = 0xC8E71055
     /// - `keys`: wallet account and voting hotkey metadata for the delegation PCZT

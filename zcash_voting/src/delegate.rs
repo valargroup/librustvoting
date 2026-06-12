@@ -509,7 +509,7 @@ pub struct KeystoneSigningRequest {
     pub pczt_sighash: Vec<u8>,
     /// Randomized verification key (rk) for signature verification.
     pub rk: Vec<u8>,
-    /// Orchard action index containing the governance spend/output.
+    /// Governance action index within the selected shielded protocol bundle.
     pub action_index: u32,
     /// Human-readable memo shown to the signer.
     pub display_memo: String,

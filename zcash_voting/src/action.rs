@@ -191,9 +191,9 @@ fn make_note(
     Ok((note.expect("is_some checked above"), rseed_bytes))
 }
 
-/// Construct a 1-zatoshi Orchard note.
+/// Construct a 1-zatoshi governance note for the selected shielded protocol.
 ///
-/// The signed note uses value 1 so Keystone renders a non-zero Orchard action.
+/// The signed note uses value 1 so Keystone renders a non-zero governance action.
 fn make_dummy_note(
     addr: Address,
     rho: Rho,
@@ -250,10 +250,10 @@ fn encode_delegation_action_bytes(
 
 /// Build a governance-specific PCZT for Keystone signing.
 ///
-/// Constructs a PCZT whose single real Orchard action is the governance dummy action
-/// (spend of signed note with constrained rho → output to hotkey). The Builder
-/// generates alpha/rk internally, and the PCZT's ZIP-244 sighash is computed by
-/// Keystone when it runs the Signer role.
+/// Constructs a PCZT whose real governance action belongs to the selected
+/// shielded protocol (spend of signed note with constrained rho → output to
+/// hotkey). The Builder generates alpha/rk internally, and the PCZT's ZIP-244
+/// sighash is computed by Keystone when it runs the Signer role.
 ///
 /// Parameters:
 /// - `notes`: input notes for governance nullifier derivation, up to
