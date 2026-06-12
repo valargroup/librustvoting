@@ -74,13 +74,40 @@ fn pczt_actions_for_protocol(
     pczt.orchard().actions()
 }
 
-fn signed_pczt_actions(pczt: &pczt::Pczt) -> (&[pczt::orchard::Action], &'static str) {
+fn signed_pczt_actions(
+    pczt: &pczt::Pczt,
+) -> Result<(&[pczt::orchard::Action], &'static str), VotingError> {
+    let orchard_actions = pczt.orchard().actions();
+
     #[cfg(zcash_unstable = "nu7")]
-    if !pczt.ironwood().actions().is_empty() {
-        return (pczt.ironwood().actions(), "Ironwood");
+    {
+        let ironwood_actions = pczt.ironwood().actions();
+        match (!orchard_actions.is_empty(), !ironwood_actions.is_empty()) {
+            (true, false) => Ok((orchard_actions, "Orchard")),
+            (false, true) => Ok((ironwood_actions, "Ironwood")),
+            (true, true) => Err(VotingError::InvalidInput {
+                message: concat!(
+                    "signed PCZT must contain actions for exactly one shielded protocol; ",
+                    "found both Orchard and Ironwood actions"
+                )
+                .to_string(),
+            }),
+            (false, false) => Err(VotingError::InvalidInput {
+                message: "signed PCZT contains no Orchard or Ironwood actions".to_string(),
+            }),
+        }
     }
 
-    (pczt.orchard().actions(), "Orchard")
+    #[cfg(not(zcash_unstable = "nu7"))]
+    {
+        if orchard_actions.is_empty() {
+            Err(VotingError::InvalidInput {
+                message: "signed PCZT contains no Orchard actions".to_string(),
+            })
+        } else {
+            Ok((orchard_actions, "Orchard"))
+        }
+    }
 }
 
 /// Extract the affine x-coordinate bytes from a non-identity Pallas point.
@@ -739,7 +766,7 @@ pub fn extract_spend_auth_sig(
         message: format!("Failed to parse signed PCZT: {:?}", e),
     })?;
 
-    let (actions, protocol_name) = signed_pczt_actions(&pczt);
+    let (actions, protocol_name) = signed_pczt_actions(&pczt)?;
 
     // Try the expected action index first.
     if action_index < actions.len() {
