@@ -10,6 +10,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Aligned the workspace's Zcash and Orchard dependency graph with the
   Ironwood-capable Zcash crates so wallet integrations resolve one Orchard/PCZT
   stack.
+- Updated NU7 snapshot selection and governance PCZT construction to use only
+  Ironwood/V3 notes, while pre-NU7 voting remains on Orchard/V2 notes.
 
 ## v1.0.0
 
