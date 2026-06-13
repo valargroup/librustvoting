@@ -53,7 +53,7 @@ precompute → delegate → vote → share lifecycle:
 |---|---|
 | `prelude` | Recommended imports for wallet SDKs. |
 | `round` | `VotingDb`, `RoundParams`, `RoundInfo`, idempotent `ensure_bundles`, and policy-aware bundle planning. |
-| `precompute` | Orchard note witness generation and PIR precompute wrappers. |
+| `precompute` | Shielded note witness generation and PIR precompute wrappers. |
 | `delegate` | PCZT setup, proof generation, submission assembly, and chain recovery writes. |
 | `confirmation` | Chain tx event parsing plus atomic delegation and cast-vote confirmation recording. |
 | `vote` | ZKP2 construction, cast-vote signing, and vote recovery bundle persistence. |
@@ -192,7 +192,7 @@ The crate no longer accepts root wallet seed material for delegation signing.
   vote commitment tree state and optional HTTP sync.
 - **`pczt`, `zcash_keys`, `zcash_client_backend`, `zcash_client_sqlite`,
   `zcash_primitives`, and `zcash_protocol`** from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
-  rev `a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae`.
+  rev `e71942a84d753098b9ed8352fa0c241a097f7d70`.
 
 ## Migrating from 0.10
 

@@ -36,7 +36,7 @@ pub struct PirPrecomputeReport {
     pub fetched: u32,
 }
 
-/// Persists a snapshot tree state, generates Orchard witnesses, and caches them.
+/// Persists a snapshot tree state, generates shielded note witnesses, and caches them.
 ///
 /// This is the FFI-friendly variant for callers that pass the round tree state
 /// with the note-witness request.
@@ -62,7 +62,7 @@ where
     )
 }
 
-/// Loads a round's cached tree state, generates Orchard witnesses, and caches them.
+/// Loads a round's cached tree state, generates shielded note witnesses, and caches them.
 ///
 /// This is the FFI-friendly variant for callers that already persisted the
 /// round tree state through [`VotingDb`] and should not reach into storage
@@ -83,7 +83,7 @@ where
     Ok(witnesses)
 }
 
-/// Verifies an Orchard note witness against its stored root.
+/// Verifies a shielded note witness against its stored root.
 ///
 /// Returns `Ok(())` when the witness recomputes to the expected root and
 /// [`VotingError::InvalidInput`] when the bytes are malformed or mismatched.

@@ -40,7 +40,7 @@ New wallet integrations should import `zcash_voting::prelude::*` and use the
 stage-oriented API:
 
 - `round::*` creates rounds and binds eligible notes into bundles.
-- `precompute::*` prepares Orchard witnesses, delegation PIR inputs, and VAN
+- `precompute::*` prepares shielded note witnesses, delegation PIR inputs, and VAN
   witnesses for vote proofs.
 - `delegate::*` builds delegation PCZTs, proves delegation, prepares signing
   requests, and assembles signed delegation submissions. Wallets keep root seed
@@ -120,7 +120,7 @@ manifest and member manifests:
 - **librustzcash crates** (`pczt`, `zcash_keys`, `zcash_client_sqlite`,
   `zcash_client_backend`, `zcash_primitives`, and `zcash_protocol`) — Resolved
   from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
-  rev `a2c5a1b2be77d6bcc730d07d083c9fbee02c71ae` for the Ironwood/NU7 wallet,
+  rev `e71942a84d753098b9ed8352fa0c241a097f7d70` for the Ironwood/NU7 wallet,
   PCZT, and protocol APIs used by this branch.
 
 - **voting-circuits 0.8** — Resolved from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)

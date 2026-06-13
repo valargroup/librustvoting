@@ -581,7 +581,7 @@ pub struct DelegationPirPrecomputeResult {
     pub fetched_count: u32,
 }
 
-/// Merkle witness for a note in the Orchard commitment tree.
+/// Merkle witness for a note in the selected shielded commitment tree.
 #[derive(Clone, Debug)]
 pub struct WitnessData {
     pub note_commitment: Vec<u8>,
