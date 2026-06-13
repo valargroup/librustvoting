@@ -185,20 +185,20 @@ The crate no longer accepts root wallet seed material for delegation signing.
 
 ## Dependency notes
 
-`zcash_voting` currently follows a temporary Ironwood dependency stack:
+`zcash_voting` currently follows a temporary Ironwood dependency stack through
+workspace-level git `rev` pins. The root `Cargo.toml` is the source of truth for
+the current dependency repositories, revs, and feature flags; `Cargo.lock`
+records the resolved commits used by this branch.
 
-- **`orchard 0.14`** from [valargroup/qr_orchard](https://github.com/valargroup/qr_orchard)
-  rev `89d46956a3ae58cd2af170edace8a2f5d7a7715f`, with
-  `unstable-voting-circuits` enabled for the
-  governance proof paths.
+- **`orchard 0.14`** from [valargroup/qr_orchard](https://github.com/valargroup/qr_orchard),
+  with `unstable-voting-circuits` enabled for the governance proof paths.
 - **`voting-circuits 0.8`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
-  rev `9e7957028c5835da689112d7084ec9b283c9c1e3` for the delegation and
-  vote proof circuits.
+  for the delegation and vote proof circuits.
 - **`vote-commitment-tree 0.3`** and **`vote-commitment-tree-client 0.5`** for
   vote commitment tree state and optional HTTP sync.
 - **`pczt`, `zcash_keys`, `zcash_client_backend`, `zcash_client_sqlite`,
   `zcash_primitives`, and `zcash_protocol`** from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
-  rev `8f242680358a2db7a6df42a629c8dd3d5cb4d737`.
+  for the Zcash protocol, wallet, PCZT, and storage dependencies.
 
 ## Migrating from 0.10
 
