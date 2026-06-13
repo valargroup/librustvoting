@@ -933,14 +933,14 @@ fn redact_delegation_pczt_for_signer(pczt_bytes: &[u8]) -> Result<Vec<u8>, Votin
         message: format!("parse PCZT failed: {e:?}"),
     })?;
 
-    let redacted = Redactor::new(pczt)
+    let redactor = Redactor::new(pczt)
         .redact_global_with(|mut r| r.redact_proprietary("zcash_client_backend:proposal_info"))
-        .redact_orchard_with(|mut r| {
-            r.redact_actions(|mut ar| {
-                ar.clear_spend_witness();
-                ar.redact_output_proprietary("zcash_client_backend:output_info");
-            });
-        })
+        .redact_orchard_with(redact_orchard_like_bundle_for_signer);
+
+    #[cfg(zcash_unstable = "nu7")]
+    let redactor = redactor.redact_ironwood_with(redact_orchard_like_bundle_for_signer);
+
+    let redacted = redactor
         .redact_sapling_with(|mut r| {
             r.redact_spends(|mut sr| sr.clear_witness());
             r.redact_outputs(|mut or| {
@@ -955,6 +955,15 @@ fn redact_delegation_pczt_for_signer(pczt_bytes: &[u8]) -> Result<Vec<u8>, Votin
         .finish();
 
     Ok(redacted.serialize())
+}
+
+fn redact_orchard_like_bundle_for_signer(
+    mut r: pczt::roles::redactor::orchard::OrchardRedactor<'_>,
+) {
+    r.redact_actions(|mut ar| {
+        ar.clear_spend_witness();
+        ar.redact_output_proprietary("zcash_client_backend:output_info");
+    });
 }
 
 /// Returns the human-readable Keystone memo for a delegation PCZT.
@@ -1076,6 +1085,8 @@ mod tests {
     use zcash_client_backend::data_api::{chain::ChainState, AccountBirthday, WalletWrite};
     use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db};
     use zcash_primitives::block::BlockHash;
+    #[cfg(zcash_unstable = "nu7")]
+    use zcash_protocol::consensus::BranchId;
     use zcash_protocol::consensus::{
         Network as ZcashNetwork, NetworkConstants, NetworkUpgrade, Parameters,
     };
@@ -1754,5 +1765,76 @@ mod tests {
             .to_string();
 
         assert!(err.contains("parse PCZT failed"));
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    fn ironwood_spend_witnesses(pczt: &pczt::Pczt) -> Vec<serde_json::Value> {
+        let value = serde_json::to_value(pczt).expect("serialize PCZT to JSON");
+        value["ironwood"]["actions"]
+            .as_array()
+            .expect("ironwood actions serialize as an array")
+            .iter()
+            .map(|action| action["spend"]["witness"].clone())
+            .collect()
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    fn pczt_with_ironwood_output_info(pczt: &pczt::Pczt) -> pczt::Pczt {
+        let mut value = serde_json::to_value(pczt).expect("serialize PCZT to JSON");
+        for action in value["ironwood"]["actions"]
+            .as_array_mut()
+            .expect("ironwood actions serialize as an array")
+        {
+            action["output"]["proprietary"]
+                .as_object_mut()
+                .expect("output proprietary serializes as an object")
+                .insert(
+                    "zcash_client_backend:output_info".to_string(),
+                    serde_json::json!([1, 2, 3]),
+                );
+        }
+
+        serde_json::from_value(value).expect("deserialize seeded PCZT")
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    #[test]
+    fn redact_delegation_pczt_for_signer_redacts_ironwood_actions() {
+        let (voting_db, _round_params, _hotkey, mut prepared) =
+            prepared_wallet_delegation_fixture();
+        prepared.branch_id_provider =
+            LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu7));
+
+        let request = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .expect("build Keystone request");
+        let full_pczt = pczt::Pczt::parse(&request.pczt_bytes).expect("parse full PCZT");
+        let seeded_pczt = pczt_with_ironwood_output_info(&full_pczt);
+        let seeded_pczt_bytes = seeded_pczt.serialize();
+        let redacted_pczt_bytes = redact_delegation_pczt_for_signer(&seeded_pczt_bytes)
+            .expect("redact seeded Ironwood PCZT");
+        let redacted_pczt = pczt::Pczt::parse(&redacted_pczt_bytes).expect("parse redacted PCZT");
+
+        assert!(full_pczt.orchard().actions().is_empty());
+        assert_eq!(full_pczt.ironwood().actions().len(), 2);
+        assert!(ironwood_spend_witnesses(&full_pczt)
+            .iter()
+            .any(|witness| !witness.is_null()));
+
+        assert!(redacted_pczt.orchard().actions().is_empty());
+        assert_eq!(redacted_pczt.ironwood().actions().len(), 2);
+        assert!(ironwood_spend_witnesses(&redacted_pczt)
+            .iter()
+            .all(serde_json::Value::is_null));
+        assert!(redacted_pczt.ironwood().actions().iter().all(|action| {
+            !action
+                .output()
+                .proprietary()
+                .contains_key("zcash_client_backend:output_info")
+        }));
+        assert_eq!(
+            pczt_sighash(&redacted_pczt_bytes).unwrap(),
+            pczt_sighash(&seeded_pczt_bytes).unwrap()
+        );
     }
 }
