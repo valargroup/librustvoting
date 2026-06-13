@@ -161,8 +161,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   `VotingDb::generate_hotkey`.
 - Added `delegate::LightwalletdBranchIdProvider` and
   `delegate::branch_id_for_height` so wallet SDKs can resolve delegation
-  consensus branches from `lightwalletd_url` plus `Network` without duplicating
-  lightwalletd tip-fetching code.
+  consensus branches from a voting snapshot height plus `Network` without
+  duplicating consensus activation logic.
 - Added `vote::VoteCommitStage` plus `VoteCommitStageReporter` and
   `VoteCommitStageBridge` so wallet SDKs can consume library-owned cast-vote
   lifecycle and proof-progress stages without defining local event enums.

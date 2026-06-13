@@ -121,19 +121,28 @@ pub enum DelegationProgress {
 #[deprecated(note = "use DelegationProgress")]
 pub type DelegationStage = DelegationProgress;
 
-/// Resolves the consensus branch id for the wallet's selected chain tip.
+/// Supplies the consensus branch id used for a delegation PCZT.
 pub trait BranchIdProvider {
     fn consensus_branch_id(&self) -> Result<u32, VotingError>;
 }
 
-/// Branch-id provider backed by a lightwalletd tip lookup.
+/// Resolved branch-id provider for delegation PCZT construction.
 #[derive(Clone, Debug)]
 pub struct LightwalletdBranchIdProvider {
     resolved: u32,
 }
 
 impl LightwalletdBranchIdProvider {
+    /// Resolves the branch id active at the voting snapshot height.
+    pub fn for_height(network: Network, height: u64) -> Result<Self, VotingError> {
+        let resolved = crate::lwd::branch_id_for_height(network, height)?;
+        Ok(Self { resolved })
+    }
+
     /// Fetches the current lightwalletd tip and resolves the active branch id.
+    ///
+    /// Round delegation setup should use [`Self::for_height`] with the round
+    /// snapshot height so PCZT construction matches note selection and witnesses.
     pub async fn resolve(lightwalletd_url: &str, network: Network) -> Result<Self, VotingError> {
         let branch_height = crate::lwd::latest_block_height_with_retry(lightwalletd_url).await?;
         let resolved = crate::lwd::branch_id_for_height(network, branch_height)?;
@@ -255,8 +264,10 @@ pub async fn gather_delegation_lwd_inputs(
         params.round_params.snapshot_height,
     )
     .await?;
-    let branch_id_provider =
-        LightwalletdBranchIdProvider::resolve(params.lightwalletd_url, params.network).await?;
+    let branch_id_provider = LightwalletdBranchIdProvider::for_height(
+        params.network,
+        params.round_params.snapshot_height,
+    )?;
 
     Ok(DelegationLwdInputs {
         round_params: params.round_params,
@@ -535,6 +546,24 @@ pub struct PreparedDelegationReport {
 }
 
 impl PreparedDelegationBundle {
+    fn snapshot_branch_id_provider(&self) -> Result<LightwalletdBranchIdProvider, VotingError> {
+        LightwalletdBranchIdProvider::for_height(self.network, self.round_params.snapshot_height)
+    }
+
+    fn validate_snapshot_branch_id_provider(&self) -> Result<(), VotingError> {
+        let expected = self.snapshot_branch_id_provider()?.consensus_branch_id()?;
+        let actual = self.branch_id_provider.consensus_branch_id()?;
+        if actual != expected {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "delegation branch id 0x{actual:08X} does not match snapshot height {} branch id 0x{expected:08X}",
+                    self.round_params.snapshot_height
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns the quantized weight represented by this prepared bundle.
     ///
     /// This is the weight used in delegation payload metadata. Display text may
@@ -612,6 +641,7 @@ impl PreparedDelegationBundle {
         voting_db: &VotingDb,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationSetup, VotingError> {
+        self.validate_snapshot_branch_id_provider()?;
         crate::delegate::setup(
             voting_db,
             &self.round_id,
@@ -1092,6 +1122,9 @@ mod tests {
     };
     use zip32::Scope;
 
+    const TESTNET_NU6_SNAPSHOT_HEIGHT: u64 = 3_536_500;
+    const TESTNET_NU6_BRANCH_ID: u32 = 0x4DEC_4DF0;
+
     fn test_voting_hotkey() -> VotingHotkey {
         VotingHotkey::from_stored_secret(&[0x77; 64], Network::Testnet).unwrap()
     }
@@ -1124,7 +1157,10 @@ mod tests {
         let divisor = crate::governance::BALLOT_DIVISOR;
 
         assert_eq!(prepared.round_id, round_params.vote_round_id);
-        assert_eq!(prepared.round_params.snapshot_height, 12);
+        assert_eq!(
+            prepared.round_params.snapshot_height,
+            TESTNET_NU6_SNAPSHOT_HEIGHT
+        );
         assert_eq!(prepared.bundle_index, 0);
         assert_eq!(prepared.layout.bundle_count, 1);
         assert_eq!(prepared.layout.eligible_weight, divisor * 3);
@@ -1136,7 +1172,7 @@ mod tests {
         assert_eq!(prepared.round_name, "Demo Round");
         assert_eq!(
             prepared.branch_id_provider.consensus_branch_id().unwrap(),
-            0x4DEC_4DF0
+            TESTNET_NU6_BRANCH_ID
         );
         assert_eq!(
             &prepared.delegation_keys.hotkey_raw_address,
@@ -1226,7 +1262,7 @@ mod tests {
             round_id: "round-1".to_string(),
             round_params: crate::VotingRoundParams {
                 vote_round_id: "round-1".to_string(),
-                snapshot_height: 42,
+                snapshot_height: TESTNET_NU6_SNAPSHOT_HEIGHT,
                 ea_pk: vec![1; 32],
                 nc_root: vec![2; 32],
                 nullifier_imt_root: vec![3; 32],
@@ -1248,7 +1284,7 @@ mod tests {
                 coin_type: Network::Testnet.network_type().coin_type(),
                 round_name: "Demo Round".to_string(),
             },
-            branch_id_provider: LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0),
+            branch_id_provider: LightwalletdBranchIdProvider::resolved(TESTNET_NU6_BRANCH_ID),
             anchor_tree_state_bytes: vec![0xAA],
             network: Network::Testnet,
             round_name: "Demo Round".to_string(),
@@ -1266,9 +1302,33 @@ mod tests {
         let account_ref = account_internal_id(&conn, &account_uuid);
         let divisor = crate::governance::BALLOT_DIVISOR;
 
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, divisor, 7);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 10, divisor * 2, 3);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 11);
+        insert_orchard_note(
+            &conn,
+            account_ref,
+            &orchard_fvk,
+            1,
+            (TESTNET_NU6_SNAPSHOT_HEIGHT - 2) as u32,
+            divisor,
+            7,
+        );
+        insert_orchard_note(
+            &conn,
+            account_ref,
+            &orchard_fvk,
+            2,
+            (TESTNET_NU6_SNAPSHOT_HEIGHT - 2) as u32,
+            divisor * 2,
+            3,
+        );
+        insert_orchard_note(
+            &conn,
+            account_ref,
+            &orchard_fvk,
+            3,
+            (TESTNET_NU6_SNAPSHOT_HEIGHT + 4) as u32,
+            divisor * 3,
+            11,
+        );
 
         let wallet_db = WalletDb::from_connection(
             &conn,
@@ -1284,7 +1344,7 @@ mod tests {
         let round_params = crate::VotingRoundParams {
             vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
                 .to_string(),
-            snapshot_height: 12,
+            snapshot_height: TESTNET_NU6_SNAPSHOT_HEIGHT,
             ea_pk: ea_pk.to_bytes().to_vec(),
             nc_root: vec![2; 32],
             nullifier_imt_root: vec![3; 32],
@@ -1293,14 +1353,14 @@ mod tests {
             round_params: round_params.clone(),
             resolved_round_name: "Demo Round".to_string(),
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
-            branch_id_provider: LightwalletdBranchIdProvider::resolved(0x4DEC_4DF0),
+            branch_id_provider: LightwalletdBranchIdProvider::resolved(TESTNET_NU6_BRANCH_ID),
         };
         let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &wallet_db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
             voting_hotkey: &hotkey,
             snapshot_height: round_params.snapshot_height,
-            scanned_height: 12,
+            scanned_height: TESTNET_NU6_SNAPSHOT_HEIGHT,
             anchor_tree_state_bytes: lwd.anchor_tree_state_bytes.clone(),
             resolved_round_name: lwd.resolved_round_name.clone(),
         })
@@ -1568,6 +1628,38 @@ mod tests {
     }
 
     #[test]
+    fn lightwalletd_branch_id_provider_for_height_returns_snapshot_branch_id() {
+        let provider =
+            LightwalletdBranchIdProvider::for_height(Network::Testnet, TESTNET_NU6_SNAPSHOT_HEIGHT)
+                .unwrap();
+
+        assert_eq!(
+            provider.consensus_branch_id().unwrap(),
+            TESTNET_NU6_BRANCH_ID
+        );
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    #[test]
+    fn prepared_setup_rejects_branch_id_that_does_not_match_snapshot_height() {
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        let mut prepared =
+            prepared_bundle_fixture(vec![note_info(0, crate::governance::BALLOT_DIVISOR)]);
+        prepared.network = Network::Regtest;
+        prepared.round_params.snapshot_height =
+            u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT) - 1;
+        prepared.branch_id_provider =
+            LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu7));
+
+        let err = prepared
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("does not match snapshot height"));
+    }
+
+    #[test]
     fn external_signature_signer_validates_signature_shapes() {
         assert!(matches!(
             DelegationSigner::signature_from_bytes(&[1; 64], &[2; 32]).unwrap(),
@@ -1802,6 +1894,11 @@ mod tests {
     fn redact_delegation_pczt_for_signer_redacts_ironwood_actions() {
         let (voting_db, _round_params, _hotkey, mut prepared) =
             prepared_wallet_delegation_fixture();
+        prepared.network = Network::Regtest;
+        prepared.delegation_keys.network = Network::Regtest;
+        prepared.delegation_keys.coin_type = Network::Regtest.network_type().coin_type();
+        prepared.round_params.snapshot_height =
+            u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
         prepared.branch_id_provider =
             LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu7));
 
