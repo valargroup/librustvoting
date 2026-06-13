@@ -187,7 +187,9 @@ The crate no longer accepts root wallet seed material for delegation signing.
   rev `2b531b9d61a564a11cbdd9418a9788d1dd7d20de`, with
   `unstable-voting-circuits` enabled for the
   governance proof paths.
-- **`voting-circuits 0.8`** for the delegation and vote proof circuits.
+- **`voting-circuits 0.8`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
+  rev `76b31e2b19be43a67567db3aaf2c29df91206016` for the delegation and
+  vote proof circuits.
 - **`vote-commitment-tree 0.3`** and **`vote-commitment-tree-client 0.5`** for
   vote commitment tree state and optional HTTP sync.
 - **`pczt`, `zcash_keys`, `zcash_client_backend`, `zcash_client_sqlite`,

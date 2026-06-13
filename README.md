@@ -124,7 +124,8 @@ manifest and member manifests:
   PCZT, and protocol APIs used by this branch.
 
 - **voting-circuits 0.8** — Resolved from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
-  for the delegation and vote proof circuits.
+  rev `76b31e2b19be43a67567db3aaf2c29df91206016` for the delegation and
+  vote proof circuits.
 
 ## FFI
 

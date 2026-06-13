@@ -62,9 +62,9 @@ anyhow = "1"
 thiserror = "2"
 zeroize = "1"
 
-# Single Ironwood Orchard node: every consumer inherits Orchard from the
-# workspace Ironwood branch. The `unstable-voting-circuits` feature is required
-# by integration tests in `zkp1.rs` (`Note::new`, `Note::dummy`,
+# Orchard and voting-circuits use workspace rev pins so every consumer gets the
+# same circuit-compatible pair. Orchard's `unstable-voting-circuits` feature is
+# required by integration tests in `zkp1.rs` (`Note::new`, `Note::dummy`,
 # `Rho::from_nf_old`).
 subtle = "2.6"
 orchard = { workspace = true }
