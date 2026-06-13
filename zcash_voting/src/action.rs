@@ -5,13 +5,13 @@ use pasta_curves::pallas;
 use rand::RngCore;
 use subtle::CtOption;
 
-use orchard::builder::{Builder, BundleProtocol, BundleType};
+use orchard::builder::Builder;
 use orchard::keys::FullViewingKey;
 use orchard::note::{NoteVersion, RandomSeed, Rho};
 use orchard::pczt::Zip32Derivation;
 use orchard::tree::{MerkleHashOrchard, MerklePath};
 use orchard::value::NoteValue;
-use orchard::{Address, Anchor};
+use orchard::{Address, Anchor, BundleProtocol};
 use voting_circuits::delegation::synthetic_padding_note_parts;
 use zcash_primitives::transaction::builder::PcztParts;
 use zcash_primitives::transaction::TxVersion;
@@ -31,8 +31,6 @@ use crate::types::{
 const MERKLE_DEPTH: usize = 32;
 const DELEGATION_ACTION_FIXED_FIELD_COUNT: usize = 5;
 const MAX_PCZT_LAYOUT_ATTEMPTS: usize = 32;
-#[cfg(test)]
-const ZIP32_MAINNET_COIN_TYPE: u32 = 133;
 
 /// Orchard key diversification personalization for DiversifyHash^Orchard.
 const ORCHARD_GD_PERSONALIZATION: &str = "z.cash:Orchard-gd";
@@ -41,19 +39,23 @@ const ORCHARD_GD_PERSONALIZATION: &str = "z.cash:Orchard-gd";
 fn pczt_actions_for_protocol(
     pczt: &pczt::Pczt,
     protocol: BundleProtocol,
-) -> &[pczt::orchard::Action] {
+) -> Result<&[pczt::orchard::Action], VotingError> {
     match protocol {
-        BundleProtocol::Orchard => pczt.orchard().actions(),
-        BundleProtocol::Ironwood => pczt.ironwood().actions(),
+        BundleProtocol::Ironwood => Ok(pczt.ironwood().actions()),
+        BundleProtocol::Orchard => Err(VotingError::InvalidInput {
+            message: "zcash voting only supports Ironwood PCZT actions".to_string(),
+        }),
     }
 }
 
 #[cfg(not(zcash_unstable = "nu7"))]
 fn pczt_actions_for_protocol(
-    pczt: &pczt::Pczt,
+    _pczt: &pczt::Pczt,
     _protocol: BundleProtocol,
-) -> &[pczt::orchard::Action] {
-    pczt.orchard().actions()
+) -> Result<&[pczt::orchard::Action], VotingError> {
+    Err(VotingError::InvalidInput {
+        message: "Ironwood PCZT actions require a NU7 build".to_string(),
+    })
 }
 
 fn signed_pczt_actions(
@@ -65,30 +67,24 @@ fn signed_pczt_actions(
     {
         let ironwood_actions = pczt.ironwood().actions();
         match (!orchard_actions.is_empty(), !ironwood_actions.is_empty()) {
-            (true, false) => Ok((orchard_actions, "Orchard")),
             (false, true) => Ok((ironwood_actions, "Ironwood")),
-            (true, true) => Err(VotingError::InvalidInput {
-                message: concat!(
-                    "signed PCZT must contain actions for exactly one shielded protocol; ",
-                    "found both Orchard and Ironwood actions"
-                )
-                .to_string(),
+            (true, _) => Err(VotingError::InvalidInput {
+                message:
+                    "signed PCZT contains Orchard actions; zcash voting only supports Ironwood"
+                        .to_string(),
             }),
             (false, false) => Err(VotingError::InvalidInput {
-                message: "signed PCZT contains no Orchard or Ironwood actions".to_string(),
+                message: "signed PCZT contains no Ironwood actions".to_string(),
             }),
         }
     }
 
     #[cfg(not(zcash_unstable = "nu7"))]
     {
-        if orchard_actions.is_empty() {
-            Err(VotingError::InvalidInput {
-                message: "signed PCZT contains no Orchard actions".to_string(),
-            })
-        } else {
-            Ok((orchard_actions, "Orchard"))
-        }
+        let _ = orchard_actions;
+        Err(VotingError::InvalidInput {
+            message: "Ironwood signed PCZTs require a NU7 build".to_string(),
+        })
     }
 }
 
@@ -191,7 +187,7 @@ fn make_note(
     version: NoteVersion,
 ) -> Result<(orchard::Note, [u8; 32]), VotingError> {
     let (rseed, rseed_bytes) = random_rseed(rng, &rho);
-    let note = orchard::Note::from_parts_with_version(addr, value, rho, rseed, version);
+    let note = orchard::Note::from_parts(addr, value, rho, rseed, version);
     if !bool::from(note.is_some()) {
         return Err(VotingError::Internal {
             message: "failed to construct note".to_string(),
@@ -375,7 +371,7 @@ pub(crate) fn build_governance_pczt(
         .expect("validated as 32 bytes above");
 
     let mut rng = rand::thread_rng();
-    let shielded_protocol = VotingShieldedProtocol::for_branch_id(branch_id);
+    let shielded_protocol = VotingShieldedProtocol::for_branch_id(branch_id)?;
     let bundle_protocol = shielded_protocol.bundle_protocol();
 
     // --- Compute governance nullifiers ---
@@ -538,7 +534,7 @@ pub(crate) fn build_governance_pczt(
     let consensus_network = consensus_network_for_voting_network(network);
 
     for _ in 0..MAX_PCZT_LAYOUT_ATTEMPTS {
-        let mut builder = Builder::new(bundle_protocol, BundleType::DEFAULT, anchor);
+        let mut builder = Builder::new(bundle_protocol, anchor);
 
         // Add the governance signed note as a spend.
         builder
@@ -645,10 +641,9 @@ pub(crate) fn build_governance_pczt(
             })?;
 
         #[cfg(zcash_unstable = "nu7")]
-        let (orchard_bundle, ironwood_bundle) = match bundle_protocol {
-            BundleProtocol::Orchard => (Some(pczt_bundle), None),
-            BundleProtocol::Ironwood => (None, Some(pczt_bundle)),
-        };
+        let ironwood_bundle = Some(pczt_bundle);
+        #[cfg(zcash_unstable = "nu7")]
+        let orchard_bundle = None;
         #[cfg(not(zcash_unstable = "nu7"))]
         let orchard_bundle = Some(pczt_bundle);
 
@@ -684,7 +679,7 @@ pub(crate) fn build_governance_pczt(
         let parsed_pczt = pczt::Pczt::parse(&pczt_bytes).map_err(|e| VotingError::Internal {
             message: format!("Failed to parse returned PCZT: {:?}", e),
         })?;
-        let indexed_actions = pczt_actions_for_protocol(&parsed_pczt, bundle_protocol);
+        let indexed_actions = pczt_actions_for_protocol(&parsed_pczt, bundle_protocol)?;
         let indexed_action =
             indexed_actions
                 .get(action_index)
@@ -842,6 +837,31 @@ mod tests {
         }
     }
 
+    #[cfg(zcash_unstable = "nu7")]
+    fn mock_nu7_params() -> VotingRoundParams {
+        let mut params = mock_params();
+        params.snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
+        params
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    fn build_mock_nu7_pczt(notes: &[NoteInfo]) -> GovernancePczt {
+        build_governance_pczt(
+            notes,
+            &mock_nu7_params(),
+            VotingNetwork::Regtest,
+            &mock_fvk_bytes(),
+            &mock_hotkey_address(),
+            u32::from(BranchId::Nu7),
+            VotingNetwork::Regtest.network_type().coin_type(),
+            &MOCK_SEED_FP,
+            MOCK_ACCOUNT,
+            "Test Round",
+            &sample_padded_note_secrets(notes.len()).unwrap(),
+        )
+        .unwrap()
+    }
+
     /// Derive a valid 96-byte FVK from a deterministic SpendingKey.
     fn mock_fvk_bytes() -> Vec<u8> {
         let sk = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
@@ -920,22 +940,10 @@ mod tests {
     /// Mock account index
     const MOCK_ACCOUNT: u32 = 0;
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn test_build_governance_pczt_one_note() {
-        let result = build_governance_pczt(
-            &[mock_note()],
-            &mock_params(),
-            VotingNetwork::Mainnet,
-            &mock_fvk_bytes(),
-            &mock_hotkey_address(),
-            NU5_BRANCH_ID,
-            ZIP32_MAINNET_COIN_TYPE,
-            &MOCK_SEED_FP,
-            MOCK_ACCOUNT,
-            "Test Round",
-            &sample_padded_note_secrets(1).unwrap(),
-        )
-        .unwrap();
+        let result = build_mock_nu7_pczt(&[mock_note()]);
 
         // PCZT bytes are non-empty and parseable
         assert!(!result.pczt_bytes.is_empty());
@@ -995,11 +1003,12 @@ mod tests {
         // action_index is 0 or 1 (2 actions total: 1 real + 1 dummy padding)
         assert!(result.action_index <= 1);
 
-        // The parsed PCZT should have 2 orchard actions (1 real + 1 padding)
+        // The parsed PCZT should have 2 Ironwood actions (1 real + 1 padding)
         let pczt = parsed.unwrap();
-        assert_eq!(pczt.orchard().actions().len(), 2);
+        assert!(pczt.orchard().actions().is_empty());
+        assert_eq!(pczt.ironwood().actions().len(), 2);
         let output_value = pczt
-            .orchard()
+            .ironwood()
             .actions()
             .iter()
             .find_map(|action| action.output().value().as_ref().copied())
@@ -1007,30 +1016,18 @@ mod tests {
         assert_eq!(output_value, NoteValue::ZERO.inner());
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn test_build_governance_pczt_action_index_points_to_paired_governance_action() {
         for _ in 0..64 {
-            let result = build_governance_pczt(
-                &[mock_note()],
-                &mock_params(),
-                VotingNetwork::Mainnet,
-                &mock_fvk_bytes(),
-                &mock_hotkey_address(),
-                NU5_BRANCH_ID,
-                ZIP32_MAINNET_COIN_TYPE,
-                &MOCK_SEED_FP,
-                MOCK_ACCOUNT,
-                "Test Round",
-                &sample_padded_note_secrets(1).unwrap(),
-            )
-            .unwrap();
+            let result = build_mock_nu7_pczt(&[mock_note()]);
 
             let pczt = pczt::Pczt::parse(&result.pczt_bytes).unwrap();
             let indexed_action = pczt
-                .orchard()
+                .ironwood()
                 .actions()
                 .get(result.action_index)
-                .expect("action_index should point to an Orchard action");
+                .expect("action_index should point to an Ironwood action");
 
             assert_eq!(
                 indexed_action.spend().nullifier().to_vec(),
@@ -1070,23 +1067,7 @@ mod tests {
     #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn test_build_governance_pczt_uses_ironwood_for_nu7() {
-        let mut params = mock_params();
-        params.snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
-
-        let result = build_governance_pczt(
-            &[mock_note()],
-            &params,
-            VotingNetwork::Regtest,
-            &mock_fvk_bytes(),
-            &mock_hotkey_address(),
-            u32::from(BranchId::Nu7),
-            VotingNetwork::Regtest.network_type().coin_type(),
-            &MOCK_SEED_FP,
-            MOCK_ACCOUNT,
-            "Test Round",
-            &sample_padded_note_secrets(1).unwrap(),
-        )
-        .unwrap();
+        let result = build_mock_nu7_pczt(&[mock_note()]);
 
         let pczt = pczt::Pczt::parse(&result.pczt_bytes).unwrap();
         assert!(pczt.orchard().actions().is_empty());
@@ -1125,25 +1106,13 @@ mod tests {
         assert!(err.to_string().contains("coin_type"), "{err}");
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn test_build_governance_pczt_padded_slots_match_synthetic_circuit_slots() {
         let note = mock_note();
-        let params = mock_params();
+        let params = mock_nu7_params();
         let fvk_bytes = mock_fvk_bytes();
-        let result = build_governance_pczt(
-            &[note.clone()],
-            &params,
-            VotingNetwork::Mainnet,
-            &fvk_bytes,
-            &mock_hotkey_address(),
-            NU5_BRANCH_ID,
-            ZIP32_MAINNET_COIN_TYPE,
-            &MOCK_SEED_FP,
-            MOCK_ACCOUNT,
-            "Test Round",
-            &sample_padded_note_secrets(1).unwrap(),
-        )
-        .unwrap();
+        let result = build_mock_nu7_pczt(&[note.clone()]);
 
         let fvk_96: [u8; 96] = fvk_bytes.clone().try_into().unwrap();
         let fvk = FullViewingKey::from_bytes(&fvk_96).unwrap();
@@ -1186,6 +1155,7 @@ mod tests {
         assert_eq!(result.rho_signed, expected_rho_signed);
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn test_build_governance_pczt_full_note_slots() {
         let notes: Vec<NoteInfo> = (0..BUNDLE_NOTE_SLOTS)
@@ -1202,20 +1172,7 @@ mod tests {
             })
             .collect();
 
-        let result = build_governance_pczt(
-            &notes,
-            &mock_params(),
-            VotingNetwork::Mainnet,
-            &mock_fvk_bytes(),
-            &mock_hotkey_address(),
-            NU5_BRANCH_ID,
-            ZIP32_MAINNET_COIN_TYPE,
-            &MOCK_SEED_FP,
-            MOCK_ACCOUNT,
-            "Test Round",
-            &sample_padded_note_secrets(notes.len()).unwrap(),
-        )
-        .unwrap();
+        let result = build_mock_nu7_pczt(&notes);
 
         assert_eq!(result.gov_nullifiers.len(), BUNDLE_NOTE_SLOTS);
         assert!(result.padded_cmx.is_empty());
@@ -1229,37 +1186,11 @@ mod tests {
         }
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn test_build_governance_pczt_different_rk_each_call() {
-        let result1 = build_governance_pczt(
-            &[mock_note()],
-            &mock_params(),
-            VotingNetwork::Mainnet,
-            &mock_fvk_bytes(),
-            &mock_hotkey_address(),
-            NU5_BRANCH_ID,
-            ZIP32_MAINNET_COIN_TYPE,
-            &MOCK_SEED_FP,
-            MOCK_ACCOUNT,
-            "Test Round",
-            &sample_padded_note_secrets(1).unwrap(),
-        )
-        .unwrap();
-
-        let result2 = build_governance_pczt(
-            &[mock_note()],
-            &mock_params(),
-            VotingNetwork::Mainnet,
-            &mock_fvk_bytes(),
-            &mock_hotkey_address(),
-            NU5_BRANCH_ID,
-            ZIP32_MAINNET_COIN_TYPE,
-            &MOCK_SEED_FP,
-            MOCK_ACCOUNT,
-            "Test Round",
-            &sample_padded_note_secrets(1).unwrap(),
-        )
-        .unwrap();
+        let result1 = build_mock_nu7_pczt(&[mock_note()]);
+        let result2 = build_mock_nu7_pczt(&[mock_note()]);
 
         // rk and alpha should differ due to randomization
         assert_ne!(result1.rk, result2.rk);

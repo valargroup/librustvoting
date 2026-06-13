@@ -224,7 +224,7 @@ where
         });
     }
 
-    let voting_protocol = VotingShieldedProtocol::for_height(db.params(), snapshot_block_height);
+    let voting_protocol = VotingShieldedProtocol::for_height(db.params(), snapshot_block_height)?;
     let voting_note_version = voting_protocol.note_version();
     let selected = db
         .get_unspent_orchard_notes_at_historical_height(account.id(), snapshot_block_height)
@@ -360,17 +360,18 @@ mod tests {
     use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
     use zip32::Scope;
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
-    fn select_snapshot_notes_returns_snapshot_eligible_orchard_notes() {
+    fn select_snapshot_notes_returns_snapshot_eligible_ironwood_notes() {
         let network = crate::Network::Regtest;
-        let snapshot_height = 9;
+        let snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
         let divisor = crate::governance::BALLOT_DIVISOR;
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
         let account_ref = account_internal_id(&conn, &account_uuid);
 
         let selected_before_snapshot =
-            insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 8, divisor, 3);
+            insert_ironwood_note(&conn, account_ref, &orchard_fvk, 1, 8, divisor, 3);
         let spent_after_snapshot_tx = insert_transaction(&conn, 11, 15);
         conn.execute(
             "INSERT INTO orchard_received_note_spends (orchard_received_note_id, transaction_id)
@@ -379,12 +380,12 @@ mod tests {
         )
         .unwrap();
 
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 9, divisor * 2 + 1, 7);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 9, divisor - 1, 8);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 4, 16, divisor, 9);
+        insert_ironwood_note(&conn, account_ref, &orchard_fvk, 2, 9, divisor * 2 + 1, 7);
+        insert_ironwood_note(&conn, account_ref, &orchard_fvk, 3, 9, divisor - 1, 8);
+        insert_ironwood_note(&conn, account_ref, &orchard_fvk, 4, 16, divisor, 9);
 
         let spent_before_snapshot =
-            insert_orchard_note(&conn, account_ref, &orchard_fvk, 5, 8, divisor * 3, 10);
+            insert_ironwood_note(&conn, account_ref, &orchard_fvk, 5, 8, divisor * 3, 10);
         let spent_before_snapshot_tx = insert_transaction(&conn, 12, 9);
         conn.execute(
             "INSERT INTO orchard_received_note_spends (orchard_received_note_id, transaction_id)
@@ -416,7 +417,7 @@ mod tests {
         assert_eq!(selected.notes[2].commitment_tree_position, 8);
         assert_eq!(selected.notes[2].value_zatoshi, divisor - 1);
         assert_eq!(crate::voting_power(&selected), divisor * 4);
-        assert!(selected.notes.iter().all(|note| note.pool == "orchard"));
+        assert!(selected.notes.iter().all(|note| note.pool == "ironwood"));
         assert!(selected.notes.iter().all(|note| note.scope == 0));
         assert!(selected.notes.iter().all(|note| !note.ufvk_str.is_empty()));
     }
@@ -452,10 +453,11 @@ mod tests {
         assert_eq!(crate::voting_power(&selected), divisor * 2);
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn select_notes_with_wallet_db_keeps_sub_divisor_notes_for_smart_bundles() {
         let network = crate::Network::Regtest;
-        let snapshot_height = 9;
+        let snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
         let divisor = crate::governance::BALLOT_DIVISOR;
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
@@ -463,7 +465,7 @@ mod tests {
         let note_value = (divisor / crate::governance::BUNDLE_NOTE_SLOTS as u64) + 1;
 
         for note_tag in 1..=crate::governance::BUNDLE_NOTE_SLOTS {
-            insert_orchard_note(
+            insert_ironwood_note(
                 &conn,
                 account_ref,
                 &orchard_fvk,
@@ -541,18 +543,19 @@ mod tests {
         assert!(err.contains("does not match voting network"));
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn select_snapshot_note_infos_returns_sorted_snapshot_note_inputs() {
         let network = crate::Network::Regtest;
-        let snapshot_height = 9;
+        let snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
         let divisor = crate::governance::BALLOT_DIVISOR;
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
         let account_ref = account_internal_id(&conn, &account_uuid);
 
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 8, divisor, 9);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 8, divisor * 2, 4);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 1);
+        insert_ironwood_note(&conn, account_ref, &orchard_fvk, 1, 8, divisor, 9);
+        insert_ironwood_note(&conn, account_ref, &orchard_fvk, 2, 8, divisor * 2, 4);
+        insert_ironwood_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 1);
 
         let db = WalletDb::from_connection(&conn, network, SystemClock, rand::rngs::OsRng);
         let notes = select_snapshot_note_infos(
@@ -573,10 +576,11 @@ mod tests {
         assert!(notes.iter().all(|note| !note.ufvk_str.is_empty()));
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn select_snapshot_notes_rejects_empty_snapshot() {
         let network = crate::Network::Regtest;
-        let snapshot_height = 9;
+        let snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, _) = setup_test_account(&mut conn, network);
         mark_scanned_through(&conn, 0, snapshot_height);
@@ -592,7 +596,7 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert!(err.contains("no spendable voting notes at snapshot height 9"));
+        assert!(err.contains("no spendable voting notes at snapshot height 10"));
     }
 
     #[test]
@@ -794,15 +798,13 @@ mod tests {
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&(seed_nonce + u64::from(note_tag) * 10_000).to_le_bytes());
             if let Some(rseed) = Option::<RandomSeed>::from(RandomSeed::from_bytes(seed, &rho)) {
-                if let Some(note) =
-                    Option::<orchard::Note>::from(orchard::Note::from_parts_with_version(
-                        recipient,
-                        NoteValue::from_raw(value_zatoshi),
-                        rho,
-                        rseed,
-                        note_version,
-                    ))
-                {
+                if let Some(note) = Option::<orchard::Note>::from(orchard::Note::from_parts(
+                    recipient,
+                    NoteValue::from_raw(value_zatoshi),
+                    rho,
+                    rseed,
+                    note_version,
+                )) {
                     return note;
                 }
             }

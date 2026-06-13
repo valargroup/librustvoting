@@ -1,57 +1,71 @@
-use orchard::builder::BundleProtocol;
 use orchard::note::NoteVersion;
+use orchard::BundleProtocol;
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
+
+use crate::types::VotingError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VotingShieldedProtocol {
-    Orchard,
     #[cfg(zcash_unstable = "nu7")]
     Ironwood,
 }
 
 impl VotingShieldedProtocol {
-    pub(crate) fn for_branch_id(_branch_id: BranchId) -> Self {
+    pub(crate) fn for_branch_id(_branch_id: BranchId) -> Result<Self, VotingError> {
         #[cfg(zcash_unstable = "nu7")]
         if matches!(_branch_id, BranchId::Nu7) {
-            return Self::Ironwood;
+            return Ok(Self::Ironwood);
         }
 
-        Self::Orchard
+        Err(VotingError::InvalidInput {
+            message: "zcash voting only supports Ironwood/NU7 shielded voting notes".to_string(),
+        })
     }
 
-    pub(crate) fn for_height<P: Parameters>(params: &P, height: BlockHeight) -> Self {
+    pub(crate) fn for_height<P: Parameters>(
+        params: &P,
+        height: BlockHeight,
+    ) -> Result<Self, VotingError> {
         Self::for_branch_id(BranchId::for_height(params, height))
     }
 
     pub(crate) fn bundle_protocol(self) -> BundleProtocol {
+        #[cfg(zcash_unstable = "nu7")]
         match self {
-            Self::Orchard => BundleProtocol::Orchard,
-            #[cfg(zcash_unstable = "nu7")]
             Self::Ironwood => BundleProtocol::Ironwood,
         }
+
+        #[cfg(not(zcash_unstable = "nu7"))]
+        match self {}
     }
 
     pub(crate) fn note_version(self) -> NoteVersion {
+        #[cfg(zcash_unstable = "nu7")]
         match self {
-            Self::Orchard => NoteVersion::V2,
-            #[cfg(zcash_unstable = "nu7")]
             Self::Ironwood => NoteVersion::V3,
         }
+
+        #[cfg(not(zcash_unstable = "nu7"))]
+        match self {}
     }
 
     pub(crate) fn pool(self) -> &'static str {
+        #[cfg(zcash_unstable = "nu7")]
         match self {
-            Self::Orchard => "orchard",
-            #[cfg(zcash_unstable = "nu7")]
             Self::Ironwood => "ironwood",
         }
+
+        #[cfg(not(zcash_unstable = "nu7"))]
+        match self {}
     }
 
     pub(crate) fn name(self) -> &'static str {
+        #[cfg(zcash_unstable = "nu7")]
         match self {
-            Self::Orchard => "Orchard",
-            #[cfg(zcash_unstable = "nu7")]
             Self::Ironwood => "Ironwood",
         }
+
+        #[cfg(not(zcash_unstable = "nu7"))]
+        match self {}
     }
 }

@@ -1116,7 +1116,7 @@ mod tests {
     use super::*;
 
     use orchard::{
-        note::{RandomSeed, Rho},
+        note::{NoteVersion, RandomSeed, Rho},
         value::NoteValue,
     };
     use rusqlite::{params, Connection};
@@ -1133,9 +1133,16 @@ mod tests {
 
     const TESTNET_NU6_SNAPSHOT_HEIGHT: u64 = 3_536_500;
     const TESTNET_NU6_BRANCH_ID: u32 = 0x4DEC_4DF0;
+    #[cfg(zcash_unstable = "nu7")]
+    const REGTEST_NU7_SNAPSHOT_HEIGHT: u64 = crate::types::REGTEST_NU7_ACTIVATION_HEIGHT as u64;
 
     fn test_voting_hotkey() -> VotingHotkey {
         VotingHotkey::from_stored_secret(&[0x77; 64], Network::Testnet).unwrap()
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    fn test_regtest_voting_hotkey() -> VotingHotkey {
+        VotingHotkey::from_stored_secret(&[0x77; 64], Network::Regtest).unwrap()
     }
 
     #[test]
@@ -1168,6 +1175,7 @@ mod tests {
         assert_eq!(voting_db.list_rounds().unwrap().len(), 1);
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn prepare_delegation_bundle_returns_plain_reusable_bundle_state() {
         let (_voting_db, round_params, hotkey, prepared) = prepared_wallet_delegation_fixture();
@@ -1176,7 +1184,7 @@ mod tests {
         assert_eq!(prepared.round_id, round_params.vote_round_id);
         assert_eq!(
             prepared.round_params.snapshot_height,
-            TESTNET_NU6_SNAPSHOT_HEIGHT
+            REGTEST_NU7_SNAPSHOT_HEIGHT
         );
         assert_eq!(prepared.bundle_index, 0);
         assert_eq!(prepared.layout.bundle_count, 1);
@@ -1185,11 +1193,11 @@ mod tests {
         assert_eq!(prepared.bundle_note_infos[0].position, 3);
         assert_eq!(prepared.bundle_note_infos[1].position, 7);
         assert_eq!(prepared.anchor_tree_state_bytes, vec![0xAA, 0xBB]);
-        assert_eq!(prepared.network, Network::Testnet);
+        assert_eq!(prepared.network, Network::Regtest);
         assert_eq!(prepared.round_name, "Demo Round");
         assert_eq!(
             prepared.branch_id_provider.consensus_branch_id().unwrap(),
-            TESTNET_NU6_BRANCH_ID
+            u32::from(BranchId::Nu7)
         );
         assert_eq!(
             &prepared.delegation_keys.hotkey_raw_address,
@@ -1197,6 +1205,7 @@ mod tests {
         );
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn signed_bundle_rejects_pczt_sighash_mismatch() {
         let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
@@ -1218,6 +1227,7 @@ mod tests {
         assert!(err.contains("pczt_bytes sighash does not match delegation signer sighash"));
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn signing_request_rejects_key_network_mismatch() {
         let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
@@ -1260,7 +1270,7 @@ mod tests {
         .to_string();
 
         assert!(err.contains(
-            "delegation keys network Mainnet does not match stored round network Testnet"
+            "delegation keys network Mainnet does not match stored round network Regtest"
         ));
     }
 
@@ -1282,18 +1292,23 @@ mod tests {
         zcash_client_sqlite::AccountUuid,
         orchard::keys::FullViewingKey,
     ) {
+        setup_test_account_for_network(conn, Network::Testnet)
+    }
+
+    fn setup_test_account_for_network(
+        conn: &mut Connection,
+        network: Network,
+    ) -> (
+        zcash_client_sqlite::AccountUuid,
+        orchard::keys::FullViewingKey,
+    ) {
         let seed = SecretVec::new(vec![7u8; 32]);
-        let mut db = WalletDb::from_connection(
-            conn,
-            ZcashNetwork::TestNetwork,
-            SystemClock,
-            rand::rngs::OsRng,
-        );
+        let mut db = WalletDb::from_connection(conn, network, SystemClock, rand::rngs::OsRng);
         init_wallet_db(&mut db, Some(SecretVec::new(seed.expose_secret().to_vec()))).unwrap();
 
-        let sapling_height = ZcashNetwork::TestNetwork
+        let sapling_height = network
             .activation_height(NetworkUpgrade::Sapling)
-            .expect("testnet has Sapling activation");
+            .expect("test network has Sapling activation");
         let birthday = AccountBirthday::from_parts(
             ChainState::empty(sapling_height - 1, BlockHash([0; 32])),
             None,
@@ -1354,6 +1369,7 @@ mod tests {
         }
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     fn prepared_wallet_delegation_fixture() -> (
         VotingDb,
         crate::VotingRoundParams,
@@ -1361,76 +1377,73 @@ mod tests {
         PreparedDelegationBundle,
     ) {
         let mut conn = Connection::open_in_memory().unwrap();
-        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn);
+        let (account_uuid, orchard_fvk) =
+            setup_test_account_for_network(&mut conn, Network::Regtest);
         let account_ref = account_internal_id(&conn, &account_uuid);
         let divisor = crate::governance::BALLOT_DIVISOR;
 
-        insert_orchard_note(
+        insert_ironwood_note(
             &conn,
             account_ref,
             &orchard_fvk,
             1,
-            (TESTNET_NU6_SNAPSHOT_HEIGHT - 2) as u32,
+            (REGTEST_NU7_SNAPSHOT_HEIGHT - 2) as u32,
             divisor,
             7,
         );
-        insert_orchard_note(
+        insert_ironwood_note(
             &conn,
             account_ref,
             &orchard_fvk,
             2,
-            (TESTNET_NU6_SNAPSHOT_HEIGHT - 2) as u32,
+            (REGTEST_NU7_SNAPSHOT_HEIGHT - 2) as u32,
             divisor * 2,
             3,
         );
-        insert_orchard_note(
+        insert_ironwood_note(
             &conn,
             account_ref,
             &orchard_fvk,
             3,
-            (TESTNET_NU6_SNAPSHOT_HEIGHT + 4) as u32,
+            (REGTEST_NU7_SNAPSHOT_HEIGHT + 4) as u32,
             divisor * 3,
             11,
         );
 
-        let wallet_db = WalletDb::from_connection(
-            &conn,
-            ZcashNetwork::TestNetwork,
-            SystemClock,
-            rand::rngs::OsRng,
-        );
+        let wallet_db =
+            WalletDb::from_connection(&conn, Network::Regtest, SystemClock, rand::rngs::OsRng);
         let voting_db = VotingDb::open_in_memory().unwrap();
         voting_db.set_wallet_id("prepare-delegation-bundle-test");
-        let hotkey = test_voting_hotkey();
+        let hotkey = test_regtest_voting_hotkey();
         use group::GroupEncoding;
         let ea_pk = pasta_curves::pallas::Point::from(voting_circuits::spend_auth_g_affine());
         let round_params = crate::VotingRoundParams {
             vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
                 .to_string(),
-            snapshot_height: TESTNET_NU6_SNAPSHOT_HEIGHT,
+            snapshot_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
             ea_pk: ea_pk.to_bytes().to_vec(),
             nc_root: vec![2; 32],
             nullifier_imt_root: vec![3; 32],
         };
         let lwd = DelegationLwdInputs {
-            network: Network::Testnet,
+            network: Network::Regtest,
             round_params: round_params.clone(),
             resolved_round_name: "Demo Round".to_string(),
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
-            branch_id_provider: LightwalletdBranchIdProvider::resolved(TESTNET_NU6_BRANCH_ID),
+            branch_id_provider: LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu7)),
         };
         let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &wallet_db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
             voting_hotkey: &hotkey,
             snapshot_height: round_params.snapshot_height,
-            scanned_height: TESTNET_NU6_SNAPSHOT_HEIGHT,
+            scanned_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
             anchor_tree_state_bytes: lwd.anchor_tree_state_bytes.clone(),
             resolved_round_name: lwd.resolved_round_name.clone(),
         })
         .unwrap();
         voting_db
-            .ensure_round(Network::Testnet, &round_params, None)
+            .ensure_round(Network::Regtest, &round_params, None)
             .unwrap();
         let layout = voting_db
             .ensure_bundles_with_skipped_suffix_with_policy(
@@ -1496,16 +1509,60 @@ mod tests {
         value_zatoshi: u64,
         commitment_tree_position: u64,
     ) {
+        insert_note_with_version(
+            conn,
+            account_ref,
+            orchard_fvk,
+            note_tag,
+            mined_height,
+            value_zatoshi,
+            commitment_tree_position,
+            NoteVersion::V2,
+        );
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    fn insert_ironwood_note(
+        conn: &Connection,
+        account_ref: i64,
+        orchard_fvk: &orchard::keys::FullViewingKey,
+        note_tag: u8,
+        mined_height: u32,
+        value_zatoshi: u64,
+        commitment_tree_position: u64,
+    ) {
+        insert_note_with_version(
+            conn,
+            account_ref,
+            orchard_fvk,
+            note_tag,
+            mined_height,
+            value_zatoshi,
+            commitment_tree_position,
+            NoteVersion::V3,
+        );
+    }
+
+    fn insert_note_with_version(
+        conn: &Connection,
+        account_ref: i64,
+        orchard_fvk: &orchard::keys::FullViewingKey,
+        note_tag: u8,
+        mined_height: u32,
+        value_zatoshi: u64,
+        commitment_tree_position: u64,
+        note_version: NoteVersion,
+    ) {
         let transaction_id = insert_transaction(conn, note_tag, mined_height);
-        let note = test_orchard_note(orchard_fvk, note_tag, value_zatoshi);
+        let note = test_note_with_version(orchard_fvk, note_tag, value_zatoshi, note_version);
         let nullifier = note.nullifier(orchard_fvk);
 
         conn.execute(
             "INSERT INTO orchard_received_notes (
                 transaction_id, action_index, account_id, diversifier, value, rho, rseed,
-                nf, is_change, commitment_tree_position, recipient_key_scope
+                nf, is_change, commitment_tree_position, recipient_key_scope, note_version
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0, ?10)",
             params![
                 transaction_id,
                 i64::from(note_tag),
@@ -1516,15 +1573,17 @@ mod tests {
                 note.rseed().as_bytes(),
                 nullifier.to_bytes(),
                 commitment_tree_position,
+                note_version_code(note_version),
             ],
         )
         .unwrap();
     }
 
-    fn test_orchard_note(
+    fn test_note_with_version(
         orchard_fvk: &orchard::keys::FullViewingKey,
         note_tag: u8,
         value_zatoshi: u64,
+        note_version: NoteVersion,
     ) -> orchard::Note {
         let recipient = orchard_fvk.address_at(u64::from(note_tag), Scope::External);
         let rho = rho_from_nonce(u64::from(note_tag) + 1);
@@ -1538,6 +1597,7 @@ mod tests {
                     NoteValue::from_raw(value_zatoshi),
                     rho,
                     rseed,
+                    note_version,
                 )) {
                     return note;
                 }
@@ -1545,6 +1605,13 @@ mod tests {
         }
 
         panic!("failed to generate valid Orchard note fixture");
+    }
+
+    fn note_version_code(version: NoteVersion) -> u8 {
+        match version {
+            NoteVersion::V2 => 2,
+            NoteVersion::V3 => 3,
+        }
     }
 
     fn rho_from_nonce(nonce: u64) -> Rho {
@@ -1811,30 +1878,27 @@ mod tests {
         assert!(err.contains("wallet is not synced to voting snapshot height 12"));
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn gather_delegation_wallet_inputs_selects_sorted_notes_and_keys() {
         let mut conn = Connection::open_in_memory().unwrap();
-        let (account_uuid, orchard_fvk) = setup_test_account(&mut conn);
+        let (account_uuid, orchard_fvk) =
+            setup_test_account_for_network(&mut conn, Network::Regtest);
         let account_ref = account_internal_id(&conn, &account_uuid);
         let divisor = crate::governance::BALLOT_DIVISOR;
 
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 1, 10, divisor, 7);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 2, 10, divisor * 2, 3);
-        insert_orchard_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 11);
+        insert_ironwood_note(&conn, account_ref, &orchard_fvk, 1, 8, divisor, 7);
+        insert_ironwood_note(&conn, account_ref, &orchard_fvk, 2, 8, divisor * 2, 3);
+        insert_ironwood_note(&conn, account_ref, &orchard_fvk, 3, 16, divisor * 3, 11);
 
-        let db = WalletDb::from_connection(
-            &conn,
-            ZcashNetwork::TestNetwork,
-            SystemClock,
-            rand::rngs::OsRng,
-        );
-        let hotkey = test_voting_hotkey();
+        let db = WalletDb::from_connection(&conn, Network::Regtest, SystemClock, rand::rngs::OsRng);
+        let hotkey = test_regtest_voting_hotkey();
         let inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
             voting_hotkey: &hotkey,
-            snapshot_height: 12,
-            scanned_height: 12,
+            snapshot_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
+            scanned_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
             resolved_round_name: "Demo Round".to_string(),
         })
@@ -1851,28 +1915,24 @@ mod tests {
         assert_eq!(inputs.delegation_keys.address_index, hotkey.address_index());
         assert_eq!(
             inputs.delegation_keys.coin_type,
-            ZcashNetwork::TestNetwork.network_type().coin_type()
+            Network::Regtest.network_type().coin_type()
         );
         assert_eq!(inputs.delegation_keys.round_name, "Demo Round");
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn gather_delegation_wallet_inputs_rejects_empty_snapshot() {
         let mut conn = Connection::open_in_memory().unwrap();
-        let (account_uuid, _) = setup_test_account(&mut conn);
-        let db = WalletDb::from_connection(
-            &conn,
-            ZcashNetwork::TestNetwork,
-            SystemClock,
-            rand::rngs::OsRng,
-        );
-        let hotkey = test_voting_hotkey();
+        let (account_uuid, _) = setup_test_account_for_network(&mut conn, Network::Regtest);
+        let db = WalletDb::from_connection(&conn, Network::Regtest, SystemClock, rand::rngs::OsRng);
+        let hotkey = test_regtest_voting_hotkey();
         let err = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
             voting_hotkey: &hotkey,
-            snapshot_height: 12,
-            scanned_height: 12,
+            snapshot_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
+            scanned_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
             resolved_round_name: "Demo Round".to_string(),
         })

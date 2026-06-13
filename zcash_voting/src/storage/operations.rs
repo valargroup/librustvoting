@@ -1591,6 +1591,8 @@ mod tests {
     const W: &str = "test-wallet";
     const TESTNET_NU6_SNAPSHOT_HEIGHT: u64 = 3_536_500;
     const TESTNET_NU6_BRANCH_ID: u32 = 0x4DEC_4DF0;
+    #[cfg(zcash_unstable = "nu7")]
+    const REGTEST_NU7_SNAPSHOT_HEIGHT: u64 = crate::types::REGTEST_NU7_ACTIVATION_HEIGHT as u64;
 
     fn test_db() -> VotingDb {
         let db = VotingDb::open(":memory:").unwrap();
@@ -1609,6 +1611,19 @@ mod tests {
             nc_root: vec![0xAA; 32],
             nullifier_imt_root: vec![0xBB; 32],
         }
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    fn test_params_nu7() -> VotingRoundParams {
+        VotingRoundParams {
+            snapshot_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
+            ..test_params()
+        }
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    fn nu7_branch_id() -> u32 {
+        u32::from(zcash_protocol::consensus::BranchId::Nu7)
     }
 
     fn test_params_with_nc_root(nc_root: Vec<u8>) -> VotingRoundParams {
@@ -1660,6 +1675,7 @@ mod tests {
         (rk, (&sig).into())
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     fn sign_delegation_request(seed: &[u8], request: &DelegationSigningRequest) -> [u8; 64] {
         use orchard::keys::SpendAuthorizingKey;
         use zcash_keys::keys::UnifiedSpendingKey;
@@ -1932,34 +1948,39 @@ mod tests {
         assert!(err.to_string().contains("rseed_signed"), "{err}");
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn test_padded_pir_nullifiers_match_persisted_dummy_nullifiers() {
-        use orchard::{note::Rho, value::NoteValue};
+        use orchard::{
+            note::{NoteVersion, Rho},
+            value::NoteValue,
+        };
         use rand::rngs::OsRng;
         use zcash_keys::keys::UnifiedSpendingKey;
-        use zcash_protocol::consensus::TEST_NETWORK;
         use zip32::{AccountId, Scope};
 
         let seed = [0x42u8; 32];
         let account = AccountId::try_from(0u32).unwrap();
-        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &seed, account).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&Network::Regtest, &seed, account).unwrap();
         let ufvk = usk.to_unified_full_viewing_key();
         let fvk = ufvk.orchard().unwrap().clone();
         let address = fvk.address_at(0u32, Scope::External);
 
         let mut rng = OsRng;
-        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, NoteVersion::V3);
         let note = orchard::Note::new(
             address,
             NoteValue::from_raw(13_000_000),
             Rho::from_nf_old(parent_note.nullifier(&fvk)),
             &mut rng,
+            NoteVersion::V3,
         );
         let note_info =
-            NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &TEST_NETWORK).unwrap();
+            NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &Network::Regtest)
+                .unwrap();
 
         let db = test_db();
-        db.init_round(Network::Testnet, &test_params(), None)
+        db.init_round(Network::Regtest, &test_params_nu7(), None)
             .unwrap();
         db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
         {
@@ -1983,33 +2004,27 @@ mod tests {
             .unwrap();
         assert_eq!(warmed, warmed_again);
         let precompute_nullifiers =
-            padded_nullifiers_for_circuit(&[note_info.clone()], &warmed, Network::Testnet).unwrap();
+            padded_nullifiers_for_circuit(&[note_info.clone()], &warmed, Network::Regtest).unwrap();
         {
             let conn = db.conn();
             assert!(queries::load_pczt_sighash(&conn, ROUND_ID, W, 0).is_err());
         }
 
         let voting_hotkey =
-            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Testnet).unwrap();
+            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Regtest).unwrap();
         let seed_fingerprint = [0x42u8; 32];
         let keys =
             test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, seed_fingerprint, 0);
 
         let result = db
-            .build_governance_pczt(
-                ROUND_ID,
-                0,
-                &[note_info.clone()],
-                &keys,
-                TESTNET_NU6_BRANCH_ID,
-            )
+            .build_governance_pczt(ROUND_ID, 0, &[note_info.clone()], &keys, nu7_branch_id())
             .unwrap();
 
         let conn = db.conn();
         let stored_dummy = queries::load_dummy_nullifiers(&conn, ROUND_ID, W, 0).unwrap();
         let padded_secrets = queries::load_padded_note_secrets(&conn, ROUND_ID, W, 0).unwrap();
         let pir_nullifiers =
-            padded_nullifiers_for_circuit(&[note_info], &padded_secrets, Network::Testnet).unwrap();
+            padded_nullifiers_for_circuit(&[note_info], &padded_secrets, Network::Regtest).unwrap();
 
         assert_eq!(result.padded_note_secrets, warmed_again);
         assert_eq!(precompute_nullifiers, result.dummy_nullifiers);
@@ -2019,7 +2034,10 @@ mod tests {
 
     #[test]
     fn test_padded_secret_warmup_reuses_cached_pir_proofs_without_pczt() {
-        use orchard::{note::Rho, value::NoteValue};
+        use orchard::{
+            note::{NoteVersion, Rho},
+            value::NoteValue,
+        };
         use rand::rngs::OsRng;
         use voting_circuits::delegation::ImtProvider;
         use zcash_keys::keys::UnifiedSpendingKey;
@@ -2036,12 +2054,13 @@ mod tests {
         let mut rng = OsRng;
         let mut notes = Vec::new();
         for position in 0..BUNDLE_NOTE_SLOTS {
-            let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+            let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, NoteVersion::V2);
             let note = orchard::Note::new(
                 address,
                 NoteValue::from_raw(13_000_000),
                 Rho::from_nf_old(parent_note.nullifier(&fvk)),
                 &mut rng,
+                NoteVersion::V2,
             );
             notes.push(
                 NoteInfo::from_orchard_note(
@@ -3221,12 +3240,15 @@ mod tests {
         assert_eq!(votes[0].choice, 1);
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn test_delegation_signing_request_signature_path_submits() {
-        use orchard::{note::Rho, value::NoteValue};
+        use orchard::{
+            note::{NoteVersion, Rho},
+            value::NoteValue,
+        };
         use rand::rngs::OsRng;
         use zcash_keys::keys::UnifiedSpendingKey;
-        use zcash_protocol::consensus::TEST_NETWORK;
         use zip32::{fingerprint::SeedFingerprint, AccountId, Scope};
 
         struct StaticBranchId(u32);
@@ -3238,30 +3260,32 @@ mod tests {
         }
 
         let db = test_db();
-        db.init_round(Network::Testnet, &test_params(), None)
+        db.init_round(Network::Regtest, &test_params_nu7(), None)
             .unwrap();
 
         let sender_seed = [0x42; 32];
         let account_index = 0;
         let account = AccountId::try_from(account_index).unwrap();
-        let usk = UnifiedSpendingKey::from_seed(&TEST_NETWORK, &sender_seed, account).unwrap();
+        let usk = UnifiedSpendingKey::from_seed(&Network::Regtest, &sender_seed, account).unwrap();
         let ufvk = usk.to_unified_full_viewing_key();
         let fvk = ufvk.orchard().unwrap().clone();
         let address = fvk.address_at(0u32, Scope::External);
         let mut rng = OsRng;
-        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, NoteVersion::V3);
         let note = orchard::Note::new(
             address,
             NoteValue::from_raw(13_000_000),
             Rho::from_nf_old(parent_note.nullifier(&fvk)),
             &mut rng,
+            NoteVersion::V3,
         );
         let note_info =
-            NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &TEST_NETWORK).unwrap();
+            NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &Network::Regtest)
+                .unwrap();
         db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
 
         let voting_hotkey =
-            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Testnet).unwrap();
+            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Regtest).unwrap();
         let seed_fingerprint = SeedFingerprint::from_seed(&sender_seed).unwrap().to_bytes();
         let keys = test_delegation_keys(
             fvk.to_bytes().to_vec(),
@@ -3275,7 +3299,7 @@ mod tests {
             0,
             &[note_info],
             &keys,
-            &StaticBranchId(TESTNET_NU6_BRANCH_ID),
+            &StaticBranchId(nu7_branch_id()),
             &crate::types::NoopProgressReporter,
         )
         .unwrap();
@@ -3283,7 +3307,7 @@ mod tests {
 
         let request = crate::delegate::signing_request(&db, ROUND_ID, 0, &keys).unwrap();
         assert_eq!(request.account_index, account_index);
-        assert_eq!(request.network, crate::types::Network::Testnet);
+        assert_eq!(request.network, crate::types::Network::Regtest);
         assert_eq!(request.seed_fingerprint, seed_fingerprint);
         assert_eq!(request.sighash, setup.pczt_sighash);
 
@@ -3385,12 +3409,13 @@ mod tests {
     }
 
     /// Multi-bundle test: 6 notes → 2 bundles (5+1), independent delegation + vote storage per bundle.
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn test_multi_bundle_delegation_and_voting() {
         use orchard::keys::{FullViewingKey, SpendingKey};
 
         let db = test_db();
-        db.init_round(Network::Testnet, &test_params(), None)
+        db.init_round(Network::Regtest, &test_params_nu7(), None)
             .unwrap();
 
         // Create 6 notes with distinct positions and unique nullifiers
@@ -3434,7 +3459,7 @@ mod tests {
         let fvk = FullViewingKey::from(&sk);
         let fvk_bytes = fvk.to_bytes().to_vec();
         let voting_hotkey =
-            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Testnet).unwrap();
+            VotingHotkey::from_stored_secret(&[0x43; 64], crate::types::Network::Regtest).unwrap();
         let seed_fingerprint = [0x42u8; 32];
         let keys = test_delegation_keys(fvk_bytes.clone(), &voting_hotkey, seed_fingerprint, 0);
 
@@ -3443,7 +3468,7 @@ mod tests {
 
         for (i, chunk) in chunk_result.bundles.iter().enumerate() {
             let result = db
-                .build_governance_pczt(ROUND_ID, i as u32, chunk, &keys, TESTNET_NU6_BRANCH_ID)
+                .build_governance_pczt(ROUND_ID, i as u32, chunk, &keys, nu7_branch_id())
                 .unwrap();
 
             // Each bundle should have valid delegation data
