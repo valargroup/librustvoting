@@ -182,8 +182,11 @@ impl fmt::Debug for VotingHotkey {
     }
 }
 
-/// A shielded Orchard note from the wallet DB, containing all fields needed
-/// for delegation proof construction and governance PCZT building.
+/// A shielded voting note from the wallet DB.
+///
+/// The note material may come from an Orchard/V2 note before NU7 or an
+/// Ironwood/V3 note at NU7. `NoteInfo` contains the fields needed for
+/// delegation proof construction and governance PCZT building.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteInfo {
     /// Extracted note commitment (cmx), recomputed from note parts.
@@ -207,7 +210,11 @@ pub struct NoteInfo {
 }
 
 impl NoteInfo {
-    /// Build voting note metadata from an Orchard note owned by the given UFVK.
+    /// Builds voting note metadata from a shielded note owned by the given UFVK.
+    ///
+    /// The `orchard` crate represents both Orchard/V2 and Ironwood/V3 notes.
+    /// Callers are responsible for selecting notes from the protocol version
+    /// required by the voting round.
     pub fn from_orchard_note<P: consensus::Parameters>(
         note: &orchard::note::Note,
         position: u64,
@@ -239,12 +246,13 @@ impl NoteInfo {
     }
 }
 
-/// A snapshot-eligible Orchard note selected for voting.
+/// A snapshot-eligible shielded note selected for voting.
 ///
 /// `NoteInfo` is the executable proof input. `NoteRef` keeps wallet/UI metadata
 /// beside the same note material so SDKs can display the selected notes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteRef {
+    /// Shielded pool label for wallet/UI display, such as `orchard` or `ironwood`.
     pub pool: String,
     pub txid_hex: String,
     pub output_index: u32,

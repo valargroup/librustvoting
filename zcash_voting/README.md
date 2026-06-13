@@ -9,8 +9,9 @@ precompute → delegate → vote → share lifecycle:
 
 1. Open a `VotingDb`, set the wallet id, and call `create_round` (pass `None`
    when no round session metadata is available).
-2. Convert eligible Orchard notes into `NoteInfo` with
-   `NoteInfo::from_orchard_note`, then call `ensure_bundles`.
+2. Convert eligible shielded notes into `NoteInfo` with
+   `NoteInfo::from_orchard_note`, then call `ensure_bundles`. Snapshot
+   selection uses Orchard/V2 notes before NU7 and Ironwood/V3 notes at NU7.
    The default `BundlePolicy` fills each bundle up to the circuit note-slot
    count. Wallets that need fewer real notes per bundle can call the
    `*_with_policy` variants with `BundlePolicy::new(...)`; proof construction
@@ -184,11 +185,11 @@ The crate no longer accepts root wallet seed material for delegation signing.
 `zcash_voting` currently follows a temporary Ironwood dependency stack:
 
 - **`orchard 0.14`** from [valargroup/qr_orchard](https://github.com/valargroup/qr_orchard)
-  rev `2b531b9d61a564a11cbdd9418a9788d1dd7d20de`, with
+  rev `89d46956a3ae58cd2af170edace8a2f5d7a7715f`, with
   `unstable-voting-circuits` enabled for the
   governance proof paths.
 - **`voting-circuits 0.8`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
-  rev `76b31e2b19be43a67567db3aaf2c29df91206016` for the delegation and
+  rev `9e7957028c5835da689112d7084ec9b283c9c1e3` for the delegation and
   vote proof circuits.
 - **`vote-commitment-tree 0.3`** and **`vote-commitment-tree-client 0.5`** for
   vote commitment tree state and optional HTTP sync.
