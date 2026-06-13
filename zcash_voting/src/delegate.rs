@@ -199,11 +199,12 @@ pub struct DelegationRoundContext {
 /// An empty `round_name` falls back to `params.vote_round_id`.
 pub fn ensure_round_context(
     voting_db: &VotingDb,
+    network: Network,
     params: &RoundParams,
     round_name: &str,
     session_json: Option<&str>,
 ) -> Result<DelegationRoundContext, VotingError> {
-    let state = voting_db.ensure_round_state(params, session_json)?;
+    let state = voting_db.ensure_round_state(network, params, session_json)?;
     Ok(DelegationRoundContext {
         snapshot_height: state.snapshot_height,
         round_name: crate::round::delegation_round_name(params, round_name),
@@ -221,6 +222,7 @@ pub struct ResolveDelegationLwdParams<'a> {
 /// Lightwalletd-derived inputs for delegation precompute.
 #[derive(Clone, Debug)]
 pub struct DelegationLwdInputs {
+    pub network: Network,
     pub round_params: crate::VotingRoundParams,
     pub resolved_round_name: String,
     pub anchor_tree_state_bytes: Vec<u8>,
@@ -270,6 +272,7 @@ pub async fn gather_delegation_lwd_inputs(
     )?;
 
     Ok(DelegationLwdInputs {
+        network: params.network,
         round_params: params.round_params,
         resolved_round_name,
         anchor_tree_state_bytes,
@@ -299,9 +302,15 @@ where
 {
     let lwd = params.lwd;
     let session_json = params.session_json;
+    if lwd.network != params.voting_hotkey.network() {
+        return Err(VotingError::InvalidInput {
+            message: "delegation LWD network does not match voting hotkey network".to_string(),
+        });
+    }
     // Ensure the round is present in the voting database.
     ensure_round_context(
         voting_db,
+        lwd.network,
         &lwd.round_params,
         &lwd.resolved_round_name,
         session_json,
@@ -311,6 +320,7 @@ where
         resolved_round_name,
         anchor_tree_state_bytes,
         branch_id_provider,
+        network,
     } = lwd;
     let round_id = round_params.vote_round_id.clone();
     let round_name = resolved_round_name.clone();
@@ -337,7 +347,7 @@ where
     })?;
 
     // Ensure the round is present in the voting database.
-    voting_db.ensure_round(&round_params, None)?;
+    voting_db.ensure_round(network, &round_params, None)?;
     // Ensure the bundles are present in the voting database.
     let layout = voting_db.ensure_bundles_with_skipped_suffix_with_policy(
         &round_id,
@@ -360,7 +370,7 @@ where
         delegation_keys: wallet_inputs.delegation_keys,
         branch_id_provider,
         anchor_tree_state_bytes: wallet_inputs.anchor_tree_state_bytes,
-        network: params.voting_hotkey.network(),
+        network,
         round_name,
     };
 
@@ -1012,10 +1022,9 @@ pub fn display_memo(round_name: &str, total_weight_zatoshi: u64) -> String {
     // ASCII round-name capacity with a 13-digit whole ZEC amount:
     // 512 - len(prefix=61) - len(".\nAmount:"=9) - len(" {whole13}.{frac8} ZEC."=28) = 414.
     // For ASCII input, this byte budget equals the maximum character count.
-    let round_name_budget = DISPLAY_MEMO_MAX_BYTES
-        .saturating_sub(
-            DISPLAY_MEMO_PREFIX.len() + DISPLAY_MEMO_ROUND_SUFFIX.len() + amount_suffix.len(),
-        );
+    let round_name_budget = DISPLAY_MEMO_MAX_BYTES.saturating_sub(
+        DISPLAY_MEMO_PREFIX.len() + DISPLAY_MEMO_ROUND_SUFFIX.len() + amount_suffix.len(),
+    );
     let round_name_visible = truncate_utf8_prefix(round_name, round_name_budget);
     let memo = format!(
         "{}{}{}{}",
@@ -1142,8 +1151,16 @@ mod tests {
             nullifier_imt_root: vec![3; 32],
         };
 
-        let named = ensure_round_context(&voting_db, &params, "Demo Round", Some("{}")).unwrap();
-        let fallback = ensure_round_context(&voting_db, &params, "", None).unwrap();
+        let named = ensure_round_context(
+            &voting_db,
+            Network::Testnet,
+            &params,
+            "Demo Round",
+            Some("{}"),
+        )
+        .unwrap();
+        let fallback =
+            ensure_round_context(&voting_db, Network::Testnet, &params, "", None).unwrap();
 
         assert_eq!(named.snapshot_height, 42);
         assert_eq!(named.round_name, "Demo Round");
@@ -1199,6 +1216,52 @@ mod tests {
             .to_string();
 
         assert!(err.contains("pczt_bytes sighash does not match delegation signer sighash"));
+    }
+
+    #[test]
+    fn signing_request_rejects_key_network_mismatch() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        let mut wrong_network_keys = prepared.delegation_keys.clone();
+        wrong_network_keys.network = Network::Mainnet;
+        wrong_network_keys.coin_type = Network::Mainnet.network_type().coin_type();
+
+        {
+            let conn = voting_db.conn();
+            crate::storage::queries::store_delegation_data(
+                &conn,
+                &prepared.round_id,
+                "prepare-delegation-bundle-test",
+                prepared.bundle_index,
+                &[0x11; 32],
+                &[],
+                &[0x22; 32],
+                &[],
+                &[0x33; 32],
+                &[0x44; 32],
+                &[0x55; 32],
+                &[0x66; 32],
+                &[0x77; 32],
+                &[0x88; 32],
+                1,
+                0,
+                &[],
+                &[0x99; 32],
+            )
+            .unwrap();
+        }
+
+        let err = signing_request(
+            &voting_db,
+            &prepared.round_id,
+            prepared.bundle_index,
+            &wrong_network_keys,
+        )
+        .expect_err("signing request network must match stored round")
+        .to_string();
+
+        assert!(err.contains(
+            "delegation keys network Mainnet does not match stored round network Testnet"
+        ));
     }
 
     #[test]
@@ -1350,6 +1413,7 @@ mod tests {
             nullifier_imt_root: vec![3; 32],
         };
         let lwd = DelegationLwdInputs {
+            network: Network::Testnet,
             round_params: round_params.clone(),
             resolved_round_name: "Demo Round".to_string(),
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
@@ -1365,7 +1429,9 @@ mod tests {
             resolved_round_name: lwd.resolved_round_name.clone(),
         })
         .unwrap();
-        voting_db.ensure_round(&round_params, None).unwrap();
+        voting_db
+            .ensure_round(Network::Testnet, &round_params, None)
+            .unwrap();
         let layout = voting_db
             .ensure_bundles_with_skipped_suffix_with_policy(
                 round_params.vote_round_id.as_str(),
@@ -1537,8 +1603,11 @@ mod tests {
 
         for amount in amount_cases {
             let memo = display_memo("Poll", amount);
-            let expected_amount_line =
-                format!("Amount: {}.{:08} ZEC.", amount / 100_000_000, amount % 100_000_000);
+            let expected_amount_line = format!(
+                "Amount: {}.{:08} ZEC.",
+                amount / 100_000_000,
+                amount % 100_000_000
+            );
 
             assert!(memo.contains("\nAmount: "));
             assert!(
@@ -1901,6 +1970,20 @@ mod tests {
             u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
         prepared.branch_id_provider =
             LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu7));
+        {
+            let conn = voting_db.conn();
+            let wallet_id = voting_db.wallet_id();
+            conn.execute(
+                "UPDATE rounds SET network = ?1, snapshot_height = ?2 WHERE round_id = ?3 AND wallet_id = ?4",
+                params![
+                    crate::storage::queries::network_to_storage(Network::Regtest),
+                    prepared.round_params.snapshot_height as i64,
+                    prepared.round_id.as_str(),
+                    wallet_id,
+                ],
+            )
+            .unwrap();
+        }
 
         let request = prepared
             .keystone_request(&voting_db, &crate::types::NoopProgressReporter)

@@ -3,7 +3,7 @@ use std::borrow::Borrow;
 use crate::{
     shielded_protocol::VotingShieldedProtocol,
     storage::{queries, VotingDb},
-    types::{NoteInfo, VotingError, VotingRoundParams, WitnessData},
+    types::{Network, NoteInfo, VotingError, VotingRoundParams, WitnessData},
 };
 
 use incrementalmerkletree::{Hashable, Level, Position};
@@ -12,7 +12,7 @@ use prost::Message;
 use subtle::CtOption;
 use zcash_client_backend::proto::service::TreeState;
 use zcash_client_sqlite::WalletDb;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, Parameters};
 
 /// Persist a voting snapshot tree state, generate shielded note witnesses, and cache them.
 ///
@@ -32,6 +32,7 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
+    validate_wallet_db_network_for_round(db, round_id, wallet_db)?;
     db.store_tree_state(round_id, tree_state_bytes)?;
     let witnesses = generate_note_witnesses(db, round_id, notes, wallet_db)?;
     db.replace_bundle_witnesses(round_id, bundle_index, &witnesses)?;
@@ -53,13 +54,15 @@ where
     C: Borrow<rusqlite::Connection>,
     P: zcash_protocol::consensus::Parameters,
 {
-    let (tree_state_bytes, params) = {
+    let (tree_state_bytes, params, stored_network) = {
         let wallet_id = db.wallet_id();
         let conn = db.conn();
         let tree_state_bytes = queries::load_tree_state(&conn, round_id, &wallet_id)?;
-        let params = queries::load_round_params(&conn, round_id, &wallet_id)?;
-        (tree_state_bytes, params)
+        let (params, stored_network) =
+            queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
+        (tree_state_bytes, params, stored_network)
     };
+    validate_wallet_network(stored_network, wallet_db)?;
 
     let tree_state =
         TreeState::decode(tree_state_bytes.as_slice()).map_err(|e| VotingError::Internal {
@@ -75,7 +78,7 @@ where
         })?;
     let snapshot_block_height = BlockHeight::from_u32(snapshot_height);
     let voting_protocol =
-        VotingShieldedProtocol::for_height(wallet_db.params(), snapshot_block_height);
+        VotingShieldedProtocol::for_height(&stored_network, snapshot_block_height);
 
     let note_commitment_tree = match voting_protocol {
         VotingShieldedProtocol::Orchard => tree_state.orchard_tree(),
@@ -159,6 +162,40 @@ where
                 .collect(),
         })
         .collect())
+}
+
+fn validate_wallet_db_network_for_round<C, P, CL, R>(
+    db: &VotingDb,
+    round_id: &str,
+    wallet_db: &WalletDb<C, P, CL, R>,
+) -> Result<(), VotingError>
+where
+    P: Parameters,
+{
+    let wallet_id = db.wallet_id();
+    let conn = db.conn();
+    let stored_network = queries::load_round_network(&conn, round_id, &wallet_id)?;
+    validate_wallet_network(stored_network, wallet_db)
+}
+
+fn validate_wallet_network<C, P, CL, R>(
+    stored_network: Network,
+    wallet_db: &WalletDb<C, P, CL, R>,
+) -> Result<(), VotingError>
+where
+    P: Parameters,
+{
+    let wallet_network = wallet_db.params().network_type();
+    if wallet_network != stored_network.network_type() {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "wallet DB network {:?} does not match stored round network {:?}",
+                wallet_network, stored_network
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 /// Ensure the cached wallet frontier is exactly the round snapshot anchor.
@@ -384,10 +421,14 @@ mod tests {
         }
     }
 
-    fn voting_db_with_tree_state(params: &VotingRoundParams, tree_state: &TreeState) -> VotingDb {
+    fn voting_db_with_tree_state(
+        network: crate::Network,
+        params: &VotingRoundParams,
+        tree_state: &TreeState,
+    ) -> VotingDb {
         let db = VotingDb::open(":memory:").unwrap();
         db.set_wallet_id(WALLET_ID);
-        db.init_round(params, None).unwrap();
+        db.init_round(network, params, None).unwrap();
         db.store_tree_state(ROUND_ID, &tree_state.encode_to_vec())
             .unwrap();
         db
@@ -514,7 +555,8 @@ mod tests {
         let tree_state = tree_state_from_frontier(SNAPSHOT_HEIGHT, &frontier);
         let db = VotingDb::open(":memory:").unwrap();
         db.set_wallet_id(WALLET_ID);
-        db.init_round(&params, None).unwrap();
+        db.init_round(crate::Network::Testnet, &params, None)
+            .unwrap();
         queries::insert_bundle(
             &db.conn(),
             ROUND_ID,
@@ -561,7 +603,8 @@ mod tests {
         let params = round_params(SNAPSHOT_HEIGHT, &frontier);
         let db = VotingDb::open(":memory:").unwrap();
         db.set_wallet_id(WALLET_ID);
-        db.init_round(&params, None).unwrap();
+        db.init_round(crate::Network::Testnet, &params, None)
+            .unwrap();
         queries::insert_bundle(&db.conn(), ROUND_ID, WALLET_ID, 0, &[1]).expect("insert bundle");
         let invalid_tree_state = TreeState {
             network: "test".to_string(),
@@ -596,7 +639,7 @@ mod tests {
         let (wallet_db, frontier) = seeded_wallet_db(SNAPSHOT_HEIGHT, 200, &positions);
         let params = round_params(SNAPSHOT_HEIGHT, &frontier);
         let tree_state = tree_state_from_frontier(SNAPSHOT_HEIGHT, &frontier);
-        let voting_db = voting_db_with_tree_state(&params, &tree_state);
+        let voting_db = voting_db_with_tree_state(crate::Network::Testnet, &params, &tree_state);
 
         let witnesses = generate_note_witnesses(&voting_db, ROUND_ID, &notes, &wallet_db)
             .expect("generate witnesses");
@@ -609,6 +652,81 @@ mod tests {
             assert_eq!(witness.auth_path.len(), orchard::NOTE_COMMITMENT_TREE_DEPTH);
             assert!(verify_witness(witness).expect("witness is parseable"));
         }
+    }
+
+    #[test]
+    fn generate_note_witnesses_rejects_wallet_network_mismatch() {
+        let positions = vec![Position::from(1)];
+        let notes = positions
+            .iter()
+            .map(|position| note(u64::from(*position)))
+            .collect::<Vec<_>>();
+        let (_wallet_db, frontier) = seeded_wallet_db(SNAPSHOT_HEIGHT, 200, &positions);
+        let params = round_params(SNAPSHOT_HEIGHT, &frontier);
+        let tree_state = tree_state_from_frontier(SNAPSHOT_HEIGHT, &frontier);
+        let voting_db = voting_db_with_tree_state(crate::Network::Testnet, &params, &tree_state);
+        let wrong_network_wallet_db = WalletDb::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            Network::MainNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+
+        let err = generate_note_witnesses(&voting_db, ROUND_ID, &notes, &wrong_network_wallet_db)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("wallet DB network Main does not match stored round network Testnet"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn store_tree_state_and_generate_note_witnesses_rejects_wallet_network_mismatch_without_caching(
+    ) {
+        let positions = vec![Position::from(1)];
+        let notes = positions
+            .iter()
+            .map(|position| note(u64::from(*position)))
+            .collect::<Vec<_>>();
+        let (_wallet_db, frontier) = seeded_wallet_db(SNAPSHOT_HEIGHT, 200, &positions);
+        let params = round_params(SNAPSHOT_HEIGHT, &frontier);
+        let tree_state = tree_state_from_frontier(SNAPSHOT_HEIGHT, &frontier);
+        let voting_db = VotingDb::open(":memory:").unwrap();
+        voting_db.set_wallet_id(WALLET_ID);
+        voting_db
+            .init_round(crate::Network::Testnet, &params, None)
+            .unwrap();
+        queries::insert_bundle(&voting_db.conn(), ROUND_ID, WALLET_ID, 0, &[1])
+            .expect("insert bundle");
+        let wrong_network_wallet_db = WalletDb::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            Network::MainNetwork,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+
+        let err = store_tree_state_and_generate_note_witnesses(
+            &voting_db,
+            ROUND_ID,
+            0,
+            &tree_state.encode_to_vec(),
+            &notes,
+            &wrong_network_wallet_db,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("wallet DB network Main does not match stored round network Testnet"),
+            "{err}"
+        );
+        let conn = voting_db.conn();
+        assert!(queries::load_tree_state(&conn, ROUND_ID, WALLET_ID).is_err());
+        assert!(queries::load_witnesses(&conn, ROUND_ID, WALLET_ID, 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[cfg(zcash_unstable = "nu7")]
@@ -632,7 +750,7 @@ mod tests {
             Some(&orchard_frontier),
             Some(&ironwood_frontier),
         );
-        let voting_db = voting_db_with_tree_state(&params, &tree_state);
+        let voting_db = voting_db_with_tree_state(crate::Network::Regtest, &params, &tree_state);
 
         let witnesses = generate_note_witnesses(&voting_db, ROUND_ID, &notes, &wallet_db)
             .expect("generate Ironwood witnesses");
@@ -708,7 +826,9 @@ mod tests {
         let tree_state = tree_state_from_frontier(u64::from(u32::MAX) + 1, &frontier);
         let voting_db = VotingDb::open(":memory:").unwrap();
         voting_db.set_wallet_id(WALLET_ID);
-        voting_db.init_round(&params, None).unwrap();
+        voting_db
+            .init_round(crate::Network::Testnet, &params, None)
+            .unwrap();
         voting_db
             .store_tree_state(ROUND_ID, &tree_state.encode_to_vec())
             .unwrap();

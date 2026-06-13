@@ -7,8 +7,9 @@ Client-side library for integrating [Zcash shielded voting](https://github.com/v
 Wallets should import `zcash_voting::prelude::*` and follow the stable setup →
 precompute → delegate → vote → share lifecycle:
 
-1. Open a `VotingDb`, set the wallet id, and call `create_round` (pass `None`
-   when no round session metadata is available).
+1. Open a `VotingDb`, set the wallet id, and call `create_round` with the
+   wallet/voting `Network` (pass `None` when no round session metadata is
+   available).
 2. Convert eligible shielded notes into `NoteInfo` with
    `NoteInfo::from_orchard_note`, then call `ensure_bundles`. Snapshot
    selection uses Orchard/V2 notes before NU7 and Ironwood/V3 notes at NU7.
@@ -203,7 +204,8 @@ The crate no longer accepts root wallet seed material for delegation signing.
 
 - PIR and tree-sync APIs are now always compiled; no feature flags are required.
 - Prefer `VotingDb::create_round`, `VotingDb::ensure_bundles`, and
-  `VotingDb::delegation_phases` over direct `storage::queries` calls.
+  `VotingDb::delegation_phases` over direct `storage::queries` calls. Pass the
+  round's wallet/voting `Network` when creating or ensuring a round.
 - Use `BundlePolicy` plus the `*_with_policy` APIs when an integration needs
   fewer real notes per bundle. Omit the policy for the default circuit-slot
   behavior.

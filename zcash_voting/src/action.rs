@@ -15,19 +15,23 @@ use orchard::{Address, Anchor};
 use voting_circuits::delegation::synthetic_padding_note_parts;
 use zcash_primitives::transaction::builder::PcztParts;
 use zcash_primitives::transaction::TxVersion;
-use zcash_protocol::consensus::{BlockHeight, BranchId, Network};
+use zcash_protocol::consensus::{
+    BlockHeight, BranchId, Network as ConsensusNetwork, NetworkConstants, Parameters,
+};
 use zip32::Scope;
 
 use crate::governance::{self, BUNDLE_NOTE_SLOTS};
 use crate::shielded_protocol::VotingShieldedProtocol;
 use crate::types::{
-    validate_notes, validate_round_params, GovernancePczt, NoteInfo, VotingError, VotingRoundParams,
+    validate_notes, validate_round_params, GovernancePczt, Network as VotingNetwork, NoteInfo,
+    VotingError, VotingRoundParams,
 };
 
 /// Orchard Merkle tree depth (32 levels).
 const MERKLE_DEPTH: usize = 32;
 const DELEGATION_ACTION_FIXED_FIELD_COUNT: usize = 5;
 const MAX_PCZT_LAYOUT_ATTEMPTS: usize = 32;
+#[cfg(test)]
 const ZIP32_MAINNET_COIN_TYPE: u32 = 133;
 
 /// Orchard key diversification personalization for DiversifyHash^Orchard.
@@ -205,7 +209,13 @@ fn make_dummy_note(
     rng: &mut impl RngCore,
     protocol: VotingShieldedProtocol,
 ) -> Result<(orchard::Note, [u8; 32]), VotingError> {
-    make_note(addr, NoteValue::from_raw(1), rho, rng, protocol.note_version())
+    make_note(
+        addr,
+        NoteValue::from_raw(1),
+        rho,
+        rng,
+        protocol.note_version(),
+    )
 }
 
 /// Canonical delegate action payload encoding for external signing.
@@ -247,10 +257,40 @@ fn encode_delegation_action_bytes(
     Ok(out)
 }
 
+fn consensus_network_for_voting_network(network: VotingNetwork) -> ConsensusNetwork {
+    match network {
+        VotingNetwork::Mainnet => ConsensusNetwork::MainNetwork,
+        VotingNetwork::Testnet | VotingNetwork::Regtest => ConsensusNetwork::TestNetwork,
+    }
+}
+
+fn validate_consensus_branch_id(
+    network: VotingNetwork,
+    snapshot_height: u64,
+    consensus_branch_id: u32,
+) -> Result<BranchId, VotingError> {
+    let branch_id =
+        BranchId::try_from(consensus_branch_id).map_err(|e| VotingError::InvalidInput {
+            message: format!(
+                "invalid consensus_branch_id 0x{:08X}: {}",
+                consensus_branch_id, e
+            ),
+        })?;
+    let expected = crate::lwd::branch_id_for_height(network, snapshot_height)?;
+    if consensus_branch_id != expected {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "consensus_branch_id 0x{consensus_branch_id:08X} does not match snapshot height {snapshot_height} branch id 0x{expected:08X}",
+            ),
+        });
+    }
+    Ok(branch_id)
+}
+
 /// Build a governance-specific PCZT for Keystone signing.
 ///
 /// Constructs a PCZT whose real governance action belongs to the selected
-/// shielded protocol (spend of signed note with constrained rho → output to
+/// shielded protocol (spend of signed note with constrained rho -> output to
 /// hotkey). The Builder generates alpha/rk internally, and the PCZT's ZIP-244
 /// sighash is computed by Keystone when it runs the Signer role.
 ///
@@ -258,16 +298,18 @@ fn encode_delegation_action_bytes(
 /// - `notes`: input notes for governance nullifier derivation, up to
 ///   [`BUNDLE_NOTE_SLOTS`].
 /// - `params`: voting round parameters (round ID, snapshot height, etc.)
+/// - `network`: network that owns the persisted voting round snapshot.
 /// - `fvk_bytes`: 96-byte orchard FullViewingKey (ak[32] || nk[32] || rivk[32])
 /// - `hotkey_raw_address`: 43-byte hotkey raw orchard address
-/// - `consensus_branch_id`: network consensus branch ID (e.g. 0xC2D6D0B4 for NU5)
-/// - `coin_type`: BIP-44 coin type (133 for mainnet, 1 for testnet)
+/// - `consensus_branch_id`: network consensus branch ID active at the snapshot height.
+/// - `coin_type`: BIP-44 coin type (133 for mainnet, 1 for testnet/regtest)
 /// - `seed_fingerprint`: 32-byte ZIP-32 seed fingerprint (Keystone needs this to
 ///   identify which seed to derive the spending key from)
 /// - `account_index`: ZIP-32 account index (typically 0)
-pub fn build_governance_pczt(
+pub(crate) fn build_governance_pczt(
     notes: &[NoteInfo],
     params: &VotingRoundParams,
+    network: VotingNetwork,
     fvk_bytes: &[u8],
     hotkey_raw_address: &[u8],
     consensus_branch_id: u32,
@@ -279,6 +321,17 @@ pub fn build_governance_pczt(
 ) -> Result<GovernancePczt, VotingError> {
     validate_notes(notes)?;
     validate_round_params(params)?;
+    let branch_id =
+        validate_consensus_branch_id(network, params.snapshot_height, consensus_branch_id)?;
+    let expected_coin_type = network.network_type().coin_type();
+    if coin_type != expected_coin_type {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "coin_type {coin_type} does not match voting network {:?} coin type {expected_coin_type}",
+                network
+            ),
+        });
+    }
 
     // Parse FVK from 96 bytes: ak[32] || nk[32] || rivk[32]
     let fvk_96: [u8; 96] = fvk_bytes
@@ -322,13 +375,6 @@ pub fn build_governance_pczt(
         .expect("validated as 32 bytes above");
 
     let mut rng = rand::thread_rng();
-    let branch_id =
-        BranchId::try_from(consensus_branch_id).map_err(|e| VotingError::InvalidInput {
-            message: format!(
-                "invalid consensus_branch_id 0x{:08X}: {}",
-                consensus_branch_id, e
-            ),
-        })?;
     let shielded_protocol = VotingShieldedProtocol::for_branch_id(branch_id);
     let bundle_protocol = shielded_protocol.bundle_protocol();
 
@@ -489,10 +535,7 @@ pub fn build_governance_pczt(
     // --- Serialize to full PCZT ---
     // Use Creator::build_from_parts to construct the PCZT with the selected
     // Orchard or Ironwood bundle, matching the wallet transaction builder path.
-    let network = match coin_type {
-        ZIP32_MAINNET_COIN_TYPE => Network::MainNetwork,
-        _ => Network::TestNetwork,
-    };
+    let consensus_network = consensus_network_for_voting_network(network);
 
     for _ in 0..MAX_PCZT_LAYOUT_ATTEMPTS {
         let mut builder = Builder::new(bundle_protocol, BundleType::DEFAULT, anchor);
@@ -610,7 +653,7 @@ pub fn build_governance_pczt(
         let orchard_bundle = Some(pczt_bundle);
 
         let parts = PcztParts {
-            params: network,
+            params: consensus_network,
             version: TxVersion::suggested_for_branch(branch_id),
             consensus_branch_id: branch_id,
             // Keystone's determine_lock_time returns global.lock_time() for shielded-only PCZTs
@@ -787,11 +830,12 @@ mod tests {
     }
 
     fn mock_params() -> VotingRoundParams {
+        const MAINNET_NU5_SNAPSHOT_HEIGHT: u64 = 1_687_104;
         VotingRoundParams {
             // Hex string representing 32 bytes
             vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
                 .to_string(),
-            snapshot_height: 100_000,
+            snapshot_height: MAINNET_NU5_SNAPSHOT_HEIGHT,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0x01; 32],
             nullifier_imt_root: vec![0x02; 32],
@@ -881,6 +925,7 @@ mod tests {
         let result = build_governance_pczt(
             &[mock_note()],
             &mock_params(),
+            VotingNetwork::Mainnet,
             &mock_fvk_bytes(),
             &mock_hotkey_address(),
             NU5_BRANCH_ID,
@@ -968,6 +1013,7 @@ mod tests {
             let result = build_governance_pczt(
                 &[mock_note()],
                 &mock_params(),
+                VotingNetwork::Mainnet,
                 &mock_fvk_bytes(),
                 &mock_hotkey_address(),
                 NU5_BRANCH_ID,
@@ -996,14 +1042,45 @@ mod tests {
 
     #[cfg(zcash_unstable = "nu7")]
     #[test]
-    fn test_build_governance_pczt_uses_ironwood_for_nu7() {
-        let result = build_governance_pczt(
+    fn test_build_governance_pczt_rejects_nu7_branch_before_activation() {
+        let mut params = mock_params();
+        params.snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT) - 1;
+
+        let err = build_governance_pczt(
             &[mock_note()],
-            &mock_params(),
+            &params,
+            VotingNetwork::Regtest,
             &mock_fvk_bytes(),
             &mock_hotkey_address(),
             u32::from(BranchId::Nu7),
-            ZIP32_MAINNET_COIN_TYPE,
+            VotingNetwork::Regtest.network_type().coin_type(),
+            &MOCK_SEED_FP,
+            MOCK_ACCOUNT,
+            "Test Round",
+            &sample_padded_note_secrets(1).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("does not match snapshot height"),
+            "{err}"
+        );
+    }
+
+    #[cfg(zcash_unstable = "nu7")]
+    #[test]
+    fn test_build_governance_pczt_uses_ironwood_for_nu7() {
+        let mut params = mock_params();
+        params.snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
+
+        let result = build_governance_pczt(
+            &[mock_note()],
+            &params,
+            VotingNetwork::Regtest,
+            &mock_fvk_bytes(),
+            &mock_hotkey_address(),
+            u32::from(BranchId::Nu7),
+            VotingNetwork::Regtest.network_type().coin_type(),
             &MOCK_SEED_FP,
             MOCK_ACCOUNT,
             "Test Round",
@@ -1029,6 +1106,26 @@ mod tests {
     }
 
     #[test]
+    fn test_build_governance_pczt_rejects_coin_type_network_mismatch() {
+        let err = build_governance_pczt(
+            &[mock_note()],
+            &mock_params(),
+            VotingNetwork::Mainnet,
+            &mock_fvk_bytes(),
+            &mock_hotkey_address(),
+            NU5_BRANCH_ID,
+            VotingNetwork::Testnet.network_type().coin_type(),
+            &MOCK_SEED_FP,
+            MOCK_ACCOUNT,
+            "Test Round",
+            &sample_padded_note_secrets(1).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("coin_type"), "{err}");
+    }
+
+    #[test]
     fn test_build_governance_pczt_padded_slots_match_synthetic_circuit_slots() {
         let note = mock_note();
         let params = mock_params();
@@ -1036,6 +1133,7 @@ mod tests {
         let result = build_governance_pczt(
             &[note.clone()],
             &params,
+            VotingNetwork::Mainnet,
             &fvk_bytes,
             &mock_hotkey_address(),
             NU5_BRANCH_ID,
@@ -1107,6 +1205,7 @@ mod tests {
         let result = build_governance_pczt(
             &notes,
             &mock_params(),
+            VotingNetwork::Mainnet,
             &mock_fvk_bytes(),
             &mock_hotkey_address(),
             NU5_BRANCH_ID,
@@ -1135,6 +1234,7 @@ mod tests {
         let result1 = build_governance_pczt(
             &[mock_note()],
             &mock_params(),
+            VotingNetwork::Mainnet,
             &mock_fvk_bytes(),
             &mock_hotkey_address(),
             NU5_BRANCH_ID,
@@ -1149,6 +1249,7 @@ mod tests {
         let result2 = build_governance_pczt(
             &[mock_note()],
             &mock_params(),
+            VotingNetwork::Mainnet,
             &mock_fvk_bytes(),
             &mock_hotkey_address(),
             NU5_BRANCH_ID,
