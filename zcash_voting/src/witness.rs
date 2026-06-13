@@ -199,7 +199,7 @@ fn validate_cached_tree_state_for_round(
 /// Verify a Merkle witness by recomputing the root from leaf + auth path.
 ///
 /// Returns true if the computed root matches the expected root in the witness.
-/// Uses the same level-aware Sinsemilla hash as the Orchard commitment tree.
+/// Uses the level-aware Sinsemilla hash shared by supported shielded note trees.
 pub fn verify_witness(witness: &WitnessData) -> Result<bool, VotingError> {
     if witness.note_commitment.len() != 32 {
         return Err(VotingError::InvalidInput {
@@ -277,7 +277,7 @@ fn ct_option_to_result(
     field: &str,
 ) -> Result<MerkleHashOrchard, VotingError> {
     Option::from(opt).ok_or_else(|| VotingError::InvalidInput {
-        message: format!("{} is not a valid Orchard tree hash", field),
+        message: format!("{} is not a valid shielded note tree hash", field),
     })
 }
 

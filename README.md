@@ -34,6 +34,12 @@ cargo check                    # check all crates
 cargo build -p zcash_voting   # build just the core library
 ```
 
+Ironwood/NU7 code paths are cfg-gated. Build or test those paths with:
+
+```bash
+RUSTFLAGS='--cfg zcash_unstable="nu7"' cargo test -p zcash_voting --locked
+```
+
 ## Wallet API Lifecycle
 
 New wallet integrations should import `zcash_voting::prelude::*` and use the

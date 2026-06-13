@@ -1470,7 +1470,7 @@ pub fn load_tree_state(
     })
 }
 
-// --- Witnesses (Merkle inclusion proofs for Orchard notes) ---
+// --- Witnesses (Merkle inclusion proofs for shielded notes) ---
 
 /// Check if witnesses are already cached for a bundle.
 pub fn has_witnesses(

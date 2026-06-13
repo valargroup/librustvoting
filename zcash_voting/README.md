@@ -12,6 +12,8 @@ precompute → delegate → vote → share lifecycle:
 2. Convert eligible shielded notes into `NoteInfo` with
    `NoteInfo::from_orchard_note`, then call `ensure_bundles`. Snapshot
    selection uses Orchard/V2 notes before NU7 and Ironwood/V3 notes at NU7.
+   Ironwood/NU7 code paths are cfg-gated; build them with
+   `RUSTFLAGS='--cfg zcash_unstable="nu7"'`.
    The default `BundlePolicy` fills each bundle up to the circuit note-slot
    count. Wallets that need fewer real notes per bundle can call the
    `*_with_policy` variants with `BundlePolicy::new(...)`; proof construction
@@ -195,7 +197,7 @@ The crate no longer accepts root wallet seed material for delegation signing.
   vote commitment tree state and optional HTTP sync.
 - **`pczt`, `zcash_keys`, `zcash_client_backend`, `zcash_client_sqlite`,
   `zcash_primitives`, and `zcash_protocol`** from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
-  rev `e71942a84d753098b9ed8352fa0c241a097f7d70`.
+  rev `8f242680358a2db7a6df42a629c8dd3d5cb4d737`.
 
 ## Migrating from 0.10
 
