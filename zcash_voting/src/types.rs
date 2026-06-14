@@ -894,7 +894,7 @@ pub fn validate_notes_for_round(notes: &[NoteInfo]) -> Result<(), VotingError> {
 mod tests {
     use super::*;
     use crate::governance::BALLOT_DIVISOR;
-    use orchard::note::{ExtractedNoteCommitment, Rho};
+    use orchard::note::{ExtractedNoteCommitment, NoteVersion, Rho};
     use orchard::value::NoteValue;
     use rand::rngs::OsRng;
     use zcash_keys::keys::UnifiedSpendingKey;
@@ -1029,12 +1029,13 @@ mod tests {
         let address = fvk.address_at(0u32, Scope::External);
 
         let mut rng = OsRng;
-        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, NoteVersion::V2);
         let note = orchard::Note::new(
             address,
             NoteValue::from_raw(12_500_000),
             Rho::from_nf_old(parent_note.nullifier(&fvk)),
             &mut rng,
+            NoteVersion::V2,
         );
 
         let note_info =

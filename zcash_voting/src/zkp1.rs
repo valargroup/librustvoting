@@ -131,12 +131,12 @@ fn bytes_to_scalar(bytes: &[u8], name: &str) -> Result<pallas::Scalar, VotingErr
 fn supported_note_versions() -> &'static [NoteVersion] {
     #[cfg(zcash_unstable = "nu7")]
     {
-        &[NoteVersion::V2, NoteVersion::V3]
+        &[NoteVersion::V3]
     }
 
     #[cfg(not(zcash_unstable = "nu7"))]
     {
-        &[NoteVersion::V2]
+        &[]
     }
 }
 
@@ -218,9 +218,9 @@ fn reconstruct_note(
     let note_value = NoteValue::from_raw(full_note.value);
     let mut matched_note = None;
     for version in supported_note_versions() {
-        let Some(candidate) = Option::<orchard::Note>::from(
-            orchard::Note::from_parts_with_version(address, note_value, rho, rseed, *version),
-        ) else {
+        let Some(candidate) = Option::<orchard::Note>::from(orchard::Note::from_parts(
+            address, note_value, rho, rseed, *version,
+        )) else {
             continue;
         };
 
@@ -693,18 +693,16 @@ mod tests {
         rng: &mut impl RngCore,
     ) -> orchard::Note {
         loop {
-            let (_, _, dummy_parent) = orchard::Note::dummy(&mut *rng, None);
+            let (_, _, dummy_parent) = orchard::Note::dummy(&mut *rng, None, NoteVersion::V2);
             let rho = Rho::from_nf_old(dummy_parent.nullifier(fvk));
             let rseed = random_seed_for_rho(&rho, rng);
-            if let Some(note) =
-                Option::<orchard::Note>::from(orchard::Note::from_parts_with_version(
-                    address,
-                    NoteValue::from_raw(value),
-                    rho,
-                    rseed,
-                    version,
-                ))
-            {
+            if let Some(note) = Option::<orchard::Note>::from(orchard::Note::from_parts(
+                address,
+                NoteValue::from_raw(value),
+                rho,
+                rseed,
+                version,
+            )) {
                 break note;
             }
         }
@@ -744,7 +742,7 @@ mod tests {
         let rho = Rho::from_bytes(&rho_arr).unwrap();
         let rseed_arr: [u8; 32] = full_note.rseed.as_slice().try_into().unwrap();
         let rseed = RandomSeed::from_bytes(rseed_arr, &rho).unwrap();
-        orchard::Note::from_parts_with_version(
+        orchard::Note::from_parts(
             address,
             NoteValue::from_raw(full_note.value),
             rho,
@@ -754,6 +752,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(zcash_unstable = "nu7")]
     #[test]
     fn reconstruct_note_accepts_regtest_network() {
         let network = Network::Regtest;
@@ -761,12 +760,12 @@ mod tests {
         let address = fvk.address_at(0u32, Scope::External);
 
         let mut rng = OsRng;
-        let note = test_note_with_version(&fvk, address, 1, NoteVersion::V2, &mut rng);
+        let note = test_note_with_version(&fvk, address, 1, NoteVersion::V3, &mut rng);
         let full_note = note_info_for_test_note(&note, &fvk, ufvk_str, 1);
 
         let (rebuilt, rebuilt_fvk) = reconstruct_note(&full_note, &network).unwrap();
 
-        assert_eq!(rebuilt.version(), NoteVersion::V2);
+        assert_eq!(rebuilt.version(), NoteVersion::V3);
         assert_eq!(
             ExtractedNoteCommitment::from(rebuilt.commitment()),
             ExtractedNoteCommitment::from(note.commitment())
@@ -872,12 +871,13 @@ mod tests {
 
         let mut notes = Vec::new();
         for &v in &note_values {
-            let (_, _, dummy_parent) = orchard::Note::dummy(&mut rng, None);
+            let (_, _, dummy_parent) = orchard::Note::dummy(&mut rng, None, NoteVersion::V2);
             let note = orchard::Note::new(
                 address,
                 NoteValue::from_raw(v),
                 Rho::from_nf_old(dummy_parent.nullifier(&fvk)),
                 &mut rng,
+                NoteVersion::V2,
             );
             notes.push(note);
         }
