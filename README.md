@@ -119,18 +119,18 @@ This workspace temporarily pins the Ironwood dependency stack through the root
 manifest and member manifests:
 
 - **orchard 0.14** — Resolved from [valargroup/qr_orchard](https://github.com/valargroup/qr_orchard)
-  rev `2b531b9d61a564a11cbdd9418a9788d1dd7d20de`, with
+  rev `6e73dc1d8b21bbcaefea82ae67d2028366fe3b89`, with
   `unstable-voting-circuits` enabled for governance
   proof paths.
 
 - **librustzcash crates** (`pczt`, `zcash_keys`, `zcash_client_sqlite`,
   `zcash_client_backend`, `zcash_primitives`, and `zcash_protocol`) — Resolved
   from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
-  rev `f1c37d45f1e7db67d1fa717bddc1691525bff4b0` for the Ironwood/NU7 wallet,
-  PCZT, and protocol APIs used by this branch.
+  rev `c72f670fdb72000b9a8a2061b3b3854dc6bb39a8` for the Ironwood/NU7 wallet,
+  PCZT, legacy v5 Orchard PCZT, and protocol APIs used by this branch.
 
 - **voting-circuits 0.8** — Resolved from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
-  rev `76b31e2b19be43a67567db3aaf2c29df91206016` for the delegation and
+  rev `2eaae8958e62ae63e1d23d9b7cd57ff2c8e3ff02` for the delegation and
   vote proof circuits.
 
 ## FFI

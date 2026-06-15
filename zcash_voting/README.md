@@ -12,8 +12,8 @@ precompute → delegate → vote → share lifecycle:
    available).
 2. Convert eligible shielded notes into `NoteInfo` with
    `NoteInfo::from_orchard_note`, then call `ensure_bundles`. Snapshot
-   selection uses Orchard/V2 notes before NU7 and Ironwood/V3 notes at NU7.
-   Ironwood/NU7 code paths are cfg-gated; build them with
+   selection is Ironwood/NU7-only on this branch and rejects non-NU7
+   snapshots. Ironwood/NU7 code paths are cfg-gated; build them with
    `RUSTFLAGS='--cfg zcash_unstable="nu7"'`.
    The default `BundlePolicy` fills each bundle up to the circuit note-slot
    count. Wallets that need fewer real notes per bundle can call the
