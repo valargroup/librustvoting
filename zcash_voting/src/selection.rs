@@ -360,11 +360,11 @@ mod tests {
     use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
     use zip32::Scope;
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn select_snapshot_notes_returns_snapshot_eligible_ironwood_notes() {
         let network = crate::Network::Regtest;
-        let snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
+        let snapshot_height = u64::from(crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT);
         let divisor = crate::governance::BALLOT_DIVISOR;
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
@@ -422,9 +422,9 @@ mod tests {
         assert!(selected.notes.iter().all(|note| !note.ufvk_str.is_empty()));
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
-    fn select_snapshot_notes_counts_only_ironwood_notes_at_nu7() {
+    fn select_snapshot_notes_counts_only_ironwood_notes_at_nu6_3() {
         let network = crate::Network::Regtest;
         let snapshot_height = 10;
         let divisor = crate::governance::BALLOT_DIVISOR;
@@ -453,11 +453,11 @@ mod tests {
         assert_eq!(crate::voting_power(&selected), divisor * 2);
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn select_notes_with_wallet_db_keeps_sub_divisor_notes_for_smart_bundles() {
         let network = crate::Network::Regtest;
-        let snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
+        let snapshot_height = u64::from(crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT);
         let divisor = crate::governance::BALLOT_DIVISOR;
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
@@ -543,11 +543,11 @@ mod tests {
         assert!(err.contains("does not match voting network"));
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn select_snapshot_note_infos_returns_sorted_snapshot_note_inputs() {
         let network = crate::Network::Regtest;
-        let snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
+        let snapshot_height = u64::from(crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT);
         let divisor = crate::governance::BALLOT_DIVISOR;
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, orchard_fvk) = setup_test_account(&mut conn, network);
@@ -576,11 +576,11 @@ mod tests {
         assert!(notes.iter().all(|note| !note.ufvk_str.is_empty()));
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn select_snapshot_notes_rejects_empty_snapshot() {
         let network = crate::Network::Regtest;
-        let snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
+        let snapshot_height = u64::from(crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT);
         let mut conn = Connection::open_in_memory().unwrap();
         let (account_uuid, _) = setup_test_account(&mut conn, network);
         mark_scanned_through(&conn, 0, snapshot_height);
@@ -698,7 +698,7 @@ mod tests {
         )
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     fn insert_ironwood_note(
         conn: &Connection,
         account_ref: i64,

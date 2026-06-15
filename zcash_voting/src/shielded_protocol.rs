@@ -6,19 +6,20 @@ use crate::types::VotingError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VotingShieldedProtocol {
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     Ironwood,
 }
 
 impl VotingShieldedProtocol {
     pub(crate) fn for_branch_id(_branch_id: BranchId) -> Result<Self, VotingError> {
-        #[cfg(zcash_unstable = "nu7")]
-        if matches!(_branch_id, BranchId::Nu7) {
+        #[cfg(zcash_unstable = "nu6.3")]
+        if matches!(_branch_id, BranchId::Nu6_3) {
             return Ok(Self::Ironwood);
         }
 
         Err(VotingError::InvalidInput {
-            message: "zcash voting only supports Ironwood/NU7 shielded voting notes".to_string(),
+            message: "zcash voting only supports Ironwood / NU6.3 shielded voting notes"
+                .to_string(),
         })
     }
 
@@ -30,42 +31,42 @@ impl VotingShieldedProtocol {
     }
 
     pub(crate) fn bundle_protocol(self) -> BundleProtocol {
-        #[cfg(zcash_unstable = "nu7")]
+        #[cfg(zcash_unstable = "nu6.3")]
         match self {
             Self::Ironwood => BundleProtocol::Ironwood,
         }
 
-        #[cfg(not(zcash_unstable = "nu7"))]
+        #[cfg(not(zcash_unstable = "nu6.3"))]
         match self {}
     }
 
     pub(crate) fn note_version(self) -> NoteVersion {
-        #[cfg(zcash_unstable = "nu7")]
+        #[cfg(zcash_unstable = "nu6.3")]
         match self {
             Self::Ironwood => NoteVersion::V3,
         }
 
-        #[cfg(not(zcash_unstable = "nu7"))]
+        #[cfg(not(zcash_unstable = "nu6.3"))]
         match self {}
     }
 
     pub(crate) fn pool(self) -> &'static str {
-        #[cfg(zcash_unstable = "nu7")]
+        #[cfg(zcash_unstable = "nu6.3")]
         match self {
             Self::Ironwood => "ironwood",
         }
 
-        #[cfg(not(zcash_unstable = "nu7"))]
+        #[cfg(not(zcash_unstable = "nu6.3"))]
         match self {}
     }
 
     pub(crate) fn name(self) -> &'static str {
-        #[cfg(zcash_unstable = "nu7")]
+        #[cfg(zcash_unstable = "nu6.3")]
         match self {
             Self::Ironwood => "Ironwood",
         }
 
-        #[cfg(not(zcash_unstable = "nu7"))]
+        #[cfg(not(zcash_unstable = "nu6.3"))]
         match self {}
     }
 }

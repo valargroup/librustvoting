@@ -1591,8 +1591,8 @@ mod tests {
     const W: &str = "test-wallet";
     const TESTNET_NU6_SNAPSHOT_HEIGHT: u64 = 3_536_500;
     const TESTNET_NU6_BRANCH_ID: u32 = 0x4DEC_4DF0;
-    #[cfg(zcash_unstable = "nu7")]
-    const REGTEST_NU7_SNAPSHOT_HEIGHT: u64 = crate::types::REGTEST_NU7_ACTIVATION_HEIGHT as u64;
+    #[cfg(zcash_unstable = "nu6.3")]
+    const REGTEST_NU6_3_SNAPSHOT_HEIGHT: u64 = crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT as u64;
 
     fn test_db() -> VotingDb {
         let db = VotingDb::open(":memory:").unwrap();
@@ -1613,17 +1613,17 @@ mod tests {
         }
     }
 
-    #[cfg(zcash_unstable = "nu7")]
-    fn test_params_nu7() -> VotingRoundParams {
+    #[cfg(zcash_unstable = "nu6.3")]
+    fn test_params_nu6_3() -> VotingRoundParams {
         VotingRoundParams {
-            snapshot_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
             ..test_params()
         }
     }
 
-    #[cfg(zcash_unstable = "nu7")]
-    fn nu7_branch_id() -> u32 {
-        u32::from(zcash_protocol::consensus::BranchId::Nu7)
+    #[cfg(zcash_unstable = "nu6.3")]
+    fn nu6_3_branch_id() -> u32 {
+        u32::from(zcash_protocol::consensus::BranchId::Nu6_3)
     }
 
     fn test_params_with_nc_root(nc_root: Vec<u8>) -> VotingRoundParams {
@@ -1675,7 +1675,7 @@ mod tests {
         (rk, (&sig).into())
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     fn sign_delegation_request(seed: &[u8], request: &DelegationSigningRequest) -> [u8; 64] {
         use orchard::keys::SpendAuthorizingKey;
         use zcash_keys::keys::UnifiedSpendingKey;
@@ -1948,7 +1948,7 @@ mod tests {
         assert!(err.to_string().contains("rseed_signed"), "{err}");
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn test_padded_pir_nullifiers_match_persisted_dummy_nullifiers() {
         use orchard::{
@@ -1980,7 +1980,7 @@ mod tests {
                 .unwrap();
 
         let db = test_db();
-        db.init_round(Network::Regtest, &test_params_nu7(), None)
+        db.init_round(Network::Regtest, &test_params_nu6_3(), None)
             .unwrap();
         db.ensure_bundles(ROUND_ID, &[note_info.clone()]).unwrap();
         {
@@ -2017,7 +2017,7 @@ mod tests {
             test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, seed_fingerprint, 0);
 
         let result = db
-            .build_governance_pczt(ROUND_ID, 0, &[note_info.clone()], &keys, nu7_branch_id())
+            .build_governance_pczt(ROUND_ID, 0, &[note_info.clone()], &keys, nu6_3_branch_id())
             .unwrap();
 
         let conn = db.conn();
@@ -2654,14 +2654,14 @@ mod tests {
         );
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
-    fn test_build_governance_pczt_rejects_nu7_branch_for_pre_nu7_snapshot() {
+    fn test_build_governance_pczt_rejects_nu6_3_branch_for_pre_nu6_3_snapshot() {
         use orchard::keys::{FullViewingKey, SpendingKey};
         use zcash_protocol::consensus::BranchId;
 
         let mut params = test_params();
-        params.snapshot_height = u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT) - 1;
+        params.snapshot_height = u64::from(crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT) - 1;
 
         let db = test_db();
         db.init_round(Network::Regtest, &params, None).unwrap();
@@ -2678,7 +2678,7 @@ mod tests {
             test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, seed_fingerprint, 0);
 
         let err = db
-            .build_governance_pczt(ROUND_ID, 0, &[note], &keys, u32::from(BranchId::Nu7))
+            .build_governance_pczt(ROUND_ID, 0, &[note], &keys, u32::from(BranchId::Nu6_3))
             .unwrap_err();
 
         assert!(
@@ -3240,7 +3240,7 @@ mod tests {
         assert_eq!(votes[0].choice, 1);
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn test_delegation_signing_request_signature_path_submits() {
         use orchard::{
@@ -3260,7 +3260,7 @@ mod tests {
         }
 
         let db = test_db();
-        db.init_round(Network::Regtest, &test_params_nu7(), None)
+        db.init_round(Network::Regtest, &test_params_nu6_3(), None)
             .unwrap();
 
         let sender_seed = [0x42; 32];
@@ -3299,7 +3299,7 @@ mod tests {
             0,
             &[note_info],
             &keys,
-            &StaticBranchId(nu7_branch_id()),
+            &StaticBranchId(nu6_3_branch_id()),
             &crate::types::NoopProgressReporter,
         )
         .unwrap();
@@ -3409,13 +3409,13 @@ mod tests {
     }
 
     /// Multi-bundle test: 6 notes → 2 bundles (5+1), independent delegation + vote storage per bundle.
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn test_multi_bundle_delegation_and_voting() {
         use orchard::keys::{FullViewingKey, SpendingKey};
 
         let db = test_db();
-        db.init_round(Network::Regtest, &test_params_nu7(), None)
+        db.init_round(Network::Regtest, &test_params_nu6_3(), None)
             .unwrap();
 
         // Create 6 notes with distinct positions and unique nullifiers
@@ -3468,7 +3468,7 @@ mod tests {
 
         for (i, chunk) in chunk_result.bundles.iter().enumerate() {
             let result = db
-                .build_governance_pczt(ROUND_ID, i as u32, chunk, &keys, nu7_branch_id())
+                .build_governance_pczt(ROUND_ID, i as u32, chunk, &keys, nu6_3_branch_id())
                 .unwrap();
 
             // Each bundle should have valid delegation data

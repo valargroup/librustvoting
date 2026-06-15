@@ -34,10 +34,10 @@ cargo check                    # check all crates
 cargo build -p zcash_voting   # build just the core library
 ```
 
-Ironwood/NU7 code paths are cfg-gated. Build or test those paths with:
+Ironwood / NU6.3 code paths are cfg-gated. Build or test those paths with:
 
 ```bash
-RUSTFLAGS='--cfg zcash_unstable="nu7"' cargo test -p zcash_voting --locked
+RUSTFLAGS='--cfg zcash_unstable="nu6.3"' cargo test -p zcash_voting --locked
 ```
 
 ## Wallet API Lifecycle
@@ -119,18 +119,18 @@ This workspace temporarily pins the Ironwood dependency stack through the root
 manifest and member manifests:
 
 - **orchard 0.14** — Resolved from [valargroup/qr_orchard](https://github.com/valargroup/qr_orchard)
-  rev `acabbab68ff7607819fe135c47d936bbb77fdb4a`, with
+  rev `4cdd4991eb014a2831718969a12506347ff2a6ea`, with
   `unstable-voting-circuits` enabled for governance
   proof paths.
 
 - **librustzcash crates** (`pczt`, `zcash_keys`, `zcash_client_sqlite`,
   `zcash_client_backend`, `zcash_primitives`, and `zcash_protocol`) — Resolved
   from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
-  rev `acdc8cb55df9921cc51714ecc194037a35311168` for the Ironwood/NU7 wallet,
+  rev `288bc4e2b12fd720f972ad913bea441978380951` for the Ironwood / NU6.3 wallet,
   PCZT, legacy v5 Orchard PCZT, and protocol APIs used by this branch.
 
 - **voting-circuits 0.8** — Resolved from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
-  rev `b6fa6d65c7b9ed9bdb3d0e7ed9c26a895ce968aa` for the delegation and
+  rev `c9641a4d281dab6c5b51181f7b7a89981c1e742d` for the delegation and
   vote proof circuits.
 
 ## FFI

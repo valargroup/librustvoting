@@ -11,7 +11,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   Ironwood-capable Zcash crates so wallet integrations resolve one shielded/PCZT
   stack.
 - Updated snapshot selection and governance PCZT construction to use only
-  Ironwood/V3 notes. Pre-NU7 Orchard/V2 voting is no longer supported on this
+  Ironwood/V3 notes. Pre-NU6.3 Orchard/V2 voting is no longer supported on this
   branch.
 - Persisted each voting round's wallet network and validate governance PCZT
   branch IDs against the stored round snapshot before writing PCZT setup state.

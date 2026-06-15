@@ -977,7 +977,7 @@ fn redact_delegation_pczt_for_signer(pczt_bytes: &[u8]) -> Result<Vec<u8>, Votin
         .redact_global_with(|mut r| r.redact_proprietary("zcash_client_backend:proposal_info"))
         .redact_orchard_with(redact_orchard_like_bundle_for_signer);
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     let redactor = redactor.redact_ironwood_with(redact_orchard_like_bundle_for_signer);
 
     let redacted = redactor
@@ -1124,7 +1124,7 @@ mod tests {
     use zcash_client_backend::data_api::{chain::ChainState, AccountBirthday, WalletWrite};
     use zcash_client_sqlite::{util::SystemClock, wallet::init::init_wallet_db};
     use zcash_primitives::block::BlockHash;
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     use zcash_protocol::consensus::BranchId;
     use zcash_protocol::consensus::{
         Network as ZcashNetwork, NetworkConstants, NetworkUpgrade, Parameters,
@@ -1133,14 +1133,14 @@ mod tests {
 
     const TESTNET_NU6_SNAPSHOT_HEIGHT: u64 = 3_536_500;
     const TESTNET_NU6_BRANCH_ID: u32 = 0x4DEC_4DF0;
-    #[cfg(zcash_unstable = "nu7")]
-    const REGTEST_NU7_SNAPSHOT_HEIGHT: u64 = crate::types::REGTEST_NU7_ACTIVATION_HEIGHT as u64;
+    #[cfg(zcash_unstable = "nu6.3")]
+    const REGTEST_NU6_3_SNAPSHOT_HEIGHT: u64 = crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT as u64;
 
     fn test_voting_hotkey() -> VotingHotkey {
         VotingHotkey::from_stored_secret(&[0x77; 64], Network::Testnet).unwrap()
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     fn test_regtest_voting_hotkey() -> VotingHotkey {
         VotingHotkey::from_stored_secret(&[0x77; 64], Network::Regtest).unwrap()
     }
@@ -1175,7 +1175,7 @@ mod tests {
         assert_eq!(voting_db.list_rounds().unwrap().len(), 1);
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn prepare_delegation_bundle_returns_plain_reusable_bundle_state() {
         let (_voting_db, round_params, hotkey, prepared) = prepared_wallet_delegation_fixture();
@@ -1184,7 +1184,7 @@ mod tests {
         assert_eq!(prepared.round_id, round_params.vote_round_id);
         assert_eq!(
             prepared.round_params.snapshot_height,
-            REGTEST_NU7_SNAPSHOT_HEIGHT
+            REGTEST_NU6_3_SNAPSHOT_HEIGHT
         );
         assert_eq!(prepared.bundle_index, 0);
         assert_eq!(prepared.layout.bundle_count, 1);
@@ -1197,7 +1197,7 @@ mod tests {
         assert_eq!(prepared.round_name, "Demo Round");
         assert_eq!(
             prepared.branch_id_provider.consensus_branch_id().unwrap(),
-            u32::from(BranchId::Nu7)
+            u32::from(BranchId::Nu6_3)
         );
         assert_eq!(
             &prepared.delegation_keys.hotkey_raw_address,
@@ -1205,7 +1205,7 @@ mod tests {
         );
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn signed_bundle_rejects_pczt_sighash_mismatch() {
         let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
@@ -1227,7 +1227,7 @@ mod tests {
         assert!(err.contains("pczt_bytes sighash does not match delegation signer sighash"));
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn signing_request_rejects_key_network_mismatch() {
         let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
@@ -1369,7 +1369,7 @@ mod tests {
         }
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     fn prepared_wallet_delegation_fixture() -> (
         VotingDb,
         crate::VotingRoundParams,
@@ -1387,7 +1387,7 @@ mod tests {
             account_ref,
             &orchard_fvk,
             1,
-            (REGTEST_NU7_SNAPSHOT_HEIGHT - 2) as u32,
+            (REGTEST_NU6_3_SNAPSHOT_HEIGHT - 2) as u32,
             divisor,
             7,
         );
@@ -1396,7 +1396,7 @@ mod tests {
             account_ref,
             &orchard_fvk,
             2,
-            (REGTEST_NU7_SNAPSHOT_HEIGHT - 2) as u32,
+            (REGTEST_NU6_3_SNAPSHOT_HEIGHT - 2) as u32,
             divisor * 2,
             3,
         );
@@ -1405,7 +1405,7 @@ mod tests {
             account_ref,
             &orchard_fvk,
             3,
-            (REGTEST_NU7_SNAPSHOT_HEIGHT + 4) as u32,
+            (REGTEST_NU6_3_SNAPSHOT_HEIGHT + 4) as u32,
             divisor * 3,
             11,
         );
@@ -1420,7 +1420,7 @@ mod tests {
         let round_params = crate::VotingRoundParams {
             vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
                 .to_string(),
-            snapshot_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
             ea_pk: ea_pk.to_bytes().to_vec(),
             nc_root: vec![2; 32],
             nullifier_imt_root: vec![3; 32],
@@ -1430,14 +1430,14 @@ mod tests {
             round_params: round_params.clone(),
             resolved_round_name: "Demo Round".to_string(),
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
-            branch_id_provider: LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu7)),
+            branch_id_provider: LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu6_3)),
         };
         let wallet_inputs = gather_delegation_wallet_inputs(GatherDelegationWalletParams {
             wallet_db: &wallet_db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
             voting_hotkey: &hotkey,
             snapshot_height: round_params.snapshot_height,
-            scanned_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
+            scanned_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
             anchor_tree_state_bytes: lwd.anchor_tree_state_bytes.clone(),
             resolved_round_name: lwd.resolved_round_name.clone(),
         })
@@ -1521,7 +1521,7 @@ mod tests {
         );
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     fn insert_ironwood_note(
         conn: &Connection,
         account_ref: i64,
@@ -1775,7 +1775,7 @@ mod tests {
         );
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn prepared_setup_rejects_branch_id_that_does_not_match_snapshot_height() {
         let voting_db = VotingDb::open_in_memory().unwrap();
@@ -1783,9 +1783,9 @@ mod tests {
             prepared_bundle_fixture(vec![note_info(0, crate::governance::BALLOT_DIVISOR)]);
         prepared.network = Network::Regtest;
         prepared.round_params.snapshot_height =
-            u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT) - 1;
+            u64::from(crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT) - 1;
         prepared.branch_id_provider =
-            LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu7));
+            LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu6_3));
 
         let err = prepared
             .setup(&voting_db, &crate::types::NoopProgressReporter)
@@ -1878,7 +1878,7 @@ mod tests {
         assert!(err.contains("wallet is not synced to voting snapshot height 12"));
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn gather_delegation_wallet_inputs_selects_sorted_notes_and_keys() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1897,8 +1897,8 @@ mod tests {
             wallet_db: &db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
             voting_hotkey: &hotkey,
-            snapshot_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
-            scanned_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            scanned_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
             resolved_round_name: "Demo Round".to_string(),
         })
@@ -1920,7 +1920,7 @@ mod tests {
         assert_eq!(inputs.delegation_keys.round_name, "Demo Round");
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn gather_delegation_wallet_inputs_rejects_empty_snapshot() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1931,8 +1931,8 @@ mod tests {
             wallet_db: &db,
             account_uuid: &account_uuid.expose_uuid().to_string(),
             voting_hotkey: &hotkey,
-            snapshot_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
-            scanned_height: REGTEST_NU7_SNAPSHOT_HEIGHT,
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            scanned_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
             anchor_tree_state_bytes: vec![0xAA, 0xBB],
             resolved_round_name: "Demo Round".to_string(),
         })
@@ -1988,7 +1988,7 @@ mod tests {
         assert!(err.contains("parse PCZT failed"));
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     fn ironwood_spend_witnesses(pczt: &pczt::Pczt) -> Vec<serde_json::Value> {
         let value = serde_json::to_value(pczt).expect("serialize PCZT to JSON");
         value["ironwood"]["actions"]
@@ -1999,7 +1999,7 @@ mod tests {
             .collect()
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     fn pczt_with_ironwood_output_info(pczt: &pczt::Pczt) -> pczt::Pczt {
         let mut value = serde_json::to_value(pczt).expect("serialize PCZT to JSON");
         for action in value["ironwood"]["actions"]
@@ -2018,7 +2018,7 @@ mod tests {
         serde_json::from_value(value).expect("deserialize seeded PCZT")
     }
 
-    #[cfg(zcash_unstable = "nu7")]
+    #[cfg(zcash_unstable = "nu6.3")]
     #[test]
     fn redact_delegation_pczt_for_signer_redacts_ironwood_actions() {
         let (voting_db, _round_params, _hotkey, mut prepared) =
@@ -2027,9 +2027,9 @@ mod tests {
         prepared.delegation_keys.network = Network::Regtest;
         prepared.delegation_keys.coin_type = Network::Regtest.network_type().coin_type();
         prepared.round_params.snapshot_height =
-            u64::from(crate::types::REGTEST_NU7_ACTIVATION_HEIGHT);
+            u64::from(crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT);
         prepared.branch_id_provider =
-            LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu7));
+            LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu6_3));
         {
             let conn = voting_db.conn();
             let wallet_id = voting_db.wallet_id();

@@ -30,8 +30,8 @@ pub const MIN_VOTE_OPTIONS: u32 = 2;
 /// Maximum number of options a proposal can declare.
 pub const MAX_VOTE_OPTIONS: u32 = 8;
 
-#[cfg(zcash_unstable = "nu7")]
-pub(crate) const REGTEST_NU7_ACTIVATION_HEIGHT: u32 = 10;
+#[cfg(zcash_unstable = "nu6.3")]
+pub(crate) const REGTEST_NU6_3_ACTIVATION_HEIGHT: u32 = 10;
 
 #[derive(Debug, Error)]
 pub enum VotingError {
@@ -78,8 +78,10 @@ impl Parameters for Network {
                 | NetworkUpgrade::Nu6
                 | NetworkUpgrade::Nu6_1
                 | NetworkUpgrade::Nu6_2 => Some(BlockHeight::from_u32(1)),
-                #[cfg(zcash_unstable = "nu7")]
-                NetworkUpgrade::Nu7 => Some(BlockHeight::from_u32(REGTEST_NU7_ACTIVATION_HEIGHT)),
+                #[cfg(zcash_unstable = "nu6.3")]
+                NetworkUpgrade::Nu6_3 => {
+                    Some(BlockHeight::from_u32(REGTEST_NU6_3_ACTIVATION_HEIGHT))
+                }
             },
         }
     }
@@ -184,7 +186,7 @@ impl fmt::Debug for VotingHotkey {
 
 /// A shielded voting note from the wallet DB.
 ///
-/// This branch supports Ironwood/V3 note material for NU7 voting rounds.
+/// This branch supports Ironwood/V3 note material for NU6.3 voting rounds.
 /// `NoteInfo` contains the fields needed for delegation proof construction and
 /// governance PCZT building.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -345,7 +347,7 @@ pub struct DelegationAction {
 /// Governance PCZT for Keystone signing.
 ///
 /// Contains a serialized PCZT whose governance action belongs to the Ironwood
-/// shielded protocol for NU7 voting rounds. The PCZT's rk and ZIP-244 sighash
+/// shielded protocol for NU6.3 voting rounds. The PCZT's rk and ZIP-244 sighash
 /// are internally consistent, so Keystone's SpendAuth signature will verify
 /// against them.
 #[derive(Clone, Debug)]

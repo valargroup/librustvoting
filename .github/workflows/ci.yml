@@ -10,7 +10,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --workspace
         run: cargo test --workspace --locked
-      - name: cargo test -p zcash_voting (NU7)
+      - name: cargo test -p zcash_voting (NU6.3)
         env:
-          RUSTFLAGS: --cfg zcash_unstable="nu7"
+          RUSTFLAGS: --cfg zcash_unstable="nu6.3"
         run: cargo test -p zcash_voting --locked
