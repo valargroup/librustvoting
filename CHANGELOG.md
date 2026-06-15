@@ -10,8 +10,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Aligned the workspace's Zcash and Orchard dependency graph with the
   Ironwood-capable Zcash crates so wallet integrations resolve one shielded/PCZT
   stack.
-- Updated NU7 snapshot selection and governance PCZT construction to use only
-  Ironwood/V3 notes, while pre-NU7 voting remains on Orchard/V2 notes.
+- Updated snapshot selection and governance PCZT construction to use only
+  Ironwood/V3 notes. Pre-NU7 Orchard/V2 voting is no longer supported on this
+  branch.
 - Persisted each voting round's wallet network and validate governance PCZT
   branch IDs against the stored round snapshot before writing PCZT setup state.
 
@@ -175,8 +176,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   Callers that need a non-default bundle policy can use
   `VotingDb::prepare_delegation_pir_with_policy`.
 - Added `zcash_voting::witness::generate_note_witnesses` for shielded note
-  witness generation from a stored voting round snapshot. The API selects
-  Orchard/V2 or Ironwood/V3 from the snapshot height, validates the cached
+  witness generation from a stored voting round snapshot. The API selects the
+  shielded voting protocol from the snapshot height, validates the cached
   lightwalletd `TreeState` height and selected tree root against the persisted
   round parameters, asks the wallet DB for historical Merkle paths, then returns
   `WitnessData` for each bundled note.

@@ -184,9 +184,9 @@ impl fmt::Debug for VotingHotkey {
 
 /// A shielded voting note from the wallet DB.
 ///
-/// The note material may come from an Orchard/V2 note before NU7 or an
-/// Ironwood/V3 note at NU7. `NoteInfo` contains the fields needed for
-/// delegation proof construction and governance PCZT building.
+/// This branch supports Ironwood/V3 note material for NU7 voting rounds.
+/// `NoteInfo` contains the fields needed for delegation proof construction and
+/// governance PCZT building.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteInfo {
     /// Extracted note commitment (cmx), recomputed from note parts.
@@ -213,8 +213,8 @@ impl NoteInfo {
     /// Builds voting note metadata from a shielded note owned by the given UFVK.
     ///
     /// The `orchard` crate represents both Orchard/V2 and Ironwood/V3 notes.
-    /// Callers are responsible for selecting notes from the protocol version
-    /// required by the voting round.
+    /// Callers are responsible for selecting Ironwood/V3 notes for the voting
+    /// round.
     pub fn from_orchard_note<P: consensus::Parameters>(
         note: &orchard::note::Note,
         position: u64,
@@ -344,10 +344,10 @@ pub struct DelegationAction {
 
 /// Governance PCZT for Keystone signing.
 ///
-/// Contains a serialized PCZT whose governance action belongs to the selected
-/// shielded protocol (Orchard before NU7, Ironwood at NU7). The PCZT's rk and
-/// ZIP-244 sighash are internally consistent, so Keystone's SpendAuth signature
-/// will verify against them.
+/// Contains a serialized PCZT whose governance action belongs to the Ironwood
+/// shielded protocol for NU7 voting rounds. The PCZT's rk and ZIP-244 sighash
+/// are internally consistent, so Keystone's SpendAuth signature will verify
+/// against them.
 #[derive(Clone, Debug)]
 pub struct GovernancePczt {
     /// Serialized PCZT bytes ready for UR-encoding and Keystone signing.

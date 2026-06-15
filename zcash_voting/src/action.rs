@@ -42,7 +42,7 @@ fn pczt_actions_for_protocol(
 ) -> Result<&[pczt::orchard::Action], VotingError> {
     match protocol {
         BundleProtocol::Ironwood => Ok(pczt.ironwood().actions()),
-        BundleProtocol::Orchard => Err(VotingError::InvalidInput {
+        BundleProtocol::Orchard | BundleProtocol::LegacyOrchard => Err(VotingError::InvalidInput {
             message: "zcash voting only supports Ironwood PCZT actions".to_string(),
         }),
     }
