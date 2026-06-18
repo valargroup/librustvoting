@@ -33,7 +33,7 @@ impl VotingShieldedProtocol {
     pub(crate) fn bundle_protocol(self) -> BundleProtocol {
         #[cfg(zcash_unstable = "nu6.3")]
         match self {
-            Self::Ironwood => BundleProtocol::Ironwood,
+            Self::Ironwood => BundleProtocol::IronwoodPostNu6_3,
         }
 
         #[cfg(not(zcash_unstable = "nu6.3"))]
