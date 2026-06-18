@@ -11,7 +11,7 @@ use orchard::note::{NoteVersion, RandomSeed, Rho};
 use orchard::pczt::Zip32Derivation;
 use orchard::tree::{MerkleHashOrchard, MerklePath};
 use orchard::value::NoteValue;
-use orchard::{Address, Anchor, BundleProtocol};
+use orchard::{Address, Anchor, BundleKind, BundleProtocol};
 use voting_circuits::delegation::synthetic_padding_note_parts;
 use zcash_primitives::transaction::builder::PcztParts;
 use zcash_primitives::transaction::TxVersion;
@@ -534,7 +534,7 @@ pub(crate) fn build_governance_pczt(
     let consensus_network = consensus_network_for_voting_network(network);
 
     for _ in 0..MAX_PCZT_LAYOUT_ATTEMPTS {
-        let mut builder = Builder::new(bundle_protocol, anchor);
+        let mut builder = Builder::new(BundleKind::Transaction, bundle_protocol, anchor);
 
         // Add the governance signed note as a spend.
         builder
