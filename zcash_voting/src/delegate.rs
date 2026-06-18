@@ -1989,33 +1989,39 @@ mod tests {
     }
 
     #[cfg(zcash_unstable = "nu6.3")]
-    fn ironwood_spend_witnesses(pczt: &pczt::Pczt) -> Vec<serde_json::Value> {
-        let value = serde_json::to_value(pczt).expect("serialize PCZT to JSON");
-        value["ironwood"]["actions"]
-            .as_array()
-            .expect("ironwood actions serialize as an array")
-            .iter()
-            .map(|action| action["spend"]["witness"].clone())
-            .collect()
+    const OUTPUT_INFO_KEY: &str = "zcash_client_backend:output_info";
+
+    #[cfg(zcash_unstable = "nu6.3")]
+    fn ironwood_spend_witnesses_present(pczt: &pczt::Pczt) -> Vec<bool> {
+        let mut witnesses = Vec::new();
+        pczt::roles::updater::Updater::new(pczt.clone())
+            .update_ironwood_with(|updater| {
+                witnesses = updater
+                    .bundle()
+                    .actions()
+                    .iter()
+                    .map(|action| action.spend().witness().is_some())
+                    .collect();
+                Ok(())
+            })
+            .expect("inspect Ironwood spend witnesses");
+        witnesses
     }
 
     #[cfg(zcash_unstable = "nu6.3")]
     fn pczt_with_ironwood_output_info(pczt: &pczt::Pczt) -> pczt::Pczt {
-        let mut value = serde_json::to_value(pczt).expect("serialize PCZT to JSON");
-        for action in value["ironwood"]["actions"]
-            .as_array_mut()
-            .expect("ironwood actions serialize as an array")
-        {
-            action["output"]["proprietary"]
-                .as_object_mut()
-                .expect("output proprietary serializes as an object")
-                .insert(
-                    "zcash_client_backend:output_info".to_string(),
-                    serde_json::json!([1, 2, 3]),
-                );
-        }
-
-        serde_json::from_value(value).expect("deserialize seeded PCZT")
+        pczt::roles::updater::Updater::new(pczt.clone())
+            .update_ironwood_with(|mut updater| {
+                for index in 0..updater.bundle().actions().len() {
+                    updater.update_action_with(index, |mut action| {
+                        action.set_output_proprietary(OUTPUT_INFO_KEY.to_string(), vec![1, 2, 3]);
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })
+            .expect("seed Ironwood output info")
+            .finish()
     }
 
     #[cfg(zcash_unstable = "nu6.3")]
@@ -2057,21 +2063,20 @@ mod tests {
 
         assert!(full_pczt.orchard().actions().is_empty());
         assert_eq!(full_pczt.ironwood().actions().len(), 2);
-        assert!(ironwood_spend_witnesses(&full_pczt)
+        assert!(ironwood_spend_witnesses_present(&full_pczt)
             .iter()
-            .any(|witness| !witness.is_null()));
+            .any(|witness| *witness));
 
         assert!(redacted_pczt.orchard().actions().is_empty());
         assert_eq!(redacted_pczt.ironwood().actions().len(), 2);
-        assert!(ironwood_spend_witnesses(&redacted_pczt)
+        assert!(ironwood_spend_witnesses_present(&redacted_pczt)
             .iter()
-            .all(serde_json::Value::is_null));
-        assert!(redacted_pczt.ironwood().actions().iter().all(|action| {
-            !action
-                .output()
-                .proprietary()
-                .contains_key("zcash_client_backend:output_info")
-        }));
+            .all(|witness| !*witness));
+        assert!(redacted_pczt
+            .ironwood()
+            .actions()
+            .iter()
+            .all(|action| { !action.output().proprietary().contains_key(OUTPUT_INFO_KEY) }));
         assert_eq!(
             pczt_sighash(&redacted_pczt_bytes).unwrap(),
             pczt_sighash(&seeded_pczt_bytes).unwrap()
