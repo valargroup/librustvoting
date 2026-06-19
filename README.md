@@ -126,7 +126,7 @@ manifest and member manifests:
 - **librustzcash crates** (`pczt`, `zcash_keys`, `zcash_client_sqlite`,
   `zcash_client_backend`, `zcash_primitives`, and `zcash_protocol`) — Resolved
   from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
-  rev `505e5337e444da07277de1aa13f9e5558a0c781a` for the Ironwood / NU6.3 wallet,
+  rev `dc95dcef33a081b925db551eac8bf6533fff22ed` for the Ironwood / NU6.3 wallet,
   PCZT, legacy v5 Orchard PCZT, and protocol APIs used by this branch.
 
 - **voting-circuits 0.8** — Resolved from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
