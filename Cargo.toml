@@ -8,12 +8,12 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-orchard = { version = "0.14", git = "https://github.com/zcash/orchard", rev = "b2af0a11abe00f59c51258d349c2105fe7a16215", features = ["unstable-voting-circuits"] }
-voting-circuits = { version = "=0.8.0", git = "https://github.com/valargroup/voting-circuits", rev = "dba34961b908ebd7a8ec4b408f459737d9d3e0de" }
+orchard = { version = "0.14", git = "https://github.com/zcash/orchard", branch = "adam/qleak-dummy-ciphertexts-on-pr505", features = ["unstable-voting-circuits"] }
+voting-circuits = { version = "=0.8.0", git = "https://github.com/valargroup/voting-circuits", branch = "adam/qleak-pr94-orchard-dummy-ciphertexts" }
 
-pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "dc95dcef33a081b925db551eac8bf6533fff22ed", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "dc95dcef33a081b925db551eac8bf6533fff22ed", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "dc95dcef33a081b925db551eac8bf6533fff22ed", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "dc95dcef33a081b925db551eac8bf6533fff22ed", features = ["orchard"] }
-zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "dc95dcef33a081b925db551eac8bf6533fff22ed" }
-zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "dc95dcef33a081b925db551eac8bf6533fff22ed" }
+pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", features = ["orchard"] }
+zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
