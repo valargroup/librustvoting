@@ -20,5 +20,5 @@ libc = "0.2"
 
 [dev-dependencies]
 rand = "0.8"
-orchard = { version = "=0.13.1", features = ["unstable-voting-circuits"] }
-voting-circuits = "0.6.0"
+orchard = { version = "0.14", git = "https://github.com/valargroup/orchard", branch = "adam/pczt-recompute-helpers", features = ["unstable-voting-circuits"] }
+voting-circuits = "=0.8.0"

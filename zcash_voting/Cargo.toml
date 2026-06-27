@@ -105,23 +105,30 @@ anyhow = "1"
 thiserror = "2"
 zeroize = "1"
 
-# Single orchard node: every consumer resolves upstream `orchard` from
-# crates.io at 0.13.1. The `unstable-voting-circuits` feature is required by
+# Single orchard node: every consumer resolves `orchard` from the
+# valargroup/orchard `adam/pczt-recompute-helpers` branch (0.14), the same
+# source the librustzcash `adam/pczt-optional-fields` foundation uses. The
+# `[patch.crates-io]` in the workspace root redirects the crates.io `orchard`
+# requirement of `voting-circuits` onto this git source so the graph keeps a
+# single orchard node. The `unstable-voting-circuits` feature is required by
 # integration tests in `zkp1.rs` (`Note::new`, `Note::dummy`,
 # `Rho::from_nf_old`).
 subtle = "2.6"
-orchard = { version = "=0.13.1", features = ["unstable-voting-circuits"] }
-voting-circuits = "=0.6.0"
+orchard = { version = "0.14", git = "https://github.com/valargroup/orchard", branch = "adam/pczt-recompute-helpers", features = ["unstable-voting-circuits"] }
+voting-circuits = "=0.8.0"
 nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
-zcash_protocol = "0.8"
-zcash_client_backend = { version = "0.22", default-features = false, features = ["orchard"] }
-zcash_client_sqlite = { version = "0.20", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.13", features = ["orchard"] }
-pczt = { version = "0.6", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_primitives = "0.27"
+# librustzcash pins — valargroup/librustzcash `adam/pczt-optional-fields`
+# (optional Orchard PCZT fields foundation). All six crates must share one git
+# source so the graph has a single zcash_protocol / zcash_primitives / pczt node.
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", branch = "adam/pczt-optional-fields" }
+zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", branch = "adam/pczt-optional-fields", default-features = false, features = ["orchard"] }
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", branch = "adam/pczt-optional-fields", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", branch = "adam/pczt-optional-fields", features = ["orchard"] }
+pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", branch = "adam/pczt-optional-fields", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", branch = "adam/pczt-optional-fields" }
 uuid = "1.23.1"
 base64 = "0.22.1"
 

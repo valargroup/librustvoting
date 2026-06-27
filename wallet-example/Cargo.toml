@@ -7,12 +7,12 @@ publish = false
 [dependencies]
 anyhow = "1"
 ff = "0.13"
-orchard = { version = "=0.13.1", features = ["unstable-voting-circuits"] }
+orchard = { version = "0.14", git = "https://github.com/valargroup/orchard", branch = "adam/pczt-recompute-helpers", features = ["unstable-voting-circuits"] }
 pasta_curves = "0.5"
 rand = "0.8"
 rusqlite = "0.37"
-zcash_client_sqlite = { version = "0.20", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.13", features = ["orchard"] }
-zcash_protocol = "0.8"
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", branch = "adam/pczt-optional-fields", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", branch = "adam/pczt-optional-fields", features = ["orchard"] }
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", branch = "adam/pczt-optional-fields" }
 zcash_voting = { path = "../zcash_voting", features = ["pir", "tree-sync"] }
 zip32 = "0.2"

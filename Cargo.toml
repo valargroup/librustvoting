@@ -6,3 +6,11 @@ members = [
     "wallet-example",
 ]
 resolver = "2"
+
+# Keep a single `orchard` node in the graph. The librustzcash
+# `adam/pczt-optional-fields` foundation and our direct `orchard` deps both
+# resolve `orchard` from valargroup/orchard `adam/pczt-recompute-helpers`, but
+# `voting-circuits` requests `orchard` from crates.io. Redirect that crates.io
+# requirement onto the same git source so Cargo unifies on one orchard.
+[patch.crates-io]
+orchard = { git = "https://github.com/valargroup/orchard", branch = "adam/pczt-recompute-helpers" }
