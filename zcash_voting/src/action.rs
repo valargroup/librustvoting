@@ -130,7 +130,9 @@ fn make_note(
     rng: &mut impl RngCore,
 ) -> Result<(orchard::Note, [u8; 32]), VotingError> {
     let (rseed, rseed_bytes) = random_rseed(rng, &rho);
-    let note = orchard::Note::from_parts(addr, value, rho, rseed);
+    // Voting notes are pre-Ironwood Orchard notes (V2 plaintext format).
+    let note =
+        orchard::Note::from_parts(addr, value, rho, rseed, orchard::note::NoteVersion::V2);
     if !bool::from(note.is_some()) {
         return Err(VotingError::Internal {
             message: "failed to construct note".to_string(),
@@ -187,6 +189,29 @@ fn encode_delegation_action_bytes(
     }
     out.extend_from_slice(vote_round_id);
     Ok(out)
+}
+
+/// Select the Orchard [`BundlePoolRestrictions`] for a given consensus branch.
+///
+/// Voting only ever builds Orchard (V2) bundles, so this never returns an
+/// Ironwood variant. It mirrors `zcash_primitives`'s `orchard_protocol_for_branch`
+/// so the governance bundle's circuit version and flag-byte format match what
+/// consensus expects at the target branch; using the wrong value can produce a
+/// consensus-invalid transaction.
+///
+/// [`BundlePoolRestrictions`]: orchard::bundle::BundlePoolRestrictions
+fn orchard_pool_restrictions_for_branch(
+    branch_id: BranchId,
+) -> orchard::bundle::BundlePoolRestrictions {
+    use orchard::bundle::BundlePoolRestrictions;
+    match branch_id {
+        #[cfg(zcash_unstable = "nu6.3")]
+        BranchId::Nu6_3 => BundlePoolRestrictions::OrchardNu6_3Onward,
+        #[cfg(zcash_unstable = "nu7")]
+        BranchId::Nu7 => BundlePoolRestrictions::OrchardNu6_3Onward,
+        BranchId::Nu6_2 => BundlePoolRestrictions::OrchardNu6_2Only,
+        _ => BundlePoolRestrictions::OrchardPreNu6_2,
+    }
 }
 
 /// Build a governance-specific PCZT for Keystone signing.
@@ -438,9 +463,13 @@ pub fn build_governance_pczt(
         ZIP32_MAINNET_COIN_TYPE => Network::MainNetwork,
         _ => Network::TestNetwork,
     };
+    // Voting is Orchard-only (V2). Select the Orchard pool restriction from the
+    // target consensus branch so the bundle's circuit version and flag-byte
+    // format match consensus, mirroring zcash_primitives' orchard_protocol_for_branch.
+    let pool_restrictions = orchard_pool_restrictions_for_branch(branch_id);
 
     for _ in 0..MAX_PCZT_LAYOUT_ATTEMPTS {
-        let mut builder = Builder::new(BundleType::DEFAULT, anchor);
+        let mut builder = Builder::new(pool_restrictions, BundleType::DEFAULT, anchor);
 
         // Add the governance signed note as a spend.
         builder
@@ -557,6 +586,10 @@ pub fn build_governance_pczt(
             transparent: None,
             sapling: None,
             orchard: Some(orchard_pczt_bundle),
+            // Voting bundles are Orchard-only; under the nu6.3-enabled build the
+            // PcztParts struct also carries an Ironwood pool, left empty here.
+            #[cfg(zcash_unstable = "nu6.3")]
+            ironwood: None,
         };
         let pczt = pczt::roles::creator::Creator::build_from_parts(parts).ok_or_else(|| {
             VotingError::Internal {
@@ -587,8 +620,12 @@ pub fn build_governance_pczt(
                     parsed_pczt.orchard().actions().len()
                 ),
             })?;
-        if *indexed_action.spend().nullifier() != nf_signed_bytes
-            || *indexed_action.output().cmx() != cmx_new_bytes
+        // The pczt crate now models these derived fields as `Option<[u8; 32]>`
+        // (omittable). For the governance action they must be present and match
+        // what we computed; a missing (`None`) or differing value means this
+        // index does not point at the paired governance action.
+        if *indexed_action.spend().nullifier() != Some(nf_signed_bytes)
+            || *indexed_action.output().cmx() != Some(cmx_new_bytes)
         {
             return Err(VotingError::Internal {
                 message: "GovernancePczt action_index does not point to paired governance action"
@@ -920,10 +957,21 @@ mod tests {
                 .expect("action_index should point to an Orchard action");
 
             assert_eq!(
-                indexed_action.spend().nullifier().to_vec(),
+                indexed_action
+                    .spend()
+                    .nullifier()
+                    .expect("governance action nullifier should be present")
+                    .to_vec(),
                 result.nf_signed
             );
-            assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
+            assert_eq!(
+                indexed_action
+                    .output()
+                    .cmx()
+                    .expect("governance action cmx should be present")
+                    .to_vec(),
+                result.cmx_new
+            );
         }
     }
 

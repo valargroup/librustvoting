@@ -94,6 +94,16 @@ impl Parameters for Network {
                 | NetworkUpgrade::Nu5
                 | NetworkUpgrade::Nu6
                 | NetworkUpgrade::Nu6_1 => Some(BlockHeight::from_u32(1)),
+                // Nu6_2 (and the cfg-gated NU6.3+/NU7/ZFuture variants) are not
+                // activated on this crate's regtest config, so the effective
+                // regtest branch stays Nu6_1 (matching prior behavior).
+                NetworkUpgrade::Nu6_2 => None,
+                #[cfg(zcash_unstable = "nu6.3")]
+                NetworkUpgrade::Nu6_3 => None,
+                #[cfg(zcash_unstable = "nu7")]
+                NetworkUpgrade::Nu7 => None,
+                #[cfg(zcash_unstable = "zfuture")]
+                NetworkUpgrade::ZFuture => None,
             },
         }
     }
@@ -853,6 +863,7 @@ mod tests {
             time: 0,
             sapling_tree: String::new(),
             orchard_tree: String::new(),
+            ironwood_tree: String::new(),
         }
     }
 
@@ -972,11 +983,12 @@ mod tests {
         let address = fvk.address_at(0u32, Scope::External);
 
         let mut rng = OsRng;
-        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, orchard::note::NoteVersion::V2);
         let note = orchard::Note::new(
             address,
             NoteValue::from_raw(12_500_000),
             Rho::from_nf_old(parent_note.nullifier(&fvk)),
+            orchard::note::NoteVersion::V2,
             &mut rng,
         );
 

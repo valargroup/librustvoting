@@ -61,7 +61,11 @@ rand = "0.8"
 
 # Hashing
 blake2b_simd = "1"
-halo2_gadgets = "0.4"
+# Match voting-circuits' =0.5.0 so the whole circuit stack unifies on a single
+# halo2_gadgets node. This crate only uses halo2_gadgets::poseidon::primitives::*,
+# which is unchanged across 0.4/0.5; 0.4.0 is yanked on crates.io, so a downstream
+# fresh resolve (e.g. vizor) cannot select it.
+halo2_gadgets = "=0.5.0"
 halo2_proofs = "0.3"
 sinsemilla = "0.1"
 
@@ -72,7 +76,7 @@ serde_json = "1"
 prost = "0.14"
 
 # PIR (private nullifier exclusion proofs).
-pir-client = { version = "=0.2.0", default-features = false, optional = true }
+pir-client = { version = "=0.3.0", default-features = false, optional = true }
 # Supply-chain pins for the Valar-owned PIR/tree dependency surface. These
 # direct optional dependencies constrain the versions Cargo may resolve when
 # the client features are enabled; they do not change whether upstream build
@@ -80,7 +84,7 @@ pir-client = { version = "=0.2.0", default-features = false, optional = true }
 pir-types = { version = "=0.1.0", default-features = false, optional = true }
 valar-spiral-rs = { version = "=0.5.2", default-features = false, optional = true }
 valar-ypir = { version = "=0.1.5", default-features = false, optional = true }
-imt-tree = { version = "=0.1.1", optional = true }
+imt-tree = { version = "=0.2.0", optional = true }
 
 # Direct Hyper/Rustls HTTP transport. Behind `client-pir` and `client-tree-sync`.
 bytes = { version = "1", optional = true }
@@ -115,7 +119,10 @@ zeroize = "1"
 # `Rho::from_nf_old`).
 subtle = "2.6"
 orchard = { version = "0.14", git = "https://github.com/valargroup/orchard", branch = "adam/pczt-recompute-helpers", features = ["unstable-voting-circuits"] }
-voting-circuits = "=0.8.0"
+# voting-circuits PR #94 head (adam/qrorchard-protocol-api): pinned to git so it
+# builds against the valargroup/orchard recompute-helpers line (its orchard dep
+# also points at adam/pczt-recompute-helpers), unifying on one orchard node.
+voting-circuits = { version = "0.8.0", git = "https://github.com/valargroup/voting-circuits", branch = "adam/qrorchard-protocol-api" }
 nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"

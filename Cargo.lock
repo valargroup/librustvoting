@@ -916,26 +916,6 @@ dependencies = [
 
 [[package]]
 name = "halo2_gadgets"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45824ce0dd12e91ec0c68ebae2a7ed8ae19b70946624c849add59f1d1a62a143"
-dependencies = [
- "arrayvec",
- "bitvec",
- "ff",
- "group",
- "halo2_poseidon",
- "halo2_proofs",
- "lazy_static",
- "pasta_curves",
- "rand",
- "sinsemilla",
- "subtle",
- "uint",
-]
-
-[[package]]
-name = "halo2_gadgets"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb2a697cad929f706b7987fe804ad57d43622cd37463ba7e4d662a926fdcfea3"
@@ -1185,13 +1165,13 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "imt-tree"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c378a3c5c44b985233906c966bd82a4f775a83aa4e1bde1635961c2eb8673d7b"
+checksum = "1d0a4887bb71d68b3d0c5db9d42bb76df38b0dff4d261b863dada6383b6c2012"
 dependencies = [
  "anyhow",
  "ff",
- "halo2_gadgets 0.4.0",
+ "halo2_gadgets",
  "hex",
  "pasta_curves",
  "rayon",
@@ -1507,7 +1487,7 @@ dependencies = [
  "fpe",
  "getset",
  "group",
- "halo2_gadgets 0.5.0",
+ "halo2_gadgets",
  "halo2_poseidon",
  "halo2_proofs",
  "hex",
@@ -1636,9 +1616,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pir-client"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f18409a3bbbc58985c0ba79ec464c65e6ebab19cc1a82c5d4e184c3484520100"
+checksum = "edef04868dc19983199d26c205129b86fd95e2856e3f7a7c096438e7debafb69"
 dependencies = [
  "anyhow",
  "ff",
@@ -1647,7 +1627,7 @@ dependencies = [
  "imt-tree",
  "log",
  "pasta_curves",
- "pir-types",
+ "pir-types 0.2.0",
  "serde_json",
  "tokio",
  "valar-ypir",
@@ -1658,6 +1638,15 @@ name = "pir-types"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fd3d6025cac852a7b3b81d6d07d6e21cc03bb3d5873fc13144a74c56f325b9d"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "pir-types"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27fca477d53f99bc04e449bb984231bb383c41ddc24a0304ecea48563c17e25b"
 dependencies = [
  "anyhow",
  "ff",
@@ -2765,7 +2754,7 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "ff",
- "halo2_gadgets 0.4.0",
+ "halo2_gadgets",
  "imt-tree",
  "incrementalmerkletree",
  "lazy_static",
@@ -2801,13 +2790,12 @@ dependencies = [
 [[package]]
 name = "voting-circuits"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37d8bd9964ce4aef9152a66ad8950af529de4bbbd875bfd9e5d95534abc50df9"
+source = "git+https://github.com/valargroup/voting-circuits?branch=adam%2Fqrorchard-protocol-api#8ed4466b58de810abff3d73a4f563a8f4add3b78"
 dependencies = [
  "blake2b_simd",
  "ff",
  "group",
- "halo2_gadgets 0.5.0",
+ "halo2_gadgets",
  "halo2_poseidon",
  "halo2_proofs",
  "incrementalmerkletree",
@@ -3412,7 +3400,7 @@ dependencies = [
  "bytes",
  "ff",
  "group",
- "halo2_gadgets 0.4.0",
+ "halo2_gadgets",
  "halo2_proofs",
  "hex",
  "http",
@@ -3427,7 +3415,7 @@ dependencies = [
  "pasta_curves",
  "pczt",
  "pir-client",
- "pir-types",
+ "pir-types 0.1.0",
  "prost",
  "rand",
  "rusqlite",

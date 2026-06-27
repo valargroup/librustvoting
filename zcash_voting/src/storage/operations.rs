@@ -1697,7 +1697,7 @@ mod tests {
         // Use SpendAuthG as a valid Pallas point for ea_pk in tests.
         use group::GroupEncoding;
         let ea_pk =
-            pasta_curves::pallas::Point::from(voting_circuits::vote_proof::spend_auth_g_affine());
+            pasta_curves::pallas::Point::from(voting_circuits::spend_auth_g_affine());
         VotingRoundParams {
             vote_round_id: ROUND_ID.to_string(),
             snapshot_height: 1000,
@@ -1964,11 +1964,12 @@ mod tests {
         let address = fvk.address_at(0u32, Scope::External);
 
         let mut rng = OsRng;
-        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, orchard::note::NoteVersion::V2);
         let note = orchard::Note::new(
             address,
             NoteValue::from_raw(13_000_000),
             Rho::from_nf_old(parent_note.nullifier(&fvk)),
+            orchard::note::NoteVersion::V2,
             &mut rng,
         );
         let note_info =
@@ -2117,11 +2118,12 @@ mod tests {
         let mut rng = OsRng;
         let mut notes = Vec::new();
         for position in 0..BUNDLE_NOTE_SLOTS {
-            let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+            let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, orchard::note::NoteVersion::V2);
             let note = orchard::Note::new(
                 address,
                 NoteValue::from_raw(13_000_000),
                 Rho::from_nf_old(parent_note.nullifier(&fvk)),
+                orchard::note::NoteVersion::V2,
                 &mut rng,
             );
             notes.push(
@@ -3055,11 +3057,12 @@ mod tests {
         let fvk = ufvk.orchard().unwrap().clone();
         let address = fvk.address_at(0u32, Scope::External);
         let mut rng = OsRng;
-        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None);
+        let (_, _, parent_note) = orchard::Note::dummy(&mut rng, None, orchard::note::NoteVersion::V2);
         let note = orchard::Note::new(
             address,
             NoteValue::from_raw(13_000_000),
             Rho::from_nf_old(parent_note.nullifier(&fvk)),
+            orchard::note::NoteVersion::V2,
             &mut rng,
         );
         let note_info =

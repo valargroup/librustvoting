@@ -197,8 +197,15 @@ fn reconstruct_note(
     )?;
 
     let note_value = NoteValue::from_raw(full_note.value);
+    // Voting notes are pre-Ironwood Orchard notes (V2 plaintext format).
     let note = ct_option_to_result(
-        orchard::Note::from_parts(address, note_value, rho, rseed),
+        orchard::Note::from_parts(
+            address,
+            note_value,
+            rho,
+            rseed,
+            orchard::note::NoteVersion::V2,
+        ),
         "failed to reconstruct note from parts",
     )?;
 
@@ -645,11 +652,12 @@ mod tests {
         let address = fvk.address_at(0u32, Scope::External);
 
         let mut rng = OsRng;
-        let (_, _, dummy_parent) = orchard::Note::dummy(&mut rng, None);
+        let (_, _, dummy_parent) = orchard::Note::dummy(&mut rng, None, orchard::note::NoteVersion::V2);
         let note = orchard::Note::new(
             address,
             NoteValue::from_raw(1),
             Rho::from_nf_old(dummy_parent.nullifier(&fvk)),
+            orchard::note::NoteVersion::V2,
             &mut rng,
         );
         let cmx: ExtractedNoteCommitment = note.commitment().into();
@@ -721,11 +729,12 @@ mod tests {
 
         let mut notes = Vec::new();
         for &v in &note_values {
-            let (_, _, dummy_parent) = orchard::Note::dummy(&mut rng, None);
+            let (_, _, dummy_parent) = orchard::Note::dummy(&mut rng, None, orchard::note::NoteVersion::V2);
             let note = orchard::Note::new(
                 address,
                 NoteValue::from_raw(v),
                 Rho::from_nf_old(dummy_parent.nullifier(&fvk)),
+                orchard::note::NoteVersion::V2,
                 &mut rng,
             );
             notes.push(note);

@@ -591,6 +591,7 @@ mod tests {
             time: 0,
             sapling_tree: String::new(),
             orchard_tree: String::new(),
+            ironwood_tree: String::new(),
         }
     }
 
@@ -720,6 +721,7 @@ mod tests {
                     NoteValue::from_raw(value_zatoshi),
                     rho,
                     rseed,
+                    orchard::note::NoteVersion::V2,
                 )) {
                     return note;
                 }
