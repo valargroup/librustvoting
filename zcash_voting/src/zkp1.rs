@@ -876,8 +876,8 @@ mod tests {
                 address,
                 NoteValue::from_raw(v),
                 Rho::from_nf_old(dummy_parent.nullifier(&fvk)),
-                &mut rng,
                 NoteVersion::V2,
+                &mut rng,
             );
             notes.push(note);
         }

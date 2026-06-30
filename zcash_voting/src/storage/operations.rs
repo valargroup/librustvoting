@@ -1972,8 +1972,8 @@ mod tests {
             address,
             NoteValue::from_raw(13_000_000),
             Rho::from_nf_old(parent_note.nullifier(&fvk)),
-            &mut rng,
             NoteVersion::V3,
+            &mut rng,
         );
         let note_info =
             NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &Network::Regtest)
@@ -2059,8 +2059,8 @@ mod tests {
                 address,
                 NoteValue::from_raw(13_000_000),
                 Rho::from_nf_old(parent_note.nullifier(&fvk)),
-                &mut rng,
                 NoteVersion::V2,
+                &mut rng,
             );
             notes.push(
                 NoteInfo::from_orchard_note(
@@ -3276,8 +3276,8 @@ mod tests {
             address,
             NoteValue::from_raw(13_000_000),
             Rho::from_nf_old(parent_note.nullifier(&fvk)),
-            &mut rng,
             NoteVersion::V3,
+            &mut rng,
         );
         let note_info =
             NoteInfo::from_orchard_note(&note, 7, Scope::External, &ufvk, &Network::Regtest)

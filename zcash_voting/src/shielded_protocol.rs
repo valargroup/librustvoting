@@ -1,5 +1,5 @@
+use orchard::bundle::BundleVersion;
 use orchard::note::NoteVersion;
-use orchard::BundleProtocol;
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 
 use crate::types::VotingError;
@@ -30,10 +30,10 @@ impl VotingShieldedProtocol {
         Self::for_branch_id(BranchId::for_height(params, height))
     }
 
-    pub(crate) fn bundle_protocol(self) -> BundleProtocol {
+    pub(crate) fn bundle_version(self) -> BundleVersion {
         #[cfg(zcash_unstable = "nu6.3")]
         match self {
-            Self::Ironwood => BundleProtocol::IronwoodPostNu6_3,
+            Self::Ironwood => BundleVersion::ironwood_v3(),
         }
 
         #[cfg(not(zcash_unstable = "nu6.3"))]

@@ -11,7 +11,8 @@ use orchard::note::{NoteVersion, RandomSeed, Rho};
 use orchard::pczt::Zip32Derivation;
 use orchard::tree::{MerkleHashOrchard, MerklePath};
 use orchard::value::NoteValue;
-use orchard::{Address, Anchor, BundleProtocol};
+use orchard::bundle::BundleVersion;
+use orchard::{Address, Anchor};
 use voting_circuits::delegation::synthetic_padding_note_parts;
 use zcash_primitives::transaction::builder::PcztParts;
 use zcash_primitives::transaction::TxVersion;
@@ -38,20 +39,21 @@ const ORCHARD_GD_PERSONALIZATION: &str = "z.cash:Orchard-gd";
 #[cfg(zcash_unstable = "nu6.3")]
 fn pczt_actions_for_protocol(
     pczt: &pczt::Pczt,
-    protocol: BundleProtocol,
+    bundle_version: BundleVersion,
 ) -> Result<&[pczt::orchard::Action], VotingError> {
-    match protocol {
-        BundleProtocol::IronwoodPostNu6_3 => Ok(pczt.ironwood().actions()),
-        _ => Err(VotingError::InvalidInput {
+    if bundle_version == BundleVersion::ironwood_v3() {
+        Ok(pczt.ironwood().actions())
+    } else {
+        Err(VotingError::InvalidInput {
             message: "zcash voting only supports Ironwood PCZT actions".to_string(),
-        }),
+        })
     }
 }
 
 #[cfg(not(zcash_unstable = "nu6.3"))]
 fn pczt_actions_for_protocol(
     _pczt: &pczt::Pczt,
-    _protocol: BundleProtocol,
+    _bundle_version: BundleVersion,
 ) -> Result<&[pczt::orchard::Action], VotingError> {
     Err(VotingError::InvalidInput {
         message: "Ironwood PCZT actions require a NU6.3 build".to_string(),
@@ -372,7 +374,7 @@ pub(crate) fn build_governance_pczt(
 
     let mut rng = rand::thread_rng();
     let shielded_protocol = VotingShieldedProtocol::for_branch_id(branch_id)?;
-    let bundle_protocol = shielded_protocol.bundle_protocol();
+    let bundle_version = shielded_protocol.bundle_version();
 
     // --- Compute governance nullifiers ---
     let dom = governance::compute_nullifier_domain(&vri_32)?;
@@ -534,7 +536,13 @@ pub(crate) fn build_governance_pczt(
     let consensus_network = consensus_network_for_voting_network(network);
 
     for _ in 0..MAX_PCZT_LAYOUT_ATTEMPTS {
-        let mut builder = Builder::new(bundle_protocol, BundleType::DEFAULT, anchor);
+        let mut builder = Builder::new(
+            BundleType::DEFAULT,
+            bundle_version,
+            bundle_version.default_flags(),
+            anchor,
+        )
+        .expect("default flags are representable under the bundle version");
 
         // Add the governance signed note as a spend.
         builder
@@ -679,7 +687,7 @@ pub(crate) fn build_governance_pczt(
         let parsed_pczt = pczt::Pczt::parse(&pczt_bytes).map_err(|e| VotingError::Internal {
             message: format!("Failed to parse returned PCZT: {:?}", e),
         })?;
-        let indexed_actions = pczt_actions_for_protocol(&parsed_pczt, bundle_protocol)?;
+        let indexed_actions = pczt_actions_for_protocol(&parsed_pczt, bundle_version)?;
         let indexed_action =
             indexed_actions
                 .get(action_index)

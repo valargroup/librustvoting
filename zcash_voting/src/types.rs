@@ -1036,8 +1036,8 @@ mod tests {
             address,
             NoteValue::from_raw(12_500_000),
             Rho::from_nf_old(parent_note.nullifier(&fvk)),
-            &mut rng,
             NoteVersion::V2,
+            &mut rng,
         );
 
         let note_info =
