@@ -683,7 +683,9 @@ pub(crate) fn build_governance_pczt(
                 message: format!("IoFinalizer::finalize_io failed: {:?}", e),
             })?;
 
-        let pczt_bytes = pczt.serialize();
+        let pczt_bytes = pczt.serialize().map_err(|e| VotingError::Internal {
+            message: format!("Failed to serialize PCZT: {:?}", e),
+        })?;
         let parsed_pczt = pczt::Pczt::parse(&pczt_bytes).map_err(|e| VotingError::Internal {
             message: format!("Failed to parse returned PCZT: {:?}", e),
         })?;
@@ -699,8 +701,8 @@ pub(crate) fn build_governance_pczt(
                         shielded_protocol.name()
                     ),
                 })?;
-        if *indexed_action.spend().nullifier() != nf_signed_bytes
-            || *indexed_action.output().cmx() != cmx_new_bytes
+        if *indexed_action.spend().nullifier() != Some(nf_signed_bytes)
+            || *indexed_action.output().cmx() != Some(cmx_new_bytes)
         {
             return Err(VotingError::Internal {
                 message: "GovernancePczt action_index does not point to paired governance action"

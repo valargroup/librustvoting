@@ -994,7 +994,9 @@ fn redact_delegation_pczt_for_signer(pczt_bytes: &[u8]) -> Result<Vec<u8>, Votin
         })
         .finish();
 
-    Ok(redacted.serialize())
+    redacted.serialize().map_err(|e| VotingError::Internal {
+        message: format!("Failed to serialize redacted PCZT: {:?}", e),
+    })
 }
 
 fn redact_orchard_like_bundle_for_signer(

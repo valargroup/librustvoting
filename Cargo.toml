@@ -8,14 +8,24 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-# orchard, voting-circuits, and librustzcash all resolve to the published orchard
-# 0.15.0-pre.1 (crates.io), keeping a single orchard node in the dependency graph.
-orchard = { version = "0.15.0-pre.1", features = ["unstable-voting-circuits"] }
+# Pinned to the pczt-elidable-fields (librustzcash PR 2540) stack. orchard,
+# voting-circuits, and librustzcash all resolve to orchard 0.15.0-pre.2 (the
+# consumer's `[patch.crates-io]` redirects it to the pczt-recompute head),
+# keeping a single orchard node in the dependency graph. The librustzcash crates
+# are the `adam/pczt-elidable-fields-ironwood-wallet` integration branch.
+orchard = { version = "0.15.0-pre.2", features = ["unstable-voting-circuits"] }
 voting-circuits = { version = "=0.8.0", git = "https://github.com/valargroup/voting-circuits", rev = "f160effd7a83fb75e76c17aa8f1a9fa3f31e0423" }
 
-pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "d3bb98afb57cf676f27da5bd21ae5e1f4bd03d07", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "d3bb98afb57cf676f27da5bd21ae5e1f4bd03d07", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "d3bb98afb57cf676f27da5bd21ae5e1f4bd03d07", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "d3bb98afb57cf676f27da5bd21ae5e1f4bd03d07", features = ["orchard"] }
-zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "d3bb98afb57cf676f27da5bd21ae5e1f4bd03d07" }
-zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "d3bb98afb57cf676f27da5bd21ae5e1f4bd03d07" }
+pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "9e0af8fd6b2a2dadd6baa62bc1c582798bfe0660", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "9e0af8fd6b2a2dadd6baa62bc1c582798bfe0660", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "9e0af8fd6b2a2dadd6baa62bc1c582798bfe0660", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "9e0af8fd6b2a2dadd6baa62bc1c582798bfe0660", features = ["orchard"] }
+zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "9e0af8fd6b2a2dadd6baa62bc1c582798bfe0660" }
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "9e0af8fd6b2a2dadd6baa62bc1c582798bfe0660" }
+
+# The published orchard 0.15.0-pre.2 predates the pczt-recompute work the
+# librustzcash pins above build against; redirect every crates.io `orchard`
+# requirement onto the pczt-recompute head (0aa06368 = zcash/orchard#523),
+# mirroring librustzcash's own `[patch.crates-io]`.
+[patch.crates-io]
+orchard = { git = "https://github.com/zcash/orchard", rev = "0aa06368f2c0d7fab01d2c26d32a1f2df283dccf" }
