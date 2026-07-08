@@ -2058,7 +2058,7 @@ mod tests {
             .expect("build Keystone request");
         let full_pczt = pczt::Pczt::parse(&request.pczt_bytes).expect("parse full PCZT");
         let seeded_pczt = pczt_with_ironwood_output_info(&full_pczt);
-        let seeded_pczt_bytes = seeded_pczt.serialize();
+        let seeded_pczt_bytes = seeded_pczt.serialize().expect("serialize seeded PCZT");
         let redacted_pczt_bytes = redact_delegation_pczt_for_signer(&seeded_pczt_bytes)
             .expect("redact seeded Ironwood PCZT");
         let redacted_pczt = pczt::Pczt::parse(&redacted_pczt_bytes).expect("parse redacted PCZT");

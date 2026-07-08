@@ -1040,10 +1040,23 @@ mod tests {
                 .expect("action_index should point to an Ironwood action");
 
             assert_eq!(
-                indexed_action.spend().nullifier().to_vec(),
+                indexed_action
+                    .spend()
+                    .nullifier()
+                    .as_ref()
+                    .expect("builder-produced PCZT carries the nullifier")
+                    .to_vec(),
                 result.nf_signed
             );
-            assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
+            assert_eq!(
+                indexed_action
+                    .output()
+                    .cmx()
+                    .as_ref()
+                    .expect("builder-produced PCZT carries cmx")
+                    .to_vec(),
+                result.cmx_new
+            );
         }
     }
 
@@ -1090,10 +1103,23 @@ mod tests {
             .expect("action_index should point to an Ironwood action");
 
         assert_eq!(
-            indexed_action.spend().nullifier().to_vec(),
+            indexed_action
+                .spend()
+                .nullifier()
+                .as_ref()
+                .expect("builder-produced PCZT carries the nullifier")
+                .to_vec(),
             result.nf_signed
         );
-        assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
+        assert_eq!(
+            indexed_action
+                .output()
+                .cmx()
+                .as_ref()
+                .expect("builder-produced PCZT carries cmx")
+                .to_vec(),
+            result.cmx_new
+        );
     }
 
     #[test]
