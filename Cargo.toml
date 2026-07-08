@@ -16,12 +16,12 @@ resolver = "2"
 orchard = { version = "0.15.0-pre.2", features = ["unstable-voting-circuits"] }
 voting-circuits = { version = "=0.8.0", git = "https://github.com/valargroup/voting-circuits", rev = "f160effd7a83fb75e76c17aa8f1a9fa3f31e0423" }
 
-pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "e2d7d4e048ad3486c1fdaab072c21096427c9f57", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "e2d7d4e048ad3486c1fdaab072c21096427c9f57", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "e2d7d4e048ad3486c1fdaab072c21096427c9f57", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "e2d7d4e048ad3486c1fdaab072c21096427c9f57", features = ["orchard"] }
-zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "e2d7d4e048ad3486c1fdaab072c21096427c9f57" }
-zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "e2d7d4e048ad3486c1fdaab072c21096427c9f57" }
+pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", rev = "dd86f0545e801348969b306a52307a252810433d", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "dd86f0545e801348969b306a52307a252810433d", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "dd86f0545e801348969b306a52307a252810433d", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "dd86f0545e801348969b306a52307a252810433d", features = ["orchard"] }
+zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "dd86f0545e801348969b306a52307a252810433d" }
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "dd86f0545e801348969b306a52307a252810433d" }
 
 # The published orchard 0.15.0-pre.2 predates the pczt-recompute work the
 # librustzcash pins above build against; redirect every crates.io `orchard`
@@ -29,4 +29,4 @@ zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librust
 # ciphertext fix,
 # mirroring librustzcash's own `[patch.crates-io]`.
 [patch.crates-io]
-orchard = { git = "https://github.com/zcash/orchard", rev = "7e8aa3d2dd174b6db2f0997190eab87d330d2314" }
+orchard = { git = "https://github.com/zcash/orchard", rev = "9e45f5fbbedb12bd456b3340e35e535e03c8b6ee" }
