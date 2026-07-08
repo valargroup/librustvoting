@@ -310,11 +310,17 @@ impl<'a> Drop for KvIter<'a> {
 /// accesses is read from KV.
 pub struct KvShardStore {
     pub(crate) cb: KvCallbacks,
+    /// In-memory set of retained checkpoint ids; see the retention methods in
+    /// the [`ShardStore`] impl for why this is not persisted to KV.
+    retained: BTreeSet<u32>,
 }
 
 impl KvShardStore {
     pub fn new(cb: KvCallbacks) -> Self {
-        Self { cb }
+        Self {
+            cb,
+            retained: BTreeSet::new(),
+        }
     }
 }
 
@@ -554,6 +560,25 @@ impl ShardStore for KvShardStore {
     fn remove_checkpoint(&mut self, checkpoint_id: &u32) -> Result<(), KvError> {
         let key = checkpoint_key(*checkpoint_id);
         self.cb.delete(&key)
+    }
+
+    // Checkpoint retention is kept in memory only (MemoryShardStore
+    // semantics): nothing in this workspace marks retained checkpoints, so
+    // the set stays empty and pruning behavior is unchanged. If retention is
+    // ever used here, it must move into the KV schema (keys.go) so that it
+    // survives restarts.
+    fn add_retained_checkpoint(&mut self, checkpoint_id: u32) -> Result<(), KvError> {
+        self.retained.insert(checkpoint_id);
+        Ok(())
+    }
+
+    fn remove_retained_checkpoint(&mut self, checkpoint_id: &u32) -> Result<(), KvError> {
+        self.retained.remove(checkpoint_id);
+        Ok(())
+    }
+
+    fn retained_checkpoints(&self) -> Result<BTreeSet<u32>, KvError> {
+        Ok(self.retained.clone())
     }
 
     fn truncate_checkpoints_retaining(&mut self, checkpoint_id: &u32) -> Result<(), KvError> {

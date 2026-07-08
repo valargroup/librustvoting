@@ -6,12 +6,12 @@ use rand::RngCore;
 use subtle::CtOption;
 
 use orchard::builder::{Builder, BundleType};
+use orchard::bundle::BundleVersion;
 use orchard::keys::FullViewingKey;
 use orchard::note::{NoteVersion, RandomSeed, Rho};
 use orchard::pczt::Zip32Derivation;
 use orchard::tree::{MerkleHashOrchard, MerklePath};
 use orchard::value::NoteValue;
-use orchard::bundle::BundleVersion;
 use orchard::{Address, Anchor};
 use voting_circuits::delegation::synthetic_padding_note_parts;
 use zcash_primitives::transaction::builder::PcztParts;
@@ -701,8 +701,10 @@ pub(crate) fn build_governance_pczt(
                         shielded_protocol.name()
                     ),
                 })?;
-        if *indexed_action.spend().nullifier() != Some(nf_signed_bytes)
-            || *indexed_action.output().cmx() != Some(cmx_new_bytes)
+        // The 2557 teststack keeps `nullifier` and `cmx` as required PCZT
+        // fields (the fork's elidable-field optionality is retired).
+        if *indexed_action.spend().nullifier() != nf_signed_bytes
+            || *indexed_action.output().cmx() != cmx_new_bytes
         {
             return Err(VotingError::Internal {
                 message: "GovernancePczt action_index does not point to paired governance action"

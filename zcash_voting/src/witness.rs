@@ -39,6 +39,33 @@ where
     Ok(witnesses)
 }
 
+/// Deserializes the Ironwood note commitment tree field of a lightwalletd
+/// `TreeState`, treating an empty field as the empty tree.
+///
+/// The 2557 teststack's `TreeState` exposes `ironwood_tree` as a raw hex field
+/// without a parser helper; this mirrors upstream's `TreeState::orchard_tree`.
+#[cfg(zcash_unstable = "nu6.3")]
+fn parse_ironwood_tree(
+    tree_state: &TreeState,
+) -> std::io::Result<CommitmentTree<MerkleHashOrchard, { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 }>>
+{
+    if tree_state.ironwood_tree.is_empty() {
+        Ok(CommitmentTree::empty())
+    } else {
+        let ironwood_tree_bytes = hex::decode(&tree_state.ironwood_tree).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Hex decoding of Ironwood tree bytes failed: {e:?}"),
+            )
+        })?;
+        zcash_primitives::merkle_tree::read_commitment_tree::<
+            MerkleHashOrchard,
+            _,
+            { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 },
+        >(&ironwood_tree_bytes[..])
+    }
+}
+
 /// Generate shielded Merkle witnesses for the bundle notes at the round snapshot.
 ///
 /// The cached lightwalletd `TreeState` is validated against the stored voting
@@ -88,7 +115,7 @@ where
         #[cfg(zcash_unstable = "nu6.3")]
         {
             match voting_protocol {
-                VotingShieldedProtocol::Ironwood => tree_state.ironwood_tree(),
+                VotingShieldedProtocol::Ironwood => parse_ironwood_tree(&tree_state),
             }
             .map_err(|e| VotingError::Internal {
                 message: format!(
@@ -133,8 +160,13 @@ where
         #[cfg(zcash_unstable = "nu6.3")]
         {
             match voting_protocol {
+                // The 2557 teststack retires the fork's wallet-side Ironwood
+                // tables, so the Orchard shard data is the only historical
+                // witness source; the call fails cleanly
+                // (`HistoricalFrontierInvalid`) if the Ironwood frontier is
+                // inconsistent with it.
                 VotingShieldedProtocol::Ironwood => {
-                    WalletDb::generate_ironwood_witnesses_at_historical_height(
+                    WalletDb::generate_orchard_witnesses_at_historical_height(
                         wallet_db,
                         &positions,
                         nonempty_frontier,
@@ -142,7 +174,7 @@ where
                     )
                     .map_err(|e| VotingError::Internal {
                         message: format!(
-                            "generate_ironwood_witnesses_at_historical_height failed: {e}"
+                            "generate_orchard_witnesses_at_historical_height failed: {e}"
                         ),
                     })?
                 }
