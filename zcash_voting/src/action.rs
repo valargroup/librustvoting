@@ -650,6 +650,8 @@ pub(crate) fn build_governance_pczt(
 
         #[cfg(zcash_unstable = "nu6.3")]
         let ironwood_bundle = Some(pczt_bundle);
+        #[cfg(not(zcash_unstable = "nu6.3"))]
+        let ironwood_bundle = None;
         #[cfg(zcash_unstable = "nu6.3")]
         let orchard_bundle = None;
         #[cfg(not(zcash_unstable = "nu6.3"))]
@@ -666,7 +668,6 @@ pub(crate) fn build_governance_pczt(
             transparent: None,
             sapling: None,
             orchard: orchard_bundle,
-            #[cfg(zcash_unstable = "nu6.3")]
             ironwood: ironwood_bundle,
         };
         let pczt = pczt::roles::creator::Creator::build_from_parts(parts).ok_or_else(|| {
@@ -701,8 +702,8 @@ pub(crate) fn build_governance_pczt(
                         shielded_protocol.name()
                     ),
                 })?;
-        // The 2557 teststack keeps `nullifier` and `cmx` as required PCZT
-        // fields (the fork's elidable-field optionality is retired).
+        // Upstream keeps `nullifier` and `cmx` required on the parsed action
+        // (the fork's elidable-field optionality is retired).
         if *indexed_action.spend().nullifier() != nf_signed_bytes
             || *indexed_action.output().cmx() != cmx_new_bytes
         {
@@ -1042,23 +1043,10 @@ mod tests {
                 .expect("action_index should point to an Ironwood action");
 
             assert_eq!(
-                indexed_action
-                    .spend()
-                    .nullifier()
-                    .as_ref()
-                    .expect("builder-produced PCZT carries the nullifier")
-                    .to_vec(),
+                indexed_action.spend().nullifier().to_vec(),
                 result.nf_signed
             );
-            assert_eq!(
-                indexed_action
-                    .output()
-                    .cmx()
-                    .as_ref()
-                    .expect("builder-produced PCZT carries cmx")
-                    .to_vec(),
-                result.cmx_new
-            );
+            assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
         }
     }
 
@@ -1105,23 +1093,10 @@ mod tests {
             .expect("action_index should point to an Ironwood action");
 
         assert_eq!(
-            indexed_action
-                .spend()
-                .nullifier()
-                .as_ref()
-                .expect("builder-produced PCZT carries the nullifier")
-                .to_vec(),
+            indexed_action.spend().nullifier().to_vec(),
             result.nf_signed
         );
-        assert_eq!(
-            indexed_action
-                .output()
-                .cmx()
-                .as_ref()
-                .expect("builder-produced PCZT carries cmx")
-                .to_vec(),
-            result.cmx_new
-        );
+        assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
     }
 
     #[test]
