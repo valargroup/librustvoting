@@ -82,6 +82,8 @@ impl Parameters for Network {
                 NetworkUpgrade::Nu6_3 => {
                     Some(BlockHeight::from_u32(REGTEST_NU6_3_ACTIVATION_HEIGHT))
                 }
+                #[cfg(not(zcash_unstable = "nu6.3"))]
+                NetworkUpgrade::Nu6_3 => None,
             },
         }
     }

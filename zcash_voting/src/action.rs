@@ -6,12 +6,12 @@ use rand::RngCore;
 use subtle::CtOption;
 
 use orchard::builder::{Builder, BundleType};
+use orchard::bundle::BundleVersion;
 use orchard::keys::FullViewingKey;
 use orchard::note::{NoteVersion, RandomSeed, Rho};
 use orchard::pczt::Zip32Derivation;
 use orchard::tree::{MerkleHashOrchard, MerklePath};
 use orchard::value::NoteValue;
-use orchard::bundle::BundleVersion;
 use orchard::{Address, Anchor};
 use voting_circuits::delegation::synthetic_padding_note_parts;
 use zcash_primitives::transaction::builder::PcztParts;
@@ -650,6 +650,8 @@ pub(crate) fn build_governance_pczt(
 
         #[cfg(zcash_unstable = "nu6.3")]
         let ironwood_bundle = Some(pczt_bundle);
+        #[cfg(not(zcash_unstable = "nu6.3"))]
+        let ironwood_bundle = None;
         #[cfg(zcash_unstable = "nu6.3")]
         let orchard_bundle = None;
         #[cfg(not(zcash_unstable = "nu6.3"))]
@@ -666,7 +668,6 @@ pub(crate) fn build_governance_pczt(
             transparent: None,
             sapling: None,
             orchard: orchard_bundle,
-            #[cfg(zcash_unstable = "nu6.3")]
             ironwood: ironwood_bundle,
         };
         let pczt = pczt::roles::creator::Creator::build_from_parts(parts).ok_or_else(|| {
@@ -683,7 +684,9 @@ pub(crate) fn build_governance_pczt(
                 message: format!("IoFinalizer::finalize_io failed: {:?}", e),
             })?;
 
-        let pczt_bytes = pczt.serialize();
+        let pczt_bytes = pczt.serialize().map_err(|e| VotingError::Internal {
+            message: format!("PCZT serialization failed: {:?}", e),
+        })?;
         let parsed_pczt = pczt::Pczt::parse(&pczt_bytes).map_err(|e| VotingError::Internal {
             message: format!("Failed to parse returned PCZT: {:?}", e),
         })?;

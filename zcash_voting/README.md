@@ -190,14 +190,14 @@ workspace-level git `rev` pins. The root `Cargo.toml` is the source of truth for
 the current dependency repositories, revs, and feature flags; `Cargo.lock`
 records the resolved commits used by this branch.
 
-- **`orchard 0.14`** from [valargroup/qr_orchard](https://github.com/valargroup/qr_orchard),
+- **`orchard 0.15.0-pre.2`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths.
 - **`voting-circuits 0.8`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
 - **`vote-commitment-tree 0.3`** and **`vote-commitment-tree-client 0.5`** for
   vote commitment tree state and optional HTTP sync.
 - **`pczt`, `zcash_keys`, `zcash_client_backend`, `zcash_client_sqlite`,
-  `zcash_primitives`, and `zcash_protocol`** from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
+  `zcash_primitives`, and `zcash_protocol`** from [zcash/librustzcash](https://github.com/zcash/librustzcash)
   for the Zcash protocol, wallet, PCZT, and storage dependencies.
 
 ## Migrating from 0.10

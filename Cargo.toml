@@ -8,23 +8,26 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-# orchard, voting-circuits, and librustzcash all resolve to the published
-# orchard 0.15.0-pre.1 (crates.io), keeping a single orchard node in the
-# dependency graph.
-orchard = { version = "=0.15.0-pre.1", features = ["unstable-voting-circuits"] }
+# orchard, voting-circuits, and librustzcash all resolve to the same Orchard
+# node, keeping the dependency graph type-compatible across PCZT construction
+# and vote proofs.
+orchard = { version = "0.15.0-pre.2", features = ["unstable-voting-circuits"] }
 voting-circuits = { version = "=0.8.0", git = "https://github.com/valargroup/voting-circuits", rev = "f160effd7a83fb75e76c17aa8f1a9fa3f31e0423" }
 
 pczt = { version = "0.7", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
 zcash_client_backend = { version = "0.23", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
 zcash_client_sqlite = { version = "0.21", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.14", features = ["orchard"] }
-zcash_primitives = { version = "0.28" }
-zcash_protocol = { version = "0.9" }
+zcash_keys = { version = "0.15.0-pre.0", features = ["orchard"] }
+zcash_primitives = { version = "0.29.0-pre.0" }
+zcash_protocol = { version = "0.10.0-pre.0" }
 
 [patch.crates-io]
-pczt = { git = "https://github.com/valargroup/librustzcash", rev = "79d18386461e6df08a1e132bb79f8d03aebe2438" }
-zcash_client_backend = { git = "https://github.com/valargroup/librustzcash", rev = "79d18386461e6df08a1e132bb79f8d03aebe2438" }
-zcash_client_sqlite = { git = "https://github.com/valargroup/librustzcash", rev = "79d18386461e6df08a1e132bb79f8d03aebe2438" }
-zcash_keys = { git = "https://github.com/valargroup/librustzcash", rev = "79d18386461e6df08a1e132bb79f8d03aebe2438" }
-zcash_primitives = { git = "https://github.com/valargroup/librustzcash", rev = "79d18386461e6df08a1e132bb79f8d03aebe2438" }
-zcash_protocol = { git = "https://github.com/valargroup/librustzcash", rev = "79d18386461e6df08a1e132bb79f8d03aebe2438" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "8acc3a572772ef89f63182de7f8353f405b87be4" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "8acc3a572772ef89f63182de7f8353f405b87be4" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "8acc3a572772ef89f63182de7f8353f405b87be4" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "8acc3a572772ef89f63182de7f8353f405b87be4" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "8acc3a572772ef89f63182de7f8353f405b87be4" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "8acc3a572772ef89f63182de7f8353f405b87be4" }
+orchard = { git = "https://github.com/zcash/orchard", rev = "475ef0ff77d45aebff93cb039d639250d82518a3" }
+shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
+incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
