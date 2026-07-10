@@ -702,10 +702,10 @@ pub(crate) fn build_governance_pczt(
                         shielded_protocol.name()
                     ),
                 })?;
-        // Upstream keeps `nullifier` and `cmx` required on the parsed action
-        // (the fork's elidable-field optionality is retired).
+        // IO finalization must populate the elidable `cmx` field before this
+        // action is returned for signing.
         if *indexed_action.spend().nullifier() != nf_signed_bytes
-            || *indexed_action.output().cmx() != cmx_new_bytes
+            || *indexed_action.output().cmx() != Some(cmx_new_bytes)
         {
             return Err(VotingError::Internal {
                 message: "GovernancePczt action_index does not point to paired governance action"
@@ -1046,7 +1046,14 @@ mod tests {
                 indexed_action.spend().nullifier().to_vec(),
                 result.nf_signed
             );
-            assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
+            assert_eq!(
+                indexed_action
+                    .output()
+                    .cmx()
+                    .expect("Ironwood output cmx should be set")
+                    .to_vec(),
+                result.cmx_new
+            );
         }
     }
 
@@ -1096,7 +1103,14 @@ mod tests {
             indexed_action.spend().nullifier().to_vec(),
             result.nf_signed
         );
-        assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
+        assert_eq!(
+            indexed_action
+                .output()
+                .cmx()
+                .expect("Ironwood output cmx should be set")
+                .to_vec(),
+            result.cmx_new
+        );
     }
 
     #[test]
