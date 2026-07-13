@@ -13,12 +13,12 @@ resolver = "2"
 orchard = { version = "0.15.0", features = ["unstable-voting-circuits"] }
 voting-circuits = { version = "=0.8.0", git = "https://github.com/valargroup/voting-circuits", rev = "f160effd7a83fb75e76c17aa8f1a9fa3f31e0423" }
 
-pczt = { version = "0.7", git = "https://github.com/zcash/librustzcash", rev = "878db2074ae8ac2682d3e6c61c00f7018b6adc0c", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_client_backend = { version = "0.23", git = "https://github.com/zcash/librustzcash", rev = "878db2074ae8ac2682d3e6c61c00f7018b6adc0c", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zcash_client_sqlite = { version = "0.21", git = "https://github.com/zcash/librustzcash", rev = "878db2074ae8ac2682d3e6c61c00f7018b6adc0c", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.15.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "878db2074ae8ac2682d3e6c61c00f7018b6adc0c", features = ["orchard"] }
-zcash_primitives = { version = "0.29.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "878db2074ae8ac2682d3e6c61c00f7018b6adc0c" }
-zcash_protocol = { version = "0.10.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "878db2074ae8ac2682d3e6c61c00f7018b6adc0c" }
+pczt = { version = "0.8.0-rc.1", git = "https://github.com/zcash/librustzcash", rev = "a277ecbff5c653522fdafb7cc822f5c1f3e7f3e5", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_client_backend = { version = "0.24.0-rc.1", git = "https://github.com/zcash/librustzcash", rev = "a277ecbff5c653522fdafb7cc822f5c1f3e7f3e5", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { version = "0.22.0-rc.1", git = "https://github.com/zcash/librustzcash", rev = "a277ecbff5c653522fdafb7cc822f5c1f3e7f3e5", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "0.15.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "a277ecbff5c653522fdafb7cc822f5c1f3e7f3e5", features = ["orchard"] }
+zcash_primitives = { version = "0.29.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "a277ecbff5c653522fdafb7cc822f5c1f3e7f3e5" }
+zcash_protocol = { version = "0.10.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "a277ecbff5c653522fdafb7cc822f5c1f3e7f3e5" }
 
 [patch.crates-io]
 # The pinned zcash_client_backend builds against the checkpoint-retention
