@@ -160,13 +160,8 @@ where
         #[cfg(zcash_unstable = "nu6.3")]
         {
             match voting_protocol {
-                // The 2557 teststack retires the fork's wallet-side Ironwood
-                // tables, so the Orchard shard data is the only historical
-                // witness source; the call fails cleanly
-                // (`HistoricalFrontierInvalid`) if the Ironwood frontier is
-                // inconsistent with it.
                 VotingShieldedProtocol::Ironwood => {
-                    WalletDb::generate_orchard_witnesses_at_historical_height(
+                    WalletDb::generate_ironwood_witnesses_at_historical_height(
                         wallet_db,
                         &positions,
                         nonempty_frontier,
@@ -174,7 +169,7 @@ where
                     )
                     .map_err(|e| VotingError::Internal {
                         message: format!(
-                            "generate_orchard_witnesses_at_historical_height failed: {e}"
+                            "generate_ironwood_witnesses_at_historical_height failed: {e}"
                         ),
                     })?
                 }
