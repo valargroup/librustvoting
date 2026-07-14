@@ -234,6 +234,19 @@ mod tests {
         );
         #[cfg(zcash_unstable = "nu6.3")]
         {
+            for (network, activation_height) in
+                [(Network::Mainnet, 3_428_143), (Network::Testnet, 4_134_000)]
+            {
+                assert_eq!(
+                    branch_id_for_height(network, activation_height - 1).unwrap(),
+                    u32::from(BranchId::Nu6_2)
+                );
+                assert_eq!(
+                    branch_id_for_height(network, activation_height).unwrap(),
+                    u32::from(BranchId::Nu6_3)
+                );
+            }
+
             let nu6_3_activation_height = u64::from(crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT);
             assert_eq!(
                 branch_id_for_height(Network::Regtest, nu6_3_activation_height - 1).unwrap(),

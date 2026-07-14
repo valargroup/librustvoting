@@ -703,7 +703,7 @@ pub(crate) fn build_governance_pczt(
                     ),
                 })?;
         if *indexed_action.spend().nullifier() != nf_signed_bytes
-            || *indexed_action.output().cmx() != cmx_new_bytes
+            || indexed_action.output().cmx().as_ref() != Some(&cmx_new_bytes)
         {
             return Err(VotingError::Internal {
                 message: "GovernancePczt action_index does not point to paired governance action"
@@ -1044,7 +1044,10 @@ mod tests {
                 indexed_action.spend().nullifier().to_vec(),
                 result.nf_signed
             );
-            assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
+            assert_eq!(
+                indexed_action.output().cmx().map(|cmx| cmx.to_vec()),
+                Some(result.cmx_new)
+            );
         }
     }
 
@@ -1094,7 +1097,10 @@ mod tests {
             indexed_action.spend().nullifier().to_vec(),
             result.nf_signed
         );
-        assert_eq!(indexed_action.output().cmx().to_vec(), result.cmx_new);
+        assert_eq!(
+            indexed_action.output().cmx().map(|cmx| cmx.to_vec()),
+            Some(result.cmx_new)
+        );
     }
 
     #[test]

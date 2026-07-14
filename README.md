@@ -111,27 +111,26 @@ Pre-launch wallet databases with older schema versions are reset when opened by
 this branch; callers that need to preserve test data should export it before
 upgrading the crate.
 
-The workspace depends on the private [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits) repo. The `.cargo/config.toml` enables `git-fetch-with-cli` so your local git credentials are used automatically.
+The workspace uses the published `voting-circuits 0.9.0-rc.1` release.
 
 ## Dependency Strategy
 
-This workspace temporarily pins the Ironwood dependency stack through the root
-manifest and member manifests:
+The root manifest selects one published upstream Ironwood dependency stack for
+every workspace member:
 
-- **orchard 0.14** — Resolved from [valargroup/qr_orchard](https://github.com/valargroup/qr_orchard)
-  rev `6f1a5eaddcf0e016101c0c62a477d48f31e7a83f`, with
-  `unstable-voting-circuits` enabled for governance
-  proof paths.
+- **`orchard 0.15.0`** from [zcash/orchard](https://github.com/zcash/orchard),
+  with `unstable-voting-circuits` enabled for the governance proof paths.
+- **`pczt 0.8.0-rc.1`, `zcash_client_backend 0.24.0-rc.1`, and
+  `zcash_client_sqlite 0.22.0-rc.1`**, plus the corresponding stable
+  `zcash_keys`, `zcash_primitives`, and `zcash_protocol` releases, for the
+  Ironwood wallet, PCZT, and storage APIs.
+- **`voting-circuits 0.9.0-rc.1`** from
+  [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
+  for the delegation and vote proof circuits.
 
-- **librustzcash crates** (`pczt`, `zcash_keys`, `zcash_client_sqlite`,
-  `zcash_client_backend`, `zcash_primitives`, and `zcash_protocol`) — Resolved
-  from [valargroup/librustzcash](https://github.com/valargroup/librustzcash)
-  rev `dc95dcef33a081b925db551eac8bf6533fff22ed` for the Ironwood / NU6.3 wallet,
-  PCZT, legacy v5 Orchard PCZT, and protocol APIs used by this branch.
-
-- **voting-circuits 0.8** — Resolved from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
-  rev `b9c746083577092865b013e08cc35a974328afcb` for the delegation and
-  vote proof circuits.
+`Cargo.toml` is the source of truth for version and feature requirements, and
+`Cargo.lock` records the exact package sources and versions used by this branch.
+The released Zcash wallet crates require Rust 1.88 or newer.
 
 ## FFI
 

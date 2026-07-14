@@ -2,6 +2,7 @@
 name = "zcash_voting"
 version = "1.0.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Client-side library for Zcash shielded voting: ZKP delegation and vote-commitment proofs (Halo 2), ElGamal encryption, governance PCZT construction, Merkle witness generation, and SQLite round-state persistence."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/valargroup/zcash_voting"
@@ -62,8 +63,8 @@ anyhow = "1"
 thiserror = "2"
 zeroize = "1"
 
-# Orchard and voting-circuits use workspace rev pins so every consumer gets the
-# same circuit-compatible pair. Orchard's `unstable-voting-circuits` feature is
+# Orchard and voting-circuits use workspace dependencies so every consumer gets
+# the same circuit-compatible pair. Orchard's `unstable-voting-circuits` feature is
 # required by integration tests in `zkp1.rs` (`Note::new`, `Note::dummy`,
 # `Rho::from_nf_old`).
 subtle = "2.6"

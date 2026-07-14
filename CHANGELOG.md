@@ -7,9 +7,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 # Unreleased
 
 ## Changed
-- Aligned the workspace's Zcash and Orchard dependency graph with the
-  Ironwood-capable Zcash crates so wallet integrations resolve one shielded/PCZT
-  stack.
+- Replaced the temporary Zcash and Orchard git patches with the published
+  Ironwood crate line, including `voting-circuits 0.9.0-rc.1`. Wallet
+  integrations now resolve one shielded/PCZT stack, vote tree storage APIs use
+  `shardtree 0.7`, and the published wallet crates require Rust 1.88 or newer.
 - Updated snapshot selection and governance PCZT construction to use only
   Ironwood/V3 notes. Pre-NU6.3 Orchard/V2 voting is no longer supported on this
   branch.
