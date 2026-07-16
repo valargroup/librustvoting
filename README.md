@@ -111,26 +111,25 @@ Pre-launch wallet databases with older schema versions are reset when opened by
 this branch; callers that need to preserve test data should export it before
 upgrading the crate.
 
-The workspace uses the published `voting-circuits 0.9.0-rc.1` release.
+The workspace uses the published `voting-circuits 0.9.0-rc.2` release.
 
 ## Dependency Strategy
 
-The root manifest selects one published upstream Ironwood dependency stack for
-every workspace member:
+The root manifest selects one upstream Ironwood dependency stack for every
+workspace member:
 
 - **`orchard 0.15.0`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths.
-- **`pczt 0.8.0-rc.1`, `zcash_client_backend 0.24.0-rc.1`, and
-  `zcash_client_sqlite 0.22.0-rc.1`**, plus the corresponding stable
-  `zcash_keys`, `zcash_primitives`, and `zcash_protocol` releases, for the
-  Ironwood wallet, PCZT, and storage APIs.
-- **`voting-circuits 0.9.0-rc.1`** from
+- **`pczt`, `zcash_client_backend`, `zcash_client_sqlite`, `zcash_keys`,
+  `zcash_primitives`, and `zcash_protocol`** from a pinned upstream
+  librustzcash revision containing Ironwood historical note selection.
+- **`voting-circuits 0.9.0-rc.2`** from
   [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.
-The released Zcash wallet crates require Rust 1.88 or newer.
+The Zcash wallet crates require Rust 1.88 or newer.
 
 ## FFI
 

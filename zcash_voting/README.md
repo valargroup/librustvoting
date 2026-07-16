@@ -185,22 +185,21 @@ The crate no longer accepts root wallet seed material for delegation signing.
 
 ## Dependency notes
 
-`zcash_voting` uses the published upstream Ironwood dependency stack selected
-by the workspace root. `Cargo.toml` is the source of truth for version and
+`zcash_voting` uses the upstream Ironwood dependency stack selected by the
+workspace root. `Cargo.toml` is the source of truth for version and
 feature requirements, and `Cargo.lock` records the exact package sources and
 versions used by this branch.
 This release line requires Rust 1.88 or newer.
 
 - **`orchard 0.15.0`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths.
-- **`voting-circuits 0.9.0-rc.1`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
+- **`voting-circuits 0.9.0-rc.2`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
 - **`vote-commitment-tree 0.3`** and **`vote-commitment-tree-client 0.5`** for
   vote commitment tree state and optional HTTP sync.
-- **`pczt 0.8.0-rc.1`, `zcash_client_backend 0.24.0-rc.1`, and
-  `zcash_client_sqlite 0.22.0-rc.1`**, plus the corresponding stable
-  `zcash_keys`, `zcash_primitives`, and `zcash_protocol` releases, for the
-  Zcash protocol, wallet, PCZT, and storage dependencies.
+- **`pczt`, `zcash_client_backend`, `zcash_client_sqlite`, `zcash_keys`,
+  `zcash_primitives`, and `zcash_protocol`** from the pinned librustzcash
+  revision for the Zcash protocol, wallet, PCZT, and storage dependencies.
 
 ## Migrating from 0.10
 

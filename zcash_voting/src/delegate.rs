@@ -1120,6 +1120,7 @@ mod tests {
     use orchard::{
         note::{NoteVersion, RandomSeed, Rho},
         value::NoteValue,
+        ValuePool,
     };
     use rusqlite::{params, Connection};
     use secrecy::{ExposeSecret, SecretVec};
@@ -1511,7 +1512,7 @@ mod tests {
         value_zatoshi: u64,
         commitment_tree_position: u64,
     ) {
-        insert_note_with_version(
+        insert_note(
             conn,
             account_ref,
             orchard_fvk,
@@ -1519,7 +1520,7 @@ mod tests {
             mined_height,
             value_zatoshi,
             commitment_tree_position,
-            NoteVersion::V2,
+            ValuePool::Orchard,
         );
     }
 
@@ -1533,7 +1534,7 @@ mod tests {
         value_zatoshi: u64,
         commitment_tree_position: u64,
     ) {
-        insert_note_with_version(
+        insert_note(
             conn,
             account_ref,
             orchard_fvk,
@@ -1541,11 +1542,11 @@ mod tests {
             mined_height,
             value_zatoshi,
             commitment_tree_position,
-            NoteVersion::V3,
+            ValuePool::Ironwood,
         );
     }
 
-    fn insert_note_with_version(
+    fn insert_note(
         conn: &Connection,
         account_ref: i64,
         orchard_fvk: &orchard::keys::FullViewingKey,
@@ -1553,18 +1554,24 @@ mod tests {
         mined_height: u32,
         value_zatoshi: u64,
         commitment_tree_position: u64,
-        note_version: NoteVersion,
+        pool: ValuePool,
     ) {
+        let (table_prefix, note_version) = match pool {
+            ValuePool::Orchard => ("orchard", NoteVersion::V2),
+            ValuePool::Ironwood => ("ironwood", NoteVersion::V3),
+        };
         let transaction_id = insert_transaction(conn, note_tag, mined_height);
         let note = test_note_with_version(orchard_fvk, note_tag, value_zatoshi, note_version);
         let nullifier = note.nullifier(orchard_fvk);
 
         conn.execute(
-            "INSERT INTO orchard_received_notes (
+            &format!(
+                "INSERT INTO {table_prefix}_received_notes (
                 transaction_id, action_index, account_id, diversifier, value, rho, rseed,
                 nf, is_change, commitment_tree_position, recipient_key_scope, note_version
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0, ?10)"
+            ),
             params![
                 transaction_id,
                 i64::from(note_tag),

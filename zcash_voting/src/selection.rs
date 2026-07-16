@@ -227,7 +227,7 @@ where
     let voting_protocol = VotingShieldedProtocol::for_height(db.params(), snapshot_block_height)?;
     let voting_note_version = voting_protocol.note_version();
     let selected = db
-        .get_unspent_orchard_notes_at_historical_height(account.id(), snapshot_block_height)
+        .get_unspent_ironwood_notes_at_historical_height(account.id(), snapshot_block_height)
         .map_err(|e| VotingError::Internal {
             message: format!(
                 "failed to select unspent shielded voting notes at snapshot height: {e}"
@@ -351,6 +351,7 @@ mod tests {
     use orchard::{
         note::{NoteVersion, RandomSeed, Rho},
         value::NoteValue,
+        ValuePool,
     };
     use rusqlite::{params, Connection};
     use secrecy::{ExposeSecret, SecretVec};
@@ -374,7 +375,7 @@ mod tests {
             insert_ironwood_note(&conn, account_ref, &orchard_fvk, 1, 8, divisor, 3);
         let spent_after_snapshot_tx = insert_transaction(&conn, 11, 15);
         conn.execute(
-            "INSERT INTO orchard_received_note_spends (orchard_received_note_id, transaction_id)
+            "INSERT INTO ironwood_received_note_spends (ironwood_received_note_id, transaction_id)
              VALUES (?1, ?2)",
             params![selected_before_snapshot, spent_after_snapshot_tx],
         )
@@ -388,7 +389,7 @@ mod tests {
             insert_ironwood_note(&conn, account_ref, &orchard_fvk, 5, 8, divisor * 3, 10);
         let spent_before_snapshot_tx = insert_transaction(&conn, 12, 9);
         conn.execute(
-            "INSERT INTO orchard_received_note_spends (orchard_received_note_id, transaction_id)
+            "INSERT INTO ironwood_received_note_spends (ironwood_received_note_id, transaction_id)
              VALUES (?1, ?2)",
             params![spent_before_snapshot, spent_before_snapshot_tx],
         )
@@ -686,7 +687,7 @@ mod tests {
         value_zatoshi: u64,
         commitment_tree_position: u64,
     ) -> i64 {
-        insert_note_with_version(
+        insert_note(
             conn,
             account_ref,
             orchard_fvk,
@@ -694,7 +695,7 @@ mod tests {
             mined_height,
             value_zatoshi,
             commitment_tree_position,
-            NoteVersion::V2,
+            ValuePool::Orchard,
         )
     }
 
@@ -708,7 +709,7 @@ mod tests {
         value_zatoshi: u64,
         commitment_tree_position: u64,
     ) -> i64 {
-        insert_note_with_version(
+        insert_note(
             conn,
             account_ref,
             orchard_fvk,
@@ -716,11 +717,11 @@ mod tests {
             mined_height,
             value_zatoshi,
             commitment_tree_position,
-            NoteVersion::V3,
+            ValuePool::Ironwood,
         )
     }
 
-    fn insert_note_with_version(
+    fn insert_note(
         conn: &Connection,
         account_ref: i64,
         orchard_fvk: &orchard::keys::FullViewingKey,
@@ -728,18 +729,24 @@ mod tests {
         mined_height: u32,
         value_zatoshi: u64,
         commitment_tree_position: u64,
-        note_version: NoteVersion,
+        pool: ValuePool,
     ) -> i64 {
+        let (table_prefix, note_version) = match pool {
+            ValuePool::Orchard => ("orchard", NoteVersion::V2),
+            ValuePool::Ironwood => ("ironwood", NoteVersion::V3),
+        };
         let transaction_id = insert_transaction(conn, note_tag, mined_height);
         let note = test_note_with_version(orchard_fvk, note_tag, value_zatoshi, note_version);
         let nullifier = note.nullifier(orchard_fvk);
 
         conn.execute(
-            "INSERT INTO orchard_received_notes (
+            &format!(
+                "INSERT INTO {table_prefix}_received_notes (
                 transaction_id, action_index, account_id, diversifier, value, rho, rseed,
                 nf, is_change, commitment_tree_position, recipient_key_scope, note_version
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 0, ?10)"
+            ),
             params![
                 transaction_id,
                 i64::from(note_tag),
