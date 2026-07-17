@@ -1774,9 +1774,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pir-client"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edef04868dc19983199d26c205129b86fd95e2856e3f7a7c096438e7debafb69"
+checksum = "d29df6d641712023d496e58151fe3e4e9513d0c7e91d09dc759bce48cd65fd48"
 dependencies = [
  "anyhow",
  "ff",
@@ -1793,9 +1793,9 @@ dependencies = [
 
 [[package]]
 name = "pir-types"
-version = "0.2.0"
+version = "0.3.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27fca477d53f99bc04e449bb984231bb383c41ddc24a0304ecea48563c17e25b"
+checksum = "0194b40ba1f9595e6b301de84d12511f60c472b53b0df106a015bc251afe715f"
 dependencies = [
  "anyhow",
  "ff",
