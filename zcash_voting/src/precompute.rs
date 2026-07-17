@@ -243,6 +243,7 @@ mod pir_tests {
                         )),
                         "/root" => Ok(transport_response(
                             serde_json::to_vec(&pir_types::RootInfo {
+                                zcash_network: pir_types::ZcashNetwork::Test,
                                 nullifier_pool: pir_types::NULLIFIER_POOL.to_owned(),
                                 dataset_version: pir_types::DATASET_VERSION,
                                 root29: hex::encode([0u8; 32]),
@@ -317,6 +318,7 @@ mod pir_tests {
         };
         let pir_client = pir_client::PirClientBlocking::with_transport(
             "https://pir.test",
+            crate::pir::pir_network(Network::Testnet).unwrap(),
             std::sync::Arc::new(StaticPirTransport),
         )
         .unwrap();

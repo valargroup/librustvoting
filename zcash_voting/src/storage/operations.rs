@@ -791,6 +791,16 @@ impl VotingDb {
             missing.len()
         );
         let missing_nullifiers: Vec<_> = missing.iter().map(|(_, nf)| *nf).collect();
+        let expected_pir_network = crate::pir::pir_network(stored_network)?;
+        if pir_client.network() != expected_pir_network {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "PIR client network {} does not match stored round network {:?}",
+                    pir_client.network(),
+                    stored_network
+                ),
+            });
+        }
         let expected_nf_imt_root = nullifier_imt_root_to_base(&params.nullifier_imt_root)?;
         let raw_fetched_proofs =
             pir_client
@@ -1698,7 +1708,23 @@ mod tests {
         (&sig).into()
     }
 
-    struct StaticPirTransport;
+    struct StaticPirTransport {
+        network: pir_types::ZcashNetwork,
+        post_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StaticPirTransport {
+        fn new(network: pir_types::ZcashNetwork) -> Self {
+            Self {
+                network,
+                post_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn post_count(&self) -> usize {
+            self.post_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
 
     impl pir_client::Transport for StaticPirTransport {
         fn get<'a>(&'a self, url: &'a str) -> pir_client::TransportFuture<'a> {
@@ -1729,6 +1755,7 @@ mod tests {
                     )),
                     "/root" => Ok(transport_response(
                         serde_json::to_vec(&pir_types::RootInfo {
+                            zcash_network: self.network,
                             nullifier_pool: pir_types::NULLIFIER_POOL.to_owned(),
                             dataset_version: pir_types::DATASET_VERSION,
                             root29: hex::encode([0u8; 32]),
@@ -1745,6 +1772,8 @@ mod tests {
         }
 
         fn post<'a>(&'a self, url: &'a str, _body: Vec<u8>) -> pir_client::TransportFuture<'a> {
+            self.post_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
                 Err(anyhow::anyhow!(
                     "unexpected POST {}; proofs should be cached",
@@ -2095,7 +2124,8 @@ mod tests {
 
         let pir_client = pir_client::PirClientBlocking::with_transport(
             "https://pir.test",
-            std::sync::Arc::new(StaticPirTransport),
+            crate::pir::pir_network(Network::Testnet).unwrap(),
+            std::sync::Arc::new(StaticPirTransport::new(pir_types::ZcashNetwork::Test)),
         )
         .unwrap();
 
@@ -2120,7 +2150,8 @@ mod tests {
 
         let pir_client = pir_client::PirClientBlocking::with_transport(
             "https://pir.test",
-            std::sync::Arc::new(StaticPirTransport),
+            crate::pir::pir_network(Network::Testnet).unwrap(),
+            std::sync::Arc::new(StaticPirTransport::new(pir_types::ZcashNetwork::Test)),
         )
         .unwrap();
 
@@ -2134,6 +2165,69 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_precompute_delegation_pir_rejects_pir_client_network_before_fetch() {
+        let notes = (0..BUNDLE_NOTE_SLOTS)
+            .map(|position| identity_note_with_position(position as u8))
+            .collect::<Vec<_>>();
+        let mut params = test_params();
+        params.nullifier_imt_root = vec![0; 32];
+        let db = test_db();
+        db.init_round(Network::Testnet, &params, None).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        db.ensure_padded_secrets(ROUND_ID, 0, &notes).unwrap();
+
+        let transport = std::sync::Arc::new(StaticPirTransport::new(pir_types::ZcashNetwork::Main));
+        let pir_client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            crate::pir::pir_network(Network::Mainnet).unwrap(),
+            transport.clone(),
+        )
+        .unwrap();
+
+        let err = db
+            .precompute_delegation_pir(ROUND_ID, 0, &notes, &pir_client, Network::Testnet)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("PIR client network main does not match stored round network Testnet"),
+            "{err}"
+        );
+        assert_eq!(transport.post_count(), 0);
+    }
+
+    #[test]
+    fn test_precompute_delegation_pir_matching_testnet_client_reaches_fetch() {
+        let notes = (0..BUNDLE_NOTE_SLOTS)
+            .map(|position| identity_note_with_position(position as u8))
+            .collect::<Vec<_>>();
+        let mut params = test_params();
+        params.nullifier_imt_root = vec![0; 32];
+        let db = test_db();
+        db.init_round(Network::Testnet, &params, None).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        db.ensure_padded_secrets(ROUND_ID, 0, &notes).unwrap();
+
+        let transport = std::sync::Arc::new(StaticPirTransport::new(pir_types::ZcashNetwork::Test));
+        let pir_client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            crate::pir::pir_network(Network::Testnet).unwrap(),
+            transport.clone(),
+        )
+        .unwrap();
+
+        let err = db
+            .precompute_delegation_pir(ROUND_ID, 0, &notes, &pir_client, Network::Testnet)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("PIR parallel fetch failed"),
+            "{err}"
+        );
+        assert!(transport.post_count() > 0);
     }
 
     #[test]
@@ -2587,7 +2681,8 @@ mod tests {
         let keys = test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, [0x42; 32], 0);
         let pir_client = pir_client::PirClientBlocking::with_transport(
             "https://pir.test",
-            std::sync::Arc::new(StaticPirTransport),
+            crate::pir::pir_network(Network::Testnet).unwrap(),
+            std::sync::Arc::new(StaticPirTransport::new(pir_types::ZcashNetwork::Test)),
         )
         .unwrap();
 
@@ -2634,7 +2729,8 @@ mod tests {
         let keys = test_delegation_keys(fvk.to_bytes().to_vec(), &voting_hotkey, [0x42; 32], 0);
         let pir_client = pir_client::PirClientBlocking::with_transport(
             "https://pir.test",
-            std::sync::Arc::new(StaticPirTransport),
+            crate::pir::pir_network(Network::Testnet).unwrap(),
+            std::sync::Arc::new(StaticPirTransport::new(pir_types::ZcashNetwork::Test)),
         )
         .unwrap();
 

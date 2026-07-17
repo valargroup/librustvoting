@@ -94,7 +94,7 @@ where
     C: std::borrow::Borrow<rusqlite::Connection>,
     P: Parameters,
 {
-    let pir_client = connect_pir(pir_server_url)?;
+    let pir_client = connect_pir(pir_server_url, prepared.network)?;
     prepared
         .precompute(voting_db, wallet_db, &pir_client)
         .context("precompute delegation bundle")
@@ -126,7 +126,7 @@ pub fn prove_and_submit_delegation_bundle(
         .context("load delegation signing request")?;
     let (sig, sighash) = example_sign_delegation_request(seed, signing_request)?;
 
-    let pir_client = connect_pir(pir_server_url)?;
+    let pir_client = connect_pir(pir_server_url, prepared.network)?;
     prepared
         .prove(voting_db, &pir_client, &progress)
         .context("prove delegation bundle")?;
@@ -183,7 +183,7 @@ pub fn prove_and_submit_keystone_delegation_bundle(
     // Generate the proof using warmed witnesses and PIR rows, without
     // rebuilding the PCZT that Keystone already signed.
     let progress = NoopProgressReporter;
-    let pir_client = connect_pir(pir_server_url)?;
+    let pir_client = connect_pir(pir_server_url, prepared.network)?;
     prepared
         .prove(voting_db, &pir_client, &progress)
         .context("prove delegation bundle")?;
@@ -235,7 +235,8 @@ fn example_sign_delegation_request(
     Ok(((&sig).into(), request.sighash))
 }
 
-fn connect_pir(pir_server_url: &str) -> Result<PirClientBlocking> {
-    PirClientBlocking::with_transport(pir_server_url, Arc::new(HyperTransport::new()))
+fn connect_pir(pir_server_url: &str, network: Network) -> Result<PirClientBlocking> {
+    let network = zcash_voting::pir_network(network).context("select PIR network")?;
+    PirClientBlocking::with_transport(pir_server_url, network, Arc::new(HyperTransport::new()))
         .context("connect to PIR server")
 }

@@ -44,6 +44,7 @@ pub mod zkp1;
 pub mod zkp2;
 
 pub use http_transport::HyperTransport;
+pub use pir::pir_network;
 pub use pir_client::{
     ImtProofData, PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
