@@ -23,9 +23,9 @@ zcash_primitives = { version = "0.29.0", git = "https://github.com/zcash/librust
 zcash_protocol = { version = "0.10.0", git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
 
 [patch.crates-io]
-# Temporary until the network-bound PIR release candidates are published.
-pir-client = { git = "https://github.com/valargroup/vote-nullifier-pir", rev = "89be4f02944fbeacf3bf6fa15a1c7d94643ad90d" }
-pir-types = { git = "https://github.com/valargroup/vote-nullifier-pir", rev = "89be4f02944fbeacf3bf6fa15a1c7d94643ad90d" }
+# Temporary until these PIR release candidates are published.
+pir-client = { git = "https://github.com/valargroup/vote-nullifier-pir", rev = "c8f70cb26a3c55e570fe9024cae3170e78f87bf8" }
+pir-types = { git = "https://github.com/valargroup/vote-nullifier-pir", rev = "c8f70cb26a3c55e570fe9024cae3170e78f87bf8" }
 
 [patch."https://github.com/valargroup/vote-nullifier-pir"]
 # Keep the temporary git PIR crates on the published imt-tree package.
