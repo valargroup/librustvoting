@@ -1775,7 +1775,8 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pir-client"
 version = "0.4.0-rc.2"
-source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=c8f70cb26a3c55e570fe9024cae3170e78f87bf8#c8f70cb26a3c55e570fe9024cae3170e78f87bf8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "666111370cf8a3fb2fa41a2442accc9d283226c1229828ff92c253dda1eb51e3"
 dependencies = [
  "anyhow",
  "ff",
@@ -1793,7 +1794,8 @@ dependencies = [
 [[package]]
 name = "pir-types"
 version = "0.3.0-rc.2"
-source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=c8f70cb26a3c55e570fe9024cae3170e78f87bf8#c8f70cb26a3c55e570fe9024cae3170e78f87bf8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87a9ba9677931ac73da6d7726af28357da8f2e3d635a3e186c92a7f41382fe3e"
 dependencies = [
  "anyhow",
  "ff",
