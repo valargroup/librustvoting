@@ -8,16 +8,25 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-# orchard, voting-circuits, and librustzcash all resolve to the same Orchard
-# release, keeping the dependency graph type-compatible across PCZT construction
-# and vote proofs.
-orchard = { version = "0.15", features = ["unstable-voting-circuits"] }
+# Every version below is an exact `=` requirement, not a caret range.
+#
+# orchard, voting-circuits, and librustzcash must all resolve to the same
+# Orchard release, or the dependency graph stops being type-compatible across
+# PCZT construction and vote proofs. A caret range lets a future publish break
+# that invariant during a routine `cargo update`, so the whole stack moves
+# together only via an explicit edit here.
+#
+# Two of these are prereleases, where caret ranges are especially surprising:
+# `^0.24.0-rc.3` also accepts `0.24.0-rc.4` and `0.24.0` final. Consumers of the
+# published crate get the requirement, not our Cargo.lock, so the requirement
+# itself has to be the pin.
+orchard = { version = "=0.15.4", features = ["unstable-voting-circuits"] }
 voting-circuits = "=0.9.0-rc.3"
 
 # These published librustzcash versions include the Ironwood historical selector.
-pczt = { version = "0.9.0", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zcash_client_backend = { version = "0.24.0-rc.3", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zcash_client_sqlite = { version = "0.22.0-rc.3", default-features = false, features = ["orchard"] }
-zcash_keys = { version = "0.16.0", features = ["orchard"] }
-zcash_primitives = { version = "0.30.0" }
-zcash_protocol = { version = "0.10.1" }
+pczt = { version = "=0.9.0", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zcash_client_backend = { version = "=0.24.0-rc.3", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { version = "=0.22.0-rc.3", default-features = false, features = ["orchard"] }
+zcash_keys = { version = "=0.16.0", features = ["orchard"] }
+zcash_primitives = { version = "=0.30.0" }
+zcash_protocol = { version = "=0.10.1" }

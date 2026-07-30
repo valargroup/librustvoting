@@ -116,19 +116,26 @@ The workspace uses the published `voting-circuits 0.9.0-rc.3` release.
 ## Dependency Strategy
 
 The root manifest selects one upstream Ironwood dependency stack for every
-workspace member:
+workspace member. Every crate below is published on crates.io — the workspace
+has no git dependencies and no `[patch.crates-io]` overrides, and CI enforces
+that (`.github/scripts/check_no_git_dependencies.py`).
 
-- **`orchard 0.15`** from [zcash/orchard](https://github.com/zcash/orchard),
+- **`orchard 0.15.4`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths.
-- **`pczt`, `zcash_client_backend`, `zcash_client_sqlite`, `zcash_keys`,
-  `zcash_primitives`, and `zcash_protocol`** from a pinned upstream
-  librustzcash revision containing Ironwood historical note selection.
+- **`pczt 0.9.0`, `zcash_client_backend 0.24.0-rc.3`,
+  `zcash_client_sqlite 0.22.0-rc.3`, `zcash_keys 0.16.0`,
+  `zcash_primitives 0.30.0`, and `zcash_protocol 0.10.1`** — the published
+  librustzcash line containing Ironwood historical note selection.
 - **`voting-circuits 0.9.0-rc.3`** from
   [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
 
-`Cargo.toml` is the source of truth for version and feature requirements, and
-`Cargo.lock` records the exact package sources and versions used by this branch.
+Each is an exact `=` version requirement in `[workspace.dependencies]`, not a
+caret range. orchard, voting-circuits, and librustzcash must resolve to the same
+Orchard release to stay type-compatible across PCZT construction and vote
+proofs, so the stack moves only via an explicit manifest edit. `Cargo.lock`
+additionally records the exact resolved graph.
+
 The Zcash wallet crates require Rust 1.88 or newer.
 
 ## FFI

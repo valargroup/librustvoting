@@ -10,8 +10,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Changed
 - Updated the librustzcash dependency family to published `zcash_primitives 0.30.0`,
-  `zcash_keys 0.16.0`, `zcash_client_backend 0.24.0-rc.2`,
-  `zcash_client_sqlite 0.22.0-rc.2`, and `pczt 0.8.0`.
+  `zcash_keys 0.16.0`, `zcash_client_backend 0.24.0-rc.3`,
+  `zcash_client_sqlite 0.22.0-rc.3`, `zcash_protocol 0.10.1`, and `pczt 0.9.0`.
+- Pinned every workspace shielded/PCZT dependency to an exact `=` version
+  requirement, so the Orchard-compatible stack can only move via an explicit
+  manifest edit.
 - Aligned the Ironwood crate line on `voting-circuits 0.9.0-rc.3`,
   `pir-client 0.4.0-rc.2`, and `pir-types 0.3.0-rc.2`. Wallet integrations
   resolve one shielded/PCZT stack, vote tree storage APIs use `shardtree 0.7`,
