@@ -6,6 +6,16 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 # Unreleased
 
+## v2.0.0-rc.2
+
+### Changed
+- Published the retained-checkpoint vote tree on `shardtree 0.7` as
+  `vote-commitment-tree 0.4.0-rc.1`, with the aligned
+  `vote-commitment-tree-client 0.6.0-rc.1` release.
+- Updated the librustzcash dependency family to published
+  `zcash_client_backend 0.24.0-rc.4`, `zcash_client_sqlite 0.22.0-rc.4`, and
+  `pczt 0.9.1`.
+
 ## v2.0.0-rc.1
 
 ### Changed
