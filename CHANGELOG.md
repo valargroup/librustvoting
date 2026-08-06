@@ -6,6 +6,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 # Unreleased
 
+### Changed
+- Extended delegation submissions with versioned Ironwood transaction effects
+  for deterministic signing-digest reconstruction without transporting PCZT
+  signer metadata. Synthetic outputs omit account-scoped outgoing viewing
+  metadata because the effects are serialized for verifier use.
+
 ## v2.0.0-rc.3
 
 ### Changed
