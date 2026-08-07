@@ -132,11 +132,11 @@ PY
 # Point this workspace at the sibling PIR checkout without rewriting Cargo.toml.
 # Cargo --config path keys override the git [patch.crates-io] entries.
 run_pir_smoke() {
-  cargo test --manifest-path "${ROOT}/Cargo.toml" \
+  cargo run --manifest-path "${ROOT}/Cargo.toml" \
     --config "patch.crates-io.pir-client.path=\"${PIR_REPO}/pir/client\"" \
     --config "patch.crates-io.pir-types.path=\"${PIR_REPO}/pir/types\"" \
     --config "patch.crates-io.imt-tree.path=\"${PIR_REPO}/imt-tree\"" \
-    -p zcash_voting --test pir_smoke -- "$@"
+    -p zcash_voting --example pir_smoke -- "$@"
 }
 
 # ── Export PIR tiers from the sibling tree ───────────────────────────────────

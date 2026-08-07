@@ -1,6 +1,6 @@
 //! Local smoke driver for config resolution + PIR nullifier fetch.
 //!
-//! Invoked by `tests/pir-smoke.sh` / `make pir-smoke` (custom harness, not part
+//! Invoked by `tests/pir-smoke.sh` / `make pir-smoke` (example target, not part
 //! of the default `cargo test` suite). Keeps production HTTPS URL validation
 //! unchanged by embedding synthetic `https://` identities in the dummy config
 //! documents while fetching those paths from a loopback HTTP base.
@@ -35,32 +35,8 @@ const TRUSTED_KEY_ID: &str = "pir-smoke-k1";
 const ROUND_ID: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
 fn main() -> Result<()> {
-    // Drop libtest flags (`--nocapture`, etc.) that `cargo test` may forward
-    // when this custom harness is invoked without an explicit subcommand.
-    let args = std::env::args()
-        .skip(1)
-        .filter(|arg| {
-            !matches!(
-                arg.as_str(),
-                "--nocapture"
-                    | "--quiet"
-                    | "--exact"
-                    | "--list"
-                    | "--show-output"
-                    | "--include-ignored"
-                    | "--ignored"
-            ) && !arg.starts_with("--test-threads")
-                && !arg.starts_with("--color")
-                && !arg.starts_with("--format")
-                && !arg.starts_with("--report-time")
-                && !arg.starts_with("-Z")
-        })
-        .collect::<Vec<_>>();
-
-    let mut args = args.into_iter();
+    let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {
-        // `cargo test --workspace` builds and executes this harness with no
-        // useful args. Skip cleanly; the real exercise is `make pir-smoke`.
         eprintln!("pir_smoke: skipped (run via `make pir-smoke`)");
         return Ok(());
     };
