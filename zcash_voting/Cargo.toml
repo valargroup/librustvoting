@@ -86,3 +86,10 @@ uuid = "1.23.1"
 secrecy = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 zcash_note_encryption = "0.4.2"
+
+# Custom-harness smoke binary invoked by tests/pir-smoke.sh / `make pir-smoke`.
+# Kept out of the default `cargo test` suite; run explicitly via the Makefile.
+[[test]]
+name = "pir_smoke"
+path = "tests/pir_smoke.rs"
+harness = false
