@@ -788,8 +788,9 @@ impl VotingDb {
         let expected_nf_imt_root = nullifier_imt_root_to_base(&params.nullifier_imt_root)?;
         if pir_client.circuit_root() != expected_nf_imt_root {
             return Err(VotingError::InvalidInput {
-                message: "connected PIR circuit root does not match the stored round nullifier_imt_root"
-                    .to_string(),
+                message:
+                    "connected PIR circuit root does not match the stored round nullifier_imt_root"
+                        .to_string(),
             });
         }
 
