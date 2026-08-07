@@ -489,7 +489,10 @@ impl PreparedSigner {
     }
 }
 
-/// Chain-ready delegation transaction fields for one bundle.
+/// Validated delegation transaction fields for one bundle.
+///
+/// The sighash is retained for wallet-side signing checks. The vote-chain wire
+/// format omits it because verifiers reconstruct it from `tx1_effects`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegationSubmission {
     pub proof: Vec<u8>,

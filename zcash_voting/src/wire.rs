@@ -72,7 +72,6 @@ pub use crate::vote::VanWitness;
 pub struct DelegationSubmissionWire {
     pub rk: String,
     pub spend_auth_sig: String,
-    pub sighash: String,
     /// Base64-encoded versioned Ironwood TX1 effecting data.
     pub tx1_effects: String,
     #[serde(rename = "signed_note_nullifier")]

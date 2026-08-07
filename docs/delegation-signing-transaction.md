@@ -26,7 +26,6 @@ build TX1 PCZT
     +------------------+--------------------> delegation submission
                                                + ZKP #1
                                                + rk
-                                               + TX1 sighash
                                                + TX1 effecting data
                                                + SpendAuth signature
 ```
@@ -333,8 +332,7 @@ that account's FVK. The PCZT retains the output metadata needed by the signer.
 A verifier can reconstruct the ZIP-244 shielded sighash from this payload and
 the fixed profile. It must require `rk` to occur in exactly one action, require
 that action to match the submitted `nf_signed` and `cmx_new`, recompute the
-sighash, compare it with the submitted value, and then verify the SpendAuth
-signature. The shared fixture
+sighash, and verify the SpendAuth signature against that digest. The shared fixture
 [`delegation_tx1_effects_v1.json`](../zcash_voting/test-vectors/delegation_tx1_effects_v1.json)
 pins this boundary for implementations in other repositories.
 
@@ -384,9 +382,9 @@ Before assembling the vote-chain delegation submission, the wallet MUST:
 6. verify the final delegation proof before releasing a submission whenever
    the wallet has a local verifier available.
 
-The vote-chain submission contains the SpendAuth signature, `rk`, TX1 sighash,
-and the compact effecting data needed to recompute that sighash. It is not TX1,
-does not contain a Zcash transaction, and never carries a PCZT.
+The vote-chain submission contains the SpendAuth signature, `rk`, and the
+compact effecting data from which the verifier reconstructs the sighash. It is
+not TX1, does not contain a Zcash transaction, and never carries a PCZT.
 
 Portable transfer of the resulting voting authority is not yet exposed as a
 complete export and import API. The required credential handling and

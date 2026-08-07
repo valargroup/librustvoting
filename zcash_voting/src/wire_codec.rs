@@ -93,7 +93,6 @@ impl TryFrom<&DelegationSubmission> for DelegationSubmissionWire {
         Ok(Self {
             rk: b64(submission.rk),
             spend_auth_sig: b64(submission.spend_auth_sig),
-            sighash: b64(submission.sighash),
             tx1_effects: b64(&submission.tx1_effects),
             nf_signed: b64(submission.nf_signed),
             cmx_new: b64(submission.cmx_new),
@@ -569,6 +568,7 @@ mod tests {
 
         let json = submission.to_wire_json().unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("sighash").is_none());
         assert!(value.get("signed_note_nullifier").is_some());
         assert!(value.get("van_cmx").is_some());
         assert_eq!(
