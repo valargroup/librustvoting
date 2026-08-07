@@ -7,9 +7,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 # Unreleased
 
 ### Changed
-- Aligned nullifier PIR on `pir-client 0.4.0-rc.3` / `pir-types 0.3.0-rc.3`
-  (dataset v2 one-query 12+7 layout). Until published, those crates (and
-  `imt-tree`) are patched from vote-nullifier-pir.
 - `pir::connect_pir` / `pir::connect_pir_blocking` now take an explicit
   `PirLayout` and fail closed on config/server layout mismatch before any
   private query (`VotingError::InvalidInput`). Clients accept any valid
