@@ -17,10 +17,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Dynamic voting config now requires top-level `pir_layout` (`pir_depth`,
   `tier0_layers`, `tier1_layers`). `ResolvedVotingConfig` and its wire exports
   expose it; layout changes are same-chain service updates.
-- Delegation submissions now carry versioned Ironwood transaction effects so
-  verifiers derive the signing digest directly instead of receiving it as a
-  separate field. The payload excludes PCZT signer metadata, and synthetic
-  outputs omit account-scoped outgoing viewing metadata.
 - Delegation submissions now carry compact, versioned Ironwood transaction
   effects so verifiers derive the signing digest directly instead of receiving
   it as a separate field. The payload excludes PCZT signer metadata, and
