@@ -239,8 +239,8 @@ impl VotingDb {
 
     /// Ensures a round exists for `params`, initializing it when absent.
     ///
-    /// Existing rounds are left unchanged. `session_json` is stored only on the
-    /// first insert.
+    /// Existing rounds are left unchanged when their network and election
+    /// authority key match. `session_json` is stored only on the first insert.
     pub fn ensure_round(
         &self,
         network: Network,
@@ -251,13 +251,21 @@ impl VotingDb {
         if self.has_round(&params.vote_round_id)? {
             let conn = self.conn();
             let wallet_id = self.wallet_id();
-            let stored_network =
-                queries::load_round_network(&conn, &params.vote_round_id, &wallet_id)?;
+            let (stored_params, stored_network) =
+                queries::load_round_params_with_network(&conn, &params.vote_round_id, &wallet_id)?;
             if stored_network != network {
                 return Err(VotingError::InvalidInput {
                     message: format!(
                         "round {} exists for network {:?}, not {:?}",
                         params.vote_round_id, stored_network, network
+                    ),
+                });
+            }
+            if stored_params.ea_pk != params.ea_pk {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "round {} exists with a different election authority key",
+                        params.vote_round_id
                     ),
                 });
             }
@@ -578,6 +586,25 @@ mod tests {
             .expect_err("existing round cannot be rebound to another network");
 
         assert!(err.to_string().contains("exists for network"), "{err}");
+    }
+
+    #[test]
+    fn ensure_round_rejects_existing_round_ea_pk_mismatch() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id("wallet-ea-pk");
+        let params = round_params();
+        db.ensure_round(Network::Testnet, &params, None).unwrap();
+
+        let mut rotated = params;
+        rotated.ea_pk = vec![0xEB; 32];
+        let err = db
+            .ensure_round(Network::Testnet, &rotated, None)
+            .expect_err("existing round cannot be rebound to another election authority key");
+
+        assert!(
+            err.to_string().contains("different election authority key"),
+            "{err}"
+        );
     }
 
     fn note(position: u64, value: u64) -> NoteInfo {

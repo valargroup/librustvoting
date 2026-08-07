@@ -285,17 +285,12 @@ pub struct ResolvedVotingConfigSummary {
 
 impl From<&ResolvedVotingConfig> for ResolvedVotingConfigSummary {
     fn from(config: &ResolvedVotingConfig) -> Self {
-        let authenticated_round_ids = config
-            .authenticated_rounds
-            .iter()
-            .map(|round| round.round_id.clone())
-            .collect::<Vec<_>>();
         Self {
             trusted_key_fingerprint: config.trusted_key_fingerprint.clone(),
             vote_server_fingerprint: fingerprint_json(&config.vote_servers),
             pir_endpoint_fingerprint: fingerprint_json(&config.pir_endpoints),
             pir_layout: config.pir_layout,
-            authenticated_round_set_fingerprint: fingerprint_json(&authenticated_round_ids),
+            authenticated_round_set_fingerprint: fingerprint_json(&config.authenticated_rounds),
             protocol_versions: config.supported_versions.clone(),
         }
     }
@@ -1286,6 +1281,24 @@ mod tests {
         assert_eq!(
             summary_base.authenticated_round_set_fingerprint,
             summary_with_different_skips.authenticated_round_set_fingerprint
+        );
+    }
+
+    #[test]
+    fn summary_fingerprint_includes_authenticated_round_ea_pk() {
+        let base = resolved_config_with_authenticated_round(vec![7u8; 32]);
+        let rotated = resolved_config_with_authenticated_round(vec![8u8; 32]);
+
+        let base_summary = ResolvedVotingConfigSummary::from(&base);
+        let rotated_summary = ResolvedVotingConfigSummary::from(&rotated);
+
+        assert_ne!(
+            base_summary.authenticated_round_set_fingerprint,
+            rotated_summary.authenticated_round_set_fingerprint
+        );
+        assert_eq!(
+            decide_config_switch(Some(base_summary), rotated_summary).kind,
+            ConfigSwitchKind::NewChainOrRound
         );
     }
 
