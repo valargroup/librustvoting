@@ -7,6 +7,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 # Unreleased
 
 ### Changed
+- `pir_layout` accepts an optional `tier2_layers` field (default 0 keeps the
+  two-tier layout; the disabled state serializes without the field). When
+  set, wallets negotiate a three-tier PIR layout and issue two encrypted
+  queries per nullifier behind the same fail-closed config/server handshake.
+  Layout validation bounds `tier0_layers` to 11..=16 and requires
+  `tier0_layers + tier1_layers + tier2_layers == pir_depth`.
 - Aligned nullifier PIR on `pir-client 0.4.0-rc.3` / `pir-types 0.3.0-rc.3`
   (dataset v2 one-query 12+7 layout). Until published, those crates (and
   `imt-tree`) are patched from vote-nullifier-pir.

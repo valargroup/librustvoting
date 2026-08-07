@@ -22,11 +22,12 @@ zcash_keys = { version = "0.16.1", features = ["orchard"] }
 zcash_primitives = { version = "0.30.0" }
 zcash_protocol = { version = "0.10.4" }
 
-# Temporary git overrides for integration against vote-nullifier-pir PR 124
-# (branch roman/dynamic-two-tier-pir). Package manifests keep exact rc.3 version
-# requirements; remove this table once the crates are published (or switch back
-# to a sibling path checkout for local PIR development).
+# Temporary git overrides for integration against the vote-nullifier-pir
+# tier-2 prototype (branch roman/tier2-pir, stacked on PR 125). Package
+# manifests keep exact rc.3 version requirements; remove this table once the
+# crates are published (or switch back to a sibling path checkout for local
+# PIR development).
 [patch.crates-io]
-pir-client = { git = "https://github.com/valargroup/vote-nullifier-pir", branch = "roman/dynamic-two-tier-pir" }
-pir-types = { git = "https://github.com/valargroup/vote-nullifier-pir", branch = "roman/dynamic-two-tier-pir" }
-imt-tree = { git = "https://github.com/valargroup/vote-nullifier-pir", branch = "roman/dynamic-two-tier-pir" }
+pir-client = { git = "https://github.com/valargroup/vote-nullifier-pir", branch = "roman/tier2-pir" }
+pir-types = { git = "https://github.com/valargroup/vote-nullifier-pir", branch = "roman/tier2-pir" }
+imt-tree = { git = "https://github.com/valargroup/vote-nullifier-pir", branch = "roman/tier2-pir" }

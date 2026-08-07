@@ -61,6 +61,7 @@ use std::collections::BTreeMap;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use imt_tree::tree::TREE_DEPTH;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -76,8 +77,6 @@ const SHA256_CHECKSUM_PREFIX: &str = "sha256:";
 const VERSION_V0: &str = "v0";
 const VOTE_SERVER_VERSION_V1: &str = "v1";
 const ROUND_PARAM_BYTE_LEN: usize = 32;
-// Keep aligned with `imt_tree::tree::TREE_DEPTH` (nullifier IMT depth).
-const MAX_PIR_CIRCUIT_DEPTH: u32 = 29;
 
 /// Versions of each voting-protocol component implemented by this crate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +129,11 @@ pub struct PirLayout {
     pub pir_depth: u32,
     pub tier0_layers: u32,
     pub tier1_layers: u32,
+    /// Optional second encrypted tier; 0 (the default for configs published
+    /// before Tier 2 existed) selects the two-tier layout. Skipped when zero
+    /// so the disabled-state wire JSON matches pre-tier2 consumers.
+    #[serde(default, skip_serializing_if = "tier2_is_disabled")]
+    pub tier2_layers: u32,
 }
 
 impl PirLayout {
@@ -138,7 +142,12 @@ impl PirLayout {
         pir_depth: 0,
         tier0_layers: 0,
         tier1_layers: 0,
+        tier2_layers: 0,
     };
+}
+
+fn tier2_is_disabled(v: &u32) -> bool {
+    *v == 0
 }
 
 impl Default for PirLayout {
@@ -644,27 +653,48 @@ fn validate_dynamic_config(
     Ok(())
 }
 
+/// Supported Tier 0 layer range: `2^tier0_layers` is the first encrypted
+/// tier's row count (YPIR requires >= 2048 rows, so >= 11) and the Tier 0
+/// blob every client downloads is ~96 B x 2^tier0_layers (~6 MiB at 16).
+const MIN_PIR_TIER0_LAYERS: u32 = 11;
+const MAX_PIR_TIER0_LAYERS: u32 = 16;
+
 fn validate_pir_layout(layout: PirLayout) -> Result<(), VotingConfigError> {
     let combined_depth = layout
         .tier0_layers
         .checked_add(layout.tier1_layers)
+        .and_then(|v| v.checked_add(layout.tier2_layers))
         .ok_or_else(|| VotingConfigError::DecodeFailed {
             message: "pir_layout tier layer sum overflows u32".to_string(),
         })?;
     if layout.pir_depth != combined_depth {
         return Err(VotingConfigError::DecodeFailed {
             message: format!(
-                "pir_layout.pir_depth {} must equal tier0_layers {} + tier1_layers {}",
-                layout.pir_depth, layout.tier0_layers, layout.tier1_layers
+                "pir_layout.pir_depth {} must equal tier0_layers {} + tier1_layers {} + tier2_layers {}",
+                layout.pir_depth, layout.tier0_layers, layout.tier1_layers, layout.tier2_layers
             ),
         });
     }
-    if layout.pir_depth == 0 || layout.pir_depth > MAX_PIR_CIRCUIT_DEPTH {
+    if layout.pir_depth == 0 || layout.pir_depth > TREE_DEPTH as u32 {
         return Err(VotingConfigError::DecodeFailed {
             message: format!(
-                "pir_layout.pir_depth {} is outside the supported circuit range 1..={MAX_PIR_CIRCUIT_DEPTH}",
+                "pir_layout.pir_depth {} is outside the supported circuit range 1..={TREE_DEPTH}",
                 layout.pir_depth
             ),
+        });
+    }
+    if !(MIN_PIR_TIER0_LAYERS..=MAX_PIR_TIER0_LAYERS).contains(&layout.tier0_layers) {
+        return Err(VotingConfigError::DecodeFailed {
+            message: format!(
+                "pir_layout.tier0_layers {} is outside the supported range \
+                 {MIN_PIR_TIER0_LAYERS}..={MAX_PIR_TIER0_LAYERS}",
+                layout.tier0_layers
+            ),
+        });
+    }
+    if layout.tier1_layers == 0 {
+        return Err(VotingConfigError::DecodeFailed {
+            message: "pir_layout.tier1_layers must be at least 1".to_string(),
         });
     }
     Ok(())
@@ -970,6 +1000,7 @@ mod tests {
                 pir_depth: 19,
                 tier0_layers: 12,
                 tier1_layers: 7,
+                tier2_layers: 0,
             }
         );
         assert_eq!(
@@ -1133,6 +1164,7 @@ mod tests {
                 pir_depth: 19,
                 tier0_layers: 12,
                 tier1_layers: 7,
+                tier2_layers: 0,
             },
             supported_versions: SupportedVersions {
                 pir: vec!["v0".to_string()],
@@ -1169,6 +1201,7 @@ mod tests {
                 pir_depth: 19,
                 tier0_layers: 12,
                 tier1_layers: 7,
+                tier2_layers: 0,
             },
             supported_versions: SupportedVersions {
                 pir: vec!["v0".to_string()],
@@ -1326,6 +1359,7 @@ mod tests {
             pir_depth: 19,
             tier0_layers: 12,
             tier1_layers: 7,
+            tier2_layers: 0,
         };
 
         let decision = decide_config_switch(Some(current), next);
@@ -1343,6 +1377,7 @@ mod tests {
                 pir_depth: 19,
                 tier0_layers: 12,
                 tier1_layers: 7,
+                tier2_layers: 0,
             },
             authenticated_round_set_fingerprint: "same-rounds".to_string(),
             protocol_versions: SupportedVersions {
@@ -1357,6 +1392,7 @@ mod tests {
             pir_depth: 20,
             tier0_layers: 13,
             tier1_layers: 7,
+            tier2_layers: 0,
         };
 
         let decision = decide_config_switch(Some(current), next);

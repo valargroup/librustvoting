@@ -246,6 +246,8 @@ mod pir_tests {
                                 pir_depth: pir_types::PIR_DEPTH,
                                 tier1_rows: pir_types::TIER1_ROWS,
                                 tier1_row_bytes: pir_types::TIER1_ROW_BYTES,
+                                tier2_rows: 0,
+                                tier2_row_bytes: 0,
                                 height: None,
                             })
                             .unwrap(),

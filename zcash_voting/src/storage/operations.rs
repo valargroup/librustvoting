@@ -1729,6 +1729,8 @@ mod tests {
                             pir_depth: pir_types::PIR_DEPTH,
                             tier1_rows: pir_types::TIER1_ROWS,
                             tier1_row_bytes: pir_types::TIER1_ROW_BYTES,
+                            tier2_rows: 0,
+                            tier2_row_bytes: 0,
                             height: None,
                         })
                         .unwrap(),
@@ -1754,12 +1756,28 @@ mod tests {
     /// query cardinality without depending on a full YPIR encode/decode cycle.
     struct RecordingPirTransport {
         hits: std::sync::Mutex<Vec<String>>,
+        layout: pir_types::PirLayout,
     }
 
     impl RecordingPirTransport {
         fn new() -> Self {
+            Self::with_layout(pir_types::COMPILED_PIR_LAYOUT)
+        }
+
+        /// Transport advertising a 12+4+3 three-tier layout.
+        fn three_tier() -> Self {
+            Self::with_layout(pir_types::PirLayout {
+                pir_depth: 19,
+                tier0_layers: 12,
+                tier1_layers: 4,
+                tier2_layers: 3,
+            })
+        }
+
+        fn with_layout(layout: pir_types::PirLayout) -> Self {
             Self {
                 hits: std::sync::Mutex::new(Vec::new()),
+                layout,
             }
         }
 
@@ -1805,21 +1823,16 @@ mod tests {
             Box::pin(async move {
                 let path = request_path(url);
                 self.record(path);
+                let tier1 = self.layout.tier1_scenario().expect("valid layout");
+                let tier2 = self.layout.tier2_scenario().expect("valid layout");
                 match path {
                     "/tier0" => Ok(transport_response(vec![
                         0;
-                        ((1usize
-                            << pir_types::TIER0_LAYERS)
-                            - 1)
-                            * 32
-                            + pir_types::TIER1_ROWS * 64
+                        self.layout.tier0_bytes().unwrap()
                     ])),
-                    "/params/tier1" => Ok(transport_response(
-                        serde_json::to_vec(&pir_types::YpirScenario {
-                            num_items: pir_types::TIER1_ROWS,
-                            item_size_bits: pir_types::TIER1_ITEM_BITS,
-                        })
-                        .unwrap(),
+                    "/params/tier1" => Ok(transport_response(serde_json::to_vec(&tier1).unwrap())),
+                    "/params/tier2" if tier2.is_some() => Ok(transport_response(
+                        serde_json::to_vec(&tier2.unwrap()).unwrap(),
                     )),
                     "/root" => Ok(transport_response(
                         serde_json::to_vec(&pir_types::RootInfo {
@@ -1829,10 +1842,12 @@ mod tests {
                             root29: hex::encode([0u8; 32]),
                             root25: hex::encode([0u8; 32]),
                             num_ranges: 1,
-                            pir_layout: pir_types::COMPILED_PIR_LAYOUT,
-                            pir_depth: pir_types::PIR_DEPTH,
-                            tier1_rows: pir_types::TIER1_ROWS,
-                            tier1_row_bytes: pir_types::TIER1_ROW_BYTES,
+                            pir_layout: self.layout,
+                            pir_depth: self.layout.pir_depth,
+                            tier1_rows: tier1.num_items,
+                            tier1_row_bytes: tier1.item_size_bits / 8,
+                            tier2_rows: tier2.as_ref().map_or(0, |s| s.num_items),
+                            tier2_row_bytes: tier2.as_ref().map_or(0, |s| s.item_size_bits / 8),
                             height: None,
                         })
                         .unwrap(),
@@ -1846,8 +1861,10 @@ mod tests {
             Box::pin(async move {
                 let path = request_path(url);
                 self.record(path);
+                let tier2_enabled = self.layout.tier2_enabled();
                 match path {
                     "/tier1/query" => Ok(transport_response(vec![0xDE; 65536])),
+                    "/tier2/query" if tier2_enabled => Ok(transport_response(vec![0xDE; 65536])),
                     _ => Err(anyhow::anyhow!("unexpected POST {path}")),
                 }
             })
@@ -2264,6 +2281,26 @@ mod tests {
         assert_eq!(transport.count_hits("/tier1/query"), K);
         assert_eq!(transport.query_post_count(), K);
         transport.assert_no_legacy_tier2_traffic();
+    }
+
+    #[test]
+    fn test_pir_client_three_tier_fetch_sends_two_queries_per_nullifier() {
+        const K: usize = 3;
+        let transport = std::sync::Arc::new(RecordingPirTransport::three_tier());
+        let client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            transport.layout,
+            transport.clone(),
+        )
+        .unwrap();
+
+        // Corrupt ciphertext on both tiers: the tier2 query must still be
+        // sent after every tier1 failure (dummy-row latching).
+        let nullifiers: Vec<_> = (1u64..=K as u64).map(pallas::Base::from).collect();
+        assert!(client.fetch_proofs(&nullifiers).is_err());
+        assert_eq!(transport.count_hits("/tier1/query"), K);
+        assert_eq!(transport.count_hits("/tier2/query"), K);
+        assert_eq!(transport.query_post_count(), 2 * K);
     }
 
     #[test]

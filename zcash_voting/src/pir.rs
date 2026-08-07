@@ -52,6 +52,7 @@ pub fn negotiated_pir_layout(layout: PirLayout) -> Result<NegotiatedPirLayout, V
         pir_depth: usize_field(layout.pir_depth, "pir_layout.pir_depth")?,
         tier0_layers: usize_field(layout.tier0_layers, "pir_layout.tier0_layers")?,
         tier1_layers: usize_field(layout.tier1_layers, "pir_layout.tier1_layers")?,
+        tier2_layers: usize_field(layout.tier2_layers, "pir_layout.tier2_layers")?,
     })
 }
 
@@ -131,8 +132,7 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use ed25519_dalek::{Signer, SigningKey};
     use pir_types::{
-        RootInfo, YpirScenario, COMPILED_PIR_LAYOUT, DATASET_VERSION, NULLIFIER_POOL, PIR_DEPTH,
-        TIER0_LAYERS,
+        RootInfo, COMPILED_PIR_LAYOUT, DATASET_VERSION, NULLIFIER_POOL, PIR_DEPTH, TIER0_LAYERS,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -161,10 +161,8 @@ mod tests {
         }
 
         fn insert_matching_assets(&self, layout: NegotiatedPirLayout) {
-            let rows = layout.tier1_rows().unwrap();
-            let row_bytes = layout.tier1_row_bytes().unwrap();
-            let item_bits = layout.tier1_item_bits().unwrap();
-            let tier0_bytes = layout.tier0_bytes().unwrap();
+            let tier1 = layout.tier1_scenario().expect("valid tier1 scenario");
+            let tier2 = layout.tier2_scenario().expect("valid tier2 scenario");
             let root = RootInfo {
                 zcash_network: pir_types::ZcashNetwork::Test,
                 nullifier_pool: NULLIFIER_POOL.to_owned(),
@@ -174,21 +172,31 @@ mod tests {
                 num_ranges: 1,
                 pir_layout: layout,
                 pir_depth: layout.pir_depth,
-                tier1_rows: rows,
-                tier1_row_bytes: row_bytes,
+                tier1_rows: tier1.num_items,
+                tier1_row_bytes: tier1.item_size_bits / 8,
+                tier2_rows: tier2.as_ref().map_or(0, |s| s.num_items),
+                tier2_row_bytes: tier2.as_ref().map_or(0, |s| s.item_size_bits / 8),
                 height: Some(100),
             };
-            let tier1 = YpirScenario {
-                num_items: rows,
-                item_size_bits: item_bits,
-            };
             let mut gets = self.gets.lock().unwrap();
-            gets.insert("/tier0".to_string(), response(vec![0; tier0_bytes]));
+            gets.insert(
+                "/tier0".to_string(),
+                response(vec![0; layout.tier0_bytes().unwrap()]),
+            );
             gets.insert(
                 "/params/tier1".to_string(),
                 response(serde_json::to_vec(&tier1).unwrap()),
             );
-            gets.insert("/root".to_string(), response(serde_json::to_vec(&root).unwrap()));
+            if let Some(tier2) = tier2 {
+                gets.insert(
+                    "/params/tier2".to_string(),
+                    response(serde_json::to_vec(&tier2).unwrap()),
+                );
+            }
+            gets.insert(
+                "/root".to_string(),
+                response(serde_json::to_vec(&root).unwrap()),
+            );
         }
 
         fn count_hits(&self, path: &str) -> usize {
@@ -231,6 +239,14 @@ mod tests {
         }
     }
 
+    fn response_with_status(status: u16, body: Vec<u8>) -> TransportResponse {
+        TransportResponse {
+            status,
+            headers: Vec::new(),
+            body,
+        }
+    }
+
     fn response(body: Vec<u8>) -> TransportResponse {
         TransportResponse {
             status: 200,
@@ -247,7 +263,6 @@ mod tests {
             .unwrap_or("/")
     }
 
-
     fn expect_connect_err(result: Result<PirClientBlocking, VotingError>) -> VotingError {
         match result {
             Ok(_) => panic!("expected PIR connect failure"),
@@ -260,6 +275,7 @@ mod tests {
             pir_depth: u32::try_from(COMPILED_PIR_LAYOUT.pir_depth).unwrap(),
             tier0_layers: u32::try_from(COMPILED_PIR_LAYOUT.tier0_layers).unwrap(),
             tier1_layers: u32::try_from(COMPILED_PIR_LAYOUT.tier1_layers).unwrap(),
+            tier2_layers: 0,
         }
     }
 
@@ -285,6 +301,7 @@ mod tests {
             pir_depth: PIR_DEPTH,
             tier0_layers: TIER0_LAYERS - 1,
             tier1_layers: COMPILED_PIR_LAYOUT.tier1_layers + 1,
+            tier2_layers: 0,
         };
         let transport = Arc::new(RecordingTransport::with_root_layout(mismatched));
 
@@ -295,7 +312,13 @@ mod tests {
         ));
 
         assert!(matches!(err, VotingError::InvalidInput { .. }), "{err}");
-        assert!(err.to_string().contains("PIR layout mismatch"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "Invalid input: PIR connect failed: PIR layout mismatch: expected PirLayout { \
+             pir_depth: 19, tier0_layers: 12, tier1_layers: 7, tier2_layers: 0 }, server \
+             advertised PirLayout { pir_depth: 19, tier0_layers: 11, tier1_layers: 8, \
+             tier2_layers: 0 }"
+        );
         assert_eq!(transport.post_count(), 0);
     }
 
@@ -305,6 +328,7 @@ mod tests {
             pir_depth: 18,
             tier0_layers: 11,
             tier1_layers: 7,
+            tier2_layers: 0,
         };
         let transport = Arc::new(RecordingTransport::matching_root());
 
@@ -334,6 +358,84 @@ mod tests {
         assert_eq!(transport.count_hits("/params/tier1"), 1);
         assert_eq!(transport.count_hits("/root"), 1);
         assert_eq!(transport.post_count(), 0);
+    }
+
+    #[test]
+    fn connect_succeeds_for_three_tier_layout() {
+        let three_tier = NegotiatedPirLayout {
+            pir_depth: 19,
+            tier0_layers: 12,
+            tier1_layers: 4,
+            tier2_layers: 3,
+        };
+        let transport = Arc::new(RecordingTransport::with_root_layout(three_tier));
+
+        let _client = connect_pir_blocking(
+            crate::config::PirLayout {
+                pir_depth: 19,
+                tier0_layers: 12,
+                tier1_layers: 4,
+                tier2_layers: 3,
+            },
+            "https://pir.example.com/",
+            transport.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(transport.count_hits("/params/tier2"), 1);
+        assert_eq!(transport.post_count(), 0);
+    }
+
+    #[test]
+    fn connect_rejects_tier_count_mismatch_before_query() {
+        // Two-tier config against a three-tier server (and vice versa) must
+        // fail closed before any private query.
+        let three_tier = NegotiatedPirLayout {
+            pir_depth: 19,
+            tier0_layers: 12,
+            tier1_layers: 4,
+            tier2_layers: 3,
+        };
+        let transport = Arc::new(RecordingTransport::with_root_layout(three_tier));
+        let result = connect_pir_blocking(
+            crate::config::PirLayout {
+                pir_depth: 19,
+                tier0_layers: 12,
+                tier1_layers: 7,
+                tier2_layers: 0,
+            },
+            "https://pir.example.com/",
+            transport.clone(),
+        );
+        let err = match result {
+            Ok(_) => panic!("tier-count mismatch must be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VotingError::InvalidInput { .. }), "{err:?}");
+        assert_eq!(transport.post_count(), 0);
+    }
+
+    #[test]
+    fn hostile_server_body_cannot_flip_error_classification() {
+        // A server error body containing the literal "PIR layout mismatch"
+        // must not reclassify a transport failure as a config problem: the
+        // client no longer echoes server bodies into error strings.
+        let transport = RecordingTransport::matching_root();
+        transport.gets.lock().unwrap().insert(
+            "/root".to_string(),
+            response_with_status(500, b"PIR layout mismatch".to_vec()),
+        );
+        let transport = Arc::new(transport);
+        let result = connect_pir_blocking(
+            compiled_wallet_layout(),
+            "https://pir.example.com/",
+            transport,
+        );
+        let err = match result {
+            Ok(_) => panic!("HTTP 500 on /root must fail connect"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VotingError::Internal { .. }), "{err:?}");
     }
 
     #[test]
@@ -438,6 +540,7 @@ mod tests {
             pir_depth: 18,
             tier0_layers: 11,
             tier1_layers: 7,
+            tier2_layers: 0,
         }));
         let err = expect_connect_err(connect_pir_blocking(
             resolved.pir_layout,
