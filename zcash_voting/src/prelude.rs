@@ -35,7 +35,6 @@ pub use crate::note_bundling::{
 pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
 pub use crate::pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, select_pir_endpoint, PirEndpoint,
-    COMPILED_PIR_LAYOUT,
 };
 pub use crate::precompute::{
     note_witnesses, stored_note_witnesses, verify_witness, PirPrecomputeReport,

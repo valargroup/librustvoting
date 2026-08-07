@@ -102,7 +102,9 @@ After resolution, wallets typically connect PIR through
 `pir::connect_pir_blocking` (or `pir::connect_pir`) with the resolved config's
 `pir_layout` and a caller-chosen endpoint URL. The helpers run the
 config/server/compiled-client layout handshake and fail closed before any
-private query; they do not re-check advertised-endpoint membership.
+private query (`VotingError::InvalidInput` on layout mismatch); they do not
+re-check advertised-endpoint membership. Do not pass a compiled-client layout
+constant in place of `resolved.pir_layout`.
 
 ```rust
 use std::sync::Arc;

@@ -76,6 +76,7 @@ const SHA256_CHECKSUM_PREFIX: &str = "sha256:";
 const VERSION_V0: &str = "v0";
 const VOTE_SERVER_VERSION_V1: &str = "v1";
 const ROUND_PARAM_BYTE_LEN: usize = 32;
+// Keep aligned with `imt_tree::tree::TREE_DEPTH` (nullifier IMT depth).
 const MAX_PIR_CIRCUIT_DEPTH: u32 = 29;
 
 /// Versions of each voting-protocol component implemented by this crate.
@@ -141,6 +142,8 @@ impl PirLayout {
 }
 
 impl Default for PirLayout {
+    /// Same sentinel as [`PirLayout::UNKNOWN`]; not a live layout for connect
+    /// or dynamic config — only for legacy summary deserialization defaults.
     fn default() -> Self {
         Self::UNKNOWN
     }

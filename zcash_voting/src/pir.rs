@@ -35,7 +35,7 @@ pub fn select_pir_endpoint(
 pub use pir_client::{
     ImtProofData, PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
 };
-pub use pir_types::{PirLayout as NegotiatedPirLayout, COMPILED_PIR_LAYOUT};
+pub use pir_types::PirLayout as NegotiatedPirLayout;
 
 /// Converts a wallet-config [`PirLayout`] into the PIR client's negotiated layout.
 ///
@@ -61,7 +61,9 @@ pub fn negotiated_pir_layout(layout: PirLayout) -> Result<NegotiatedPirLayout, V
 /// advertised endpoint list; callers pass a layout and URL they already chose
 /// (for example after exact-height snapshot probing). Fails closed before any
 /// private query when the layout is unknown or the three-way layout handshake
-/// rejects the server or compiled client.
+/// rejects the server or compiled client. Layout mismatches surface as
+/// [`VotingError::InvalidInput`]; other connect failures remain
+/// [`VotingError::Internal`].
 pub fn connect_pir_blocking(
     pir_layout: PirLayout,
     endpoint_url: &str,
@@ -74,11 +76,8 @@ pub fn connect_pir_blocking(
         });
     }
     let expected_layout = negotiated_pir_layout(pir_layout)?;
-    PirClientBlocking::with_transport(&endpoint, expected_layout, transport).map_err(|e| {
-        VotingError::Internal {
-            message: format!("PIR connect failed: {e}"),
-        }
-    })
+    PirClientBlocking::with_transport(&endpoint, expected_layout, transport)
+        .map_err(map_pir_connect_error)
 }
 
 /// Connects an async PIR client using an explicit layout and endpoint URL.
@@ -98,13 +97,23 @@ pub async fn connect_pir(
     let expected_layout = negotiated_pir_layout(pir_layout)?;
     PirClient::with_transport(&endpoint, expected_layout, transport)
         .await
-        .map_err(|e| VotingError::Internal {
-            message: format!("PIR connect failed: {e}"),
-        })
+        .map_err(map_pir_connect_error)
 }
 
 fn normalize_endpoint_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
+}
+
+fn map_pir_connect_error(err: impl std::fmt::Display) -> VotingError {
+    let detail = err.to_string();
+    let message = format!("PIR connect failed: {detail}");
+    // Config/server/compiled-client layout disagreement is a caller/config
+    // incompatibility, not an unexpected internal failure.
+    if detail.contains("PIR layout mismatch") {
+        VotingError::InvalidInput { message }
+    } else {
+        VotingError::Internal { message }
+    }
 }
 
 fn usize_field(value: u32, field: &str) -> Result<usize, VotingError> {
@@ -266,6 +275,7 @@ mod tests {
             transport.clone(),
         ));
 
+        assert!(matches!(err, VotingError::InvalidInput { .. }), "{err}");
         assert!(err.to_string().contains("pir_layout is unknown"), "{err}");
         assert_eq!(transport.count_hits("/root"), 0);
         assert_eq!(transport.post_count(), 0);
@@ -286,11 +296,8 @@ mod tests {
             transport.clone(),
         ));
 
-        assert!(
-            err.to_string().contains("PIR layout mismatch")
-                || err.to_string().contains("PIR connect failed"),
-            "{err}"
-        );
+        assert!(matches!(err, VotingError::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("PIR layout mismatch"), "{err}");
         assert_eq!(transport.post_count(), 0);
     }
 
@@ -309,11 +316,8 @@ mod tests {
             transport.clone(),
         ));
 
-        assert!(
-            err.to_string().contains("PIR layout mismatch")
-                || err.to_string().contains("PIR connect failed"),
-            "{err}"
-        );
+        assert!(matches!(err, VotingError::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("PIR layout mismatch"), "{err}");
         assert_eq!(transport.post_count(), 0);
     }
 
@@ -442,11 +446,8 @@ mod tests {
             "https://pir.example.com",
             mismatched.clone(),
         ));
-        assert!(
-            err.to_string().contains("PIR layout mismatch")
-                || err.to_string().contains("PIR connect failed"),
-            "{err}"
-        );
+        assert!(matches!(err, VotingError::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("PIR layout mismatch"), "{err}");
         assert_eq!(mismatched.post_count(), 0);
     }
 }

@@ -13,7 +13,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   `roman/negotiated-tier-pir` on `valargroup/vote-nullifier-pir` (PR 123).
 - `pir::connect_pir` / `pir::connect_pir_blocking` now take an explicit
   `PirLayout` and fail closed on config/server/client layout mismatch before
-  any private query.
+  any private query (`VotingError::InvalidInput`). `COMPILED_PIR_LAYOUT` is
+  no longer re-exported from `zcash_voting` / `prelude`; use resolved config
+  `pir_layout` (tests may still import from `pir-types`).
 - Dynamic voting config now requires top-level `pir_layout` (`pir_depth`,
   `tier0_layers`, `tier1_layers`). `ResolvedVotingConfig` and its wire exports
   expose it; layout changes are same-chain service updates.
