@@ -120,6 +120,24 @@ fn retained_checkpoint_key(id: u32) -> [u8; 5] {
     k
 }
 
+fn parse_shard_key(key: &[u8]) -> Option<u64> {
+    let index: [u8; 8] = key.strip_prefix(&[SHARD_PREFIX])?.try_into().ok()?;
+    Some(u64::from_be_bytes(index))
+}
+
+fn parse_checkpoint_key(key: &[u8]) -> Option<u32> {
+    let id: [u8; 4] = key.strip_prefix(&[CHECKPOINT_PREFIX])?.try_into().ok()?;
+    Some(u32::from_be_bytes(id))
+}
+
+fn parse_retained_checkpoint_key(key: &[u8]) -> Option<u32> {
+    let id: [u8; 4] = key
+        .strip_prefix(&[RETAINED_CHECKPOINT_PREFIX])?
+        .try_into()
+        .ok()?;
+    Some(u32::from_be_bytes(id))
+}
+
 // ---------------------------------------------------------------------------
 // Callback function pointer types
 // ---------------------------------------------------------------------------
@@ -260,10 +278,14 @@ impl KvCallbacks {
     }
 
     /// Create a forward or reverse iterator over the given prefix.
-    fn iter(&self, prefix: &[u8], reverse: bool) -> KvIter<'_> {
+    fn iter(&self, prefix: &[u8], reverse: bool) -> Result<KvIter<'_>, KvError> {
         let handle =
             unsafe { (self.iter_create)(self.ctx, prefix.as_ptr(), prefix.len(), reverse as u8) };
-        KvIter { handle, cb: self }
+        if handle.is_null() {
+            Err(KvError::IoError)
+        } else {
+            Ok(KvIter { handle, cb: self })
+        }
     }
 }
 
@@ -272,12 +294,11 @@ struct KvIter<'a> {
     cb: &'a KvCallbacks,
 }
 
+type KvEntry = (Vec<u8>, Vec<u8>);
+
 impl<'a> KvIter<'a> {
-    /// Advance and return `Some((key, value))`, or `None` when exhausted.
-    fn next(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        if self.handle.is_null() {
-            return None;
-        }
+    /// Advance and return an entry, normal exhaustion, or a callback error.
+    fn next(&mut self) -> Result<Option<KvEntry>, KvError> {
         let mut key_ptr: *mut u8 = std::ptr::null_mut();
         let mut key_len: usize = 0;
         let mut val_ptr: *mut u8 = std::ptr::null_mut();
@@ -291,14 +312,29 @@ impl<'a> KvIter<'a> {
                 &mut val_len,
             )
         };
-        if rc != 0 {
-            return None;
+        match rc {
+            0 => {
+                let key = self.copy_and_free(key_ptr, key_len)?;
+                let val = self.copy_and_free(val_ptr, val_len)?;
+                Ok(Some((key, val)))
+            }
+            1 => Ok(None),
+            _ => Err(KvError::IoError),
         }
-        let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len).to_vec() };
-        unsafe { (self.cb.free_buf)(key_ptr, key_len) };
-        let val = unsafe { std::slice::from_raw_parts(val_ptr, val_len).to_vec() };
-        unsafe { (self.cb.free_buf)(val_ptr, val_len) };
-        Some((key, val))
+    }
+
+    fn copy_and_free(&self, ptr: *mut u8, len: usize) -> Result<Vec<u8>, KvError> {
+        if ptr.is_null() {
+            return if len == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(KvError::IoError)
+            };
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
+        unsafe { (self.cb.free_buf)(ptr, len) };
+        Ok(bytes)
     }
 }
 
@@ -325,6 +361,21 @@ impl KvShardStore {
     pub fn new(cb: KvCallbacks) -> Self {
         Self { cb }
     }
+
+    fn checkpoints(&self) -> Result<Vec<(u32, Checkpoint)>, KvError> {
+        let prefix = [CHECKPOINT_PREFIX];
+        let mut iter = self.cb.iter(&prefix, false)?;
+        let mut checkpoints = Vec::new();
+        while let Some((key, value)) = iter.next()? {
+            let Some(id) = parse_checkpoint_key(&key) else {
+                continue;
+            };
+            let checkpoint = read_checkpoint(&value).map_err(|_| KvError::Deserialization)?;
+            checkpoints.push((id, checkpoint));
+        }
+        checkpoints.sort_by_key(|(id, _)| *id);
+        Ok(checkpoints)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,28 +396,26 @@ impl ShardStore for KvShardStore {
         let Some(blob) = self.cb.get(&key)? else {
             return Ok(None);
         };
-        match read_shard_vote(&blob) {
-            Ok(tree) => Ok(LocatedTree::from_parts(shard_root, tree).ok()),
-            Err(_) => Err(KvError::Deserialization),
-        }
+        let tree = read_shard_vote(&blob).map_err(|_| KvError::Deserialization)?;
+        LocatedTree::from_parts(shard_root, tree)
+            .map(Some)
+            .map_err(|_| KvError::Deserialization)
     }
 
     fn last_shard(&self) -> Result<Option<LocatedPrunableTree<MerkleHashVote>>, KvError> {
         let prefix = [SHARD_PREFIX];
-        let mut iter = self.cb.iter(&prefix, true /* reverse */);
-        let Some((key, val)) = iter.next() else {
-            return Ok(None);
-        };
-        if key.len() < 9 {
-            return Ok(None);
+        let mut iter = self.cb.iter(&prefix, true /* reverse */)?;
+        while let Some((key, value)) = iter.next()? {
+            let Some(index) = parse_shard_key(&key) else {
+                continue;
+            };
+            let address = Address::from_parts(Level::from(SHARD_HEIGHT), index);
+            let tree = read_shard_vote(&value).map_err(|_| KvError::Deserialization)?;
+            return LocatedTree::from_parts(address, tree)
+                .map(Some)
+                .map_err(|_| KvError::Deserialization);
         }
-        let idx = u64::from_be_bytes(key[1..9].try_into().unwrap());
-        let level = Level::from(SHARD_HEIGHT);
-        let addr = Address::from_parts(level, idx);
-        match read_shard_vote(&val) {
-            Ok(tree) => Ok(LocatedTree::from_parts(addr, tree).ok()),
-            Err(_) => Err(KvError::Deserialization),
-        }
+        Ok(None)
     }
 
     fn put_shard(&mut self, subtree: LocatedPrunableTree<MerkleHashVote>) -> Result<(), KvError> {
@@ -378,29 +427,23 @@ impl ShardStore for KvShardStore {
 
     fn get_shard_roots(&self) -> Result<Vec<Address>, KvError> {
         let prefix = [SHARD_PREFIX];
-        let mut iter = self.cb.iter(&prefix, false);
+        let mut iter = self.cb.iter(&prefix, false)?;
         let level = Level::from(SHARD_HEIGHT);
         let mut roots = Vec::new();
-        while let Some((key, _)) = iter.next() {
-            if key.len() < 9 {
-                continue;
+        while let Some((key, _)) = iter.next()? {
+            if let Some(index) = parse_shard_key(&key) {
+                roots.push(Address::from_parts(level, index));
             }
-            let idx = u64::from_be_bytes(key[1..9].try_into().unwrap());
-            roots.push(Address::from_parts(level, idx));
         }
         Ok(roots)
     }
 
     fn truncate_shards(&mut self, shard_index: u64) -> Result<(), KvError> {
         let prefix = [SHARD_PREFIX];
-        let mut iter = self.cb.iter(&prefix, false);
+        let mut iter = self.cb.iter(&prefix, false)?;
         let mut to_delete = Vec::new();
-        while let Some((key, _)) = iter.next() {
-            if key.len() < 9 {
-                continue;
-            }
-            let idx = u64::from_be_bytes(key[1..9].try_into().unwrap());
-            if idx >= shard_index {
+        while let Some((key, _)) = iter.next()? {
+            if parse_shard_key(&key).is_some_and(|index| index >= shard_index) {
                 to_delete.push(key);
             }
         }
@@ -426,27 +469,11 @@ impl ShardStore for KvShardStore {
     }
 
     fn min_checkpoint_id(&self) -> Result<Option<u32>, KvError> {
-        let prefix = [CHECKPOINT_PREFIX];
-        let mut iter = self.cb.iter(&prefix, false);
-        Ok(iter.next().and_then(|(k, _)| {
-            if k.len() >= 5 {
-                Some(u32::from_be_bytes(k[1..5].try_into().unwrap()))
-            } else {
-                None
-            }
-        }))
+        Ok(self.checkpoints()?.first().map(|(id, _)| *id))
     }
 
     fn max_checkpoint_id(&self) -> Result<Option<u32>, KvError> {
-        let prefix = [CHECKPOINT_PREFIX];
-        let mut iter = self.cb.iter(&prefix, true /* reverse */);
-        Ok(iter.next().and_then(|(k, _)| {
-            if k.len() >= 5 {
-                Some(u32::from_be_bytes(k[1..5].try_into().unwrap()))
-            } else {
-                None
-            }
-        }))
+        Ok(self.checkpoints()?.last().map(|(id, _)| *id))
     }
 
     fn add_checkpoint(
@@ -460,33 +487,14 @@ impl ShardStore for KvShardStore {
     }
 
     fn checkpoint_count(&self) -> Result<usize, KvError> {
-        let prefix = [CHECKPOINT_PREFIX];
-        let mut iter = self.cb.iter(&prefix, false);
-        let mut count = 0usize;
-        while iter.next().is_some() {
-            count += 1;
-        }
-        Ok(count)
+        Ok(self.checkpoints()?.len())
     }
 
     fn get_checkpoint_at_depth(
         &self,
         checkpoint_depth: usize,
     ) -> Result<Option<(u32, Checkpoint)>, KvError> {
-        let prefix = [CHECKPOINT_PREFIX];
-        let mut iter = self.cb.iter(&prefix, true /* reverse */);
-        let mut seen = 0usize;
-        while let Some((key, val)) = iter.next() {
-            if seen == checkpoint_depth {
-                if key.len() < 5 {
-                    return Ok(None);
-                }
-                let id = u32::from_be_bytes(key[1..5].try_into().unwrap());
-                return Ok(read_checkpoint(&val).ok().map(|cp| (id, cp)));
-            }
-            seen += 1;
-        }
-        Ok(None)
+        Ok(self.checkpoints()?.into_iter().rev().nth(checkpoint_depth))
     }
 
     fn get_checkpoint(&self, checkpoint_id: &u32) -> Result<Option<Checkpoint>, KvError> {
@@ -494,28 +502,17 @@ impl ShardStore for KvShardStore {
         let Some(blob) = self.cb.get(&key)? else {
             return Ok(None);
         };
-        Ok(read_checkpoint(&blob).ok())
+        read_checkpoint(&blob)
+            .map(Some)
+            .map_err(|_| KvError::Deserialization)
     }
 
     fn with_checkpoints<F>(&mut self, limit: usize, mut callback: F) -> Result<(), KvError>
     where
         F: FnMut(&u32, &Checkpoint) -> Result<(), KvError>,
     {
-        let prefix = [CHECKPOINT_PREFIX];
-        let mut iter = self.cb.iter(&prefix, false);
-        let mut count = 0usize;
-        while count < limit {
-            let Some((key, val)) = iter.next() else {
-                break;
-            };
-            if key.len() < 5 {
-                continue;
-            }
-            let id = u32::from_be_bytes(key[1..5].try_into().unwrap());
-            if let Ok(cp) = read_checkpoint(&val) {
-                callback(&id, &cp)?;
-            }
-            count += 1;
+        for (id, checkpoint) in self.checkpoints()?.into_iter().take(limit) {
+            callback(&id, &checkpoint)?;
         }
         Ok(())
     }
@@ -524,21 +521,8 @@ impl ShardStore for KvShardStore {
     where
         F: FnMut(&u32, &Checkpoint) -> Result<(), KvError>,
     {
-        let prefix = [CHECKPOINT_PREFIX];
-        let mut iter = self.cb.iter(&prefix, false);
-        let mut count = 0usize;
-        while count < limit {
-            let Some((key, val)) = iter.next() else {
-                break;
-            };
-            if key.len() < 5 {
-                continue;
-            }
-            let id = u32::from_be_bytes(key[1..5].try_into().unwrap());
-            if let Ok(cp) = read_checkpoint(&val) {
-                callback(&id, &cp)?;
-            }
-            count += 1;
+        for (id, checkpoint) in self.checkpoints()?.into_iter().take(limit) {
+            callback(&id, &checkpoint)?;
         }
         Ok(())
     }
@@ -551,9 +535,7 @@ impl ShardStore for KvShardStore {
         let Some(blob) = self.cb.get(&key)? else {
             return Ok(false);
         };
-        let Ok(mut cp) = read_checkpoint(&blob) else {
-            return Ok(false);
-        };
+        let mut cp = read_checkpoint(&blob).map_err(|_| KvError::Deserialization)?;
         update(&mut cp)?;
         let new_blob = write_checkpoint(&cp);
         self.cb.set(&key, &new_blob)?;
@@ -577,32 +559,25 @@ impl ShardStore for KvShardStore {
 
     fn retained_checkpoints(&self) -> Result<BTreeSet<u32>, KvError> {
         let prefix = [RETAINED_CHECKPOINT_PREFIX];
-        let mut iter = self.cb.iter(&prefix, false);
+        let mut iter = self.cb.iter(&prefix, false)?;
         let mut checkpoints = BTreeSet::new();
-        while let Some((key, _)) = iter.next() {
-            if key.len() < 5 {
-                continue;
+        while let Some((key, _)) = iter.next()? {
+            if let Some(id) = parse_retained_checkpoint_key(&key) {
+                checkpoints.insert(id);
             }
-            checkpoints.insert(u32::from_be_bytes(key[1..5].try_into().unwrap()));
         }
         Ok(checkpoints)
     }
 
     fn truncate_checkpoints_retaining(&mut self, checkpoint_id: &u32) -> Result<(), KvError> {
-        // Delete all checkpoints with id < checkpoint_id; clear marks_removed
+        // Delete all checkpoints with id > checkpoint_id; clear marks_removed
         // on the retained checkpoint itself (matches MemoryShardStore semantics).
         let prefix = [CHECKPOINT_PREFIX];
-        let mut iter = self.cb.iter(&prefix, false);
+        let mut iter = self.cb.iter(&prefix, false)?;
         let mut to_delete = Vec::new();
-        while let Some((key, _)) = iter.next() {
-            if key.len() < 5 {
-                continue;
-            }
-            let id = u32::from_be_bytes(key[1..5].try_into().unwrap());
-            if id < *checkpoint_id {
+        while let Some((key, _)) = iter.next()? {
+            if parse_checkpoint_key(&key).is_some_and(|id| id > *checkpoint_id) {
                 to_delete.push(key);
-            } else {
-                break;
             }
         }
         drop(iter);
@@ -612,11 +587,312 @@ impl ShardStore for KvShardStore {
         // Clear marks_removed on the retaining checkpoint.
         let retain_key = checkpoint_key(*checkpoint_id);
         if let Some(blob) = self.cb.get(&retain_key)? {
-            if let Ok(cp) = read_checkpoint(&blob) {
-                let cleared = Checkpoint::from_parts(cp.tree_state(), BTreeSet::new());
-                self.cb.set(&retain_key, &write_checkpoint(&cleared))?;
-            }
+            let checkpoint = read_checkpoint(&blob).map_err(|_| KvError::Deserialization)?;
+            let cleared = Checkpoint::from_parts(checkpoint.tree_state(), BTreeSet::new());
+            self.cb.set(&retain_key, &write_checkpoint(&cleared))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::ptr;
+
+    use shardtree::{
+        error::ShardTreeError,
+        store::{Checkpoint, ShardStore},
+        PrunableTree, Tree,
+    };
+
+    use super::*;
+    use crate::{server::TreeServer, SyncableServer, TreeSyncApi};
+
+    #[derive(Default)]
+    struct TestKv {
+        entries: BTreeMap<Vec<u8>, Vec<u8>>,
+        fail_get: bool,
+        fail_iter_create: bool,
+        fail_iter_at: Option<usize>,
+    }
+
+    struct TestIter {
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+        index: usize,
+        fail_at: Option<usize>,
+    }
+
+    unsafe fn write_buffer(bytes: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) -> bool {
+        *out_len = bytes.len();
+        if bytes.is_empty() {
+            *out_ptr = ptr::null_mut();
+            return true;
+        }
+
+        let allocated = libc::malloc(bytes.len()).cast::<u8>();
+        if allocated.is_null() {
+            return false;
+        }
+        ptr::copy_nonoverlapping(bytes.as_ptr(), allocated, bytes.len());
+        *out_ptr = allocated;
+        true
+    }
+
+    unsafe extern "C" fn test_get(
+        ctx: *mut c_void,
+        key: *const u8,
+        key_len: usize,
+        out_val: *mut *mut u8,
+        out_val_len: *mut usize,
+    ) -> i32 {
+        let store = &mut *ctx.cast::<TestKv>();
+        if store.fail_get {
+            return -1;
+        }
+        let key = std::slice::from_raw_parts(key, key_len);
+        match store.entries.get(key) {
+            Some(value) if write_buffer(value, out_val, out_val_len) => 0,
+            Some(_) => -1,
+            None => 1,
+        }
+    }
+
+    unsafe extern "C" fn test_set(
+        ctx: *mut c_void,
+        key: *const u8,
+        key_len: usize,
+        value: *const u8,
+        value_len: usize,
+    ) -> i32 {
+        let store = &mut *ctx.cast::<TestKv>();
+        let key = std::slice::from_raw_parts(key, key_len).to_vec();
+        let value = std::slice::from_raw_parts(value, value_len).to_vec();
+        store.entries.insert(key, value);
+        0
+    }
+
+    unsafe extern "C" fn test_delete(ctx: *mut c_void, key: *const u8, key_len: usize) -> i32 {
+        let store = &mut *ctx.cast::<TestKv>();
+        let key = std::slice::from_raw_parts(key, key_len);
+        store.entries.remove(key);
+        0
+    }
+
+    unsafe extern "C" fn test_iter_create(
+        ctx: *mut c_void,
+        prefix: *const u8,
+        prefix_len: usize,
+        reverse: u8,
+    ) -> *mut c_void {
+        let store = &mut *ctx.cast::<TestKv>();
+        if store.fail_iter_create {
+            return ptr::null_mut();
+        }
+        let prefix = std::slice::from_raw_parts(prefix, prefix_len);
+        let mut entries = store
+            .entries
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        if reverse != 0 {
+            entries.reverse();
+        }
+        Box::into_raw(Box::new(TestIter {
+            entries,
+            index: 0,
+            fail_at: store.fail_iter_at,
+        }))
+        .cast()
+    }
+
+    unsafe extern "C" fn test_iter_next(
+        iter: *mut c_void,
+        out_key: *mut *mut u8,
+        out_key_len: *mut usize,
+        out_val: *mut *mut u8,
+        out_val_len: *mut usize,
+    ) -> i32 {
+        let iter = &mut *iter.cast::<TestIter>();
+        if iter.fail_at == Some(iter.index) {
+            return -1;
+        }
+        let Some((key, value)) = iter.entries.get(iter.index) else {
+            return 1;
+        };
+        if !write_buffer(key, out_key, out_key_len) || !write_buffer(value, out_val, out_val_len) {
+            return -1;
+        }
+        iter.index += 1;
+        0
+    }
+
+    unsafe extern "C" fn test_iter_free(iter: *mut c_void) {
+        drop(Box::from_raw(iter.cast::<TestIter>()));
+    }
+
+    unsafe extern "C" fn test_free_buffer(buffer: *mut u8, _len: usize) {
+        if !buffer.is_null() {
+            libc::free(buffer.cast());
+        }
+    }
+
+    fn callbacks(store: &mut TestKv) -> KvCallbacks {
+        KvCallbacks {
+            ctx: (store as *mut TestKv).cast(),
+            get: test_get,
+            set: test_set,
+            delete: test_delete,
+            iter_create: test_iter_create,
+            iter_next: test_iter_next,
+            iter_free: test_iter_free,
+            free_buf: test_free_buffer,
+        }
+    }
+
+    fn insert_checkpoint(store: &mut TestKv, id: u32) {
+        store.entries.insert(
+            checkpoint_key(id).to_vec(),
+            write_checkpoint(&Checkpoint::tree_empty()),
+        );
+    }
+
+    #[test]
+    fn iterator_creation_failure_is_not_an_empty_checkpoint_set() {
+        let mut state = TestKv {
+            fail_iter_create: true,
+            ..TestKv::default()
+        };
+        let store = KvShardStore::new(callbacks(&mut state));
+
+        assert_eq!(store.max_checkpoint_id(), Err(KvError::IoError));
+        assert!(matches!(
+            TreeServer::new(callbacks(&mut state), 0),
+            Err(KvError::IoError)
+        ));
+    }
+
+    #[test]
+    fn iterator_advance_failure_aborts_checkpoint_scans() {
+        let mut state = TestKv {
+            fail_iter_at: Some(1),
+            ..TestKv::default()
+        };
+        insert_checkpoint(&mut state, 4);
+        insert_checkpoint(&mut state, 9);
+        let store = KvShardStore::new(callbacks(&mut state));
+
+        assert_eq!(store.checkpoint_count(), Err(KvError::IoError));
+        assert_eq!(store.max_checkpoint_id(), Err(KvError::IoError));
+    }
+
+    #[test]
+    fn iterator_failure_does_not_partially_truncate_checkpoints() {
+        let mut state = TestKv {
+            fail_iter_at: Some(1),
+            ..TestKv::default()
+        };
+        insert_checkpoint(&mut state, 1);
+        insert_checkpoint(&mut state, 2);
+        insert_checkpoint(&mut state, 3);
+        let mut store = KvShardStore::new(callbacks(&mut state));
+
+        assert_eq!(
+            store.truncate_checkpoints_retaining(&0),
+            Err(KvError::IoError)
+        );
+        assert!(state.entries.contains_key(checkpoint_key(1).as_slice()));
+        assert!(state.entries.contains_key(checkpoint_key(2).as_slice()));
+        assert!(state.entries.contains_key(checkpoint_key(3).as_slice()));
+    }
+
+    #[test]
+    fn checkpoint_truncation_discards_only_newer_checkpoints() {
+        let mut state = TestKv::default();
+        insert_checkpoint(&mut state, 1);
+        insert_checkpoint(&mut state, 2);
+        insert_checkpoint(&mut state, 3);
+        let mut store = KvShardStore::new(callbacks(&mut state));
+
+        store.truncate_checkpoints_retaining(&2).unwrap();
+
+        assert!(state.entries.contains_key(checkpoint_key(1).as_slice()));
+        assert!(state.entries.contains_key(checkpoint_key(2).as_slice()));
+        assert!(!state.entries.contains_key(checkpoint_key(3).as_slice()));
+    }
+
+    #[test]
+    fn checkpoint_discovery_skips_noncanonical_keys_and_finds_the_true_maximum() {
+        let mut state = TestKv::default();
+        state
+            .entries
+            .insert(vec![CHECKPOINT_PREFIX, 0xff], vec![0xff]);
+        state
+            .entries
+            .insert(vec![CHECKPOINT_PREFIX, 0, 0, 0, 99, 0], vec![0xff]);
+        insert_checkpoint(&mut state, 3);
+        insert_checkpoint(&mut state, 11);
+        let store = KvShardStore::new(callbacks(&mut state));
+
+        assert_eq!(store.min_checkpoint_id().unwrap(), Some(3));
+        assert_eq!(store.max_checkpoint_id().unwrap(), Some(11));
+        assert_eq!(store.checkpoint_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn corrupt_checkpoint_is_not_reported_as_missing() {
+        let mut state = TestKv::default();
+        state.entries.insert(checkpoint_key(5).to_vec(), vec![0xff]);
+        let store = KvShardStore::new(callbacks(&mut state));
+
+        assert!(matches!(
+            store.get_checkpoint(&5),
+            Err(KvError::Deserialization)
+        ));
+        assert_eq!(store.max_checkpoint_id(), Err(KvError::Deserialization));
+    }
+
+    #[test]
+    fn invalid_shard_location_is_not_reported_as_missing() {
+        let mut state = TestKv::default();
+        let mut tree: PrunableTree<MerkleHashVote> = Tree::empty();
+        for _ in 0..=SHARD_HEIGHT {
+            tree = Tree::parent(None, tree, Tree::empty());
+        }
+        state
+            .entries
+            .insert(shard_key(0).to_vec(), write_shard_vote(&tree).unwrap());
+        let store = KvShardStore::new(callbacks(&mut state));
+        let address = Address::from_parts(Level::from(SHARD_HEIGHT), 0);
+
+        assert_eq!(store.get_shard(address), Err(KvError::Deserialization));
+    }
+
+    #[test]
+    fn tree_queries_propagate_checkpoint_storage_failure() {
+        let mut state = TestKv::default();
+        insert_checkpoint(&mut state, 7);
+        let tree = TreeServer::new(callbacks(&mut state), 0).unwrap();
+        state.fail_get = true;
+
+        assert!(matches!(
+            tree.root(),
+            Err(ShardTreeError::Storage(KvError::IoError))
+        ));
+        assert!(matches!(
+            tree.root_at_height(7),
+            Err(ShardTreeError::Storage(KvError::IoError))
+        ));
+        assert!(matches!(
+            tree.path(0, 7),
+            Err(ShardTreeError::Storage(KvError::IoError))
+        ));
+
+        let syncable = SyncableServer::new(tree);
+        assert!(matches!(
+            syncable.get_tree_state(),
+            Err(ShardTreeError::Storage(KvError::IoError))
+        ));
     }
 }

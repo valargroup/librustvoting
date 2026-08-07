@@ -9,6 +9,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ### Changed
 - Changed vote-share wire JSON to include only the encrypted share assigned to
   the receiving helper. The `all_enc_shares` field is no longer serialized.
+- KV-backed tree construction and query APIs now preserve storage and query
+  errors so callers can handle unavailable state explicitly.
+
+### Fixed
+- Hardened KV-backed shard and checkpoint scans by validating persisted entries
+  and distinguishing iterator completion from callback errors.
+- Aligned checkpoint rewind behavior with `MemoryShardStore` and left sync
+  bookkeeping unchanged when `ShardTree` declines a checkpoint.
 
 ## v2.0.0-rc.3
 

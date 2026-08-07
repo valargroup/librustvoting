@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use incrementalmerkletree::{Hashable, Level, Retention};
 use pasta_curves::{group::ff::PrimeField, Fp};
 use shardtree::{
-    error::ShardTreeError,
+    error::{QueryError, ShardTreeError},
     store::{memory::MemoryShardStore, ShardStore},
     ShardTree,
 };
@@ -139,7 +139,7 @@ pub enum CheckpointError<E> {
     /// The requested checkpoint height is not strictly greater than the most
     /// recently recorded one. Checkpoint IDs must increase monotonically.
     NotMonotonic { prev: u32, requested: u32 },
-    /// The underlying [`ShardTree`] rejected the checkpoint (storage error).
+    /// The underlying [`ShardTree`] checkpoint or root query failed.
     Tree(ShardTreeError<E>),
 }
 
@@ -175,17 +175,16 @@ impl TreeServer {
     /// boot). On a cold start, `latest_checkpoint` is initialised from the
     /// maximum checkpoint ID persisted in the KV store, so that `root()`
     /// returns the correct value even before the first checkpoint after restart.
-    pub fn new(cb: KvCallbacks, next_position: u64) -> Self {
+    ///
+    /// Returns an error if persisted checkpoint discovery fails.
+    pub fn new(cb: KvCallbacks, next_position: u64) -> Result<Self, KvError> {
         let store = KvShardStore::new(cb);
-        // Initialise latest_checkpoint from the KV store before handing the
-        // store to ShardTree (which takes ownership). Errors are treated as
-        // "no checkpoint" — the tree will re-checkpoint on the next append.
-        let latest_checkpoint = store.max_checkpoint_id().unwrap_or(None);
-        Self {
+        let latest_checkpoint = store.max_checkpoint_id()?;
+        Ok(Self {
             inner: ShardTree::new(store, MAX_CHECKPOINTS),
             latest_checkpoint,
             next_position,
-        }
+        })
     }
 }
 
@@ -226,6 +225,34 @@ impl TreeServer {
         Ok(())
     }
 
+    /// Current Merkle root at the latest checkpoint.
+    ///
+    /// Returns an error if persisted tree state cannot be read or is incomplete.
+    pub fn root(&self) -> Result<Fp, ShardTreeError<KvError>> {
+        self.try_root()
+    }
+
+    /// Root at a specific checkpoint height.
+    ///
+    /// Returns `Ok(None)` if the checkpoint does not exist.
+    /// Returns an error if persisted tree state cannot be read or is incomplete.
+    pub fn root_at_height(&self, height: u32) -> Result<Option<Fp>, ShardTreeError<KvError>> {
+        self.try_root_at_height(height)
+    }
+
+    /// Build a Merkle path for a leaf at a checkpoint height.
+    ///
+    /// Returns `Ok(None)` if the checkpoint does not exist.
+    /// Returns an error if persisted tree state cannot be read or the requested
+    /// position is not contained in the checkpointed tree.
+    pub fn path(
+        &self,
+        position: u64,
+        anchor_height: u32,
+    ) -> Result<Option<MerklePath>, ShardTreeError<KvError>> {
+        self.try_path(position, anchor_height)
+    }
+
     /// KV key for an app-level commitment leaf: `0x02 || u64 BE index`.
     ///
     /// Matches `types.CommitmentLeafKey(index)` in keys.go.
@@ -253,6 +280,27 @@ impl SyncableServer<MemoryShardStore<MerkleHashVote, u32>> {
             blocks: BTreeMap::new(),
             pending_leaves: Vec::new(),
             pending_start: 0,
+        }
+    }
+
+    /// Current Merkle root at the latest checkpoint.
+    pub fn root(&self) -> Fp {
+        self.try_root()
+            .expect("in-memory vote tree root lookup must succeed")
+    }
+
+    /// Root at a specific checkpoint height.
+    pub fn root_at_height(&self, height: u32) -> Option<Fp> {
+        self.try_root_at_height(height)
+            .expect("in-memory vote tree root lookup must succeed")
+    }
+
+    /// Build a Merkle path for a leaf at a checkpoint height.
+    pub fn path(&self, position: u64, anchor_height: u32) -> Option<MerklePath> {
+        match self.try_path(position, anchor_height) {
+            Ok(path) => path,
+            Err(ShardTreeError::Query(_) | ShardTreeError::Insert(_)) => None,
+            Err(ShardTreeError::Storage(error)) => match error {},
         }
     }
 }
@@ -296,11 +344,12 @@ where
     /// # Errors
     /// Returns [`CheckpointError::NotMonotonic`] if `height` is not strictly
     /// greater than the previous checkpoint height.
+    /// Returns [`CheckpointError::Tree`] if checkpointing or root lookup fails.
     pub fn checkpoint(&mut self, height: u32) -> Result<(), CheckpointError<S::Error>> {
         self.tree.checkpoint(height)?;
         let root = self
-            .root_at_height(height)
-            .unwrap_or_else(|| self.tree.root());
+            .try_root_at_height(height)?
+            .ok_or(ShardTreeError::Query(QueryError::CheckpointPruned))?;
         let commitments = BlockCommitments {
             height,
             start_index: self.pending_start,
@@ -312,14 +361,19 @@ where
         Ok(())
     }
 
-    /// Current Merkle root (at the latest checkpoint).
-    pub fn root(&self) -> Fp {
-        self.tree.root()
+    /// Current Merkle root at the latest checkpoint.
+    ///
+    /// Returns an error if the backing store cannot be read or the tree is incomplete.
+    pub fn try_root(&self) -> Result<Fp, ShardTreeError<S::Error>> {
+        self.tree.try_root()
     }
 
     /// Root at a specific checkpoint height.
-    pub fn root_at_height(&self, height: u32) -> Option<Fp> {
-        self.tree.root_at_height(height)
+    ///
+    /// Returns `Ok(None)` if the checkpoint does not exist, or an error if the
+    /// backing store cannot be read or the tree is incomplete.
+    pub fn try_root_at_height(&self, height: u32) -> Result<Option<Fp>, ShardTreeError<S::Error>> {
+        self.tree.try_root_at_height(height)
     }
 
     /// Number of leaves appended.
@@ -328,8 +382,15 @@ where
     }
 
     /// Build a Merkle path for the leaf at `position` at `anchor_height`.
-    pub fn path(&self, position: u64, anchor_height: u32) -> Option<MerklePath> {
-        self.tree.path(position, anchor_height)
+    ///
+    /// Returns `Ok(None)` if the checkpoint does not exist, or an error if the
+    /// backing store cannot be read or the position is not contained in the tree.
+    pub fn try_path(
+        &self,
+        position: u64,
+        anchor_height: u32,
+    ) -> Result<Option<MerklePath>, ShardTreeError<S::Error>> {
+        self.tree.try_path(position, anchor_height)
     }
 
     /// Latest checkpoint height.
@@ -386,34 +447,44 @@ where
                 });
             }
         }
-        self.inner.checkpoint(height)?;
+        if !self.inner.checkpoint(height)? {
+            let prev = self
+                .inner
+                .store()
+                .max_checkpoint_id()
+                .map_err(|error| CheckpointError::Tree(ShardTreeError::Storage(error)))?
+                .unwrap_or(height);
+            return Err(CheckpointError::NotMonotonic {
+                prev,
+                requested: height,
+            });
+        }
         self.latest_checkpoint = Some(height);
         Ok(())
     }
 
-    /// Current Merkle root (at the latest checkpoint).
-    pub fn root(&self) -> Fp {
+    /// Current Merkle root at the latest checkpoint.
+    ///
+    /// Returns an error if persisted tree state cannot be read or is incomplete.
+    pub fn try_root(&self) -> Result<Fp, ShardTreeError<S::Error>> {
         if let Some(id) = self.latest_checkpoint {
             self.inner
-                .root_at_checkpoint_id(&id)
-                .ok()
-                .flatten()
-                .map(|h| h.0)
-                .unwrap_or_else(|| MerkleHashVote::empty_root(Level::from(TREE_DEPTH as u8)).0)
+                .root_at_checkpoint_id(&id)?
+                .map(|hash| hash.0)
+                .ok_or_else(|| ShardTreeError::Query(QueryError::CheckpointPruned))
         } else {
-            MerkleHashVote::empty_root(Level::from(TREE_DEPTH as u8)).0
+            Ok(MerkleHashVote::empty_root(Level::from(TREE_DEPTH as u8)).0)
         }
     }
 
     /// Root at a specific checkpoint height (anchor lookup).
     ///
-    /// Returns `None` if the checkpoint does not exist.
-    pub fn root_at_height(&self, height: u32) -> Option<Fp> {
+    /// Returns `Ok(None)` if the checkpoint does not exist.
+    /// Returns an error if persisted tree state cannot be read or is incomplete.
+    pub fn try_root_at_height(&self, height: u32) -> Result<Option<Fp>, ShardTreeError<S::Error>> {
         self.inner
             .root_at_checkpoint_id(&height)
-            .ok()
-            .flatten()
-            .map(|h| h.0)
+            .map(|root| root.map(|hash| hash.0))
     }
 
     /// Number of leaves appended.
@@ -430,13 +501,49 @@ where
     /// Build a Merkle path for the leaf at `position`, valid at the given
     /// checkpoint `anchor_height`.
     ///
-    /// Returns `None` if the position or checkpoint is invalid.
-    pub fn path(&self, position: u64, anchor_height: u32) -> Option<MerklePath> {
+    /// Returns `Ok(None)` if the checkpoint does not exist. Returns an error if
+    /// persisted tree state cannot be read or `position` is not contained in
+    /// the checkpointed tree.
+    pub fn try_path(
+        &self,
+        position: u64,
+        anchor_height: u32,
+    ) -> Result<Option<MerklePath>, ShardTreeError<S::Error>> {
         let pos = incrementalmerkletree::Position::from(position);
         self.inner
             .witness_at_checkpoint_id(pos, &anchor_height)
-            .ok()
-            .flatten()
-            .map(MerklePath::from)
+            .map(|path| path.map(MerklePath::from))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pasta_curves::Fp;
+
+    use super::{CheckpointError, MemoryTreeServer};
+
+    #[test]
+    fn rejected_checkpoint_does_not_advance_sync_bookkeeping() {
+        let mut server = MemoryTreeServer::empty();
+        server.append(Fp::from(1)).unwrap();
+        server.checkpoint(5).unwrap();
+        server.append(Fp::from(2)).unwrap();
+
+        // Simulate stale restart metadata while the backing store still has
+        // checkpoint 5. ShardTree rejects the duplicate by returning false.
+        server.tree.latest_checkpoint = None;
+        let error = server.checkpoint(5).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CheckpointError::NotMonotonic {
+                prev: 5,
+                requested: 5
+            }
+        ));
+        assert_eq!(server.pending_leaves.len(), 1);
+
+        server.checkpoint(6).unwrap();
+        assert_eq!(server.blocks.get(&6).unwrap().leaves.len(), 1);
     }
 }

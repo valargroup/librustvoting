@@ -8,10 +8,8 @@
 //! For the production incremental path use [`crate::server::TreeServer`]
 //! backed by [`crate::kv_shard_store::KvShardStore`].
 
-use std::convert::Infallible;
-
 use pasta_curves::Fp;
-use shardtree::store::ShardStore;
+use shardtree::{error::ShardTreeError, store::ShardStore};
 
 use crate::hash::MerkleHashVote;
 use crate::server::SyncableServer;
@@ -26,15 +24,13 @@ where
     S: ShardStore<H = MerkleHashVote, CheckpointId = u32>,
     S::Error: std::fmt::Debug,
 {
-    /// `SyncableServer` never fails when serving sync data — the `blocks` map
-    /// is an in-memory `BTreeMap` and all root lookups are infallible.
-    type Error = Infallible;
+    type Error = ShardTreeError<S::Error>;
 
     fn get_block_commitments(
         &self,
         from_height: u32,
         to_height: u32,
-    ) -> Result<BlockCommitmentsPage, Infallible> {
+    ) -> Result<BlockCommitmentsPage, Self::Error> {
         let blocks = self
             .blocks
             .range(from_height..=to_height)
@@ -46,14 +42,14 @@ where
         })
     }
 
-    fn get_root_at_height(&self, height: u32) -> Result<Option<Fp>, Infallible> {
-        Ok(self.root_at_height(height))
+    fn get_root_at_height(&self, height: u32) -> Result<Option<Fp>, Self::Error> {
+        self.try_root_at_height(height)
     }
 
-    fn get_tree_state(&self) -> Result<TreeState, Infallible> {
+    fn get_tree_state(&self) -> Result<TreeState, Self::Error> {
         Ok(TreeState {
             next_index: self.size(),
-            root: self.root(),
+            root: self.try_root()?,
             height: self.latest_checkpoint().unwrap_or(0),
         })
     }
