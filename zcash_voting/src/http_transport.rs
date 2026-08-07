@@ -3,7 +3,7 @@ use std::{future::Future, sync::OnceLock};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::{Method, Request};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::HttpsConnector;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -12,6 +12,11 @@ use hyper_util::{
 
 type RequestBody = Full<Bytes>;
 type HyperClient = Client<HttpsConnector<HttpConnector>, RequestBody>;
+
+// PIR responses are normally below 1 MiB after layout validation. Keep a
+// generous fixed ceiling in the built-in transport so a server cannot force an
+// unbounded allocation before the client validates the negotiated geometry.
+const MAX_PIR_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 struct HyperResponse {
     status: u16,
@@ -46,7 +51,13 @@ impl HyperTransport {
         Self { client, runtime }
     }
 
-    async fn request(&self, method: Method, url: &str, body: Vec<u8>) -> Result<HyperResponse> {
+    async fn request(
+        &self,
+        method: Method,
+        url: &str,
+        body: Vec<u8>,
+        max_response_bytes: Option<usize>,
+    ) -> Result<HyperResponse> {
         let request = Request::builder()
             .method(method)
             .uri(url)
@@ -68,13 +79,23 @@ impl HyperTransport {
                     .map(|value| (name.as_str().to_string(), value.to_string()))
             })
             .collect();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .context("read HTTP response body")?
-            .to_bytes()
-            .to_vec();
+        let body = match max_response_bytes {
+            Some(limit) => Limited::new(response.into_body(), limit)
+                .collect()
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("read HTTP response body (limit {limit} bytes): {error}")
+                })?
+                .to_bytes()
+                .to_vec(),
+            None => response
+                .into_body()
+                .collect()
+                .await
+                .context("read HTTP response body")?
+                .to_bytes()
+                .to_vec(),
+        };
 
         Ok(HyperResponse {
             status,
@@ -132,7 +153,7 @@ impl Drop for BlockingRuntime {
 impl pir_client::Transport for HyperTransport {
     fn get<'a>(&'a self, url: &'a str) -> pir_client::TransportFuture<'a> {
         Box::pin(async move {
-            self.request(Method::GET, url, Vec::new())
+            self.request(Method::GET, url, Vec::new(), Some(MAX_PIR_RESPONSE_BYTES))
                 .await
                 .map(|response| pir_client::TransportResponse {
                     status: response.status,
@@ -144,13 +165,13 @@ impl pir_client::Transport for HyperTransport {
 
     fn post<'a>(&'a self, url: &'a str, body: Vec<u8>) -> pir_client::TransportFuture<'a> {
         Box::pin(async move {
-            self.request(Method::POST, url, body).await.map(|response| {
-                pir_client::TransportResponse {
+            self.request(Method::POST, url, body, Some(MAX_PIR_RESPONSE_BYTES))
+                .await
+                .map(|response| pir_client::TransportResponse {
                     status: response.status,
                     headers: response.headers,
                     body: response.body,
-                }
-            })
+                })
         })
     }
 }
@@ -164,7 +185,7 @@ impl vote_commitment_tree_client::transport::Transport for HyperTransport {
         vote_commitment_tree_client::transport::TransportError,
     > {
         self.runtime
-            .block_on(async { self.request(Method::GET, url, Vec::new()).await })
+            .block_on(async { self.request(Method::GET, url, Vec::new(), None).await })
             .map(
                 |response| vote_commitment_tree_client::transport::TransportResponse {
                     status: response.status,

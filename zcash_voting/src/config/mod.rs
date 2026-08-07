@@ -78,6 +78,11 @@ const VOTE_SERVER_VERSION_V1: &str = "v1";
 const ROUND_PARAM_BYTE_LEN: usize = 32;
 // Keep aligned with `imt_tree::tree::TREE_DEPTH` (nullifier IMT depth).
 const MAX_PIR_CIRCUIT_DEPTH: u32 = 29;
+// These limits are deliberately generous compared with supported depth-19
+// splits. They leave ample headroom for future layouts while protecting clients
+// from the worst-case exponential tier allocations.
+const MAX_PIR_TIER0_BYTES: usize = 7_864_000;
+const MAX_PIR_TIER1_ROW_BYTES: usize = 2_457_600;
 
 /// Versions of each voting-protocol component implemented by this crate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -691,6 +696,18 @@ pub(crate) fn validate_and_convert_pir_layout(
         })?,
     };
     negotiated.validate_ypir_bounds()?;
+    let tier0_bytes = negotiated.tier0_bytes()?;
+    if tier0_bytes > MAX_PIR_TIER0_BYTES {
+        return Err(format!(
+            "pir_layout Tier 0 size {tier0_bytes} bytes exceeds client limit {MAX_PIR_TIER0_BYTES}"
+        ));
+    }
+    let tier1_row_bytes = negotiated.tier1_row_bytes()?;
+    if tier1_row_bytes > MAX_PIR_TIER1_ROW_BYTES {
+        return Err(format!(
+            "pir_layout Tier 1 row size {tier1_row_bytes} bytes exceeds client limit {MAX_PIR_TIER1_ROW_BYTES}"
+        ));
+    }
     Ok(negotiated)
 }
 
@@ -1135,6 +1152,55 @@ mod tests {
 
             assert!(matches!(err, VotingConfigError::DecodeFailed { .. }));
             assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn dynamic_resolution_rejects_pir_layouts_exceeding_client_resource_limits() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        for (layout, expected) in [
+            (
+                serde_json::json!({
+                    "pir_depth": 29,
+                    "tier0_layers": 23,
+                    "tier1_layers": 6,
+                }),
+                "Tier 0 size 805306336 bytes exceeds client limit 7864000",
+            ),
+            (
+                serde_json::json!({
+                    "pir_depth": 29,
+                    "tier0_layers": 11,
+                    "tier1_layers": 18,
+                }),
+                "Tier 1 row size 25165824 bytes exceeds client limit 2457600",
+            ),
+        ] {
+            let mut dynamic: serde_json::Value =
+                serde_json::from_slice(&dynamic_bytes(&signing_key)).unwrap();
+            dynamic["pir_layout"] = layout;
+
+            let err = resolve_test_dynamic(&signing_key, &serde_json::to_vec(&dynamic).unwrap())
+                .unwrap_err();
+
+            assert!(matches!(err, VotingConfigError::DecodeFailed { .. }));
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn dynamic_resolution_accepts_layouts_within_client_resource_limits() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        for (tier0_layers, tier1_layers) in [(11, 8), (13, 6), (16, 11)] {
+            let mut dynamic: serde_json::Value =
+                serde_json::from_slice(&dynamic_bytes(&signing_key)).unwrap();
+            dynamic["pir_layout"] = serde_json::json!({
+                "pir_depth": tier0_layers + tier1_layers,
+                "tier0_layers": tier0_layers,
+                "tier1_layers": tier1_layers,
+            });
+
+            resolve_test_dynamic(&signing_key, &serde_json::to_vec(&dynamic).unwrap()).unwrap();
         }
     }
 
