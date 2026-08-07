@@ -1,4 +1,4 @@
-use std::{future::Future, sync::OnceLock};
+use std::{future::Future, sync::OnceLock, time::Duration};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -15,8 +15,10 @@ type HyperClient = Client<HttpsConnector<HttpConnector>, RequestBody>;
 
 // PIR responses are normally below 1 MiB after layout validation. Keep a
 // generous fixed ceiling in the built-in transport so a server cannot force an
-// unbounded allocation before the client validates the negotiated geometry.
+// unbounded allocation before the client validates the negotiated geometry,
+// and bound the complete request so a slow or endless body cannot stall setup.
 const MAX_PIR_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const PIR_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct HyperResponse {
     status: u16,
@@ -153,25 +155,33 @@ impl Drop for BlockingRuntime {
 impl pir_client::Transport for HyperTransport {
     fn get<'a>(&'a self, url: &'a str) -> pir_client::TransportFuture<'a> {
         Box::pin(async move {
-            self.request(Method::GET, url, Vec::new(), Some(MAX_PIR_RESPONSE_BYTES))
-                .await
-                .map(|response| pir_client::TransportResponse {
-                    status: response.status,
-                    headers: response.headers,
-                    body: response.body,
-                })
+            tokio::time::timeout(
+                PIR_REQUEST_TIMEOUT,
+                self.request(Method::GET, url, Vec::new(), Some(MAX_PIR_RESPONSE_BYTES)),
+            )
+            .await
+            .context("PIR HTTP request timed out")?
+            .map(|response| pir_client::TransportResponse {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+            })
         })
     }
 
     fn post<'a>(&'a self, url: &'a str, body: Vec<u8>) -> pir_client::TransportFuture<'a> {
         Box::pin(async move {
-            self.request(Method::POST, url, body, Some(MAX_PIR_RESPONSE_BYTES))
-                .await
-                .map(|response| pir_client::TransportResponse {
-                    status: response.status,
-                    headers: response.headers,
-                    body: response.body,
-                })
+            tokio::time::timeout(
+                PIR_REQUEST_TIMEOUT,
+                self.request(Method::POST, url, body, Some(MAX_PIR_RESPONSE_BYTES)),
+            )
+            .await
+            .context("PIR HTTP request timed out")?
+            .map(|response| pir_client::TransportResponse {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+            })
         })
     }
 }
