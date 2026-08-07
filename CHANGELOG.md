@@ -11,6 +11,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   verifiers derive the signing digest directly instead of receiving it as a
   separate field. The payload excludes PCZT signer metadata, and synthetic
   outputs omit account-scoped outgoing viewing metadata.
+- Changed vote-share wire JSON to include only the encrypted share assigned to
+  the receiving helper. The `all_enc_shares` field is no longer serialized.
 
 ## v2.0.0-rc.3
 
