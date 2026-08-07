@@ -785,13 +785,20 @@ impl VotingDb {
             });
         }
 
+        let expected_nf_imt_root = nullifier_imt_root_to_base(&params.nullifier_imt_root)?;
+        if pir_client.circuit_root() != expected_nf_imt_root {
+            return Err(VotingError::InvalidInput {
+                message: "connected PIR circuit root does not match the stored round nullifier_imt_root"
+                    .to_string(),
+            });
+        }
+
         eprintln!(
             "[ZKP1] Precomputing PIR proofs: {} cached, {} missing",
             cached_count,
             missing.len()
         );
         let missing_nullifiers: Vec<_> = missing.iter().map(|(_, nf)| *nf).collect();
-        let expected_nf_imt_root = nullifier_imt_root_to_base(&params.nullifier_imt_root)?;
         let raw_fetched_proofs =
             pir_client
                 .fetch_proofs(&missing_nullifiers)
@@ -2272,7 +2279,7 @@ mod tests {
             .map(|i| identity_note_with_position(i as u8))
             .collect();
         let mut params = test_params();
-        params.nullifier_imt_root = pallas::Base::from(7u64).to_repr().to_vec();
+        params.nullifier_imt_root = pallas::Base::zero().to_repr().to_vec();
         let db = test_db();
         db.init_round(Network::Testnet, &params, None).unwrap();
         db.ensure_bundles(ROUND_ID, &notes).unwrap();
@@ -2295,6 +2302,40 @@ mod tests {
         );
         assert_eq!(transport.count_hits("/tier1/query"), BUNDLE_NOTE_SLOTS);
         assert_eq!(transport.query_post_count(), BUNDLE_NOTE_SLOTS);
+        transport.assert_no_legacy_tier2_traffic();
+    }
+
+    #[test]
+    fn test_precompute_delegation_pir_rejects_wrong_connected_root_before_queries() {
+        let notes: Vec<NoteInfo> = (0..BUNDLE_NOTE_SLOTS)
+            .map(|i| identity_note_with_position(i as u8))
+            .collect();
+        let mut params = test_params();
+        params.nullifier_imt_root = pallas::Base::from(7u64).to_repr().to_vec();
+        let db = test_db();
+        db.init_round(Network::Testnet, &params, None).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+
+        let transport = std::sync::Arc::new(RecordingPirTransport::new());
+        let pir_client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            pir_types::COMPILED_PIR_LAYOUT,
+            transport.clone(),
+        )
+        .unwrap();
+
+        db.ensure_padded_secrets(ROUND_ID, 0, &notes).unwrap();
+        let err = db
+            .precompute_delegation_pir(ROUND_ID, 0, &notes, &pir_client, Network::Testnet)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "connected PIR circuit root does not match the stored round nullifier_imt_root"
+            ),
+            "{err}"
+        );
+        assert_eq!(transport.query_post_count(), 0);
         transport.assert_no_legacy_tier2_traffic();
     }
 
