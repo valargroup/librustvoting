@@ -8,14 +8,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Changed
 - Aligned nullifier PIR on `pir-client 0.4.0-rc.3` / `pir-types 0.3.0-rc.3`
-  (dataset v2 one-query 12+7 layout). Until published, `[patch.crates-io]`
-  temporarily pins those crates (and `imt-tree`) to git branch
-  `roman/negotiated-tier-pir` on `valargroup/vote-nullifier-pir` (PR 123).
+  (dataset v2 one-query 12+7 layout). Until published, those crates (and
+  `imt-tree`) are patched from vote-nullifier-pir.
 - `pir::connect_pir` / `pir::connect_pir_blocking` now take an explicit
-  `PirLayout` and fail closed on config/server/client layout mismatch before
-  any private query (`VotingError::InvalidInput`). `COMPILED_PIR_LAYOUT` is
-  no longer re-exported from `zcash_voting` / `prelude`; use resolved config
-  `pir_layout` (tests may still import from `pir-types`).
+  `PirLayout` and fail closed on config/server layout mismatch before any
+  private query (`VotingError::InvalidInput`). Clients accept any valid
+  two-tier layout matching `/root` rather than a compiled-layout gate.
+  `COMPILED_PIR_LAYOUT` is no longer re-exported from `zcash_voting` /
+  `prelude`; use resolved config `pir_layout` (tests may still import from
+  `pir-types`).
 - Dynamic voting config now requires top-level `pir_layout` (`pir_depth`,
   `tier0_layers`, `tier1_layers`). `ResolvedVotingConfig` and its wire exports
   expose it; layout changes are same-chain service updates.

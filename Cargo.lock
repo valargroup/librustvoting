@@ -759,7 +759,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1330,7 +1330,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 [[package]]
 name = "imt-tree"
 version = "0.2.0"
-source = "git+https://github.com/valargroup/vote-nullifier-pir?branch=roman%2Fnegotiated-tier-pir#cc83431b34494b64cb1d4d862a097a7714cbac32"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?branch=roman%2Fdynamic-two-tier-pir#7aaeea7a3deeb08221a1c4b3a5f46b18ef8b4c77"
 dependencies = [
  "anyhow",
  "ff",
@@ -1773,7 +1773,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pir-client"
 version = "0.4.0-rc.3"
-source = "git+https://github.com/valargroup/vote-nullifier-pir?branch=roman%2Fnegotiated-tier-pir#cc83431b34494b64cb1d4d862a097a7714cbac32"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?branch=roman%2Fdynamic-two-tier-pir#7aaeea7a3deeb08221a1c4b3a5f46b18ef8b4c77"
 dependencies = [
  "anyhow",
  "ff",
@@ -1791,7 +1791,7 @@ dependencies = [
 [[package]]
 name = "pir-types"
 version = "0.3.0-rc.3"
-source = "git+https://github.com/valargroup/vote-nullifier-pir?branch=roman%2Fnegotiated-tier-pir#cc83431b34494b64cb1d4d862a097a7714cbac32"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?branch=roman%2Fdynamic-two-tier-pir#7aaeea7a3deeb08221a1c4b3a5f46b18ef8b4c77"
 dependencies = [
  "anyhow",
  "ff",
@@ -2133,7 +2133,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2534,7 +2534,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

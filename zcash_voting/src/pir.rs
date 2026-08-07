@@ -3,9 +3,9 @@
 //! Wallets use this module to select an exact-height PIR snapshot endpoint
 //! before delegation PIR precomputation. [`connect_pir_blocking`] /
 //! [`connect_pir`] bind a caller-chosen URL to an explicit [`PirLayout`] for
-//! the three-way config/server/compiled-client handshake. Neither path
-//! hardcodes depth or tier-split constants, and neither checks whether the URL
-//! appears in a resolved config's advertised endpoint list.
+//! the config/server layout handshake. Neither path hardcodes depth or
+//! tier-split constants, and neither checks whether the URL appears in a
+//! resolved config's advertised endpoint list.
 
 use std::sync::Arc;
 
@@ -60,8 +60,8 @@ pub fn negotiated_pir_layout(layout: PirLayout) -> Result<NegotiatedPirLayout, V
 /// Does not check whether `endpoint_url` appears in a resolved config's
 /// advertised endpoint list; callers pass a layout and URL they already chose
 /// (for example after exact-height snapshot probing). Fails closed before any
-/// private query when the layout is unknown or the three-way layout handshake
-/// rejects the server or compiled client. Layout mismatches surface as
+/// private query when the layout is unknown or the config/server layout
+/// handshake rejects the server. Layout mismatches surface as
 /// [`VotingError::InvalidInput`]; other connect failures remain
 /// [`VotingError::Internal`].
 pub fn connect_pir_blocking(
@@ -107,7 +107,7 @@ fn normalize_endpoint_url(url: &str) -> String {
 fn map_pir_connect_error(err: impl std::fmt::Display) -> VotingError {
     let detail = err.to_string();
     let message = format!("PIR connect failed: {detail}");
-    // Config/server/compiled-client layout disagreement is a caller/config
+    // Config/server layout disagreement is a caller/config
     // incompatibility, not an unexpected internal failure.
     if detail.contains("PIR layout mismatch") {
         VotingError::InvalidInput { message }
@@ -132,7 +132,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use pir_types::{
         RootInfo, YpirScenario, COMPILED_PIR_LAYOUT, DATASET_VERSION, NULLIFIER_POOL, PIR_DEPTH,
-        TIER0_LAYERS, TIER1_ITEM_BITS, TIER1_ROWS, TIER1_ROW_BYTES,
+        TIER0_LAYERS,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -161,6 +161,10 @@ mod tests {
         }
 
         fn insert_matching_assets(&self, layout: NegotiatedPirLayout) {
+            let rows = layout.tier1_rows().unwrap();
+            let row_bytes = layout.tier1_row_bytes().unwrap();
+            let item_bits = layout.tier1_item_bits().unwrap();
+            let tier0_bytes = layout.tier0_bytes().unwrap();
             let root = RootInfo {
                 zcash_network: pir_types::ZcashNetwork::Test,
                 nullifier_pool: NULLIFIER_POOL.to_owned(),
@@ -170,22 +174,16 @@ mod tests {
                 num_ranges: 1,
                 pir_layout: layout,
                 pir_depth: layout.pir_depth,
-                tier1_rows: TIER1_ROWS,
-                tier1_row_bytes: TIER1_ROW_BYTES,
+                tier1_rows: rows,
+                tier1_row_bytes: row_bytes,
                 height: Some(100),
             };
             let tier1 = YpirScenario {
-                num_items: TIER1_ROWS,
-                item_size_bits: TIER1_ITEM_BITS,
+                num_items: rows,
+                item_size_bits: item_bits,
             };
             let mut gets = self.gets.lock().unwrap();
-            gets.insert(
-                "/tier0".to_string(),
-                response(vec![
-                    0;
-                    ((1usize << TIER0_LAYERS) - 1) * 32 + TIER1_ROWS * 64
-                ]),
-            );
+            gets.insert("/tier0".to_string(), response(vec![0; tier0_bytes]));
             gets.insert(
                 "/params/tier1".to_string(),
                 response(serde_json::to_vec(&tier1).unwrap()),
@@ -322,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_succeeds_when_config_server_and_client_layouts_match() {
+    fn connect_succeeds_when_config_and_server_layouts_match() {
         let transport = Arc::new(RecordingTransport::matching_root());
 
         let _client = connect_pir_blocking(
