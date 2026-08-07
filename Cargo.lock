@@ -1342,6 +1342,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "imt-tree"
+version = "0.2.0"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=3050db80b76e3c3edfc5f4943a5a3a821919d358#3050db80b76e3c3edfc5f4943a5a3a821919d358"
+dependencies = [
+ "anyhow",
+ "ff",
+ "halo2_gadgets",
+ "hex",
+ "pasta_curves",
+ "rayon",
+]
+
+[[package]]
 name = "incrementalmerkletree"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1773,15 +1786,14 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pir-client"
-version = "0.4.0-rc.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "666111370cf8a3fb2fa41a2442accc9d283226c1229828ff92c253dda1eb51e3"
+version = "0.4.0-rc.3"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=3050db80b76e3c3edfc5f4943a5a3a821919d358#3050db80b76e3c3edfc5f4943a5a3a821919d358"
 dependencies = [
  "anyhow",
  "ff",
  "futures",
  "hex",
- "imt-tree",
+ "imt-tree 0.2.0 (git+https://github.com/valargroup/vote-nullifier-pir?rev=3050db80b76e3c3edfc5f4943a5a3a821919d358)",
  "log",
  "pasta_curves",
  "pir-types",
@@ -1792,13 +1804,12 @@ dependencies = [
 
 [[package]]
 name = "pir-types"
-version = "0.3.0-rc.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87a9ba9677931ac73da6d7726af28357da8f2e3d635a3e186c92a7f41382fe3e"
+version = "0.3.0-rc.3"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=3050db80b76e3c3edfc5f4943a5a3a821919d358#3050db80b76e3c3edfc5f4943a5a3a821919d358"
 dependencies = [
  "anyhow",
  "ff",
- "imt-tree",
+ "imt-tree 0.2.0 (git+https://github.com/valargroup/vote-nullifier-pir?rev=3050db80b76e3c3edfc5f4943a5a3a821919d358)",
  "pasta_curves",
  "serde",
 ]
@@ -2943,7 +2954,7 @@ dependencies = [
  "anyhow",
  "ff",
  "halo2_gadgets",
- "imt-tree",
+ "imt-tree 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "incrementalmerkletree",
  "lazy_static",
  "libc",
@@ -3490,7 +3501,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "imt-tree",
+ "imt-tree 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "incrementalmerkletree",
  "nonempty",
  "orchard",

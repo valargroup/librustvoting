@@ -21,3 +21,10 @@ zcash_client_sqlite = { version = "0.22.0-rc.7", default-features = false, featu
 zcash_keys = { version = "0.16.1", features = ["orchard"] }
 zcash_primitives = { version = "0.30.0" }
 zcash_protocol = { version = "0.10.4" }
+
+# Temporary source override until pir-client / pir-types 0.4.0-rc.3 /
+# 0.3.0-rc.3 are published. Keeps version requirements exact in package
+# manifests while resolving the one-query dataset-v2 client from main.
+[patch.crates-io]
+pir-client = { git = "https://github.com/valargroup/vote-nullifier-pir", rev = "3050db80b76e3c3edfc5f4943a5a3a821919d358" }
+pir-types = { git = "https://github.com/valargroup/vote-nullifier-pir", rev = "3050db80b76e3c3edfc5f4943a5a3a821919d358" }

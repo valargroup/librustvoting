@@ -1711,15 +1711,8 @@ mod tests {
                     ])),
                     "/params/tier1" => Ok(transport_response(
                         serde_json::to_vec(&pir_types::YpirScenario {
-                            num_items: pir_types::TIER1_YPIR_ROWS,
+                            num_items: pir_types::TIER1_ROWS,
                             item_size_bits: pir_types::TIER1_ITEM_BITS,
-                        })
-                        .unwrap(),
-                    )),
-                    "/params/tier2" => Ok(transport_response(
-                        serde_json::to_vec(&pir_types::YpirScenario {
-                            num_items: pir_types::TIER1_YPIR_ROWS,
-                            item_size_bits: pir_types::TIER2_ITEM_BITS,
                         })
                         .unwrap(),
                     )),
@@ -1732,6 +1725,8 @@ mod tests {
                             root25: hex::encode([0u8; 32]),
                             num_ranges: 1,
                             pir_depth: pir_types::PIR_DEPTH,
+                            tier1_rows: pir_types::TIER1_ROWS,
+                            tier1_row_bytes: pir_types::TIER1_ROW_BYTES,
                             height: None,
                         })
                         .unwrap(),
@@ -1747,6 +1742,111 @@ mod tests {
                     "unexpected POST {}; proofs should be cached",
                     request_path(url)
                 ))
+            })
+        }
+    }
+
+    /// Dataset-v2 PIR transport that records every request path.
+    ///
+    /// POSTs return a deliberately corrupt ciphertext so callers can assert
+    /// query cardinality without depending on a full YPIR encode/decode cycle.
+    struct RecordingPirTransport {
+        hits: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingPirTransport {
+        fn new() -> Self {
+            Self {
+                hits: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, path: &str) {
+            self.hits.lock().unwrap().push(path.to_owned());
+        }
+
+        fn count_hits(&self, path: &str) -> usize {
+            self.hits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|hit| hit.as_str() == path)
+                .count()
+        }
+
+        fn query_post_count(&self) -> usize {
+            self.hits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|hit| hit.ends_with("/query"))
+                .count()
+        }
+
+        fn assert_no_legacy_tier2_traffic(&self) {
+            assert_eq!(self.count_hits("/params/tier2"), 0);
+            assert_eq!(self.count_hits("/tier2/query"), 0);
+            assert!(
+                self.hits
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|hit| !hit.contains("tier2")),
+                "unexpected tier2 traffic: {:?}",
+                self.hits.lock().unwrap()
+            );
+        }
+    }
+
+    impl pir_client::Transport for RecordingPirTransport {
+        fn get<'a>(&'a self, url: &'a str) -> pir_client::TransportFuture<'a> {
+            Box::pin(async move {
+                let path = request_path(url);
+                self.record(path);
+                match path {
+                    "/tier0" => Ok(transport_response(vec![
+                        0;
+                        ((1usize
+                            << pir_types::TIER0_LAYERS)
+                            - 1)
+                            * 32
+                            + pir_types::TIER1_ROWS * 64
+                    ])),
+                    "/params/tier1" => Ok(transport_response(
+                        serde_json::to_vec(&pir_types::YpirScenario {
+                            num_items: pir_types::TIER1_ROWS,
+                            item_size_bits: pir_types::TIER1_ITEM_BITS,
+                        })
+                        .unwrap(),
+                    )),
+                    "/root" => Ok(transport_response(
+                        serde_json::to_vec(&pir_types::RootInfo {
+                            zcash_network: pir_types::ZcashNetwork::Test,
+                            nullifier_pool: pir_types::NULLIFIER_POOL.to_owned(),
+                            dataset_version: pir_types::DATASET_VERSION,
+                            root29: hex::encode([0u8; 32]),
+                            root25: hex::encode([0u8; 32]),
+                            num_ranges: 1,
+                            pir_depth: pir_types::PIR_DEPTH,
+                            tier1_rows: pir_types::TIER1_ROWS,
+                            tier1_row_bytes: pir_types::TIER1_ROW_BYTES,
+                            height: None,
+                        })
+                        .unwrap(),
+                    )),
+                    _ => Err(anyhow::anyhow!("unexpected GET {path}")),
+                }
+            })
+        }
+
+        fn post<'a>(&'a self, url: &'a str, _body: Vec<u8>) -> pir_client::TransportFuture<'a> {
+            Box::pin(async move {
+                let path = request_path(url);
+                self.record(path);
+                match path {
+                    "/tier1/query" => Ok(transport_response(vec![0xDE; 65536])),
+                    _ => Err(anyhow::anyhow!("unexpected POST {path}")),
+                }
             })
         }
     }
@@ -2090,9 +2190,10 @@ mod tests {
             }
         }
 
+        let transport = std::sync::Arc::new(RecordingPirTransport::new());
         let pir_client = pir_client::PirClientBlocking::with_transport(
             "https://pir.test",
-            std::sync::Arc::new(StaticPirTransport),
+            transport.clone(),
         )
         .unwrap();
 
@@ -2103,8 +2204,90 @@ mod tests {
 
         assert_eq!(result.cached_count, BUNDLE_NOTE_SLOTS as u32);
         assert_eq!(result.fetched_count, 0);
+        assert_eq!(transport.query_post_count(), 0);
+        transport.assert_no_legacy_tier2_traffic();
         let conn = db.conn();
         assert!(queries::load_pczt_sighash(&conn, ROUND_ID, W, 0).is_err());
+    }
+
+    #[test]
+    fn test_pir_client_connect_uses_dataset_v2_one_tier_endpoints() {
+        let transport = std::sync::Arc::new(RecordingPirTransport::new());
+        let _client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            transport.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(transport.count_hits("/tier0"), 1);
+        assert_eq!(transport.count_hits("/params/tier1"), 1);
+        assert_eq!(transport.count_hits("/root"), 1);
+        assert_eq!(transport.query_post_count(), 0);
+        transport.assert_no_legacy_tier2_traffic();
+    }
+
+    #[test]
+    fn test_pir_client_fetch_proof_sends_exactly_one_tier1_query() {
+        let transport = std::sync::Arc::new(RecordingPirTransport::new());
+        let client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            transport.clone(),
+        )
+        .unwrap();
+
+        // Corrupt ciphertext: request cardinality is the property under test.
+        assert!(client.fetch_proof(pallas::Base::from(7u64)).is_err());
+        assert_eq!(transport.count_hits("/tier1/query"), 1);
+        assert_eq!(transport.query_post_count(), 1);
+        transport.assert_no_legacy_tier2_traffic();
+    }
+
+    #[test]
+    fn test_pir_client_fetch_proofs_sends_one_tier1_query_per_nullifier() {
+        const K: usize = 5;
+        let transport = std::sync::Arc::new(RecordingPirTransport::new());
+        let client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            transport.clone(),
+        )
+        .unwrap();
+
+        let nullifiers: Vec<_> = (1u64..=K as u64).map(pallas::Base::from).collect();
+        assert!(client.fetch_proofs(&nullifiers).is_err());
+        assert_eq!(transport.count_hits("/tier1/query"), K);
+        assert_eq!(transport.query_post_count(), K);
+        transport.assert_no_legacy_tier2_traffic();
+    }
+
+    #[test]
+    fn test_precompute_delegation_pir_issues_one_query_per_uncached_nullifier() {
+        let notes: Vec<NoteInfo> = (0..BUNDLE_NOTE_SLOTS)
+            .map(|i| identity_note_with_position(i as u8))
+            .collect();
+        let mut params = test_params();
+        params.nullifier_imt_root = pallas::Base::from(7u64).to_repr().to_vec();
+        let db = test_db();
+        db.init_round(Network::Testnet, &params, None).unwrap();
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+
+        let transport = std::sync::Arc::new(RecordingPirTransport::new());
+        let pir_client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            transport.clone(),
+        )
+        .unwrap();
+
+        db.ensure_padded_secrets(ROUND_ID, 0, &notes).unwrap();
+        let err = db
+            .precompute_delegation_pir(ROUND_ID, 0, &notes, &pir_client, Network::Testnet)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("PIR parallel fetch failed"),
+            "expected PIR fetch failure from corrupt mock ciphertext, got: {err}"
+        );
+        assert_eq!(transport.count_hits("/tier1/query"), BUNDLE_NOTE_SLOTS);
+        assert_eq!(transport.query_post_count(), BUNDLE_NOTE_SLOTS);
+        transport.assert_no_legacy_tier2_traffic();
     }
 
     #[test]

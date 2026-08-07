@@ -7,6 +7,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 # Unreleased
 
 ### Changed
+- Aligned nullifier PIR on `pir-client 0.4.0-rc.3` / `pir-types 0.3.0-rc.3`
+  (dataset v2 one-query 12+7 layout). Until those crates are published, the
+  workspace root `[patch.crates-io]` table resolves both packages from
+  `vote-nullifier-pir` commit `3050db80b76e3c3edfc5f4943a5a3a821919d358`.
+  Each nullifier lookup now issues a single `POST /tier1/query`; Tier 2
+  params/query routes are gone.
 - Changed vote-share wire JSON to include only the encrypted share assigned to
   the receiving helper. The `all_enc_shares` field is no longer serialized.
 
