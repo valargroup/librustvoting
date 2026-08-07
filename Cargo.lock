@@ -1330,7 +1330,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 [[package]]
 name = "imt-tree"
 version = "0.2.0"
-source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=1514c063a13ddb1c9b47f35dcd8334a70812212a#1514c063a13ddb1c9b47f35dcd8334a70812212a"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=7aa15891b946ab189f08df66ae2132fd09497480#7aa15891b946ab189f08df66ae2132fd09497480"
 dependencies = [
  "anyhow",
  "ff",
@@ -1773,7 +1773,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pir-client"
 version = "0.4.0-rc.3"
-source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=1514c063a13ddb1c9b47f35dcd8334a70812212a#1514c063a13ddb1c9b47f35dcd8334a70812212a"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=7aa15891b946ab189f08df66ae2132fd09497480#7aa15891b946ab189f08df66ae2132fd09497480"
 dependencies = [
  "anyhow",
  "ff",
@@ -1791,7 +1791,7 @@ dependencies = [
 [[package]]
 name = "pir-types"
 version = "0.3.0-rc.3"
-source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=1514c063a13ddb1c9b47f35dcd8334a70812212a#1514c063a13ddb1c9b47f35dcd8334a70812212a"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=7aa15891b946ab189f08df66ae2132fd09497480#7aa15891b946ab189f08df66ae2132fd09497480"
 dependencies = [
  "anyhow",
  "ff",
