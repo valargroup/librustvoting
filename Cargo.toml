@@ -21,12 +21,3 @@ zcash_client_sqlite = { version = "0.22.0-rc.7", default-features = false, featu
 zcash_keys = { version = "0.16.1", features = ["orchard"] }
 zcash_primitives = { version = "0.30.0" }
 zcash_protocol = { version = "0.10.4" }
-
-# Temporary git overrides for integration against vote-nullifier-pir PR 125
-# (tip 7aa15891b946ab189f08df66ae2132fd09497480). Package manifests keep exact rc.3 version
-# requirements; remove this table once the crates are published (or switch back
-# to a sibling path checkout for local PIR development).
-[patch.crates-io]
-pir-client = { git = "https://github.com/valargroup/vote-nullifier-pir", rev = "7aa15891b946ab189f08df66ae2132fd09497480" }
-pir-types = { git = "https://github.com/valargroup/vote-nullifier-pir", rev = "7aa15891b946ab189f08df66ae2132fd09497480" }
-imt-tree = { git = "https://github.com/valargroup/vote-nullifier-pir", rev = "7aa15891b946ab189f08df66ae2132fd09497480" }
