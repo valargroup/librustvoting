@@ -180,7 +180,10 @@ mod tests {
                 "/params/tier1".to_string(),
                 response(serde_json::to_vec(&tier1).unwrap()),
             );
-            gets.insert("/root".to_string(), response(serde_json::to_vec(&root).unwrap()));
+            gets.insert(
+                "/root".to_string(),
+                response(serde_json::to_vec(&root).unwrap()),
+            );
         }
 
         fn count_hits(&self, path: &str) -> usize {
@@ -238,7 +241,6 @@ mod tests {
             .map(|idx| &without_scheme[idx..])
             .unwrap_or("/")
     }
-
 
     fn expect_connect_err(result: Result<PirClientBlocking, VotingError>) -> VotingError {
         match result {

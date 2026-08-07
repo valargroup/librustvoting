@@ -13,8 +13,7 @@ use zcash_voting::prelude::{
 };
 use zcash_voting::wire::PirLayout;
 use zcash_voting::{
-    connect_pir_blocking, BundlePolicy, HyperTransport, PirClientBlocking,
-    VotingRoundParams,
+    connect_pir_blocking, BundlePolicy, HyperTransport, PirClientBlocking, VotingRoundParams,
 };
 use zip32::{fingerprint::SeedFingerprint, AccountId};
 
@@ -251,10 +250,6 @@ fn example_sign_delegation_request(
 }
 
 fn connect_pir(pir_layout: PirLayout, pir_server_url: &str) -> Result<PirClientBlocking> {
-    connect_pir_blocking(
-        pir_layout,
-        pir_server_url,
-        Arc::new(HyperTransport::new()),
-    )
-    .context("connect to PIR server")
+    connect_pir_blocking(pir_layout, pir_server_url, Arc::new(HyperTransport::new()))
+        .context("connect to PIR server")
 }
