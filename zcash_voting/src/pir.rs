@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use crate::config::PirLayout;
+use crate::config::{validate_and_convert_pir_layout, PirLayout};
 use crate::types::VotingError;
 
 pub use crate::pir_snapshot::{
@@ -39,8 +39,8 @@ pub use pir_types::PirLayout as NegotiatedPirLayout;
 
 /// Converts a wallet-config [`PirLayout`] into the PIR client's negotiated layout.
 ///
-/// Rejects the legacy summary sentinel [`PirLayout::UNKNOWN`] and any values
-/// that cannot be represented as platform `usize` fields.
+/// Rejects the legacy summary sentinel [`PirLayout::UNKNOWN`], inconsistent
+/// geometry, and layouts below the YPIR row or item-size minima.
 pub fn negotiated_pir_layout(layout: PirLayout) -> Result<NegotiatedPirLayout, VotingError> {
     if layout == PirLayout::UNKNOWN {
         return Err(VotingError::InvalidInput {
@@ -48,10 +48,8 @@ pub fn negotiated_pir_layout(layout: PirLayout) -> Result<NegotiatedPirLayout, V
                 .to_string(),
         });
     }
-    Ok(NegotiatedPirLayout {
-        pir_depth: usize_field(layout.pir_depth, "pir_layout.pir_depth")?,
-        tier0_layers: usize_field(layout.tier0_layers, "pir_layout.tier0_layers")?,
-        tier1_layers: usize_field(layout.tier1_layers, "pir_layout.tier1_layers")?,
+    validate_and_convert_pir_layout(layout).map_err(|message| VotingError::InvalidInput {
+        message: format!("invalid pir_layout: {message}"),
     })
 }
 
@@ -114,12 +112,6 @@ fn map_pir_connect_error(err: impl std::fmt::Display) -> VotingError {
     } else {
         VotingError::Internal { message }
     }
-}
-
-fn usize_field(value: u32, field: &str) -> Result<usize, VotingError> {
-    usize::try_from(value).map_err(|_| VotingError::InvalidInput {
-        message: format!("{field} {value} does not fit usize"),
-    })
 }
 
 #[cfg(test)]
@@ -277,6 +269,50 @@ mod tests {
         assert!(err.to_string().contains("pir_layout is unknown"), "{err}");
         assert_eq!(transport.count_hits("/root"), 0);
         assert_eq!(transport.post_count(), 0);
+    }
+
+    #[test]
+    fn connect_rejects_unusable_ypir_layouts_before_transport() {
+        for (layout, expected) in [
+            (
+                PirLayout {
+                    pir_depth: 19,
+                    tier0_layers: 10,
+                    tier1_layers: 9,
+                },
+                "Tier 1 rows 1024 below YPIR minimum 2048",
+            ),
+            (
+                PirLayout {
+                    pir_depth: 19,
+                    tier0_layers: 14,
+                    tier1_layers: 5,
+                },
+                "Tier 1 item bits 24576 below YPIR minimum 28672",
+            ),
+            (
+                PirLayout {
+                    pir_depth: 19,
+                    tier0_layers: 0,
+                    tier1_layers: 19,
+                },
+                "PIR layout tiers must be non-zero",
+            ),
+        ] {
+            let transport = Arc::new(RecordingTransport::matching_root());
+            let err = expect_connect_err(connect_pir_blocking(
+                layout,
+                "https://pir.example.com",
+                transport.clone(),
+            ));
+
+            assert!(matches!(err, VotingError::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains(expected), "{err}");
+            assert_eq!(transport.count_hits("/tier0"), 0);
+            assert_eq!(transport.count_hits("/params/tier1"), 0);
+            assert_eq!(transport.count_hits("/root"), 0);
+            assert_eq!(transport.post_count(), 0);
+        }
     }
 
     #[test]

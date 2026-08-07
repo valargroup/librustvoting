@@ -645,29 +645,53 @@ fn validate_dynamic_config(
 }
 
 fn validate_pir_layout(layout: PirLayout) -> Result<(), VotingConfigError> {
+    validate_and_convert_pir_layout(layout)
+        .map(|_| ())
+        .map_err(|message| VotingConfigError::DecodeFailed { message })
+}
+
+pub(crate) fn validate_and_convert_pir_layout(
+    layout: PirLayout,
+) -> Result<pir_types::PirLayout, String> {
     let combined_depth = layout
         .tier0_layers
         .checked_add(layout.tier1_layers)
-        .ok_or_else(|| VotingConfigError::DecodeFailed {
-            message: "pir_layout tier layer sum overflows u32".to_string(),
-        })?;
+        .ok_or_else(|| "pir_layout tier layer sum overflows u32".to_string())?;
     if layout.pir_depth != combined_depth {
-        return Err(VotingConfigError::DecodeFailed {
-            message: format!(
-                "pir_layout.pir_depth {} must equal tier0_layers {} + tier1_layers {}",
-                layout.pir_depth, layout.tier0_layers, layout.tier1_layers
-            ),
-        });
+        return Err(format!(
+            "pir_layout.pir_depth {} must equal tier0_layers {} + tier1_layers {}",
+            layout.pir_depth, layout.tier0_layers, layout.tier1_layers
+        ));
     }
     if layout.pir_depth == 0 || layout.pir_depth > MAX_PIR_CIRCUIT_DEPTH {
-        return Err(VotingConfigError::DecodeFailed {
-            message: format!(
-                "pir_layout.pir_depth {} is outside the supported circuit range 1..={MAX_PIR_CIRCUIT_DEPTH}",
-                layout.pir_depth
-            ),
-        });
+        return Err(format!(
+            "pir_layout.pir_depth {} is outside the supported circuit range 1..={MAX_PIR_CIRCUIT_DEPTH}",
+            layout.pir_depth
+        ));
     }
-    Ok(())
+
+    let negotiated = pir_types::PirLayout {
+        pir_depth: usize::try_from(layout.pir_depth).map_err(|_| {
+            format!(
+                "pir_layout.pir_depth {} does not fit usize",
+                layout.pir_depth
+            )
+        })?,
+        tier0_layers: usize::try_from(layout.tier0_layers).map_err(|_| {
+            format!(
+                "pir_layout.tier0_layers {} does not fit usize",
+                layout.tier0_layers
+            )
+        })?,
+        tier1_layers: usize::try_from(layout.tier1_layers).map_err(|_| {
+            format!(
+                "pir_layout.tier1_layers {} does not fit usize",
+                layout.tier1_layers
+            )
+        })?,
+    };
+    negotiated.validate_ypir_bounds()?;
+    Ok(negotiated)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1070,6 +1094,47 @@ mod tests {
             assert!(err
                 .to_string()
                 .contains("outside the supported circuit range 1..=29"));
+        }
+    }
+
+    #[test]
+    fn dynamic_resolution_rejects_pir_layouts_unusable_by_ypir() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        for (layout, expected) in [
+            (
+                serde_json::json!({
+                    "pir_depth": 19,
+                    "tier0_layers": 10,
+                    "tier1_layers": 9,
+                }),
+                "Tier 1 rows 1024 below YPIR minimum 2048",
+            ),
+            (
+                serde_json::json!({
+                    "pir_depth": 19,
+                    "tier0_layers": 14,
+                    "tier1_layers": 5,
+                }),
+                "Tier 1 item bits 24576 below YPIR minimum 28672",
+            ),
+            (
+                serde_json::json!({
+                    "pir_depth": 19,
+                    "tier0_layers": 0,
+                    "tier1_layers": 19,
+                }),
+                "PIR layout tiers must be non-zero",
+            ),
+        ] {
+            let mut dynamic: serde_json::Value =
+                serde_json::from_slice(&dynamic_bytes(&signing_key)).unwrap();
+            dynamic["pir_layout"] = layout;
+
+            let err = resolve_test_dynamic(&signing_key, &serde_json::to_vec(&dynamic).unwrap())
+                .unwrap_err();
+
+            assert!(matches!(err, VotingConfigError::DecodeFailed { .. }));
+            assert!(err.to_string().contains(expected), "{err}");
         }
     }
 
