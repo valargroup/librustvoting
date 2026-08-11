@@ -69,7 +69,8 @@ hotkey, then gives the customer its opaque stored secret plus a compact
 delegation capability. This grants the customer a copy of voting authority,
 not exclusive control: the provider can observe, cast, or race votes with its
 retained hotkey. The hotkey cannot spend funds held by the original delegating
-account, but its receiver must not be funded or reused. See
+account. Its receiver must not receive value or be reused outside the
+delegation for that customer and round. See
 [Custody-provider voting handoff](exporting-to-external-software.md).
 
 No single field carries the full meaning of the delegation. The authorization
@@ -90,7 +91,9 @@ Consequently, a valid delegation signature and ZKP #1 statement mean:
 > for this round to this one new hotkey.
 
 The hotkey can authorize later vote-chain actions. It cannot spend the
-account's Zcash funds, but it can spend funds sent to its own receiver.
+account's Zcash funds, but it can spend funds sent to its own receiver. That
+receiver is shared across this round's delegation bundles but must never be
+used as a value-bearing address.
 
 ## Inputs
 

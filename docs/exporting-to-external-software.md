@@ -11,7 +11,9 @@ round. The customer receives a copy of that voting authority, not an exclusive
 transfer. The provider can observe the customer's vote and can cast or race a
 vote using its retained copy. The voting hotkey cannot spend funds held by the
 original delegating account. It can spend funds sent to its own Orchard
-receiver, so that receiver MUST NOT be funded or reused.
+receiver, so that receiver MUST NOT receive value or be reused outside the
+delegation for that customer and round. The same receiver is required for every
+bundle within that delegation.
 
 Do not use this flow when the customer must have voting privacy or exclusive
 voting authority against the provider.
