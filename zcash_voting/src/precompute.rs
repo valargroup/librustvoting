@@ -101,6 +101,9 @@ pub fn verify_witness(witness: &WitnessData) -> Result<(), VotingError> {
 }
 
 /// Syncs the vote commitment tree for one round and returns the latest height.
+///
+/// For each confirmed bundle that has not yet submitted a vote, this also
+/// verifies that the confirmed event position contains its delegation VAN.
 pub fn sync_vote_tree(db: &VotingDb, round_id: &str, node_url: &str) -> Result<u32, VotingError> {
     vote_tree_sync_for(db)?.sync(db, round_id, node_url)
 }
@@ -342,6 +345,7 @@ mod pir_tests {
 #[cfg(test)]
 mod tree_sync_tests {
     use super::*;
+    use ff::PrimeField;
     use pasta_curves::Fp;
     use std::{
         io::{Read, Write},
@@ -361,6 +365,13 @@ mod tree_sync_tests {
             .unwrap();
         db.ensure_bundles(ROUND_ID, &[note(0)]).unwrap();
         db.store_van_position(ROUND_ID, 0, 0).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET gov_comm = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 0",
+                rusqlite::params![Fp::from(1).to_repr().as_slice(), ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
         let server = start_tree_server(1, vec![1], 2);
 
         let height = sync_vote_tree(&db, ROUND_ID, &server).unwrap();

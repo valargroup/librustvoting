@@ -84,6 +84,21 @@ Consequently, a valid delegation signature and ZKP #1 statement mean:
 The hotkey can authorize later vote-chain actions. It cannot spend the
 account's Zcash funds.
 
+### Custody-provider target mode
+
+The voting hotkey address may come from the same wallet that owns the funds, or
+from a customer who retains the hotkey while a custody provider owns and signs
+for the funds. In provider mode, the customer sends only a validated
+`RoundBoundVotingHotkeyTarget`; no hotkey secret or account viewing material is
+shared. TX1 construction, the account SpendAuth signature, and ZKP1 are
+otherwise unchanged.
+
+The provider MUST use the same target for every bundle in its round job and
+retain that target across restarts. After signing the vote-chain delegation
+transactions, it exports a `DelegationCapabilityV1`, obtains the customer's
+digest acknowledgement, and only then broadcasts the exact hashed transaction
+bytes. See [Custody-provider voting capability](exporting-to-external-software.md).
+
 ## Inputs
 
 The wallet MUST fix the following inputs before building TX1:
@@ -385,11 +400,12 @@ The vote-chain submission contains the SpendAuth signature, `rk`, and the
 compact effecting data from which the verifier reconstructs the sighash. It is
 not TX1, does not contain a Zcash transaction, and never carries a PCZT.
 
-Portable transfer of the resulting voting authority is not yet exposed as a
-complete export and import API. The required credential handling and
-validation are documented in
-[external software export](exporting-to-external-software.md). Do not export
-the wallet seed or account spending key.
+A custody provider can instead prepare TX1 for a customer's public,
+round-bound hotkey target and deliver the resulting runtime data through a
+`DelegationCapabilityV1`. The customer retains the hotkey secret; the provider
+retains its account keys. The acknowledgement and validation contract is
+documented in
+[custody-provider voting capability](exporting-to-external-software.md).
 
 Signing state is one-shot. After a restart, the wallet MAY resume only if it
 retained the exact signing request, including the full PCZT. Otherwise it MUST

@@ -1,130 +1,151 @@
-# External software export design
+# Custody-provider voting capability
 
 ## Purpose
 
-After delegation, later votes are authorized by the voting hotkey instead of
-the Zcash account spending key. A future portable export can hand that
-delegated voting authority to external software without sharing the account
-spending key.
+A custodian can delegate voting weight for customer funds without receiving the
+customer's voting key and without giving the customer access to the custodian's
+Zcash account keys.
 
-This export does not include the wallet seed, mnemonic, account spending key,
-or full viewing key. It also does not move ZEC.
+The customer creates and retains a fresh `VotingHotkey`. The custodian receives
+only a public target bound to one vote chain, network, and round. After the
+custodian prepares and signs every delegation transaction, it returns a compact
+capability package over its existing authenticated, confidential API. The
+customer imports and acknowledges that package before the custodian broadcasts.
 
-## Status
+No wallet seed, account spending key, account IVK or FVK, or voting-hotkey
+secret crosses this boundary.
 
-The crate does not currently expose a complete portable export and import API.
-The material below defines credential components and validation requirements
-for a future format. Applications MUST NOT treat the credential fields alone
-as a complete import package.
+## Roles
 
-## Export contents
+- The **customer** owns the voting hotkey and later produces ZKP2 votes.
+- The **provider** owns the Zcash funds and account signing keys, selects the
+  eligible notes, proves the delegations, and broadcasts them.
+- The **vote chain** publishes the confirmed transaction event and VAN leaf
+  position. The existing public vote-tree sync supplies the commitment and
+  witness used by ZKP2.
 
-A future package needs at least three credential fields:
+Version 1 supports one provider and one fresh hotkey per customer and round.
+Using a fresh hotkey for each provider relationship also avoids bundle-index
+collisions and unnecessary cross-provider linkability.
 
-| Field | Contents |
+## Public target handoff
+
+The customer encodes `VotingHotkey::delegation_target()` as
+`VotingHotkeyTargetV1` and validates it against independently authenticated
+round parameters. The target contains:
+
+- format version;
+- vote-chain identifier;
+- Zcash network;
+- vote-round identifier;
+- fixed address index zero; and
+- the 43-byte raw Orchard address, encoded as padded standard Base64.
+
+The provider passes the resulting opaque `RoundBoundVotingHotkeyTarget` to
+`prepare_delegation_bundle_for_target`. It MUST use the same target for every
+bundle in that provider job.
+
+The provider application, not `VotingDb`, owns the durable job/outbox record.
+That record MUST retain the validated target across restarts because the target
+cannot be recovered from the VAN. It should also retain the exact signed
+transactions, their hashes, the canonical package bytes and digest, customer
+acknowledgement state, and broadcast state.
+
+## Capability package
+
+`DelegationCapabilityV1` is a canonical compact JSON document. Its top-level
+context repeats the target binding, followed by a complete bundle array. Each
+bundle contains:
+
+| Field | Meaning |
 | --- | --- |
-| `hotkey_private_key` | The 64-byte opaque secret returned by `VotingHotkey::stored_secret()`. |
-| `signature` | The TX1 SpendAuth signature record for each delegated bundle. |
-| `ivk` | The delegating account's 64-byte raw external Orchard incoming viewing key. |
+| `bundle_index` | Contiguous zero-based index in the complete provider batch. |
+| `num_ballots` | Voting weight after division by `BALLOT_DIVISOR`. |
+| `van_comm_rand` | Canonical padded Base64 of the 32-byte VAN blinding field. |
+| `delegation_tx_hash` | Lowercase SHA-256 of the exact signed vote-chain transaction bytes. |
 
-A complete package also needs a format version, Zcash network, and voting round
-ID so that the receiver can interpret those fields in the correct context.
-These are transport metadata, not additional authority.
+The package contains privacy-sensitive linkage material but no voting or
+spending authority. It belongs on the same authenticated, confidential channel
+as the customer's other provider data and should be excluded from logs and
+analytics.
 
-### Hotkey private key
+The strict codec rejects unknown or duplicate fields, noncanonical JSON,
+noncanonical Base64 or field elements, non-lowercase hashes, empty or oversized
+batches, gaps, duplicate transaction hashes, duplicate VANs, zero voting
+weight, and aggregate values above `MAX_MONEY`.
 
-`hotkey_private_key` is the name used by the export format. In the current
-Rust API its value is the opaque 64-byte
-`VotingHotkey::stored_secret()` value. It is seed material for the
-voting-only key hierarchy, not the Zcash wallet seed and not a directly
-encoded 32-byte Orchard spending key.
+## Delivery and broadcast protocol
 
-The receiver reconstructs the hotkey using:
+The provider MUST use this order:
 
-```rust
-let hotkey =
-    VotingHotkey::from_stored_secret(hotkey_private_key, network)?;
-```
+1. Prepare, prove, and sign every delegation transaction for the retained
+   public target.
+2. Persist the exact signed transaction bytes and their SHA-256 hashes.
+3. Call `export_delegation_capability` and persist the exact canonical package
+   bytes and `package_digest()`.
+4. Deliver those bytes to the customer.
+5. The customer parses with `DelegationCapabilityV1::from_json`, atomically
+   imports with `import_delegation_capability`, durably commits, and returns the
+   digest produced by the importer.
+6. The provider compares the acknowledgement to its stored digest.
+7. Only after an exact match, broadcast the same signed transactions whose
+   bytes produced the package hashes.
 
-The current derivation uses voting-hotkey account index zero, external scope,
-and address index zero. After reconstruction, the receiver SHOULD verify that
-the resulting raw Orchard address equals the hotkey address used by the
-delegation.
+Retries MUST redeliver byte-identical package bytes. The provider should retain
+the outbox through round close. Broadcasting before durable acknowledgement can
+make that round's voting weight unusable if both parties then lose the package;
+it does not put the underlying funds at risk.
 
-Possession of this field is sufficient to sign later votes for every exported
-delegation that targets this hotkey. It does not grant authority over the
-holder's Zcash account.
+## Customer import
 
-### Signature
+The customer supplies independent trusted context through
+`ImportDelegationCapabilityParams`: its locally retained hotkey, chain ID,
+network, full authenticated round parameters, and optional session metadata.
 
-The signature is the 64-byte RedPallas SpendAuth signature produced for TX1.
-It is meaningful only with the exact 32-byte ZIP-244 sighash and 32-byte
-randomized verification key `rk` under which it verifies. The logical
-`signature` field therefore carries a record:
+Import validation derives the public target from the customer's own hotkey and
+requires an exact package match. It recomputes every VAN from the hotkey
+address, round ID, `num_ballots`, and `van_comm_rand`. It then stores only the
+existing runtime fields needed by voting:
 
-```text
-signature:
-    bundle_index
-    spend_auth_sig
-    sighash
-    rk
-```
+- canonical quantized `total_note_value`;
+- `van_comm_rand`;
+- recomputed `gov_comm`;
+- address index zero; and
+- the exact delegation transaction hash.
 
-The receiver MUST NOT verify the signature against only the supplied sighash.
-It must also obtain the corresponding confirmed delegation submission,
-including its versioned `tx1_effects`, and perform the same binding checks as
-the vote chain. The receiver must reconstruct the canonical sighash from those
-effects, require it to equal the recorded sighash, require the effects to match
-the confirmed `rk`, signed-note nullifier, and output commitment, and then
-verify `spend_auth_sig` under `rk` and that sighash.
+The round row and all bundle rows commit in one immediate SQLite transaction.
+The current schema is sufficient. No delegation construction fields, proofs,
+raw vote transactions, account keys, or provenance records are imported.
 
-A complete format must therefore carry the confirmed delegation data or an
-authenticated reference from which it can be retrieved. That container and
-retrieval mechanism are not defined by the current crate API.
+The package is complete and contiguous. A byte-identical reimport is a no-op,
+including after later confirmation updates the current VAN position. Partial,
+locally constructed, or conflicting state is rejected without mutation.
 
-One TX1 authorizes one delegation bundle. If a voting identity has more than
-five eligible notes, it has more than one TX1 and the export MUST contain one
-signature record for every delegated bundle. All of those bundles SHOULD
-target the one exported hotkey.
+## Confirmation and voting
 
-### IVK
+After broadcast, the customer queries the existing transaction-status API by
+the package's transaction hash and passes its `delegate_vote` event to
+`confirm_delegation_submission`. The existing confirmation path rejects a hash
+that differs from the package and records the public `leaf_index`.
+Use the package's canonical lowercase hash for both the status lookup and the
+confirmation call; do not substitute a differently rendered broadcast result.
 
-`ivk` is the delegating account's external Orchard incoming viewing key:
+At the next `sync_vote_tree`, the library obtains the public tree root and
+witness for that position and verifies that the leaf is the imported,
+customer-recomputed VAN. A wrong target, weight, blinding factor, transaction,
+or event position therefore fails before ZKP2 work starts. Correct state then
+uses the unchanged `van_witness` and `vote::commit` path.
 
-```text
-account_fvk.to_ivk(External).to_bytes()
-```
+The vote proof and cast-vote signature still require the customer's hotkey
+secret. Possession of a capability package alone cannot create voting
+authority.
 
-Its encoding is 64 bytes: the 32-byte diversifier key followed by the
-32-byte Orchard incoming-viewing-key field element. It is the IVK of the
-account whose voting rights were delegated, not the hotkey's IVK. The
-hotkey's viewing material can already be derived from
-`hotkey_private_key`.
+## Recovery boundary
 
-The IVK is read-only and cannot spend funds or create SpendAuth signatures.
-It can, however, reveal addresses and incoming transaction data for the
-delegating account, so the receiver MUST treat it as privacy-sensitive.
+Version 1 deliberately does not add a continuation memo, raw-transaction
+receipt decoder, or public-chain-only recovery protocol. The provider must
+support idempotent package redelivery through round close, and the customer
+must retain both its hotkey and imported voting database.
 
-## Transfer and storage requirements
-
-Exporting copies authority; it does not revoke the source wallet's copy. If
-both applications retain the hotkey private key, both can attempt to vote with
-the same delegated authority. The applications need an explicit ownership or
-coordination policy to avoid conflicting actions.
-
-The sender MUST use an authenticated, encrypted channel. Both sender and
-receiver MUST keep `hotkey_private_key` out of logs, analytics, crash reports,
-clipboard history, and unencrypted backups. The receiver MUST validate field
-lengths, signature context, network, and round before storing the package, and
-SHOULD place the hotkey private key in platform secure storage.
-
-The receiver SHOULD zero temporary plaintext buffers after import. Deleting
-the source copy after a successful import is a product decision, not a
-protocol-level revocation mechanism.
-
-## Relationship to TX1
-
-TX1 delegates one eligible-note bundle to the hotkey. A future export package
-can hand control of that hotkey to external software. See
-[Delegation signing transaction (TX1)](delegation-signing-transaction.md) for
-the note construction, `rho_signed` binding, and signature flow.
+If public-chain recovery becomes a product requirement, it can be designed for
+a future round boundary without changing the authority model in this version.

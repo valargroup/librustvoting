@@ -600,6 +600,7 @@ fn internal_serialize(error: serde_json::Error) -> VotingError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use group::{Group, GroupEncoding};
     use rusqlite::params;
     use std::path::PathBuf;
 
@@ -610,7 +611,7 @@ mod tests {
         VotingRoundParams {
             vote_round_id: hex::encode(pallas::Base::from(7).to_repr()),
             snapshot_height: 100,
-            ea_pk: vec![0xEA; 32],
+            ea_pk: pallas::Point::generator().to_bytes().to_vec(),
             nc_root: vec![0xAA; 32],
             nullifier_imt_root: vec![0xBB; 32],
         }
@@ -855,6 +856,12 @@ mod tests {
             assert_eq!(data.address_index, 0);
         }
         queries::store_van_position(&conn, &params.vote_round_id, WALLET, 0, 42).unwrap();
+        queries::store_van_position(&conn, &params.vote_round_id, WALLET, 1, 43).unwrap();
+        assert!(
+            queries::get_round_state(&conn, &params.vote_round_id, WALLET)
+                .unwrap()
+                .proof_generated
+        );
         drop(conn);
         drop(customer);
 
@@ -867,6 +874,10 @@ mod tests {
         assert_eq!(
             queries::load_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0).unwrap(),
             42
+        );
+        assert_eq!(
+            queries::load_van_position(&customer.conn(), &params.vote_round_id, WALLET, 1).unwrap(),
+            43
         );
 
         let mut conflicting = capability.clone();
@@ -956,5 +967,115 @@ mod tests {
         )
         .is_err());
         assert!(!customer.has_round(&params.vote_round_id).unwrap());
+    }
+
+    #[test]
+    fn confirmation_must_match_the_transaction_hash_in_the_package() {
+        use crate::confirmation::{confirm_delegation_submission, TxEvent, TxEventAttribute};
+
+        let (_, params, hotkey, capability) = exported_fixture();
+        let customer = test_db(":memory:");
+        import_delegation_capability(&customer, &capability, import_context(&hotkey, &params))
+            .unwrap();
+        let events = [TxEvent {
+            event_type: "delegate_vote".to_string(),
+            attributes: vec![
+                TxEventAttribute {
+                    key: "vote_round_id".to_string(),
+                    value: params.vote_round_id.clone(),
+                },
+                TxEventAttribute {
+                    key: "leaf_index".to_string(),
+                    value: "0".to_string(),
+                },
+            ],
+        }];
+
+        let error = confirm_delegation_submission(
+            &customer,
+            &params.vote_round_id,
+            0,
+            &"ff".repeat(32),
+            &events,
+        )
+        .expect_err("confirmation must bind the exact signed transaction");
+        assert!(
+            error.to_string().contains("delegation tx_hash conflict"),
+            "{error}"
+        );
+        assert!(
+            queries::load_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0).is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "generates a real ZKP2 proof"]
+    fn custody_target_capability_confirms_tree_leaf_and_builds_a_real_vote() {
+        use crate::{
+            confirmation::{confirm_delegation_submission, TxEvent, TxEventAttribute},
+            types::NoopProgressReporter,
+            vote::{DraftVote, VoteSigner},
+        };
+        use vote_commitment_tree::MemoryTreeServer;
+
+        let (_, params, hotkey, capability) = exported_fixture();
+        let customer = test_db(":memory:");
+        import_delegation_capability(&customer, &capability, import_context(&hotkey, &params))
+            .unwrap();
+
+        let tx_hash = capability.bundles[0].delegation_tx_hash.clone();
+        confirm_delegation_submission(
+            &customer,
+            &params.vote_round_id,
+            0,
+            &tx_hash,
+            &[TxEvent {
+                event_type: "delegate_vote".to_string(),
+                attributes: vec![
+                    TxEventAttribute {
+                        key: "vote_round_id".to_string(),
+                        value: params.vote_round_id.clone(),
+                    },
+                    TxEventAttribute {
+                        key: "leaf_index".to_string(),
+                        value: "0".to_string(),
+                    },
+                ],
+            }],
+        )
+        .unwrap();
+
+        let validated = capability.validate().unwrap();
+        let leaf = Option::from(pallas::Base::from_repr(validated.bundles[0].van)).unwrap();
+        let mut server = MemoryTreeServer::empty();
+        server.append(leaf).unwrap();
+        server.checkpoint(1).unwrap();
+
+        let tree = crate::tree_sync::VoteTreeSync::new();
+        let anchor_height = tree
+            .sync_with_api(&customer, &params.vote_round_id, &server)
+            .unwrap();
+        let witness = tree
+            .generate_van_witness(&customer, &params.vote_round_id, 0, anchor_height)
+            .unwrap();
+        let committed = crate::vote::commit(
+            &customer,
+            &params.vote_round_id,
+            0,
+            &DraftVote {
+                proposal_id: 1,
+                choice: 0,
+                num_options: 2,
+                single_share: true,
+                vc_tree_position: 0,
+            },
+            &witness,
+            VoteSigner::hotkey(&hotkey),
+            &NoopProgressReporter,
+        )
+        .unwrap();
+
+        assert_eq!(committed.proposal_id, 1);
+        assert!(!committed.proof.is_empty());
     }
 }

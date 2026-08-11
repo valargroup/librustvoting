@@ -6,10 +6,14 @@ use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Parameters;
 use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
-    gather_delegation_lwd_inputs, prepare_delegation_bundle as prepare_bundle_state,
-    spend_auth_signature, DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
-    Network, NoopProgressReporter, PrepareDelegationBundleParams, PreparedDelegationBundle,
-    PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
+    export_delegation_capability, gather_delegation_lwd_inputs, import_delegation_capability,
+    prepare_delegation_bundle as prepare_bundle_state,
+    prepare_delegation_bundle_for_target as prepare_target_bundle_state, spend_auth_signature,
+    DelegationCapabilityV1, DelegationSigningRequest, DelegationSubmission,
+    ImportDelegationCapabilityParams, KeystoneSigningRequest, Network, NoopProgressReporter,
+    PrepareDelegationBundleForTargetParams, PrepareDelegationBundleParams,
+    PreparedDelegationBundle, PreparedDelegationReport, PreparedSigner,
+    RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey,
 };
 use zcash_voting::wire::PirLayout;
 use zcash_voting::{
@@ -29,6 +33,19 @@ pub struct PrepareRequest<'a> {
     pub round_params: VotingRoundParams,
     pub round_name: &'a str,
     pub voting_hotkey: &'a VotingHotkey,
+    pub session_json: Option<&'a str>,
+    pub bundle_index: u32,
+    pub bundle_policy: BundlePolicy,
+}
+
+/// Provider-side inputs for preparing one bundle for a customer's public target.
+pub struct PrepareForTargetRequest<'a> {
+    pub account_uuid: &'a str,
+    pub lightwalletd_url: &'a str,
+    pub network: Network,
+    pub round_params: VotingRoundParams,
+    pub round_name: &'a str,
+    pub voting_target: &'a RoundBoundVotingHotkeyTarget,
     pub session_json: Option<&'a str>,
     pub bundle_index: u32,
     pub bundle_policy: BundlePolicy,
@@ -76,6 +93,94 @@ where
         },
     )
     .context("prepare delegation bundle with witnesses")
+}
+
+/// Prepares a provider-owned delegation bundle for a customer-owned hotkey.
+///
+/// The request contains only the validated public target. The customer retains
+/// the voting hotkey secret, while the provider retains this target with its
+/// durable delegation job until the round closes.
+pub async fn prepare_delegation_bundle_for_public_target<C, P, CL, R>(
+    voting_db: &VotingDb,
+    wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
+    request: PrepareForTargetRequest<'_>,
+) -> Result<PreparedDelegationBundle>
+where
+    C: std::borrow::Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    let lwd_inputs = gather_delegation_lwd_inputs(ResolveDelegationLwdParams {
+        lightwalletd_url: request.lightwalletd_url,
+        network: request.network,
+        round_params: request.round_params,
+        round_name: request.round_name,
+    })
+    .await
+    .context("gather provider delegation lightwalletd inputs")?;
+
+    prepare_target_bundle_state(
+        voting_db,
+        wallet_db,
+        PrepareDelegationBundleForTargetParams {
+            lwd: lwd_inputs,
+            session_json: request.session_json,
+            account_uuid: request.account_uuid,
+            voting_target: request.voting_target,
+            bundle_index: request.bundle_index,
+            bundle_policy: request.bundle_policy,
+        },
+    )
+    .context("prepare delegation bundle for public target")
+}
+
+/// Exports the canonical package that a provider delivers before broadcast.
+///
+/// `signed_delegation_txs` are the exact vote-chain transaction bytes retained
+/// in the provider's durable outbox. The returned digest is the value that must
+/// match the customer's acknowledgement before those bytes are broadcast.
+pub fn export_custody_capability(
+    voting_db: &VotingDb,
+    voting_target: &RoundBoundVotingHotkeyTarget,
+    signed_delegation_txs: &[Vec<u8>],
+) -> Result<(Vec<u8>, String)> {
+    let capability = export_delegation_capability(voting_db, voting_target, signed_delegation_txs)
+        .context("export delegation capability")?;
+    let json = capability
+        .to_json()
+        .context("encode delegation capability")?;
+    let digest = capability
+        .package_digest()
+        .context("hash delegation capability")?;
+    Ok((json, digest))
+}
+
+/// Validates and atomically imports a provider package for a customer hotkey.
+///
+/// Return this digest only after the call succeeds durably. The provider then
+/// compares it to its outbox digest before broadcasting the exact transactions.
+pub fn import_custody_capability(
+    voting_db: &VotingDb,
+    capability_json: &[u8],
+    voting_hotkey: &VotingHotkey,
+    expected_chain_id: &str,
+    expected_network: Network,
+    expected_round_params: &VotingRoundParams,
+    session_json: Option<&str>,
+) -> Result<String> {
+    let capability = DelegationCapabilityV1::from_json(capability_json)
+        .context("decode delegation capability")?;
+    import_delegation_capability(
+        voting_db,
+        &capability,
+        ImportDelegationCapabilityParams {
+            voting_hotkey,
+            expected_chain_id,
+            expected_network,
+            expected_round_params,
+            session_json,
+        },
+    )
+    .context("import delegation capability")
 }
 
 /// Precomputes persistent artifacts needed to later prove one delegation bundle.

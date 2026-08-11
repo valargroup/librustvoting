@@ -310,10 +310,9 @@ pub fn get_round_state(
         })?;
     let network = network_from_storage(&network)?;
 
-    // proof_generated is true only when ALL bundles have a successful proof
-    // AND all bundles have a VAN leaf position (delegation TX landed on chain).
-    // This prevents the UI from treating delegation as complete before the
-    // on-chain submission finishes.
+    // proof_generated is true only when ALL bundles are locally proven or
+    // capability-imported AND all bundles have a VAN leaf position. This keeps
+    // the legacy UI field false until every delegation transaction lands.
     let bundle_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id",
@@ -327,14 +326,33 @@ pub fn get_round_state(
     let proof_generated = if bundle_count == 0 {
         false
     } else {
-        let proofs_count: i64 = conn
+        let proven_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM proofs WHERE round_id = :round_id AND wallet_id = :wallet_id AND success = 1",
+                "SELECT COUNT(*)
+                 FROM bundles b
+                 WHERE b.round_id = :round_id AND b.wallet_id = :wallet_id
+                   AND (
+                       EXISTS (
+                           SELECT 1 FROM proofs p
+                           WHERE p.round_id = b.round_id
+                             AND p.wallet_id = b.wallet_id
+                             AND p.bundle_index = b.bundle_index
+                             AND p.success = 1
+                       )
+                       OR (
+                           b.note_positions_blob IS NULL
+                           AND b.van_comm_rand IS NOT NULL
+                           AND b.gov_comm IS NOT NULL
+                           AND b.total_note_value IS NOT NULL
+                           AND b.address_index = 0
+                           AND b.delegation_tx_hash IS NOT NULL
+                       )
+                   )",
                 named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
                 |row| row.get(0),
             )
             .map_err(|e| VotingError::Internal {
-                message: format!("failed to count proofs: {}", e),
+                message: format!("failed to count completed delegations: {}", e),
             })?;
 
         let van_positions_count: i64 = conn
@@ -347,7 +365,7 @@ pub fn get_round_state(
                 message: format!("failed to count VAN positions: {}", e),
             })?;
 
-        proofs_count >= bundle_count && van_positions_count >= bundle_count
+        proven_count >= bundle_count && van_positions_count >= bundle_count
     };
 
     Ok(RoundState {
@@ -1308,6 +1326,91 @@ pub fn load_van_position(
     .ok_or_else(|| VotingError::InvalidInput {
         message: format!("van_leaf_position not yet set for round={}, bundle={}", round_id, bundle_index),
     })
+}
+
+/// One confirmed VAN position that must be retained during vote-tree sync.
+pub(crate) struct VanTreeEntry {
+    pub bundle_index: u32,
+    pub position: u32,
+    /// Present only while the delegation VAN is still the bundle's current VAN.
+    pub initial_commitment: Option<pallas::Base>,
+}
+
+/// Loads confirmed VAN positions and the initial commitments that remain current.
+///
+/// A submitted vote replaces the delegation VAN with a successor commitment,
+/// so only bundles without a submitted vote can be checked against `gov_comm`.
+pub(crate) fn load_van_tree_entries(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Vec<VanTreeEntry>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.bundle_index, b.van_leaf_position, b.gov_comm,
+                    EXISTS (
+                        SELECT 1 FROM votes v
+                        WHERE v.round_id = b.round_id
+                          AND v.wallet_id = b.wallet_id
+                          AND v.bundle_index = b.bundle_index
+                          AND v.tx_hash IS NOT NULL
+                    )
+             FROM bundles b
+             WHERE b.round_id = :round_id
+               AND b.wallet_id = :wallet_id
+               AND b.van_leaf_position IS NOT NULL
+             ORDER BY b.bundle_index",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare VAN tree entries query: {e}"),
+        })?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to query VAN tree entries: {e}"),
+        })?;
+
+    rows.map(|row| {
+        let (bundle_index, position, commitment, has_submitted_vote) =
+            row.map_err(|e| VotingError::Internal {
+                message: format!("failed to read VAN tree entry: {e}"),
+            })?;
+        let bundle_index = u32::try_from(bundle_index).map_err(|_| VotingError::Internal {
+            message: "stored VAN bundle index does not fit in u32".to_string(),
+        })?;
+        let position = u32::try_from(position).map_err(|_| VotingError::Internal {
+            message: format!("stored VAN position for bundle {bundle_index} does not fit in u32"),
+        })?;
+        let initial_commitment = if has_submitted_vote {
+            None
+        } else {
+            let commitment = commitment.ok_or_else(|| VotingError::Internal {
+                message: format!(
+                    "confirmed delegation bundle {bundle_index} is missing its VAN commitment"
+                ),
+            })?;
+            Some(field_from_bytes(
+                &commitment,
+                &format!("bundle {bundle_index} VAN commitment"),
+            )?)
+        };
+        Ok(VanTreeEntry {
+            bundle_index,
+            position,
+            initial_commitment,
+        })
+    })
+    .collect()
 }
 
 // --- Delegation proof result fields ---
