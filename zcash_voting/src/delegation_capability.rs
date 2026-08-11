@@ -3,7 +3,8 @@
 //! This flow assumes the provider generates and retains the voting hotkey. The
 //! customer receives a copy of voting authority, not an exclusive transfer:
 //! the provider can observe, cast, or race votes for the round. The hotkey
-//! cannot spend the customer's ZEC.
+//! cannot spend funds held by the original delegating account. It can spend
+//! funds sent to its own receiver, which must not be funded or reused.
 
 use std::collections::HashSet;
 

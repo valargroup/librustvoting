@@ -68,7 +68,8 @@ In the custody-provider handoff, the provider generates and retains that fresh
 hotkey, then gives the customer its opaque stored secret plus a compact
 delegation capability. This grants the customer a copy of voting authority,
 not exclusive control: the provider can observe, cast, or race votes with its
-retained hotkey. The hotkey still cannot spend the customer's ZEC. See
+retained hotkey. The hotkey cannot spend funds held by the original delegating
+account, but its receiver must not be funded or reused. See
 [Custody-provider voting handoff](exporting-to-external-software.md).
 
 No single field carries the full meaning of the delegation. The authorization
@@ -89,7 +90,7 @@ Consequently, a valid delegation signature and ZKP #1 statement mean:
 > for this round to this one new hotkey.
 
 The hotkey can authorize later vote-chain actions. It cannot spend the
-account's Zcash funds.
+account's Zcash funds, but it can spend funds sent to its own receiver.
 
 ## Inputs
 

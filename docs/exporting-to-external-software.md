@@ -9,8 +9,9 @@ that control the customer's funds.
 The provider generates and retains a fresh voting hotkey for one customer and
 round. The customer receives a copy of that voting authority, not an exclusive
 transfer. The provider can observe the customer's vote and can cast or race a
-vote using its retained copy. The voting hotkey cannot spend the customer's
-ZEC.
+vote using its retained copy. The voting hotkey cannot spend funds held by the
+original delegating account. It can spend funds sent to its own Orchard
+receiver, so that receiver MUST NOT be funded or reused.
 
 Do not use this flow when the customer must have voting privacy or exclusive
 voting authority against the provider.

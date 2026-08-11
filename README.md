@@ -86,8 +86,9 @@ It distinguishes the PCZT-only signing artifact from the vote-chain
 delegation submission and includes software-wallet and Keystone examples.
 The companion [custody-provider voting handoff](docs/exporting-to-external-software.md)
 documents the generated-hotkey trust model, capability format, and delivery
-flow. The provider retains shared voting authority; the hotkey cannot spend
-the customer's ZEC.
+flow. The provider retains shared voting authority. The hotkey cannot spend
+funds held by the original delegating account, but its receiver must not be
+funded or reused.
 
 ## Migrating 0.11 to 0.12
 
