@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ff::PrimeField;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Parameters;
@@ -12,7 +13,7 @@ use zcash_voting::prelude::{
     DelegationSigningRequest, DelegationSubmission, ImportDelegationCapabilityParams,
     KeystoneSigningRequest, Network, NoopProgressReporter, PrepareDelegationBundleForTargetParams,
     PrepareDelegationBundleParams, PreparedDelegationBundle, PreparedDelegationReport,
-    PreparedSigner, RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey,
+    PreparedSigner, RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey, VotingHotkeyTargetV1,
 };
 use zcash_voting::wire::PirLayout;
 use zcash_voting::{
@@ -48,6 +49,56 @@ pub struct PrepareForTargetRequest<'a> {
     pub session_json: Option<&'a str>,
     pub bundle_index: u32,
     pub bundle_policy: BundlePolicy,
+}
+
+/// Encodes the public target that the voter sends to the funds controller.
+///
+/// The voter retains the hotkey secret. Only these canonical, round-bound JSON
+/// bytes cross the boundary.
+pub fn encode_public_voting_target(
+    voting_hotkey: &VotingHotkey,
+    vote_chain_id: &str,
+    round_params: &VotingRoundParams,
+) -> Result<Vec<u8>> {
+    let target = voting_hotkey.delegation_target();
+    let network = match target.network() {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Regtest => "regtest",
+    };
+    let target_v1 = VotingHotkeyTargetV1 {
+        format_version: 1,
+        vote_chain_id: vote_chain_id.to_string(),
+        network: network.to_string(),
+        vote_round_id: round_params.vote_round_id.clone(),
+        address_index: target.address_index(),
+        raw_orchard_address: BASE64_STANDARD.encode(target.raw_orchard_address()),
+    };
+
+    target_v1
+        .validate_for(vote_chain_id, target.network(), round_params)
+        .context("validate public voting target")?;
+    target_v1
+        .to_json()
+        .map(String::into_bytes)
+        .context("encode public voting target")
+}
+
+/// Parses and independently validates the target on the funds controller.
+///
+/// The returned opaque value is local to the controller and is the value passed
+/// to [`prepare_delegation_bundle_for_public_target`].
+pub fn validate_public_voting_target(
+    target_json: &[u8],
+    expected_chain_id: &str,
+    expected_network: Network,
+    expected_round_params: &VotingRoundParams,
+) -> Result<RoundBoundVotingHotkeyTarget> {
+    let target_json = std::str::from_utf8(target_json).context("decode public target UTF-8")?;
+    VotingHotkeyTargetV1::from_json(target_json)
+        .context("parse public voting target")?
+        .validate_for(expected_chain_id, expected_network, expected_round_params)
+        .context("validate public voting target context")
 }
 
 /// Resolves lightwalletd and wallet inputs for later delegation operations.

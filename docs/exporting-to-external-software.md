@@ -35,8 +35,8 @@ collisions and unnecessary cross-controller linkability.
 ## Public target handoff
 
 The voter encodes `VotingHotkey::delegation_target()` as
-`VotingHotkeyTargetV1` and validates it against independently authenticated
-round parameters. The target contains:
+`VotingHotkeyTargetV1`, validates it against independently authenticated round
+parameters, calls `to_json`, and sends those JSON bytes. The target contains:
 
 - format version;
 - vote-chain identifier;
@@ -45,9 +45,13 @@ round parameters. The target contains:
 - fixed address index zero; and
 - the 43-byte raw Orchard address, encoded as padded standard Base64.
 
-The funds controller passes the resulting opaque
-`RoundBoundVotingHotkeyTarget` to `prepare_delegation_bundle_for_target`. It
-MUST use the same target for every bundle in that delegation job.
+The funds controller parses the received bytes with
+`VotingHotkeyTargetV1::from_json`, then independently calls `validate_for` with
+its authenticated chain, network, and full round parameters. That validation
+creates a controller-local opaque `RoundBoundVotingHotkeyTarget`; the opaque
+type itself never crosses the boundary. The controller passes that value to
+`prepare_delegation_bundle_for_target` and MUST use the same target for every
+bundle in that delegation job.
 
 The funds controller application, not `VotingDb`, owns the durable job/outbox
 record. That record MUST retain the validated target across restarts because
