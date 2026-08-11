@@ -37,7 +37,7 @@ pub struct PrepareRequest<'a> {
     pub bundle_policy: BundlePolicy,
 }
 
-/// Provider-side inputs for preparing one bundle for a customer's public target.
+/// Funds controller inputs for preparing one bundle for a voter's public target.
 pub struct PrepareForTargetRequest<'a> {
     pub account_uuid: &'a str,
     pub lightwalletd_url: &'a str,
@@ -94,11 +94,11 @@ where
     .context("prepare delegation bundle with witnesses")
 }
 
-/// Prepares a provider-owned delegation bundle for a customer-owned hotkey.
+/// Prepares a funds controller delegation bundle for a voter-owned hotkey.
 ///
-/// The request contains only the validated public target. The customer retains
-/// the voting hotkey secret, while the provider retains this target with its
-/// durable delegation job until the round closes.
+/// The request contains only the validated public target. The voter retains the
+/// voting hotkey secret, while the funds controller retains this target with
+/// its durable delegation job until the round closes.
 pub async fn prepare_delegation_bundle_for_public_target<C, P, CL, R>(
     voting_db: &VotingDb,
     wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
@@ -115,7 +115,7 @@ where
         round_name: request.round_name,
     })
     .await
-    .context("gather provider delegation lightwalletd inputs")?;
+    .context("gather public target delegation lightwalletd inputs")?;
 
     prepare_target_bundle_state(
         voting_db,
@@ -132,13 +132,13 @@ where
     .context("prepare delegation bundle for public target")
 }
 
-/// Exports the canonical package a provider stores before broadcast.
+/// Exports the canonical package a funds controller stores before broadcast.
 ///
 /// `signed_delegation_txs` are the exact vote-chain transaction bytes retained
-/// in the provider's durable outbox. The provider may deliver the package while
-/// broadcasting; the returned digest lets it verify the customer's delivery
+/// in the funds controller's durable outbox. It may deliver the package while
+/// broadcasting; the returned digest lets it verify the voter's delivery
 /// acknowledgement.
-pub fn export_custody_capability(
+pub fn export_delegation_capability_package(
     voting_db: &VotingDb,
     voting_target: &RoundBoundVotingHotkeyTarget,
     signed_delegation_txs: &[Vec<u8>],
@@ -154,12 +154,12 @@ pub fn export_custody_capability(
     Ok((json, digest))
 }
 
-/// Validates and atomically imports a provider package for a customer hotkey.
+/// Validates and atomically imports a package for a voter hotkey.
 ///
-/// Return this digest only after the call succeeds durably. The provider
+/// Return this digest only after the call succeeds durably. The funds controller
 /// compares it to its outbox digest as a delivery receipt and keeps redelivering
 /// the same package through round close when needed.
-pub fn import_custody_capability(
+pub fn import_delegation_capability_package(
     voting_db: &VotingDb,
     capability_json: &[u8],
     voting_hotkey: &VotingHotkey,

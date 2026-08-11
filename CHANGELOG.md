@@ -7,12 +7,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Added
-- Added secret-free, round-bound voting hotkey targets and a canonical custody-provider
-  capability handoff. Providers can prepare delegation for a customer's public
-  target, durably store the package before broadcasting, verify delivery by its
-  digest, and let the customer use the existing confirmation, tree-sync, and
-  ZKP2 voting path without sharing account viewing material or the voting
-  hotkey secret.
+- Added secret-free, round-bound voting hotkey targets and a canonical
+  delegation capability handoff. A funds controller, such as a custody
+  provider, can prepare delegation for a voter's public target, durably store
+  the package before broadcasting, verify delivery by its digest, and let the
+  voter use the existing confirmation, tree-sync, and ZKP2 voting path without
+  sharing account viewing material or the voting hotkey secret.
 
 ## v2.0.0-rc.5
 

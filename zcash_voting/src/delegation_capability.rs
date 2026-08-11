@@ -1,4 +1,5 @@
-//! Compact custody-provider delegation capability handoff.
+//! Compact delegation capability handoff for separately controlled funds and
+//! voting hotkeys.
 
 use std::collections::HashSet;
 
@@ -51,11 +52,11 @@ pub struct DelegationCapabilityBundleV1 {
     pub delegation_tx_hash: String,
 }
 
-/// Canonical custody-provider delegation capability.
+/// Canonical delegation capability handoff package.
 ///
 /// It contains no voting hotkey secret, but it is privacy-sensitive and should
-/// travel over the provider's existing authenticated confidential channel. This
-/// type deliberately omits `Debug`.
+/// travel over the parties' authenticated confidential channel. This type
+/// deliberately omits `Debug`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegationCapabilityV1 {
@@ -177,9 +178,9 @@ impl DelegationCapabilityV1 {
     }
 }
 
-/// Independently trusted customer context for capability import.
+/// Independently trusted voter context for capability import.
 pub struct ImportDelegationCapabilityParams<'a> {
-    /// Customer-owned hotkey; its secret never enters the package.
+    /// Voter-owned hotkey; its secret never enters the package.
     pub voting_hotkey: &'a VotingHotkey,
     /// Vote chain identifier obtained independently of the package.
     pub expected_chain_id: &'a str,
@@ -204,15 +205,15 @@ struct ValidatedBundle {
     tx_hash: String,
 }
 
-/// Exports a capability from completed provider-side delegation state.
+/// Exports a capability from completed funds controller delegation state.
 ///
 /// `signed_delegation_txs` must contain the exact transactions in bundle order.
-/// Before broadcasting, the provider must durably store the target, transaction
-/// bytes, package bytes, and digest, and retain them through round close. It may
-/// deliver the package while broadcasting; the customer's matching digest is a
-/// delivery receipt rather than a broadcast prerequisite. Supplying the wrong
-/// target after a restart fails because it cannot reproduce the persisted VAN
-/// commitments.
+/// Before broadcasting, the funds controller must durably store the target,
+/// transaction bytes, package bytes, and digest, and retain them through round
+/// close. It may deliver the package while broadcasting; the voter's matching
+/// digest is a delivery receipt rather than a broadcast prerequisite. Supplying
+/// the wrong target after a restart fails because it cannot reproduce the
+/// persisted VAN commitments.
 pub fn export_delegation_capability(
     db: &VotingDb,
     voting_target: &RoundBoundVotingHotkeyTarget,
@@ -233,7 +234,7 @@ pub fn export_delegation_capability(
 
     let rows = provider_bundles(&conn, &round_id, &wallet_id)?;
     if rows.is_empty() || rows.len() > MAX_DELEGATION_CAPABILITY_BUNDLES {
-        return Err(invalid("provider delegation has an invalid bundle count"));
+        return Err(invalid("delegation job has an invalid bundle count"));
     }
     if signed_delegation_txs.len() != rows.len() {
         return Err(invalid(format!(
@@ -253,21 +254,21 @@ pub fn export_delegation_capability(
         let (index, rand, stored_van, total, address_index, stored_hash) = row;
         if index != expected_index as u32 {
             return Err(VotingError::Internal {
-                message: "stored provider bundle indices are not contiguous".to_string(),
+                message: "stored delegation bundle indices are not contiguous".to_string(),
             });
         }
         if address_index != target.address_index() || raw_tx.is_empty() {
-            return Err(invalid(
-                "provider delegation target or transaction is invalid",
-            ));
+            return Err(invalid("delegation target or transaction is invalid"));
         }
         if total > MAX_MONEY {
-            return Err(internal("stored provider voting weight exceeds MAX_MONEY"));
+            return Err(internal(
+                "stored delegation voting weight exceeds MAX_MONEY",
+            ));
         }
         batch_total = batch_total
             .checked_add(total)
             .filter(|total| *total <= MAX_MONEY)
-            .ok_or_else(|| internal("stored provider batch weight exceeds MAX_MONEY"))?;
+            .ok_or_else(|| internal("stored delegation batch weight exceeds MAX_MONEY"))?;
         let num_ballots = total / BALLOT_DIVISOR;
         let canonical_total = canonical_total(num_ballots)?;
         let expected_van: [u8; 32] = construct_van(
@@ -316,7 +317,7 @@ pub fn export_delegation_capability(
 /// including after confirmation advances VAN positions. Any partial,
 /// locally-constructed, or conflicting bundle state is rejected. `capability_json`
 /// must use the exact canonical encoding, and the returned lowercase digest
-/// acknowledges those delivered bytes to the provider.
+/// acknowledges those delivered bytes to the funds controller.
 pub fn import_delegation_capability(
     db: &VotingDb,
     capability_json: &[u8],
@@ -335,7 +336,7 @@ pub fn import_delegation_capability(
         || validated.target != context.voting_hotkey.delegation_target()
     {
         return Err(invalid(
-            "delegation capability does not match the trusted customer context",
+            "delegation capability does not match the trusted voter context",
         ));
     }
 
@@ -445,7 +446,7 @@ fn provider_bundles(
         .map_err(|e| internal(format!("read provider capability bundles failed: {e}")))?;
     if raw.len() != total_count {
         return Err(invalid(
-            "provider delegation bundles must be locally prepared and proven",
+            "delegation bundles must be locally prepared and proven",
         ));
     }
     raw.into_iter()
@@ -455,7 +456,9 @@ fn provider_bundles(
             if pallas::Base::from_repr(rand).is_none().into()
                 || pallas::Base::from_repr(van).is_none().into()
             {
-                return Err(internal("stored provider commitment data is not canonical"));
+                return Err(internal(
+                    "stored delegation commitment data is not canonical",
+                ));
             }
             Ok((
                 u32::try_from(index).map_err(|_| internal("stored bundle index is invalid"))?,
@@ -581,7 +584,7 @@ fn array32(value: Vec<u8>, field: &str) -> Result<[u8; 32], VotingError> {
     let len = value.len();
     value.try_into().map_err(|_| {
         internal(format!(
-            "stored provider {field} must be 32 bytes, got {len}"
+            "stored delegation {field} must be 32 bytes, got {len}"
         ))
     })
 }
@@ -1072,7 +1075,7 @@ mod tests {
 
     #[test]
     #[ignore = "generates a real ZKP2 proof"]
-    fn custody_target_capability_confirms_tree_leaf_and_builds_a_real_vote() {
+    fn delegation_capability_handoff_confirms_tree_leaf_and_builds_a_real_vote() {
         use crate::{
             confirmation::{confirm_delegation_submission, TxEvent, TxEventAttribute},
             types::NoopProgressReporter,

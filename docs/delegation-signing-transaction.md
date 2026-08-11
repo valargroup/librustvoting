@@ -84,21 +84,22 @@ Consequently, a valid delegation signature and ZKP #1 statement mean:
 The hotkey can authorize later vote-chain actions. It cannot spend the
 account's Zcash funds.
 
-### Custody-provider target mode
+### Public-target delegation mode
 
 The voting hotkey address may come from the same wallet that owns the funds, or
-from a customer who retains the hotkey while a custody provider owns and signs
-for the funds. In provider mode, the customer sends only a validated
+from a voter who retains the hotkey while another party controls and signs for
+the funds. A custody provider is one example of that funds controller role. In
+public-target mode, the voter sends only a validated
 `RoundBoundVotingHotkeyTarget`; no hotkey secret or account viewing material is
 shared. TX1 construction, the account SpendAuth signature, and ZKP1 are
 otherwise unchanged.
 
-The provider MUST use the same target for every bundle in its round job and
-retain that target across restarts. After signing the vote-chain delegation
+The funds controller MUST use the same target for every bundle in its round job
+and retain that target across restarts. After signing the vote-chain delegation
 transactions, it exports and durably stores a `DelegationCapabilityV1` before
 broadcast. It may deliver the package while broadcasting the exact hashed
-transaction bytes; the customer's matching digest is a delivery receipt. See
-[Custody-provider voting capability](exporting-to-external-software.md).
+transaction bytes; the voter's matching digest is a delivery receipt. See
+[Delegation capability handoff](exporting-to-external-software.md).
 
 ## Inputs
 
@@ -401,12 +402,12 @@ The vote-chain submission contains the SpendAuth signature, `rk`, and the
 compact effecting data from which the verifier reconstructs the sighash. It is
 not TX1, does not contain a Zcash transaction, and never carries a PCZT.
 
-A custody provider can instead prepare TX1 for a customer's public,
+A separate funds controller can instead prepare TX1 for a voter's public,
 round-bound hotkey target and deliver the resulting runtime data through a
-`DelegationCapabilityV1`. The customer retains the hotkey secret; the provider
-retains its account keys. The delivery receipt and validation contract is
-documented in
-[custody-provider voting capability](exporting-to-external-software.md).
+`DelegationCapabilityV1`. The voter retains the hotkey secret; the funds
+controller retains its account keys. The delivery receipt and validation
+contract is documented in
+[delegation capability handoff](exporting-to-external-software.md).
 
 Signing state is one-shot. After a restart, the wallet MAY resume only if it
 retained the exact signing request, including the full PCZT. Otherwise it MUST

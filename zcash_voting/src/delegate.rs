@@ -274,8 +274,9 @@ pub struct PrepareDelegationBundleParams<'a> {
 
 /// Parameters for preparing one delegation bundle for a public target.
 ///
-/// The provider must retain the validated target with its durable delegation
-/// job and use that same value when exporting the customer capability.
+/// The funds controller must retain the validated target with its durable
+/// delegation job and use that same value when exporting the capability
+/// package.
 pub struct PrepareDelegationBundleForTargetParams<'a> {
     pub lwd: DelegationLwdInputs,
     pub session_json: Option<&'a str>,
