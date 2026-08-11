@@ -8,9 +8,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Added
 - Added a compact, zero-migration custody-provider capability handoff. A
-  provider can generate and retain a voting hotkey, delegate customer funds to
-  it, and deliver the customer a copy of the voting authority without exposing
-  Zcash spending or viewing keys.
+  provider can generate and retain a voting hotkey, delegate the voting
+  authority of customer funds to it, and deliver the customer a copy of that
+  authority without exposing keys that control those funds.
 
 ### Changed
 - Recovery cleanup now preserves confirmed vote authority and imported
