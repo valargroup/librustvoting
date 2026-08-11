@@ -117,7 +117,7 @@ impl VotingHotkeyTargetV1 {
         ))
     }
 
-    fn validated_parts(&self) -> Result<(VotingHotkeyTarget, [u8; 32]), VotingError> {
+    pub(crate) fn validated_parts(&self) -> Result<(VotingHotkeyTarget, [u8; 32]), VotingError> {
         if self.format_version != VOTING_HOTKEY_TARGET_FORMAT_VERSION {
             return Err(VotingError::InvalidInput {
                 message: format!(
