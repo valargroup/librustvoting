@@ -52,6 +52,9 @@ stage-oriented API:
   requests, and assembles signed delegation submissions. Wallets keep root seed
   material outside this crate, sign requests at the wallet boundary, and pass
   only signature bytes back through `PreparedSigner::signature`.
+- `delegation_capability::*` lets a custody provider hand a generated voting
+  hotkey and compact delegation capability to a customer without exposing the
+  Zcash keys that control the customer's funds.
 - `confirmation::*` parses delegation and cast-vote tx events, then records tx
   hashes and tree positions atomically.
 - `vote::*` builds ZKP #2, signs cast-vote payloads, persists the canonical
@@ -81,10 +84,10 @@ The Zcash-format transaction signed during delegation is specified separately
 in [Delegation signing transaction (TX1)](docs/delegation-signing-transaction.md).
 It distinguishes the PCZT-only signing artifact from the vote-chain
 delegation submission and includes software-wallet and Keystone examples.
-The companion
-[external software export](docs/exporting-to-external-software.md) documents
-credential material and validation requirements for a future portable format.
-The crate does not yet expose a complete export and import API.
+The companion [custody-provider voting handoff](docs/exporting-to-external-software.md)
+documents the generated-hotkey trust model, capability format, and delivery
+flow. The provider retains shared voting authority; the hotkey cannot spend
+the customer's ZEC.
 
 ## Migrating 0.11 to 0.12
 

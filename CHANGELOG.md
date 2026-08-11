@@ -4,6 +4,18 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- Added a compact, zero-migration custody-provider capability handoff. A
+  provider can generate and retain a voting hotkey, delegate customer funds to
+  it, and deliver the customer a copy of the voting authority without exposing
+  Zcash spending or viewing keys.
+
+### Changed
+- Recovery cleanup now preserves confirmed vote authority and imported
+  capability data while continuing to reset unconfirmed local work.
+
 ## v2.0.0-rc.5
 
 ### Fixed

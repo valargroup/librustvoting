@@ -64,6 +64,13 @@ hotkey before preparing delegation bundles. If the eligible notes require
 more than one bundle, every TX1 for that identity and round SHOULD delegate to
 the same hotkey.
 
+In the custody-provider handoff, the provider generates and retains that fresh
+hotkey, then gives the customer its opaque stored secret plus a compact
+delegation capability. This grants the customer a copy of voting authority,
+not exclusive control: the provider can observe, cast, or race votes with its
+retained hotkey. The hotkey still cannot spend the customer's ZEC. See
+[Custody-provider voting handoff](exporting-to-external-software.md).
+
 No single field carries the full meaning of the delegation. The authorization
 comes from the following bindings taken together:
 

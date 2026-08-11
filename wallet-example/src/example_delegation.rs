@@ -6,10 +6,11 @@ use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Parameters;
 use zcash_voting::delegate::ResolveDelegationLwdParams;
 use zcash_voting::prelude::{
-    gather_delegation_lwd_inputs, prepare_delegation_bundle as prepare_bundle_state,
-    spend_auth_signature, DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
-    Network, NoopProgressReporter, PrepareDelegationBundleParams, PreparedDelegationBundle,
-    PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
+    export_delegation_capability, gather_delegation_lwd_inputs, import_delegation_capability,
+    prepare_delegation_bundle as prepare_bundle_state, spend_auth_signature,
+    DelegationSigningRequest, DelegationSubmission, ImportDelegationCapabilityParams,
+    KeystoneSigningRequest, Network, NoopProgressReporter, PrepareDelegationBundleParams,
+    PreparedDelegationBundle, PreparedDelegationReport, PreparedSigner, VotingDb, VotingHotkey,
 };
 use zcash_voting::wire::PirLayout;
 use zcash_voting::{
@@ -32,6 +33,70 @@ pub struct PrepareRequest<'a> {
     pub session_json: Option<&'a str>,
     pub bundle_index: u32,
     pub bundle_policy: BundlePolicy,
+}
+
+/// Provider-side capability result that must be durably stored before broadcast.
+pub struct CustodyCapabilityExport {
+    /// Exact canonical capability bytes delivered to the customer.
+    pub capability_json: Vec<u8>,
+    /// Lowercase SHA-256 acknowledged by the customer after import.
+    pub package_digest: String,
+}
+
+/// Exports a completed provider delegation for customer handoff.
+///
+/// The provider retains the hotkey and therefore retains shared voting
+/// authority. It must durably store `voting_hotkey.stored_secret()`, the
+/// returned values, and the exact signed transaction bytes before broadcasting.
+pub fn export_custody_capability(
+    voting_db: &VotingDb,
+    vote_chain_id: &str,
+    round_id: &str,
+    voting_hotkey: &VotingHotkey,
+    signed_delegation_txs: &[Vec<u8>],
+) -> Result<CustodyCapabilityExport> {
+    let capability = export_delegation_capability(
+        voting_db,
+        vote_chain_id,
+        round_id,
+        voting_hotkey,
+        signed_delegation_txs,
+    )
+    .context("export delegation capability")?;
+    Ok(CustodyCapabilityExport {
+        capability_json: capability.to_json().context("encode capability")?,
+        package_digest: capability.package_digest().context("digest capability")?,
+    })
+}
+
+/// Imports provider-delivered voting authority into the customer database.
+///
+/// The caller should store the opaque hotkey secret in platform secure storage
+/// and return the digest as its exact-byte delivery acknowledgement.
+pub fn import_custody_handoff(
+    voting_db: &VotingDb,
+    hotkey_secret: &[u8],
+    capability_json: &[u8],
+    expected_chain_id: &str,
+    expected_network: Network,
+    expected_round_params: &VotingRoundParams,
+    session_json: Option<&str>,
+) -> Result<(VotingHotkey, String)> {
+    let voting_hotkey = VotingHotkey::from_stored_secret(hotkey_secret, expected_network)
+        .context("reconstruct delivered voting hotkey")?;
+    let digest = import_delegation_capability(
+        voting_db,
+        capability_json,
+        ImportDelegationCapabilityParams {
+            voting_hotkey: &voting_hotkey,
+            expected_chain_id,
+            expected_network,
+            expected_round_params,
+            session_json,
+        },
+    )
+    .context("import delegation capability")?;
+    Ok((voting_hotkey, digest))
 }
 
 /// Resolves lightwalletd and wallet inputs for later delegation operations.
