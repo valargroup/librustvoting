@@ -1276,6 +1276,10 @@ pub fn load_zkp2_inputs(
 // --- VAN leaf position ---
 
 /// Store the VAN leaf position after delegation TX is confirmed on chain.
+///
+/// Cast-vote confirmations should use `confirmation::confirm_vote_submission`
+/// so the vote hash, successor VAN position, and VC position are recorded
+/// atomically.
 pub fn store_van_position(
     conn: &Connection,
     round_id: &str,
@@ -2720,6 +2724,7 @@ pub fn clear_unsigned_delegation_setup_fields(
            AND wallet_id = :wallet_id
            AND note_positions_blob IS NOT NULL
            AND delegation_tx_hash IS NULL
+           AND van_leaf_position IS NULL
            AND bundle_index NOT IN (
                SELECT bundle_index
                FROM keystone_signatures
@@ -2760,7 +2765,8 @@ pub fn clear_recovery_state(
         "UPDATE bundles SET delegation_tx_hash = NULL
          WHERE round_id = :round_id
            AND wallet_id = :wallet_id
-           AND note_positions_blob IS NOT NULL",
+           AND note_positions_blob IS NOT NULL
+           AND van_leaf_position IS NULL",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {

@@ -1110,6 +1110,9 @@ pub fn record_submission(
 }
 
 /// Records the confirmed VAN leaf position for a delegated bundle.
+///
+/// Cast-vote callers should use `confirmation::confirm_vote_submission` so the
+/// vote hash, successor VAN position, and VC position are stored atomically.
 pub fn record_van_position(
     db: &VotingDb,
     round_id: &str,

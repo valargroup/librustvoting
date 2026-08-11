@@ -1179,6 +1179,8 @@ impl VotingDb {
 
     /// Store the VAN leaf position after delegation TX is confirmed on chain.
     /// The app calls this after parsing the delegation TX response events.
+    /// Cast-vote callers should use `confirmation::confirm_vote_submission` so
+    /// all confirmation fields are stored atomically.
     pub fn store_van_position(
         &self,
         round_id: &str,

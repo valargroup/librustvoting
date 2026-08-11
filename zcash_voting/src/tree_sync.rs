@@ -194,6 +194,46 @@ mod tests {
     }
 
     #[test]
+    fn sync_retains_incremental_state_when_confirmed_position_is_not_yet_synced() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.create_round(crate::Network::Testnet, &round_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[note(0)]).unwrap();
+        db.store_van_position(ROUND_ID, 0, 1).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET gov_comm = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 0",
+                rusqlite::params![Fp::from(2).to_repr().as_slice(), ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+
+        let sync = VoteTreeSync::new();
+        let mut server = server_with_single_leaf_blocks(1);
+        let error = sync
+            .sync_with_api(&db, ROUND_ID, &server)
+            .expect_err("a position beyond the synced tree must remain pending");
+        assert!(
+            error
+                .to_string()
+                .contains("is absent from the synced vote tree"),
+            "{error}"
+        );
+
+        let round_client = sync.clients.lock().unwrap().get(ROUND_ID).cloned().unwrap();
+        assert_eq!(round_client.lock().unwrap().client.size(), 1);
+        assert!(sync.generate_van_witness(&db, ROUND_ID, 0, 1).is_err());
+
+        server.append(Fp::from(2)).unwrap();
+        server.checkpoint(2).unwrap();
+        let height = sync.sync_with_api(&db, ROUND_ID, &server).unwrap();
+        let witness = sync.generate_van_witness(&db, ROUND_ID, 0, height).unwrap();
+        assert_eq!(height, 2);
+        assert_eq!(witness.position, 1);
+    }
+
+    #[test]
     fn blocked_sync_does_not_block_another_round() {
         struct BlockingApi {
             entered: mpsc::Sender<()>,
@@ -368,8 +408,10 @@ impl VoteTreeSync {
     /// Before a bundle's first vote, sync also requires its confirmed event
     /// position to contain the stored delegation VAN. Capability import
     /// recomputes that VAN from the customer's own public hotkey target. A
-    /// failed VAN check invalidates the round client so witness generation
-    /// cannot use unverified tree state.
+    /// VAN mismatch or inconsistent tree state invalidates the round client so
+    /// witness generation cannot use unverified data. A confirmed position that
+    /// has not reached the synced tree yet is reported without discarding the
+    /// incremental client, allowing a later sync to resume normally.
     ///
     /// Returns the latest synced block height.
     pub fn sync(&self, db: &VotingDb, round_id: &str, node_url: &str) -> Result<u32, VotingError> {
@@ -420,19 +462,18 @@ impl VoteTreeSync {
 
         let anchor_height = round_client.client.last_synced_height().unwrap_or(0);
         let validation = (|| {
+            let mut missing_bundle = None;
             for entry in entries {
                 let Some(expected_commitment) = entry.initial_commitment else {
                     continue;
                 };
-                let path = round_client
+                let Some(path) = round_client
                     .client
                     .witness(u64::from(entry.position), anchor_height)
-                    .ok_or_else(|| VotingError::InvalidInput {
-                        message: format!(
-                            "confirmed delegation bundle {} is absent from the synced vote tree",
-                            entry.bundle_index
-                        ),
-                    })?;
+                else {
+                    missing_bundle.get_or_insert(entry.bundle_index);
+                    continue;
+                };
                 let root = round_client
                     .client
                     .root_at_height(anchor_height)
@@ -450,11 +491,21 @@ impl VoteTreeSync {
                     });
                 }
             }
-            Ok(())
+            Ok(missing_bundle)
         })();
-        if let Err(error) = validation {
-            *round_client = RoundTreeClient::empty();
-            return Err(error);
+        match validation {
+            Err(error) => {
+                *round_client = RoundTreeClient::empty();
+                return Err(error);
+            }
+            Ok(Some(bundle_index)) => {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "confirmed delegation bundle {bundle_index} is absent from the synced vote tree"
+                    ),
+                });
+            }
+            Ok(None) => {}
         }
 
         // Empty tree is valid before the first delegation commitment is appended.

@@ -741,6 +741,10 @@ pub fn record_submission(
 }
 
 /// Records the on-chain vote commitment tree position after confirmation.
+///
+/// This does not advance the bundle's current VAN position. Prefer
+/// `confirmation::confirm_vote_submission` when recording chain events so all
+/// confirmation fields are stored atomically.
 pub fn record_vc_position(
     db: &VotingDb,
     round_id: &str,
