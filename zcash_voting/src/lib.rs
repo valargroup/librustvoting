@@ -66,10 +66,10 @@ pub use types::{
     CastVoteSignature, DelegationAction, DelegationPirPrecomputeResult, DelegationProgressBridge,
     DelegationProgressReporter, DelegationProofResult, DelegationSubmissionData, EncryptedShare,
     GovernancePczt, Network, NoopProgressReporter, NoteInfo, NoteRef, ProgressReporter,
-    SelectedNotes, ShareDelegationRecord, SharePayload, VoteCommitStageBridge,
-    VoteCommitStageReporter, VoteCommitmentBundle, VotingError, VotingHotkey, VotingRoundParams,
-    WireEncryptedShare, WitnessData, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID,
-    MIN_VOTE_OPTIONS,
+    RoundBoundVotingHotkeyTarget, SelectedNotes, ShareDelegationRecord, SharePayload,
+    VoteCommitStageBridge, VoteCommitStageReporter, VoteCommitmentBundle, VotingError,
+    VotingHotkey, VotingHotkeyTarget, VotingRoundParams, WireEncryptedShare, WitnessData,
+    MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID, MIN_VOTE_OPTIONS,
 };
 
 /// Warm process-lifetime proving-key caches used by on-device voting proofs.
