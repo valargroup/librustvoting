@@ -310,10 +310,9 @@ pub fn get_round_state(
         })?;
     let network = network_from_storage(&network)?;
 
-    // proof_generated is true only when ALL bundles have a successful proof
-    // AND all bundles have a VAN leaf position (delegation TX landed on chain).
-    // This prevents the UI from treating delegation as complete before the
-    // on-chain submission finishes.
+    // proof_generated is true only when ALL bundles are locally proven or
+    // capability-imported AND all bundles have a VAN leaf position. This keeps
+    // the legacy UI field false until every delegation transaction lands.
     let bundle_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id",
@@ -327,14 +326,33 @@ pub fn get_round_state(
     let proof_generated = if bundle_count == 0 {
         false
     } else {
-        let proofs_count: i64 = conn
+        let completed_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM proofs WHERE round_id = :round_id AND wallet_id = :wallet_id AND success = 1",
+                "SELECT COUNT(*)
+                 FROM bundles b
+                 WHERE b.round_id = :round_id AND b.wallet_id = :wallet_id
+                   AND (
+                       EXISTS (
+                           SELECT 1 FROM proofs p
+                           WHERE p.round_id = b.round_id
+                             AND p.wallet_id = b.wallet_id
+                             AND p.bundle_index = b.bundle_index
+                             AND p.success = 1
+                       )
+                       OR (
+                           b.note_positions_blob IS NULL
+                           AND b.van_comm_rand IS NOT NULL
+                           AND b.gov_comm IS NOT NULL
+                           AND b.total_note_value IS NOT NULL
+                           AND b.address_index = 0
+                           AND b.delegation_tx_hash IS NOT NULL
+                       )
+                   )",
                 named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
                 |row| row.get(0),
             )
             .map_err(|e| VotingError::Internal {
-                message: format!("failed to count proofs: {}", e),
+                message: format!("failed to count completed delegations: {}", e),
             })?;
 
         let van_positions_count: i64 = conn
@@ -347,7 +365,7 @@ pub fn get_round_state(
                 message: format!("failed to count VAN positions: {}", e),
             })?;
 
-        proofs_count >= bundle_count && van_positions_count >= bundle_count
+        completed_count >= bundle_count && van_positions_count >= bundle_count
     };
 
     Ok(RoundState {
@@ -2585,8 +2603,10 @@ pub fn get_keystone_signatures(
 
 // --- Session reset cleanup ---
 
-/// Clears unsigned delegation setup fields for one round while preserving
-/// submitted bundles and bundles with persisted Keystone signatures.
+/// Clears locally prepared unsigned delegation setup fields for one round.
+///
+/// Imported capability bundles have no local note selection, so their NULL
+/// `note_positions_blob` keeps their voting fields outside this cleanup.
 pub fn clear_unsigned_delegation_setup_fields(
     conn: &Connection,
     round_id: &str,
@@ -2613,7 +2633,9 @@ pub fn clear_unsigned_delegation_setup_fields(
              tx1_effects = NULL
          WHERE round_id = :round_id
            AND wallet_id = :wallet_id
+           AND note_positions_blob IS NOT NULL
            AND delegation_tx_hash IS NULL
+           AND van_leaf_position IS NULL
            AND bundle_index NOT IN (
                SELECT bundle_index
                FROM keystone_signatures
@@ -2629,6 +2651,8 @@ pub fn clear_unsigned_delegation_setup_fields(
 
 // --- Recovery state cleanup ---
 
+/// Clears retryable recovery state without erasing recorded confirmations or
+/// imported delegation capabilities.
 pub fn clear_recovery_state(
     conn: &Connection,
     round_id: &str,
@@ -2649,14 +2673,21 @@ pub fn clear_recovery_state(
         message: format!("failed to clear keystone signatures: {}", e),
     })?;
     conn.execute(
-        "UPDATE bundles SET delegation_tx_hash = NULL WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        "UPDATE bundles SET delegation_tx_hash = NULL
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND note_positions_blob IS NOT NULL
+           AND van_leaf_position IS NULL",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {
         message: format!("failed to clear delegation tx hashes: {}", e),
     })?;
     conn.execute(
-        "UPDATE votes SET tx_hash = NULL, vc_tree_position = NULL, commitment_bundle_json = NULL WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        "UPDATE votes SET tx_hash = NULL, commitment_bundle_json = NULL
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND vc_tree_position IS NULL",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {

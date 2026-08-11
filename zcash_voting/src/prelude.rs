@@ -21,6 +21,11 @@ pub use crate::delegate::{
 pub use crate::delegate::{
     prepare_delegation_bundle, PrepareDelegationBundleParams, PreparedDelegationBundle,
 };
+pub use crate::delegation_capability::{
+    export_delegation_capability, import_delegation_capability, DelegationCapabilityBundleV1,
+    DelegationCapabilityV1, ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
+    MAX_DELEGATION_CAPABILITY_JSON_BYTES,
+};
 pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::hotkey::{
