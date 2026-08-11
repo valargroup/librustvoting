@@ -396,9 +396,13 @@ The vote-chain submission contains the SpendAuth signature, `rk`, and the
 compact effecting data from which the verifier reconstructs the sighash. It is
 not TX1, does not contain a Zcash transaction, and never carries a PCZT.
 
-Portable transfer of the resulting voting authority is not yet exposed as a
-complete export and import API. The required credential handling and
-validation are documented in
+Portable transfer of the resulting voting authority is exposed by the
+generated-hotkey handoff: the provider retains and sends
+`VotingHotkey::stored_secret()` with the output of
+`export_delegation_capability`, and the customer reconstructs the hotkey with
+`VotingHotkey::from_stored_secret` before calling
+`import_delegation_capability`. The required trust model, credential handling,
+and validation are documented in
 [external software export](exporting-to-external-software.md). Do not export
 the wallet seed or account spending key.
 

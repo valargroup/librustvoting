@@ -47,7 +47,9 @@ voting authority against the provider.
 
 The provider should support idempotent redelivery through round close. Voting
 weight becomes unusable only if both parties lose the hotkey secret or
-capability package; the customer's funds are not at risk.
+capability package. Funds held by the original delegating account are not at
+risk. Any value mistakenly sent to the generated hotkey receiver is controlled
+by both hotkey holders and is outside that guarantee.
 
 ## Capability format
 
