@@ -89,7 +89,8 @@ account's Zcash funds.
 The voting hotkey address may come from the same wallet that owns the funds, or
 from a voter who retains the hotkey while another party controls and signs for
 the funds. A custody provider is one example of that funds controller role. In
-public-target mode, the voter sends only a validated
+public-target mode, the voter sends only canonical `VotingHotkeyTargetV1` JSON.
+The funds controller independently validates those bytes into its own local
 `RoundBoundVotingHotkeyTarget`; no hotkey secret or account viewing material is
 shared. TX1 construction, the account SpendAuth signature, and ZKP1 are
 otherwise unchanged.
