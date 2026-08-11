@@ -1457,17 +1457,19 @@ impl VotingDb {
         queries::get_keystone_signatures(&conn, round_id, &wallet_id)
     }
 
-    /// Clears derived recovery artifacts while preserving the voter's ballot
-    /// intent. Use `clear_round`/`delete_round` to remove the whole round,
-    /// including recorded decisions.
+    /// Clears unconfirmed recovery artifacts while preserving ballot intent,
+    /// recorded vote confirmations, and imported delegation capabilities. Use
+    /// `clear_round`/`delete_round` to remove the whole round, including
+    /// recorded decisions.
     pub fn clear_recovery_state(&self, round_id: &str) -> Result<(), VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::clear_recovery_state(&conn, round_id, &wallet_id)
     }
 
-    /// Clears unsigned delegation setup fields for one round while preserving
-    /// submitted bundles and bundles with persisted Keystone signatures.
+    /// Clears locally prepared unsigned delegation setup fields for one round
+    /// while preserving submitted bundles, imported capabilities, and bundles
+    /// with persisted Keystone signatures.
     pub fn clear_unsigned_delegation_setup_fields(
         &self,
         round_id: &str,

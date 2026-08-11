@@ -123,8 +123,9 @@ pub fn reset_vote_tree(db: &VotingDb, round_id: &str) -> Result<(), VotingError>
     vote_tree_sync_for(db)?.reset(round_id)
 }
 
-/// Drops cached vote tree state and, for round-scoped resets, clears unsigned
-/// delegation setup fields so interrupted Keystone requests can be rebuilt safely.
+/// Drops cached vote tree state and, for round-scoped resets, clears locally
+/// prepared unsigned delegation setup fields so interrupted Keystone requests
+/// can be rebuilt safely. Imported delegation capabilities are preserved.
 ///
 /// Round-scoped cleanup is mainly for the restart mid-signing case: if the app
 /// dies after `build_governance_pczt` persisted `pczt_sighash` (and related

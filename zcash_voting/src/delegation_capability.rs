@@ -29,7 +29,8 @@ pub const MAX_DELEGATION_CAPABILITY_BUNDLES: usize = 4_096;
 /// Maximum accepted size of a canonical capability JSON document.
 ///
 /// Network callers should enforce this while reading, before allocating the
-/// complete buffer passed to [`DelegationCapabilityV1::from_json`].
+/// complete buffer passed to [`DelegationCapabilityV1::from_json`] or
+/// [`import_delegation_capability`].
 pub const MAX_DELEGATION_CAPABILITY_JSON_BYTES: usize = 1_048_576;
 
 /// One bundle in a version 1 delegation capability.
@@ -50,7 +51,7 @@ pub struct DelegationCapabilityBundleV1 {
     pub delegation_tx_hash: String,
 }
 
-/// Canonical capability delivered before a provider broadcasts delegation.
+/// Canonical custody-provider delegation capability.
 ///
 /// It contains no voting hotkey secret, but it is privacy-sensitive and should
 /// travel over the provider's existing authenticated confidential channel. This
@@ -81,6 +82,10 @@ impl DelegationCapabilityV1 {
     /// noncanonical scalar encodings are rejected so both parties hash the
     /// same bytes.
     pub fn from_json(json: &[u8]) -> Result<Self, VotingError> {
+        Self::from_json_with_validation(json).map(|(capability, _)| capability)
+    }
+
+    fn from_json_with_validation(json: &[u8]) -> Result<(Self, ValidatedCapability), VotingError> {
         if json.len() > MAX_DELEGATION_CAPABILITY_JSON_BYTES {
             return Err(invalid(format!(
                 "delegation capability JSON exceeds {MAX_DELEGATION_CAPABILITY_JSON_BYTES} bytes"
@@ -88,13 +93,13 @@ impl DelegationCapabilityV1 {
         }
         let capability: Self = serde_json::from_slice(json)
             .map_err(|e| invalid(format!("invalid delegation capability JSON: {e}")))?;
-        capability.validate()?;
+        let validated = capability.validate()?;
         if serde_json::to_vec(&capability).map_err(internal_serialize)? != json {
             return Err(invalid(
                 "delegation capability JSON must use its exact canonical encoding",
             ));
         }
-        Ok(capability)
+        Ok((capability, validated))
     }
 
     /// Returns the exact compact JSON bytes covered by the package digest.
@@ -201,11 +206,13 @@ struct ValidatedBundle {
 
 /// Exports a capability from completed provider-side delegation state.
 ///
-/// `signed_delegation_txs` must contain the exact transactions in bundle order. The
-/// provider must durably retain the target, transaction bytes, package bytes,
-/// and digest, and broadcast those same transactions only after receiving the
-/// customer's exact digest acknowledgement. Supplying the wrong target after a
-/// restart fails because it cannot reproduce the persisted VAN commitments.
+/// `signed_delegation_txs` must contain the exact transactions in bundle order.
+/// Before broadcasting, the provider must durably store the target, transaction
+/// bytes, package bytes, and digest, and retain them through round close. It may
+/// deliver the package while broadcasting; the customer's matching digest is a
+/// delivery receipt rather than a broadcast prerequisite. Supplying the wrong
+/// target after a restart fails because it cannot reproduce the persisted VAN
+/// commitments.
 pub fn export_delegation_capability(
     db: &VotingDb,
     voting_target: &RoundBoundVotingHotkeyTarget,
@@ -307,18 +314,20 @@ pub fn export_delegation_capability(
 ///
 /// Missing round and bundle rows commit together. Exact re-import is a no-op,
 /// including after confirmation advances VAN positions. Any partial,
-/// locally-constructed, or conflicting bundle state is rejected. The returned
-/// lowercase digest is acknowledged to the provider before it broadcasts.
+/// locally-constructed, or conflicting bundle state is rejected. `capability_json`
+/// must use the exact canonical encoding, and the returned lowercase digest
+/// acknowledges those delivered bytes to the provider.
 pub fn import_delegation_capability(
     db: &VotingDb,
-    capability: &DelegationCapabilityV1,
+    capability_json: &[u8],
     context: ImportDelegationCapabilityParams<'_>,
 ) -> Result<String, VotingError> {
     validate_vote_chain_id(context.expected_chain_id)?;
     validate_round_params(context.expected_round_params)?;
     i64::try_from(context.expected_round_params.snapshot_height)
         .map_err(|_| invalid("snapshot_height does not fit in SQLite INTEGER"))?;
-    let validated = capability.validate()?;
+    let (capability, validated) =
+        DelegationCapabilityV1::from_json_with_validation(capability_json)?;
     if capability.vote_chain_id != context.expected_chain_id
         || capability.vote_round_id != context.expected_round_params.vote_round_id
         || validated.target.network() != context.expected_network
@@ -330,9 +339,7 @@ pub fn import_delegation_capability(
         ));
     }
 
-    let digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(capability).map_err(internal_serialize)?,
-    ));
+    let digest = hex::encode(Sha256::digest(capability_json));
     let wallet_id = db.wallet_id();
     let mut conn = db.conn();
     let tx = conn
@@ -714,6 +721,14 @@ mod tests {
         }
     }
 
+    fn import_capability(
+        db: &VotingDb,
+        capability: &DelegationCapabilityV1,
+        context: ImportDelegationCapabilityParams<'_>,
+    ) -> Result<String, VotingError> {
+        import_delegation_capability(db, &capability.to_json()?, context)
+    }
+
     fn temp_db_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "zcash-voting-{label}-{}-{}.sqlite",
@@ -784,12 +799,21 @@ mod tests {
 
     #[test]
     fn canonical_codec_rejects_malleable_or_incomplete_packages() {
-        let (_, _, _, capability) = exported_fixture();
+        let (_, params, hotkey, capability) = exported_fixture();
         let json = capability.to_json().unwrap();
         assert!(DelegationCapabilityV1::from_json(&json).unwrap() == capability);
         assert_eq!(capability.package_digest().unwrap().len(), 64);
 
-        assert!(DelegationCapabilityV1::from_json(&[json.as_slice(), b" "].concat()).is_err());
+        let noncanonical = [json.as_slice(), b" "].concat();
+        assert!(DelegationCapabilityV1::from_json(&noncanonical).is_err());
+        let customer = test_db(":memory:");
+        assert!(import_delegation_capability(
+            &customer,
+            &noncanonical,
+            import_context(&hotkey, &params),
+        )
+        .is_err());
+        assert!(!customer.has_round(&params.vote_round_id).unwrap());
         let text = String::from_utf8(json).unwrap();
         let unknown = text.replacen("{", "{\"extra\":true,", 1);
         assert!(DelegationCapabilityV1::from_json(unknown.as_bytes()).is_err());
@@ -834,11 +858,16 @@ mod tests {
     #[test]
     fn import_is_atomic_idempotent_and_uses_the_existing_schema() {
         let (_, params, hotkey, capability) = exported_fixture();
+        let capability_json = capability.to_json().unwrap();
         let path = temp_db_path("capability-customer");
         let customer = test_db(path.to_str().unwrap());
-        let digest =
-            import_delegation_capability(&customer, &capability, import_context(&hotkey, &params))
-                .unwrap();
+        let digest = import_delegation_capability(
+            &customer,
+            &capability_json,
+            import_context(&hotkey, &params),
+        )
+        .unwrap();
+        assert_eq!(digest, hex::encode(Sha256::digest(&capability_json)));
         assert_eq!(digest, capability.package_digest().unwrap());
         assert_eq!(customer.get_bundle_count(&params.vote_round_id).unwrap(), 2);
         let conn = customer.conn();
@@ -867,8 +896,12 @@ mod tests {
 
         let customer = test_db(path.to_str().unwrap());
         assert_eq!(
-            import_delegation_capability(&customer, &capability, import_context(&hotkey, &params),)
-                .unwrap(),
+            import_delegation_capability(
+                &customer,
+                &capability_json,
+                import_context(&hotkey, &params),
+            )
+            .unwrap(),
             digest
         );
         assert_eq!(
@@ -882,12 +915,9 @@ mod tests {
 
         let mut conflicting = capability.clone();
         conflicting.bundles[0].delegation_tx_hash = "11".repeat(32);
-        assert!(import_delegation_capability(
-            &customer,
-            &conflicting,
-            import_context(&hotkey, &params),
-        )
-        .is_err());
+        assert!(
+            import_capability(&customer, &conflicting, import_context(&hotkey, &params),).is_err()
+        );
         assert_eq!(
             queries::get_delegation_tx_hash(&customer.conn(), &params.vote_round_id, WALLET, 0)
                 .unwrap(),
@@ -898,11 +928,47 @@ mod tests {
     }
 
     #[test]
+    fn imported_capability_survives_recovery_and_session_reset() {
+        let (_, params, hotkey, capability) = exported_fixture();
+        let capability_json = capability.to_json().unwrap();
+        let customer = test_db(":memory:");
+        let digest = import_delegation_capability(
+            &customer,
+            &capability_json,
+            import_context(&hotkey, &params),
+        )
+        .unwrap();
+        let validated = capability.validate().unwrap();
+
+        crate::recovery::clear(&customer, &params.vote_round_id).unwrap();
+        crate::precompute::reset_voting_session_state(&customer, &params.vote_round_id).unwrap();
+
+        let conn = customer.conn();
+        for bundle in &validated.bundles {
+            assert!(
+                bundle_matches(&conn, &params.vote_round_id, WALLET, bundle).unwrap(),
+                "imported bundle {} changed during cleanup",
+                bundle.index
+            );
+        }
+        drop(conn);
+        assert_eq!(
+            import_delegation_capability(
+                &customer,
+                &capability_json,
+                import_context(&hotkey, &params),
+            )
+            .unwrap(),
+            digest
+        );
+    }
+
+    #[test]
     fn import_rejects_context_and_local_state_without_writes() {
         let (_, params, customer_hotkey, capability) = exported_fixture();
         let wrong_hotkey = hotkey(0x44);
         let customer = test_db(":memory:");
-        assert!(import_delegation_capability(
+        assert!(import_capability(
             &customer,
             &capability,
             import_context(&wrong_hotkey, &params),
@@ -914,7 +980,7 @@ mod tests {
             .init_round(Network::Regtest, &params, None)
             .unwrap();
         queries::insert_bundle(&customer.conn(), &params.vote_round_id, WALLET, 0, &[9]).unwrap();
-        assert!(import_delegation_capability(
+        assert!(import_capability(
             &customer,
             &capability,
             import_context(&customer_hotkey, &params),
@@ -933,7 +999,7 @@ mod tests {
         conflicting_round
             .init_round(Network::Regtest, &stored_params, None)
             .unwrap();
-        assert!(import_delegation_capability(
+        assert!(import_capability(
             &conflicting_round,
             &capability,
             import_context(&customer_hotkey, &params),
@@ -960,12 +1026,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(import_delegation_capability(
-            &customer,
-            &capability,
-            import_context(&hotkey, &params),
-        )
-        .is_err());
+        assert!(
+            import_capability(&customer, &capability, import_context(&hotkey, &params),).is_err()
+        );
         assert!(!customer.has_round(&params.vote_round_id).unwrap());
     }
 
@@ -975,8 +1038,7 @@ mod tests {
 
         let (_, params, hotkey, capability) = exported_fixture();
         let customer = test_db(":memory:");
-        import_delegation_capability(&customer, &capability, import_context(&hotkey, &params))
-            .unwrap();
+        import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
         let events = [TxEvent {
             event_type: "delegate_vote".to_string(),
             attributes: vec![
@@ -1020,8 +1082,7 @@ mod tests {
 
         let (_, params, hotkey, capability) = exported_fixture();
         let customer = test_db(":memory:");
-        import_delegation_capability(&customer, &capability, import_context(&hotkey, &params))
-            .unwrap();
+        import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
 
         let tx_hash = capability.bundles[0].delegation_tx_hash.clone();
         confirm_delegation_submission(

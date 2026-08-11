@@ -115,6 +115,48 @@ mod tests {
     }
 
     #[test]
+    fn recovery_clear_preserves_recorded_vote_tree_state() {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.create_round(crate::Network::Testnet, &round_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[note(0)]).unwrap();
+        db.store_van_position(ROUND_ID, 0, 0).unwrap();
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE bundles SET gov_comm = ?1
+             WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 0",
+            rusqlite::params![Fp::from(1).to_repr().as_slice(), ROUND_ID, WALLET_ID],
+        )
+        .unwrap();
+        queries::store_vote(&conn, ROUND_ID, WALLET_ID, 0, 1, 0, &[0xAA; 32]).unwrap();
+        queries::record_vote_submission(&conn, ROUND_ID, WALLET_ID, 0, 1, "confirmed-vote")
+            .unwrap();
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json = '{}', vc_tree_position = 1
+             WHERE round_id = ?1 AND wallet_id = ?2
+               AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::params![ROUND_ID, WALLET_ID],
+        )
+        .unwrap();
+        drop(conn);
+        db.store_van_position(ROUND_ID, 0, 1).unwrap();
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        assert_eq!(
+            db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
+            Some("confirmed-vote")
+        );
+        let sync = VoteTreeSync::new();
+        let height = sync
+            .sync_with_api(&db, ROUND_ID, &server_with_single_leaf_blocks(2))
+            .unwrap();
+        let witness = sync.generate_van_witness(&db, ROUND_ID, 0, height).unwrap();
+        assert_eq!(witness.position, 1);
+    }
+
+    #[test]
     fn sync_rejects_a_confirmed_position_for_a_different_van() {
         let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(WALLET_ID);
@@ -130,7 +172,8 @@ mod tests {
             )
             .unwrap();
 
-        let error = VoteTreeSync::new()
+        let sync = VoteTreeSync::new();
+        let error = sync
             .sync_with_api(&db, ROUND_ID, &server_with_single_leaf_blocks(1))
             .expect_err("a different public leaf must not authorize voting");
         assert!(
@@ -138,6 +181,15 @@ mod tests {
                 .to_string()
                 .contains("does not match its synced vote-tree leaf"),
             "{error}"
+        );
+        let witness_error = sync
+            .generate_van_witness(&db, ROUND_ID, 0, 1)
+            .expect_err("unverified tree state must not produce a witness");
+        assert!(
+            witness_error
+                .to_string()
+                .contains("failed to generate witness"),
+            "{witness_error}"
         );
     }
 
@@ -315,7 +367,9 @@ impl VoteTreeSync {
     /// rebuilt so the sparse tree retains that historical leaf.
     /// Before a bundle's first vote, sync also requires its confirmed event
     /// position to contain the stored delegation VAN. Capability import
-    /// recomputes that VAN from the customer's own public hotkey target.
+    /// recomputes that VAN from the customer's own public hotkey target. A
+    /// failed VAN check invalidates the round client so witness generation
+    /// cannot use unverified tree state.
     ///
     /// Returns the latest synced block height.
     pub fn sync(&self, db: &VotingDb, round_id: &str, node_url: &str) -> Result<u32, VotingError> {
@@ -365,35 +419,42 @@ impl VoteTreeSync {
             })?;
 
         let anchor_height = round_client.client.last_synced_height().unwrap_or(0);
-        for entry in entries {
-            let Some(expected_commitment) = entry.initial_commitment else {
-                continue;
-            };
-            let path = round_client
-                .client
-                .witness(u64::from(entry.position), anchor_height)
-                .ok_or_else(|| VotingError::InvalidInput {
-                    message: format!(
-                        "confirmed delegation bundle {} is absent from the synced vote tree",
-                        entry.bundle_index
-                    ),
-                })?;
-            let root = round_client
-                .client
-                .root_at_height(anchor_height)
-                .ok_or_else(|| VotingError::Internal {
-                    message: format!(
-                        "synced vote tree has no root at anchor height {anchor_height}"
-                    ),
-                })?;
-            if !path.verify(expected_commitment, root) {
-                return Err(VotingError::InvalidInput {
-                    message: format!(
-                        "confirmed delegation bundle {} does not match its synced vote-tree leaf",
-                        entry.bundle_index
-                    ),
-                });
+        let validation = (|| {
+            for entry in entries {
+                let Some(expected_commitment) = entry.initial_commitment else {
+                    continue;
+                };
+                let path = round_client
+                    .client
+                    .witness(u64::from(entry.position), anchor_height)
+                    .ok_or_else(|| VotingError::InvalidInput {
+                        message: format!(
+                            "confirmed delegation bundle {} is absent from the synced vote tree",
+                            entry.bundle_index
+                        ),
+                    })?;
+                let root = round_client
+                    .client
+                    .root_at_height(anchor_height)
+                    .ok_or_else(|| VotingError::Internal {
+                        message: format!(
+                            "synced vote tree has no root at anchor height {anchor_height}"
+                        ),
+                    })?;
+                if !path.verify(expected_commitment, root) {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "confirmed delegation bundle {} does not match its synced vote-tree leaf",
+                            entry.bundle_index
+                        ),
+                    });
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            *round_client = RoundTreeClient::empty();
+            return Err(error);
         }
 
         // Empty tree is valid before the first delegation commitment is appended.

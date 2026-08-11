@@ -83,8 +83,8 @@ It distinguishes the PCZT-only signing artifact from the vote-chain
 delegation submission and includes software-wallet and Keystone examples.
 The companion
 [custody-provider voting capability](docs/exporting-to-external-software.md)
-documents the public-target, package-acknowledgement, and zero-migration import
-flow for delegating provider-held funds to a customer-retained voting hotkey.
+documents the public-target, delivery-receipt, and zero-migration import flow
+for delegating provider-held funds to a customer-retained voting hotkey.
 
 ## Migrating 0.11 to 0.12
 

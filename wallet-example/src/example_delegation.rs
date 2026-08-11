@@ -9,11 +9,10 @@ use zcash_voting::prelude::{
     export_delegation_capability, gather_delegation_lwd_inputs, import_delegation_capability,
     prepare_delegation_bundle as prepare_bundle_state,
     prepare_delegation_bundle_for_target as prepare_target_bundle_state, spend_auth_signature,
-    DelegationCapabilityV1, DelegationSigningRequest, DelegationSubmission,
-    ImportDelegationCapabilityParams, KeystoneSigningRequest, Network, NoopProgressReporter,
-    PrepareDelegationBundleForTargetParams, PrepareDelegationBundleParams,
-    PreparedDelegationBundle, PreparedDelegationReport, PreparedSigner,
-    RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey,
+    DelegationSigningRequest, DelegationSubmission, ImportDelegationCapabilityParams,
+    KeystoneSigningRequest, Network, NoopProgressReporter, PrepareDelegationBundleForTargetParams,
+    PrepareDelegationBundleParams, PreparedDelegationBundle, PreparedDelegationReport,
+    PreparedSigner, RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey,
 };
 use zcash_voting::wire::PirLayout;
 use zcash_voting::{
@@ -133,11 +132,12 @@ where
     .context("prepare delegation bundle for public target")
 }
 
-/// Exports the canonical package that a provider delivers before broadcast.
+/// Exports the canonical package a provider stores before broadcast.
 ///
 /// `signed_delegation_txs` are the exact vote-chain transaction bytes retained
-/// in the provider's durable outbox. The returned digest is the value that must
-/// match the customer's acknowledgement before those bytes are broadcast.
+/// in the provider's durable outbox. The provider may deliver the package while
+/// broadcasting; the returned digest lets it verify the customer's delivery
+/// acknowledgement.
 pub fn export_custody_capability(
     voting_db: &VotingDb,
     voting_target: &RoundBoundVotingHotkeyTarget,
@@ -156,8 +156,9 @@ pub fn export_custody_capability(
 
 /// Validates and atomically imports a provider package for a customer hotkey.
 ///
-/// Return this digest only after the call succeeds durably. The provider then
-/// compares it to its outbox digest before broadcasting the exact transactions.
+/// Return this digest only after the call succeeds durably. The provider
+/// compares it to its outbox digest as a delivery receipt and keeps redelivering
+/// the same package through round close when needed.
 pub fn import_custody_capability(
     voting_db: &VotingDb,
     capability_json: &[u8],
@@ -167,11 +168,9 @@ pub fn import_custody_capability(
     expected_round_params: &VotingRoundParams,
     session_json: Option<&str>,
 ) -> Result<String> {
-    let capability = DelegationCapabilityV1::from_json(capability_json)
-        .context("decode delegation capability")?;
     import_delegation_capability(
         voting_db,
-        &capability,
+        capability_json,
         ImportDelegationCapabilityParams {
             voting_hotkey,
             expected_chain_id,

@@ -95,9 +95,10 @@ otherwise unchanged.
 
 The provider MUST use the same target for every bundle in its round job and
 retain that target across restarts. After signing the vote-chain delegation
-transactions, it exports a `DelegationCapabilityV1`, obtains the customer's
-digest acknowledgement, and only then broadcasts the exact hashed transaction
-bytes. See [Custody-provider voting capability](exporting-to-external-software.md).
+transactions, it exports and durably stores a `DelegationCapabilityV1` before
+broadcast. It may deliver the package while broadcasting the exact hashed
+transaction bytes; the customer's matching digest is a delivery receipt. See
+[Custody-provider voting capability](exporting-to-external-software.md).
 
 ## Inputs
 
@@ -403,7 +404,7 @@ not TX1, does not contain a Zcash transaction, and never carries a PCZT.
 A custody provider can instead prepare TX1 for a customer's public,
 round-bound hotkey target and deliver the resulting runtime data through a
 `DelegationCapabilityV1`. The customer retains the hotkey secret; the provider
-retains its account keys. The acknowledgement and validation contract is
+retains its account keys. The delivery receipt and validation contract is
 documented in
 [custody-provider voting capability](exporting-to-external-software.md).
 

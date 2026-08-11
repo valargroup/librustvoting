@@ -8,9 +8,11 @@ Zcash account keys.
 
 The customer creates and retains a fresh `VotingHotkey`. The custodian receives
 only a public target bound to one vote chain, network, and round. After the
-custodian prepares and signs every delegation transaction, it returns a compact
-capability package over its existing authenticated, confidential API. The
-customer imports and acknowledges that package before the custodian broadcasts.
+custodian prepares and signs every delegation transaction, it durably stores a
+compact capability package before broadcasting and delivers the package over
+its existing authenticated, confidential API. Delivery and broadcast may
+proceed concurrently; the customer imports the package and acknowledges its
+digest as a delivery receipt.
 
 No wallet seed, account spending key, account IVK or FVK, or voting-hotkey
 secret crosses this boundary.
@@ -47,7 +49,7 @@ bundle in that provider job.
 
 The provider application, not `VotingDb`, owns the durable job/outbox record.
 That record MUST retain the validated target across restarts because the target
-cannot be recovered from the VAN. It should also retain the exact signed
+cannot be recovered from the VAN. It MUST also retain the exact signed
 transactions, their hashes, the canonical package bytes and digest, customer
 acknowledgement state, and broadcast state.
 
@@ -76,25 +78,25 @@ weight, and aggregate values above `MAX_MONEY`.
 
 ## Delivery and broadcast protocol
 
-The provider MUST use this order:
+The provider MUST use this protocol:
 
 1. Prepare, prove, and sign every delegation transaction for the retained
    public target.
 2. Persist the exact signed transaction bytes and their SHA-256 hashes.
 3. Call `export_delegation_capability` and persist the exact canonical package
    bytes and `package_digest()`.
-4. Deliver those bytes to the customer.
-5. The customer parses with `DelegationCapabilityV1::from_json`, atomically
-   imports with `import_delegation_capability`, durably commits, and returns the
-   digest produced by the importer.
-6. The provider compares the acknowledgement to its stored digest.
-7. Only after an exact match, broadcast the same signed transactions whose
-   bytes produced the package hashes.
+4. After that durable write, broadcast the same signed transactions whose bytes
+   produced the package hashes. Package delivery may proceed concurrently.
+5. Deliver the exact package bytes to the customer. The customer atomically
+   imports them with `import_delegation_capability`, durably commits, and returns
+   the digest produced by the importer.
+6. Compare the acknowledgement to the stored digest. A missing or mismatched
+   acknowledgement triggers redelivery; it does not gate broadcast.
 
-Retries MUST redeliver byte-identical package bytes. The provider should retain
-the outbox through round close. Broadcasting before durable acknowledgement can
-make that round's voting weight unusable if both parties then lose the package;
-it does not put the underlying funds at risk.
+Retries MUST redeliver byte-identical package bytes. The provider MUST retain
+the outbox through round close. If both parties lose the package before the
+customer stores it, that round's voting weight can become unusable; the
+underlying funds are never at risk.
 
 ## Customer import
 
