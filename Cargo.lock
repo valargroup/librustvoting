@@ -759,7 +759,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1773,9 +1773,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pir-client"
-version = "0.4.0-rc.4"
+version = "0.4.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25d28b9974a13bdde2f90c614e3e399ec260165554fd1077b07290c73b075cc3"
+checksum = "5a85d03c85d565c87b72dd33677b5b3ff8c4388135c9b239d094015f9a05da3d"
 dependencies = [
  "anyhow",
  "ff",
@@ -1792,9 +1792,9 @@ dependencies = [
 
 [[package]]
 name = "pir-types"
-version = "0.3.0-rc.4"
+version = "0.3.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81a363975b44d002bfa04c2003bdcd1b4564cd54bbd99bc0862140bc86865580"
+checksum = "4e378fde19e41b467099e44c0951b281364f1cdd348d9eca26691942037c9dd5"
 dependencies = [
  "anyhow",
  "ff",
@@ -2136,7 +2136,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2537,7 +2537,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2898,9 +2898,9 @@ dependencies = [
 
 [[package]]
 name = "valar-ypir"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8c3852d9476a0e3efd6c3bfbfc54d3a21a68d8818c4779824ace78aec84a042"
+checksum = "06a0e6155d97d9e2df44a7f552383a311fbcb5528dfc93e9b3236c98184eb840"
 dependencies = [
  "cc",
  "fastrand",

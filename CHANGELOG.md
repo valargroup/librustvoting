@@ -17,6 +17,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation bundle to confirm before creating fresh vote commitments, keeping
   pre-vote package replacement recoverable.
 
+### Changed
+- Bumped the PIR client stack to `pir-types 0.3.0-rc.5`, `pir-client 0.4.0-rc.5`,
+  and `valar-ypir 0.2.0` (vote-nullifier-pir `v0.0.42-alpha.2`). Clients now
+  negotiate YPIR polynomial degree via `YpirScenario.poly_len` (server default
+  4096; omitted responses stay legacy 2048).
+
 ## v2.0.0-rc.5
 
 ### Fixed
