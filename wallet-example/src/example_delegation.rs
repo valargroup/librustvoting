@@ -10,8 +10,9 @@ use zcash_voting::prelude::{
     export_delegation_capability, gather_delegation_lwd_inputs, import_delegation_capability,
     prepare_delegation_bundle as prepare_bundle_state,
     prepare_delegation_bundle_for_target as prepare_target_bundle_state, spend_auth_signature,
-    DelegationSigningRequest, DelegationSubmission, ImportDelegationCapabilityParams,
-    KeystoneSigningRequest, Network, NoopProgressReporter, PrepareDelegationBundleForTargetParams,
+    DelegationCapabilityDigest, DelegationSigningRequest, DelegationSubmission,
+    ExportedDelegationCapability, ImportDelegationCapabilityParams, KeystoneSigningRequest,
+    Network, NoopProgressReporter, PrepareDelegationBundleForTargetParams,
     PrepareDelegationBundleParams, PreparedDelegationBundle, PreparedDelegationReport,
     PreparedSigner, RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey, VotingHotkeyTargetV1,
 };
@@ -187,22 +188,15 @@ where
 ///
 /// `signed_delegation_txs` are the exact vote-chain transaction bytes retained
 /// in the funds controller's durable outbox. It may deliver the package while
-/// broadcasting; the returned digest lets it verify the voter's delivery
-/// acknowledgement.
+/// broadcasting. The returned opaque value binds the canonical bytes to the
+/// typed digest used to verify the voter's delivery acknowledgement.
 pub fn export_delegation_capability_package(
     voting_db: &VotingDb,
     voting_target: &RoundBoundVotingHotkeyTarget,
     signed_delegation_txs: &[Vec<u8>],
-) -> Result<(Vec<u8>, String)> {
-    let capability = export_delegation_capability(voting_db, voting_target, signed_delegation_txs)
-        .context("export delegation capability")?;
-    let json = capability
-        .to_json()
-        .context("encode delegation capability")?;
-    let digest = capability
-        .package_digest()
-        .context("hash delegation capability")?;
-    Ok((json, digest))
+) -> Result<ExportedDelegationCapability> {
+    export_delegation_capability(voting_db, voting_target, signed_delegation_txs)
+        .context("export delegation capability")
 }
 
 /// Validates and atomically imports a package for a voter hotkey.
@@ -218,7 +212,7 @@ pub fn import_delegation_capability_package(
     expected_network: Network,
     expected_round_params: &VotingRoundParams,
     session_json: Option<&str>,
-) -> Result<String> {
+) -> Result<DelegationCapabilityDigest> {
     import_delegation_capability(
         voting_db,
         capability_json,

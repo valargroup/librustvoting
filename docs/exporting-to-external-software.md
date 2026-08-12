@@ -89,8 +89,9 @@ The funds controller MUST use this protocol:
 1. Prepare, prove, and sign every delegation transaction for the retained
    public target.
 2. Persist the exact signed transaction bytes and their SHA-256 hashes.
-3. Call `export_delegation_capability` and persist the exact canonical package
-   bytes and `package_digest()`.
+3. Call `export_delegation_capability` and persist the returned package's exact
+   `canonical_json()` bytes and typed `digest()`. Both come from the same
+   serialization.
 4. After that durable write, broadcast the same signed transactions whose bytes
    produced the package hashes. Package delivery may proceed concurrently.
 5. Deliver the exact package bytes to the voter. The voter atomically

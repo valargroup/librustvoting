@@ -97,7 +97,8 @@ otherwise unchanged.
 
 The funds controller MUST use the same target for every bundle in its round job
 and retain that target across restarts. After signing the vote-chain delegation
-transactions, it exports and durably stores a `DelegationCapabilityV1` before
+transactions, it exports and durably stores the canonical
+`DelegationCapabilityV1` bytes together with their typed digest before
 broadcast. It may deliver the package while broadcasting the exact hashed
 transaction bytes; the voter's matching digest is a delivery receipt. See
 [Delegation capability handoff](exporting-to-external-software.md).

@@ -76,6 +76,66 @@ pub struct DelegationCapabilityV1 {
     pub bundles: Vec<DelegationCapabilityBundleV1>,
 }
 
+/// SHA-256 digest of exact canonical delegation capability bytes.
+///
+/// This type deliberately omits `Debug` because the digest is linkable to a
+/// privacy-sensitive capability package.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DelegationCapabilityDigest([u8; 32]);
+
+impl DelegationCapabilityDigest {
+    fn from_package_bytes(package_bytes: &[u8]) -> Self {
+        Self(Sha256::digest(package_bytes).into())
+    }
+
+    /// Returns the raw SHA-256 digest bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Returns the canonical lowercase hexadecimal digest.
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// Canonical capability bytes and the digest computed from those exact bytes.
+///
+/// Export constructs both values together so callers cannot accidentally pair
+/// bytes with a digest from a different serialization. This type deliberately
+/// omits `Debug` because the package is privacy-sensitive.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExportedDelegationCapability {
+    canonical_json: Vec<u8>,
+    digest: DelegationCapabilityDigest,
+}
+
+impl ExportedDelegationCapability {
+    fn from_capability(capability: DelegationCapabilityV1) -> Result<Self, VotingError> {
+        let canonical_json = capability.to_json()?;
+        let digest = DelegationCapabilityDigest::from_package_bytes(&canonical_json);
+        Ok(Self {
+            canonical_json,
+            digest,
+        })
+    }
+
+    /// Returns the exact canonical JSON bytes to store and deliver.
+    pub fn canonical_json(&self) -> &[u8] {
+        &self.canonical_json
+    }
+
+    /// Returns the digest of [`Self::canonical_json`].
+    pub fn digest(&self) -> DelegationCapabilityDigest {
+        self.digest
+    }
+
+    /// Consumes this value and returns the inseparable export results.
+    pub fn into_parts(self) -> (Vec<u8>, DelegationCapabilityDigest) {
+        (self.canonical_json, self.digest)
+    }
+}
+
 impl DelegationCapabilityV1 {
     /// Parses exact canonical version 1 JSON.
     ///
@@ -107,11 +167,6 @@ impl DelegationCapabilityV1 {
     pub fn to_json(&self) -> Result<Vec<u8>, VotingError> {
         self.validate()?;
         serde_json::to_vec(self).map_err(internal_serialize)
-    }
-
-    /// Returns lowercase SHA-256 of the exact canonical package bytes.
-    pub fn package_digest(&self) -> Result<String, VotingError> {
-        Ok(hex::encode(Sha256::digest(self.to_json()?)))
     }
 
     fn validate(&self) -> Result<ValidatedCapability, VotingError> {
@@ -218,7 +273,7 @@ pub fn export_delegation_capability(
     db: &VotingDb,
     voting_target: &RoundBoundVotingHotkeyTarget,
     signed_delegation_txs: &[Vec<u8>],
-) -> Result<DelegationCapabilityV1, VotingError> {
+) -> Result<ExportedDelegationCapability, VotingError> {
     let conn = db.conn();
     let wallet_id = db.wallet_id();
     let round_id = hex::encode(voting_target.vote_round_id());
@@ -308,7 +363,7 @@ pub fn export_delegation_capability(
         raw_orchard_address: BASE64_STANDARD.encode(target.raw_orchard_address()),
         bundles,
     };
-    Ok(capability)
+    ExportedDelegationCapability::from_capability(capability)
 }
 
 /// Atomically imports a complete capability into the existing voting schema.
@@ -322,7 +377,7 @@ pub fn import_delegation_capability(
     db: &VotingDb,
     capability_json: &[u8],
     context: ImportDelegationCapabilityParams<'_>,
-) -> Result<String, VotingError> {
+) -> Result<DelegationCapabilityDigest, VotingError> {
     validate_vote_chain_id(context.expected_chain_id)?;
     validate_round_params(context.expected_round_params)?;
     i64::try_from(context.expected_round_params.snapshot_height)
@@ -340,7 +395,7 @@ pub fn import_delegation_capability(
         ));
     }
 
-    let digest = hex::encode(Sha256::digest(capability_json));
+    let digest = DelegationCapabilityDigest::from_package_bytes(capability_json);
     let wallet_id = db.wallet_id();
     let mut conn = db.conn();
     let tx = conn
@@ -705,9 +760,10 @@ mod tests {
         let target = bound_target(&hotkey, &params);
         let db = test_db(":memory:");
         seed_provider(&db, &params, &[&target, &target]);
-        let capability =
+        let exported =
             export_delegation_capability(&db, &target, &[b"tx-zero".to_vec(), b"tx-one".to_vec()])
                 .unwrap();
+        let capability = DelegationCapabilityV1::from_json(exported.canonical_json()).unwrap();
         (db, params, hotkey, capability)
     }
 
@@ -728,7 +784,7 @@ mod tests {
         db: &VotingDb,
         capability: &DelegationCapabilityV1,
         context: ImportDelegationCapabilityParams<'_>,
-    ) -> Result<String, VotingError> {
+    ) -> Result<DelegationCapabilityDigest, VotingError> {
         import_delegation_capability(db, &capability.to_json()?, context)
     }
 
@@ -760,11 +816,18 @@ mod tests {
         let db = test_db(path.to_str().unwrap());
         let first = export_delegation_capability(&db, &target_a, &raw_txs).unwrap();
         let second = export_delegation_capability(&db, &target_a, &raw_txs).unwrap();
-        assert_eq!(first.to_json().unwrap(), second.to_json().unwrap());
-        assert_eq!(first.bundles[0].num_ballots, 2);
-        assert_eq!(first.bundles[1].num_ballots, 3);
+        assert_eq!(first.canonical_json(), second.canonical_json());
+        assert!(first.digest() == second.digest());
+        assert!(
+            first.digest()
+                == DelegationCapabilityDigest::from_package_bytes(first.canonical_json())
+        );
+        assert_eq!(first.digest().to_hex().len(), 64);
+        let first_capability = DelegationCapabilityV1::from_json(first.canonical_json()).unwrap();
+        assert_eq!(first_capability.bundles[0].num_ballots, 2);
+        assert_eq!(first_capability.bundles[1].num_ballots, 3);
         assert_eq!(
-            first.bundles[0].delegation_tx_hash,
+            first_capability.bundles[0].delegation_tx_hash,
             hex::encode(Sha256::digest(&raw_txs[0]))
         );
         assert!(export_delegation_capability(&db, &target_a, &raw_txs[..1]).is_err());
@@ -805,7 +868,6 @@ mod tests {
         let (_, params, hotkey, capability) = exported_fixture();
         let json = capability.to_json().unwrap();
         assert!(DelegationCapabilityV1::from_json(&json).unwrap() == capability);
-        assert_eq!(capability.package_digest().unwrap().len(), 64);
 
         let noncanonical = [json.as_slice(), b" "].concat();
         assert!(DelegationCapabilityV1::from_json(&noncanonical).is_err());
@@ -870,8 +932,11 @@ mod tests {
             import_context(&hotkey, &params),
         )
         .unwrap();
-        assert_eq!(digest, hex::encode(Sha256::digest(&capability_json)));
-        assert_eq!(digest, capability.package_digest().unwrap());
+        assert!(digest == DelegationCapabilityDigest::from_package_bytes(&capability_json));
+        assert_eq!(
+            digest.to_hex(),
+            hex::encode(Sha256::digest(&capability_json))
+        );
         assert_eq!(customer.get_bundle_count(&params.vote_round_id).unwrap(), 2);
         let conn = customer.conn();
         let version: u32 = conn
@@ -898,14 +963,14 @@ mod tests {
         drop(customer);
 
         let customer = test_db(path.to_str().unwrap());
-        assert_eq!(
+        assert!(
             import_delegation_capability(
                 &customer,
                 &capability_json,
                 import_context(&hotkey, &params),
             )
-            .unwrap(),
-            digest
+            .unwrap()
+                == digest
         );
         assert_eq!(
             queries::load_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0).unwrap(),
@@ -955,14 +1020,14 @@ mod tests {
             );
         }
         drop(conn);
-        assert_eq!(
+        assert!(
             import_delegation_capability(
                 &customer,
                 &capability_json,
                 import_context(&hotkey, &params),
             )
-            .unwrap(),
-            digest
+            .unwrap()
+                == digest
         );
     }
 
