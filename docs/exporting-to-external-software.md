@@ -18,6 +18,9 @@ digest as a delivery receipt.
 No wallet seed, account spending key, account IVK or FVK, or voting-hotkey
 secret crosses this boundary.
 
+The wallet example includes a compile-checked, role-separated walkthrough in
+[`example_capability_handoff.rs`](../wallet-example/src/example_capability_handoff.rs).
+
 ## Roles
 
 - The **voter** owns the voting hotkey and later produces ZKP2 votes.
