@@ -464,7 +464,7 @@ impl VoteTreeSync {
         let validation = (|| {
             let mut missing_bundle = None;
             for entry in entries {
-                let Some(expected_commitment) = entry.initial_commitment else {
+                let Some(expected_delegation_van) = entry.expected_delegation_van else {
                     continue;
                 };
                 let Some(path) = round_client
@@ -482,7 +482,7 @@ impl VoteTreeSync {
                             "synced vote tree has no root at anchor height {anchor_height}"
                         ),
                     })?;
-                if !path.verify(expected_commitment, root) {
+                if !path.verify(expected_delegation_van, root) {
                     return Err(VotingError::InvalidInput {
                         message: format!(
                             "confirmed delegation bundle {} does not match its synced vote-tree leaf",

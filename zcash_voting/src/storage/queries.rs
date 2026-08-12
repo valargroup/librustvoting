@@ -1337,10 +1337,11 @@ pub(crate) struct VanTreeEntry {
     pub bundle_index: u32,
     pub position: u32,
     /// Present only while the delegation VAN is still the bundle's current VAN.
-    pub initial_commitment: Option<pallas::Base>,
+    pub expected_delegation_van: Option<pallas::Base>,
 }
 
-/// Loads confirmed VAN positions and the initial commitments that remain current.
+/// Loads confirmed VAN positions and expected delegation VANs that remain
+/// current.
 ///
 /// A submitted vote replaces the delegation VAN with a successor commitment,
 /// so only bundles without a submitted vote can be checked against `gov_comm`.
@@ -1395,7 +1396,7 @@ pub(crate) fn load_van_tree_entries(
         let position = u32::try_from(position).map_err(|_| VotingError::Internal {
             message: format!("stored VAN position for bundle {bundle_index} does not fit in u32"),
         })?;
-        let initial_commitment = if has_submitted_vote {
+        let expected_delegation_van = if has_submitted_vote {
             None
         } else {
             let commitment = commitment.ok_or_else(|| VotingError::Internal {
@@ -1411,7 +1412,7 @@ pub(crate) fn load_van_tree_entries(
         Ok(VanTreeEntry {
             bundle_index,
             position,
-            initial_commitment,
+            expected_delegation_van,
         })
     })
     .collect()
