@@ -13,8 +13,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the package before broadcasting, verify delivery by its digest, and let the
   voter use the existing confirmation, tree-sync, and ZKP2 voting path without
   sharing account viewing material or the voting hotkey secret. Imported
-  capability rounds wait for every delegation bundle to confirm before creating
-  fresh vote commitments, keeping pre-vote package replacement recoverable.
+  capability rounds keep their complete bundle batch atomic and wait for every
+  delegation bundle to confirm before creating fresh vote commitments, keeping
+  pre-vote package replacement recoverable.
 
 ## v2.0.0-rc.5
 

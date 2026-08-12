@@ -1199,6 +1199,54 @@ mod tests {
             .is_empty());
     }
 
+    fn assert_imported_capability_rejects_bundle_trim(keep_count: u32) {
+        let (_, params, hotkey, capability) = exported_fixture();
+        let customer = test_db(":memory:");
+        let digest =
+            import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
+        queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0, 42)
+            .unwrap();
+
+        let error = customer
+            .delete_skipped_bundles(&params.vote_round_id, keep_count)
+            .expect_err("imported capability batches must remain complete");
+        assert!(matches!(&error, VotingError::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot delete bundles independently"),
+            "{error}"
+        );
+        assert_eq!(customer.get_bundle_count(&params.vote_round_id).unwrap(), 2);
+        assert_eq!(
+            queries::load_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0).unwrap(),
+            42
+        );
+        let blocked = customer
+            .require_capability_delegations_confirmed(&params.vote_round_id)
+            .expect_err("the second imported bundle must remain unconfirmed");
+        assert!(
+            blocked
+                .to_string()
+                .contains("bundle 1 is still unconfirmed"),
+            "{blocked}"
+        );
+        assert!(
+            import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap()
+                == digest
+        );
+    }
+
+    #[test]
+    fn imported_capability_rejects_suffix_bundle_deletion() {
+        assert_imported_capability_rejects_bundle_trim(1);
+    }
+
+    #[test]
+    fn imported_capability_rejects_full_bundle_deletion() {
+        assert_imported_capability_rejects_bundle_trim(0);
+    }
+
     #[test]
     fn terminal_capability_reset_accepts_a_corrected_complete_package() {
         let (_, params, hotkey, capability) = exported_fixture();

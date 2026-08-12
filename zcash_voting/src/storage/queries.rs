@@ -1,6 +1,6 @@
 use ff::PrimeField;
 use pasta_curves::pallas;
-use rusqlite::{named_params, Connection, OptionalExtension};
+use rusqlite::{named_params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use voting_circuits::delegation::ImtProofData;
 
 use crate::storage::{KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord};
@@ -522,6 +522,28 @@ pub fn get_bundle_count(
     })
 }
 
+/// Imported bundles omit local note positions; local bundle insertion always stores them.
+fn round_has_imported_capability_bundles(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<bool, VotingError> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM bundles
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND note_positions_blob IS NULL
+         )",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to check for imported capability bundles: {e}"),
+    })
+}
+
 /// Require every delegation in an imported capability round to be confirmed
 /// before fresh vote state is created.
 ///
@@ -531,6 +553,10 @@ pub(crate) fn require_capability_delegations_confirmed(
     round_id: &str,
     wallet_id: &str,
 ) -> Result<(), VotingError> {
+    if !round_has_imported_capability_bundles(conn, round_id, wallet_id)? {
+        return Ok(());
+    }
+
     let pending_bundle = conn
         .query_row(
             "SELECT pending.bundle_index
@@ -538,18 +564,6 @@ pub(crate) fn require_capability_delegations_confirmed(
              WHERE pending.round_id = :round_id
                AND pending.wallet_id = :wallet_id
                AND pending.van_leaf_position IS NULL
-               AND EXISTS (
-                   SELECT 1
-                   FROM bundles imported
-                   WHERE imported.round_id = pending.round_id
-                     AND imported.wallet_id = pending.wallet_id
-                     AND imported.note_positions_blob IS NULL
-                     AND imported.van_comm_rand IS NOT NULL
-                     AND imported.gov_comm IS NOT NULL
-                     AND imported.total_note_value IS NOT NULL
-                     AND imported.address_index = 0
-                     AND imported.delegation_tx_hash IS NOT NULL
-               )
              ORDER BY pending.bundle_index
              LIMIT 1",
             named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -2352,17 +2366,31 @@ pub fn get_votes(
     Ok(votes)
 }
 
-/// Delete all bundles (and their cascaded witnesses/proofs) with index >= `from_index`.
+/// Delete all local bundles (and their cascaded witnesses/proofs) with index >= `from_index`.
 /// Used when the user skips remaining Keystone bundles — we remove the unsigned
 /// bundle rows so that `proof_generated` (which counts ALL DB bundles) reflects
-/// only the signed+proven bundles.
+/// only the signed+proven bundles. Imported capability batches are atomic and
+/// must instead be replaced with `clear_round` followed by a complete re-import.
 pub fn delete_bundles_from(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
     from_index: u32,
 ) -> Result<u64, VotingError> {
-    let rows = conn
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|e| {
+        VotingError::Internal {
+            message: format!("failed to begin bundle deletion: {e}"),
+        }
+    })?;
+    if round_has_imported_capability_bundles(&tx, round_id, wallet_id)? {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "imported capability round {round_id} cannot delete bundles independently; clear the round before importing a complete replacement capability"
+            ),
+        });
+    }
+
+    let rows = tx
         .execute(
             "DELETE FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index >= :from_index",
             named_params! {
@@ -2374,6 +2402,9 @@ pub fn delete_bundles_from(
         .map_err(|e| VotingError::Internal {
             message: format!("failed to delete bundles from index {}: {}", from_index, e),
         })?;
+    tx.commit().map_err(|e| VotingError::Internal {
+        message: format!("failed to commit bundle deletion: {e}"),
+    })?;
     Ok(rows as u64)
 }
 
