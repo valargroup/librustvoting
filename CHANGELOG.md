@@ -4,6 +4,19 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v2.0.0
+
+### Changed
+
+- Promoted `zcash_voting 2.0.0-rc.5` to stable without library, runtime, wire,
+  persisted format, protocol, proof, or verification key changes.
+- Promoted `vote-commitment-tree 0.4.0-rc.2` and
+  `vote-commitment-tree-client 0.6.0-rc.2` to stable without implementation or
+  API changes, and advanced their exact internal dependency pins to the stable
+  releases.
+- Advanced the exact `voting-circuits` dependency from source-equivalent
+  `0.9.0-rc.3` to `0.9.0`.
+
 ## v2.0.0-rc.5
 
 ### Fixed
