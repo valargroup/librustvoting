@@ -19,8 +19,9 @@
 //!    digest as a delivery acknowledgement. The funds controller compares it
 //!    with the stored digest and redelivers the same bytes after a mismatch or
 //!    missing acknowledgement.
-//! 5. After broadcast, the voter calls [`voter_confirm_delegation`] with the
-//!    confirmed transaction event to record the bundle's public VAN position.
+//! 5. After broadcast, the voter calls [`voter_confirm_delegation`] for every
+//!    bundle with its confirmed transaction event. Imported capability rounds
+//!    cannot create votes until every bundle has a public VAN position.
 //! 6. The voter calls [`voter_build_signed_vote`], submits its payloads, and
 //!    records the results with the remaining helpers in
 //!    [`crate::example_vote`].

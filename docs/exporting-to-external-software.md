@@ -142,6 +142,11 @@ that differs from the package and records the public `leaf_index`.
 Use the package's canonical lowercase hash for both the status lookup and the
 confirmation call; do not substitute a differently rendered broadcast result.
 
+The voter MUST record confirmation for every bundle in an imported package
+before creating its first vote commitment. The library enforces this barrier
+for imported capability rounds while preserving per-bundle voting for locally
+prepared rounds.
+
 At the next `sync_vote_tree`, the library obtains the public tree root and
 witness for that position and verifies that the leaf is the imported,
 voter-recomputed VAN. A wrong target, weight, blinding factor, transaction,
@@ -158,6 +163,14 @@ Version 1 deliberately does not add a continuation memo, raw-transaction
 receipt decoder, or public-chain-only recovery protocol. The funds controller
 must support idempotent package redelivery through round close, and the voter
 must retain both its hotkey and imported voting database.
+
+An unknown, timed-out, or missing transaction remains retryable and MUST NOT be
+treated as terminal. If the controller establishes that an exact signed
+transaction cannot confirm and must be replaced, it prepares and retains a
+corrected complete package. Before any vote commitment exists, the voter may
+retain its session metadata and draft choices, call `clear_round`, import the
+corrected package, and restore that local state. The all-bundle confirmation
+barrier keeps this reset ahead of irreversible vote state.
 
 If public-chain recovery becomes a product requirement, it can be designed for
 a future round boundary without changing the authority model in this version.

@@ -522,6 +522,55 @@ pub fn get_bundle_count(
     })
 }
 
+/// Require every delegation in an imported capability round to be confirmed
+/// before fresh vote state is created.
+///
+/// Locally prepared rounds retain their existing per-bundle voting behavior.
+pub(crate) fn require_capability_delegations_confirmed(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<(), VotingError> {
+    let pending_bundle = conn
+        .query_row(
+            "SELECT pending.bundle_index
+             FROM bundles pending
+             WHERE pending.round_id = :round_id
+               AND pending.wallet_id = :wallet_id
+               AND pending.van_leaf_position IS NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM bundles imported
+                   WHERE imported.round_id = pending.round_id
+                     AND imported.wallet_id = pending.wallet_id
+                     AND imported.note_positions_blob IS NULL
+                     AND imported.van_comm_rand IS NOT NULL
+                     AND imported.gov_comm IS NOT NULL
+                     AND imported.total_note_value IS NOT NULL
+                     AND imported.address_index = 0
+                     AND imported.delegation_tx_hash IS NOT NULL
+               )
+             ORDER BY pending.bundle_index
+             LIMIT 1",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to check imported delegation confirmations: {e}"),
+        })?;
+
+    if let Some(bundle_index) = pending_bundle {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "imported capability round {round_id} cannot create votes until every delegation is confirmed; bundle {bundle_index} is still unconfirmed"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Load the note positions for a specific bundle.
 pub fn load_bundle_note_positions(
     conn: &Connection,

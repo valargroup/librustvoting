@@ -460,6 +460,16 @@ impl VotingDb {
         queries::get_bundle_count(&conn, round_id, &wallet_id)
     }
 
+    /// Enforce the pre-vote confirmation barrier for imported capability rounds.
+    pub(crate) fn require_capability_delegations_confirmed(
+        &self,
+        round_id: &str,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::require_capability_delegations_confirmed(&conn, round_id, &wallet_id)
+    }
+
     /// Ensure synthetic padded-note secrets exist for a delegation bundle.
     ///
     /// These secrets determine the fixed-arity circuit padding nullifiers used

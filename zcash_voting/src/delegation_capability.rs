@@ -1139,6 +1139,108 @@ mod tests {
     }
 
     #[test]
+    fn imported_capability_blocks_fresh_votes_until_every_delegation_confirms() {
+        use crate::{
+            types::NoopProgressReporter,
+            vote::{DraftVote, VanWitness, VoteSigner},
+        };
+
+        let (provider, params, hotkey, capability) = exported_fixture();
+        provider
+            .require_capability_delegations_confirmed(&params.vote_round_id)
+            .expect("locally prepared rounds retain per-bundle voting");
+
+        let customer = test_db(":memory:");
+        import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
+        queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0, 42)
+            .unwrap();
+
+        let commit = || {
+            crate::vote::commit(
+                &customer,
+                &params.vote_round_id,
+                0,
+                &DraftVote {
+                    proposal_id: 1,
+                    choice: 0,
+                    num_options: 2,
+                    single_share: true,
+                    vc_tree_position: 0,
+                },
+                &VanWitness {
+                    auth_path: Vec::new(),
+                    position: 42,
+                    anchor_height: 100,
+                },
+                VoteSigner::hotkey(&hotkey),
+                &NoopProgressReporter,
+            )
+        };
+
+        let blocked = commit().expect_err("the second imported bundle is unconfirmed");
+        assert!(
+            blocked.to_string().contains(
+                "cannot create votes until every delegation is confirmed; bundle 1 is still unconfirmed"
+            ),
+            "{blocked}"
+        );
+        assert!(customer
+            .get_votes(&params.vote_round_id)
+            .unwrap()
+            .is_empty());
+
+        queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 1, 43)
+            .unwrap();
+        let unblocked = commit().expect_err("the intentionally empty witness remains invalid");
+        assert!(unblocked.to_string().contains("24 siblings"), "{unblocked}");
+        assert!(customer
+            .get_votes(&params.vote_round_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn terminal_capability_reset_accepts_a_corrected_complete_package() {
+        let (_, params, hotkey, capability) = exported_fixture();
+        let customer = test_db(":memory:");
+        import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
+        queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0, 42)
+            .unwrap();
+
+        customer.clear_round(&params.vote_round_id).unwrap();
+        let mut corrected = capability.clone();
+        corrected.bundles[1].delegation_tx_hash = "11".repeat(32);
+        import_capability(&customer, &corrected, import_context(&hotkey, &params)).unwrap();
+
+        assert!(
+            queries::load_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0).is_err(),
+            "the old confirmation must not survive the reset"
+        );
+        assert_eq!(
+            queries::get_delegation_tx_hash(&customer.conn(), &params.vote_round_id, WALLET, 0)
+                .unwrap(),
+            Some(capability.bundles[0].delegation_tx_hash.clone())
+        );
+        assert_eq!(
+            queries::get_delegation_tx_hash(&customer.conn(), &params.vote_round_id, WALLET, 1)
+                .unwrap(),
+            Some(corrected.bundles[1].delegation_tx_hash.clone())
+        );
+        assert!(customer
+            .get_votes(&params.vote_round_id)
+            .unwrap()
+            .is_empty());
+
+        queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0, 52)
+            .unwrap();
+        queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 1, 53)
+            .unwrap();
+        customer
+            .require_capability_delegations_confirmed(&params.vote_round_id)
+            .unwrap();
+    }
+
+    #[test]
     #[ignore = "generates a real ZKP2 proof"]
     fn delegation_capability_handoff_confirms_tree_leaf_and_builds_a_real_vote() {
         use crate::{
@@ -1152,32 +1254,36 @@ mod tests {
         let customer = test_db(":memory:");
         import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
 
-        let tx_hash = capability.bundles[0].delegation_tx_hash.clone();
-        confirm_delegation_submission(
-            &customer,
-            &params.vote_round_id,
-            0,
-            &tx_hash,
-            &[TxEvent {
-                event_type: "delegate_vote".to_string(),
-                attributes: vec![
-                    TxEventAttribute {
-                        key: "vote_round_id".to_string(),
-                        value: params.vote_round_id.clone(),
-                    },
-                    TxEventAttribute {
-                        key: "leaf_index".to_string(),
-                        value: "0".to_string(),
-                    },
-                ],
-            }],
-        )
-        .unwrap();
+        for bundle_index in 0..2 {
+            let tx_hash = capability.bundles[bundle_index].delegation_tx_hash.clone();
+            confirm_delegation_submission(
+                &customer,
+                &params.vote_round_id,
+                bundle_index as u32,
+                &tx_hash,
+                &[TxEvent {
+                    event_type: "delegate_vote".to_string(),
+                    attributes: vec![
+                        TxEventAttribute {
+                            key: "vote_round_id".to_string(),
+                            value: params.vote_round_id.clone(),
+                        },
+                        TxEventAttribute {
+                            key: "leaf_index".to_string(),
+                            value: bundle_index.to_string(),
+                        },
+                    ],
+                }],
+            )
+            .unwrap();
+        }
 
         let validated = capability.validate().unwrap();
-        let leaf = Option::from(pallas::Base::from_repr(validated.bundles[0].van)).unwrap();
         let mut server = MemoryTreeServer::empty();
-        server.append(leaf).unwrap();
+        for bundle in &validated.bundles {
+            let leaf = Option::from(pallas::Base::from_repr(bundle.van)).unwrap();
+            server.append(leaf).unwrap();
+        }
         server.checkpoint(1).unwrap();
 
         let tree = crate::tree_sync::VoteTreeSync::new();
