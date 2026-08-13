@@ -3,6 +3,7 @@
 use zcash_voting::{
     phases::VotePhase,
     round::{RoundParams, VotingDb},
+    share,
     storage::RoundPhase,
     types::{EncryptedShare, Network, NoteInfo},
     vote::{
@@ -186,6 +187,66 @@ fn downstream_fixture_does_not_repair_a_submitted_vote() {
     assert_eq!(
         stored_confirmation_fields(&db).0.as_deref(),
         Some("vote-tx")
+    );
+}
+
+#[test]
+fn downstream_fixture_does_not_reset_a_recorded_position() {
+    let db = db_with_bundle();
+    let fixture = recovery_fixture();
+    insert_recovery_fixture(&db, &fixture).unwrap();
+    record_vc_position(&db, ROUND_ID, 0, 1, 789).unwrap();
+
+    let err = insert_recovery_fixture(&db, &fixture).unwrap_err();
+
+    assert!(
+        err.to_string().contains("cannot replace confirmed vote"),
+        "{err}"
+    );
+    assert_eq!(stored_confirmation_fields(&db), (None, Some(789)));
+    assert_eq!(
+        recovery_bundle(&db, ROUND_ID, 0, 1)
+            .unwrap()
+            .unwrap()
+            .vc_tree_position,
+        789
+    );
+}
+
+#[test]
+fn downstream_fixture_replacement_clears_stale_share_tracking() {
+    let db = db_with_bundle();
+    let mut fixture = recovery_fixture();
+    fixture.share_blinds[0] = [0x01; 32];
+    insert_recovery_fixture(&db, &fixture).unwrap();
+    share::record(
+        &db,
+        ROUND_ID,
+        0,
+        1,
+        0,
+        &["https://helper.example".to_string()],
+        99,
+    )
+    .unwrap();
+    share::confirm(&db, ROUND_ID, 0, 1, 0).unwrap();
+
+    insert_recovery_fixture(&db, &fixture).unwrap();
+    let tracked = share::list(&db, ROUND_ID).unwrap();
+    assert_eq!(tracked.len(), 1);
+    assert!(tracked[0].confirmed);
+
+    let mut replacement = fixture.clone();
+    replacement.share_blinds[0] = [0x02; 32];
+    insert_recovery_fixture(&db, &replacement).unwrap();
+
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+    assert_eq!(
+        recovery_bundle(&db, ROUND_ID, 0, 1)
+            .unwrap()
+            .unwrap()
+            .share_blinds,
+        replacement.share_blinds
     );
 }
 

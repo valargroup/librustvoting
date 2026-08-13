@@ -916,6 +916,11 @@ pub fn parse_recovery(json: &str) -> Result<VoteRecoveryBundle, VotingError> {
 /// [`crate::storage::RoundPhase::VoteReady`], while leaving submission and
 /// confirmation fields unset.
 ///
+/// Exact reinsertions are idempotent. If recovery material changes before vote
+/// submission or confirmation, matching helper-share tracking is cleared in
+/// the same transaction. A vote with a submission hash or commitment-tree
+/// position is never replaced.
+///
 /// Unlike [`commit`], this does not run any commit-time verification gates,
 /// including capability, signer network, witness, proof, or signature checks.
 /// Only use trusted fixture data. Cargo features are additive and are not a
@@ -959,9 +964,11 @@ pub fn insert_recovery_fixture(
         });
     }
 
-    let submitted = tx
+    let existing_state = tx
         .query_row(
-            "SELECT tx_hash IS NOT NULL FROM votes
+            "SELECT tx_hash IS NOT NULL, vc_tree_position IS NOT NULL,
+                    commitment_bundle_json
+             FROM votes
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
             rusqlite::named_params! {
@@ -970,21 +977,40 @@ pub fn insert_recovery_fixture(
                 ":bundle_index": bundle.bundle_index as i64,
                 ":proposal_id": bundle.proposal_id as i64,
             },
-            |row| Ok(row.get::<_, i64>(0)? != 0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? != 0,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(|e| VotingError::Internal {
-            message: format!("failed to check vote recovery fixture submission state: {e}"),
-        })?
-        .unwrap_or(false);
-    if submitted {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "cannot replace submitted vote with recovery fixture for round={}, bundle={}, proposal={}",
-                bundle.vote_round_id, bundle.bundle_index, bundle.proposal_id
-            ),
-        });
+            message: format!("failed to check vote recovery fixture lifecycle state: {e}"),
+        })?;
+    if let Some((submitted, confirmed, _)) = &existing_state {
+        if *submitted {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "cannot replace submitted vote with recovery fixture for round={}, bundle={}, proposal={}",
+                    bundle.vote_round_id, bundle.bundle_index, bundle.proposal_id
+                ),
+            });
+        }
+        if *confirmed {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "cannot replace confirmed vote with recovery fixture for round={}, bundle={}, proposal={}",
+                    bundle.vote_round_id, bundle.bundle_index, bundle.proposal_id
+                ),
+            });
+        }
     }
+    let recovery_changed = existing_state
+        .as_ref()
+        .map(|(_, _, stored_json)| stored_json.as_deref() != Some(recovery_json.as_str()))
+        .unwrap_or(true);
 
     crate::storage::queries::store_vote(
         &tx,
@@ -995,6 +1021,22 @@ pub fn insert_recovery_fixture(
         bundle.vote_decision,
         &commitment,
     )?;
+    if recovery_changed {
+        tx.execute(
+            "DELETE FROM share_delegations
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+            rusqlite::named_params! {
+                ":round_id": &bundle.vote_round_id,
+                ":wallet_id": &wallet_id,
+                ":bundle_index": bundle.bundle_index as i64,
+                ":proposal_id": bundle.proposal_id as i64,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to clear stale vote recovery fixture shares: {e}"),
+        })?;
+    }
     crate::storage::queries::advance_round_phase(
         &tx,
         &bundle.vote_round_id,
