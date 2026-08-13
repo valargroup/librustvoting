@@ -247,7 +247,7 @@ pub fn precompute_delegation_bundle<C, P, CL, R>(
     wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
     prepared: &PreparedDelegationBundle,
     pir_layout: PirLayout,
-        pir_server_url: &str,
+    pir_server_url: &str,
 ) -> Result<PreparedDelegationReport>
 where
     C: std::borrow::Borrow<rusqlite::Connection>,
@@ -274,7 +274,7 @@ pub fn prove_and_submit_delegation_bundle(
     voting_db: &VotingDb,
     prepared: &PreparedDelegationBundle,
     pir_layout: PirLayout,
-        pir_server_url: &str,
+    pir_server_url: &str,
     seed: &[u8],
 ) -> Result<DelegationSubmission> {
     let progress = NoopProgressReporter;
@@ -339,7 +339,7 @@ pub fn prove_and_submit_keystone_delegation_bundle(
     voting_db: &VotingDb,
     prepared: &PreparedDelegationBundle,
     pir_layout: PirLayout,
-        pir_server_url: &str,
+    pir_server_url: &str,
     keystone_request: &KeystoneSigningRequest,
     signed_pczt_bytes: &[u8],
 ) -> Result<DelegationSubmission> {

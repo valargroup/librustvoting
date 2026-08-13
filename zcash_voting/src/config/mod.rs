@@ -152,6 +152,28 @@ impl Default for PirLayout {
     }
 }
 
+fn deserialize_summary_pir_layout<'de, D>(deserializer: D) -> Result<PirLayout, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct PersistedPirLayout {
+        pir_depth: u32,
+        tier0_layers: u32,
+        tier1_layers: u32,
+        #[serde(default)]
+        poly_len: u32,
+    }
+
+    let layout = PersistedPirLayout::deserialize(deserializer)?;
+    Ok(PirLayout {
+        pir_depth: layout.pir_depth,
+        tier0_layers: layout.tier0_layers,
+        tier1_layers: layout.tier1_layers,
+        poly_len: layout.poly_len,
+    })
+}
+
 /// Protocol component versions advertised by the dynamic config.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupportedVersions {
@@ -275,7 +297,7 @@ pub struct ResolvedVotingConfigSummary {
     pub pir_endpoint_fingerprint: String,
     /// Defaults to [`PirLayout::UNKNOWN`] for summaries persisted by older
     /// versions so the next known layout is treated as a service update.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_summary_pir_layout")]
     pub pir_layout: PirLayout,
     pub authenticated_round_set_fingerprint: String,
     pub protocol_versions: SupportedVersions,
@@ -678,12 +700,8 @@ pub(crate) fn validate_and_convert_pir_layout(
                 layout.tier1_layers
             )
         })?,
-        poly_len: usize::try_from(layout.poly_len).map_err(|_| {
-            format!(
-                "pir_layout.poly_len {} does not fit usize",
-                layout.poly_len
-            )
-        })?,
+        poly_len: usize::try_from(layout.poly_len)
+            .map_err(|_| format!("pir_layout.poly_len {} does not fit usize", layout.poly_len))?,
     };
     negotiated.validate_supported()?;
     Ok(negotiated)
@@ -894,8 +912,8 @@ mod tests {
             pir_depth: 19,
             tier0_layers: 12,
             tier1_layers: 7,
-                poly_len: 4096,
-}
+            poly_len: 4096,
+        }
     }
 
     fn dynamic_bytes_with_round_signers(round_signers: &[(&str, &SigningKey)]) -> Vec<u8> {
@@ -1490,7 +1508,7 @@ mod tests {
                 tier0_layers: 12,
                 tier1_layers: 7,
                 poly_len: 4096,
-},
+            },
             supported_versions: SupportedVersions {
                 pir: vec!["v0".to_string()],
                 vote_protocol: "v0".to_string(),
@@ -1527,7 +1545,7 @@ mod tests {
                 tier0_layers: 12,
                 tier1_layers: 7,
                 poly_len: 4096,
-},
+            },
             supported_versions: SupportedVersions {
                 pir: vec!["v0".to_string()],
                 vote_protocol: "v0".to_string(),
@@ -1684,8 +1702,47 @@ mod tests {
             pir_depth: 19,
             tier0_layers: 12,
             tier1_layers: 7,
-                poly_len: 4096,
-};
+            poly_len: 4096,
+        };
+
+        let decision = decide_config_switch(Some(current), next);
+
+        assert_eq!(decision.kind, ConfigSwitchKind::SameChainServiceUpdate);
+    }
+
+    #[test]
+    fn pre_poly_len_summary_deserializes_and_known_layout_is_service_update() {
+        let legacy_json = serde_json::json!({
+            "trusted_key_fingerprint": "same-keys",
+            "vote_server_fingerprint": "same-vote-servers",
+            "pir_endpoint_fingerprint": "same-pir-endpoints",
+            "pir_layout": {
+                "pir_depth": 19,
+                "tier0_layers": 12,
+                "tier1_layers": 7,
+            },
+            "authenticated_round_set_fingerprint": "same-rounds",
+            "protocol_versions": {
+                "pir": ["v0"],
+                "vote_protocol": "v0",
+                "tally": "v0",
+                "vote_server": "v1",
+            },
+        });
+        let current: ResolvedVotingConfigSummary =
+            serde_json::from_value(legacy_json).expect("pre-poly_len summary remains readable");
+        assert_eq!(
+            current.pir_layout,
+            PirLayout {
+                pir_depth: 19,
+                tier0_layers: 12,
+                tier1_layers: 7,
+                poly_len: 0,
+            }
+        );
+
+        let mut next = current.clone();
+        next.pir_layout.poly_len = 4096;
 
         let decision = decide_config_switch(Some(current), next);
 
@@ -1703,7 +1760,7 @@ mod tests {
                 tier0_layers: 12,
                 tier1_layers: 7,
                 poly_len: 4096,
-},
+            },
             authenticated_round_set_fingerprint: "same-rounds".to_string(),
             protocol_versions: SupportedVersions {
                 pir: vec!["v0".to_string()],
@@ -1717,8 +1774,8 @@ mod tests {
             pir_depth: 20,
             tier0_layers: 13,
             tier1_layers: 7,
-                poly_len: 4096,
-};
+            poly_len: 4096,
+        };
 
         let decision = decide_config_switch(Some(current), next);
 
