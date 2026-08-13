@@ -759,7 +759,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1342,6 +1342,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "imt-tree"
+version = "0.2.1"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=c813e42d01c5515fbe1e488749228f451b19073d#c813e42d01c5515fbe1e488749228f451b19073d"
+dependencies = [
+ "anyhow",
+ "ff",
+ "halo2_gadgets",
+ "hex",
+ "pasta_curves",
+ "rayon",
+]
+
+[[package]]
 name = "incrementalmerkletree"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1773,15 +1786,14 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pir-client"
-version = "0.4.0-rc.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a85d03c85d565c87b72dd33677b5b3ff8c4388135c9b239d094015f9a05da3d"
+version = "0.4.0-rc.7"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=c813e42d01c5515fbe1e488749228f451b19073d#c813e42d01c5515fbe1e488749228f451b19073d"
 dependencies = [
  "anyhow",
  "ff",
  "futures",
  "hex",
- "imt-tree",
+ "imt-tree 0.2.1 (git+https://github.com/valargroup/vote-nullifier-pir?rev=c813e42d01c5515fbe1e488749228f451b19073d)",
  "log",
  "pasta_curves",
  "pir-types",
@@ -1792,13 +1804,12 @@ dependencies = [
 
 [[package]]
 name = "pir-types"
-version = "0.3.0-rc.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e378fde19e41b467099e44c0951b281364f1cdd348d9eca26691942037c9dd5"
+version = "0.3.0-rc.6"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=c813e42d01c5515fbe1e488749228f451b19073d#c813e42d01c5515fbe1e488749228f451b19073d"
 dependencies = [
  "anyhow",
  "ff",
- "imt-tree",
+ "imt-tree 0.2.1 (git+https://github.com/valargroup/vote-nullifier-pir?rev=c813e42d01c5515fbe1e488749228f451b19073d)",
  "pasta_curves",
  "serde",
 ]
@@ -2136,7 +2147,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2537,7 +2548,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2943,7 +2954,7 @@ dependencies = [
  "anyhow",
  "ff",
  "halo2_gadgets",
- "imt-tree",
+ "imt-tree 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "incrementalmerkletree",
  "lazy_static",
  "libc",
@@ -3491,7 +3502,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "imt-tree",
+ "imt-tree 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "incrementalmerkletree",
  "nonempty",
  "orchard",
