@@ -575,10 +575,20 @@ pub fn plan_share_submission(
 /// payloads. It consumes separate entropy for each returned plan so callers
 /// cannot accidentally reuse one `submit_at` or helper target order for every
 /// share. Use `share_submission_random_bytes_required` to size the two entropy
-/// inputs. For a complete normal 16-share commitment with multiple helpers,
-/// initial targets are spread so that no helper receives every share by
-/// default. Each returned plan already contains its final initial target list.
-/// This does not constrain fallback or recovery attempts.
+/// inputs.
+///
+/// For a complete normal 16-share commitment with multiple helpers, initial
+/// targets are spread so that no helper receives every share by default. Each
+/// returned plan already contains its final initial target list. This guarantee
+/// applies only to initial submission. Fallback and recovery may send an
+/// initially omitted share to any configured helper, including one that
+/// ultimately receives all 16 shares, when needed to preserve liveness.
+///
+/// `server_urls` must contain distinct, valid helper endpoint URLs. This
+/// function checks only that the list is non-empty and has no duplicates; it
+/// does not parse URLs or probe helper health. Callers are responsible for
+/// validating endpoints and assessing health before planning, because
+/// unavailable helpers can prevent reaching the returned `target_count`.
 pub fn plan_share_submissions(
     share_count: usize,
     server_urls: &[String],
