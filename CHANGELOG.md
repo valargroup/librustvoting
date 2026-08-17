@@ -7,12 +7,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Added
-- Add an opt-in vote share planner that returns indexed plans in dispatch order,
-  with the largest share first and scheduled at the current time when enabled.
-  The existing count-based planner remains unchanged for current callers.
-- Add an independent resume-plan option that keeps the largest share blocking
-  until committed-chain confirmation, plus source-checked confirmation for
-  helper URLs recorded as accepting that share.
+- Add an opt-in vote share planner that returns indexed plans for a complete
+  wallet submission, with exactly one global largest share first and scheduled
+  at the current time when enabled. The existing count-based planner remains
+  unchanged for current callers.
+- Add an independent resume-plan option that keeps that one submission-wide
+  largest share blocking until committed-chain confirmation, plus
+  source-checked confirmation for a helper recorded as accepting the share.
 
 ### Changed
 - Cap each randomized initial helper-share delay at 48 hours while preserving
