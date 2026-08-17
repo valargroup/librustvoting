@@ -9,8 +9,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ### Added
 - Add an opt-in vote share planner that returns indexed plans for a complete
   wallet submission, with exactly one global largest share first and scheduled
-  at the current time when enabled. The existing count-based planner remains
-  unchanged for current callers.
+  at the current time when enabled. The planner draws its own operating system
+  randomness. The existing count-based planner remains unchanged for current
+  callers.
 
 ### Changed
 - Cap each randomized initial helper-share delay at 48 hours while preserving
