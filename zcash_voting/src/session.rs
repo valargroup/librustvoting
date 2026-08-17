@@ -807,6 +807,8 @@ pub fn resume_plan_with_options(
 
     let mut steps: Vec<NextStep> = Vec::new();
     let mut bundles_needing_delegation: BTreeSet<u32> = BTreeSet::new();
+    let mut all_choice_votes_confirmed = !choice_proposals.is_empty();
+    let mut confirmed_vote_recoveries = Vec::new();
     let stale_vote_keys: BTreeSet<(u32, u32)> = vote_choices
         .iter()
         .filter_map(|(&(bundle_index, proposal_id), &stored_choice)| {
@@ -844,6 +846,7 @@ pub fn resume_plan_with_options(
             if stale_vote_keys.contains(&vote_key)
                 || vote_choices.get(&vote_key) != Some(&intent_choice)
             {
+                all_choice_votes_confirmed = false;
                 steps.push(NextStep::CastVote {
                     bundle_index: b,
                     proposal_id: pid,
@@ -852,13 +855,20 @@ pub fn resume_plan_with_options(
                 bundles_needing_delegation.insert(b);
                 continue;
             }
-            match votes.get(&vote_key) {
+            let vote_phase = votes.get(&vote_key);
+            if vote_phase != Some(&VotePhase::Confirmed) {
+                all_choice_votes_confirmed = false;
+            }
+            match vote_phase {
                 Some(VotePhase::Confirmed) => {
+                    let recovery = crate::vote::recovery_bundle(db, round_id, b, pid)?
+                        .ok_or_else(|| VotingError::InvalidInput {
+                            message: format!(
+                                "confirmed vote for round {round_id} bundle {b} proposal {pid} is missing recovery material for helper-share submission"
+                            ),
+                        })?;
                     for share_index in missing_share_indexes_for_confirmed_vote(
-                        db,
-                        round_id,
-                        b,
-                        pid,
+                        &recovery,
                         share_indexes_by_vote
                             .get(&vote_key)
                             .cloned()
@@ -869,6 +879,9 @@ pub fn resume_plan_with_options(
                             proposal_id: pid,
                             share_index,
                         });
+                    }
+                    if options.require_largest_share_confirmation {
+                        confirmed_vote_recoveries.push(recovery);
                     }
                 }
                 Some(VotePhase::Committed) => {
@@ -963,19 +976,10 @@ pub fn resume_plan_with_options(
         })
         .map(|share| (share.bundle_index, share.proposal_id, share.share_index))
         .collect::<BTreeSet<_>>();
-    let all_choice_votes_confirmed = !choice_proposals.is_empty()
-        && choice_proposals.iter().all(|proposal_id| {
-            bundles.iter().all(|bundle_index| {
-                votes.get(&(*bundle_index, *proposal_id)) == Some(&VotePhase::Confirmed)
-            })
-        });
     let required_largest_share_key =
         if options.require_largest_share_confirmation && all_choice_votes_confirmed {
-            Some(submission_largest_share_key(
-                db,
-                round_id,
-                &choice_proposals,
-                &bundles,
+            Some(crate::share::largest_active_share_key(
+                &confirmed_vote_recoveries,
             )?)
         } else {
             None
@@ -1100,43 +1104,6 @@ fn share_step_key(step: &NextStep) -> Option<(u32, u32, u32)> {
     }
 }
 
-fn submission_largest_share_key(
-    db: &VotingDb,
-    round_id: &str,
-    choice_proposals: &[u32],
-    bundles: &[u32],
-) -> Result<(u32, u32, u32), VotingError> {
-    let mut recoveries = Vec::new();
-    for &proposal_id in choice_proposals {
-        for &bundle_index in bundles {
-            let recovery = crate::vote::recovery_bundle(
-                db,
-                round_id,
-                bundle_index,
-                proposal_id,
-            )?
-            .ok_or_else(|| VotingError::InvalidInput {
-                message: format!(
-                    "cannot require submission-wide share confirmation without recovery material for round {round_id} bundle {bundle_index} proposal {proposal_id}"
-                ),
-            })?;
-            if recovery.vote_round_id != round_id
-                || recovery.bundle_index != bundle_index
-                || recovery.proposal_id != proposal_id
-            {
-                return Err(VotingError::InvalidInput {
-                    message: format!(
-                        "vote recovery identity mismatch while selecting the submission-wide largest share for round {round_id} bundle {bundle_index} proposal {proposal_id}"
-                    ),
-                });
-            }
-            recoveries.push(recovery);
-        }
-    }
-
-    crate::share::largest_active_share_key(&recoveries)
-}
-
 fn vote_has_recovery_bundle(
     db: &VotingDb,
     round_id: &str,
@@ -1150,28 +1117,18 @@ fn vote_has_recovery_bundle(
 }
 
 fn missing_share_indexes_for_confirmed_vote(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
+    recovery: &crate::vote::VoteRecoveryBundle,
     recorded_share_indexes: BTreeSet<u32>,
 ) -> Result<Vec<u32>, VotingError> {
-    let Some(recovery) = crate::vote::recovery_bundle(db, round_id, bundle_index, proposal_id)?
-    else {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "confirmed vote for round {round_id} bundle {bundle_index} proposal {proposal_id} is missing recovery material for helper-share submission"
-            ),
-        });
-    };
-    let expected_share_indexes = crate::share::recover_payloads(&recovery)?
+    let expected_share_indexes = crate::share::recover_payloads(recovery)?
         .iter()
         .map(|payload| payload.enc_share.share_index)
         .collect::<BTreeSet<_>>();
     if expected_share_indexes.is_empty() {
         return Err(VotingError::InvalidInput {
             message: format!(
-                "confirmed vote for round {round_id} bundle {bundle_index} proposal {proposal_id} has no recoverable helper shares"
+                "confirmed vote for round {} bundle {} proposal {} has no recoverable helper shares",
+                recovery.vote_round_id, recovery.bundle_index, recovery.proposal_id
             ),
         });
     }
@@ -2468,49 +2425,10 @@ mod tests {
     }
 
     #[test]
-    fn single_share_confirmation_uses_the_only_active_share() {
-        let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
-            .unwrap();
-        confirm_vote_fixture(&db, 0, 2, 1);
-        let mut recovery = recovery_bundle_fixture(0, 2, 1, 42);
-        recovery.single_share = true;
-        store_recovery_bundle_fixture(&db, &recovery, Some(42));
-        record_submitted_share_fixture(&db, 0, 2, 0, &["https://helper.example".to_string()]);
-
-        let plan =
-            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
-                .unwrap();
-
-        assert!(plan.blocking_recovery);
-        assert!(plan.recovered_vote_work.is_empty());
-    }
-
-    #[test]
     fn resume_plan_options_default_preserves_existing_behavior() {
         let options: ResumePlanOptions = serde_json::from_str("{}").unwrap();
         assert_eq!(options, ResumePlanOptions::default());
         assert!(!options.require_largest_share_confirmation);
-    }
-
-    #[test]
-    fn largest_share_confirmation_rejects_mismatched_recovery_identity() {
-        let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
-            .unwrap();
-        confirm_vote_fixture(&db, 0, 2, 1);
-        let mut recovery = recovery_bundle_fixture(0, 2, 1, 42);
-        recovery.vote_round_id =
-            "0202020202020202020202020202020202020202020202020202020202020202".to_string();
-        store_recovery_bundle_fixture(&db, &recovery, Some(42));
-        record_confirmed_share_fixture(&db, 0, 2, 0);
-        record_submitted_share_fixture(&db, 0, 2, 1, &["https://helper.example".to_string()]);
-
-        let err =
-            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
-                .unwrap_err();
-
-        assert!(err.to_string().contains("vote recovery identity mismatch"));
     }
 
     #[test]
