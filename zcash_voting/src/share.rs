@@ -14,6 +14,7 @@ use crate::{
 };
 use ff::PrimeField;
 use pasta_curves::pallas;
+use rand::{rngs::OsRng, CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -75,7 +76,9 @@ pub struct IndexedShareSubmissionPlan {
 /// order and match payloads by all three index fields. Sending the first share
 /// now intentionally makes that share's public identity timing-linkable as the
 /// submission-wide largest share.
-#[allow(clippy::too_many_arguments)]
+///
+/// The crate draws the planning entropy from the operating system's secure
+/// random number generator. Callers do not need to manage random byte buffers.
 pub fn plan_vote_share_submissions(
     bundles: &[VoteRecoveryBundle],
     server_urls: &[String],
@@ -83,32 +86,30 @@ pub fn plan_vote_share_submissions(
     vote_end_time_seconds: u64,
     last_moment_buffer_seconds: Option<u64>,
     submit_largest_share_now: bool,
-    submit_at_random_bytes: &[u8],
-    server_random_bytes: &[u8],
 ) -> Result<Vec<IndexedShareSubmissionPlan>, VotingError> {
-    let largest_share_key = largest_active_share_key(bundles)?;
-    let required = random_bytes_required(
+    plan_vote_share_submissions_with_rng(
         bundles,
-        server_urls.len(),
+        server_urls,
         now_seconds,
         vote_end_time_seconds,
         last_moment_buffer_seconds,
-    )?;
-    require_random_bytes(
-        "submit_at_random_bytes",
-        submit_at_random_bytes.len(),
-        required.submit_at_random_bytes,
-    )?;
-    require_random_bytes(
-        "server_random_bytes",
-        server_random_bytes.len(),
-        required.server_random_bytes,
-    )?;
+        submit_largest_share_now,
+        &mut OsRng,
+    )
+}
 
+fn plan_vote_share_submissions_with_rng<R: RngCore + CryptoRng>(
+    bundles: &[VoteRecoveryBundle],
+    server_urls: &[String],
+    now_seconds: u64,
+    vote_end_time_seconds: u64,
+    last_moment_buffer_seconds: Option<u64>,
+    submit_largest_share_now: bool,
+    rng: &mut R,
+) -> Result<Vec<IndexedShareSubmissionPlan>, VotingError> {
+    let largest_share_key = largest_active_share_key(bundles)?;
     let promoted_key = submit_largest_share_now.then_some(largest_share_key);
     let mut submissions = Vec::new();
-    let mut submit_at_offset = 0usize;
-    let mut server_offset = 0usize;
     for bundle in bundles {
         let active_shares = active_shares(bundle);
         let required = policy::share_submission_random_bytes_required(
@@ -119,8 +120,10 @@ pub fn plan_vote_share_submissions(
             last_moment_buffer_seconds,
             bundle.single_share,
         );
-        let submit_at_end = submit_at_offset + required.submit_at_random_bytes;
-        let server_end = server_offset + required.server_random_bytes;
+        let submit_at_random_bytes =
+            random_bytes(rng, required.submit_at_random_bytes, "share submit time")?;
+        let server_random_bytes =
+            random_bytes(rng, required.server_random_bytes, "share server order")?;
         let plans = policy::plan_share_submissions(
             active_shares.len(),
             server_urls,
@@ -128,11 +131,9 @@ pub fn plan_vote_share_submissions(
             vote_end_time_seconds,
             last_moment_buffer_seconds,
             bundle.single_share,
-            &submit_at_random_bytes[submit_at_offset..submit_at_end],
-            &server_random_bytes[server_offset..server_end],
+            &submit_at_random_bytes,
+            &server_random_bytes,
         )?;
-        submit_at_offset = submit_at_end;
-        server_offset = server_end;
 
         submissions.extend(active_shares.iter().zip(plans).map(|(share, plan)| {
             let key = (bundle.bundle_index, bundle.proposal_id, share.share_index);
@@ -162,24 +163,6 @@ pub fn plan_vote_share_submissions(
     }
 
     Ok(submissions)
-}
-
-/// Returns the entropy sizes required by [`plan_vote_share_submissions`].
-pub fn vote_share_submission_random_bytes_required(
-    bundles: &[VoteRecoveryBundle],
-    server_count: usize,
-    now_seconds: u64,
-    vote_end_time_seconds: u64,
-    last_moment_buffer_seconds: Option<u64>,
-) -> Result<policy::ShareSubmissionRandomBytesRequired, VotingError> {
-    largest_active_share_key(bundles)?;
-    random_bytes_required(
-        bundles,
-        server_count,
-        now_seconds,
-        vote_end_time_seconds,
-        last_moment_buffer_seconds,
-    )
 }
 
 /// Validates a recovery batch and returns its deterministic largest active share.
@@ -238,41 +221,6 @@ pub(crate) fn largest_active_share_key(
         })
 }
 
-fn random_bytes_required(
-    bundles: &[VoteRecoveryBundle],
-    server_count: usize,
-    now_seconds: u64,
-    vote_end_time_seconds: u64,
-    last_moment_buffer_seconds: Option<u64>,
-) -> Result<policy::ShareSubmissionRandomBytesRequired, VotingError> {
-    let mut submit_at_random_bytes = 0usize;
-    let mut server_random_bytes = 0usize;
-    for bundle in bundles {
-        let required = policy::share_submission_random_bytes_required(
-            active_shares(bundle).len(),
-            server_count,
-            now_seconds,
-            vote_end_time_seconds,
-            last_moment_buffer_seconds,
-            bundle.single_share,
-        );
-        submit_at_random_bytes = submit_at_random_bytes
-            .checked_add(required.submit_at_random_bytes)
-            .ok_or_else(|| VotingError::InvalidInput {
-                message: "submit_at random byte requirement overflow".to_string(),
-            })?;
-        server_random_bytes = server_random_bytes
-            .checked_add(required.server_random_bytes)
-            .ok_or_else(|| VotingError::InvalidInput {
-                message: "server random byte requirement overflow".to_string(),
-            })?;
-    }
-    Ok(policy::ShareSubmissionRandomBytesRequired {
-        submit_at_random_bytes,
-        server_random_bytes,
-    })
-}
-
 fn active_shares(bundle: &VoteRecoveryBundle) -> &[crate::types::EncryptedShare] {
     if bundle.single_share {
         &bundle.encrypted_shares[..1.min(bundle.encrypted_shares.len())]
@@ -281,13 +229,17 @@ fn active_shares(bundle: &VoteRecoveryBundle) -> &[crate::types::EncryptedShare]
     }
 }
 
-fn require_random_bytes(label: &str, actual: usize, required: usize) -> Result<(), VotingError> {
-    if actual < required {
-        return Err(VotingError::InvalidInput {
-            message: format!("{label} must contain at least {required} bytes"),
-        });
-    }
-    Ok(())
+fn random_bytes<R: RngCore + CryptoRng>(
+    rng: &mut R,
+    len: usize,
+    purpose: &str,
+) -> Result<Vec<u8>, VotingError> {
+    let mut bytes = vec![0; len];
+    rng.try_fill_bytes(&mut bytes)
+        .map_err(|err| VotingError::Internal {
+            message: format!("failed to generate {purpose} randomness: {err}"),
+        })?;
+    Ok(bytes)
 }
 
 /// Computes the 32-byte share reveal nullifier.
@@ -522,6 +474,7 @@ mod tests {
         types::{EncryptedShare, NoteInfo},
         vote::{serialize_recovery, VoteRecoveryBundle},
     };
+    use rand::{rngs::StdRng, RngCore, SeedableRng};
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const WALLET_ID: &str = "wallet";
@@ -683,8 +636,11 @@ mod tests {
             Some(100),
             false,
         );
-        let submit_at_entropy = vec![0x55; required.submit_at_random_bytes];
-        let server_entropy = vec![0xAA; required.server_random_bytes];
+        let mut rng = planning_rng();
+        let mut submit_at_entropy = vec![0; required.submit_at_random_bytes];
+        rng.fill_bytes(&mut submit_at_entropy);
+        let mut server_entropy = vec![0; required.server_random_bytes];
+        rng.fill_bytes(&mut server_entropy);
         let legacy = policy::plan_share_submissions(
             16,
             &servers,
@@ -696,15 +652,14 @@ mod tests {
             &server_entropy,
         )
         .unwrap();
-        let indexed = plan_vote_share_submissions(
+        let indexed = plan_vote_share_submissions_with_rng(
             &[bundle],
             &servers,
             1_000,
             2_000,
             Some(100),
             false,
-            &submit_at_entropy,
-            &server_entropy,
+            &mut planning_rng(),
         )
         .unwrap();
 
@@ -762,7 +717,15 @@ mod tests {
     fn vote_share_planning_validates_the_complete_batch() {
         let mut single = recovery_bundle_fixture();
         single.single_share = true;
-        let planned = plan_vote_shares(std::slice::from_ref(&single), true).unwrap();
+        let planned = plan_vote_share_submissions(
+            std::slice::from_ref(&single),
+            &helper_servers(),
+            1_000,
+            2_000,
+            Some(100),
+            true,
+        )
+        .unwrap();
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].share_index, 0);
         assert_eq!(planned[0].submit_at, 1_000);
@@ -889,23 +852,19 @@ mod tests {
         submit_largest_share_now: bool,
     ) -> Result<Vec<IndexedShareSubmissionPlan>, VotingError> {
         let servers = helper_servers();
-        let required = vote_share_submission_random_bytes_required(
-            bundles,
-            servers.len(),
-            1_000,
-            2_000,
-            Some(100),
-        )?;
-        plan_vote_share_submissions(
+        plan_vote_share_submissions_with_rng(
             bundles,
             &servers,
             1_000,
             2_000,
             Some(100),
             submit_largest_share_now,
-            &vec![0x55; required.submit_at_random_bytes],
-            &vec![0xAA; required.server_random_bytes],
+            &mut planning_rng(),
         )
+    }
+
+    fn planning_rng() -> StdRng {
+        StdRng::from_seed([0x42; 32])
     }
 
     fn plan_key(plan: &IndexedShareSubmissionPlan) -> (u32, u32, u32) {
