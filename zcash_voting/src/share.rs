@@ -44,7 +44,7 @@ pub use policy::{ShareSubmissionPlan as SharePlan, ShareTimingPolicy, ShareTrack
 
 /// One helper-share plan keyed by its persisted vote and public share index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexedShareSubmissionPlan {
+pub struct VoteShareSubmissionPlan {
     /// Delegation bundle that produced the share.
     pub bundle_index: u32,
     /// Proposal that the share belongs to.
@@ -86,7 +86,7 @@ pub fn plan_vote_share_submissions(
     vote_end_time_seconds: u64,
     last_moment_buffer_seconds: Option<u64>,
     submit_largest_share_now: bool,
-) -> Result<Vec<IndexedShareSubmissionPlan>, VotingError> {
+) -> Result<Vec<VoteShareSubmissionPlan>, VotingError> {
     plan_vote_share_submissions_with_rng(
         bundles,
         server_urls,
@@ -106,7 +106,7 @@ fn plan_vote_share_submissions_with_rng<R: RngCore + CryptoRng>(
     last_moment_buffer_seconds: Option<u64>,
     submit_largest_share_now: bool,
     rng: &mut R,
-) -> Result<Vec<IndexedShareSubmissionPlan>, VotingError> {
+) -> Result<Vec<VoteShareSubmissionPlan>, VotingError> {
     let largest_share_key = largest_active_share_key(bundles)?;
     let promoted_key = submit_largest_share_now.then_some(largest_share_key);
     let mut submissions = Vec::new();
@@ -137,7 +137,7 @@ fn plan_vote_share_submissions_with_rng<R: RngCore + CryptoRng>(
 
         submissions.extend(active_shares.iter().zip(plans).map(|(share, plan)| {
             let key = (bundle.bundle_index, bundle.proposal_id, share.share_index);
-            IndexedShareSubmissionPlan {
+            VoteShareSubmissionPlan {
                 bundle_index: bundle.bundle_index,
                 proposal_id: bundle.proposal_id,
                 share_index: share.share_index,
@@ -610,7 +610,7 @@ mod tests {
             &server_entropy,
         )
         .unwrap();
-        let indexed = plan_vote_share_submissions_with_rng(
+        let planned = plan_vote_share_submissions_with_rng(
             &[bundle],
             &servers,
             1_000,
@@ -621,11 +621,11 @@ mod tests {
         )
         .unwrap();
 
-        for (share_index, (indexed, legacy)) in indexed.iter().zip(legacy).enumerate() {
-            assert_eq!(indexed.share_index, share_index as u32);
-            assert_eq!(indexed.submit_at, legacy.submit_at);
-            assert_eq!(indexed.target_count, legacy.target_count);
-            assert_eq!(indexed.target_servers, legacy.target_servers);
+        for (share_index, (planned, legacy)) in planned.iter().zip(legacy).enumerate() {
+            assert_eq!(planned.share_index, share_index as u32);
+            assert_eq!(planned.submit_at, legacy.submit_at);
+            assert_eq!(planned.target_count, legacy.target_count);
+            assert_eq!(planned.target_servers, legacy.target_servers);
         }
     }
 
@@ -784,7 +784,7 @@ mod tests {
     fn plan_vote_shares(
         bundles: &[VoteRecoveryBundle],
         submit_largest_share_now: bool,
-    ) -> Result<Vec<IndexedShareSubmissionPlan>, VotingError> {
+    ) -> Result<Vec<VoteShareSubmissionPlan>, VotingError> {
         let servers = helper_servers();
         plan_vote_share_submissions_with_rng(
             bundles,
@@ -801,7 +801,7 @@ mod tests {
         StdRng::from_seed([0x42; 32])
     }
 
-    fn plan_key(plan: &IndexedShareSubmissionPlan) -> (u32, u32, u32) {
+    fn plan_key(plan: &VoteShareSubmissionPlan) -> (u32, u32, u32) {
         (plan.bundle_index, plan.proposal_id, plan.share_index)
     }
 
