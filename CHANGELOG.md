@@ -7,9 +7,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Added
-- Add an opt-in recovery-bundle share planner that schedules the largest share
-  at the current time, returns plans keyed by public share index, and leaves the
-  existing count-based planner unchanged for current callers.
+- Add an opt-in vote share planner that returns indexed plans in dispatch order,
+  with the largest share first and scheduled at the current time when enabled.
+  The existing count-based planner remains unchanged for current callers.
 - Add an independent resume-plan option that keeps the largest share blocking
   until committed-chain confirmation, plus source-checked confirmation for
   helper URLs recorded as accepting that share.

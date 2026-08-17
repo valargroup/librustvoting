@@ -68,10 +68,9 @@ pub use crate::session::{
 };
 pub use crate::share::{
     add_sent_servers, compute_nullifier, confirm as confirm_share, confirm_from_helper,
-    list as share_records, plan_bundle_share_submissions, record as record_share, recover_payload,
+    list as share_records, plan_vote_share_submissions, record as record_share, recover_payload,
     recover_wire_json, unconfirmed as unconfirmed_shares, IndexedShareSubmissionPlan, SharePlan,
-    ShareRecord, ShareSubmissionBatchPlan, ShareSubmissionScheduleOptions, ShareTimingPolicy,
-    ShareTrackingSummary,
+    ShareRecord, ShareTimingPolicy, ShareTrackingSummary,
 };
 pub use crate::types::{
     validate_proposal_id, validate_vote_decision, validate_vote_options, DelegationProgressBridge,
