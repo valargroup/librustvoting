@@ -225,8 +225,8 @@ that should stay consistent across SDKs:
   ending before the round's last-moment window
 - helper target counts and randomized helper ordering
 - batch share planning with independent entropy per share
-- opt-in vote share planning that submits the largest share first at the current
-  time
+- opt-in submission-wide planning that submits one global largest share first
+  at the current time
 - resubmission ordering with untried helpers before already-sent helpers
 - share tracking summaries, readiness checks, retry thresholds, and polling delay
 
@@ -236,11 +236,14 @@ crate own the sampling and ordering policy.
 Existing integrations can keep calling `share_policy::plan_share_submissions`.
 Integrations that opt into largest-share-first delivery should instead call
 `share::plan_vote_share_submissions` with `submit_largest_share_now: true` and
-submit the returned indexed plans in order. The API uses the lowest public share
-index to break equal-value ties, returns that share first with `submit_at` set to
-the caller's current Unix time, and leaves the other sampled times and initial
-helper targets unchanged. This intentionally makes the first share's public
-index timing-linkable as the vote's largest share.
+submit the returned indexed plans in order. Pass every recovery bundle in the
+complete logical wallet submission in one call. The API chooses one largest
+active share across that batch, uses the lowest bundle, proposal, and public
+share indexes to break equal-value ties, and returns it first with `submit_at`
+set to the caller's current Unix time. Other sampled times and initial helper
+targets remain unchanged. Calling the planner once per bundle would promote one
+share per call and reveal the bundle count through immediate timing. The single
+promoted share remains timing-linkable as the submission-wide largest share.
 
 ## Secret boundaries
 

@@ -15,6 +15,7 @@ use crate::{
 use ff::PrimeField;
 use pasta_curves::pallas;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub use crate::types::ShareDelegationRecord as ShareRecord;
 
@@ -40,9 +41,13 @@ pub mod policy {
 
 pub use policy::{ShareSubmissionPlan as SharePlan, ShareTimingPolicy, ShareTrackingSummary};
 
-/// One helper-share plan keyed by its public share index.
+/// One helper-share plan keyed by its persisted vote and public share index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedShareSubmissionPlan {
+    /// Delegation bundle that produced the share.
+    pub bundle_index: u32,
+    /// Proposal that the share belongs to.
+    pub proposal_id: u32,
     /// Public share index committed by the encrypted share.
     pub share_index: u32,
     /// Unix seconds when helpers should submit the share, or 0 for immediate.
@@ -53,21 +58,27 @@ pub struct IndexedShareSubmissionPlan {
     pub target_servers: Vec<String>,
 }
 
-/// Plans one vote's helper-share timing and initial targets.
+/// Plans one complete wallet submission's helper-share timing and initial targets.
 ///
 /// This is an additive wrapper around [`policy::plan_share_submissions`]. When
 /// `submit_largest_share_now` is false, every plan keeps the existing randomized
-/// timing policy and the result is ordered by public share index. When it is
-/// true, the active share with the greatest `plaintext_value` is returned first
-/// with `submit_at` set to `now_seconds`; equal values use the lowest public
-/// share index. All remaining plans keep their sampled times and helper targets.
+/// timing policy and the result is ordered by bundle, proposal, and public share
+/// index. When it is true, exactly one active share across all supplied recovery
+/// bundles is promoted. The share with the greatest `plaintext_value` is
+/// returned first with `submit_at` set to `now_seconds`; equal values use the
+/// lowest `(bundle_index, proposal_id, share_index)` tuple. All remaining plans
+/// keep their sampled times and helper targets.
 ///
-/// Callers should submit the returned plans in order. Sending the first share
-/// now intentionally makes its public index timing-linkable as the vote's
-/// largest share.
+/// `bundles` must contain the complete logical wallet submission before any
+/// returned share is dispatched. Calling this function separately for each
+/// bundle would promote one share per call and reveal the bundle count through
+/// immediate submission timing. Callers should submit the returned plans in
+/// order and match payloads by all three index fields. Sending the first share
+/// now intentionally makes that share's public identity timing-linkable as the
+/// submission-wide largest share.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_vote_share_submissions(
-    bundle: &VoteRecoveryBundle,
+    bundles: &[VoteRecoveryBundle],
     server_urls: &[String],
     now_seconds: u64,
     vote_end_time_seconds: u64,
@@ -76,8 +87,143 @@ pub fn plan_vote_share_submissions(
     submit_at_random_bytes: &[u8],
     server_random_bytes: &[u8],
 ) -> Result<Vec<IndexedShareSubmissionPlan>, VotingError> {
-    validate_recovery_bundle_vote_fields(bundle)?;
+    let active_bundles = sorted_active_bundles(bundles)?;
+    let required = random_bytes_required(
+        &active_bundles,
+        server_urls.len(),
+        now_seconds,
+        vote_end_time_seconds,
+        last_moment_buffer_seconds,
+    )?;
+    require_random_bytes(
+        "submit_at_random_bytes",
+        submit_at_random_bytes.len(),
+        required.submit_at_random_bytes,
+    )?;
+    require_random_bytes(
+        "server_random_bytes",
+        server_random_bytes.len(),
+        required.server_random_bytes,
+    )?;
 
+    let largest_share_key = (submit_largest_share_now && !active_bundles.is_empty())
+        .then(|| largest_active_share_key_from_sorted(&active_bundles));
+    let mut submissions = Vec::new();
+    let mut submit_at_offset = 0usize;
+    let mut server_offset = 0usize;
+    for (bundle, active_shares) in active_bundles {
+        let required = policy::share_submission_random_bytes_required(
+            active_shares.len(),
+            server_urls.len(),
+            now_seconds,
+            vote_end_time_seconds,
+            last_moment_buffer_seconds,
+            bundle.single_share,
+        );
+        let submit_at_end = submit_at_offset + required.submit_at_random_bytes;
+        let server_end = server_offset + required.server_random_bytes;
+        let plans = policy::plan_share_submissions(
+            active_shares.len(),
+            server_urls,
+            now_seconds,
+            vote_end_time_seconds,
+            last_moment_buffer_seconds,
+            bundle.single_share,
+            &submit_at_random_bytes[submit_at_offset..submit_at_end],
+            &server_random_bytes[server_offset..server_end],
+        )?;
+        submit_at_offset = submit_at_end;
+        server_offset = server_end;
+
+        submissions.extend(active_shares.into_iter().zip(plans).map(|(share, plan)| {
+            let key = (bundle.bundle_index, bundle.proposal_id, share.share_index);
+            IndexedShareSubmissionPlan {
+                bundle_index: bundle.bundle_index,
+                proposal_id: bundle.proposal_id,
+                share_index: share.share_index,
+                submit_at: if largest_share_key == Some(key) {
+                    now_seconds
+                } else {
+                    plan.submit_at
+                },
+                target_count: plan.target_count,
+                target_servers: plan.target_servers,
+            }
+        }));
+    }
+
+    if let Some(largest_share_key) = largest_share_key {
+        let position = submissions
+            .iter()
+            .position(|plan| {
+                (plan.bundle_index, plan.proposal_id, plan.share_index) == largest_share_key
+            })
+            .expect("selected share is present in the planned batch");
+        let largest = submissions.remove(position);
+        submissions.insert(0, largest);
+    }
+
+    Ok(submissions)
+}
+
+/// Returns the entropy sizes required by [`plan_vote_share_submissions`].
+pub fn vote_share_submission_random_bytes_required(
+    bundles: &[VoteRecoveryBundle],
+    server_count: usize,
+    now_seconds: u64,
+    vote_end_time_seconds: u64,
+    last_moment_buffer_seconds: Option<u64>,
+) -> Result<policy::ShareSubmissionRandomBytesRequired, VotingError> {
+    let active_bundles = sorted_active_bundles(bundles)?;
+    random_bytes_required(
+        &active_bundles,
+        server_count,
+        now_seconds,
+        vote_end_time_seconds,
+        last_moment_buffer_seconds,
+    )
+}
+
+type ActiveBundle<'a> = (
+    &'a VoteRecoveryBundle,
+    Vec<&'a crate::types::EncryptedShare>,
+);
+
+fn sorted_active_bundles(
+    bundles: &[VoteRecoveryBundle],
+) -> Result<Vec<ActiveBundle<'_>>, VotingError> {
+    let mut sorted = bundles.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|bundle| (bundle.bundle_index, bundle.proposal_id));
+    let mut vote_keys = BTreeSet::new();
+    let mut round_id: Option<&str> = None;
+    let mut active_bundles = Vec::with_capacity(sorted.len());
+    for bundle in sorted {
+        validate_recovery_bundle_vote_fields(bundle)?;
+        if let Some(expected) = round_id {
+            if bundle.vote_round_id != expected {
+                return Err(VotingError::InvalidInput {
+                    message: "vote recovery batch must contain one round".to_string(),
+                });
+            }
+        } else {
+            round_id = Some(&bundle.vote_round_id);
+        }
+        if !vote_keys.insert((bundle.bundle_index, bundle.proposal_id)) {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "vote recovery batch contains duplicate bundle/proposal key ({}, {})",
+                    bundle.bundle_index, bundle.proposal_id
+                ),
+            });
+        }
+        active_bundles.push((bundle, sorted_active_shares(bundle)?));
+    }
+    Ok(active_bundles)
+}
+
+fn sorted_active_shares(
+    bundle: &VoteRecoveryBundle,
+) -> Result<Vec<&crate::types::EncryptedShare>, VotingError> {
     let active_share_count = if bundle.single_share {
         1.min(bundle.encrypted_shares.len())
     } else {
@@ -108,57 +254,69 @@ pub fn plan_vote_share_submissions(
             ),
         });
     }
-
-    let largest_share_index = submit_largest_share_now.then(|| largest_share_index(&active_shares));
-    let plans = policy::plan_share_submissions(
-        active_shares.len(),
-        server_urls,
-        now_seconds,
-        vote_end_time_seconds,
-        last_moment_buffer_seconds,
-        bundle.single_share,
-        submit_at_random_bytes,
-        server_random_bytes,
-    )?;
-    let mut submissions = active_shares
-        .into_iter()
-        .zip(plans)
-        .map(|(share, plan)| IndexedShareSubmissionPlan {
-            share_index: share.share_index,
-            submit_at: if largest_share_index == Some(share.share_index) {
-                now_seconds
-            } else {
-                plan.submit_at
-            },
-            target_count: plan.target_count,
-            target_servers: plan.target_servers,
-        })
-        .collect::<Vec<_>>();
-
-    if let Some(largest_share_index) = largest_share_index {
-        let position = submissions
-            .iter()
-            .position(|plan| plan.share_index == largest_share_index)
-            .expect("selected share is present in the planned batch");
-        let largest = submissions.remove(position);
-        submissions.insert(0, largest);
-    }
-
-    Ok(submissions)
+    Ok(active_shares)
 }
 
-// The input is nonempty and sorted by share index.
-fn largest_share_index(active_shares: &[&crate::types::EncryptedShare]) -> u32 {
-    let mut largest = active_shares[0];
-    for candidate in &active_shares[1..] {
-        if candidate.plaintext_value > largest.plaintext_value
-            || (candidate.plaintext_value == largest.plaintext_value
-                && candidate.share_index < largest.share_index)
-        {
-            largest = candidate;
+fn largest_active_share_key_from_sorted(active_bundles: &[ActiveBundle<'_>]) -> (u32, u32, u32) {
+    let mut largest: Option<(u64, (u32, u32, u32))> = None;
+    for (bundle, shares) in active_bundles {
+        for share in shares {
+            let key = (bundle.bundle_index, bundle.proposal_id, share.share_index);
+            if largest.as_ref().is_none_or(|(value, largest_key)| {
+                share.plaintext_value > *value
+                    || (share.plaintext_value == *value && key < *largest_key)
+            }) {
+                largest = Some((share.plaintext_value, key));
+            }
         }
     }
-    largest.share_index
+    largest
+        .map(|(_, key)| key)
+        .expect("validated active bundle batch is nonempty")
+}
+
+fn random_bytes_required(
+    active_bundles: &[ActiveBundle<'_>],
+    server_count: usize,
+    now_seconds: u64,
+    vote_end_time_seconds: u64,
+    last_moment_buffer_seconds: Option<u64>,
+) -> Result<policy::ShareSubmissionRandomBytesRequired, VotingError> {
+    let mut submit_at_random_bytes = 0usize;
+    let mut server_random_bytes = 0usize;
+    for (bundle, shares) in active_bundles {
+        let required = policy::share_submission_random_bytes_required(
+            shares.len(),
+            server_count,
+            now_seconds,
+            vote_end_time_seconds,
+            last_moment_buffer_seconds,
+            bundle.single_share,
+        );
+        submit_at_random_bytes = submit_at_random_bytes
+            .checked_add(required.submit_at_random_bytes)
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "submit_at random byte requirement overflow".to_string(),
+            })?;
+        server_random_bytes = server_random_bytes
+            .checked_add(required.server_random_bytes)
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: "server random byte requirement overflow".to_string(),
+            })?;
+    }
+    Ok(policy::ShareSubmissionRandomBytesRequired {
+        submit_at_random_bytes,
+        server_random_bytes,
+    })
+}
+
+fn require_random_bytes(label: &str, actual: usize, required: usize) -> Result<(), VotingError> {
+    if actual < required {
+        return Err(VotingError::InvalidInput {
+            message: format!("{label} must contain at least {required} bytes"),
+        });
+    }
+    Ok(())
 }
 
 /// Computes the 32-byte share reveal nullifier.
@@ -511,7 +669,7 @@ mod tests {
         .unwrap();
 
         let planned = plan_vote_share_submissions(
-            &bundle,
+            std::slice::from_ref(&bundle),
             &servers,
             1_000,
             2_000,
@@ -543,7 +701,7 @@ mod tests {
         let submit_at_entropy = scheduling_entropy();
         let server_entropy = vec![0; 16];
         let randomized = plan_vote_share_submissions(
-            &bundle,
+            std::slice::from_ref(&bundle),
             &servers,
             1_000,
             2_000,
@@ -555,7 +713,7 @@ mod tests {
         .unwrap();
 
         let planned = plan_vote_share_submissions(
-            &bundle,
+            std::slice::from_ref(&bundle),
             &servers,
             1_000,
             2_000,
@@ -578,6 +736,85 @@ mod tests {
         let serialized = serde_json::to_string(&planned).unwrap();
         assert!(!serialized.contains("plaintext_value"));
         assert!(!serialized.contains("randomness"));
+    }
+
+    #[test]
+    fn vote_share_planning_promotes_one_global_maximum_across_bundles() {
+        let mut bundle_0 = recovery_bundle_fixture();
+        bundle_0.encrypted_shares[0].plaintext_value = 20;
+        bundle_0.encrypted_shares[1].plaintext_value = 30;
+        let mut bundle_1 = recovery_bundle_fixture();
+        bundle_1.bundle_index = 1;
+        bundle_1.proposal_id = 2;
+        bundle_1.encrypted_shares[0].plaintext_value = 50;
+        bundle_1.encrypted_shares[1].plaintext_value = 40;
+        let bundles = vec![bundle_1, bundle_0];
+        let servers = helper_servers();
+        let required = vote_share_submission_random_bytes_required(
+            &bundles,
+            servers.len(),
+            1_000,
+            2_000,
+            Some(100),
+        )
+        .unwrap();
+        let submit_at_entropy = multi_bundle_scheduling_entropy();
+        let server_entropy = vec![0; required.server_random_bytes];
+        assert_eq!(required.submit_at_random_bytes, submit_at_entropy.len());
+
+        let randomized = plan_vote_share_submissions(
+            &bundles,
+            &servers,
+            1_000,
+            2_000,
+            Some(100),
+            false,
+            &submit_at_entropy,
+            &server_entropy,
+        )
+        .unwrap();
+        let planned = plan_vote_share_submissions(
+            &bundles,
+            &servers,
+            1_000,
+            2_000,
+            Some(100),
+            true,
+            &submit_at_entropy,
+            &server_entropy,
+        )
+        .unwrap();
+
+        assert_eq!(
+            (
+                planned[0].bundle_index,
+                planned[0].proposal_id,
+                planned[0].share_index
+            ),
+            (1, 2, 0)
+        );
+        assert_eq!(planned[0].submit_at, 1_000);
+        assert_eq!(
+            planned
+                .iter()
+                .filter(|plan| plan.submit_at == 1_000)
+                .count(),
+            1
+        );
+        for plan in &planned[1..] {
+            let original = randomized
+                .iter()
+                .find(|original| {
+                    (
+                        original.bundle_index,
+                        original.proposal_id,
+                        original.share_index,
+                    ) == (plan.bundle_index, plan.proposal_id, plan.share_index)
+                })
+                .unwrap();
+            assert_eq!(plan.submit_at, original.submit_at);
+            assert_eq!(plan.target_servers, original.target_servers);
+        }
     }
 
     #[test]
@@ -624,7 +861,7 @@ mod tests {
         .unwrap();
 
         let planned = plan_vote_share_submissions(
-            &bundle,
+            std::slice::from_ref(&bundle),
             &servers,
             1_000,
             2_000,
@@ -654,23 +891,30 @@ mod tests {
     }
 
     #[test]
-    fn vote_share_planning_breaks_largest_value_ties_by_lowest_index() {
-        let mut bundle = recovery_bundle_fixture();
-        bundle.encrypted_shares[0].plaintext_value = 6;
-        bundle.encrypted_shares.swap(0, 1);
+    fn vote_share_planning_breaks_global_ties_by_lowest_identity() {
+        let mut bundle_0 = recovery_bundle_fixture();
+        bundle_0.encrypted_shares[0].plaintext_value = 6;
+        bundle_0.encrypted_shares.swap(0, 1);
+        let mut bundle_1 = recovery_bundle_fixture();
+        bundle_1.bundle_index = 1;
+        bundle_1.proposal_id = 2;
+        bundle_1.encrypted_shares[0].plaintext_value = 6;
+        bundle_1.encrypted_shares[1].plaintext_value = 1;
 
         let planned = plan_vote_share_submissions(
-            &bundle,
+            &[bundle_1, bundle_0],
             &helper_servers(),
             1_000,
             2_000,
             Some(100),
             true,
-            &scheduling_entropy(),
-            &[0; 16],
+            &multi_bundle_scheduling_entropy(),
+            &[0; 32],
         )
         .unwrap();
 
+        assert_eq!(planned[0].bundle_index, 0);
+        assert_eq!(planned[0].proposal_id, 1);
         assert_eq!(planned[0].share_index, 0);
         assert_eq!(planned[0].submit_at, 1_000);
         assert_eq!(planned[1].share_index, 1);
@@ -681,7 +925,7 @@ mod tests {
         let mut single = recovery_bundle_fixture();
         single.single_share = true;
         let planned = plan_vote_share_submissions(
-            &single,
+            std::slice::from_ref(&single),
             &helper_servers(),
             1_000,
             2_000,
@@ -698,7 +942,7 @@ mod tests {
         let mut duplicate = recovery_bundle_fixture();
         duplicate.encrypted_shares[1].share_index = 0;
         let err = plan_vote_share_submissions(
-            &duplicate,
+            std::slice::from_ref(&duplicate),
             &helper_servers(),
             1_000,
             2_000,
@@ -709,6 +953,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("duplicate share_index 0"));
+
+        let bundle = recovery_bundle_fixture();
+        let duplicate_bundle = bundle.clone();
+        let err = plan_vote_share_submissions(
+            &[bundle.clone(), duplicate_bundle],
+            &helper_servers(),
+            1_000,
+            2_000,
+            Some(100),
+            true,
+            &multi_bundle_scheduling_entropy(),
+            &[0; 32],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate bundle/proposal key"));
+
+        let mut other_round = bundle.clone();
+        other_round.bundle_index = 1;
+        other_round.vote_round_id = "02".repeat(32);
+        let err = plan_vote_share_submissions(
+            &[bundle, other_round],
+            &helper_servers(),
+            1_000,
+            2_000,
+            Some(100),
+            true,
+            &multi_bundle_scheduling_entropy(),
+            &[0; 32],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must contain one round"));
     }
 
     #[test]
@@ -784,6 +1059,13 @@ mod tests {
 
     fn scheduling_entropy() -> Vec<u8> {
         [1_u64 << 62, 1_u64 << 63]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect()
+    }
+
+    fn multi_bundle_scheduling_entropy() -> Vec<u8> {
+        [1_u64 << 61, 1_u64 << 62, 1_u64 << 63, 3_u64 << 62]
             .into_iter()
             .flat_map(u64::to_le_bytes)
             .collect()
