@@ -652,8 +652,6 @@ fn push_submit_share_work(
 fn select_primary_action(
     steps: &[NextStep],
     blocking_recovery: bool,
-    blocking_share_work: bool,
-    blocking_share_confirmation: bool,
     completed_for_display: bool,
 ) -> RoundPlanAction {
     if completed_for_display {
@@ -681,11 +679,7 @@ fn select_primary_action(
     }) {
         return RoundPlanAction::Vote;
     }
-    if blocking_share_work || blocking_share_confirmation {
-        RoundPlanAction::SubmitShares
-    } else {
-        RoundPlanAction::Idle
-    }
+    RoundPlanAction::SubmitShares
 }
 
 fn completed_vote_display(
@@ -969,23 +963,31 @@ pub fn resume_plan_with_options(
         })
         .map(|share| (share.bundle_index, share.proposal_id, share.share_index))
         .collect::<BTreeSet<_>>();
-    let required_largest_share_key = if options.require_largest_share_confirmation {
-        submission_largest_share_key(db, round_id, &choice_proposals, &bundles, &votes)?
-    } else {
-        None
-    };
+    let all_choice_votes_confirmed = !choice_proposals.is_empty()
+        && choice_proposals.iter().all(|proposal_id| {
+            bundles.iter().all(|bundle_index| {
+                votes.get(&(*bundle_index, *proposal_id)) == Some(&VotePhase::Confirmed)
+            })
+        });
+    let required_largest_share_key =
+        if options.require_largest_share_confirmation && all_choice_votes_confirmed {
+            Some(submission_largest_share_key(
+                db,
+                round_id,
+                &choice_proposals,
+                &bundles,
+            )?)
+        } else {
+            None
+        };
     let blocking_share_work = !blocking_confirm_share_keys.is_empty();
-    let required_share_position = required_largest_share_key.and_then(|required_key| {
+    if let Some(position) = required_largest_share_key.and_then(|required_key| {
         steps
             .iter()
             .position(|step| share_step_key(step) == Some(required_key))
-    });
-    let blocking_share_confirmation = if let Some(position) = required_share_position {
+    }) {
         steps[..=position].rotate_right(1);
-        true
-    } else {
-        false
-    };
+    }
     let blocking_recovery = steps.iter().any(|step| {
         if options.require_largest_share_confirmation {
             share_step_key(step).is_none_or(|key| required_largest_share_key == Some(key))
@@ -1056,13 +1058,7 @@ pub fn resume_plan_with_options(
     });
     let pending_recovery = !steps.is_empty();
     let needs_draft_setup = !blocking_recovery && !all_decided && !open_proposals.is_empty();
-    let primary_action = select_primary_action(
-        &steps,
-        blocking_recovery,
-        blocking_share_work,
-        blocking_share_confirmation,
-        completed_for_display,
-    );
+    let primary_action = select_primary_action(&steps, blocking_recovery, completed_for_display);
     let recovered_delegation_work =
         recovered_delegation_work_from_steps(db, round_id, &delegation, &steps)?;
     let recovered_vote_work =
@@ -1109,18 +1105,7 @@ fn submission_largest_share_key(
     round_id: &str,
     choice_proposals: &[u32],
     bundles: &[u32],
-    votes: &BTreeMap<(u32, u32), VotePhase>,
-) -> Result<Option<(u32, u32, u32)>, VotingError> {
-    if choice_proposals.is_empty()
-        || choice_proposals.iter().any(|proposal_id| {
-            bundles.iter().any(|bundle_index| {
-                votes.get(&(*bundle_index, *proposal_id)) != Some(&VotePhase::Confirmed)
-            })
-        })
-    {
-        return Ok(None);
-    }
-
+) -> Result<(u32, u32, u32), VotingError> {
     let mut recoveries = Vec::new();
     for &proposal_id in choice_proposals {
         for &bundle_index in bundles {
@@ -1149,7 +1134,7 @@ fn submission_largest_share_key(
         }
     }
 
-    crate::share::largest_active_share_key(&recoveries).map(Some)
+    crate::share::largest_active_share_key(&recoveries)
 }
 
 fn vote_has_recovery_bundle(
@@ -2407,17 +2392,15 @@ mod tests {
     #[test]
     fn largest_share_confirmation_waits_for_the_complete_submission() {
         let db = db_with_two_bundles();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
         confirm_vote_fixture(&db, 0, 2, 1);
-        let votes = db
-            .vote_phases(ROUND)
-            .unwrap()
-            .into_iter()
-            .map(|(bundle_index, proposal_id, phase)| ((bundle_index, proposal_id), phase))
-            .collect::<BTreeMap<_, _>>();
+        let plan = resume_plan_with_options(&db, ROUND, &[2], require_largest_share_confirmation())
+            .unwrap();
 
         assert_eq!(
-            submission_largest_share_key(&db, ROUND, &[2], &[0, 1], &votes).unwrap(),
-            None
+            plan.next_steps.first(),
+            Some(&NextStep::Delegate { bundle_index: 1 })
         );
     }
 
