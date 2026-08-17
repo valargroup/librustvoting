@@ -247,10 +247,13 @@ promoted share remains timing-linkable as the submission-wide largest share.
 
 Callers can separately opt into foreground confirmation with
 `session::resume_plan_with_options` and
-`require_largest_share_confirmation: true`. This keeps only the largest active
-share for each vote blocking after helper acceptance. Other accepted shares
-remain background work. Pair the option with immediate largest-share scheduling
-or the selected share can remain scheduled for later.
+`require_largest_share_confirmation: true`. This keeps the same one largest
+active share across the complete logical wallet submission blocking after
+helper acceptance. The planner waits until every selected bundle and proposal
+has confirmed recovery material before choosing it, so restart recovery cannot
+promote a second bundle after the original share confirms. Other accepted
+shares remain background work. Pair the option with immediate largest-share
+scheduling or the selected share can remain scheduled for later.
 
 The planner does not perform network requests or sleep. Execute its
 `ConfirmShare` step by polling only the helper URLs recorded for that share, and
@@ -342,10 +345,10 @@ boundary, so production builds should not enable this feature.
   VAN positions, and VC positions atomically.
 - Use `session::resume_plan` instead of reconstructing what comes next from raw
   delegation, vote, and share phases in wallet code. New integrations that keep
-  the foreground operation open for largest-share confirmation can use
-  `resume_plan_with_options`; the default remains nonblocking after one helper
-  accepts a share. Fetch step execution material through crate APIs such as
-  `vote::submission`, `vote::recover_commit`, `share::*`, and the tx hash
+  the foreground operation open for submission-wide largest-share confirmation
+  can use `resume_plan_with_options`; the default remains nonblocking after one
+  helper accepts a share. Fetch step execution material through crate APIs such
+  as `vote::submission`, `vote::recover_commit`, `share::*`, and the tx hash
   accessors.
 - Use `vote::commit`, `vote::submission`, `vote::recover_commit`,
   `vote::record_submission`, and `vote::record_vc_position` for the cast-vote

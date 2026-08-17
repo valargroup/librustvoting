@@ -323,11 +323,6 @@ pub(crate) fn largest_active_share_key(
     Ok(largest_active_share_key_from_sorted(&active_bundles))
 }
 
-/// Returns the largest active share index in one recovery bundle.
-pub(crate) fn largest_active_share_index(bundle: &VoteRecoveryBundle) -> Result<u32, VotingError> {
-    Ok(largest_active_share_key(std::slice::from_ref(bundle))?.2)
-}
-
 fn require_random_bytes(label: &str, actual: usize, required: usize) -> Result<(), VotingError> {
     if actual < required {
         return Err(VotingError::InvalidInput {
