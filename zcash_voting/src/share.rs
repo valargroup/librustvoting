@@ -315,10 +315,9 @@ pub fn unconfirmed(
 
 /// Marks one helper-share record confirmed.
 ///
-/// This compatibility API trusts the caller's confirmation source. New flows
-/// that wait for a specific accepted helper should use
-/// [`confirm_from_helper`] so the source URL is checked against durable
-/// delivery state.
+/// Call this only after a helper that accepted the share reports it in
+/// committed chain state. This function records that terminal application
+/// state; it does not query a helper or verify chain evidence itself.
 pub fn confirm(
     db: &VotingDb,
     round_id: &str,
@@ -326,43 +325,6 @@ pub fn confirm(
     proposal_id: u32,
     share_index: u32,
 ) -> Result<(), VotingError> {
-    db.mark_share_confirmed(round_id, bundle_index, proposal_id, share_index)
-}
-
-/// Marks one helper-share record confirmed after validating its helper source.
-///
-/// `helper_url` must exactly match a URL previously recorded in
-/// `sent_to_urls` for this share. The caller remains responsible for querying
-/// that helper's status endpoint and calling this only after it reports the
-/// share nullifier in committed chain state.
-pub fn confirm_from_helper(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    share_index: u32,
-    helper_url: &str,
-) -> Result<(), VotingError> {
-    let record = db
-        .get_share_delegations(round_id)?
-        .into_iter()
-        .find(|record| {
-            record.bundle_index == bundle_index
-                && record.proposal_id == proposal_id
-                && record.share_index == share_index
-        })
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: format!(
-                "share delegation not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}, share={share_index}"
-            ),
-        })?;
-    if !record.sent_to_urls.iter().any(|url| url == helper_url) {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "helper URL was not recorded for round={round_id}, bundle={bundle_index}, proposal={proposal_id}, share={share_index}"
-            ),
-        });
-    }
     db.mark_share_confirmed(round_id, bundle_index, proposal_id, share_index)
 }
 
@@ -803,30 +765,6 @@ mod tests {
         confirm(&db, ROUND_ID, 0, 1, 1).unwrap();
         assert!(unconfirmed(&db, ROUND_ID).unwrap().is_empty());
         assert_eq!(list(&db, ROUND_ID).unwrap()[0].confirmed, true);
-    }
-
-    #[test]
-    fn confirmation_source_must_be_a_recorded_helper() {
-        let db = db_with_vote_recovery();
-        record(
-            &db,
-            ROUND_ID,
-            0,
-            1,
-            1,
-            &["https://helper-1.example".to_string()],
-            99,
-        )
-        .unwrap();
-
-        let err =
-            confirm_from_helper(&db, ROUND_ID, 0, 1, 1, "https://helper-2.example").unwrap_err();
-        assert!(err.to_string().contains("helper URL was not recorded"));
-        assert!(!list(&db, ROUND_ID).unwrap()[0].confirmed);
-
-        confirm_from_helper(&db, ROUND_ID, 0, 1, 1, "https://helper-1.example").unwrap();
-        confirm_from_helper(&db, ROUND_ID, 0, 1, 1, "https://helper-1.example").unwrap();
-        assert!(list(&db, ROUND_ID).unwrap()[0].confirmed);
     }
 
     #[test]

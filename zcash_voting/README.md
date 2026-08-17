@@ -251,20 +251,20 @@ Callers can separately opt into foreground confirmation with
 active share across the complete logical wallet submission blocking after
 helper acceptance. The planner waits until every selected bundle and proposal
 has confirmed recovery material before choosing it, so restart recovery cannot
-promote a second bundle after the original share confirms. Other accepted
-shares remain background work. Pair the option with immediate largest-share
-scheduling or the selected share can remain scheduled for later.
+promote a second bundle after the original share confirms. Its outstanding
+share step is returned first; other accepted shares remain background work.
+Pair the option with immediate largest-share scheduling or the selected share
+can remain scheduled for later.
 
 The planner does not perform network requests or sleep. Execute its
-`ConfirmShare` step by polling only the helper URLs recorded for that share, and
-use `share::confirm_from_helper` after any one reports `confirmed` from committed
-chain state. Helper enqueue and transaction broadcast acceptance are not
+`ConfirmShare` step by polling the helper URLs recorded for that share, then
+call `share::confirm` only after any one reports the share in committed chain
+state. Helper enqueue and transaction broadcast acceptance are not
 confirmation. The caller owns the foreground timeout; on timeout, leave the
 durable unconfirmed row intact and continue polling or retrying in the
 background. Repeated delivery and confirmation are idempotent for the same
-share identity, and a helper restart does not invalidate committed-chain
-evidence. Persist confirmation only after the caller's chain finality policy is
-satisfied because the crate treats confirmation as terminal.
+share identity. Apply the caller's finality and reorg policy before recording
+confirmation because the crate treats it as terminal.
 
 ## Secret boundaries
 

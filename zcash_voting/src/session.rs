@@ -32,8 +32,8 @@ pub enum Decision {
 pub struct ResumePlanOptions {
     /// Keep the submission-wide largest active share blocking until confirmed.
     ///
-    /// Other helper-share submission and confirmation steps remain in the
-    /// returned plan as nonblocking background recovery work.
+    /// Its outstanding share step is returned first. Other helper-share
+    /// submission and confirmation steps remain nonblocking background work.
     ///
     /// Pair this with immediate largest-share scheduling. Without that
     /// scheduling opt-in, the selected share can retain a future `submit_at`
@@ -744,14 +744,14 @@ pub fn resume_plan(
 /// This function performs no network requests or sleeping. When
 /// `require_largest_share_confirmation` is enabled, exactly one active share
 /// across every chosen proposal and delegation bundle remains blocking while
-/// its `SubmitShares` or `ConfirmShare` step is outstanding. The planner uses
-/// the same value and identity ordering as `share::plan_vote_share_submissions`.
-/// It does not select the share until every vote in the logical submission is
-/// confirmed and all recovery bundles are available. Missing, unaccepted, or
-/// unconfirmed non-largest shares remain in the plan as nonblocking background
-/// recovery work. The wallet executes the blocking confirmation step by
-/// polling the share's recorded helper URLs, persists confirmation after any
-/// one reports `confirmed`, and calls this function again. Callers own their
+/// its `SubmitShares` or `ConfirmShare` step is outstanding, and that step is
+/// returned first. The planner uses the same value and identity ordering as
+/// `share::plan_vote_share_submissions`. It does not select the share until
+/// every vote in the logical submission is confirmed and all recovery bundles
+/// are available. Missing, unaccepted, or unconfirmed non-largest shares remain
+/// in the plan as nonblocking background recovery work. The wallet executes the
+/// first step, persists confirmation after any one recorded helper reports it
+/// in committed chain state, and calls this function again. Callers own their
 /// wait timeout; timing out must leave the durable share row intact so
 /// background polling can continue.
 pub fn resume_plan_with_options(
@@ -956,23 +956,7 @@ pub fn resume_plan_with_options(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let share_step_keys = steps
-        .iter()
-        .filter_map(|step| match step {
-            NextStep::SubmitShares {
-                bundle_index,
-                proposal_id,
-                share_index,
-            }
-            | NextStep::ConfirmShare {
-                bundle_index,
-                proposal_id,
-                share_index,
-            } => Some((*bundle_index, *proposal_id, *share_index)),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let unaccepted_confirm_share_keys = share_delegations
+    let blocking_confirm_share_keys = share_delegations
         .iter()
         .filter(|share| !share.confirmed)
         .filter(|share| share.sent_to_urls.is_empty())
@@ -985,45 +969,33 @@ pub fn resume_plan_with_options(
         })
         .map(|share| (share.bundle_index, share.proposal_id, share.share_index))
         .collect::<BTreeSet<_>>();
-    let expected_vote_keys = choice_proposals
-        .iter()
-        .flat_map(|proposal_id| {
-            bundles
-                .iter()
-                .map(move |bundle_index| (*bundle_index, *proposal_id))
-        })
-        .collect::<BTreeSet<_>>();
     let required_largest_share_key = if options.require_largest_share_confirmation {
-        required_submission_share_key(db, round_id, &expected_vote_keys, &votes, &share_step_keys)?
+        submission_largest_share_key(db, round_id, &choice_proposals, &bundles, &votes)?
     } else {
         None
     };
-    let blocking_share_work = !unaccepted_confirm_share_keys.is_empty();
-    let blocking_share_confirmation = required_largest_share_key.is_some();
+    let blocking_share_work = !blocking_confirm_share_keys.is_empty();
+    let required_share_position = required_largest_share_key.and_then(|required_key| {
+        steps
+            .iter()
+            .position(|step| share_step_key(step) == Some(required_key))
+    });
+    let blocking_share_confirmation = if let Some(position) = required_share_position {
+        steps[..=position].rotate_right(1);
+        true
+    } else {
+        false
+    };
     let blocking_recovery = steps.iter().any(|step| {
         if options.require_largest_share_confirmation {
-            match step {
-                NextStep::SubmitShares {
-                    bundle_index,
-                    proposal_id,
-                    share_index,
-                }
-                | NextStep::ConfirmShare {
-                    bundle_index,
-                    proposal_id,
-                    share_index,
-                } => {
-                    required_largest_share_key == Some((*bundle_index, *proposal_id, *share_index))
-                }
-                _ => true,
-            }
+            share_step_key(step).is_none_or(|key| required_largest_share_key == Some(key))
         } else {
             match step {
                 NextStep::ConfirmShare {
                     bundle_index,
                     proposal_id,
                     share_index,
-                } => unaccepted_confirm_share_keys.contains(&(
+                } => blocking_confirm_share_keys.contains(&(
                     *bundle_index,
                     *proposal_id,
                     *share_index,
@@ -1094,7 +1066,7 @@ pub fn resume_plan_with_options(
     let recovered_delegation_work =
         recovered_delegation_work_from_steps(db, round_id, &delegation, &steps)?;
     let recovered_vote_work =
-        recovered_vote_work_from_steps(db, round_id, &unaccepted_confirm_share_keys, &steps)?;
+        recovered_vote_work_from_steps(db, round_id, &blocking_confirm_share_keys, &steps)?;
 
     Ok(RoundPlan {
         round_id: round_id.to_string(),
@@ -1116,49 +1088,68 @@ pub fn resume_plan_with_options(
     })
 }
 
-fn required_submission_share_key(
+fn share_step_key(step: &NextStep) -> Option<(u32, u32, u32)> {
+    match step {
+        NextStep::SubmitShares {
+            bundle_index,
+            proposal_id,
+            share_index,
+        }
+        | NextStep::ConfirmShare {
+            bundle_index,
+            proposal_id,
+            share_index,
+        } => Some((*bundle_index, *proposal_id, *share_index)),
+        _ => None,
+    }
+}
+
+fn submission_largest_share_key(
     db: &VotingDb,
     round_id: &str,
-    expected_vote_keys: &BTreeSet<(u32, u32)>,
+    choice_proposals: &[u32],
+    bundles: &[u32],
     votes: &BTreeMap<(u32, u32), VotePhase>,
-    share_step_keys: &BTreeSet<(u32, u32, u32)>,
 ) -> Result<Option<(u32, u32, u32)>, VotingError> {
-    if expected_vote_keys.is_empty()
-        || expected_vote_keys
-            .iter()
-            .any(|key| votes.get(key) != Some(&VotePhase::Confirmed))
+    if choice_proposals.is_empty()
+        || choice_proposals.iter().any(|proposal_id| {
+            bundles.iter().any(|bundle_index| {
+                votes.get(&(*bundle_index, *proposal_id)) != Some(&VotePhase::Confirmed)
+            })
+        })
     {
         return Ok(None);
     }
 
-    let mut recoveries = Vec::with_capacity(expected_vote_keys.len());
-    for &(bundle_index, proposal_id) in expected_vote_keys {
-        let recovery = crate::vote::recovery_bundle(
-            db,
-            round_id,
-            bundle_index,
-            proposal_id,
-        )?
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: format!(
-                "cannot require submission-wide share confirmation without recovery material for round {round_id} bundle {bundle_index} proposal {proposal_id}"
-            ),
-        })?;
-        if recovery.vote_round_id != round_id
-            || recovery.bundle_index != bundle_index
-            || recovery.proposal_id != proposal_id
-        {
-            return Err(VotingError::InvalidInput {
+    let mut recoveries = Vec::new();
+    for &proposal_id in choice_proposals {
+        for &bundle_index in bundles {
+            let recovery = crate::vote::recovery_bundle(
+                db,
+                round_id,
+                bundle_index,
+                proposal_id,
+            )?
+            .ok_or_else(|| VotingError::InvalidInput {
                 message: format!(
-                    "vote recovery identity mismatch while selecting the submission-wide largest share for round {round_id} bundle {bundle_index} proposal {proposal_id}"
+                    "cannot require submission-wide share confirmation without recovery material for round {round_id} bundle {bundle_index} proposal {proposal_id}"
                 ),
-            });
+            })?;
+            if recovery.vote_round_id != round_id
+                || recovery.bundle_index != bundle_index
+                || recovery.proposal_id != proposal_id
+            {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "vote recovery identity mismatch while selecting the submission-wide largest share for round {round_id} bundle {bundle_index} proposal {proposal_id}"
+                    ),
+                });
+            }
+            recoveries.push(recovery);
         }
-        recoveries.push(recovery);
     }
 
-    let key = crate::share::largest_active_share_key(&recoveries)?;
-    Ok(share_step_keys.contains(&key).then_some(key))
+    crate::share::largest_active_share_key(&recoveries).map(Some)
 }
 
 fn vote_has_recovery_bundle(
@@ -1261,6 +1252,12 @@ mod tests {
         .unwrap();
         assert_eq!(db.delegation_phases(ROUND).unwrap().len(), 2);
         db
+    }
+
+    fn require_largest_share_confirmation() -> ResumePlanOptions {
+        ResumePlanOptions {
+            require_largest_share_confirmation: true,
+        }
     }
 
     fn store_vote_recovery_fixture(
@@ -2322,15 +2319,9 @@ mod tests {
         let default_plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert!(!default_plan.blocking_recovery);
 
-        let waiting_plan = resume_plan_with_options(
-            &db,
-            ROUND,
-            &[1, 2, 3],
-            ResumePlanOptions {
-                require_largest_share_confirmation: true,
-            },
-        )
-        .unwrap();
+        let waiting_plan =
+            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
+                .unwrap();
 
         assert_eq!(
             waiting_plan.next_steps,
@@ -2347,15 +2338,9 @@ mod tests {
         assert!(waiting_plan.recovered_vote_work.is_empty());
 
         db.mark_share_confirmed(ROUND, 0, 2, 1).unwrap();
-        let confirmed_plan = resume_plan_with_options(
-            &db,
-            ROUND,
-            &[1, 2, 3],
-            ResumePlanOptions {
-                require_largest_share_confirmation: true,
-            },
-        )
-        .unwrap();
+        let confirmed_plan =
+            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
+                .unwrap();
         assert!(confirmed_plan.next_steps.is_empty());
         assert!(!confirmed_plan.blocking_recovery);
         assert!(confirmed_plan.completed_for_display);
@@ -2381,38 +2366,31 @@ mod tests {
         record_submitted_share_fixture(&db, 1, 2, 0, &["https://helper.example".to_string()]);
         record_confirmed_share_fixture(&db, 1, 2, 1);
 
-        let waiting_plan = resume_plan_with_options(
-            &db,
-            ROUND,
-            &[1, 2, 3],
-            ResumePlanOptions {
-                require_largest_share_confirmation: true,
-            },
-        )
-        .unwrap();
+        let waiting_plan =
+            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
+                .unwrap();
 
         assert!(waiting_plan.blocking_recovery);
-        assert!(waiting_plan.next_steps.contains(&NextStep::ConfirmShare {
-            bundle_index: 0,
-            proposal_id: 2,
-            share_index: 1,
-        }));
-        assert!(waiting_plan.next_steps.contains(&NextStep::ConfirmShare {
-            bundle_index: 1,
-            proposal_id: 2,
-            share_index: 0,
-        }));
+        assert_eq!(
+            waiting_plan.next_steps,
+            vec![
+                NextStep::ConfirmShare {
+                    bundle_index: 1,
+                    proposal_id: 2,
+                    share_index: 0,
+                },
+                NextStep::ConfirmShare {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                    share_index: 1,
+                },
+            ]
+        );
 
         db.mark_share_confirmed(ROUND, 1, 2, 0).unwrap();
-        let confirmed_plan = resume_plan_with_options(
-            &db,
-            ROUND,
-            &[1, 2, 3],
-            ResumePlanOptions {
-                require_largest_share_confirmation: true,
-            },
-        )
-        .unwrap();
+        let confirmed_plan =
+            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
+                .unwrap();
 
         assert_eq!(
             confirmed_plan.next_steps,
@@ -2436,18 +2414,9 @@ mod tests {
             .into_iter()
             .map(|(bundle_index, proposal_id, phase)| ((bundle_index, proposal_id), phase))
             .collect::<BTreeMap<_, _>>();
-        let expected_vote_keys = BTreeSet::from([(0, 2), (1, 2)]);
-        let share_step_keys = BTreeSet::from([(0, 2, 1)]);
 
         assert_eq!(
-            required_submission_share_key(
-                &db,
-                ROUND,
-                &expected_vote_keys,
-                &votes,
-                &share_step_keys,
-            )
-            .unwrap(),
+            submission_largest_share_key(&db, ROUND, &[2], &[0, 1], &votes).unwrap(),
             None
         );
     }
@@ -2461,15 +2430,9 @@ mod tests {
         record_submitted_share_fixture(&db, 0, 2, 0, &[]);
         record_confirmed_share_fixture(&db, 0, 2, 1);
 
-        let plan = resume_plan_with_options(
-            &db,
-            ROUND,
-            &[1, 2, 3],
-            ResumePlanOptions {
-                require_largest_share_confirmation: true,
-            },
-        )
-        .unwrap();
+        let plan =
+            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
+                .unwrap();
 
         assert_eq!(
             plan.next_steps,
@@ -2504,15 +2467,9 @@ mod tests {
         confirm_vote_fixture(&db, 0, 2, 1);
         record_confirmed_share_fixture(&db, 0, 2, 0);
 
-        let plan = resume_plan_with_options(
-            &db,
-            ROUND,
-            &[1, 2, 3],
-            ResumePlanOptions {
-                require_largest_share_confirmation: true,
-            },
-        )
-        .unwrap();
+        let plan =
+            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
+                .unwrap();
 
         assert_eq!(
             plan.next_steps,
@@ -2538,15 +2495,9 @@ mod tests {
         store_recovery_bundle_fixture(&db, &recovery, Some(42));
         record_submitted_share_fixture(&db, 0, 2, 0, &["https://helper.example".to_string()]);
 
-        let plan = resume_plan_with_options(
-            &db,
-            ROUND,
-            &[1, 2, 3],
-            ResumePlanOptions {
-                require_largest_share_confirmation: true,
-            },
-        )
-        .unwrap();
+        let plan =
+            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
+                .unwrap();
 
         assert!(plan.blocking_recovery);
         assert!(plan.recovered_vote_work.is_empty());
@@ -2572,15 +2523,9 @@ mod tests {
         record_confirmed_share_fixture(&db, 0, 2, 0);
         record_submitted_share_fixture(&db, 0, 2, 1, &["https://helper.example".to_string()]);
 
-        let err = resume_plan_with_options(
-            &db,
-            ROUND,
-            &[1, 2, 3],
-            ResumePlanOptions {
-                require_largest_share_confirmation: true,
-            },
-        )
-        .unwrap_err();
+        let err =
+            resume_plan_with_options(&db, ROUND, &[1, 2, 3], require_largest_share_confirmation())
+                .unwrap_err();
 
         assert!(err.to_string().contains("vote recovery identity mismatch"));
     }

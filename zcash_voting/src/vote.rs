@@ -311,7 +311,8 @@ impl CommittedVote {
         )
     }
 
-    /// Marks one helper-share submission confirmed.
+    /// Marks one helper-share submission confirmed after the caller has
+    /// verified committed chain state with an accepting helper.
     pub fn confirm_share(&self, db: &VotingDb, share_index: u32) -> Result<(), VotingError> {
         crate::share::confirm(
             db,
@@ -319,23 +320,6 @@ impl CommittedVote {
             self.bundle_index,
             self.commit.proposal_id,
             share_index,
-        )
-    }
-
-    /// Marks one helper-share submission confirmed by a recorded helper.
-    pub fn confirm_share_from_helper(
-        &self,
-        db: &VotingDb,
-        share_index: u32,
-        helper_url: &str,
-    ) -> Result<(), VotingError> {
-        crate::share::confirm_from_helper(
-            db,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-            share_index,
-            helper_url,
         )
     }
 
