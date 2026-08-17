@@ -98,38 +98,7 @@ pub fn plan_bundle_share_submissions(
     submit_at_random_bytes: &[u8],
     server_random_bytes: &[u8],
 ) -> Result<ShareSubmissionBatchPlan, VotingError> {
-    validate_recovery_bundle_vote_fields(bundle)?;
-
-    let active_share_count = if bundle.single_share {
-        1.min(bundle.encrypted_shares.len())
-    } else {
-        bundle.encrypted_shares.len()
-    };
-    let mut active_shares = bundle
-        .encrypted_shares
-        .iter()
-        .take(active_share_count)
-        .collect::<Vec<_>>();
-    if active_shares.is_empty() {
-        return Err(VotingError::InvalidInput {
-            message: "vote recovery bundle contains no active shares".to_string(),
-        });
-    }
-    for share in &active_shares {
-        validate_share_index(share.share_index)?;
-    }
-    active_shares.sort_by_key(|share| share.share_index);
-    if let Some(duplicate) = active_shares
-        .windows(2)
-        .find(|pair| pair[0].share_index == pair[1].share_index)
-    {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "vote recovery bundle contains duplicate share_index {}",
-                duplicate[0].share_index
-            ),
-        });
-    }
+    let active_shares = sorted_active_shares(bundle)?;
 
     let immediate_share_index = options
         .submit_largest_share_immediately
@@ -163,6 +132,51 @@ pub fn plan_bundle_share_submissions(
         submissions,
         immediate_share_index,
     })
+}
+
+/// Returns the public index of the largest active share in a recovery bundle.
+///
+/// This remains crate-internal so callers use [`plan_bundle_share_submissions`]
+/// instead of exporting secret share values or recreating selection policy.
+pub(crate) fn largest_active_share_index(bundle: &VoteRecoveryBundle) -> Result<u32, VotingError> {
+    Ok(largest_share_index(&sorted_active_shares(bundle)?))
+}
+
+fn sorted_active_shares(
+    bundle: &VoteRecoveryBundle,
+) -> Result<Vec<&crate::types::EncryptedShare>, VotingError> {
+    validate_recovery_bundle_vote_fields(bundle)?;
+    let active_share_count = if bundle.single_share {
+        1.min(bundle.encrypted_shares.len())
+    } else {
+        bundle.encrypted_shares.len()
+    };
+    let mut active_shares = bundle
+        .encrypted_shares
+        .iter()
+        .take(active_share_count)
+        .collect::<Vec<_>>();
+    if active_shares.is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: "vote recovery bundle contains no active shares".to_string(),
+        });
+    }
+    for share in &active_shares {
+        validate_share_index(share.share_index)?;
+    }
+    active_shares.sort_by_key(|share| share.share_index);
+    if let Some(duplicate) = active_shares
+        .windows(2)
+        .find(|pair| pair[0].share_index == pair[1].share_index)
+    {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle contains duplicate share_index {}",
+                duplicate[0].share_index
+            ),
+        });
+    }
+    Ok(active_shares)
 }
 
 // The input is nonempty and sorted by share index. Keeping selection here
@@ -252,6 +266,11 @@ pub fn unconfirmed(
 }
 
 /// Marks one helper-share record confirmed.
+///
+/// This compatibility API trusts the caller's confirmation source. New flows
+/// that wait for a specific accepted helper should use
+/// [`confirm_from_helper`] so the source URL is checked against durable
+/// delivery state.
 pub fn confirm(
     db: &VotingDb,
     round_id: &str,
@@ -259,6 +278,43 @@ pub fn confirm(
     proposal_id: u32,
     share_index: u32,
 ) -> Result<(), VotingError> {
+    db.mark_share_confirmed(round_id, bundle_index, proposal_id, share_index)
+}
+
+/// Marks one helper-share record confirmed after validating its helper source.
+///
+/// `helper_url` must exactly match a URL previously recorded in
+/// `sent_to_urls` for this share. The caller remains responsible for querying
+/// that helper's status endpoint and calling this only after it reports the
+/// share nullifier in committed chain state.
+pub fn confirm_from_helper(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    helper_url: &str,
+) -> Result<(), VotingError> {
+    let record = db
+        .get_share_delegations(round_id)?
+        .into_iter()
+        .find(|record| {
+            record.bundle_index == bundle_index
+                && record.proposal_id == proposal_id
+                && record.share_index == share_index
+        })
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "share delegation not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}, share={share_index}"
+            ),
+        })?;
+    if !record.sent_to_urls.iter().any(|url| url == helper_url) {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "helper URL was not recorded for round={round_id}, bundle={bundle_index}, proposal={proposal_id}, share={share_index}"
+            ),
+        });
+    }
     db.mark_share_confirmed(round_id, bundle_index, proposal_id, share_index)
 }
 
@@ -800,6 +856,30 @@ mod tests {
         confirm(&db, ROUND_ID, 0, 1, 1).unwrap();
         assert!(unconfirmed(&db, ROUND_ID).unwrap().is_empty());
         assert_eq!(list(&db, ROUND_ID).unwrap()[0].confirmed, true);
+    }
+
+    #[test]
+    fn confirmation_source_must_be_a_recorded_helper() {
+        let db = db_with_vote_recovery();
+        record(
+            &db,
+            ROUND_ID,
+            0,
+            1,
+            1,
+            &["https://helper-1.example".to_string()],
+            99,
+        )
+        .unwrap();
+
+        let err =
+            confirm_from_helper(&db, ROUND_ID, 0, 1, 1, "https://helper-2.example").unwrap_err();
+        assert!(err.to_string().contains("helper URL was not recorded"));
+        assert!(!list(&db, ROUND_ID).unwrap()[0].confirmed);
+
+        confirm_from_helper(&db, ROUND_ID, 0, 1, 1, "https://helper-1.example").unwrap();
+        confirm_from_helper(&db, ROUND_ID, 0, 1, 1, "https://helper-1.example").unwrap();
+        assert!(list(&db, ROUND_ID).unwrap()[0].confirmed);
     }
 
     #[test]

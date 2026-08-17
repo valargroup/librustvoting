@@ -10,6 +10,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Add an opt-in recovery-bundle share planner that schedules the largest share
   at the current time, returns plans keyed by public share index, and leaves the
   existing count-based planner unchanged for current callers.
+- Add an independent resume-plan option that keeps the largest share blocking
+  until committed-chain confirmation, plus source-checked confirmation for
+  helper URLs recorded as accepting that share.
 
 ### Changed
 - Cap each randomized initial helper-share delay at 48 hours while preserving

@@ -322,6 +322,23 @@ impl CommittedVote {
         )
     }
 
+    /// Marks one helper-share submission confirmed by a recorded helper.
+    pub fn confirm_share_from_helper(
+        &self,
+        db: &VotingDb,
+        share_index: u32,
+        helper_url: &str,
+    ) -> Result<(), VotingError> {
+        crate::share::confirm_from_helper(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            share_index,
+            helper_url,
+        )
+    }
+
     /// Adds helper URLs to a previously recorded share submission.
     pub fn add_sent_servers(
         &self,

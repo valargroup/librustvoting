@@ -62,15 +62,15 @@ pub use crate::selection::{
     select_snapshot_notes, DelegationWalletInputs, GatherDelegationWalletParams,
 };
 pub use crate::session::{
-    resume_plan, CompletedVoteChoice, CompletedVoteDisplay, Decision, DelegationRecoveryWork,
-    DelegationRecoveryWorkKind, DelegationStatus, NextStep, RoundPlan, RoundPlanAction,
-    VoteRecoveryWork, VoteRecoveryWorkKind,
+    resume_plan, resume_plan_with_options, CompletedVoteChoice, CompletedVoteDisplay, Decision,
+    DelegationRecoveryWork, DelegationRecoveryWorkKind, DelegationStatus, NextStep,
+    ResumePlanOptions, RoundPlan, RoundPlanAction, VoteRecoveryWork, VoteRecoveryWorkKind,
 };
 pub use crate::share::{
-    add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,
-    plan_bundle_share_submissions, record as record_share, recover_payload, recover_wire_json,
-    unconfirmed as unconfirmed_shares, IndexedShareSubmissionPlan, SharePlan, ShareRecord,
-    ShareSubmissionBatchPlan, ShareSubmissionScheduleOptions, ShareTimingPolicy,
+    add_sent_servers, compute_nullifier, confirm as confirm_share, confirm_from_helper,
+    list as share_records, plan_bundle_share_submissions, record as record_share, recover_payload,
+    recover_wire_json, unconfirmed as unconfirmed_shares, IndexedShareSubmissionPlan, SharePlan,
+    ShareRecord, ShareSubmissionBatchPlan, ShareSubmissionScheduleOptions, ShareTimingPolicy,
     ShareTrackingSummary,
 };
 pub use crate::types::{

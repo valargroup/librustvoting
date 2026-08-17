@@ -246,6 +246,24 @@ the remaining plans. Revealing that share immediately
 intentionally makes its public index timing-linkable as the bundle's largest
 share.
 
+Callers can separately opt into foreground confirmation with
+`session::resume_plan_with_options` and
+`require_largest_share_confirmation: true`. This keeps only the largest active
+share for each vote blocking after helper acceptance. Other accepted shares
+remain background work. Pair the option with immediate largest-share scheduling
+or the selected share can remain scheduled for later.
+
+The planner does not perform network requests or sleep. Execute its
+`ConfirmShare` step by polling only the helper URLs recorded for that share, and
+use `share::confirm_from_helper` after any one reports `confirmed` from committed
+chain state. Helper enqueue and transaction broadcast acceptance are not
+confirmation. The caller owns the foreground timeout; on timeout, leave the
+durable unconfirmed row intact and continue polling or retrying in the
+background. Repeated delivery and confirmation are idempotent for the same
+share identity, and a helper restart does not invalidate committed-chain
+evidence. Persist confirmation only after the caller's chain finality policy is
+satisfied because the crate treats confirmation as terminal.
+
 ## Secret boundaries
 
 Wallet seed material should stay in the wallet integration. For v2 integrations,
@@ -324,9 +342,12 @@ boundary, so production builds should not enable this feature.
   confirmation API parses the chain `leaf_index` events and records tx hashes,
   VAN positions, and VC positions atomically.
 - Use `session::resume_plan` instead of reconstructing what comes next from raw
-  delegation, vote, and share phases in wallet code. Fetch step execution
-  material through crate APIs such as `vote::submission`,
-  `vote::recover_commit`, `share::*`, and the tx hash accessors.
+  delegation, vote, and share phases in wallet code. New integrations that keep
+  the foreground operation open for largest-share confirmation can use
+  `resume_plan_with_options`; the default remains nonblocking after one helper
+  accepts a share. Fetch step execution material through crate APIs such as
+  `vote::submission`, `vote::recover_commit`, `share::*`, and the tx hash
+  accessors.
 - Use `vote::commit`, `vote::submission`, `vote::recover_commit`,
   `vote::record_submission`, and `vote::record_vc_position` for the cast-vote
   lifecycle. Wallets should not write recovery JSON, submission flags, or vote
