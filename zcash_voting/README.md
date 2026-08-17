@@ -230,13 +230,13 @@ that should stay consistent across SDKs:
 - resubmission ordering with untried helpers before already-sent helpers
 - share tracking summaries, readiness checks, retry thresholds, and polling delay
 
-Wallet SDKs should provide fresh CSPRNG bytes from their platform RNG and let the
-crate own the sampling and ordering policy.
+The low-level `share_policy` planners accept fresh CSPRNG bytes from wallet
+SDKs. The submission-wide planner draws its own operating system randomness.
 
 Existing integrations can keep calling `share_policy::plan_share_submissions`.
 Integrations that opt into largest-share-first delivery should instead call
 `share::plan_vote_share_submissions` with `submit_largest_share_now: true` and
-submit the returned indexed plans in order. Pass every recovery bundle in the
+submit the returned plans in order. Pass every recovery bundle in the
 complete logical wallet submission in one call. The API chooses one largest
 active share across that batch, uses the lowest bundle, proposal, and public
 share indexes to break equal-value ties, and returns it first with `submit_at`
