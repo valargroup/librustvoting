@@ -64,6 +64,9 @@ pub use crate::config::{
 };
 pub use crate::delegate::KeystoneSigningRequest;
 pub use crate::round::BundleLayout;
+pub use crate::share::{
+    IndexedShareSubmissionPlan, ShareSubmissionBatchPlan, ShareSubmissionScheduleOptions,
+};
 pub use crate::share_policy::ShareSubmissionPlan;
 pub use crate::types::WireEncryptedShare;
 pub use crate::vote::VanWitness;

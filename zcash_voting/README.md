@@ -225,11 +225,26 @@ that should stay consistent across SDKs:
   ending before the round's last-moment window
 - helper target counts and randomized helper ordering
 - batch share planning with independent entropy per share
+- opt-in recovery-bundle planning that submits the largest share at the current
+  time while keeping secret share values inside Rust
 - resubmission ordering with untried helpers before already-sent helpers
 - share tracking summaries, readiness checks, retry thresholds, and polling delay
 
 Wallet SDKs should provide fresh CSPRNG bytes from their platform RNG and let the
 crate own the sampling and ordering policy.
+
+Existing integrations can keep calling `share_policy::plan_share_submissions`.
+Integrations that opt into largest-share-first delivery should instead call
+`share::plan_bundle_share_submissions` with
+`submit_largest_share_immediately: true`. That API selects from secret recovery
+state, uses the lowest public share index to break equal-value ties, and returns
+the selected index without exporting its plaintext value. Only the selected
+plan is changed to the caller's current Unix time; other sampled times and
+initial helper targets remain unchanged. Callers that require it to be the
+first delivered share should submit `immediate_share_index` before dispatching
+the remaining plans. Revealing that share immediately
+intentionally makes its public index timing-linkable as the bundle's largest
+share.
 
 ## Secret boundaries
 
