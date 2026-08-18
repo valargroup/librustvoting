@@ -265,11 +265,11 @@ impl NextStep {
 pub enum RoundPlanAction {
     /// No crate-owned recovery or submitted vote artifact is present.
     Idle,
-    /// Delegation must be submitted or polled before fresh vote work can finish.
+    /// The first blocking step is delegation submission or polling.
     Delegate,
-    /// Cast-vote, vote-submission, vote-polling, or helper-share submission work remains.
+    /// The first blocking step casts, submits, or polls a vote, or submits helper shares.
     Vote,
-    /// Only blocking helper-share confirmation work remains.
+    /// The first blocking step is helper-share confirmation.
     SubmitShares,
     /// A vote artifact exists and no blocking recovery work remains.
     Done,
@@ -414,7 +414,7 @@ pub struct RoundPlan {
     pub completed_vote_display: Option<CompletedVoteDisplay>,
     /// True when a wallet should collect or restore draft choices for open proposals.
     pub needs_draft_setup: bool,
-    /// Primary work area derived from the crate-owned recovery state.
+    /// Primary work area for the first blocking recovery step.
     pub primary_action: RoundPlanAction,
     /// Delegation recovery work grouped from `next_steps` for wallet orchestration.
     pub recovered_delegation_work: Vec<DelegationRecoveryWork>,
@@ -649,37 +649,27 @@ fn push_submit_share_work(
     Ok(())
 }
 
+/// Maps the first blocking step to the wallet work area that should resume.
 fn select_primary_action(
-    steps: &[NextStep],
-    blocking_recovery: bool,
+    blocking_step: Option<&NextStep>,
     completed_for_display: bool,
 ) -> RoundPlanAction {
     if completed_for_display {
         return RoundPlanAction::Done;
     }
-    if !blocking_recovery {
-        return RoundPlanAction::Idle;
-    }
-    if steps.iter().any(|step| {
-        matches!(
-            step,
-            NextStep::Delegate { .. } | NextStep::PollDelegation { .. }
-        )
-    }) {
-        return RoundPlanAction::Delegate;
-    }
-    if steps.iter().any(|step| {
-        matches!(
-            step,
+    match blocking_step {
+        None => RoundPlanAction::Idle,
+        Some(NextStep::Delegate { .. } | NextStep::PollDelegation { .. }) => {
+            RoundPlanAction::Delegate
+        }
+        Some(
             NextStep::CastVote { .. }
-                | NextStep::SubmitVote { .. }
-                | NextStep::PollVote { .. }
-                | NextStep::SubmitShares { .. }
-        )
-    }) {
-        return RoundPlanAction::Vote;
+            | NextStep::SubmitVote { .. }
+            | NextStep::PollVote { .. }
+            | NextStep::SubmitShares { .. },
+        ) => RoundPlanAction::Vote,
+        Some(NextStep::ConfirmShare { .. }) => RoundPlanAction::SubmitShares,
     }
-    RoundPlanAction::SubmitShares
 }
 
 fn completed_vote_display(
@@ -994,7 +984,8 @@ pub fn resume_plan_with_options(
     }) {
         steps[..=position].rotate_right(1);
     }
-    let blocking_recovery = steps.iter().any(|step| {
+    let first_blocking_step = steps.iter().find(|step| {
+        let step = *step;
         if options.require_largest_share_confirmation {
             share_step_key(step).is_none_or(|key| required_largest_share_key == Some(key))
         } else {
@@ -1012,6 +1003,7 @@ pub fn resume_plan_with_options(
             }
         }
     });
+    let blocking_recovery = first_blocking_step.is_some();
 
     let delegation_statuses = delegation_statuses(db, round_id, &delegation)?;
     let hotkey_bound = delegation
@@ -1064,7 +1056,7 @@ pub fn resume_plan_with_options(
     });
     let pending_recovery = !steps.is_empty();
     let needs_draft_setup = !blocking_recovery && !all_decided && !open_proposals.is_empty();
-    let primary_action = select_primary_action(&steps, blocking_recovery, completed_for_display);
+    let primary_action = select_primary_action(first_blocking_step, completed_for_display);
     let recovered_delegation_work =
         recovered_delegation_work_from_steps(db, round_id, &delegation, &steps)?;
     let recovered_vote_work =
@@ -2288,6 +2280,36 @@ mod tests {
         assert!(confirmed_plan.next_steps.is_empty());
         assert!(!confirmed_plan.blocking_recovery);
         assert!(confirmed_plan.completed_for_display);
+    }
+
+    #[test]
+    fn largest_share_confirmation_drives_action_before_background_submission() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        confirm_vote_fixture(&db, 0, 2, 1);
+        record_submitted_share_fixture(&db, 0, 2, 1, &["https://helper.example".to_string()]);
+
+        let plan = resume_plan_with_options(&db, ROUND, &[2], require_largest_share_confirmation())
+            .unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![
+                NextStep::ConfirmShare {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                    share_index: 1,
+                },
+                NextStep::SubmitShares {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                    share_index: 0,
+                },
+            ]
+        );
+        assert!(plan.blocking_recovery);
+        assert_eq!(plan.primary_action, RoundPlanAction::SubmitShares);
     }
 
     #[test]
