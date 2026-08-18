@@ -4,6 +4,12 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- Added `share::pending_rounds` so wallets can restore unconfirmed helper-share
+  tracking with the caller context persisted for each round.
+
 ## v2.0.0-rc.5
 
 ### Fixed
