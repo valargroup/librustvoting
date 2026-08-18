@@ -249,10 +249,11 @@ Callers can separately opt into foreground confirmation with
 `session::resume_plan_with_options` and
 `require_largest_share_confirmation: true`. This keeps the same one largest
 active share across the complete logical wallet submission blocking after
-helper acceptance. The planner waits until every selected bundle and proposal
-has confirmed recovery material before choosing it, so restart recovery cannot
-promote a second bundle after the original share confirms. Its outstanding
-share step is returned first; other accepted shares remain background work.
+helper acceptance. The planner waits until every proposal is chosen or skipped
+and every selected bundle and proposal has confirmed recovery material before
+choosing it, so restart recovery cannot promote a second share after the
+original share confirms. Its outstanding share step is returned first; other
+accepted shares remain background work.
 Pair the option with immediate largest-share scheduling or the selected share
 can remain scheduled for later.
 
