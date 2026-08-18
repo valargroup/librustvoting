@@ -1330,7 +1330,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 [[package]]
 name = "imt-tree"
 version = "0.2.1"
-source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=7214397dc648ee06ddbe3429d1e40b18b59e54d3#7214397dc648ee06ddbe3429d1e40b18b59e54d3"
+source = "git+https://github.com/valargroup/vote-nullifier-pir?rev=3a89f2838e64475746805c25a2f999c8dc96adff#3a89f2838e64475746805c25a2f999c8dc96adff"
 dependencies = [
  "anyhow",
  "ff",
@@ -2974,7 +2974,7 @@ dependencies = [
 [[package]]
 name = "voting-circuits"
 version = "0.10.0"
-source = "git+https://github.com/valargroup/voting-circuits?rev=e2b8c10b76e59e7155d2b3842203af74d9891a2f#e2b8c10b76e59e7155d2b3842203af74d9891a2f"
+source = "git+https://github.com/valargroup/voting-circuits?rev=83427979fccb8ae3bf010e21691742c78d283bc8#83427979fccb8ae3bf010e21691742c78d283bc8"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -2989,7 +2989,7 @@ dependencies = [
 [[package]]
 name = "voting-crypto-deps"
 version = "0.1.0"
-source = "git+https://github.com/valargroup/voting-circuits?rev=e2b8c10b76e59e7155d2b3842203af74d9891a2f#e2b8c10b76e59e7155d2b3842203af74d9891a2f"
+source = "git+https://github.com/valargroup/voting-circuits?rev=83427979fccb8ae3bf010e21691742c78d283bc8#83427979fccb8ae3bf010e21691742c78d283bc8"
 dependencies = [
  "halo2_gadgets",
  "halo2_poseidon",
