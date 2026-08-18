@@ -72,7 +72,7 @@ zeroize = "1"
 # `Rho::from_nf_old`).
 subtle = "2.6"
 orchard = { workspace = true }
-voting-circuits = { workspace = true }
+voting-circuits = { workspace = true, features = ["upstream"] }
 nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"
