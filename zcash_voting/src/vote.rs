@@ -859,6 +859,9 @@ pub(crate) fn record_vc_position_with_conn(
 }
 
 /// Loads and parses the persisted vote recovery bundle, if present.
+///
+/// The embedded round, bundle, and proposal identity must match the requested
+/// vote row.
 pub fn recovery_bundle(
     db: &VotingDb,
     round_id: &str,
@@ -884,7 +887,11 @@ pub fn recovery_bundle(
         .map_err(|e| VotingError::Internal {
             message: format!("failed to load vote recovery bundle: {e}"),
         })?;
-    json.flatten().as_deref().map(parse_recovery).transpose()
+    let recovery = json.flatten().as_deref().map(parse_recovery).transpose()?;
+    if let Some(recovery) = &recovery {
+        validate_recovery_identity(recovery, round_id, bundle_index, proposal_id)?;
+    }
+    Ok(recovery)
 }
 
 /// Serializes a recovery bundle using the library-owned JSON format.
@@ -1210,6 +1217,37 @@ fn validate_recovery_matches_stored_vote(
     stored_choice: i64,
     stored_commitment: Option<&[u8]>,
 ) -> Result<(), VotingError> {
+    validate_recovery_identity(recovery, round_id, bundle_index, proposal_id)?;
+    let stored_choice =
+        u32::try_from(stored_choice).map_err(|_| invalid_stored_choice_error(stored_choice))?;
+    if recovery.vote_decision != stored_choice {
+        return Err(vote_recovery_identity_mismatch_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            "vote_decision",
+        ));
+    }
+    if let Some(stored_commitment) = stored_commitment {
+        let recovery_commitment = stored_vote_commitment_bytes(recovery)?;
+        if stored_commitment != recovery_commitment {
+            return Err(vote_recovery_identity_mismatch_error(
+                round_id,
+                bundle_index,
+                proposal_id,
+                "commitment",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovery_identity(
+    recovery: &VoteRecoveryBundle,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<(), VotingError> {
     if recovery.vote_round_id != round_id {
         return Err(vote_recovery_identity_mismatch_error(
             round_id,
@@ -1233,27 +1271,6 @@ fn validate_recovery_matches_stored_vote(
             proposal_id,
             "proposal_id",
         ));
-    }
-    let stored_choice =
-        u32::try_from(stored_choice).map_err(|_| invalid_stored_choice_error(stored_choice))?;
-    if recovery.vote_decision != stored_choice {
-        return Err(vote_recovery_identity_mismatch_error(
-            round_id,
-            bundle_index,
-            proposal_id,
-            "vote_decision",
-        ));
-    }
-    if let Some(stored_commitment) = stored_commitment {
-        let recovery_commitment = stored_vote_commitment_bytes(recovery)?;
-        if stored_commitment != recovery_commitment {
-            return Err(vote_recovery_identity_mismatch_error(
-                round_id,
-                bundle_index,
-                proposal_id,
-                "commitment",
-            ));
-        }
     }
     Ok(())
 }
@@ -2526,6 +2543,42 @@ mod tests {
         let recovery = recovery_bundle(&db, ROUND_ID, 0, 99).unwrap();
 
         assert!(recovery.is_none());
+    }
+
+    #[test]
+    fn recovery_bundle_rejects_embedded_identity_mismatches() {
+        let db = db_with_vote();
+        let assert_mismatch = |recovery: &VoteRecoveryBundle, field: &str| {
+            store_recovery_json_for_vote(
+                &db,
+                ROUND_ID,
+                0,
+                1,
+                2,
+                Some(&[0xCA; 32]),
+                &serialize_recovery(recovery).unwrap(),
+            )
+            .unwrap();
+
+            let err = recovery_bundle(&db, ROUND_ID, 0, 1)
+                .expect_err("mismatched recovery identity must be rejected");
+            assert!(
+                err.to_string().contains(&format!("{field} mismatch")),
+                "{err}"
+            );
+        };
+
+        let mut wrong_round = recovery_bundle_fixture();
+        wrong_round.vote_round_id = "02".repeat(32);
+        assert_mismatch(&wrong_round, "round_id");
+
+        let mut wrong_bundle = recovery_bundle_fixture();
+        wrong_bundle.bundle_index = 1;
+        assert_mismatch(&wrong_bundle, "bundle_index");
+
+        let mut wrong_proposal = recovery_bundle_fixture();
+        wrong_proposal.proposal_id = 2;
+        assert_mismatch(&wrong_proposal, "proposal_id");
     }
 
     #[test]
