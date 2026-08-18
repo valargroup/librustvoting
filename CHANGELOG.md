@@ -11,6 +11,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   tracking with the caller context persisted for each round.
 
 ### Changed
+- Let the vote commitment tree and client select either the default upstream
+  voting crypto crates or the mutually exclusive Zakura backend.
 - Cap each randomized initial helper-share delay at 100 hours while preserving
   the round's last-moment safety window and retry timing from the sampled
   `submit_at`.
