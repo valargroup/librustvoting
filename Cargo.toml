@@ -21,3 +21,15 @@ zcash_client_sqlite = { version = "0.22.0-rc.7", default-features = false, featu
 zcash_keys = { version = "0.16.1", features = ["orchard"] }
 zcash_primitives = { version = "0.30.0" }
 zcash_protocol = { version = "0.10.4" }
+
+# Keep the upstream-named wallet dependency graph on one reviewed source
+# revision. wallet-libraries mirrors compatible Zcash releases and carries only
+# the minimum voting-specific delta when one is required.
+[patch.crates-io]
+orchard = { git = "https://github.com/valargroup/wallet-libraries.git", rev = "698bb3876746f35ea60713a00571c3d7a61a03bf" }
+pczt = { git = "https://github.com/valargroup/wallet-libraries.git", rev = "698bb3876746f35ea60713a00571c3d7a61a03bf" }
+zcash_client_backend = { git = "https://github.com/valargroup/wallet-libraries.git", rev = "698bb3876746f35ea60713a00571c3d7a61a03bf" }
+zcash_client_sqlite = { git = "https://github.com/valargroup/wallet-libraries.git", rev = "698bb3876746f35ea60713a00571c3d7a61a03bf" }
+zcash_keys = { git = "https://github.com/valargroup/wallet-libraries.git", rev = "698bb3876746f35ea60713a00571c3d7a61a03bf" }
+zcash_primitives = { git = "https://github.com/valargroup/wallet-libraries.git", rev = "698bb3876746f35ea60713a00571c3d7a61a03bf" }
+zcash_protocol = { git = "https://github.com/valargroup/wallet-libraries.git", rev = "698bb3876746f35ea60713a00571c3d7a61a03bf" }

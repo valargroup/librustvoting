@@ -11,6 +11,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   tracking with the caller context persisted for each round.
 
 ### Changed
+- Pinned the upstream-named librustzcash and Orchard dependency graph to the
+  reviewed `valargroup/wallet-libraries` source revision.
 - Cap each randomized initial helper-share delay at 48 hours while preserving
   the round's last-moment safety window and retry timing from the sampled
   `submit_at`.
