@@ -790,6 +790,39 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_notes_applies_25k_whale_threshold_to_zip318_shape() {
+        const ZATOSHI_PER_ZEC: u64 = 100_000_000;
+        const WHALE_PROTECTION_THRESHOLD: u64 = 25_000 * ZATOSHI_PER_ZEC;
+
+        // ZIP-318 can produce this 10k + 10k + 5k note shape. Its exact
+        // 25k total stays together, while another voting unit starts a bundle.
+        let exact_threshold = vec![
+            make_note(10_000 * ZATOSHI_PER_ZEC, 0),
+            make_note(10_000 * ZATOSHI_PER_ZEC, 1),
+            make_note(5_000 * ZATOSHI_PER_ZEC, 2),
+        ];
+        let policy =
+            BundlePolicy::default().with_bundle_addition_threshold(WHALE_PROTECTION_THRESHOLD);
+
+        let exact_result = chunk_notes_with_policy(&exact_threshold, policy);
+        assert_eq!(exact_result.bundles.len(), 1);
+        assert_eq!(exact_result.bundles[0].len(), 3);
+
+        let mut crossing_threshold = exact_threshold;
+        crossing_threshold.push(make_note(BALLOT_DIVISOR, 3));
+        let crossing_result = chunk_notes_with_policy(&crossing_threshold, policy);
+        let bundle_positions: Vec<Vec<u64>> = crossing_result
+            .bundles
+            .iter()
+            .map(|bundle| bundle.iter().map(|note| note.position).collect())
+            .collect();
+
+        assert_eq!(crossing_result.bundles.len(), 2);
+        assert!(bundle_positions.contains(&vec![0, 1, 2]));
+        assert!(bundle_positions.contains(&vec![3]));
+    }
+
+    #[test]
     fn test_chunk_notes_does_not_split_small_notes_when_bundle_stays_under_threshold() {
         let threshold = 500 * BALLOT_DIVISOR;
         let notes: Vec<NoteInfo> = (0..(BUNDLE_NOTE_SLOTS * 2))
