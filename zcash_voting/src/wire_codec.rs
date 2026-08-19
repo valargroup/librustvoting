@@ -315,16 +315,14 @@ impl From<NoteRef> for VotingNoteRefView {
 impl VotingNoteSelectionResultView {
     /// Builds a selection view using the policy authoritative for `round_id`.
     ///
-    /// If the round already has a persisted bundle policy, that policy wins over
-    /// `requested_policy`. For rounds planned before policies were persisted, or
-    /// rounds that have not been planned yet, the requested policy is used.
+    /// Wallet setup persists the effective policy before this view is built.
     pub fn from_selected_for_round(
         selected: SelectedNotes,
         voting_db: &crate::round::VotingDb,
         round_id: &str,
-        requested_policy: BundlePolicy,
     ) -> Result<Self, VotingError> {
-        let effective_policy = voting_db.effective_bundle_policy(round_id, requested_policy)?;
+        let effective_policy =
+            voting_db.effective_bundle_policy(round_id, BundlePolicy::default())?;
         Self::from_selected_with_policy(selected, effective_policy)
     }
 
@@ -1396,12 +1394,15 @@ mod tests {
             crate::note_bundling::voting_power_with_policy(&selected, requested_policy),
             0
         );
+        assert_eq!(
+            crate::voting_power_for_round(&selected, &voting_db, &params.vote_round_id,).unwrap(),
+            2 * divisor
+        );
 
         let resumed_round_view = VotingNoteSelectionResultView::from_selected_for_round(
             selected,
             &voting_db,
             &params.vote_round_id,
-            requested_policy,
         )
         .unwrap();
         assert_eq!(resumed_round_view.eligible_weight_zatoshi, 2 * divisor);

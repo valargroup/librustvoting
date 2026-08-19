@@ -547,20 +547,17 @@ fn ensure_delegation_bundle_selection(
     bundle_index: u32,
     requested_policy: BundlePolicy,
 ) -> Result<(BundleLayout, Vec<NoteInfo>), VotingError> {
-    // Selection must use the same effective policy as validation. A persisted
-    // round policy is authoritative when callers resume after their defaults
-    // have changed.
-    let policy = voting_db.effective_bundle_policy(round_id, requested_policy)?;
     let layout = voting_db.ensure_bundles_with_skipped_suffix_with_policy(
         round_id,
         round_note_infos,
-        policy,
+        requested_policy,
     )?;
-    let bundle_note_infos = crate::round::bundle_notes_for_index_with_policy(
+    let bundle_note_infos = crate::round::bundle_notes_for_index_for_round(
         round_note_infos,
         &layout,
         bundle_index,
-        policy,
+        voting_db,
+        round_id,
     )?;
     Ok((layout, bundle_note_infos))
 }

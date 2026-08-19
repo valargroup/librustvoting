@@ -74,23 +74,24 @@ pub fn delegation_round_name(params: &RoundParams, round_name: &str) -> String {
     }
 }
 
-/// Returns the note rows for one bundle index after [`VotingDb::ensure_bundles`].
+/// Returns the note rows for one bundle index using the policy authoritative for
+/// `round_id`.
+///
+/// Wallet setup persists the effective policy before this helper is used.
 ///
 /// # Errors
 ///
-/// Returns [`VotingError::InvalidInput`] when no bundles exist, `bundle_index`
-/// is out of range, or note bundling fails.
-pub fn bundle_notes_for_index(
+/// Returns an error when the round policy cannot be loaded, no bundles exist,
+/// `bundle_index` is out of range, or note bundling fails.
+pub fn bundle_notes_for_index_for_round(
     round_note_infos: &[NoteInfo],
     bundle_setup: &BundleLayout,
     bundle_index: u32,
+    voting_db: &VotingDb,
+    round_id: &str,
 ) -> Result<Vec<NoteInfo>, VotingError> {
-    bundle_notes_for_index_with_policy(
-        round_note_infos,
-        bundle_setup,
-        bundle_index,
-        BundlePolicy::default(),
-    )
+    let policy = voting_db.effective_bundle_policy(round_id, BundlePolicy::default())?;
+    bundle_notes_for_index_with_policy(round_note_infos, bundle_setup, bundle_index, policy)
 }
 
 /// Returns the note rows for one bundle index under an explicit bundle policy.
@@ -123,16 +124,28 @@ pub fn bundle_notes_for_index_with_policy(
         })
 }
 
-/// Returns the canonical eligible note bundles for a round note set.
+/// Returns the canonical eligible note bundles under the current default policy.
 ///
-/// This is the read-only counterpart to [`VotingDb::ensure_bundles`]. Wallets
-/// that need to operate on one bundle after setup can use this instead of
-/// depending on the lower-level chunking internals.
+/// This helper does not consult persisted round state. Use
+/// [`note_bundles_for_round`] when interpreting an existing round.
 ///
 /// Duplicate nullifiers are collapsed before chunking so each spendable note can
 /// appear in at most one bundle.
 pub fn note_bundles(notes: &[NoteInfo]) -> Result<Vec<Vec<NoteInfo>>, VotingError> {
     note_bundles_with_policy(notes, BundlePolicy::default())
+}
+
+/// Returns the eligible note bundles using the policy authoritative for
+/// `round_id`.
+///
+/// Wallet setup persists the effective policy before this helper is used.
+pub fn note_bundles_for_round(
+    notes: &[NoteInfo],
+    voting_db: &VotingDb,
+    round_id: &str,
+) -> Result<Vec<Vec<NoteInfo>>, VotingError> {
+    let policy = voting_db.effective_bundle_policy(round_id, BundlePolicy::default())?;
+    note_bundles_with_policy(notes, policy)
 }
 
 /// Returns the eligible note bundles for a round note set under an explicit policy.
@@ -437,6 +450,9 @@ impl VotingDb {
                 bundle_notes,
             )?;
         }
+        // Successful validation proves this policy reproduces legacy rows.
+        // Persist it so later round-aware reads never need caller policy input.
+        queries::set_round_bundle_policy(&conn, round_id, &wallet_id, policy)?;
 
         Ok(BundleLayout {
             bundle_count: expected_count,
@@ -501,6 +517,9 @@ impl VotingDb {
 
         let stored_bundles = &bundles[..stored_count as usize];
         validate_persisted_bundle_notes(self, round_id, stored_bundles)?;
+        // Backfill legacy rounds after their persisted prefix validates.
+        let conn = self.conn();
+        queries::set_round_bundle_policy(&conn, round_id, &self.wallet_id(), policy)?;
         Ok(BundleLayout {
             bundle_count: stored_count,
             eligible_weight: quantized_bundle_set_weight(stored_bundles)?,
@@ -663,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_bundles_uses_custom_real_note_capacity() {
+    fn round_aware_helpers_reuse_custom_real_note_capacity() {
         let db = test_db("wallet-policy");
         let notes = vec![
             note(0, crate::governance::BALLOT_DIVISOR),
@@ -675,7 +694,7 @@ mod tests {
         let layout = db
             .ensure_bundles_with_policy(ROUND_ID, &notes, policy)
             .unwrap();
-        let bundles = note_bundles_with_policy(&notes, policy).unwrap();
+        let bundles = note_bundles_for_round(&notes, &db, ROUND_ID).unwrap();
 
         assert_eq!(layout.bundle_count, 3);
         assert_eq!(
@@ -684,7 +703,7 @@ mod tests {
         );
         assert!(bundles.iter().all(|bundle| bundle.len() == 1));
         assert_eq!(
-            bundle_notes_for_index_with_policy(&notes, &layout, 2, policy)
+            bundle_notes_for_index_for_round(&notes, &layout, 2, &db, ROUND_ID,)
                 .unwrap()
                 .len(),
             1
@@ -708,7 +727,7 @@ mod tests {
         let notes = vec![base_note.clone(); crate::governance::BUNDLE_NOTE_SLOTS];
 
         let layout = db.ensure_bundles(ROUND_ID, &notes).unwrap();
-        let bundle = bundle_notes_for_index(&notes, &layout, 0).unwrap();
+        let bundle = bundle_notes_for_index_for_round(&notes, &layout, 0, &db, ROUND_ID).unwrap();
 
         assert_eq!(layout.bundle_count, 1);
         assert_eq!(layout.eligible_weight, crate::governance::BALLOT_DIVISOR);
@@ -789,6 +808,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(revalidated.bundle_count, 6);
+        assert_eq!(
+            queries::get_round_bundle_policy(&db.conn(), ROUND_ID, &db.wallet_id()).unwrap(),
+            Some(policy.with_max_privacy_bundles(None))
+        );
+        assert_eq!(
+            note_bundles_for_round(&notes, &db, ROUND_ID).unwrap().len(),
+            6
+        );
     }
 
     #[test]
@@ -826,9 +853,24 @@ mod tests {
         let resumed = db
             .ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::default())
             .unwrap();
+        let resumed_bundles = note_bundles_for_round(&notes, &db, ROUND_ID).unwrap();
 
         assert_eq!(resumed.bundle_count, 5);
         assert!(resumed.privacy_trim.is_empty());
+        assert_eq!(resumed_bundles.len(), 5);
+        for (bundle_index, expected_notes) in resumed_bundles.iter().enumerate() {
+            assert_eq!(
+                bundle_notes_for_index_for_round(
+                    &notes,
+                    &resumed,
+                    bundle_index as u32,
+                    &db,
+                    ROUND_ID,
+                )
+                .unwrap(),
+                expected_notes.clone()
+            );
+        }
     }
 
     #[test]

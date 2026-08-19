@@ -290,9 +290,25 @@ impl MinimumVotingEligibility {
     }
 }
 
-/// Returns quantized zatoshi voting power for the selected note set.
+/// Returns quantized zatoshi voting power under the current default policy.
+///
+/// This helper does not consult persisted round state. Use
+/// [`voting_power_for_round`] when reporting power for an existing round.
 pub fn voting_power(notes: &SelectedNotes) -> u64 {
     voting_power_with_policy(notes, BundlePolicy::default())
+}
+
+/// Returns quantized zatoshi voting power using the policy authoritative for
+/// `round_id`.
+///
+/// Wallet setup persists the effective policy before this helper is used.
+pub fn voting_power_for_round(
+    notes: &SelectedNotes,
+    voting_db: &crate::round::VotingDb,
+    round_id: &str,
+) -> Result<u64, VotingError> {
+    let policy = voting_db.effective_bundle_policy(round_id, BundlePolicy::default())?;
+    Ok(voting_power_with_policy(notes, policy))
 }
 
 /// Returns quantized zatoshi voting power under an explicit bundle policy.
