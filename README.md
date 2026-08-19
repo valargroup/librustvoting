@@ -125,7 +125,7 @@ The workspace uses the published `voting-circuits 0.10.0` release.
 
 ## Dependency Strategy
 
-The root manifest selects one upstream Ironwood dependency stack for every
+The default `upstream` feature keeps one Ironwood dependency stack for every
 workspace member:
 
 - **`orchard 0.15`** from [zcash/orchard](https://github.com/zcash/orchard),
@@ -137,6 +137,11 @@ workspace member:
 - **`voting-circuits 0.10.0`** from
   [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
+
+Build with `--no-default-features --features zakura` to select the Zakura
+proving stack (`voting-crypto-deps` / VCT) and the Zakura wallet-libraries
+forks (`zakura-wallet-lib`). The `upstream` and `zakura` features are mutually
+exclusive.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.

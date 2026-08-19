@@ -66,6 +66,42 @@ jobs:
             exit 1
           fi
 
+  zakura-wallet:
+    name: Zakura wallet backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Test Zakura wallet stack
+        run: |
+          cargo test -p zcash_voting -p zcash-voting-wallet-example \
+            --all-targets --no-default-features --features zakura --locked
+      - name: Check wallet backend contracts
+        run: |
+          if cargo tree -p zcash_voting -e all --prefix none --locked \
+            | grep -Eq '^zakura-(pczt|client-backend|client-sqlite|orchard|keys|primitives) v'; then
+            echo "Zakura wallet crates entered the default upstream graph"
+            exit 1
+          fi
+
+          if cargo tree -p zcash_voting -e all --prefix none \
+            --no-default-features --features zakura --locked \
+            | grep -Eq '^(pczt|zcash_client_backend|zcash_client_sqlite|orchard|zcash_keys|zcash_primitives) v'; then
+            echo "Upstream wallet crates entered the Zakura graph"
+            exit 1
+          fi
+
+          if cargo check -p zcash_voting --no-default-features --locked; then
+            echo "A wallet backend must be selected"
+            exit 1
+          fi
+
+          if cargo check -p zcash_voting --all-features --locked; then
+            echo "The upstream and Zakura backends must remain mutually exclusive"
+            exit 1
+          fi
+
   msrv:
     name: Rust 1.88
     runs-on: ubuntu-latest
