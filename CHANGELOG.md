@@ -27,6 +27,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   its policy is authoritative and later planning passes re-derive with it, so an
   SDK upgrade that changes the defaults cannot invalidate bundle rows that were
   already signed or submitted.
+- Upgraded launched voting databases in place instead of recreating them.
+  Schema changes at or above the launch version now apply ordered `ALTER`
+  statements and preserve persisted round state; only pre-launch databases are
+  still reset. A wallet that upgrades between submitting a delegation and
+  casting its vote cannot re-create the randomly sampled `van_comm_rand` that
+  ZKP #2 needs, and its governance nullifiers are already spent on chain, so a
+  reset would have cost that round's voting weight with no way to recover it.
 - Added `share::pending_rounds` so wallets can restore unconfirmed helper-share
   tracking with the caller context persisted for each round.
 
