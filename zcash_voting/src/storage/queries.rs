@@ -129,7 +129,8 @@ mod bundle_policy_schema_tests {
 
     #[test]
     fn bundle_policy_reads_the_unversioned_legacy_shape() {
-        let legacy_json = serde_json::to_string(&custom_policy()).unwrap();
+        let legacy_json =
+            serde_json::to_string(&PersistedBundlePolicyV1::from(custom_policy())).unwrap();
 
         assert_eq!(decode_bundle_policy(&legacy_json).unwrap(), custom_policy());
     }

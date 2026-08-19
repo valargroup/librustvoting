@@ -58,9 +58,33 @@ const BPS_DENOMINATOR: u128 = 10_000;
 pub struct BundlePolicy {
     max_real_notes_per_bundle: usize,
     bundle_addition_threshold_zatoshi: Option<u64>,
-    max_privacy_bundles: Option<usize>,
-    privacy_drop_bps: u32,
-    max_privacy_drop_zatoshi: Option<u64>,
+    /// Missing from policies serialized before privacy trimming shipped.
+    ///
+    /// Treating absence as disabled preserves the behavior of those policies
+    /// instead of silently applying the current trim defaults on deserialization.
+    #[serde(default)]
+    privacy_trim: Option<PrivacyTrimPolicy>,
+}
+
+/// Configuration for dropping a low-value bundle tail.
+///
+/// This is optional on [`BundlePolicy`]: `None` disables privacy trimming,
+/// while `Some` keeps the target and both budget limits together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivacyTrimPolicy {
+    max_bundles: usize,
+    drop_bps: u32,
+    max_drop_zatoshi: Option<u64>,
+}
+
+impl Default for PrivacyTrimPolicy {
+    fn default() -> Self {
+        Self {
+            max_bundles: DEFAULT_MAX_PRIVACY_BUNDLES,
+            drop_bps: DEFAULT_PRIVACY_DROP_BPS,
+            max_drop_zatoshi: Some(DEFAULT_MAX_PRIVACY_DROP_ZATOSHI),
+        }
+    }
 }
 
 impl BundlePolicy {
@@ -134,39 +158,55 @@ impl BundlePolicy {
     /// still re-derive. A target of zero is treated as one because privacy
     /// trimming must preserve at least one eligible bundle.
     pub fn with_max_privacy_bundles(mut self, max_privacy_bundles: Option<usize>) -> Self {
-        self.max_privacy_bundles = max_privacy_bundles;
+        self.privacy_trim = max_privacy_bundles.map(|max_bundles| {
+            let mut privacy_trim = self.privacy_trim.unwrap_or_default();
+            privacy_trim.max_bundles = max_bundles;
+            privacy_trim
+        });
         self
     }
 
     /// Returns a copy of this policy with an explicit privacy drop budget, in
     /// basis points of total selected note value.
+    ///
+    /// This has no effect while privacy trimming is disabled.
     pub fn with_privacy_drop_bps(mut self, privacy_drop_bps: u32) -> Self {
-        self.privacy_drop_bps = privacy_drop_bps;
+        if let Some(privacy_trim) = &mut self.privacy_trim {
+            privacy_trim.drop_bps = privacy_drop_bps;
+        }
         self
     }
 
     /// Returns a copy of this policy with an absolute clamp on the privacy drop.
     ///
     /// The effective budget becomes `min(bps_budget, clamp)`. Passing `None`
-    /// removes the default 1,000 ZEC ceiling.
+    /// removes the default 1,000 ZEC ceiling. This has no effect while privacy
+    /// trimming is disabled.
     pub fn with_max_privacy_drop_zatoshi(mut self, max_privacy_drop_zatoshi: Option<u64>) -> Self {
-        self.max_privacy_drop_zatoshi = max_privacy_drop_zatoshi;
+        if let Some(privacy_trim) = &mut self.privacy_trim {
+            privacy_trim.max_drop_zatoshi = max_privacy_drop_zatoshi;
+        }
         self
     }
 
     /// Returns the bundle count the privacy trim aims for, if it is enabled.
     pub fn max_privacy_bundles(self) -> Option<usize> {
-        self.max_privacy_bundles
+        self.privacy_trim
+            .map(|privacy_trim| privacy_trim.max_bundles)
     }
 
     /// Returns the privacy drop budget in basis points of selected note value.
     pub fn privacy_drop_bps(self) -> u32 {
-        self.privacy_drop_bps
+        self.privacy_trim
+            .map(|privacy_trim| privacy_trim.drop_bps)
+            .unwrap_or(DEFAULT_PRIVACY_DROP_BPS)
     }
 
     /// Returns the optional absolute clamp on the privacy drop budget.
     pub fn max_privacy_drop_zatoshi(self) -> Option<u64> {
-        self.max_privacy_drop_zatoshi
+        self.privacy_trim
+            .map(|privacy_trim| privacy_trim.max_drop_zatoshi)
+            .unwrap_or(Some(DEFAULT_MAX_PRIVACY_DROP_ZATOSHI))
     }
 
     /// Returns the privacy drop budget in zatoshi for a given total note value.
@@ -175,8 +215,11 @@ impl BundlePolicy {
     /// by [`BundlePolicy::max_privacy_drop_zatoshi`] when one is set. Integer
     /// math throughout, so the returned budget never exceeds the intended share.
     fn privacy_drop_budget(self, total_value: u128) -> u128 {
-        let budget = total_value * u128::from(self.privacy_drop_bps) / BPS_DENOMINATOR;
-        match self.max_privacy_drop_zatoshi {
+        let Some(privacy_trim) = self.privacy_trim else {
+            return 0;
+        };
+        let budget = total_value * u128::from(privacy_trim.drop_bps) / BPS_DENOMINATOR;
+        match privacy_trim.max_drop_zatoshi {
             Some(clamp) => budget.min(u128::from(clamp)),
             None => budget,
         }
@@ -188,9 +231,7 @@ impl Default for BundlePolicy {
         Self {
             max_real_notes_per_bundle: BUNDLE_NOTE_SLOTS,
             bundle_addition_threshold_zatoshi: None,
-            max_privacy_bundles: Some(DEFAULT_MAX_PRIVACY_BUNDLES),
-            privacy_drop_bps: DEFAULT_PRIVACY_DROP_BPS,
-            max_privacy_drop_zatoshi: Some(DEFAULT_MAX_PRIVACY_DROP_ZATOSHI),
+            privacy_trim: Some(PrivacyTrimPolicy::default()),
         }
     }
 }
@@ -1021,6 +1062,39 @@ mod tests {
         assert!(BundlePolicy::new(BUNDLE_NOTE_SLOTS + 1).is_err());
         assert!(BundlePolicy::from_optional_max_real_notes_per_bundle(None).is_ok());
         assert!(BundlePolicy::from_optional_max_real_notes_per_bundle(Some(999)).is_err());
+    }
+
+    #[test]
+    fn bundle_policy_decodes_pre_privacy_trim_json_with_trimming_disabled() {
+        let legacy = serde_json::json!({
+            "max_real_notes_per_bundle": 3,
+            "bundle_addition_threshold_zatoshi": 42
+        });
+
+        let policy: BundlePolicy = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(policy.max_real_notes_per_bundle(), 3);
+        assert_eq!(policy.bundle_addition_threshold(), Some(42));
+        assert_eq!(policy.max_privacy_bundles(), None);
+    }
+
+    #[test]
+    fn bundle_policy_json_round_trips_nested_privacy_trim_policy() {
+        let policy = BundlePolicy::new(2)
+            .unwrap()
+            .with_max_privacy_bundles(Some(3))
+            .with_privacy_drop_bps(75)
+            .with_max_privacy_drop_zatoshi(Some(99));
+
+        let json = serde_json::to_value(policy).unwrap();
+
+        assert_eq!(json["privacy_trim"]["max_bundles"], 3);
+        assert_eq!(json["privacy_trim"]["drop_bps"], 75);
+        assert_eq!(json["privacy_trim"]["max_drop_zatoshi"], 99);
+        assert_eq!(
+            serde_json::from_value::<BundlePolicy>(json).unwrap(),
+            policy
+        );
     }
 
     const ZEC: u64 = 100_000_000;
