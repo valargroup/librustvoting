@@ -6,7 +6,7 @@ use rusqlite::{named_params, Connection, OptionalExtension, Transaction, Transac
 use serde::{Deserialize, Serialize};
 use voting_circuits::delegation::ImtProofData;
 
-use crate::note_bundling::BundlePolicy;
+use crate::note_bundling::{BundlePolicy, MAX_PRIVACY_DROP_BPS};
 use crate::storage::{KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord};
 use crate::types::{
     Network, NoteInfo, ShareDelegationRecord, VotingError, VotingRoundParams, WitnessData,
@@ -157,7 +157,7 @@ mod bundle_policy_schema_tests {
     #[test]
     fn bundle_policy_rejects_privacy_drop_bps_above_max() {
         let mut persisted = PersistedBundlePolicyV1::from(custom_policy());
-        persisted.privacy_drop_bps = note_bundling::MAX_PRIVACY_DROP_BPS + 1;
+        persisted.privacy_drop_bps = MAX_PRIVACY_DROP_BPS + 1;
 
         let json = serde_json::json!({
             "version": BUNDLE_POLICY_SCHEMA_VERSION,
