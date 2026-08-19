@@ -7,6 +7,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Added
+- Added durable delegation-submission pacing so wallets can serialize note
+  bundles with randomized 45–75 second gaps, restart-safe recovery, and
+  deadline-aware delay compression.
 - Added `share::pending_rounds` so wallets can restore unconfirmed helper-share
   tracking with the caller context persisted for each round.
 

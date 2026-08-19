@@ -2417,15 +2417,43 @@ pub fn store_delegation_tx_hash(
     bundle_index: u32,
     tx_hash: &str,
 ) -> Result<(), VotingError> {
+    let submitted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    store_delegation_submission_at(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        tx_hash,
+        submitted_at,
+    )
+}
+
+pub fn store_delegation_submission_at(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    tx_hash: &str,
+    submitted_at: u64,
+) -> Result<(), VotingError> {
+    let submitted_at = i64::try_from(submitted_at).map_err(|_| VotingError::InvalidInput {
+        message: "delegation submitted_at exceeds SQLite INTEGER range".to_string(),
+    })?;
     let rows = conn
         .execute(
-            "UPDATE bundles SET delegation_tx_hash = :tx_hash
+            "UPDATE bundles
+             SET delegation_tx_hash = :tx_hash,
+                 delegation_submitted_at = COALESCE(delegation_submitted_at, :submitted_at)
              WHERE round_id = :round_id
                AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index
                AND (delegation_tx_hash IS NULL OR delegation_tx_hash = :tx_hash)",
             named_params! {
                 ":tx_hash": tx_hash,
+                ":submitted_at": submitted_at,
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
@@ -2502,6 +2530,37 @@ pub fn get_delegation_tx_hash(
     )
     .map_err(|e| VotingError::Internal {
         message: format!("failed to get delegation tx hash: {}", e),
+    })
+}
+
+pub fn latest_delegation_submission(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Option<(u32, String, u64)>, VotingError> {
+    conn.query_row(
+        "SELECT bundle_index, delegation_tx_hash, delegation_submitted_at
+         FROM bundles
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND delegation_tx_hash IS NOT NULL
+           AND delegation_submitted_at IS NOT NULL
+         ORDER BY delegation_submitted_at DESC, bundle_index DESC
+         LIMIT 1",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+        },
+        |row| {
+            let bundle_index = row.get::<_, i64>(0)?;
+            let tx_hash = row.get::<_, String>(1)?;
+            let submitted_at = row.get::<_, i64>(2)?;
+            Ok((bundle_index as u32, tx_hash, submitted_at as u64))
+        },
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to load latest delegation submission: {e}"),
     })
 }
 

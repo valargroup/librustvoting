@@ -2,7 +2,8 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 13;
+const CURRENT_VERSION: u32 = 14;
+const LAST_RESET_VERSION: u32 = 13;
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
@@ -31,7 +32,22 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
         });
     }
 
-    if version < CURRENT_VERSION {
+    if version == LAST_RESET_VERSION {
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("failed to start database migration transaction: {e}"),
+        })?;
+        tx.execute_batch("ALTER TABLE bundles ADD COLUMN delegation_submitted_at INTEGER;")
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to add delegation submission timestamp: {e}"),
+            })?;
+        tx.pragma_update(None, "user_version", CURRENT_VERSION)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to update database version: {e}"),
+            })?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("failed to commit database migration: {e}"),
+        })?;
+    } else if version < LAST_RESET_VERSION {
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("failed to start database migration transaction: {}", e),
         })?;
@@ -63,6 +79,11 @@ mod tests {
 
     fn pre_v8_schema() -> String {
         include_str!("migrations/001_init.sql").replace("    note_identity_hashes_blob BLOB,\n", "")
+    }
+
+    fn v13_schema() -> String {
+        include_str!("migrations/001_init.sql")
+            .replace("    delegation_submitted_at INTEGER,\n", "")
     }
 
     fn test_params() -> VotingRoundParams {
@@ -142,6 +163,42 @@ mod tests {
         let columns = table_columns(&conn, "bundles");
         assert!(columns.contains(&"note_identity_hashes_blob".to_string()));
         assert!(columns.contains(&"tx1_effects".to_string()));
+        assert!(columns.contains(&"delegation_submitted_at".to_string()));
+    }
+
+    #[test]
+    fn test_migrate_from_v13_preserves_existing_round_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v13_schema()).unwrap();
+        queries::insert_round(
+            &conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
+        conn.execute(
+            "UPDATE bundles SET delegation_tx_hash = 'accepted'
+             WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 0",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 13).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert!(table_columns(&conn, "bundles").contains(&"delegation_submitted_at".to_string()));
+        let stored_hash: String = conn
+            .query_row(
+                "SELECT delegation_tx_hash FROM bundles
+                 WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_hash, "accepted");
     }
 
     #[test]
@@ -183,6 +240,8 @@ mod tests {
 
         let round_columns = table_columns(&conn, "rounds");
         assert!(round_columns.contains(&"network".to_string()));
+        let bundle_columns = table_columns(&conn, "bundles");
+        assert!(bundle_columns.contains(&"delegation_submitted_at".to_string()));
     }
 
     /// Verify that the bundles table columns exist after migration and can round-trip BLOB data.

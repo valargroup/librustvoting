@@ -1329,6 +1329,15 @@ impl VotingDb {
         queries::get_delegation_tx_hash(&conn, round_id, &wallet_id, bundle_index)
     }
 
+    pub(crate) fn latest_delegation_submission(
+        &self,
+        round_id: &str,
+    ) -> Result<Option<(u32, String, u64)>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::latest_delegation_submission(&conn, round_id, &wallet_id)
+    }
+
     pub fn get_vote_tx_hash(
         &self,
         round_id: &str,
@@ -1366,6 +1375,20 @@ impl VotingDb {
         bundle_index: u32,
         tx_hash: &str,
     ) -> Result<(), VotingError> {
+        let submitted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.mark_delegation_submitted_at(round_id, bundle_index, tx_hash, submitted_at)
+    }
+
+    pub(crate) fn mark_delegation_submitted_at(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        tx_hash: &str,
+        submitted_at: u64,
+    ) -> Result<(), VotingError> {
         let wallet_id = self.wallet_id();
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
@@ -1373,7 +1396,14 @@ impl VotingDb {
         })?;
         let stored = queries::get_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index)?;
         check_text_conflict(stored.as_deref(), tx_hash, "delegation tx_hash")?;
-        queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
+        queries::store_delegation_submission_at(
+            &tx,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            tx_hash,
+            submitted_at,
+        )?;
         tx.commit().map_err(|e| VotingError::Internal {
             message: format!("commit delegation submitted transaction failed: {e}"),
         })

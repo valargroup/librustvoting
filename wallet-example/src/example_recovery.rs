@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use zcash_voting::prelude::{
-    resume_plan, round_snapshot, CommittedVote, NextStep, RoundPlan, RoundRecoverySnapshot,
-    VotingDb,
+    delegation_submission_eligibility, resume_plan, round_snapshot, CommittedVote,
+    DelegationSubmissionEligibility, NextStep, RoundPlan, RoundRecoverySnapshot, VotingDb,
 };
 
 /// One round-level recovery payload fetched in a single caller entrypoint.
@@ -37,9 +37,11 @@ pub fn snapshot_with_resume_plan(
 
 /// Loads round recovery data and planner steps in one wallet-facing call.
 ///
-/// Wallet code can persist this result and drive retries by iterating
-/// `context.plan.next_steps`. For `submit_vote` / `submit_shares`, recover the
-/// committed vote payload once and submit network requests from that payload.
+/// Wallet code can persist this result and drive retries from
+/// `context.plan.next_steps`. Delegation steps must go through
+/// [`next_paced_delegation`] instead of being submitted concurrently. For
+/// `submit_vote` / `submit_shares`, recover the committed vote payload once and
+/// submit network requests from that payload.
 pub fn load_round_recovery_context(
     voting_db: &VotingDb,
     round_id: &str,
@@ -47,6 +49,38 @@ pub fn load_round_recovery_context(
 ) -> Result<RoundRecoveryContext> {
     let (snapshot, plan) = snapshot_with_resume_plan(voting_db, round_id, proposal_ids)?;
     Ok(RoundRecoveryContext { snapshot, plan })
+}
+
+/// Returns the one delegation bundle that a serialized wallet queue may submit.
+///
+/// After the vote-chain node accepts a transaction, call
+/// `delegate::record_submission`, discard this plan, and build a fresh one.
+/// A failed submission leaves the same bundle eligible for the wallet's normal
+/// bounded retry. Polling submitted transactions can continue while this
+/// result is `WaitUntil`.
+pub fn next_paced_delegation(
+    voting_db: &VotingDb,
+    round_id: &str,
+    plan: &RoundPlan,
+    now: u64,
+    safe_deadline: Option<u64>,
+) -> Result<DelegationSubmissionEligibility> {
+    let pending_bundle_indexes: Vec<u32> = plan
+        .next_steps
+        .iter()
+        .filter_map(|step| match step {
+            NextStep::Delegate { bundle_index } => Some(*bundle_index),
+            _ => None,
+        })
+        .collect();
+    delegation_submission_eligibility(
+        voting_db,
+        round_id,
+        &pending_bundle_indexes,
+        now,
+        safe_deadline,
+    )
+    .context("plan paced delegation submission")
 }
 
 /// Reconstructs the committed vote payload for a resume step.

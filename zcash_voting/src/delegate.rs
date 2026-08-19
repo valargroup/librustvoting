@@ -1106,7 +1106,7 @@ pub fn record_submission(
     bundle_index: u32,
     tx_hash: &str,
 ) -> Result<(), VotingError> {
-    db.store_delegation_tx_hash(round_id, bundle_index, tx_hash)
+    db.mark_delegation_submitted(round_id, bundle_index, tx_hash)
 }
 
 /// Records the confirmed VAN leaf position for a delegated bundle.

@@ -29,6 +29,11 @@ pub use crate::delegation_capability::{
     ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
+pub use crate::delegation_policy::{
+    delegation_submission_eligibility, delegation_submission_eligibility_with_policy,
+    DelegationPacingPolicy, DelegationSubmissionEligibility, DELEGATION_STAGGER_MAX_SECONDS,
+    DELEGATION_STAGGER_MIN_SECONDS,
+};
 pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::hotkey::{
