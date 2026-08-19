@@ -46,10 +46,15 @@ const BPS_DENOMINATOR: u128 = 10_000;
 /// selected wallet notes can appear in one real bundle.
 ///
 /// Serialized with every round so the plan re-derives identically after an SDK
-/// upgrade that changes the defaults. Missing fields fall back to the defaults
-/// in force when the payload was written.
+/// upgrade that changes the defaults.
+///
+/// # Persisted schema
+///
+/// Round storage does not serialize this type directly. It uses a strict,
+/// versioned persistence DTO so a newly added policy field cannot silently
+/// change an older round. Any extension here must add the corresponding field
+/// to a new persisted schema version and define its conversion explicitly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct BundlePolicy {
     max_real_notes_per_bundle: usize,
     bundle_addition_threshold_zatoshi: Option<u64>,

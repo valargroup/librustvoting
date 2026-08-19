@@ -3,6 +3,7 @@ pub(crate) use crate::backend::pasta_curves;
 use ff::PrimeField;
 use pasta_curves::pallas;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 use voting_circuits::delegation::ImtProofData;
 
 use crate::note_bundling::BundlePolicy;
@@ -13,6 +14,150 @@ use crate::types::{
 
 const NOTE_IDENTITY_HASH_BYTES: usize = 32;
 const NOTE_IDENTITY_DOMAIN: &[u8] = b"zcash-voting-note-identity-v1";
+const BUNDLE_POLICY_SCHEMA_VERSION: u32 = 1;
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// Exact on-disk representation of bundle policy schema version 1.
+///
+/// All fields are required intentionally. Adding a runtime policy field requires
+/// a new persistence DTO and schema version rather than a serde default here.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedBundlePolicyV1 {
+    max_real_notes_per_bundle: usize,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    bundle_addition_threshold_zatoshi: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    max_privacy_bundles: Option<usize>,
+    privacy_drop_bps: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    max_privacy_drop_zatoshi: Option<u64>,
+}
+
+impl From<BundlePolicy> for PersistedBundlePolicyV1 {
+    fn from(policy: BundlePolicy) -> Self {
+        Self {
+            max_real_notes_per_bundle: policy.max_real_notes_per_bundle(),
+            bundle_addition_threshold_zatoshi: policy.bundle_addition_threshold(),
+            max_privacy_bundles: policy.max_privacy_bundles(),
+            privacy_drop_bps: policy.privacy_drop_bps(),
+            max_privacy_drop_zatoshi: policy.max_privacy_drop_zatoshi(),
+        }
+    }
+}
+
+impl PersistedBundlePolicyV1 {
+    fn into_policy(self) -> Result<BundlePolicy, VotingError> {
+        let mut policy = BundlePolicy::new(self.max_real_notes_per_bundle)?;
+        if let Some(threshold) = self.bundle_addition_threshold_zatoshi {
+            policy = policy.with_bundle_addition_threshold(threshold);
+        }
+        Ok(policy
+            .with_max_privacy_bundles(self.max_privacy_bundles)
+            .with_privacy_drop_bps(self.privacy_drop_bps)
+            .with_max_privacy_drop_zatoshi(self.max_privacy_drop_zatoshi))
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedBundlePolicyEnvelope<T> {
+    version: u32,
+    policy: T,
+}
+
+fn encode_bundle_policy(policy: BundlePolicy) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&PersistedBundlePolicyEnvelope::<PersistedBundlePolicyV1> {
+        version: BUNDLE_POLICY_SCHEMA_VERSION,
+        policy: policy.into(),
+    })
+}
+
+fn decode_bundle_policy(json: &str) -> Result<BundlePolicy, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+
+    let persisted: PersistedBundlePolicyV1 = if value.get("version").is_some() {
+        let envelope: PersistedBundlePolicyEnvelope<serde_json::Value> =
+            serde_json::from_value(value).map_err(|e| format!("invalid versioned policy: {e}"))?;
+        if envelope.version != BUNDLE_POLICY_SCHEMA_VERSION {
+            return Err(format!("unsupported schema version {}", envelope.version));
+        }
+        serde_json::from_value(envelope.policy)
+            .map_err(|e| format!("invalid version 1 policy: {e}"))?
+    } else {
+        // Versioning was introduced after direct BundlePolicy JSON had shipped.
+        // That legacy writer emitted every V1 field, so decode it as the same
+        // strict shape rather than applying runtime defaults to missing fields.
+        serde_json::from_value(value).map_err(|e| format!("invalid legacy policy: {e}"))?
+    };
+
+    persisted
+        .into_policy()
+        .map_err(|e| format!("invalid policy value: {e}"))
+}
+
+#[cfg(test)]
+mod bundle_policy_schema_tests {
+    use super::*;
+
+    fn custom_policy() -> BundlePolicy {
+        BundlePolicy::new(1)
+            .unwrap()
+            .with_bundle_addition_threshold(42)
+            .with_max_privacy_bundles(Some(3))
+            .with_privacy_drop_bps(75)
+            .with_max_privacy_drop_zatoshi(Some(99))
+    }
+
+    #[test]
+    fn bundle_policy_writes_a_versioned_envelope() {
+        let json = encode_bundle_policy(custom_policy()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["version"], BUNDLE_POLICY_SCHEMA_VERSION);
+        assert!(value["policy"].is_object());
+        assert_eq!(decode_bundle_policy(&json).unwrap(), custom_policy());
+    }
+
+    #[test]
+    fn bundle_policy_reads_the_unversioned_legacy_shape() {
+        let legacy_json = serde_json::to_string(&custom_policy()).unwrap();
+
+        assert_eq!(decode_bundle_policy(&legacy_json).unwrap(), custom_policy());
+    }
+
+    #[test]
+    fn bundle_policy_rejects_missing_persisted_fields() {
+        let incomplete = serde_json::json!({
+            "max_real_notes_per_bundle": 1,
+            "bundle_addition_threshold_zatoshi": null,
+            "max_privacy_bundles": 2,
+            "privacy_drop_bps": 100
+        });
+
+        let error = decode_bundle_policy(&incomplete.to_string()).unwrap_err();
+        assert!(error.contains("missing field `max_privacy_drop_zatoshi`"));
+    }
+
+    #[test]
+    fn bundle_policy_rejects_unknown_schema_versions() {
+        let json = serde_json::json!({
+            "version": BUNDLE_POLICY_SCHEMA_VERSION + 1,
+            "policy": PersistedBundlePolicyV1::from(custom_policy())
+        });
+
+        let error = decode_bundle_policy(&json.to_string()).unwrap_err();
+        assert!(error.contains("unsupported schema version"));
+    }
+}
 
 fn update_hash_with_len_prefixed_bytes(state: &mut blake2b_simd::State, value: &[u8]) {
     state.update(&(value.len() as u64).to_le_bytes());
@@ -548,7 +693,7 @@ pub fn get_round_bundle_policy(
 
     stored
         .map(|json| {
-            serde_json::from_str(&json).map_err(|e| VotingError::Internal {
+            decode_bundle_policy(&json).map_err(|e| VotingError::Internal {
                 message: format!("stored bundle policy for round {round_id} is unreadable: {e}"),
             })
         })
@@ -566,7 +711,7 @@ pub fn set_round_bundle_policy(
     wallet_id: &str,
     policy: BundlePolicy,
 ) -> Result<(), VotingError> {
-    let json = serde_json::to_string(&policy).map_err(|e| VotingError::Internal {
+    let json = encode_bundle_policy(policy).map_err(|e| VotingError::Internal {
         message: format!("failed to encode bundle policy: {e}"),
     })?;
     conn.execute(
