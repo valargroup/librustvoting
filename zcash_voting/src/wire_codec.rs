@@ -1196,6 +1196,12 @@ mod tests {
         assert_eq!(view.delegated_weight_zatoshi, 10);
         assert_eq!(view.bundle_count, 2);
         assert_eq!(view.bundle_index, 1);
+
+        // Payloads cached before privacy trimming shipped must still decode.
+        let mut legacy_json = serde_json::to_value(&view).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("privacy_trim");
+        let decoded: SignedDelegationPayloadView = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(decoded.privacy_trim, Default::default());
     }
 
     #[test]
@@ -1328,6 +1334,12 @@ mod tests {
         assert_eq!(view.notes[0].commitment_tree_position, 3);
         assert_eq!(view.notes[1].value_zatoshi, divisor / 2);
         assert_eq!(view.notes[1].voting_weight_zatoshi, divisor / 2);
+
+        // Results cached before privacy trimming shipped must still decode.
+        let mut legacy_json = serde_json::to_value(&view).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("privacy_trim");
+        let decoded: VotingNoteSelectionResultView = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(decoded.privacy_trim, Default::default());
     }
 
     #[test]

@@ -189,6 +189,7 @@ pub struct VotingNoteSelectionResultView {
     pub notes: Vec<VotingNoteRefView>,
     /// Voting weight the privacy trim withholds from delegation. Surface this
     /// so the voter can see what planning left out and why.
+    #[serde(default)]
     pub privacy_trim: PrivacyTrim,
 }
 
@@ -210,6 +211,7 @@ pub struct SignedDelegationPayloadView {
     pub delegated_weight_zatoshi: u64,
     pub bundle_count: u32,
     pub bundle_index: u32,
+    #[serde(default)]
     pub privacy_trim: PrivacyTrim,
 }
 
