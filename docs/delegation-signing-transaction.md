@@ -140,6 +140,33 @@ There are three different kinds of notes in the construction:
 TX1 also has a separate, zero-value output note addressed to the hotkey. That
 output is not the signed note.
 
+### Which eligible notes reach a bundle
+
+Not every selected note is delegated. Bundle planning drops notes twice, for
+different reasons, and a wallet should present the two differently:
+
+- Bundles whose total falls below `BALLOT_DIVISOR` are dropped because they are
+  worth zero ballots after quantization. Nothing is lost.
+- Trailing bundles are dropped by the **privacy trim** even though they carry
+  real weight. Bundle count is `ceil(note_count / BUNDLE_NOTE_SLOTS)`, so a
+  holder whose value sits in a few large notes plus a long dust tail emits many
+  TX1s and delegation submissions that contribute almost nothing. Planning trims
+  that tail down to `BundlePolicy::max_privacy_bundles` while the discarded value
+  stays inside `BundlePolicy::privacy_drop_bps` of the selected note value. The
+  count is a target; the budget is a hard ceiling.
+
+Trimmed notes never appear in any TX1, VAN, or delegation submission, so the trim
+leaves no on-chain trace. The withheld amount is reported as `PrivacyTrim` and
+wallets SHOULD surface it rather than discarding voting power silently.
+
+The trim composes with a per-bundle value threshold rather than replacing it. A
+1% budget cannot pay for a bundle sitting near a large per-bundle cap, so
+full-weight bundles survive and only the dust tail goes. It follows that holders
+whose notes are uniformly sized see no reduction at all: no single tail bundle
+fits the budget. The trim narrows the "this voter emitted many submissions"
+inference for concentrated holders; it does not make bundle counts uniform
+across voters.
+
 ### Eligible and padding note slots
 
 ZKP #1 always has `BUNDLE_NOTE_SLOTS` note slots. The wallet places the real
