@@ -1297,8 +1297,9 @@ impl VotingDb {
 
     /// Delete local bundle rows with index >= `keep_count`, so that only the
     /// first `keep_count` bundles remain. Witnesses and proofs cascade-delete
-    /// via FK. Imported capability rounds return [`VotingError::InvalidInput`]
-    /// because their complete bundle batch must remain atomic.
+    /// via FK. When no bundle rows remain, clears the stored bundle policy.
+    /// Imported capability rounds return [`VotingError::InvalidInput`] because
+    /// their complete bundle batch must remain atomic.
     /// Returns the number of deleted rows.
     pub fn delete_skipped_bundles(
         &self,

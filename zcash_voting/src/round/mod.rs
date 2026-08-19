@@ -1005,6 +1005,37 @@ mod tests {
     }
 
     #[test]
+    fn delete_skipped_bundles_clears_policy_when_no_rows_remain() {
+        // keep_count == 0 removes every bundle row but leaves the rounds row.
+        // The stored policy must go with them so a later replan uses the caller.
+        let db = test_db("wallet-clear-policy-on-full-skip");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        let policy = BundlePolicy::new(1).unwrap();
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, policy)
+            .unwrap();
+        assert_eq!(
+            queries::get_round_bundle_policy(&db.conn(), ROUND_ID, &db.wallet_id()).unwrap(),
+            Some(policy)
+        );
+
+        db.delete_skipped_bundles(ROUND_ID, 0).unwrap();
+
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 0);
+        assert_eq!(
+            queries::get_round_bundle_policy(&db.conn(), ROUND_ID, &db.wallet_id()).unwrap(),
+            None
+        );
+        assert_eq!(
+            db.effective_bundle_policy(ROUND_ID, BundlePolicy::default())
+                .unwrap(),
+            BundlePolicy::default()
+        );
+    }
+
+    #[test]
     fn ensure_bundles_with_skipped_suffix_uses_custom_policy() {
         let db = test_db("wallet-policy-skip");
         let notes = vec![

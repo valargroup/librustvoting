@@ -2586,8 +2586,10 @@ pub fn get_votes(
 /// Delete all local bundles (and their cascaded witnesses/proofs) with index >= `from_index`.
 /// Used when the user skips remaining Keystone bundles — we remove the unsigned
 /// bundle rows so that `proof_generated` (which counts ALL DB bundles) reflects
-/// only the signed+proven bundles. Imported capability batches are atomic and
-/// must instead be replaced with `clear_round` followed by a complete re-import.
+/// only the signed+proven bundles. When no bundle rows remain, clears
+/// `bundle_policy_json` so a later replan can honor the caller's policy.
+/// Imported capability batches are atomic and must instead be replaced with
+/// `clear_round` followed by a complete re-import.
 pub fn delete_bundles_from(
     conn: &Connection,
     round_id: &str,
@@ -2619,6 +2621,19 @@ pub fn delete_bundles_from(
         .map_err(|e| VotingError::Internal {
             message: format!("failed to delete bundles from index {}: {}", from_index, e),
         })?;
+    if get_bundle_count(&tx, round_id, wallet_id)? == 0 {
+        tx.execute(
+            "UPDATE rounds SET bundle_policy_json = NULL
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to clear bundle policy after deleting all bundles: {e}"),
+        })?;
+    }
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("failed to commit bundle deletion: {e}"),
     })?;
