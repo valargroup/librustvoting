@@ -4,13 +4,7 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## v3.1.0-rc.1
-
-### Changed
-- Updated `zakura-client-backend`, `zakura-client-sqlite`, and
-  `zakura-wallet-lib` to their coordinated `0.1.0-rc1` releases.
-
-## v3.1.0-rc.0
+## v3.1.0-rc.2
 
 ### Added
 - Added a privacy trim to bundle planning. Bundle count is
@@ -45,6 +39,28 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   Rounds carried across that upgrade have no stored bundle policy, so the
   privacy trim is disabled for any round that already has persisted bundle
   rows; they keep re-deriving the plan they were signed against.
+
+### Changed
+- **Breaking:** added `privacy_trim` to the public `ChunkResult`,
+  `BundleLayout`, `SignedDelegationBundle`, `SignedDelegationPayloadView`, and
+  `VotingNoteSelectionResultView` structs. Downstream struct literals must carry
+  the value returned by bundle planning or use `PrivacyTrim::default()` when no
+  trim occurred. Serde-backed views accept older payloads with the field absent.
+
+### Removed
+- **Breaking:** removed `VotingNoteSelectionResultView::from_selected`.
+  Integrations must use `from_selected_for_round` so resumed rounds honor their
+  persisted bundle policy.
+
+## v3.1.0-rc.1
+
+### Changed
+- Updated `zakura-client-backend`, `zakura-client-sqlite`, and
+  `zakura-wallet-lib` to their coordinated `0.1.0-rc1` releases.
+
+## v3.1.0-rc.0
+
+### Added
 - Added `share::pending_rounds` so wallets can restore unconfirmed helper-share
   tracking with the caller context persisted for each round.
 - Extended `zcash_voting` with mutually exclusive `upstream` (default) and
