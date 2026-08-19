@@ -120,7 +120,8 @@ impl BundlePolicy {
     ///
     /// `None` disables the privacy trim entirely, which is what in-flight rounds
     /// created before the trim shipped must use so their persisted bundle rows
-    /// still re-derive.
+    /// still re-derive. A target of zero is treated as one because privacy
+    /// trimming must preserve at least one eligible bundle.
     pub fn with_max_privacy_bundles(mut self, max_privacy_bundles: Option<usize>) -> Self {
         self.max_privacy_bundles = max_privacy_bundles;
         self
@@ -454,6 +455,8 @@ pub fn chunk_notes_with_policy(notes: &[NoteInfo], policy: BundlePolicy) -> Chun
 
     if let Some(max_privacy_bundles) = policy.max_privacy_bundles() {
         let budget = policy.privacy_drop_budget(total_value);
+        // Keep at least one eligible bundle even if a zero target is configured.
+        let max_privacy_bundles = max_privacy_bundles.max(1);
         while surviving.len() > max_privacy_bundles {
             let bundle_total = surviving.last().expect("bundle exists").0;
             let bundle_value = u128::from(bundle_total);
@@ -1239,14 +1242,14 @@ mod tests {
 
     #[test]
     fn privacy_trim_never_drops_below_minimum_voting_eligibility() {
-        // Worst case for the floor: a target of one bundle and a budget large
-        // enough to pay for everything. The trim must still leave one bundle
-        // standing, so the voter stays eligible.
+        // Worst case for the floor: a zero target and a budget large enough to
+        // pay for everything. The trim must still leave one bundle standing,
+        // so the voter stays eligible.
         let notes: Vec<NoteInfo> = (0..50)
             .map(|i| make_note(BALLOT_DIVISOR, i as u64))
             .collect();
         let policy = BundlePolicy::default()
-            .with_max_privacy_bundles(Some(1))
+            .with_max_privacy_bundles(Some(0))
             .with_privacy_drop_bps(10_000);
 
         let result = chunk_notes_with_policy(&notes, policy);
