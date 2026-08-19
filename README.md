@@ -45,7 +45,10 @@ cargo test -p zcash_voting --locked
 New wallet integrations should import `zcash_voting::prelude::*` and use the
 stage-oriented API:
 
-- `round::*` creates rounds and binds eligible notes into bundles.
+- `round::*` creates rounds and binds eligible notes into bundles. Planning
+  trims the low-value bundle tail so a concentrated holder emits fewer
+  delegation submissions, bounded by a hard share of selected note value and
+  reported back as `PrivacyTrim`.
 - `precompute::*` prepares shielded note witnesses, delegation PIR inputs, and VAN
   witnesses for vote proofs.
 - `delegate::*` builds delegation PCZTs, proves delegation, prepares signing

@@ -63,6 +63,7 @@ pub use crate::config::{
     WalletCapabilities,
 };
 pub use crate::delegate::KeystoneSigningRequest;
+pub use crate::note_bundling::PrivacyTrim;
 pub use crate::round::BundleLayout;
 pub use crate::share_policy::ShareSubmissionPlan;
 pub use crate::types::WireEncryptedShare;
@@ -186,6 +187,9 @@ pub struct VotingNoteSelectionResultView {
     pub snapshot_height: u64,
     pub anchor_height: u64,
     pub notes: Vec<VotingNoteRefView>,
+    /// Voting weight the privacy trim withholds from delegation. Surface this
+    /// so the voter can see what planning left out and why.
+    pub privacy_trim: PrivacyTrim,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +210,7 @@ pub struct SignedDelegationPayloadView {
     pub delegated_weight_zatoshi: u64,
     pub bundle_count: u32,
     pub bundle_index: u32,
+    pub privacy_trim: PrivacyTrim,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

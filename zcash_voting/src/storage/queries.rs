@@ -5,6 +5,7 @@ use pasta_curves::pallas;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use voting_circuits::delegation::ImtProofData;
 
+use crate::note_bundling::BundlePolicy;
 use crate::storage::{KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord};
 use crate::types::{
     Network, NoteInfo, ShareDelegationRecord, VotingError, VotingRoundParams, WitnessData,
@@ -522,6 +523,65 @@ pub fn get_bundle_count(
     .map_err(|e| VotingError::Internal {
         message: format!("failed to get bundle count: {}", e),
     })
+}
+
+/// Reads the bundle policy persisted with a round, if one was stored.
+///
+/// Returns `None` for rounds whose bundles were planned before the policy was
+/// recorded, so callers can fall back to the policy they were handed.
+pub fn get_round_bundle_policy(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Option<BundlePolicy>, VotingError> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT bundle_policy_json FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read stored bundle policy: {e}"),
+        })?
+        .flatten();
+
+    stored
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|e| VotingError::Internal {
+                message: format!("stored bundle policy for round {round_id} is unreadable: {e}"),
+            })
+        })
+        .transpose()
+}
+
+/// Records the bundle policy that produced a round's persisted bundle rows.
+///
+/// Later planning passes re-derive with this value instead of the caller's, so
+/// an SDK upgrade that changes the defaults cannot invalidate bundles that were
+/// already signed or submitted.
+pub fn set_round_bundle_policy(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    policy: BundlePolicy,
+) -> Result<(), VotingError> {
+    let json = serde_json::to_string(&policy).map_err(|e| VotingError::Internal {
+        message: format!("failed to encode bundle policy: {e}"),
+    })?;
+    conn.execute(
+        "UPDATE rounds SET bundle_policy_json = :policy
+         WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! {
+            ":policy": json,
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to store bundle policy: {e}"),
+    })?;
+    Ok(())
 }
 
 /// Imported bundles omit local note positions; local bundle insertion always stores them.

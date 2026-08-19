@@ -324,7 +324,17 @@ impl VotingNoteSelectionResultView {
                     selected.notes.len()
                 ),
             })?;
-        let eligible_weight_zatoshi = crate::voting_power_with_policy(&selected, bundle_policy);
+        // Plan once so the reported weight and the privacy trim describe the
+        // same bundle set; recomputing the weight separately could drift.
+        // Malformed note rows report zero weight rather than failing, matching
+        // the behavior this view had when it called `voting_power_with_policy`.
+        let plan = crate::note_bundling::canonical_note_bundle_plan_for_notes(
+            &selected.voting_note_infos(),
+            bundle_policy,
+        )
+        .ok();
+        let eligible_weight_zatoshi = plan.as_ref().map_or(0, |plan| plan.eligible_weight);
+        let privacy_trim = plan.map(|plan| plan.privacy_trim).unwrap_or_default();
         let snapshot_height = selected.snapshot_height;
         let anchor_height = selected.anchor_tree_state.height;
         let notes = selected.notes.into_iter().map(Into::into).collect();
@@ -334,6 +344,7 @@ impl VotingNoteSelectionResultView {
             snapshot_height,
             anchor_height,
             notes,
+            privacy_trim,
         })
     }
 }
@@ -363,6 +374,7 @@ impl TryFrom<SignedDelegationBundle> for SignedDelegationPayloadView {
             delegated_weight_zatoshi: result.delegated_weight_zatoshi,
             bundle_count: result.bundle_count,
             bundle_index: result.bundle_index,
+            privacy_trim: result.privacy_trim,
         })
     }
 }
@@ -1069,9 +1081,27 @@ mod tests {
             bundle_count: 2,
             eligible_weight: 50,
             dropped_count: 0,
+            privacy_trim: crate::note_bundling::PrivacyTrim {
+                dropped_bundles: 1,
+                dropped_notes: 4,
+                dropped_value: 900,
+            },
         };
         assert_eq!(view.bundle_count, 2);
         assert_eq!(view.eligible_weight, 50);
+
+        let json = serde_json::to_string(&view).unwrap();
+        assert_eq!(
+            serde_json::from_str::<crate::round::BundleLayout>(&json).unwrap(),
+            view
+        );
+
+        // Payloads written before the privacy trim shipped must still decode.
+        let legacy = r#"{"bundle_count":2,"eligible_weight_zatoshi":50,"dropped_count":0}"#;
+        let decoded: crate::round::BundleLayout = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.privacy_trim.dropped_bundles, 0);
+        assert_eq!(decoded.privacy_trim.dropped_notes, 0);
+        assert_eq!(decoded.privacy_trim.dropped_value, 0);
     }
 
     #[test]
@@ -1142,8 +1172,15 @@ mod tests {
             delegated_weight_zatoshi: 10,
             bundle_count: 2,
             bundle_index: 1,
+            privacy_trim: crate::note_bundling::PrivacyTrim {
+                dropped_bundles: 3,
+                dropped_notes: 7,
+                dropped_value: 1_234,
+            },
         })
         .unwrap();
+        assert_eq!(view.privacy_trim.dropped_bundles, 3);
+        assert_eq!(view.privacy_trim.dropped_value, 1_234);
         assert_eq!(view.pczt_bytes, vec![1, 2, 3]);
         assert_eq!(view.status, "ready_for_submission");
         assert_eq!(view.message, None);
