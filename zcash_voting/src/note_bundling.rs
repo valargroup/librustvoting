@@ -30,6 +30,10 @@ pub const DEFAULT_MAX_PRIVACY_BUNDLES: usize = 2;
 /// points. 100 bps is 1%.
 pub const DEFAULT_PRIVACY_DROP_BPS: u32 = 100;
 
+/// Maximum share of selected note value the privacy trim may discard, in basis
+/// points. 500 bps is 5%.
+pub const MAX_PRIVACY_DROP_BPS: u32 = 500;
+
 /// Default absolute ceiling on raw note value discarded by the privacy trim.
 ///
 /// One ZEC is 100,000,000 zatoshi, so this caps the default budget at 1,000 ZEC
@@ -170,11 +174,23 @@ impl BundlePolicy {
     /// basis points of total selected note value.
     ///
     /// This has no effect while privacy trimming is disabled.
-    pub fn with_privacy_drop_bps(mut self, privacy_drop_bps: u32) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when `privacy_drop_bps` is greater
+    /// than [`MAX_PRIVACY_DROP_BPS`] (5% of selected note value).
+    pub fn with_privacy_drop_bps(mut self, privacy_drop_bps: u32) -> Result<Self, VotingError> {
+        if privacy_drop_bps > MAX_PRIVACY_DROP_BPS {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "privacy_drop_bps must be <= {MAX_PRIVACY_DROP_BPS}, got {privacy_drop_bps}"
+                ),
+            });
+        }
         if let Some(privacy_trim) = &mut self.privacy_trim {
             privacy_trim.drop_bps = privacy_drop_bps;
         }
-        self
+        Ok(self)
     }
 
     /// Returns a copy of this policy with an absolute clamp on the privacy drop.
@@ -1081,6 +1097,16 @@ mod tests {
     }
 
     #[test]
+    fn bundle_policy_rejects_privacy_drop_bps_above_max() {
+        assert!(BundlePolicy::default()
+            .with_privacy_drop_bps(MAX_PRIVACY_DROP_BPS)
+            .is_ok());
+        assert!(BundlePolicy::default()
+            .with_privacy_drop_bps(MAX_PRIVACY_DROP_BPS + 1)
+            .is_err());
+    }
+
+    #[test]
     fn bundle_policy_decodes_pre_privacy_trim_json_with_trimming_disabled() {
         let legacy = serde_json::json!({
             "max_real_notes_per_bundle": 3,
@@ -1100,6 +1126,7 @@ mod tests {
             .unwrap()
             .with_max_privacy_bundles(Some(3))
             .with_privacy_drop_bps(75)
+            .unwrap()
             .with_max_privacy_drop_zatoshi(Some(99));
 
         let json = serde_json::to_value(policy).unwrap();
@@ -1354,12 +1381,22 @@ mod tests {
         // Worst case for the floor: a zero target and a budget large enough to
         // pay for everything. The trim must still leave one bundle standing,
         // so the voter stays eligible.
+        //
+        // Construct the oversize budget via private fields: the public setter
+        // caps drop_bps at MAX_PRIVACY_DROP_BPS, which cannot cover dropping
+        // every eligible bundle.
         let notes: Vec<NoteInfo> = (0..50)
             .map(|i| make_note(BALLOT_DIVISOR, i as u64))
             .collect();
-        let policy = BundlePolicy::default()
-            .with_max_privacy_bundles(Some(0))
-            .with_privacy_drop_bps(10_000);
+        let policy = BundlePolicy {
+            max_real_notes_per_bundle: BUNDLE_NOTE_SLOTS,
+            bundle_addition_threshold_zatoshi: None,
+            privacy_trim: Some(PrivacyTrimPolicy {
+                max_bundles: 0,
+                drop_bps: 10_000,
+                max_drop_zatoshi: None,
+            }),
+        };
 
         let result = chunk_notes_with_policy(&notes, policy);
         let eligibility = minimum_voting_eligibility_for_notes(&notes, policy).unwrap();

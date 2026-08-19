@@ -61,7 +61,7 @@ impl PersistedBundlePolicyV1 {
         }
         Ok(policy
             .with_max_privacy_bundles(self.max_privacy_bundles)
-            .with_privacy_drop_bps(self.privacy_drop_bps)
+            .with_privacy_drop_bps(self.privacy_drop_bps)?
             .with_max_privacy_drop_zatoshi(self.max_privacy_drop_zatoshi))
     }
 }
@@ -81,23 +81,13 @@ fn encode_bundle_policy(policy: BundlePolicy) -> Result<String, serde_json::Erro
 }
 
 fn decode_bundle_policy(json: &str) -> Result<BundlePolicy, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
-
-    let persisted: PersistedBundlePolicyV1 = if value.get("version").is_some() {
-        let envelope: PersistedBundlePolicyEnvelope<serde_json::Value> =
-            serde_json::from_value(value).map_err(|e| format!("invalid versioned policy: {e}"))?;
-        if envelope.version != BUNDLE_POLICY_SCHEMA_VERSION {
-            return Err(format!("unsupported schema version {}", envelope.version));
-        }
-        serde_json::from_value(envelope.policy)
-            .map_err(|e| format!("invalid version 1 policy: {e}"))?
-    } else {
-        // Versioning was introduced after direct BundlePolicy JSON had shipped.
-        // That legacy writer emitted every V1 field, so decode it as the same
-        // strict shape rather than applying runtime defaults to missing fields.
-        serde_json::from_value(value).map_err(|e| format!("invalid legacy policy: {e}"))?
-    };
+    let envelope: PersistedBundlePolicyEnvelope<serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| format!("invalid versioned policy: {e}"))?;
+    if envelope.version != BUNDLE_POLICY_SCHEMA_VERSION {
+        return Err(format!("unsupported schema version {}", envelope.version));
+    }
+    let persisted: PersistedBundlePolicyV1 = serde_json::from_value(envelope.policy)
+        .map_err(|e| format!("invalid version 1 policy: {e}"))?;
 
     persisted
         .into_policy()
@@ -114,6 +104,7 @@ mod bundle_policy_schema_tests {
             .with_bundle_addition_threshold(42)
             .with_max_privacy_bundles(Some(3))
             .with_privacy_drop_bps(75)
+            .unwrap()
             .with_max_privacy_drop_zatoshi(Some(99))
     }
 
@@ -128,20 +119,24 @@ mod bundle_policy_schema_tests {
     }
 
     #[test]
-    fn bundle_policy_reads_the_unversioned_legacy_shape() {
-        let legacy_json =
+    fn bundle_policy_rejects_unversioned_payloads() {
+        let unversioned =
             serde_json::to_string(&PersistedBundlePolicyV1::from(custom_policy())).unwrap();
 
-        assert_eq!(decode_bundle_policy(&legacy_json).unwrap(), custom_policy());
+        let error = decode_bundle_policy(&unversioned).unwrap_err();
+        assert!(error.contains("invalid versioned policy"));
     }
 
     #[test]
     fn bundle_policy_rejects_missing_persisted_fields() {
         let incomplete = serde_json::json!({
-            "max_real_notes_per_bundle": 1,
-            "bundle_addition_threshold_zatoshi": null,
-            "max_privacy_bundles": 2,
-            "privacy_drop_bps": 100
+            "version": BUNDLE_POLICY_SCHEMA_VERSION,
+            "policy": {
+                "max_real_notes_per_bundle": 1,
+                "bundle_addition_threshold_zatoshi": null,
+                "max_privacy_bundles": 2,
+                "privacy_drop_bps": 100
+            }
         });
 
         let error = decode_bundle_policy(&incomplete.to_string()).unwrap_err();
@@ -157,6 +152,20 @@ mod bundle_policy_schema_tests {
 
         let error = decode_bundle_policy(&json.to_string()).unwrap_err();
         assert!(error.contains("unsupported schema version"));
+    }
+
+    #[test]
+    fn bundle_policy_rejects_privacy_drop_bps_above_max() {
+        let mut persisted = PersistedBundlePolicyV1::from(custom_policy());
+        persisted.privacy_drop_bps = note_bundling::MAX_PRIVACY_DROP_BPS + 1;
+
+        let json = serde_json::json!({
+            "version": BUNDLE_POLICY_SCHEMA_VERSION,
+            "policy": persisted
+        });
+
+        let error = decode_bundle_policy(&json.to_string()).unwrap_err();
+        assert!(error.contains("privacy_drop_bps"));
     }
 }
 
