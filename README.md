@@ -48,7 +48,7 @@ stage-oriented API:
 - `round::*` creates rounds and binds eligible notes into bundles. Planning
   trims the low-value bundle tail so a concentrated holder emits fewer
   delegation submissions, bounded by the smaller of 1% of selected note value
-  and 500 ZEC by default. `PrivacyTrim` reports the raw note value excluded,
+  and 1,000 ZEC by default. `PrivacyTrim` reports the raw note value excluded,
   not bundle-quantized voting weight.
 - `precompute::*` prepares shielded note witnesses, delegation PIR inputs, and VAN
   witnesses for vote proofs.

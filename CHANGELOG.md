@@ -19,18 +19,18 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   almost no voting weight. Planning now drops trailing bundles down to
   `BundlePolicy::max_privacy_bundles` (default 2) while the discarded value stays
   inside `BundlePolicy::privacy_drop_bps` (default 1% of selected note value),
-  clamped further by `max_privacy_drop_zatoshi` (default 500 ZEC). The count
+  clamped further by `max_privacy_drop_zatoshi` (default 1,000 ZEC). The count
   target is best-effort; both budget limits are hard ceilings. Raw excluded note
   value—not bundle-quantized voting weight—is reported as
   `PrivacyTrim` on `ChunkResult`, `BundleLayout`,
   `VotingNoteSelectionResultView`, and `SignedDelegationPayloadView` so wallets
   can show the voter what was left out.
 
-  This composes with a per-bundle value threshold rather than replacing it. The
-  default 500 ZEC absolute ceiling cannot pay for a bundle near a 1,000 ZEC cap,
-  regardless of selected balance, so only cheaper tail bundles totaling at most
-  500 ZEC can be trimmed. Callers can set a tighter ceiling or explicitly remove
-  it.
+  This composes with a per-bundle value threshold rather than replacing it. Below
+  100,000 ZEC selected value, a 1% budget cannot pay for a bundle near a 1,000 ZEC
+  cap, so only a cheaper tail can be trimmed. At and above 100,000 ZEC, one full
+  1,000 ZEC bundle can fit, but the default absolute ceiling prevents trimming
+  more raw note value. Callers can set a tighter ceiling or explicitly remove it.
 - Persisted the effective `BundlePolicy` with each round. Once a plan is stored
   its policy is authoritative and later planning passes re-derive with it, so an
   SDK upgrade that changes the defaults cannot invalidate bundle rows that were
