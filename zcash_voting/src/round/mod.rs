@@ -360,13 +360,6 @@ impl VotingDb {
         Ok(queries::get_round_bundle_policy(&conn, round_id, &wallet_id)?.unwrap_or(requested))
     }
 
-    /// Records the policy that produced a round's persisted bundle rows.
-    fn set_bundle_policy(&self, round_id: &str, policy: BundlePolicy) -> Result<(), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::set_round_bundle_policy(&conn, round_id, &wallet_id, policy)
-    }
-
     /// Creates bundle rows for `notes`, or validates existing bundle rows.
     ///
     /// The note ordering, duplicate-nullifier handling, and weight quantization
@@ -403,8 +396,8 @@ impl VotingDb {
         let existing_count = self.get_bundle_count(round_id)?;
 
         if existing_count == 0 {
-            let (bundle_count, eligible_weight) = self.persist_bundle_plan(round_id, &plan)?;
-            self.set_bundle_policy(round_id, policy)?;
+            let (bundle_count, eligible_weight) =
+                self.persist_bundle_plan(round_id, &plan, policy)?;
             return Ok(BundleLayout {
                 bundle_count,
                 eligible_weight,
