@@ -187,8 +187,8 @@ pub struct VotingNoteSelectionResultView {
     pub snapshot_height: u64,
     pub anchor_height: u64,
     pub notes: Vec<VotingNoteRefView>,
-    /// Voting weight the privacy trim withholds from delegation. Surface this
-    /// so the voter can see what planning left out and why.
+    /// Raw value of notes the privacy trim excludes from delegation, not their
+    /// bundle-quantized voting weight. Surface this distinction to the voter.
     #[serde(default)]
     pub privacy_trim: PrivacyTrim,
 }

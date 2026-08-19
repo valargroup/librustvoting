@@ -151,21 +151,26 @@ different reasons, and a wallet should present the two differently:
   real weight. Bundle count is `ceil(note_count / BUNDLE_NOTE_SLOTS)`, so a
   holder whose value sits in a few large notes plus a long dust tail emits many
   TX1s and delegation submissions that contribute almost nothing. Planning trims
-  that tail down to `BundlePolicy::max_privacy_bundles` while the discarded value
-  stays inside `BundlePolicy::privacy_drop_bps` of the selected note value. The
-  count is a target; the budget is a hard ceiling.
+  that tail down to `BundlePolicy::max_privacy_bundles` while the discarded raw
+  note value stays inside `BundlePolicy::privacy_drop_bps` of the selected note
+  value and the absolute `max_privacy_drop_zatoshi` ceiling. Defaults are 1% and
+  500 ZEC. The count is a target; both budget limits are hard ceilings.
 
 Trimmed notes never appear in any TX1, VAN, or delegation submission, so the trim
-leaves no on-chain trace. The withheld amount is reported as `PrivacyTrim` and
-wallets SHOULD surface it rather than discarding voting power silently.
+leaves no on-chain trace. `PrivacyTrim::dropped_value_zatoshi` reports the raw
+value of the excluded notes, not their bundle-quantized voting weight. Wallets
+SHOULD surface that distinction rather than reducing voting power silently.
 
-The trim composes with a per-bundle value threshold rather than replacing it. A
-1% budget cannot pay for a bundle sitting near a large per-bundle cap, so
-full-weight bundles survive and only the dust tail goes. It follows that holders
-whose notes are uniformly sized see no reduction at all: no single tail bundle
-fits the budget. The trim narrows the "this voter emitted many submissions"
-inference for concentrated holders; it does not make bundle counts uniform
-across voters.
+The trim composes with a per-bundle value threshold rather than replacing it.
+The default 500 ZEC absolute ceiling cannot pay for a bundle sitting near a
+1,000 ZEC per-bundle cap, regardless of the holder's selected balance, so those
+full-weight bundles survive and only a cheaper tail can be trimmed. The ceiling
+limits the total raw note value removed, not each bundle individually; for
+example, one 500 ZEC bundle or several cheaper bundles totaling at most 500 ZEC
+can be removed. Callers can set a tighter ceiling or explicitly remove it.
+Holders whose uniformly sized tail bundle exceeds the effective budget see no
+reduction. The trim narrows the "this voter emitted many submissions" inference
+for concentrated holders; it does not make bundle counts uniform across voters.
 
 ### Eligible and padding note slots
 

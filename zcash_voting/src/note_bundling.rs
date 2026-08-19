@@ -30,6 +30,12 @@ pub const DEFAULT_MAX_PRIVACY_BUNDLES: usize = 2;
 /// points. 100 bps is 1%.
 pub const DEFAULT_PRIVACY_DROP_BPS: u32 = 100;
 
+/// Default absolute ceiling on raw note value discarded by the privacy trim.
+///
+/// One ZEC is 100,000,000 zatoshi, so this caps the default budget at 500 ZEC
+/// even when 1% of the selected balance would be larger.
+pub const DEFAULT_MAX_PRIVACY_DROP_ZATOSHI: u64 = 50_000_000_000;
+
 /// Basis-point denominator. Kept explicit so the trim stays integer-only.
 const BPS_DENOMINATOR: u128 = 10_000;
 
@@ -136,9 +142,8 @@ impl BundlePolicy {
 
     /// Returns a copy of this policy with an absolute clamp on the privacy drop.
     ///
-    /// The effective budget becomes `min(bps_budget, clamp)`. Useful for very
-    /// large holders, where a percentage budget alone could grow past the
-    /// per-bundle value threshold and start trimming full-weight bundles.
+    /// The effective budget becomes `min(bps_budget, clamp)`. Passing `None`
+    /// removes the default 500 ZEC ceiling.
     pub fn with_max_privacy_drop_zatoshi(mut self, max_privacy_drop_zatoshi: Option<u64>) -> Self {
         self.max_privacy_drop_zatoshi = max_privacy_drop_zatoshi;
         self
@@ -180,7 +185,7 @@ impl Default for BundlePolicy {
             bundle_addition_threshold_zatoshi: None,
             max_privacy_bundles: Some(DEFAULT_MAX_PRIVACY_BUNDLES),
             privacy_drop_bps: DEFAULT_PRIVACY_DROP_BPS,
-            max_privacy_drop_zatoshi: None,
+            max_privacy_drop_zatoshi: Some(DEFAULT_MAX_PRIVACY_DROP_ZATOSHI),
         }
     }
 }
@@ -189,9 +194,9 @@ impl Default for BundlePolicy {
 ///
 /// Reported separately from the sub-ballot drop because the two mean different
 /// things to a voter: sub-ballot notes were already worth zero ballots, while
-/// these bundles carried real voting weight that was withheld in exchange for
-/// emitting fewer delegation submissions. Wallets should surface
-/// [`PrivacyTrim::dropped_value`] rather than hiding it.
+/// these bundles carried selected note value that was excluded in exchange for
+/// emitting fewer delegation submissions. [`PrivacyTrim::dropped_value`] is the
+/// raw value of those notes, not their bundle-quantized voting weight.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrivacyTrim {
@@ -1216,28 +1221,43 @@ mod tests {
     }
 
     #[test]
-    fn privacy_trim_budget_scales_with_balance_and_respects_absolute_clamp() {
-        // A 100_000 ZEC holder has a 1000 ZEC budget, which is large enough to
-        // pay for a full whale-protection bundle. This pins that behavior, and
-        // shows the clamp is how an operator opts out of it.
-        let notes: Vec<NoteInfo> = (0..100).map(|i| make_note(1_000 * ZEC, i as u64)).collect();
-        let policy =
-            BundlePolicy::default().with_bundle_addition_threshold(WHALE_PROTECTION_THRESHOLD);
+    fn privacy_trim_default_budget_is_capped_at_500_zec() {
+        // A 1,000,000 ZEC holder has a 10,000 ZEC percentage budget. The default
+        // absolute ceiling limits the trim to one 500 ZEC bundle. Callers can
+        // explicitly remove the ceiling or set a tighter one.
+        let notes: Vec<NoteInfo> = (0..2_000).map(|i| make_note(500 * ZEC, i as u64)).collect();
+        let policy = BundlePolicy::new(1).unwrap();
 
-        let unclamped = chunk_notes_with_policy(&notes, policy);
-        let clamped = chunk_notes_with_policy(
+        let default_capped = chunk_notes_with_policy(&notes, policy);
+        let uncapped = chunk_notes_with_policy(&notes, policy.with_max_privacy_drop_zatoshi(None));
+        let tighter_cap = chunk_notes_with_policy(
             &notes,
             policy.with_max_privacy_drop_zatoshi(Some(100 * ZEC)),
         );
 
+        assert_eq!(default_capped.bundles.len(), 1_999);
+        assert_eq!(default_capped.privacy_trim.dropped_bundles, 1);
         assert_eq!(
-            unclamped.bundles.len(),
-            99,
-            "1% pays for exactly one bundle"
+            default_capped.privacy_trim.dropped_value,
+            DEFAULT_MAX_PRIVACY_DROP_ZATOSHI
         );
-        assert_eq!(unclamped.privacy_trim.dropped_bundles, 1);
-        assert_eq!(clamped.bundles.len(), 100, "the clamp blocks the drop");
-        assert_eq!(clamped.privacy_trim.dropped_bundles, 0);
+        assert_eq!(uncapped.bundles.len(), 1_980, "1% pays for 20 bundles");
+        assert_eq!(uncapped.privacy_trim.dropped_bundles, 20);
+        assert_eq!(
+            tighter_cap.bundles.len(),
+            2_000,
+            "a 100 ZEC cap blocks a 500 ZEC bundle"
+        );
+        assert_eq!(tighter_cap.privacy_trim.dropped_bundles, 0);
+
+        let full_weight_notes: Vec<NoteInfo> =
+            (0..100).map(|i| make_note(1_000 * ZEC, i as u64)).collect();
+        let full_weight = chunk_notes_with_policy(
+            &full_weight_notes,
+            BundlePolicy::default().with_bundle_addition_threshold(WHALE_PROTECTION_THRESHOLD),
+        );
+        assert_eq!(full_weight.bundles.len(), 100);
+        assert!(full_weight.privacy_trim.is_empty());
     }
 
     #[test]

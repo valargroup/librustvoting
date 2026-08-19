@@ -493,8 +493,8 @@ impl VotingDb {
             bundle_count: stored_count,
             eligible_weight: quantized_bundle_set_weight(stored_bundles)?,
             // `dropped_count` stays 0 here: this view describes the persisted
-            // prefix, not the notes planning left out. The privacy trim is still
-            // reported, because that weight is withheld from the voter either way.
+            // prefix, not the notes planning left out. The privacy trim still
+            // reports the raw note value excluded from delegation.
             dropped_count: 0,
             privacy_trim: plan.privacy_trim,
         })
