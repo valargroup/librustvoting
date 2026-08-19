@@ -44,7 +44,3 @@ zakura-reddsa = { git = "https://github.com/zakura-core/libraries", rev = "80a5d
 zakura-redjubjub = { git = "https://github.com/zakura-core/libraries", rev = "80a5dd73bc12f6a513c6afd14488911f11f2a9db" }
 zakura-sapling-crypto = { git = "https://github.com/zakura-core/libraries", rev = "80a5dd73bc12f6a513c6afd14488911f11f2a9db" }
 zakura-sinsemilla = { git = "https://github.com/zakura-core/libraries", rev = "80a5dd73bc12f6a513c6afd14488911f11f2a9db" }
-zakura-wallet-lib = { git = "https://github.com/zakura-core/wallet-libraries.git", rev = "54ba5c4fbcf2f98d629f9afe48dfa3273f160356" }
-zakura-pczt = { git = "https://github.com/zakura-core/wallet-libraries.git", rev = "54ba5c4fbcf2f98d629f9afe48dfa3273f160356" }
-zakura-client-backend = { git = "https://github.com/zakura-core/wallet-libraries.git", rev = "54ba5c4fbcf2f98d629f9afe48dfa3273f160356" }
-zakura-client-sqlite = { git = "https://github.com/zakura-core/wallet-libraries.git", rev = "54ba5c4fbcf2f98d629f9afe48dfa3273f160356" }
