@@ -15,6 +15,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   vote commitment tree crypto backend.
 
 ### Changed
+- Replaced temporary Git dependency patches with the published backend-selector
+  releases for IMT, PIR, voting circuits, and voting crypto dependencies.
 - Let the vote commitment tree and client select either the default upstream
   voting crypto crates or the mutually exclusive Zakura backend.
 - Cap each randomized initial helper-share delay at 100 hours while preserving

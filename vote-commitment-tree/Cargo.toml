@@ -13,7 +13,7 @@ upstream = ["imt-tree/upstream", "voting-crypto-deps/upstream", "voting-circuits
 zakura = ["imt-tree/zakura", "voting-crypto-deps/zakura", "voting-circuits/zakura"]
 
 [dependencies]
-imt-tree = { version = "=0.2.1", default-features = false }
+imt-tree = { version = "=0.3.0", default-features = false }
 voting-crypto-deps = { workspace = true }
 ff = "0.13"
 anyhow = "1.0"

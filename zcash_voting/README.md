@@ -262,7 +262,7 @@ This release line requires Rust 1.88 or newer.
 - **`orchard 0.15`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths
   (or `zakura-orchard 1.0.0-rc.1` when the `zakura` feature is selected).
-- **`voting-circuits 0.10.0`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
+- **`voting-circuits 0.10.2`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
 - **`vote-commitment-tree 0.5.0`** and
   **`vote-commitment-tree-client 0.7.0`** for vote commitment tree state
