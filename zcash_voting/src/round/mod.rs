@@ -348,8 +348,14 @@ impl VotingDb {
 
     /// Returns the policy a round's bundle plan must be derived with.
     ///
-    /// Falls back to `requested` for rounds that have no stored policy, which is
-    /// every round planned before the policy was recorded.
+    /// A stored policy is authoritative. Rounds with no stored policy fall back
+    /// to `requested`, with one exception: a round that already has persisted
+    /// bundle rows but no stored policy was planned by an SDK predating the
+    /// privacy trim, so the trim is disabled for it. Re-deriving those rows
+    /// under a trimming policy would plan a smaller bundle count than storage
+    /// holds and permanently reject the round. Only the trim is overridden, so
+    /// the caller's note capacity and value threshold still apply -- those are
+    /// what the persisted rows were planned with.
     pub(crate) fn effective_bundle_policy(
         &self,
         round_id: &str,
@@ -357,7 +363,13 @@ impl VotingDb {
     ) -> Result<BundlePolicy, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        Ok(queries::get_round_bundle_policy(&conn, round_id, &wallet_id)?.unwrap_or(requested))
+        if let Some(stored) = queries::get_round_bundle_policy(&conn, round_id, &wallet_id)? {
+            return Ok(stored);
+        }
+        if queries::get_bundle_count(&conn, round_id, &wallet_id)? > 0 {
+            return Ok(requested.with_max_privacy_bundles(None));
+        }
+        Ok(requested)
     }
 
     /// Creates bundle rows for `notes`, or validates existing bundle rows.
@@ -777,6 +789,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(revalidated.bundle_count, 6);
+    }
+
+    #[test]
+    fn ensure_bundles_disables_the_privacy_trim_for_rounds_migrated_from_launch() {
+        // The v13 -> v14 in-place migration preserves bundle rows but leaves
+        // `bundle_policy_json` NULL. Those rows were planned before the trim
+        // existed, so re-deriving them under the current default would plan a
+        // smaller bundle count and reject the round for the rest of its life --
+        // stranding every bundle the voter had not yet submitted.
+        let db = test_db("wallet-migrated-launch-round");
+        let pre_trim = BundlePolicy::default().with_max_privacy_bundles(None);
+        // Value concentrated in three notes plus a dust tail: the shape the
+        // trim collapses, and the shape a migrated round can already hold.
+        let big = 1_000 * crate::governance::BALLOT_DIVISOR;
+        let mut notes: Vec<NoteInfo> = (0..3).map(|i| note(i, big)).collect();
+        notes.extend((3..23).map(|i| note(i, big / 500)));
+        let planned = db
+            .ensure_bundles_with_policy(ROUND_ID, &notes, pre_trim)
+            .unwrap();
+        assert_eq!(planned.bundle_count, 5);
+        db.conn()
+            .execute(
+                "UPDATE rounds SET bundle_policy_json = NULL WHERE round_id = ?1",
+                rusqlite::params![ROUND_ID],
+            )
+            .unwrap();
+
+        // The upgraded SDK passes its new default, which trims to two bundles.
+        assert_eq!(
+            crate::note_bundling::chunk_notes_with_policy(&notes, BundlePolicy::default())
+                .bundles
+                .len(),
+            2
+        );
+        let resumed = db
+            .ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::default())
+            .unwrap();
+
+        assert_eq!(resumed.bundle_count, 5);
+        assert!(resumed.privacy_trim.is_empty());
+    }
+
+    #[test]
+    fn ensure_bundles_with_skipped_suffix_disables_the_trim_for_migrated_rounds() {
+        // The delegation path reaches storage through the skipped-suffix
+        // variant, which rejects a plan shorter than the persisted rows.
+        let db = test_db("wallet-migrated-suffix-round");
+        let pre_trim = BundlePolicy::default().with_max_privacy_bundles(None);
+        let big = 1_000 * crate::governance::BALLOT_DIVISOR;
+        let mut notes: Vec<NoteInfo> = (0..3).map(|i| note(i, big)).collect();
+        notes.extend((3..23).map(|i| note(i, big / 500)));
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, pre_trim)
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE rounds SET bundle_policy_json = NULL WHERE round_id = ?1",
+                rusqlite::params![ROUND_ID],
+            )
+            .unwrap();
+
+        let resumed = db
+            .ensure_bundles_with_skipped_suffix_with_policy(
+                ROUND_ID,
+                &notes,
+                BundlePolicy::default(),
+            )
+            .unwrap();
+
+        assert_eq!(resumed.bundle_count, 5);
+    }
+
+    #[test]
+    fn ensure_bundles_still_trims_a_round_with_no_persisted_rows() {
+        // The override is scoped to rounds that already have bundle rows. A
+        // round planned for the first time after the upgrade must still trim.
+        let db = test_db("wallet-fresh-round-trims");
+        let big = 1_000 * crate::governance::BALLOT_DIVISOR;
+        let mut notes: Vec<NoteInfo> = (0..3).map(|i| note(i, big)).collect();
+        notes.extend((3..23).map(|i| note(i, big / 500)));
+
+        let planned = db
+            .ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::default())
+            .unwrap();
+
+        assert_eq!(planned.bundle_count, 2);
+        assert!(!planned.privacy_trim.is_empty());
     }
 
     #[test]

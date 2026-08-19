@@ -42,6 +42,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   casting its vote cannot re-create the randomly sampled `van_comm_rand` that
   ZKP #2 needs, and its governance nullifiers are already spent on chain, so a
   reset would have cost that round's voting weight with no way to recover it.
+  Rounds carried across that upgrade have no stored bundle policy, so the
+  privacy trim is disabled for any round that already has persisted bundle
+  rows; they keep re-deriving the plan they were signed against.
 - Added `share::pending_rounds` so wallets can restore unconfirmed helper-share
   tracking with the caller context persisted for each round.
 - Extended `zcash_voting` with mutually exclusive `upstream` (default) and
