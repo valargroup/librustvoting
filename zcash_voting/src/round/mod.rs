@@ -350,7 +350,7 @@ impl VotingDb {
     ///
     /// Falls back to `requested` for rounds that have no stored policy, which is
     /// every round planned before the policy was recorded.
-    fn effective_bundle_policy(
+    pub(crate) fn effective_bundle_policy(
         &self,
         round_id: &str,
         requested: BundlePolicy,

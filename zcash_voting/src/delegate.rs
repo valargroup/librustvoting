@@ -513,15 +513,10 @@ where
 
     // Ensure the round is present in the voting database.
     voting_db.ensure_round(network, &round_params, None)?;
-    // Ensure the bundles are present in the voting database.
-    let layout = voting_db.ensure_bundles_with_skipped_suffix_with_policy(
+    let (layout, bundle_note_infos) = ensure_delegation_bundle_selection(
+        voting_db,
         &round_id,
         &wallet_inputs.round_note_infos,
-        params.bundle_policy,
-    )?;
-    let bundle_note_infos = crate::round::bundle_notes_for_index_with_policy(
-        &wallet_inputs.round_note_infos,
-        &layout,
         params.bundle_index,
         params.bundle_policy,
     )?;
@@ -543,6 +538,31 @@ where
     prepared.ensure_witnesses(voting_db, wallet_db)?;
 
     Ok(prepared)
+}
+
+fn ensure_delegation_bundle_selection(
+    voting_db: &VotingDb,
+    round_id: &str,
+    round_note_infos: &[NoteInfo],
+    bundle_index: u32,
+    requested_policy: BundlePolicy,
+) -> Result<(BundleLayout, Vec<NoteInfo>), VotingError> {
+    // Selection must use the same effective policy as validation. A persisted
+    // round policy is authoritative when callers resume after their defaults
+    // have changed.
+    let policy = voting_db.effective_bundle_policy(round_id, requested_policy)?;
+    let layout = voting_db.ensure_bundles_with_skipped_suffix_with_policy(
+        round_id,
+        round_note_infos,
+        policy,
+    )?;
+    let bundle_note_infos = crate::round::bundle_notes_for_index_with_policy(
+        round_note_infos,
+        &layout,
+        bundle_index,
+        policy,
+    )?;
+    Ok((layout, bundle_note_infos))
 }
 
 /// Inputs gathered from lightwalletd and the wallet before voting-DB work.
@@ -1454,6 +1474,45 @@ mod tests {
             &prepared.delegation_keys.hotkey_raw_address,
             hotkey.raw_orchard_address()
         );
+    }
+
+    #[test]
+    fn delegation_note_selection_reuses_the_persisted_bundle_policy() {
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("delegation-persisted-policy");
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "03".repeat(32),
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        voting_db
+            .ensure_round(Network::Regtest, &round_params, None)
+            .unwrap();
+
+        let notes: Vec<_> = (0..6)
+            .map(|position| note_info(position, crate::governance::BALLOT_DIVISOR))
+            .collect();
+        let persisted_policy = BundlePolicy::new(1).unwrap();
+        let initial = voting_db
+            .ensure_bundles_with_policy(&round_params.vote_round_id, &notes, persisted_policy)
+            .unwrap();
+        assert_eq!(initial.bundle_count, 6);
+
+        // The current default would produce only two bundles, so index 5 is
+        // valid only when both validation and selection honor stored policy.
+        let (resumed, selected) = ensure_delegation_bundle_selection(
+            &voting_db,
+            &round_params.vote_round_id,
+            &notes,
+            5,
+            BundlePolicy::default(),
+        )
+        .unwrap();
+
+        assert_eq!(resumed.bundle_count, 6);
+        assert_eq!(selected.len(), 1);
     }
 
     #[test]
