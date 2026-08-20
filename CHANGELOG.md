@@ -4,6 +4,31 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- Accept `static_config_version: 2` static voting configs, which replace v1's
+  single `dynamic_config_url` with an ordered `dynamic_config_urls` mirror list.
+  `ResolvedStaticVotingConfig` gains `dynamic_config_urls` and
+  `static_config_version`; `dynamic_config_url` is retained as the first mirror
+  so v1 callers and every existing v1 hash pin keep working unchanged.
+- Added `resolve_dynamic_voting_config_from_attempts`, which takes the wallet's
+  ordered per-mirror fetch outcomes (`DynamicConfigAttempt`) and returns the
+  first that resolves plus the mirrors it passed over
+  (`DynamicConfigMirrorFailure`). A mirror is skipped when its fetch failed, its
+  bytes did not decode, or its versions are unsupported; one that resolves but
+  authenticates no rounds is deprioritized rather than skipped, so a round-less
+  resolution is still returned when no mirror carries a verifiable round set.
+  Falling back widens availability, not trust: every candidate is still
+  authenticated against the static trusted keys, and the static hash pin is
+  unchanged. Resolving from a non-first mirror emits the new
+  `ConfigConditionKind::DynamicMirrorFallbackUsed` condition.
+
+### Changed
+- `ConfigConditionKind::StaticHashPinVerified` now reports the real outcome. It
+  previously reported `status: true` even when the static config source carried
+  no `?checksum=sha256:` pin and no verification had run.
+
 ## v3.1.0-rc.2
 
 ### Added
