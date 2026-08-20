@@ -59,6 +59,7 @@ const BPS_DENOMINATOR: u128 = 10_000;
 /// change an older round. Any extension here must add the corresponding field
 /// to a new persisted schema version and define its conversion explicitly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedBundlePolicy")]
 pub struct BundlePolicy {
     max_real_notes_per_bundle: usize,
     bundle_addition_threshold_zatoshi: Option<u64>,
@@ -66,8 +67,39 @@ pub struct BundlePolicy {
     ///
     /// Treating absence as disabled preserves the behavior of those policies
     /// instead of silently applying the current trim defaults on deserialization.
+    privacy_trim: Option<PrivacyTrimPolicy>,
+}
+
+/// Deserialization shape for [`BundlePolicy`].
+///
+/// Serde must not construct the public policy directly because doing so would
+/// bypass the capacity and privacy-budget validation enforced by its builders.
+#[derive(Deserialize)]
+struct UncheckedBundlePolicy {
+    max_real_notes_per_bundle: usize,
+    bundle_addition_threshold_zatoshi: Option<u64>,
     #[serde(default)]
     privacy_trim: Option<PrivacyTrimPolicy>,
+}
+
+impl TryFrom<UncheckedBundlePolicy> for BundlePolicy {
+    type Error = VotingError;
+
+    fn try_from(value: UncheckedBundlePolicy) -> Result<Self, Self::Error> {
+        let mut policy = Self::new(value.max_real_notes_per_bundle)?;
+        if let Some(threshold) = value.bundle_addition_threshold_zatoshi {
+            policy = policy.with_bundle_addition_threshold(threshold);
+        }
+
+        let Some(privacy_trim) = value.privacy_trim else {
+            return Ok(policy.with_max_privacy_bundles(None));
+        };
+
+        Ok(policy
+            .with_max_privacy_bundles(Some(privacy_trim.max_bundles))
+            .with_privacy_drop_bps(privacy_trim.drop_bps)?
+            .with_max_privacy_drop_zatoshi(privacy_trim.max_drop_zatoshi))
+    }
 }
 
 /// Configuration for dropping a low-value bundle tail.
@@ -1137,6 +1169,44 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<BundlePolicy>(json).unwrap(),
             policy
+        );
+    }
+
+    #[test]
+    fn bundle_policy_json_rejects_invalid_real_note_capacity() {
+        for capacity in [0, BUNDLE_NOTE_SLOTS + 1] {
+            let json = serde_json::json!({
+                "max_real_notes_per_bundle": capacity,
+                "bundle_addition_threshold_zatoshi": null,
+                "privacy_trim": null
+            });
+
+            let error = serde_json::from_value::<BundlePolicy>(json).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("max_real_notes_per_bundle must be in"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_policy_json_rejects_privacy_drop_bps_above_max() {
+        let json = serde_json::json!({
+            "max_real_notes_per_bundle": BUNDLE_NOTE_SLOTS,
+            "bundle_addition_threshold_zatoshi": null,
+            "privacy_trim": {
+                "max_bundles": 1,
+                "drop_bps": MAX_PRIVACY_DROP_BPS + 1,
+                "max_drop_zatoshi": null
+            }
+        });
+
+        let error = serde_json::from_value::<BundlePolicy>(json).unwrap_err();
+        assert!(
+            error.to_string().contains("privacy_drop_bps must be <="),
+            "{error}"
         );
     }
 
