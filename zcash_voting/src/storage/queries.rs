@@ -6,7 +6,7 @@ use rusqlite::{named_params, Connection, OptionalExtension, Transaction, Transac
 use serde::{Deserialize, Serialize};
 use voting_circuits::delegation::ImtProofData;
 
-use crate::note_bundling::{BundlePolicy, MAX_PRIVACY_DROP_BPS};
+use crate::note_bundling::BundlePolicy;
 use crate::storage::{KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord};
 use crate::types::{
     Network, NoteInfo, ShareDelegationRecord, VotingError, VotingRoundParams, WitnessData,
@@ -97,6 +97,7 @@ fn decode_bundle_policy(json: &str) -> Result<BundlePolicy, String> {
 #[cfg(test)]
 mod bundle_policy_schema_tests {
     use super::*;
+    use crate::note_bundling::MAX_PRIVACY_DROP_BPS;
 
     fn custom_policy() -> BundlePolicy {
         BundlePolicy::new(1)

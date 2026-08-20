@@ -451,8 +451,9 @@ impl VotingDb {
                 bundle_notes,
             )?;
         }
-        // Backfill only an actually missing policy. An unreadable non-NULL
-        // value may belong to a newer SDK and must survive this fallback.
+        // Record the policy only after it reproduces every persisted bundle.
+        // This also replaces unreadable policy JSON with the validated fallback
+        // so later passes do not reinterpret the same rows differently.
         queries::set_round_bundle_policy(&conn, round_id, &wallet_id, policy)?;
 
         Ok(BundleLayout {
@@ -518,7 +519,8 @@ impl VotingDb {
 
         let stored_bundles = &bundles[..stored_count as usize];
         validate_persisted_bundle_notes(self, round_id, stored_bundles)?;
-        // Backfill only legacy NULL policies after their prefix validates.
+        // Record the policy only after it reproduces the persisted prefix,
+        // replacing unreadable policy JSON with the validated fallback.
         let conn = self.conn();
         queries::set_round_bundle_policy(&conn, round_id, &self.wallet_id(), policy)?;
         Ok(BundleLayout {
