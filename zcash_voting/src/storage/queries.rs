@@ -708,13 +708,23 @@ pub fn get_round_bundle_policy(
     Ok(stored.and_then(|json| decode_bundle_policy(&json).ok()))
 }
 
-/// Records the bundle policy that produced a round's persisted bundle rows
-/// when the round does not already have one.
+/// Records the bundle policy that produced a round's persisted bundle rows.
 ///
 /// Later planning passes re-derive with this value instead of the caller's, so
 /// an SDK upgrade that changes the defaults cannot invalidate bundles that were
-/// already signed or submitted. A non-NULL unreadable value may have been
-/// written by a newer SDK and must not be replaced by this binary's fallback.
+/// already signed or submitted.
+///
+/// # Invariant
+///
+/// `bundle_policy_json` is non-NULL if and only if the round has at least one
+/// bundle row, and it holds the policy that produced those rows. The `EXISTS`
+/// clause below enforces one direction; [`delete_bundles_from`] enforces the
+/// other by clearing the column once the last row is gone.
+///
+/// Callers writing a freshly planned round must therefore insert the bundle
+/// rows *before* calling this, in the same transaction. A plan with no
+/// surviving bundles writes nothing, which leaves the round free to replan
+/// under a different policy.
 pub fn set_round_bundle_policy(
     conn: &Connection,
     round_id: &str,
@@ -728,7 +738,8 @@ pub fn set_round_bundle_policy(
         "UPDATE rounds SET bundle_policy_json = :policy
          WHERE round_id = :round_id
            AND wallet_id = :wallet_id
-           AND bundle_policy_json IS NULL",
+           AND EXISTS (SELECT 1 FROM bundles b
+                        WHERE b.round_id = :round_id AND b.wallet_id = :wallet_id)",
         named_params! {
             ":policy": json,
             ":round_id": round_id,

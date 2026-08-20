@@ -447,10 +447,13 @@ impl VotingDb {
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("failed to begin bundle setup transaction: {e}"),
         })?;
-        queries::set_round_bundle_policy(&tx, round_id, &wallet_id, policy)?;
         for (i, chunk) in plan.bundles.iter().enumerate() {
             queries::insert_bundle_notes(&tx, round_id, &wallet_id, i as u32, chunk)?;
         }
+        // Must follow the inserts: the policy is only stored for a round that
+        // has bundle rows to describe. A plan whose bundles were all sub-ballot
+        // writes nothing, so a retry can replan under a corrected policy.
+        queries::set_round_bundle_policy(&tx, round_id, &wallet_id, policy)?;
         tx.commit().map_err(|e| VotingError::Internal {
             message: format!("failed to commit bundle setup transaction: {e}"),
         })?;
