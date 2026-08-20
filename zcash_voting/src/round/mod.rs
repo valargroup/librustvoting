@@ -361,13 +361,14 @@ impl VotingDb {
 
     /// Returns the policy a round's bundle plan must be derived with.
     ///
-    /// A stored policy is authoritative. Rounds with no stored policy fall back
-    /// to `requested`, with one exception: a round that already has persisted
-    /// bundle rows but no stored policy was planned by an SDK predating the
-    /// privacy trim, so the trim is disabled for it. Re-deriving those rows
-    /// under a trimming policy would plan a smaller bundle count than storage
-    /// holds and permanently reject the round. Only the trim is overridden, so
-    /// the caller's note capacity and value threshold still apply -- those are
+    /// A stored readable policy is authoritative. Rounds with no stored policy,
+    /// or whose stored JSON is an unknown/unreadable schema, fall back to
+    /// `requested`, with one exception: a round that already has persisted
+    /// bundle rows was planned without a readable policy for this binary, so
+    /// the trim is disabled for it. Re-deriving those rows under a trimming
+    /// policy would plan a smaller bundle count than storage holds and
+    /// permanently reject the round. Only the trim is overridden, so the
+    /// caller's note capacity and value threshold still apply -- those are
     /// what the persisted rows were planned with.
     pub(crate) fn effective_bundle_policy(
         &self,
@@ -900,6 +901,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(resumed.bundle_count, 5);
+    }
+
+    #[test]
+    fn ensure_bundles_disables_the_privacy_trim_for_unreadable_future_policy_schema() {
+        // A future SDK may persist a higher schema version. Downgrading must
+        // not map that to Internal and brick the round; treat it like NULL so
+        // existing rows and van_comm_rand stay usable without clear_round.
+        let db = test_db("wallet-future-policy-schema");
+        let pre_trim = BundlePolicy::default().with_max_privacy_bundles(None);
+        let big = 1_000 * crate::governance::BALLOT_DIVISOR;
+        let mut notes: Vec<NoteInfo> = (0..3).map(|i| note(i, big)).collect();
+        notes.extend((3..23).map(|i| note(i, big / 500)));
+        let planned = db
+            .ensure_bundles_with_policy(ROUND_ID, &notes, pre_trim)
+            .unwrap();
+        assert_eq!(planned.bundle_count, 5);
+        db.conn()
+            .execute(
+                "UPDATE rounds SET bundle_policy_json = ?1 WHERE round_id = ?2",
+                rusqlite::params![
+                    r#"{"version":2,"policy":{"max_real_notes_per_bundle":2}}"#,
+                    ROUND_ID
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            queries::get_round_bundle_policy(&db.conn(), ROUND_ID, &db.wallet_id()).unwrap(),
+            None
+        );
+        assert_eq!(
+            db.effective_bundle_policy(ROUND_ID, BundlePolicy::default())
+                .unwrap(),
+            BundlePolicy::default().with_max_privacy_bundles(None)
+        );
+
+        let resumed = db
+            .ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::default())
+            .unwrap();
+        assert_eq!(resumed.bundle_count, 5);
+        assert!(resumed.privacy_trim.is_empty());
+        assert_eq!(
+            queries::get_round_bundle_policy(&db.conn(), ROUND_ID, &db.wallet_id()).unwrap(),
+            Some(BundlePolicy::default().with_max_privacy_bundles(None))
+        );
     }
 
     #[test]

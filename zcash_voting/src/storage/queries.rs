@@ -682,8 +682,12 @@ pub fn get_bundle_count(
 
 /// Reads the bundle policy persisted with a round, if one was stored.
 ///
-/// Returns `None` for rounds whose bundles were planned before the policy was
-/// recorded, so callers can fall back to the policy they were handed.
+/// Returns `None` when the column is NULL, or when the stored JSON is an
+/// unknown schema version / otherwise unreadable. Callers then fall back the
+/// same way as for pre-policy rounds: keep the caller's capacity/threshold and
+/// disable the privacy trim when bundle rows already exist. Strict decode is
+/// still used when a readable policy is present; this only avoids bricking a
+/// round after a future schema bump on downgrade.
 pub fn get_round_bundle_policy(
     conn: &Connection,
     round_id: &str,
@@ -701,13 +705,7 @@ pub fn get_round_bundle_policy(
         })?
         .flatten();
 
-    stored
-        .map(|json| {
-            decode_bundle_policy(&json).map_err(|e| VotingError::Internal {
-                message: format!("stored bundle policy for round {round_id} is unreadable: {e}"),
-            })
-        })
-        .transpose()
+    Ok(stored.and_then(|json| decode_bundle_policy(&json).ok()))
 }
 
 /// Records the bundle policy that produced a round's persisted bundle rows.
