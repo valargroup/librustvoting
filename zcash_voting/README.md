@@ -219,6 +219,12 @@ let (resolved, skipped) = resolve_dynamic_voting_config_from_attempts(
 # }
 ```
 
+Async wallets can instead call `resolve_dynamic_voting_config_over_mirrors`,
+which walks the same list lazily and wraps each fetch in
+`DYNAMIC_MIRROR_FETCH_TIMEOUT` (30s) so a stalled primary cannot block a
+healthy later mirror. The wallet-example and `config_fetcher` reference
+transports use that helper; wallets with a custom stack should apply an
+equivalent per-attempt deadline before recording a fetch failure.
 A mirror is skipped when its fetch failed, its bytes did not decode, or it
 advertised unsupported versions. A mirror that resolves but authenticates no
 rounds is deprioritized rather than skipped: later mirrors are tried first, but
@@ -228,7 +234,8 @@ reported through `skipped_round_ids`. When no mirror resolves at all, the error
 is `VotingConfigError::AllMirrorsFailed`, whose message enumerates each URL and
 its reason — no single mirror's error can stand in for the set, since mirrors
 commonly fail for different reasons. A one-mirror list, which is every v1
-static config, has nothing to enumerate and reports its own error verbatim.
+static config, has nothing to enumerate and reports its own error verbatim —
+including the transport cause when the fetch itself failed.
 
 Fallback widens **availability, not trust**. Whichever mirror answers, the
 static hash pin still covers the trust anchor and every round is still
@@ -259,9 +266,10 @@ A direct-HTTPS reference transport lives in the `wallet-example` crate as
 to persist the resolved summary used for future switch decisions:
 
 - `resolve_voting_config_over_https` fetches the static config, then walks its
-  `dynamic_config_urls` lazily — stopping at the first mirror that both fetches
-  and authenticates — and returns the `ResolvedVotingConfig` together with the
-  mirrors it skipped.
+  `dynamic_config_urls` lazily via `resolve_dynamic_voting_config_over_mirrors`
+  — each attempt bounded by `DYNAMIC_MIRROR_FETCH_TIMEOUT`, stopping at the
+  first mirror that both fetches and authenticates — and returns the
+  `ResolvedVotingConfig` together with the mirrors it skipped.
 - `resolve_config_switch` resolves the config and classifies it against the
   previously stored summary, returning the `ConfigSwitchDecision` plus the
   `StoredConfigState` to persist for the next run.

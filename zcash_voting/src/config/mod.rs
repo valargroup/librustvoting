@@ -58,6 +58,8 @@
 //!   choose the correct state transition.
 //!
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -604,8 +606,12 @@ pub fn resolve_dynamic_voting_config_from_attempts(
                     url: attempt.url,
                     reason: format!("fetch failed: {error}"),
                 });
+                // Keep the transport cause in the error message. For the
+                // single-mirror / v1 path this is returned verbatim, so callers
+                // still see DNS failures and HTTP statuses instead of a bare
+                // "dynamic config fetch failed".
                 last_error = Some(VotingConfigError::RemoteAuthenticationFailed {
-                    message: "dynamic config fetch failed".to_string(),
+                    message: format!("dynamic config fetch failed: {error}"),
                 });
                 continue;
             }
@@ -658,6 +664,86 @@ pub fn resolve_dynamic_voting_config_from_attempts(
             .map(|failure| format!("{}: {}", failure.url, failure.reason))
             .collect::<Vec<_>>()
             .join("; "),
+    })
+}
+
+/// Default bound on a single dynamic-config mirror fetch for reference transports.
+///
+/// A blackholed connection or a server that stops sending must not leave a
+/// healthy later mirror unused. Wallets with their own networking stack should
+/// apply an equivalent per-attempt deadline before reporting a fetch failure to
+/// [`resolve_dynamic_voting_config_from_attempts`].
+pub const DYNAMIC_MIRROR_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Lazily fetch and resolve dynamic config mirrors, bounding each attempt.
+///
+/// Calls `fetch` for each URL in
+/// [`ResolvedStaticVotingConfig::dynamic_config_urls`] in order, wrapping every
+/// call in `timeout`. After each attempt, preference rules from
+/// [`resolve_dynamic_voting_config_from_attempts`] decide whether to stop (a
+/// resolution with authenticated rounds) or keep walking (a round-less
+/// resolution is kept while later mirrors are still tried).
+///
+/// `fetch` should return response bytes or a transport error string. A timeout
+/// is recorded as a fetch failure with an explicit timed-out reason so it
+/// participates in the same skip / all-mirrors-failed path as any other
+/// transport error.
+///
+/// # Errors
+///
+/// Propagates the error from [`resolve_dynamic_voting_config_from_attempts`]
+/// when every mirror fails and no round-less resolution was kept. Returns
+/// [`VotingConfigError::InvalidInput`] if the static config names no mirrors.
+pub async fn resolve_dynamic_voting_config_over_mirrors<F, Fut>(
+    resolved_static: ResolvedStaticVotingConfig,
+    timeout: Duration,
+    options: ResolveVotingConfigOptions,
+    mut fetch: F,
+) -> Result<(ResolvedVotingConfig, Vec<DynamicConfigMirrorFailure>), VotingConfigError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, String>>,
+{
+    let urls = resolved_static.dynamic_config_urls.clone();
+    if urls.is_empty() {
+        return Err(VotingConfigError::InvalidInput {
+            message: "dynamic config attempts must contain at least one entry".to_string(),
+        });
+    }
+
+    let mut attempts = Vec::new();
+    let mut best = None;
+
+    for url in urls.iter() {
+        let attempt = match tokio::time::timeout(timeout, fetch(url.clone())).await {
+            Ok(Ok(bytes)) => DynamicConfigAttempt::fetched(url.clone(), bytes),
+            Ok(Err(error)) => DynamicConfigAttempt::failed(url.clone(), error),
+            Err(_) => DynamicConfigAttempt::failed(
+                url.clone(),
+                format!("timed out after {}s", timeout.as_secs()),
+            ),
+        };
+        attempts.push(attempt);
+
+        match resolve_dynamic_voting_config_from_attempts(
+            resolved_static.clone(),
+            attempts.clone(),
+            options.clone(),
+        ) {
+            Ok(outcome) => {
+                let has_rounds = !outcome.0.authenticated_rounds.is_empty();
+                best = Some(outcome);
+                if has_rounds {
+                    break;
+                }
+            }
+            Err(e) if attempts.len() == urls.len() && best.is_none() => return Err(e),
+            Err(_) => {}
+        }
+    }
+
+    best.ok_or_else(|| VotingConfigError::InvalidInput {
+        message: "dynamic config attempts must contain at least one entry".to_string(),
     })
 }
 
@@ -2667,6 +2753,32 @@ mod tests {
         );
     }
 
+    /// A v1 / one-URL fetch failure must surface the transport cause, not a
+    /// bare "dynamic config fetch failed" that drops DNS or HTTP detail.
+    #[test]
+    fn single_mirror_fetch_failure_preserves_transport_error() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&signing_key)).unwrap();
+
+        let error = resolve_dynamic_voting_config_from_attempts(
+            resolved_static.clone(),
+            vec![DynamicConfigAttempt::failed(
+                &resolved_static.dynamic_config_url,
+                "dns error: no such host",
+            )],
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            VotingConfigError::RemoteAuthenticationFailed {
+                message: "dynamic config fetch failed: dns error: no such host".to_string(),
+            }
+        );
+    }
+
     #[test]
     fn mirror_fallback_rejects_empty_attempts() {
         let signing_key = SigningKey::from_bytes(&[3u8; 32]);
@@ -2682,5 +2794,46 @@ mod tests {
             matches!(&error, VotingConfigError::InvalidInput { message } if message.contains("at least one entry")),
             "unexpected error: {error:?}"
         );
+    }
+
+    /// A primary that never answers must not block a healthy secondary: each
+    /// mirror attempt is bounded, and the timed-out URL is skipped like any
+    /// other transport failure.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_primary_mirror_times_out_and_falls_back() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let healthy = dynamic_bytes(&signing_key);
+        let timeout = Duration::from_secs(5);
+
+        let (resolved, skipped) = resolve_dynamic_voting_config_over_mirrors(
+            resolved_static_v2(&signing_key),
+            timeout,
+            ResolveVotingConfigOptions::default(),
+            |url| {
+                let healthy = healthy.clone();
+                async move {
+                    if url == MIRROR_A {
+                        std::future::pending::<Result<Vec<u8>, String>>().await
+                    } else {
+                        Ok(healthy)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.authenticated_rounds.len(), 1);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].url, MIRROR_A);
+        assert!(
+            skipped[0].reason.contains("timed out after 5s"),
+            "unexpected skip reason: {}",
+            skipped[0].reason
+        );
+        assert!(resolved
+            .conditions
+            .iter()
+            .any(|c| c.kind == ConfigConditionKind::DynamicMirrorFallbackUsed));
     }
 }

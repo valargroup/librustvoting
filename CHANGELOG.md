@@ -21,11 +21,18 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   resolution is still returned when no mirror carries a verifiable round set.
   When no mirror resolves at all, the new `VotingConfigError::AllMirrorsFailed`
   enumerates every mirror and its reason; a one-mirror list, which is every v1
-  static config, reports its own error verbatim instead.
+  static config, reports its own error verbatim instead — including the
+  transport cause on a fetch failure, rather than a bare
+  "dynamic config fetch failed".
   Falling back widens availability, not trust: every candidate is still
   authenticated against the static trusted keys, and the static hash pin is
   unchanged. Resolving from a non-first mirror emits the new
   `ConfigConditionKind::DynamicMirrorFallbackUsed` condition.
+- Added `resolve_dynamic_voting_config_over_mirrors` and
+  `DYNAMIC_MIRROR_FETCH_TIMEOUT` (30s): a reference lazy walk that bounds each
+  mirror fetch so a blackholed primary cannot leave a healthy later mirror
+  unused. The wallet-example and `config_fetcher` transports use it; wallets
+  with their own networking should apply an equivalent per-attempt deadline.
 
 ### Changed
 - `ConfigConditionKind::StaticHashPinVerified` now reports the real outcome. It
