@@ -451,8 +451,8 @@ impl VotingDb {
                 bundle_notes,
             )?;
         }
-        // Successful validation proves this policy reproduces legacy rows.
-        // Persist it so later round-aware reads never need caller policy input.
+        // Backfill only an actually missing policy. An unreadable non-NULL
+        // value may belong to a newer SDK and must survive this fallback.
         queries::set_round_bundle_policy(&conn, round_id, &wallet_id, policy)?;
 
         Ok(BundleLayout {
@@ -518,7 +518,7 @@ impl VotingDb {
 
         let stored_bundles = &bundles[..stored_count as usize];
         validate_persisted_bundle_notes(self, round_id, stored_bundles)?;
-        // Backfill legacy rounds after their persisted prefix validates.
+        // Backfill only legacy NULL policies after their prefix validates.
         let conn = self.conn();
         queries::set_round_bundle_policy(&conn, round_id, &self.wallet_id(), policy)?;
         Ok(BundleLayout {
@@ -907,9 +907,11 @@ mod tests {
     fn ensure_bundles_disables_the_privacy_trim_for_unreadable_future_policy_schema() {
         // A future SDK may persist a higher schema version. Downgrading must
         // not map that to Internal and brick the round; treat it like NULL so
-        // existing rows and van_comm_rand stay usable without clear_round.
+        // existing rows and van_comm_rand stay usable without clear_round,
+        // while preserving the future policy for a subsequent upgrade.
         let db = test_db("wallet-future-policy-schema");
         let pre_trim = BundlePolicy::default().with_max_privacy_bundles(None);
+        let future_policy_json = r#"{"version":2,"policy":{"max_real_notes_per_bundle":2}}"#;
         let big = 1_000 * crate::governance::BALLOT_DIVISOR;
         let mut notes: Vec<NoteInfo> = (0..3).map(|i| note(i, big)).collect();
         notes.extend((3..23).map(|i| note(i, big / 500)));
@@ -920,10 +922,7 @@ mod tests {
         db.conn()
             .execute(
                 "UPDATE rounds SET bundle_policy_json = ?1 WHERE round_id = ?2",
-                rusqlite::params![
-                    r#"{"version":2,"policy":{"max_real_notes_per_bundle":2}}"#,
-                    ROUND_ID
-                ],
+                rusqlite::params![future_policy_json, ROUND_ID],
             )
             .unwrap();
 
@@ -943,8 +942,45 @@ mod tests {
         assert_eq!(resumed.bundle_count, 5);
         assert!(resumed.privacy_trim.is_empty());
         assert_eq!(
-            queries::get_round_bundle_policy(&db.conn(), ROUND_ID, &db.wallet_id()).unwrap(),
-            Some(BundlePolicy::default().with_max_privacy_bundles(None))
+            db.conn()
+                .query_row(
+                    "SELECT bundle_policy_json FROM rounds WHERE round_id = ?1",
+                    rusqlite::params![ROUND_ID],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            future_policy_json
+        );
+    }
+
+    #[test]
+    fn ensure_bundles_preserves_unreadable_future_policy_without_existing_rows() {
+        let db = test_db("wallet-future-policy-without-bundles");
+        let future_policy_json = r#"{"version":2,"policy":{"max_real_notes_per_bundle":2}}"#;
+        db.conn()
+            .execute(
+                "UPDATE rounds SET bundle_policy_json = ?1 WHERE round_id = ?2",
+                rusqlite::params![future_policy_json, ROUND_ID],
+            )
+            .unwrap();
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 0);
+
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        let planned = db.ensure_bundles(ROUND_ID, &notes).unwrap();
+
+        assert_eq!(planned.bundle_count, 1);
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT bundle_policy_json FROM rounds WHERE round_id = ?1",
+                    rusqlite::params![ROUND_ID],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            future_policy_json
         );
     }
 

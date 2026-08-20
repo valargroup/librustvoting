@@ -708,11 +708,13 @@ pub fn get_round_bundle_policy(
     Ok(stored.and_then(|json| decode_bundle_policy(&json).ok()))
 }
 
-/// Records the bundle policy that produced a round's persisted bundle rows.
+/// Records the bundle policy that produced a round's persisted bundle rows
+/// when the round does not already have one.
 ///
 /// Later planning passes re-derive with this value instead of the caller's, so
 /// an SDK upgrade that changes the defaults cannot invalidate bundles that were
-/// already signed or submitted.
+/// already signed or submitted. A non-NULL unreadable value may have been
+/// written by a newer SDK and must not be replaced by this binary's fallback.
 pub fn set_round_bundle_policy(
     conn: &Connection,
     round_id: &str,
@@ -724,7 +726,9 @@ pub fn set_round_bundle_policy(
     })?;
     conn.execute(
         "UPDATE rounds SET bundle_policy_json = :policy
-         WHERE round_id = :round_id AND wallet_id = :wallet_id",
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_policy_json IS NULL",
         named_params! {
             ":policy": json,
             ":round_id": round_id,
