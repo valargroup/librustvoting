@@ -391,6 +391,17 @@ pub enum VotingConfigError {
     },
     #[error("remote authentication failed: {message}")]
     RemoteAuthenticationFailed { message: String },
+    /// Every dynamic config mirror was tried and none resolved.
+    ///
+    /// `message` enumerates each mirror URL and its reason, and each reason is
+    /// the rendering of that mirror's own [`VotingConfigError`]. This variant
+    /// exists because no single mirror's error can stand in for the whole set:
+    /// mirrors commonly fail for different reasons, and picking one would
+    /// discard the rest. Only produced by
+    /// [`resolve_dynamic_voting_config_from_attempts`], and only when more than
+    /// one mirror was attempted.
+    #[error("all dynamic config mirrors failed: {message}")]
+    AllMirrorsFailed { message: String },
 }
 
 /// Parse and authenticate the static config bytes selected by the wallet.
@@ -563,9 +574,10 @@ pub struct DynamicConfigMirrorFailure {
 ///
 /// # Errors
 ///
-/// Returns [`VotingConfigError::InvalidInput`] if `attempts` is empty, and
-/// otherwise — only when no mirror resolved at all — the last mirror's error
-/// with a message enumerating every mirror and its reason.
+/// Returns [`VotingConfigError::InvalidInput`] if `attempts` is empty. When no
+/// mirror resolved at all, a single attempt reports its own error verbatim,
+/// and multiple attempts report [`VotingConfigError::AllMirrorsFailed`] with a
+/// message enumerating every mirror and its reason.
 pub fn resolve_dynamic_voting_config_from_attempts(
     resolved_static: ResolvedStaticVotingConfig,
     attempts: Vec<DynamicConfigAttempt>,
@@ -576,6 +588,7 @@ pub fn resolve_dynamic_voting_config_from_attempts(
             message: "dynamic config attempts must contain at least one entry".to_string(),
         });
     }
+    let attempt_count = attempts.len();
 
     let mut skipped: Vec<DynamicConfigMirrorFailure> = Vec::new();
     let mut last_error = None;
@@ -626,33 +639,26 @@ pub fn resolve_dynamic_voting_config_from_attempts(
         return Ok(finish(resolved, url, skipped));
     }
 
-    let detail = skipped
-        .iter()
-        .map(|failure| format!("{}: {}", failure.url, failure.reason))
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(
-        match last_error.expect("non-empty attempts record an error") {
-            VotingConfigError::InvalidInput { .. } => VotingConfigError::InvalidInput {
-                message: format!("all dynamic config mirrors failed: {detail}"),
-            },
-            VotingConfigError::DecodeFailed { .. } => VotingConfigError::DecodeFailed {
-                message: format!("all dynamic config mirrors failed: {detail}"),
-            },
-            VotingConfigError::UnsupportedVersion {
-                component,
-                advertised,
-            } => VotingConfigError::UnsupportedVersion {
-                component,
-                advertised,
-            },
-            VotingConfigError::RemoteAuthenticationFailed { .. } => {
-                VotingConfigError::RemoteAuthenticationFailed {
-                    message: format!("all dynamic config mirrors failed: {detail}"),
-                }
-            }
-        },
-    )
+    let only_error = last_error.expect("non-empty attempts record an error");
+    if attempt_count == 1 {
+        // Nothing to enumerate, so report the mirror's own error verbatim. This
+        // keeps the single-mirror path — every v1 static config — identical to
+        // a direct `resolve_dynamic_voting_config` call, kind and message alike.
+        return Err(only_error);
+    }
+
+    // Mirrors routinely fail for different reasons, and no one mirror's error
+    // can represent the set: reducing them to the last one would discard both
+    // the other reasons and the URLs. `reason` already renders each mirror's
+    // own error, so the enumeration preserves every kind, including
+    // `UnsupportedVersion`, whose fields have nowhere else to go.
+    Err(VotingConfigError::AllMirrorsFailed {
+        message: skipped
+            .iter()
+            .map(|failure| format!("{}: {}", failure.url, failure.reason))
+            .collect::<Vec<_>>()
+            .join("; "),
+    })
 }
 
 /// Attach the fallback condition when earlier mirrors were passed over.
@@ -2586,6 +2592,79 @@ mod tests {
             .conditions
             .iter()
             .any(|c| c.kind == ConfigConditionKind::DynamicMirrorFallbackUsed));
+    }
+
+    /// An unsupported-version failure must not swallow the other mirrors: it
+    /// is the one error kind with no message field of its own, so the
+    /// enumeration is the only place its detail can survive.
+    #[test]
+    fn mirror_fallback_preserves_detail_when_last_mirror_is_unsupported_version() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&signing_key)).unwrap();
+        doc["supported_versions"]["vote_server"] = serde_json::json!("v99");
+        let unsupported = doc.to_string().into_bytes();
+
+        let error = resolve_dynamic_voting_config_from_attempts(
+            resolved_static_v2(&signing_key),
+            vec![
+                DynamicConfigAttempt::failed(MIRROR_A, "connection refused"),
+                DynamicConfigAttempt::fetched(MIRROR_B, unsupported),
+            ],
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap_err();
+
+        let VotingConfigError::AllMirrorsFailed { message } = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        // The unreachable mirror survives alongside the version failure.
+        assert!(message.contains(MIRROR_A), "{message}");
+        assert!(message.contains("connection refused"), "{message}");
+        // And the version failure keeps its component and advertised value.
+        assert!(message.contains(MIRROR_B), "{message}");
+        assert!(
+            message.contains("unsupported version for vote_server: v99"),
+            "{message}"
+        );
+    }
+
+    /// A single mirror has nothing to enumerate, so its own error kind must
+    /// survive rather than being flattened into `AllMirrorsFailed`.
+    #[test]
+    fn single_mirror_failure_reports_underlying_error_verbatim() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&signing_key)).unwrap();
+        doc["supported_versions"]["vote_server"] = serde_json::json!("v99");
+        let unsupported = doc.to_string().into_bytes();
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&signing_key)).unwrap();
+
+        let via_attempts = resolve_dynamic_voting_config_from_attempts(
+            resolved_static.clone(),
+            vec![DynamicConfigAttempt::fetched(
+                &resolved_static.dynamic_config_url,
+                unsupported.clone(),
+            )],
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap_err();
+        let direct = resolve_dynamic_voting_config(
+            resolved_static,
+            &unsupported,
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(via_attempts, direct);
+        assert_eq!(
+            via_attempts,
+            VotingConfigError::UnsupportedVersion {
+                component: "vote_server".to_string(),
+                advertised: "v99".to_string(),
+            }
+        );
     }
 
     #[test]

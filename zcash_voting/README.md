@@ -225,7 +225,10 @@ rounds is deprioritized rather than skipped: later mirrors are tried first, but
 if none carries a verifiable round set, the round-less resolution is returned —
 an empty authenticated round set is a valid outcome, with unverifiable rounds
 reported through `skipped_round_ids`. When no mirror resolves at all, the error
-message enumerates each URL and its reason.
+is `VotingConfigError::AllMirrorsFailed`, whose message enumerates each URL and
+its reason — no single mirror's error can stand in for the set, since mirrors
+commonly fail for different reasons. A one-mirror list, which is every v1
+static config, has nothing to enumerate and reports its own error verbatim.
 
 Fallback widens **availability, not trust**. Whichever mirror answers, the
 static hash pin still covers the trust anchor and every round is still

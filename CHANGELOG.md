@@ -19,6 +19,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   bytes did not decode, or its versions are unsupported; one that resolves but
   authenticates no rounds is deprioritized rather than skipped, so a round-less
   resolution is still returned when no mirror carries a verifiable round set.
+  When no mirror resolves at all, the new `VotingConfigError::AllMirrorsFailed`
+  enumerates every mirror and its reason; a one-mirror list, which is every v1
+  static config, reports its own error verbatim instead.
   Falling back widens availability, not trust: every candidate is still
   authenticated against the static trusted keys, and the static hash pin is
   unchanged. Resolving from a non-first mirror emits the new
