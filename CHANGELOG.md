@@ -7,50 +7,47 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## v3.1.0-rc.2
 
 ### Added
-- Added a privacy trim to bundle planning. Bundle count is
-  `ceil(note_count / BUNDLE_NOTE_SLOTS)`, so a holder whose value sits in a few
-  large notes plus a long dust tail emits many delegation submissions that carry
-  almost no voting weight. Planning now drops trailing bundles down to
-  `BundlePolicy::max_privacy_bundles` (default 2) while the discarded value stays
-  inside `BundlePolicy::privacy_drop_bps` (default 1% of selected note value),
-  clamped further by `max_privacy_drop_zatoshi` (default 1,000 ZEC). The count
-  target is best-effort; both budget limits are hard ceilings. Raw excluded note
-  value—not bundle-quantized voting weight—is reported as
-  `PrivacyTrim` on `ChunkResult`, `BundleLayout`,
-  `VotingNoteSelectionResultView`, and `SignedDelegationPayloadView` so wallets
-  can show the voter what was left out.
-
-  This composes with a per-bundle value threshold rather than replacing it. Below
-  100,000 ZEC selected value, a 1% budget cannot pay for a bundle near a 1,000 ZEC
-  cap, so only a cheaper tail can be trimmed. At and above 100,000 ZEC, one full
-  1,000 ZEC bundle can fit, but the default absolute ceiling prevents trimming
-  more raw note value. Callers can set a tighter ceiling or explicitly remove it.
-- Persisted the effective `BundlePolicy` with each round. Once a plan is stored
-  its policy is authoritative and later planning passes re-derive with it, so an
-  SDK upgrade that changes the defaults cannot invalidate bundle rows that were
-  already signed or submitted.
-- Upgraded launched voting databases in place instead of recreating them.
-  Schema changes at or above the launch version now apply ordered `ALTER`
-  statements and preserve persisted round state; only pre-launch databases are
-  still reset. A wallet that upgrades between submitting a delegation and
-  casting its vote cannot re-create the randomly sampled `van_comm_rand` that
-  ZKP #2 needs, and its governance nullifiers are already spent on chain, so a
-  reset would have cost that round's voting weight with no way to recover it.
-  Rounds carried across that upgrade have no stored bundle policy, so the
-  privacy trim is disabled for any round that already has persisted bundle
-  rows; they keep re-deriving the plan they were signed against.
+- Privacy trim in bundle planning: trailing low-value bundles are dropped toward
+  `BundlePolicy::max_privacy_bundles` (default 2) to shrink the observable
+  delegation-submission count. The count is a target; the discarded value is
+  bounded by two hard ceilings, `privacy_drop_bps` (default 1% of selected note
+  value) and `max_privacy_drop_zatoshi` (default 1,000 ZEC).
+- `PrivacyTrim` on `ChunkResult`, `BundleLayout`, `VotingNoteSelectionResultView`,
+  and `SignedDelegationPayloadView`, reporting the raw note value withheld — not
+  its bundle-quantized voting weight. Surface it rather than discarding voting
+  power silently.
+- Round-aware planning helpers that resolve a round's stored policy, so callers
+  no longer supply policy internals: `voting_power_for_round`,
+  `note_bundles_for_round`, `bundle_notes_for_index_for_round`, and
+  `VotingNoteSelectionResultView::from_selected_for_round`.
+- In-place upgrades for launched voting databases. Schema changes at or above the
+  launch version apply ordered `ALTER` statements and keep persisted round state;
+  only pre-launch databases are reset. A reset would have destroyed the randomly
+  sampled `van_comm_rand` of any wallet upgrading between submitting a delegation
+  and casting its vote, costing that round's weight unrecoverably.
 
 ### Changed
-- **Breaking:** added `privacy_trim` to the public `ChunkResult`,
-  `BundleLayout`, `SignedDelegationBundle`, `SignedDelegationPayloadView`, and
-  `VotingNoteSelectionResultView` structs. Downstream struct literals must carry
-  the value returned by bundle planning or use `PrivacyTrim::default()` when no
-  trim occurred. Serde-backed views accept older payloads with the field absent.
+- **Breaking:** `BundlePolicy::default()` now trims. Opt out with
+  `.with_max_privacy_bundles(None)` to keep the previous planning behavior.
+- **Breaking:** added `privacy_trim` to `ChunkResult`, `BundleLayout`,
+  `SignedDelegationBundle`, `SignedDelegationPayloadView`, and
+  `VotingNoteSelectionResultView`. Struct literals must supply it; use
+  `PrivacyTrim::default()` when no trim occurred. Serde-backed views still accept
+  older payloads with the field absent.
+- **Breaking:** `BundlePolicy::with_privacy_drop_bps` returns
+  `Result<Self, VotingError>` and rejects budgets above `MAX_PRIVACY_DROP_BPS`.
+- The effective `BundlePolicy` is persisted per round and becomes authoritative
+  once stored, so an SDK upgrade that changes the defaults cannot invalidate
+  bundle rows that were already signed or submitted. Rounds carried across the
+  in-place upgrade have no stored policy, so the trim is disabled for any round
+  that already holds bundle rows; they keep re-deriving the plan they were signed
+  against.
 
 ### Removed
-- **Breaking:** removed `VotingNoteSelectionResultView::from_selected`.
-  Integrations must use `from_selected_for_round` so resumed rounds honor their
-  persisted bundle policy.
+- **Breaking:** `VotingNoteSelectionResultView::from_selected` — use
+  `from_selected_for_round`, which honors a resumed round's persisted policy.
+- **Breaking:** `bundle_notes_for_index` — use `bundle_notes_for_index_for_round`,
+  or `bundle_notes_for_index_with_policy` to pass a policy explicitly.
 
 ## v3.1.0-rc.1
 
