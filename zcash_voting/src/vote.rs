@@ -157,6 +157,25 @@ pub struct SignedVoteCommitments {
     pub commitments: Vec<SignedVoteCommitment>,
 }
 
+/// Unpersisted cast-vote work produced without holding the voting database lock.
+///
+/// This is an opaque, process-local handoff between [`prepare_commit`] and
+/// [`persist_prepared_commit`]. It is intentionally not serializable.
+pub struct PreparedVoteCommit {
+    round_id: String,
+    bundle_index: u32,
+    draft: DraftVote,
+    recovery: VoteRecoveryBundle,
+    commit: VoteCommit,
+    captured_state: Option<crate::storage::queries::VotePreparationState>,
+}
+
+/// Unpersisted cast-vote work for one delegation bundle.
+pub struct PreparedVoteCommitments {
+    bundle_index: u32,
+    commitments: Vec<PreparedVoteCommit>,
+}
+
 /// Committed cast-vote handle for the post-commit lifecycle.
 ///
 /// This wraps the signed commitment payload with the round and bundle keys used
@@ -400,6 +419,56 @@ pub fn commit_batch(
     })
 }
 
+/// Builds and signs a batch without holding SQLite during ZKP #2 computation.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_commit_batch(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    drafts: &[DraftVote],
+    witness: &VanWitness,
+    signer: VoteSigner<'_>,
+    stages: &dyn crate::types::VoteCommitStageReporter,
+) -> Result<PreparedVoteCommitments, VotingError> {
+    validate_draft_votes(drafts)?;
+    let bundle_count = db.get_bundle_count(round_id)?;
+    crate::round::validate_bundle_index(bundle_count, bundle_index, "voting")?;
+
+    let mut commitments = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        commitments.push(prepare_commit(
+            db,
+            round_id,
+            bundle_index,
+            draft,
+            witness,
+            signer,
+            stages,
+        )?);
+    }
+
+    Ok(PreparedVoteCommitments {
+        bundle_index,
+        commitments,
+    })
+}
+
+/// Atomically persists each prepared vote after revalidating its captured state.
+pub fn persist_prepared_commit_batch(
+    db: &VotingDb,
+    prepared: PreparedVoteCommitments,
+) -> Result<SignedVoteCommitments, VotingError> {
+    let mut commitments = Vec::with_capacity(prepared.commitments.len());
+    for prepared_commit in prepared.commitments {
+        let committed = persist_prepared_commit(db, prepared_commit)?;
+        commitments.push(committed.signed_commitment(db)?);
+    }
+    Ok(SignedVoteCommitments {
+        bundle_index: prepared.bundle_index,
+        commitments,
+    })
+}
+
 /// Recovers one persisted vote commitment as a single-item batch result.
 pub fn recover_signed_commitments(
     db: &VotingDb,
@@ -575,6 +644,21 @@ pub fn commit(
     signer: VoteSigner<'_>,
     stages: &dyn crate::types::VoteCommitStageReporter,
 ) -> Result<VoteCommit, VotingError> {
+    let prepared = prepare_commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
+    Ok(persist_prepared_commit(db, prepared)?.commit)
+}
+
+/// Builds and signs one vote while keeping the SQLite mutation window short.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_commit(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    draft: &DraftVote,
+    witness: &VanWitness,
+    signer: VoteSigner<'_>,
+    stages: &dyn crate::types::VoteCommitStageReporter,
+) -> Result<PreparedVoteCommit, VotingError> {
     validate_draft_vote(draft)?;
 
     let (secret, network) = signer_secret_and_network(signer);
@@ -582,7 +666,14 @@ pub fn commit(
 
     if let Some(recovered) = recovery_bundle(db, round_id, bundle_index, draft.proposal_id)? {
         if recovery_matches_draft(&recovered, draft) {
-            return commit_from_recovery(&recovered);
+            return Ok(PreparedVoteCommit {
+                round_id: round_id.to_string(),
+                bundle_index,
+                draft: draft.clone(),
+                commit: commit_from_recovery(&recovered)?,
+                recovery: recovered,
+                captured_state: None,
+            });
         }
     }
     db.require_capability_delegations_confirmed(round_id)?;
@@ -598,7 +689,7 @@ pub fn commit(
         stages,
     };
     let auth_path = witness.auth_path_fixed()?;
-    let bundle = db.build_vote_commitment(
+    let prepared_proof = db.prepare_vote_commitment(
         round_id,
         bundle_index,
         secret,
@@ -612,6 +703,7 @@ pub fn commit(
         draft.single_share,
         &progress,
     )?;
+    let bundle = prepared_proof.bundle;
     let wire_shares = bundle
         .enc_shares
         .iter()
@@ -648,28 +740,101 @@ pub fn commit(
     )?;
     let vote_auth_sig = array64("vote_auth_sig", signature.vote_auth_sig)?;
     let recovery = VoteRecoveryBundle::from_parts(bundle_index, draft, bundle, vote_auth_sig)?;
-    let commitment_bytes = stored_vote_commitment_bytes(&recovery)?;
-    store_recovery_json_for_vote(
-        db,
-        round_id,
-        bundle_index,
-        draft.proposal_id,
-        draft.choice,
-        Some(&commitment_bytes),
-        &serialize_recovery(&recovery)?,
-    )?;
-
-    Ok(VoteCommit {
+    let commit = VoteCommit {
         proposal_id: draft.proposal_id,
         van_nullifier: recovery.van_nullifier,
         vote_authority_note_new: recovery.vote_authority_note_new,
         vote_commitment: recovery.vote_commitment,
-        proof: recovery.proof,
+        proof: recovery.proof.clone(),
         anchor_height: recovery.anchor_height,
         r_vpk: recovery.r_vpk,
         vote_auth_sig: recovery.vote_auth_sig,
         encrypted_shares: wire_shares,
         share_payloads,
+    };
+
+    Ok(PreparedVoteCommit {
+        round_id: round_id.to_string(),
+        bundle_index,
+        draft: draft.clone(),
+        recovery,
+        commit,
+        captured_state: Some(prepared_proof.state),
+    })
+}
+
+/// Persists one prepared vote in a transaction after optimistic revalidation.
+pub fn persist_prepared_commit(
+    db: &VotingDb,
+    prepared: PreparedVoteCommit,
+) -> Result<CommittedVote, VotingError> {
+    let PreparedVoteCommit {
+        round_id,
+        bundle_index,
+        draft,
+        recovery,
+        commit,
+        captured_state,
+    } = prepared;
+
+    if let Some(captured_state) = captured_state {
+        let commitment_bytes = stored_vote_commitment_bytes(&recovery)?;
+        let recovery_json = serialize_recovery(&recovery)?;
+        let wallet_id = db.wallet_id();
+        let mut conn = db.conn();
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("failed to begin prepared vote persistence transaction: {e}"),
+        })?;
+        let current_state = crate::storage::queries::load_vote_preparation_state(
+            &tx,
+            &round_id,
+            &wallet_id,
+            bundle_index,
+            draft.proposal_id,
+        )?;
+        validate_prepared_vote_state(
+            &round_id,
+            bundle_index,
+            draft.proposal_id,
+            &captured_state,
+            &current_state,
+        )?;
+        crate::storage::queries::store_vote(
+            &tx,
+            &round_id,
+            &wallet_id,
+            bundle_index,
+            draft.proposal_id,
+            draft.choice,
+            &commitment_bytes,
+        )?;
+        crate::storage::queries::advance_round_phase(
+            &tx,
+            &round_id,
+            &wallet_id,
+            crate::storage::RoundPhase::VoteReady,
+        )?;
+        store_recovery_json_for_vote_with_conn(
+            &tx,
+            VoteRecoveryStorageIdentity {
+                round_id: &round_id,
+                wallet_id: &wallet_id,
+                bundle_index,
+                proposal_id: draft.proposal_id,
+                choice: draft.choice,
+                commitment: Some(&commitment_bytes),
+            },
+            &recovery_json,
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("failed to commit prepared vote persistence transaction: {e}"),
+        })?;
+    }
+
+    Ok(CommittedVote {
+        round_id,
+        bundle_index,
+        commit,
     })
 }
 
@@ -1527,6 +1692,34 @@ fn recovery_matches_draft(bundle: &VoteRecoveryBundle, draft: &DraftVote) -> boo
         && bundle.vc_tree_position == draft.vc_tree_position
 }
 
+fn validate_prepared_vote_state(
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    captured: &crate::storage::queries::VotePreparationState,
+    current: &crate::storage::queries::VotePreparationState,
+) -> Result<(), VotingError> {
+    let stale = if current.van_position != captured.van_position {
+        Some("bundle VAN position")
+    } else if current.proposal_authority != captured.proposal_authority {
+        Some("proposal-authority state")
+    } else if current.ballot_intent != captured.ballot_intent {
+        Some("ballot intent")
+    } else if current.vote != captured.vote {
+        Some("current vote state")
+    } else {
+        None
+    };
+    if let Some(stale) = stale {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "{stale} changed while preparing vote for round={round_id}, bundle={bundle_index}, proposal={proposal_id}; recompute from current state"
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_recovery_bundle_vote_fields(
     bundle: &VoteRecoveryBundle,
 ) -> Result<(), VotingError> {
@@ -1819,6 +2012,54 @@ mod tests {
             num_options: 2,
             single_share: false,
             vc_tree_position: 0,
+        }
+    }
+
+    fn prepared_vote_fixture(db: &VotingDb) -> PreparedVoteCommit {
+        db.conn()
+            .execute(
+                "UPDATE bundles SET van_comm_rand = ?1, total_note_value = ?2,
+                    address_index = 0, van_leaf_position = 7
+                 WHERE round_id = ?3 AND wallet_id = ?4 AND bundle_index = 0",
+                rusqlite::params![
+                    vec![0u8; 32],
+                    crate::governance::BALLOT_DIVISOR as i64,
+                    ROUND_ID,
+                    WALLET_ID
+                ],
+            )
+            .unwrap();
+        db.set_ballot_intent(ROUND_ID, 1, crate::session::Decision::Choice(2), 3)
+            .unwrap();
+        let state =
+            queries::load_vote_preparation_state(&db.conn(), ROUND_ID, WALLET_ID, 0, 1).unwrap();
+        let recovery = recovery_bundle_fixture();
+        let draft = DraftVote {
+            proposal_id: 1,
+            choice: 2,
+            num_options: 3,
+            single_share: false,
+            vc_tree_position: 456,
+        };
+        let commit = VoteCommit {
+            proposal_id: 1,
+            van_nullifier: recovery.van_nullifier,
+            vote_authority_note_new: recovery.vote_authority_note_new,
+            vote_commitment: recovery.vote_commitment,
+            proof: recovery.proof.clone(),
+            anchor_height: recovery.anchor_height,
+            r_vpk: recovery.r_vpk,
+            vote_auth_sig: recovery.vote_auth_sig,
+            encrypted_shares: Vec::new(),
+            share_payloads: Vec::new(),
+        };
+        PreparedVoteCommit {
+            round_id: ROUND_ID.to_string(),
+            bundle_index: 0,
+            draft,
+            recovery,
+            commit,
+            captured_state: Some(state),
         }
     }
 
@@ -2450,6 +2691,111 @@ mod tests {
         assert_eq!(result.commitments.len(), 1);
         assert_eq!(result.commitments[0].proposal_id, 1);
         assert_eq!(result.commitments[0].choice, 2);
+    }
+
+    #[test]
+    fn prepared_vote_is_unpersisted_until_atomic_persist() {
+        let db = db_with_vote();
+        let prepared = prepared_vote_fixture(&db);
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+
+        persist_prepared_commit(&db, prepared).unwrap();
+
+        let stored = recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().unwrap();
+        assert_eq!(stored.vote_decision, 2);
+        assert_eq!(stored.proof, vec![0x13; 96]);
+    }
+
+    #[test]
+    fn prepared_vote_rejects_stale_van_position() {
+        let db = db_with_vote();
+        let prepared = prepared_vote_fixture(&db);
+        queries::store_van_position(&db.conn(), ROUND_ID, WALLET_ID, 0, 8).unwrap();
+
+        let err = persist_prepared_commit(&db, prepared).unwrap_err();
+        assert!(
+            err.to_string().contains("bundle VAN position changed"),
+            "{err}"
+        );
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_vote_rejects_stale_proposal_authority() {
+        let db = db_with_vote();
+        let prepared = prepared_vote_fixture(&db);
+        queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 2, 0, &[0xAB; 32]).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE votes SET tx_hash = 'submitted' WHERE round_id = ?1
+                 AND wallet_id = ?2 AND bundle_index = 0 AND proposal_id = 2",
+                rusqlite::params![ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+
+        let err = persist_prepared_commit(&db, prepared).unwrap_err();
+        assert!(
+            err.to_string().contains("proposal-authority state changed"),
+            "{err}"
+        );
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_vote_ignores_authority_changes_in_independent_bundle() {
+        let db = db_with_vote();
+        let prepared = prepared_vote_fixture(&db);
+        queries::insert_bundle(&db.conn(), ROUND_ID, WALLET_ID, 1, &[1]).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET van_comm_rand = ?1, total_note_value = ?2,
+                    address_index = 0, van_leaf_position = 9
+                 WHERE round_id = ?3 AND wallet_id = ?4 AND bundle_index = 1",
+                rusqlite::params![
+                    vec![0u8; 32],
+                    crate::governance::BALLOT_DIVISOR as i64,
+                    ROUND_ID,
+                    WALLET_ID
+                ],
+            )
+            .unwrap();
+        queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 1, 2, 0, &[0xAB; 32]).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE votes SET tx_hash = 'submitted' WHERE round_id = ?1
+                 AND wallet_id = ?2 AND bundle_index = 1 AND proposal_id = 2",
+                rusqlite::params![ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+
+        persist_prepared_commit(&db, prepared).unwrap();
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn prepared_vote_rejects_changed_ballot_intent() {
+        let db = db_with_vote();
+        let prepared = prepared_vote_fixture(&db);
+        db.set_ballot_intent(ROUND_ID, 1, crate::session::Decision::Choice(1), 3)
+            .unwrap();
+
+        let err = persist_prepared_commit(&db, prepared).unwrap_err();
+        assert!(err.to_string().contains("ballot intent changed"), "{err}");
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_vote_rejects_changed_current_vote_state() {
+        let db = db_with_vote();
+        let prepared = prepared_vote_fixture(&db);
+        queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 1, 1, &[0xBC; 32]).unwrap();
+
+        let err = persist_prepared_commit(&db, prepared).unwrap_err();
+        assert!(
+            err.to_string().contains("current vote state changed"),
+            "{err}"
+        );
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
     }
 
     #[test]
