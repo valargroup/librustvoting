@@ -1505,6 +1505,23 @@ pub struct Zkp2DelegationData {
     pub proposal_authority: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VoteRowState {
+    pub choice: i64,
+    pub commitment: Option<Vec<u8>>,
+    pub tx_hash: Option<String>,
+    pub vc_tree_position: Option<i64>,
+    pub commitment_bundle_json: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VotePreparationState {
+    pub van_position: u32,
+    pub proposal_authority: u64,
+    pub ballot_intent: Option<(bool, Option<u32>)>,
+    pub vote: Option<VoteRowState>,
+}
+
 /// Initial authority bitmask: all 16 bits set. Bit 0 is the dead sentinel
 /// (proposal_id=0 is rejected by the circuit); bits 1–15 are the usable slots.
 const MAX_PROPOSAL_AUTHORITY: u64 = 65535;
@@ -1564,6 +1581,71 @@ pub fn load_zkp2_inputs(
     Ok(Zkp2DelegationData {
         proposal_authority: authority,
         ..data
+    })
+}
+
+pub(crate) fn load_vote_preparation_state(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<VotePreparationState, VotingError> {
+    let zkp2 = load_zkp2_inputs(conn, round_id, wallet_id, bundle_index)?;
+    let van_position = load_van_position(conn, round_id, wallet_id, bundle_index)?;
+    let ballot_intent = conn
+        .query_row(
+            "SELECT skipped, choice FROM ballot_intent
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND proposal_id = :proposal_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+            },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? != 0,
+                    row.get::<_, Option<i64>>(1)?.map(|choice| choice as u32),
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load ballot intent before vote preparation: {e}"),
+        })?;
+    let vote = conn
+        .query_row(
+            "SELECT choice, commitment, tx_hash, vc_tree_position, commitment_bundle_json
+             FROM votes
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+            |row| {
+                Ok(VoteRowState {
+                    choice: row.get(0)?,
+                    commitment: row.get(1)?,
+                    tx_hash: row.get(2)?,
+                    vc_tree_position: row.get(3)?,
+                    commitment_bundle_json: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load vote state before vote preparation: {e}"),
+        })?;
+
+    Ok(VotePreparationState {
+        van_position,
+        proposal_authority: zkp2.proposal_authority,
+        ballot_intent,
+        vote,
     })
 }
 

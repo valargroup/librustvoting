@@ -25,6 +25,11 @@ use crate::types::{
     VoteCommitmentBundle, VotingError, VotingRoundParams, WireEncryptedShare, WitnessData,
 };
 
+pub(crate) struct PreparedVoteProof {
+    pub bundle: VoteCommitmentBundle,
+    pub state: queries::VotePreparationState,
+}
+
 fn nullifier_bytes_to_base(bytes: &[u8], label: &str) -> Result<pallas::Base, VotingError> {
     let nf_bytes: [u8; 32] = bytes.try_into().map_err(|_| VotingError::Internal {
         message: format!("{label} nullifier must be 32 bytes, got {}", bytes.len()),
@@ -1087,7 +1092,7 @@ impl VotingDb {
 
     // --- Phase 3: Voting ---
 
-    /// Build vote commitment + ZKP #2 for a proposal. Stores vote in db.
+    /// Capture vote state, release SQLite, then build vote commitment + ZKP #2.
     ///
     /// Loads ZKP #2 inputs (gov_comm_rand, total_note_value, address_index, ea_pk,
     /// voting_round_id) from the DB, derives the SpendingKey from hotkey_seed
@@ -1096,7 +1101,7 @@ impl VotingDb {
     ///
     /// The builder handles share decomposition and El Gamal encryption internally.
     /// The returned bundle includes the encrypted shares for reveal-share payloads.
-    pub(crate) fn build_vote_commitment(
+    pub(crate) fn prepare_vote_commitment(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -1110,12 +1115,44 @@ impl VotingDb {
         anchor_height: u32,
         single_share: bool,
         progress: &dyn ProgressReporter,
-    ) -> Result<VoteCommitmentBundle, VotingError> {
-        let conn = self.conn();
+    ) -> Result<PreparedVoteProof, VotingError> {
+        let mut conn = self.conn();
         let wallet_id = self.wallet_id();
-        let stored_network = queries::load_round_network(&conn, round_id, &wallet_id)?;
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("failed to begin vote preparation transaction: {e}"),
+        })?;
+        let stored_network = queries::load_round_network(&tx, round_id, &wallet_id)?;
         validate_network_matches_round(stored_network, signer_network, "vote signer")?;
-        let zkp2_data = queries::load_zkp2_inputs(&conn, round_id, &wallet_id, bundle_index)?;
+        let zkp2_data = queries::load_zkp2_inputs(&tx, round_id, &wallet_id, bundle_index)?;
+        let state = queries::load_vote_preparation_state(
+            &tx,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("failed to finish vote preparation transaction: {e}"),
+        })?;
+        drop(conn);
+
+        if van_position != state.van_position {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "VAN witness position {van_position} does not match current bundle position {} for round={round_id}, bundle={bundle_index}",
+                    state.van_position
+                ),
+            });
+        }
+        if let Some((skipped, intent_choice)) = state.ballot_intent {
+            if skipped || intent_choice != Some(choice) {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "vote draft conflicts with current ballot intent for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+                    ),
+                });
+            }
+        }
 
         // Decode voting_round_id from hex string to 32 bytes
         let voting_round_id_bytes =
@@ -1140,33 +1177,12 @@ impl VotingDb {
             van_auth_path,
             van_position,
             anchor_height,
-            zkp2_data.proposal_authority,
+            state.proposal_authority,
             single_share,
             progress,
         )?;
 
-        // Store the vote commitment as serialized bytes
-        let commitment_bytes = serde_json::to_vec(&serde_json::json!({
-            "van_nullifier": hex::encode(&bundle.van_nullifier),
-            "vote_authority_note_new": hex::encode(&bundle.vote_authority_note_new),
-            "vote_commitment": hex::encode(&bundle.vote_commitment),
-            "proof": hex::encode(&bundle.proof),
-        }))
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to serialize vote commitment: {}", e),
-        })?;
-
-        queries::store_vote(
-            &conn,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            proposal_id,
-            choice,
-            &commitment_bytes,
-        )?;
-        queries::advance_round_phase(&conn, round_id, &wallet_id, RoundPhase::VoteReady)?;
-        Ok(bundle)
+        Ok(PreparedVoteProof { bundle, state })
     }
 
     /// Build share payloads for helper server delegation.
@@ -2403,13 +2419,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_vote_commitment_rejects_network_mismatch_before_zkp2_inputs() {
+    fn test_prepare_vote_commitment_rejects_network_mismatch_before_zkp2_inputs() {
         let db = test_db();
         db.init_round(Network::Testnet, &test_params(), None)
             .unwrap();
 
         let err = db
-            .build_vote_commitment(
+            .prepare_vote_commitment(
                 ROUND_ID,
                 0,
                 &[0x99; 64],
@@ -2423,7 +2439,8 @@ mod tests {
                 false,
                 &crate::types::NoopProgressReporter,
             )
-            .unwrap_err();
+            .err()
+            .expect("network mismatch must fail");
 
         assert!(
             err.to_string().contains(
