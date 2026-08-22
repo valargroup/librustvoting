@@ -4,7 +4,25 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## v3.1.0-rc.6
+
+### Added
+- Added `prepare_commit`, `prepare_commit_batch`, `persist_prepared_commit`,
+  and `persist_prepared_commit_batch` so wallets can perform expensive ZKP #2
+  proving outside SQLite transactions, then atomically persist the prepared
+  result only if its vote-authority, ballot-intent, and current-vote state are
+  still unchanged.
+- Added `warm_zkp2_proving_cache` for callers that want to initialize the vote
+  proving parameters independently of the other proving caches.
+
+### Changed
+- Updated the selectable cryptography facade to `voting-crypto-deps 0.1.2`,
+  voting circuits to `0.10.3`, the indexed Merkle tree to `imt-tree 0.4.0`,
+  and the PIR stack to `pir-types 0.5.0` and `pir-client 0.6.0`.
+- Released `vote-commitment-tree 0.5.2` and
+  `vote-commitment-tree-client 0.7.2` with backend-neutral field, group, and
+  randomness trait imports for the updated upstream and Zakura dependency
+  families.
 
 ## v3.1.0-rc.5
 

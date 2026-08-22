@@ -2,12 +2,12 @@
 pub(crate) use crate::backend::{orchard, pasta_curves, zcash_keys};
 use std::collections::HashMap;
 
-use ff::PrimeField;
 use orchard::{
     keys::FullViewingKey,
     note::{RandomSeed, Rho},
     primitives::redpallas::{Signature, SpendAuth, VerificationKey},
 };
+use pasta_curves::group::ff::PrimeField;
 use pasta_curves::pallas;
 use voting_circuits::delegation::{synthetic_padding_note_parts, ImtProofData};
 use zcash_keys::keys::UnifiedFullViewingKey;
@@ -1659,7 +1659,7 @@ mod tests {
 
     fn test_params() -> VotingRoundParams {
         // Use SpendAuthG as a valid Pallas point for ea_pk in tests.
-        use group::GroupEncoding;
+        use pasta_curves::group::GroupEncoding;
         let ea_pk = pasta_curves::pallas::Point::from(voting_circuits::spend_auth_g_affine());
         VotingRoundParams {
             vote_round_id: ROUND_ID.to_string(),
