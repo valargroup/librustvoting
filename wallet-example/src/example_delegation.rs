@@ -395,7 +395,7 @@ fn example_sign_delegation_request(
     )
     .ok_or_else(|| anyhow::anyhow!("delegation alpha is not a valid Pallas scalar"))?;
     let rsk = ask.randomize(&alpha);
-    let mut rng = rand::rngs::OsRng;
+    let mut rng = voting_crypto_deps::rand::rngs::OsRng;
     let sig = rsk.sign(&mut rng, &request.sighash);
     Ok(((&sig).into(), request.sighash))
 }

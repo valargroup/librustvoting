@@ -2153,6 +2153,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_distr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d431c2703ccf129de4d45253c03f49ebb22b97d6ad79ee3ecfc7e3f4862c1d8"
+dependencies = [
+ "num-traits",
+ "rand 0.10.2",
+]
+
+[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3376,19 +3386,18 @@ dependencies = [
 
 [[package]]
 name = "zakura-client-backend"
-version = "0.1.0-rc1"
+version = "0.1.0-rc2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e446cc7bbd3ca1d859b6df7e46dcd9845018119551940debc385330220faf4ee"
+checksum = "2a042cb0d6f6a22d976ed5dda9de3c9c51abe868324bc186ba5064be8f22756c"
 dependencies = [
  "base64",
  "bech32",
- "bls12_381",
  "bs58",
  "byteorder",
  "document-features",
  "flume",
  "getset",
- "group 0.13.0",
+ "group 0.14.0",
  "hex",
  "hyper-util",
  "incrementalmerkletree",
@@ -3396,7 +3405,8 @@ dependencies = [
  "nonempty",
  "percent-encoding",
  "prost",
- "rand_core 0.6.4",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
  "rayon",
  "secrecy",
  "shardtree",
@@ -3407,6 +3417,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "which",
+ "zakura-bls12-381",
  "zakura-keys",
  "zakura-orchard",
  "zakura-pasta-curves",
@@ -3424,24 +3435,23 @@ dependencies = [
 
 [[package]]
 name = "zakura-client-sqlite"
-version = "0.1.0-rc1"
+version = "0.1.0-rc2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "935fb2970f0612b5f8f390fe07b4357335d82c8a07a85cfed208d83aec04048e"
+checksum = "a47a7238ca986c3caec99ffe409fa49226cfe9fb5a0583ae2a5bb32466a12624"
 dependencies = [
  "bitflags 2.13.1",
  "bs58",
  "byteorder",
  "document-features",
- "group 0.13.0",
+ "group 0.14.0",
  "hex",
  "incrementalmerkletree",
- "jubjub",
  "maybe-rayon",
  "nonempty",
  "prost",
- "rand 0.8.7",
- "rand_core 0.6.4",
- "rand_distr",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
+ "rand_distr 0.6.0",
  "regex",
  "rusqlite",
  "schemerz",
@@ -3454,6 +3464,7 @@ dependencies = [
  "tracing",
  "uuid",
  "zakura-client-backend",
+ "zakura-jubjub",
  "zakura-keys",
  "zakura-orchard",
  "zakura-pczt",
@@ -3629,22 +3640,23 @@ dependencies = [
 
 [[package]]
 name = "zakura-pczt"
-version = "0.1.0-rc0"
+version = "0.1.0-rc1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9f3ca7e1b5785b709ba0c8a25f1efa4bf98a0b115be16042faa998ac30f016e"
+checksum = "226558d15d544c890bdb0cfaa935402b6697d1edf78ec0b541c4fd7e8033ce52"
 dependencies = [
  "blake2b_simd",
- "bls12_381",
  "document-features",
- "ff 0.13.1",
+ "ff 0.14.0",
  "getset",
- "jubjub",
  "nonempty",
  "postcard",
- "rand_core 0.6.4",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
  "secp256k1",
  "serde",
  "serde_with",
+ "zakura-bls12-381",
+ "zakura-jubjub",
  "zakura-orchard",
  "zakura-pasta-curves",
  "zakura-primitives",
@@ -3765,9 +3777,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-wallet-lib"
-version = "0.1.0-rc1"
+version = "0.1.0-rc2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "148371355bc6f83546a0304914a0aa832b843b57ae0dfcbcf400525a9665716c"
+checksum = "28b53acd746f74acdbdd39401cba4ad1516c8e82d54da461a8de6dbb2da47ff4"
 dependencies = [
  "orchard",
  "pczt",
@@ -3889,7 +3901,7 @@ dependencies = [
  "prost",
  "rand 0.8.7",
  "rand_core 0.6.4",
- "rand_distr",
+ "rand_distr 0.4.3",
  "regex",
  "rusqlite",
  "sapling-crypto",

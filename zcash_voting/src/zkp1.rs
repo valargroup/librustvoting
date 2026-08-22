@@ -559,7 +559,7 @@ mod tests {
         value::NoteValue, NOTE_COMMITMENT_TREE_DEPTH as TEST_TREE_DEPTH,
     };
     use pasta_curves::group::ff::Field;
-    use rand::RngCore;
+    use voting_crypto_deps::rand::Rng;
     use voting_circuits::delegation::SpacedLeafImtProvider;
     use voting_crypto_deps::rand::rngs::OsRng;
 
@@ -669,7 +669,7 @@ mod tests {
         (ufvk_str, fvk)
     }
 
-    fn random_seed_for_rho(rho: &Rho, rng: &mut impl RngCore) -> RandomSeed {
+    fn random_seed_for_rho(rho: &Rho, rng: &mut impl Rng) -> RandomSeed {
         loop {
             let mut bytes = [0u8; 32];
             rng.fill_bytes(&mut bytes);
@@ -684,7 +684,7 @@ mod tests {
         address: orchard::Address,
         value: u64,
         version: NoteVersion,
-        rng: &mut impl RngCore,
+        rng: &mut impl Rng,
     ) -> orchard::Note {
         loop {
             let (_, _, dummy_parent) = orchard::Note::dummy(&mut *rng, None, NoteVersion::V2);

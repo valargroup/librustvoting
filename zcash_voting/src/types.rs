@@ -1054,7 +1054,7 @@ mod tests {
     use crate::governance::BALLOT_DIVISOR;
     use orchard::note::{ExtractedNoteCommitment, NoteVersion, Rho};
     use orchard::value::NoteValue;
-    use rand::rngs::OsRng;
+    use voting_crypto_deps::rand::rngs::OsRng;
     use zcash_keys::keys::UnifiedSpendingKey;
     use zcash_protocol::consensus::TEST_NETWORK;
     use zip32::{AccountId, Scope};

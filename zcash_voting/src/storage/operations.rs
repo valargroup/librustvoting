@@ -1708,7 +1708,7 @@ mod tests {
         let ask = SpendAuthorizingKey::from(&sk);
         let rsk = ask.randomize(alpha);
         let rk: [u8; 32] = (&VerificationKey::<SpendAuth>::from(&rsk)).into();
-        let mut rng = rand::rngs::OsRng;
+        let mut rng = voting_crypto_deps::rand::rngs::OsRng;
         let sig = rsk.sign(&mut rng, sighash);
 
         (rk, (&sig).into())
@@ -1730,7 +1730,7 @@ mod tests {
         let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(request.alpha))
             .expect("test stores a valid alpha scalar");
         let rsk = ask.randomize(&alpha);
-        let mut rng = rand::rngs::OsRng;
+        let mut rng = voting_crypto_deps::rand::rngs::OsRng;
         let sig = rsk.sign(&mut rng, &request.sighash);
 
         (&sig).into()
@@ -2099,7 +2099,7 @@ mod tests {
             note::{NoteVersion, Rho},
             value::NoteValue,
         };
-        use rand::rngs::OsRng;
+        use voting_crypto_deps::rand::rngs::OsRng;
         use zcash_keys::keys::UnifiedSpendingKey;
         use zip32::{AccountId, Scope};
 
@@ -2182,7 +2182,7 @@ mod tests {
             note::{NoteVersion, Rho},
             value::NoteValue,
         };
-        use rand::rngs::OsRng;
+        use voting_crypto_deps::rand::rngs::OsRng;
         use voting_circuits::delegation::ImtProvider;
         use zcash_keys::keys::UnifiedSpendingKey;
         use zcash_protocol::consensus::TEST_NETWORK;
@@ -3634,7 +3634,7 @@ mod tests {
             note::{NoteVersion, Rho},
             value::NoteValue,
         };
-        use rand::rngs::OsRng;
+        use voting_crypto_deps::rand::rngs::OsRng;
         use zcash_keys::keys::UnifiedSpendingKey;
         use zip32::{fingerprint::SeedFingerprint, AccountId, Scope};
 
