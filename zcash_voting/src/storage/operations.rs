@@ -1122,6 +1122,11 @@ impl VotingDb {
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("failed to begin vote preparation transaction: {e}"),
         })?;
+        // Check the signer's network before loading the rest of the state. Capturing
+        // state first makes a mismatched network surface as a missing-row error from
+        // the ZKP2 lookup, which hides the real cause from the caller.
+        let stored_network = queries::load_round_network(&tx, round_id, &wallet_id)?;
+        validate_network_matches_round(stored_network, signer_network, "vote signer")?;
         let state = queries::load_vote_preparation_state(
             &tx,
             round_id,
@@ -1133,7 +1138,6 @@ impl VotingDb {
             message: format!("failed to finish vote preparation transaction: {e}"),
         })?;
         drop(conn);
-        validate_network_matches_round(state.network, signer_network, "vote signer")?;
 
         if van_position != state.van_position {
             return Err(VotingError::InvalidInput {
