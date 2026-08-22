@@ -419,36 +419,40 @@ pub fn commit_batch(
     })
 }
 
+/// Inputs for preparing cast-vote commitments for one delegation bundle.
+pub struct VoteCommitBatch<'a> {
+    pub round_id: &'a str,
+    pub bundle_index: u32,
+    pub drafts: &'a [DraftVote],
+    pub witness: &'a VanWitness,
+    pub stages: &'a dyn crate::types::VoteCommitStageReporter,
+}
+
 /// Builds and signs a batch without holding SQLite during ZKP #2 computation.
-#[allow(clippy::too_many_arguments)]
 pub fn prepare_commit_batch(
     db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    drafts: &[DraftVote],
-    witness: &VanWitness,
     signer: VoteSigner<'_>,
-    stages: &dyn crate::types::VoteCommitStageReporter,
+    batch: VoteCommitBatch<'_>,
 ) -> Result<PreparedVoteCommitments, VotingError> {
-    validate_draft_votes(drafts)?;
-    let bundle_count = db.get_bundle_count(round_id)?;
-    crate::round::validate_bundle_index(bundle_count, bundle_index, "voting")?;
+    validate_draft_votes(batch.drafts)?;
+    let bundle_count = db.get_bundle_count(batch.round_id)?;
+    crate::round::validate_bundle_index(bundle_count, batch.bundle_index, "voting")?;
 
-    let mut commitments = Vec::with_capacity(drafts.len());
-    for draft in drafts {
+    let mut commitments = Vec::with_capacity(batch.drafts.len());
+    for draft in batch.drafts {
         commitments.push(prepare_commit(
             db,
-            round_id,
-            bundle_index,
+            batch.round_id,
+            batch.bundle_index,
             draft,
-            witness,
+            batch.witness,
             signer,
-            stages,
+            batch.stages,
         )?);
     }
 
     Ok(PreparedVoteCommitments {
-        bundle_index,
+        bundle_index: batch.bundle_index,
         commitments,
     })
 }

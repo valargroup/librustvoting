@@ -11,7 +11,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   and `persist_prepared_commit_batch` so wallets can perform expensive ZKP #2
   proving outside SQLite transactions, then atomically persist the prepared
   result only if its vote-authority, ballot-intent, and current-vote state are
-  still unchanged.
+  still unchanged. `prepare_commit_batch` takes a `VoteCommitBatch` for the
+  round, drafts, witness, and stage reporter.
 - Added `warm_zkp2_proving_cache` for callers that want to initialize the vote
   proving parameters independently of the other proving caches.
 
@@ -19,7 +20,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Changed
 - Updated the selectable cryptography facade to `voting-crypto-deps 0.1.2`,
-  voting circuits to `0.10.3`, the indexed Merkle tree to `imt-tree 0.4.0`,
+  voting circuits to `0.10.3`, the indexed Merkle tree to `0.4.0`,
   and the PIR stack to `pir-types 0.5.0` and `pir-client 0.6.0`.
 - Released `vote-commitment-tree 0.5.2` and
   `vote-commitment-tree-client 0.7.2` with backend-neutral field, group, and
