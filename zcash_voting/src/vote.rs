@@ -162,12 +162,18 @@ pub struct SignedVoteCommitments {
 /// This is an opaque, process-local handoff between [`prepare_commit`] and
 /// [`persist_prepared_commit`]. It is intentionally not serializable.
 pub struct PreparedVoteCommit {
+    wallet_id: String,
     round_id: String,
     bundle_index: u32,
     draft: DraftVote,
     recovery: VoteRecoveryBundle,
     commit: VoteCommit,
-    captured_state: Option<crate::storage::queries::VotePreparationState>,
+    captured_state: CapturedVoteState,
+}
+
+enum CapturedVoteState {
+    Fresh(crate::storage::queries::VotePreparationState),
+    Recovered(crate::storage::queries::VoteRowState),
 }
 
 /// Unpersisted cast-vote work for one delegation bundle.
@@ -668,17 +674,43 @@ pub fn prepare_commit(
     let (secret, network) = signer_secret_and_network(signer);
     db.require_round_network(round_id, network, "vote signer")?;
 
-    if let Some(recovered) = recovery_bundle(db, round_id, bundle_index, draft.proposal_id)? {
-        if recovery_matches_draft(&recovered, draft) {
-            return Ok(PreparedVoteCommit {
-                round_id: round_id.to_string(),
-                bundle_index,
-                draft: draft.clone(),
-                commit: commit_from_recovery(&recovered)?,
-                recovery: recovered,
-                captured_state: None,
-            });
-        }
+    let wallet_id = db.wallet_id();
+    let recovered = {
+        let mut conn = db.conn();
+        let tx = conn.transaction().map_err(|e| VotingError::Internal {
+            message: format!("failed to begin recovered vote preparation transaction: {e}"),
+        })?;
+        let recovered =
+            recovery_bundle_with_conn(&tx, &wallet_id, round_id, bundle_index, draft.proposal_id)?;
+        let recovered = recovered
+            .filter(|recovered| recovery_matches_draft(recovered, draft))
+            .map(|recovered| {
+                let state = crate::storage::queries::load_vote_row_state(
+                    &tx,
+                    round_id,
+                    &wallet_id,
+                    bundle_index,
+                    draft.proposal_id,
+                )?
+                .ok_or_else(|| vote_not_found_error(round_id, bundle_index, draft.proposal_id))?;
+                Ok((recovered, CapturedVoteState::Recovered(state)))
+            })
+            .transpose()?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("failed to finish recovered vote preparation transaction: {e}"),
+        })?;
+        recovered
+    };
+    if let Some((recovered, captured_state)) = recovered {
+        return Ok(PreparedVoteCommit {
+            wallet_id,
+            round_id: round_id.to_string(),
+            bundle_index,
+            draft: draft.clone(),
+            commit: commit_from_recovery(&recovered)?,
+            recovery: recovered,
+            captured_state,
+        });
     }
     db.require_capability_delegations_confirmed(round_id)?;
     ensure_vote_rebuild_allowed(db, round_id, bundle_index, draft.proposal_id)?;
@@ -758,12 +790,13 @@ pub fn prepare_commit(
     };
 
     Ok(PreparedVoteCommit {
+        wallet_id: prepared_proof.wallet_id,
         round_id: round_id.to_string(),
         bundle_index,
         draft: draft.clone(),
         recovery,
         commit,
-        captured_state: Some(prepared_proof.state),
+        captured_state: CapturedVoteState::Fresh(prepared_proof.state),
     })
 }
 
@@ -773,6 +806,7 @@ pub fn persist_prepared_commit(
     prepared: PreparedVoteCommit,
 ) -> Result<CommittedVote, VotingError> {
     let PreparedVoteCommit {
+        wallet_id,
         round_id,
         bundle_index,
         draft,
@@ -781,59 +815,93 @@ pub fn persist_prepared_commit(
         captured_state,
     } = prepared;
 
-    if let Some(captured_state) = captured_state {
-        let commitment_bytes = stored_vote_commitment_bytes(&recovery)?;
-        let recovery_json = serialize_recovery(&recovery)?;
-        let wallet_id = db.wallet_id();
-        let mut conn = db.conn();
-        let tx = conn.transaction().map_err(|e| VotingError::Internal {
-            message: format!("failed to begin prepared vote persistence transaction: {e}"),
-        })?;
-        let current_state = crate::storage::queries::load_vote_preparation_state(
-            &tx,
-            &round_id,
-            &wallet_id,
-            bundle_index,
-            draft.proposal_id,
-        )?;
-        validate_prepared_vote_state(
-            &round_id,
-            bundle_index,
-            draft.proposal_id,
-            &captured_state,
-            &current_state,
-        )?;
-        crate::storage::queries::store_vote(
-            &tx,
-            &round_id,
-            &wallet_id,
-            bundle_index,
-            draft.proposal_id,
-            draft.choice,
-            &commitment_bytes,
-        )?;
-        crate::storage::queries::advance_round_phase(
-            &tx,
-            &round_id,
-            &wallet_id,
-            crate::storage::RoundPhase::VoteReady,
-        )?;
-        store_recovery_json_for_vote_with_conn(
-            &tx,
-            VoteRecoveryStorageIdentity {
-                round_id: &round_id,
-                wallet_id: &wallet_id,
-                bundle_index,
-                proposal_id: draft.proposal_id,
-                choice: draft.choice,
-                commitment: Some(&commitment_bytes),
-            },
-            &recovery_json,
-        )?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to commit prepared vote persistence transaction: {e}"),
-        })?;
+    let current_wallet_id = db.wallet_id();
+    if current_wallet_id != wallet_id {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "wallet identity changed while preparing vote for round={round_id}, bundle={bundle_index}, proposal={}; recompute for the current wallet",
+                draft.proposal_id
+            ),
+        });
     }
+    let mut conn = db.conn();
+    let tx = conn.transaction().map_err(|e| VotingError::Internal {
+        message: format!("failed to begin prepared vote persistence transaction: {e}"),
+    })?;
+    let captured_state = match captured_state {
+        CapturedVoteState::Fresh(captured_state) => captured_state,
+        CapturedVoteState::Recovered(captured_vote) => {
+            let current_vote = crate::storage::queries::load_vote_row_state(
+                &tx,
+                &round_id,
+                &wallet_id,
+                bundle_index,
+                draft.proposal_id,
+            )?;
+            if current_vote.as_ref() != Some(&captured_vote) {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "recovered vote state changed while preparing vote for round={round_id}, bundle={bundle_index}, proposal={}; recover from current state",
+                        draft.proposal_id
+                    ),
+                });
+            }
+            tx.commit().map_err(|e| VotingError::Internal {
+                message: format!("failed to finish recovered vote persistence transaction: {e}"),
+            })?;
+            return Ok(CommittedVote {
+                round_id,
+                bundle_index,
+                commit,
+            });
+        }
+    };
+    let current_state = crate::storage::queries::load_vote_preparation_state(
+        &tx,
+        &round_id,
+        &wallet_id,
+        bundle_index,
+        draft.proposal_id,
+    )?;
+    validate_prepared_vote_state(
+        &round_id,
+        bundle_index,
+        draft.proposal_id,
+        &captured_state,
+        &current_state,
+    )?;
+    let commitment_bytes = stored_vote_commitment_bytes(&recovery)?;
+    let recovery_json = serialize_recovery(&recovery)?;
+    crate::storage::queries::store_vote(
+        &tx,
+        &round_id,
+        &wallet_id,
+        bundle_index,
+        draft.proposal_id,
+        draft.choice,
+        &commitment_bytes,
+    )?;
+    crate::storage::queries::advance_round_phase(
+        &tx,
+        &round_id,
+        &wallet_id,
+        crate::storage::RoundPhase::VoteReady,
+    )?;
+    store_recovery_json_for_vote_with_conn(
+        &tx,
+        VoteRecoveryStorageIdentity {
+            round_id: &round_id,
+            wallet_id: &wallet_id,
+            bundle_index,
+            proposal_id: draft.proposal_id,
+            choice: draft.choice,
+            commitment: Some(&commitment_bytes),
+        },
+        &recovery_json,
+    )?;
+    tx.commit().map_err(|e| VotingError::Internal {
+        message: format!("failed to commit prepared vote persistence transaction: {e}"),
+    })?;
 
     Ok(CommittedVote {
         round_id,
@@ -1037,6 +1105,16 @@ pub fn recovery_bundle(
 ) -> Result<Option<VoteRecoveryBundle>, VotingError> {
     let conn = db.conn();
     let wallet_id = db.wallet_id();
+    recovery_bundle_with_conn(&conn, &wallet_id, round_id, bundle_index, proposal_id)
+}
+
+fn recovery_bundle_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Option<VoteRecoveryBundle>, VotingError> {
     let json: Option<Option<String>> = conn
         .query_row(
             "SELECT commitment_bundle_json FROM votes
@@ -1703,9 +1781,21 @@ fn validate_prepared_vote_state(
     captured: &crate::storage::queries::VotePreparationState,
     current: &crate::storage::queries::VotePreparationState,
 ) -> Result<(), VotingError> {
-    let stale = if current.van_position != captured.van_position {
+    let stale = if current.network != captured.network {
+        Some("round network")
+    } else if current.zkp2.gov_comm_rand != captured.zkp2.gov_comm_rand {
+        Some("governance commitment randomness")
+    } else if current.zkp2.total_note_value != captured.zkp2.total_note_value {
+        Some("delegated note value")
+    } else if current.zkp2.address_index != captured.zkp2.address_index {
+        Some("delegation address index")
+    } else if current.zkp2.ea_pk != captured.zkp2.ea_pk {
+        Some("encryption authority key")
+    } else if current.zkp2.voting_round_id != captured.zkp2.voting_round_id {
+        Some("voting round identity")
+    } else if current.van_position != captured.van_position {
         Some("bundle VAN position")
-    } else if current.proposal_authority != captured.proposal_authority {
+    } else if current.zkp2.proposal_authority != captured.zkp2.proposal_authority {
         Some("proposal-authority state")
     } else if current.ballot_intent != captured.ballot_intent {
         Some("ballot intent")
@@ -2058,12 +2148,13 @@ mod tests {
             share_payloads: Vec::new(),
         };
         PreparedVoteCommit {
+            wallet_id: WALLET_ID.to_string(),
             round_id: ROUND_ID.to_string(),
             bundle_index: 0,
             draft,
             recovery,
             commit,
-            captured_state: Some(state),
+            captured_state: CapturedVoteState::Fresh(state),
         }
     }
 
@@ -2800,6 +2891,99 @@ mod tests {
             "{err}"
         );
         assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_vote_rejects_changed_zkp2_inputs() {
+        let db = db_with_vote();
+        let prepared = prepared_vote_fixture(&db);
+        db.conn()
+            .execute(
+                "UPDATE rounds SET ea_pk = ?1 WHERE round_id = ?2 AND wallet_id = ?3",
+                rusqlite::params![vec![0xEFu8; 32], ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+
+        let err = persist_prepared_commit(&db, prepared).unwrap_err();
+        assert!(
+            err.to_string().contains("encryption authority key changed"),
+            "{err}"
+        );
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_vote_rejects_changed_wallet_identity() {
+        let db = db_with_vote();
+        let prepared = prepared_vote_fixture(&db);
+        db.set_wallet_id("different-wallet");
+
+        let err = persist_prepared_commit(&db, prepared).unwrap_err();
+        assert!(err.to_string().contains("wallet identity changed"), "{err}");
+
+        db.set_wallet_id(WALLET_ID);
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn recovered_prepared_vote_rejects_deleted_vote_state() {
+        let db = db_with_vote();
+        let recovery = recovery_bundle_fixture();
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            0,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            0,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &serialize_recovery(&recovery).unwrap(),
+        )
+        .unwrap();
+        let hotkey = VotingHotkey::from_stored_secret(&[0x99; 64], Network::Testnet).unwrap();
+        let prepared = prepare_commit(
+            &db,
+            ROUND_ID,
+            0,
+            &DraftVote {
+                proposal_id: 1,
+                choice: 2,
+                num_options: 3,
+                single_share: false,
+                vc_tree_position: 456,
+            },
+            &VanWitness {
+                auth_path: vec![],
+                position: 0,
+                anchor_height: 0,
+            },
+            VoteSigner::hotkey(&hotkey),
+            &NoopProgressReporter,
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM votes WHERE round_id = ?1 AND wallet_id = ?2
+                 AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::params![ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+
+        let err = persist_prepared_commit(&db, prepared).unwrap_err();
+        assert!(
+            err.to_string().contains("recovered vote state changed"),
+            "{err}"
+        );
     }
 
     #[test]

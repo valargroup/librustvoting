@@ -26,6 +26,7 @@ use crate::types::{
 };
 
 pub(crate) struct PreparedVoteProof {
+    pub wallet_id: String,
     pub bundle: VoteCommitmentBundle,
     pub state: queries::VotePreparationState,
 }
@@ -1121,9 +1122,6 @@ impl VotingDb {
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("failed to begin vote preparation transaction: {e}"),
         })?;
-        let stored_network = queries::load_round_network(&tx, round_id, &wallet_id)?;
-        validate_network_matches_round(stored_network, signer_network, "vote signer")?;
-        let zkp2_data = queries::load_zkp2_inputs(&tx, round_id, &wallet_id, bundle_index)?;
         let state = queries::load_vote_preparation_state(
             &tx,
             round_id,
@@ -1135,6 +1133,7 @@ impl VotingDb {
             message: format!("failed to finish vote preparation transaction: {e}"),
         })?;
         drop(conn);
+        validate_network_matches_round(state.network, signer_network, "vote signer")?;
 
         if van_position != state.van_position {
             return Err(VotingError::InvalidInput {
@@ -1156,33 +1155,37 @@ impl VotingDb {
 
         // Decode voting_round_id from hex string to 32 bytes
         let voting_round_id_bytes =
-            hex::decode(&zkp2_data.voting_round_id).map_err(|e| VotingError::Internal {
+            hex::decode(&state.zkp2.voting_round_id).map_err(|e| VotingError::Internal {
                 message: format!(
                     "invalid voting_round_id hex '{}': {e}",
-                    zkp2_data.voting_round_id
+                    state.zkp2.voting_round_id
                 ),
             })?;
 
         let bundle = crate::zkp2::build_vote_commitment(
             hotkey_seed,
-            stored_network,
-            zkp2_data.address_index,
-            zkp2_data.total_note_value,
-            &zkp2_data.gov_comm_rand,
+            state.network,
+            state.zkp2.address_index,
+            state.zkp2.total_note_value,
+            &state.zkp2.gov_comm_rand,
             &voting_round_id_bytes,
-            &zkp2_data.ea_pk,
+            &state.zkp2.ea_pk,
             proposal_id,
             choice,
             num_options,
             van_auth_path,
             van_position,
             anchor_height,
-            state.proposal_authority,
+            state.zkp2.proposal_authority,
             single_share,
             progress,
         )?;
 
-        Ok(PreparedVoteProof { bundle, state })
+        Ok(PreparedVoteProof {
+            wallet_id,
+            bundle,
+            state,
+        })
     }
 
     /// Build share payloads for helper server delegation.
