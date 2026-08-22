@@ -1515,11 +1515,16 @@ pub(crate) struct VoteRowState {
     pub commitment_bundle_json: Option<String>,
 }
 
+/// Snapshot of persisted state needed to prepare or validate a single vote draft.
+///
+/// `ballot_intent` is `None` when no intent row exists for the proposal.
+/// `vote` is `None` when no votes row exists for `(bundle_index, proposal_id)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VotePreparationState {
     pub network: Network,
     pub zkp2: Zkp2DelegationData,
     pub van_position: u32,
+    /// `(skipped, choice)` from `ballot_intent`, if present.
     pub ballot_intent: Option<(bool, Option<u32>)>,
     pub vote: Option<VoteRowState>,
 }
@@ -1586,6 +1591,20 @@ pub fn load_zkp2_inputs(
     })
 }
 
+/// Load the read-only snapshot used before preparing or committing a vote.
+///
+/// Returns network, ZKP2 delegation inputs (including live `proposal_authority`),
+/// the bundle's confirmed VAN leaf position, optional ballot intent for
+/// `proposal_id`, and optional existing vote-row state for
+/// `(bundle_index, proposal_id)`.
+///
+/// Missing ballot-intent or votes rows yield `None` fields; they are not errors.
+///
+/// # Errors
+///
+/// - [`VotingError::InvalidInput`] if the round/bundle is missing, or the VAN
+///   leaf position is unset.
+/// - [`VotingError::Internal`] on SQL failures loading ballot intent or vote state.
 pub(crate) fn load_vote_preparation_state(
     conn: &Connection,
     round_id: &str,
