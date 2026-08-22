@@ -20,7 +20,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Changed
 - Updated the selectable cryptography facade to `voting-crypto-deps 0.1.2`,
-  voting circuits to `0.10.3`, the indexed Merkle tree to `0.4.0`,
+  voting circuits to `0.10.3`, the indexed Merkle tree to `imt-tree 0.4.0`,
   and the PIR stack to `pir-types 0.5.0` and `pir-client 0.6.0`.
 - Released `vote-commitment-tree 0.5.2` and
   `vote-commitment-tree-client 0.7.2` with backend-neutral field, group, and
