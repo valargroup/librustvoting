@@ -6,6 +6,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+### Changed
+- Updated the selectable cryptography facade to `voting-crypto-deps 0.1.2`,
+  voting circuits to `0.10.3`, the indexed Merkle tree to `imt-tree 0.4.0`,
+  and the PIR stack to `pir-types 0.5.0` and `pir-client 0.6.0`.
+- Updated `vote-commitment-tree` and `vote-commitment-tree-client` with
+  backend-neutral field, group, and randomness trait imports for the updated
+  upstream and Zakura dependency families.
+
 ## v3.1.0-rc.5
 
 ### Added

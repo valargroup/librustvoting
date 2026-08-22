@@ -319,9 +319,9 @@ mod tests {
     use super::*;
 
     pub(crate) use crate::backend::pasta_curves;
-    use ff::PrimeField;
     use incrementalmerkletree::frontier::{CommitmentTree, Frontier};
     use incrementalmerkletree::Retention;
+    use pasta_curves::group::ff::PrimeField;
     use pasta_curves::pallas;
     use zcash_client_backend::data_api::WalletCommitmentTrees;
     use zcash_client_backend::proto::service::TreeState;

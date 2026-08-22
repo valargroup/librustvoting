@@ -1720,7 +1720,7 @@ mod tests {
         let voting_db = VotingDb::open_in_memory().unwrap();
         voting_db.set_wallet_id("prepare-delegation-bundle-test");
         let hotkey = test_regtest_voting_hotkey();
-        use group::GroupEncoding;
+        use pasta_curves::group::GroupEncoding;
         let ea_pk = pasta_curves::pallas::Point::from(voting_circuits::spend_auth_g_affine());
         let round_params = crate::VotingRoundParams {
             vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"

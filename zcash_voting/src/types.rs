@@ -2,8 +2,8 @@
 pub(crate) use crate::backend::{orchard, pasta_curves, zcash_client_backend, zcash_keys};
 use std::fmt;
 
-use ff::PrimeField;
 use orchard::note::{ExtractedNoteCommitment, NoteVersion};
+use pasta_curves::group::ff::PrimeField;
 use pasta_curves::pallas;
 use serde::{Deserialize, Serialize};
 use subtle::CtOption;
