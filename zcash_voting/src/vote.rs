@@ -8,7 +8,7 @@
 pub(crate) use crate::backend::{orchard, pasta_curves};
 use serde::{Deserialize, Serialize};
 
-use rusqlite::{named_params, OptionalExtension};
+use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
 
 use crate::{
     round::VotingDb,
@@ -825,9 +825,14 @@ pub fn persist_prepared_commit(
         });
     }
     let mut conn = db.conn();
-    let tx = conn.transaction().map_err(|e| VotingError::Internal {
-        message: format!("failed to begin prepared vote persistence transaction: {e}"),
-    })?;
+    // Immediate takes the write lock before the optimistic re-read so a concurrent
+    // writer cannot make the snapshot look fresh and then fail the later write with
+    // SQLITE_BUSY (which WAL often returns without waiting out busy_timeout).
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to begin prepared vote persistence transaction: {e}"),
+        })?;
     let captured_state = match captured_state {
         CapturedVoteState::Fresh(captured_state) => captured_state,
         CapturedVoteState::Recovered(captured_vote) => {
@@ -2027,7 +2032,10 @@ mod tests {
     const WALLET_ID: &str = "wallet";
 
     fn db_with_vote() -> VotingDb {
-        let db = VotingDb::open_in_memory().unwrap();
+        seeded_vote_db(VotingDb::open_in_memory().unwrap())
+    }
+
+    fn seeded_vote_db(db: VotingDb) -> VotingDb {
         db.set_wallet_id(WALLET_ID);
         db.create_round(crate::Network::Testnet, &round_params(), None)
             .unwrap();
@@ -2813,6 +2821,50 @@ mod tests {
             "{err}"
         );
         assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn persist_waits_for_external_writer_then_rejects_stale_state() {
+        use std::time::{Duration, Instant};
+
+        use rusqlite::Connection;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zcash-voting-persist-immediate-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let db = seeded_vote_db(VotingDb::open(&path_string).unwrap());
+        let prepared = prepared_vote_fixture(&db);
+
+        let lock = Connection::open(&path).unwrap();
+        lock.busy_timeout(Duration::from_secs(5)).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        queries::store_van_position(&lock, ROUND_ID, WALLET_ID, 0, 8).unwrap();
+
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let persist = scope.spawn(|| persist_prepared_commit(&db, prepared));
+            std::thread::sleep(Duration::from_millis(400));
+            lock.execute_batch("COMMIT").unwrap();
+
+            let err = persist.join().unwrap().unwrap_err();
+            assert!(started.elapsed() >= Duration::from_millis(300), "{err}");
+            assert!(
+                err.to_string().contains("bundle VAN position changed"),
+                "{err}"
+            );
+        });
+
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
     }
 
     #[test]
