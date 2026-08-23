@@ -46,7 +46,7 @@ pub use crate::pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, select_pir_endpoint, PirEndpoint,
 };
 pub use crate::precompute::{
-    cache_pir_proofs, note_witnesses, stored_note_witnesses, validate_cached_pir_proofs,
+    note_witnesses, precompute_pir_proofs, stored_note_witnesses, validate_cached_pir_proofs,
     verify_witness, PirPrecomputeReport,
 };
 pub use crate::recovery::{

@@ -725,7 +725,7 @@ pub struct DelegationPirPrecomputeResult {
 }
 
 /// Result of the bundle- and round-independent PIR proof precompute
-/// ([`crate::precompute::cache_pir_proofs`]) against the IMT root the connected
+/// ([`crate::precompute::precompute_pir_proofs`]) against the IMT root the connected
 /// PIR server currently serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PirCachePrecomputeResult {

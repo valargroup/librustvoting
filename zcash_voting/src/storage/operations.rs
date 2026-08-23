@@ -854,30 +854,34 @@ impl VotingDb {
         })
     }
 
-    /// Fetch and persist PIR-backed IMT non-membership proofs for the given
-    /// notes' nullifiers (plus optional extra raw 32-byte nullifiers) against
-    /// whatever IMT root the connected PIR server currently serves.
+    /// Fetch and persist PIR-backed IMT non-membership proofs for notes that
+    /// survive `bundle_policy`, against whatever IMT root the connected PIR
+    /// server currently serves.
     ///
-    /// Completely bundle- and round-independent: proofs land in the
-    /// `pir_proof_cache` table keyed by `(wallet_id, network, root, nullifier)`,
-    /// so they can be warmed before any round or bundle exists, and proofs for
-    /// the same nullifier under different snapshots coexist. A cached row only
-    /// counts as a hit if it decodes and verifies under the served root; a
-    /// corrupt or invalid row is treated as a miss and overwritten by the
-    /// refetch.
+    /// Completely round-independent: proofs land in the `pir_proof_cache` table
+    /// keyed by `(wallet_id, network, root, nullifier)`, so they can be warmed
+    /// before any round or bundle exists, and proofs for the same nullifier
+    /// under different snapshots coexist. Real notes are planned first with the
+    /// same policy round setup uses, so a selected-note dust tail is not
+    /// fetched. Padded-slot nullifiers are not an input; the per-bundle
+    /// precompute path fetches those after padded-note secrets exist. A cached
+    /// row only counts as a hit if it decodes and verifies under the served
+    /// root; a corrupt or invalid row is treated as a miss and overwritten by
+    /// the refetch.
     ///
     /// Every fetched proof is validated against the served root before
     /// anything is persisted; a single bad proof fails the whole call.
     pub fn precompute_pir_proof_cache(
         &self,
         notes: &[NoteInfo],
-        extra_nullifiers: &[Vec<u8>],
+        bundle_policy: BundlePolicy,
         network: Network,
         pir_client: &pir_client::PirClientBlocking,
     ) -> Result<PirCachePrecomputeResult, VotingError> {
+        let notes = crate::note_bundling::notes_for_pir_proof_cache(notes, bundle_policy)?;
         self.precompute_pir_proof_cache_inner(
-            notes,
-            extra_nullifiers,
+            &notes,
+            &[],
             network,
             pir_client.circuit_root(),
             |nfs| {
@@ -2932,7 +2936,12 @@ mod tests {
         .unwrap();
 
         let result = db
-            .precompute_pir_proof_cache(&notes, &[], Network::Testnet, &pir_client)
+            .precompute_pir_proof_cache(
+                &notes,
+                BundlePolicy::default(),
+                Network::Testnet,
+                &pir_client,
+            )
             .unwrap();
 
         assert_eq!(result.cached_count, 2);
@@ -3011,7 +3020,12 @@ mod tests {
 
         // Corrupt mock ciphertext: query cardinality is the property under test.
         let err = db
-            .precompute_pir_proof_cache(&notes, &[], Network::Testnet, &pir_client)
+            .precompute_pir_proof_cache(
+                &notes,
+                BundlePolicy::default(),
+                Network::Testnet,
+                &pir_client,
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("PIR parallel fetch failed"),
@@ -3019,6 +3033,42 @@ mod tests {
         );
         assert_eq!(transport.count_hits("/tier1/query"), 3);
         assert_eq!(transport.query_post_count(), 3);
+    }
+
+    #[test]
+    fn pir_cache_precompute_does_not_fetch_sub_ballot_notes() {
+        use voting_circuits::delegation::ImtProvider;
+        let db = test_db();
+        let imt = voting_circuits::delegation::SpacedLeafImtProvider::new();
+        let notes: Vec<NoteInfo> = (0..3)
+            .map(|position| {
+                let mut note = identity_note_with_position(position);
+                note.value = 100;
+                note
+            })
+            .collect();
+
+        let transport = std::sync::Arc::new(ConfigurableRootPirTransport::new(imt.root()));
+        let pir_client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            pir_types::COMPILED_PIR_LAYOUT,
+            transport.clone(),
+        )
+        .unwrap();
+
+        let result = db
+            .precompute_pir_proof_cache(
+                &notes,
+                BundlePolicy::default(),
+                Network::Testnet,
+                &pir_client,
+            )
+            .unwrap();
+
+        assert_eq!(result.cached_count, 0);
+        assert_eq!(result.fetched_count, 0);
+        assert_eq!(transport.query_post_count(), 0);
+        assert_eq!(pir_cache_row_count(&db), 0);
     }
 
     #[test]

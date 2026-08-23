@@ -182,24 +182,31 @@ pub fn delegation_pir(
     })
 }
 
-/// Fetches and persists PIR proofs for the given notes' nullifiers (plus
-/// optional extra raw 32-byte nullifiers) against the IMT root the connected
-/// PIR server currently serves, keyed by `network`.
+/// Fetches and persists PIR proofs for notes that survive `bundle_policy`.
 ///
-/// Bundle- and round-independent: proofs can be warmed before any round or
-/// bundle exists, and later checked against a round's expected root with
-/// [`validate_cached_pir_proofs`]. The delegation prove path reads the same
-/// cache, so proofs warmed here are never refetched at proving time. A
-/// cached row that fails to decode or verify is treated as a miss and
-/// overwritten.
-pub fn cache_pir_proofs(
+/// Callers pass the selected snapshot set against the IMT root the connected
+/// PIR server currently serves, keyed by `network`. This plans first with the
+/// same path round setup uses, so sub-ballot bundles and the privacy-trim tail
+/// are not PIR-queried. Pass the same [`crate::note_bundling::BundlePolicy`]
+/// the wallet will later persist at round setup.
+///
+/// Padded-slot nullifiers are not an input here: they only exist after bundle
+/// padded-note secrets are initialized, and the per-bundle PIR precompute path
+/// fetches them then.
+///
+/// Proofs can be warmed before any round or bundle exists, and later checked
+/// against a round's expected root with [`validate_cached_pir_proofs`]. The
+/// delegation prove path reads the same cache, so real-note proofs warmed here
+/// are never refetched at proving time. A cached row that fails to decode or
+/// verify is treated as a miss and overwritten.
+pub fn precompute_pir_proofs(
     db: &VotingDb,
     notes: &[NoteInfo],
-    extra_nullifiers: &[Vec<u8>],
+    bundle_policy: crate::note_bundling::BundlePolicy,
     network: Network,
     pir_client: &pir_client::PirClientBlocking,
 ) -> Result<PirCachePrecomputeResult, VotingError> {
-    db.precompute_pir_proof_cache(notes, extra_nullifiers, network, pir_client)
+    db.precompute_pir_proof_cache(notes, bundle_policy, network, pir_client)
 }
 
 /// Classifies the cached PIR proofs for the given nullifiers against an
@@ -384,7 +391,7 @@ mod pir_tests {
     }
 
     #[test]
-    fn cache_pir_proofs_wrapper_delegates_and_surfaces_input_errors() {
+    fn precompute_pir_proofs_wrapper_delegates_and_surfaces_input_errors() {
         struct StaticPirTransport;
 
         impl pir_client::Transport for StaticPirTransport {
@@ -455,19 +462,67 @@ mod pir_tests {
 
         // Empty inputs run the whole wrapper path without any PIR query and
         // report the served (all-zero) root.
-        let result = cache_pir_proofs(&db, &[], &[], Network::Testnet, &pir_client).unwrap();
+        let result = precompute_pir_proofs(
+            &db,
+            &[],
+            crate::note_bundling::BundlePolicy::default(),
+            Network::Testnet,
+            &pir_client,
+        )
+        .unwrap();
         assert_eq!(result.cached_count, 0);
         assert_eq!(result.fetched_count, 0);
         assert_eq!(result.served_root, vec![0u8; 32]);
 
-        // Malformed caller input surfaces through the wrapper as InvalidInput.
-        let err = cache_pir_proofs(&db, &[], &[vec![0x07; 31]], Network::Testnet, &pir_client)
-            .unwrap_err();
+        // Malformed caller input surfaces through the wrapper as InvalidInput
+        // at planning time, before any PIR query.
+        let short = NoteInfo {
+            commitment: vec![1; 32],
+            nullifier: vec![0x07; 31],
+            value: crate::governance::BALLOT_DIVISOR,
+            position: 0,
+            diversifier: vec![3; 11],
+            rho: vec![4; 32],
+            rseed: vec![5; 32],
+            scope: 0,
+            ufvk_str: "uviewtest".to_string(),
+        };
+        let err = precompute_pir_proofs(
+            &db,
+            &[short],
+            crate::note_bundling::BundlePolicy::default(),
+            Network::Testnet,
+            &pir_client,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
-                .contains("extra[0] nullifier must be 32 bytes, got 31"),
+                .contains("notes[0].nullifier must be 32 bytes, got 31"),
             "{err}"
         );
+
+        // Sub-ballot selected notes are planned away before any PIR query.
+        let dust = vec![NoteInfo {
+            commitment: vec![1; 32],
+            nullifier: vec![2; 32],
+            value: 100,
+            position: 0,
+            diversifier: vec![3; 11],
+            rho: vec![4; 32],
+            rseed: vec![5; 32],
+            scope: 0,
+            ufvk_str: "uviewtest".to_string(),
+        }];
+        let result = precompute_pir_proofs(
+            &db,
+            &dust,
+            crate::note_bundling::BundlePolicy::default(),
+            Network::Testnet,
+            &pir_client,
+        )
+        .unwrap();
+        assert_eq!(result.cached_count, 0);
+        assert_eq!(result.fetched_count, 0);
     }
 
     #[test]

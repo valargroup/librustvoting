@@ -7,16 +7,19 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## v3.1.0-rc.8
 
 ### Added
-- Added a bundle- and round-independent PIR proof cache. `cache_pir_proofs`
-  fetches and persists IMT non-membership proofs for eligible-note nullifiers
-  against whatever snapshot the connected PIR server currently serves, keyed by
-  `(wallet_id, network, root, nullifier)`, so wallets can warm proofs in the
-  background before any round is initialized, bundles exist, or a hotkey is
-  generated. `validate_cached_pir_proofs` classifies cached proofs against an
-  expected round root offline (`Valid` / `StaleRoot` / `Missing` / `Invalid`).
-  Snapshots coexist in the cache; leftover roots are unused, not harmful.
-  New types: `PirCachePrecomputeResult`, `PirCacheValidationReport`,
-  `PirProofCacheEntry`, `PirProofCacheStatus`.
+- Added a bundle- and round-independent PIR proof cache. `precompute_pir_proofs`
+  fetches and persists IMT non-membership proofs for notes that survive the
+  caller-supplied `BundlePolicy` (the same plan round setup uses: sub-ballot
+  drop and privacy trim) against whatever snapshot the connected PIR server
+  currently serves, keyed by `(wallet_id, network, root, nullifier)`, so
+  wallets can warm proofs in the background from the selected snapshot set
+  before any round is initialized, bundles exist, or a hotkey is generated.
+  Padded-slot nullifiers are fetched later on the per-bundle path.
+  `validate_cached_pir_proofs` classifies
+  cached proofs against an expected round root offline (`Valid` / `StaleRoot`
+  / `Missing` / `Invalid`). Snapshots coexist in the cache; leftover roots
+  are unused, not harmful. New types: `PirCachePrecomputeResult`,
+  `PirCacheValidationReport`, `PirProofCacheEntry`, `PirProofCacheStatus`.
 
 ### Changed
 - The delegation prove path and `precompute_delegation_pir` now read and write
