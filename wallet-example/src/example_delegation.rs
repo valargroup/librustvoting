@@ -261,6 +261,37 @@ where
         .context("precompute delegation bundle")
 }
 
+/// Warms the bundle-independent PIR proof cache for the given eligible notes
+/// against whatever snapshot the connected PIR server currently serves.
+///
+/// Run this in the background as soon as the wallet knows its eligible notes
+/// at a live snapshot height — before any round is initialized, bundles exist,
+/// or a hotkey is generated. The delegation prove path reads the same cache,
+/// so real-note proofs warmed here are never refetched at proving time; only
+/// the per-bundle padded-slot nullifiers still need a fetch there.
+///
+/// Snapshots coexist in the cache; leftover roots are unused, not harmful.
+/// Compare the returned `served_root` against the target round's
+/// `nullifier_imt_root` (or run `validate_cached_pir_proofs`) to detect a
+/// stale snapshot.
+///
+/// # Errors
+///
+/// Returns an error if the layout handshake fails, the PIR server cannot be
+/// reached, a fetched proof does not verify under the served root, or cache
+/// rows cannot be persisted.
+pub fn warm_pir_proof_cache_for_notes(
+    voting_db: &VotingDb,
+    notes: &[zcash_voting::NoteInfo],
+    network: Network,
+    pir_layout: PirLayout,
+    pir_server_url: &str,
+) -> Result<zcash_voting::PirCachePrecomputeResult> {
+    let pir_client = connect_pir(pir_layout, pir_server_url)?;
+    zcash_voting::prelude::cache_pir_proofs(voting_db, notes, &[], network, &pir_client)
+        .context("warm PIR proof cache")
+}
+
 /// Proves one precomputed delegation bundle and signs it in wallet-owned code.
 ///
 /// The returned `DelegationSubmission` contains the chain-ready fields for the

@@ -4,6 +4,28 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v3.1.0-rc.8
+
+### Added
+- Added a bundle- and round-independent PIR proof cache. `cache_pir_proofs`
+  fetches and persists IMT non-membership proofs for eligible-note nullifiers
+  against whatever snapshot the connected PIR server currently serves, keyed by
+  `(wallet_id, network, root, nullifier)`, so wallets can warm proofs in the
+  background before any round is initialized, bundles exist, or a hotkey is
+  generated. `validate_cached_pir_proofs` classifies cached proofs against an
+  expected round root offline (`Valid` / `StaleRoot` / `Missing` / `Invalid`).
+  Snapshots coexist in the cache; leftover roots are unused, not harmful.
+  New types: `PirCachePrecomputeResult`, `PirCacheValidationReport`,
+  `PirProofCacheEntry`, `PirProofCacheStatus`.
+
+### Changed
+- The delegation prove path and `precompute_delegation_pir` now read and write
+  the shared `pir_proof_cache` table instead of the bundle-scoped `imt_proofs`
+  table, so background-warmed real-note proofs are never refetched at proving
+  time; only the per-bundle padded-slot nullifiers can still require a fetch.
+  Schema version 15 migrates existing `imt_proofs` rows into the new cache
+  (keyed by the owning round's network) and drops the old table.
+
 ## v3.1.0-rc.7
 
 ### Added

@@ -51,7 +51,12 @@ stage-oriented API:
   and 1,000 ZEC by default. `PrivacyTrim` reports the raw note value excluded,
   not bundle-quantized voting weight.
 - `precompute::*` prepares shielded note witnesses, delegation PIR inputs, and VAN
-  witnesses for vote proofs.
+  witnesses for vote proofs. `cache_pir_proofs` warms PIR nullifier proofs in
+  the background before any round or bundle exists (no hotkey needed), keyed by
+  network and served IMT root; the delegation prove path reads the same cache.
+  `validate_cached_pir_proofs` checks warmed proofs against a round's
+  `nullifier_imt_root` offline. Snapshots coexist in the cache; leftover
+  roots are unused, not harmful.
 - `delegate::*` builds delegation PCZTs, proves delegation, prepares signing
   requests, and assembles signed delegation submissions. Wallets keep root seed
   material outside this crate, sign requests at the wallet boundary, and pass
