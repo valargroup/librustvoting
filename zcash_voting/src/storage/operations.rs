@@ -861,8 +861,10 @@ impl VotingDb {
     /// Completely bundle- and round-independent: proofs land in the
     /// `pir_proof_cache` table keyed by `(wallet_id, network, root, nullifier)`,
     /// so they can be warmed before any round or bundle exists, and proofs for
-    /// the same nullifier under different snapshots coexist. Nullifiers already
-    /// cached under the served root are skipped and reported as cached.
+    /// the same nullifier under different snapshots coexist. A cached row only
+    /// counts as a hit if it decodes and verifies under the served root; a
+    /// corrupt or invalid row is treated as a miss and overwritten by the
+    /// refetch.
     ///
     /// Every fetched proof is validated against the served root before
     /// anything is persisted; a single bad proof fails the whole call.
@@ -903,29 +905,44 @@ impl VotingDb {
         let served_root_bytes = served_root.to_repr().to_vec();
 
         let mut seen = HashSet::new();
-        let mut cached_count = 0u32;
-        let mut missing = Vec::new();
+        let mut unique_targets = Vec::new();
+        let mut loaded_rows = Vec::new();
         {
             let conn = self.conn();
             for (nf_bytes, nf) in targets {
                 if !seen.insert(nf_bytes) {
                     continue;
                 }
-                if queries::load_pir_cache_proof(
+                unique_targets.push((nf_bytes, nf));
+                loaded_rows.push(queries::load_pir_cache_row(
                     &conn,
                     &wallet_id,
                     network,
                     &served_root_bytes,
                     &nf_bytes,
-                )?
-                .is_some()
-                {
-                    cached_count += 1;
-                } else {
-                    missing.push((nf_bytes, nf));
-                }
+                )?);
             }
-            // Lock dropped here so the PIR fetch does not block other DB work.
+            // Lock dropped here so verify and the PIR fetch do not block other
+            // DB work. Storage errors already propagated; decode/verify below
+            // is not a storage failure.
+        }
+
+        // A cached row only counts if it decodes AND verifies under the served
+        // root; a corrupt or invalid row is a miss so the refetch upsert
+        // overwrites it (the cache self-heals instead of wedging prove).
+        let mut cached_count = 0u32;
+        let mut missing = Vec::new();
+        for ((nf_bytes, nf), row) in unique_targets.into_iter().zip(loaded_rows) {
+            let cached_ok = row.is_some_and(|row| {
+                row.decode().is_ok_and(|proof| {
+                    crate::zkp1::validate_pir_proof(&proof, nf, served_root).is_ok()
+                })
+            });
+            if cached_ok {
+                cached_count += 1;
+            } else {
+                missing.push((nf_bytes, nf));
+            }
         }
 
         if missing.is_empty() {
@@ -974,7 +991,7 @@ impl VotingDb {
     /// Completely bundle- and round-independent, and fully offline — the PIR
     /// server is never contacted. Mismatches are reported per nullifier
     /// (`Valid` / `StaleRoot` / `Missing` / `Invalid`) rather than raised as
-    /// errors; the call only fails on malformed input.
+    /// errors; the call only fails on malformed input or a storage error.
     pub fn validate_pir_proof_cache(
         &self,
         notes: &[NoteInfo],
@@ -1011,30 +1028,26 @@ impl VotingDb {
                     .into_iter()
                     .filter(|root| root.as_slice() != root_bytes)
                     .collect();
-            let status = match queries::load_pir_cache_proof(
+            let status = match queries::load_pir_cache_row(
                 &conn,
                 &wallet_id,
                 network,
                 &root_bytes,
                 &nf_bytes,
-            ) {
-                Ok(Some(proof)) => {
-                    if crate::zkp1::validate_pir_proof(&proof, nf, expected).is_ok() {
+            )? {
+                Some(row) => match row.decode() {
+                    Ok(proof) if crate::zkp1::validate_pir_proof(&proof, nf, expected).is_ok() => {
                         PirProofCacheStatus::Valid
-                    } else {
-                        PirProofCacheStatus::Invalid
                     }
-                }
-                Ok(None) => {
+                    _ => PirProofCacheStatus::Invalid,
+                },
+                None => {
                     if other_roots.is_empty() {
                         PirProofCacheStatus::Missing
                     } else {
                         PirProofCacheStatus::StaleRoot
                     }
                 }
-                // A row exists under the expected root but its blobs do not
-                // decode; report it instead of failing the whole report.
-                Err(_) => PirProofCacheStatus::Invalid,
             };
             match status {
                 PirProofCacheStatus::Valid => valid_count += 1,
@@ -2829,6 +2842,70 @@ mod tests {
 
         assert_eq!(result.cached_count, 2);
         assert_eq!(result.fetched_count, 0);
+    }
+
+    #[test]
+    fn pir_cache_precompute_refetches_corrupt_or_invalid_rows() {
+        use voting_circuits::delegation::ImtProvider;
+        let db = test_db();
+        let imt = voting_circuits::delegation::SpacedLeafImtProvider::new();
+        let notes: Vec<NoteInfo> = (0..3).map(identity_note_with_position).collect();
+        seed_pir_cache(
+            &db,
+            &imt,
+            &[
+                notes[0].nullifier.clone(),
+                notes[1].nullifier.clone(),
+                notes[2].nullifier.clone(),
+            ],
+        );
+
+        {
+            let conn = db.conn();
+            // notes[0]: undecodable blob.
+            conn.execute(
+                "UPDATE pir_proof_cache SET path = X'00' WHERE nullifier = ?1",
+                rusqlite::params![notes[0].nullifier],
+            )
+            .unwrap();
+            // notes[1]: decodes, but fails out-of-circuit verification.
+            conn.execute(
+                "UPDATE pir_proof_cache SET leaf_pos = leaf_pos + 1 WHERE nullifier = ?1",
+                rusqlite::params![notes[1].nullifier],
+            )
+            .unwrap();
+        }
+
+        let fetched = std::cell::RefCell::new(Vec::<pallas::Base>::new());
+        let result = db
+            .precompute_pir_proof_cache_inner(&notes, &[], Network::Testnet, imt.root(), |nfs| {
+                fetched.borrow_mut().extend(nfs.iter().copied());
+                Ok(nfs.iter().map(|nf| imt_pir_proof(&imt, *nf)).collect())
+            })
+            .unwrap();
+
+        assert_eq!(result.cached_count, 1);
+        assert_eq!(result.fetched_count, 2);
+        let fetched = fetched.into_inner();
+        assert_eq!(fetched.len(), 2);
+        assert!(fetched.contains(&nf_base(&notes[0].nullifier)));
+        assert!(fetched.contains(&nf_base(&notes[1].nullifier)));
+        assert!(!fetched.contains(&nf_base(&notes[2].nullifier)));
+
+        let root_bytes = imt.root().to_repr().to_vec();
+        let conn = db.conn();
+        for note in &notes {
+            let stored = queries::load_pir_cache_proof(
+                &conn,
+                W,
+                Network::Testnet,
+                &root_bytes,
+                &note.nullifier,
+            )
+            .unwrap()
+            .expect("proof persisted");
+            crate::zkp1::validate_pir_proof(&stored, nf_base(&note.nullifier), imt.root()).unwrap();
+        }
     }
 
     #[test]

@@ -189,7 +189,9 @@ pub fn delegation_pir(
 /// Bundle- and round-independent: proofs can be warmed before any round or
 /// bundle exists, and later checked against a round's expected root with
 /// [`validate_cached_pir_proofs`]. The delegation prove path reads the same
-/// cache, so proofs warmed here are never refetched at proving time.
+/// cache, so proofs warmed here are never refetched at proving time. A
+/// cached row that fails to decode or verify is treated as a miss and
+/// overwritten.
 pub fn cache_pir_proofs(
     db: &VotingDb,
     notes: &[NoteInfo],

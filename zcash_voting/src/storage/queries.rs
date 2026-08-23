@@ -2396,8 +2396,69 @@ pub fn store_pir_cache_proof(
     Ok(())
 }
 
-/// Loads the cached PIR proof for exactly `(wallet_id, network, root,
+/// Raw `pir_proof_cache` blobs for one `(wallet_id, network, root, nullifier)`.
+///
+/// Decoding is separate from the SQLite load so a corrupt row can be treated as
+/// a cache miss (and overwritten) without looking like a storage failure.
+pub struct PirCacheRow {
+    pub nf_bounds: Vec<u8>,
+    pub leaf_pos: i64,
+    pub path: Vec<u8>,
+    root: Vec<u8>,
+}
+
+impl PirCacheRow {
+    /// Decode the stored blobs into a PIR proof. Fails only on corrupt bytes.
+    pub fn decode(&self) -> Result<pir_client::ImtProofData, VotingError> {
+        Ok(pir_client::ImtProofData {
+            root: field_from_bytes(&self.root, "pir_proof_cache.root")?,
+            nf_bounds: fields_from_blob::<3>(&self.nf_bounds, "pir_proof_cache.nf_bounds")?,
+            leaf_pos: u32::try_from(self.leaf_pos).map_err(|_| VotingError::Internal {
+                message: format!("invalid cached PIR proof leaf_pos {}", self.leaf_pos),
+            })?,
+            path: fields_from_blob::<29>(&self.path, "pir_proof_cache.path")?,
+        })
+    }
+}
+
+/// Loads the raw cached PIR proof row for exactly `(wallet_id, network, root,
 /// nullifier)`, or `None` when no proof is cached under that root.
+///
+/// Storage errors propagate; blob decode is left to [`PirCacheRow::decode`].
+pub fn load_pir_cache_row(
+    conn: &Connection,
+    wallet_id: &str,
+    network: Network,
+    root: &[u8],
+    nullifier: &[u8],
+) -> Result<Option<PirCacheRow>, VotingError> {
+    conn.query_row(
+        "SELECT root, nf_bounds, leaf_pos, path FROM pir_proof_cache
+         WHERE wallet_id = :wallet_id AND network = :network
+           AND root = :root AND nullifier = :nullifier",
+        named_params! {
+            ":wallet_id": wallet_id,
+            ":network": network_to_storage(network),
+            ":root": root,
+            ":nullifier": nullifier,
+        },
+        |row| {
+            Ok(PirCacheRow {
+                root: row.get(0)?,
+                nf_bounds: row.get(1)?,
+                leaf_pos: row.get(2)?,
+                path: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to load cached PIR proof: {e}"),
+    })
+}
+
+/// Loads and decodes the cached PIR proof for exactly `(wallet_id, network,
+/// root, nullifier)`, or `None` when no proof is cached under that root.
 pub fn load_pir_cache_proof(
     conn: &Connection,
     wallet_id: &str,
@@ -2405,42 +2466,10 @@ pub fn load_pir_cache_proof(
     root: &[u8],
     nullifier: &[u8],
 ) -> Result<Option<pir_client::ImtProofData>, VotingError> {
-    let row = conn
-        .query_row(
-            "SELECT root, nf_bounds, leaf_pos, path FROM pir_proof_cache
-             WHERE wallet_id = :wallet_id AND network = :network
-               AND root = :root AND nullifier = :nullifier",
-            named_params! {
-                ":wallet_id": wallet_id,
-                ":network": network_to_storage(network),
-                ":root": root,
-                ":nullifier": nullifier,
-            },
-            |row| {
-                let root: Vec<u8> = row.get(0)?;
-                let nf_bounds: Vec<u8> = row.get(1)?;
-                let leaf_pos: i64 = row.get(2)?;
-                let path: Vec<u8> = row.get(3)?;
-                Ok((root, nf_bounds, leaf_pos, path))
-            },
-        )
-        .optional()
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to load cached PIR proof: {e}"),
-        })?;
-
-    let Some((root, nf_bounds, leaf_pos, path)) = row else {
-        return Ok(None);
-    };
-
-    Ok(Some(pir_client::ImtProofData {
-        root: field_from_bytes(&root, "pir_proof_cache.root")?,
-        nf_bounds: fields_from_blob::<3>(&nf_bounds, "pir_proof_cache.nf_bounds")?,
-        leaf_pos: u32::try_from(leaf_pos).map_err(|_| VotingError::Internal {
-            message: format!("invalid cached PIR proof leaf_pos {leaf_pos}"),
-        })?,
-        path: fields_from_blob::<29>(&path, "pir_proof_cache.path")?,
-    }))
+    match load_pir_cache_row(conn, wallet_id, network, root, nullifier)? {
+        Some(row) => Ok(Some(row.decode()?)),
+        None => Ok(None),
+    }
 }
 
 /// Lists every root the nullifier has a cached proof under on this network,

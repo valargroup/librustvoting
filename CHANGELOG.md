@@ -23,8 +23,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the shared `pir_proof_cache` table instead of the bundle-scoped `imt_proofs`
   table, so background-warmed real-note proofs are never refetched at proving
   time; only the per-bundle padded-slot nullifiers can still require a fetch.
-  Schema version 15 migrates existing `imt_proofs` rows into the new cache
-  (keyed by the owning round's network) and drops the old table.
+  A cached row that fails to decode or verify is treated as a miss and
+  overwritten by the refetched proof, so a corrupt row self-heals instead of
+  wedging the precompute. Schema version 15 migrates existing `imt_proofs`
+  rows into the new cache (keyed by the owning round's network) and drops the
+  old table.
 
 ## v3.1.0-rc.7
 
