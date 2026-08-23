@@ -2362,6 +2362,23 @@ fn fields_from_blob<const N: usize>(
 // bundle attached, so proofs can be warmed before any bundle exists and the
 // same nullifier can hold proofs for several IMT snapshots at once.
 
+pub(crate) const PIR_PROOF_CACHE_TTL_SECS: i64 = 28 * 24 * 60 * 60;
+
+/// Deletes PIR proof cache rows created more than four weeks ago.
+///
+/// This is intentionally based on `created_at`, not `updated_at`, so repeatedly
+/// storing the same cache key does not extend its lifetime indefinitely.
+pub fn prune_expired_pir_cache(conn: &Connection) -> Result<usize, VotingError> {
+    conn.execute(
+        "DELETE FROM pir_proof_cache
+         WHERE created_at < strftime('%s','now') - :ttl",
+        named_params! { ":ttl": PIR_PROOF_CACHE_TTL_SECS },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to prune expired PIR proof cache rows: {e}"),
+    })
+}
+
 /// Stores a PIR proof under `(wallet_id, network, proof.root, nullifier)`,
 /// updating the existing row in place when that exact key is already present.
 pub fn store_pir_cache_proof(

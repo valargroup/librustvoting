@@ -31,6 +31,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   wedging the precompute. Schema version 15 migrates existing `imt_proofs`
   rows into the new cache (keyed by the owning round's network) and drops the
   old table.
+- `precompute_pir_proofs` now prunes PIR proof cache rows created more than
+  four weeks ago before warming the requested notes. Prove-time cache access
+  remains non-pruning so an already cached proof can still complete a bundle.
 
 ## v3.1.0-rc.7
 

@@ -279,6 +279,7 @@ where
 /// nullifiers still need a fetch there.
 ///
 /// Snapshots coexist in the cache; leftover roots are unused, not harmful.
+/// This warmup also prunes cache rows created more than four weeks ago.
 /// Compare the returned `served_root` against the target round's
 /// `nullifier_imt_root` (or run `validate_cached_pir_proofs`) to detect a
 /// stale snapshot.

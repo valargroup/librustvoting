@@ -867,7 +867,8 @@ impl VotingDb {
     /// precompute path fetches those after padded-note secrets exist. A cached
     /// row only counts as a hit if it decodes and verifies under the served
     /// root; a corrupt or invalid row is treated as a miss and overwritten by
-    /// the refetch.
+    /// the refetch. Cache rows created more than four weeks ago are pruned
+    /// before this background warmup; prove-time precompute does not prune.
     ///
     /// Every fetched proof is validated against the served root before
     /// anything is persisted; a single bad proof fails the whole call.
@@ -879,6 +880,10 @@ impl VotingDb {
         pir_client: &pir_client::PirClientBlocking,
     ) -> Result<PirCachePrecomputeResult, VotingError> {
         let notes = crate::note_bundling::notes_for_pir_proof_cache(notes, bundle_policy)?;
+        {
+            let conn = self.conn();
+            queries::prune_expired_pir_cache(&conn)?;
+        }
         self.precompute_pir_proof_cache_inner(
             &notes,
             &[],
@@ -2926,6 +2931,13 @@ mod tests {
             &imt,
             &[notes[0].nullifier.clone(), notes[1].nullifier.clone()],
         );
+        db.conn()
+            .execute(
+                "UPDATE pir_proof_cache
+                 SET created_at = strftime('%s','now') - ?1 + 1",
+                rusqlite::params![queries::PIR_PROOF_CACHE_TTL_SECS],
+            )
+            .unwrap();
 
         let transport = std::sync::Arc::new(ConfigurableRootPirTransport::new(imt.root()));
         let pir_client = pir_client::PirClientBlocking::with_transport(
@@ -2948,6 +2960,130 @@ mod tests {
         assert_eq!(result.fetched_count, 0);
         assert_eq!(result.served_root, imt.root().to_repr().to_vec());
         assert_eq!(transport.query_post_count(), 0);
+    }
+
+    #[test]
+    fn pir_cache_public_precompute_prunes_expired_proof_before_refetch() {
+        use voting_circuits::delegation::ImtProvider;
+        let db = test_db();
+        let imt = voting_circuits::delegation::SpacedLeafImtProvider::new();
+        let note = identity_note_with_position(0);
+        seed_pir_cache(&db, &imt, std::slice::from_ref(&note.nullifier));
+        db.conn()
+            .execute(
+                "UPDATE pir_proof_cache
+                 SET created_at = strftime('%s','now') - ?1 - 1",
+                rusqlite::params![queries::PIR_PROOF_CACHE_TTL_SECS],
+            )
+            .unwrap();
+
+        let transport = std::sync::Arc::new(ConfigurableRootPirTransport::new(imt.root()));
+        let pir_client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            pir_types::COMPILED_PIR_LAYOUT,
+            transport.clone(),
+        )
+        .unwrap();
+
+        // The mock returns a deliberately corrupt ciphertext. Reaching the
+        // fetch proves the expired row was pruned and treated as a cache miss.
+        let err = db
+            .precompute_pir_proof_cache(
+                std::slice::from_ref(&note),
+                BundlePolicy::default(),
+                Network::Testnet,
+                &pir_client,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("PIR parallel fetch failed"),
+            "{err}"
+        );
+        assert_eq!(transport.query_post_count(), 1);
+        assert_eq!(pir_cache_row_count(&db), 0);
+    }
+
+    #[test]
+    fn pir_cache_inner_keeps_expired_proof_for_prove_time_reuse() {
+        use voting_circuits::delegation::ImtProvider;
+        let db = test_db();
+        let imt = voting_circuits::delegation::SpacedLeafImtProvider::new();
+        let note = identity_note_with_position(0);
+        seed_pir_cache(&db, &imt, std::slice::from_ref(&note.nullifier));
+        db.conn()
+            .execute(
+                "UPDATE pir_proof_cache
+                 SET created_at = strftime('%s','now') - ?1 - 1",
+                rusqlite::params![queries::PIR_PROOF_CACHE_TTL_SECS],
+            )
+            .unwrap();
+
+        let result = db
+            .precompute_pir_proof_cache_inner(
+                std::slice::from_ref(&note),
+                &[],
+                Network::Testnet,
+                imt.root(),
+                |_| panic!("prove-time cache path must not prune an expired proof"),
+            )
+            .unwrap();
+
+        assert_eq!(result.cached_count, 1);
+        assert_eq!(result.fetched_count, 0);
+        assert_eq!(pir_cache_row_count(&db), 1);
+    }
+
+    #[test]
+    fn pir_cache_public_precompute_prunes_expired_unrelated_root() {
+        use voting_circuits::delegation::ImtProvider;
+        let db = test_db();
+        let current_imt = voting_circuits::delegation::SpacedLeafImtProvider::new();
+        let old_imt = voting_circuits::delegation::SpacedLeafImtProvider::with_extra_nullifiers(&[
+            pallas::Base::from(1234u64),
+        ]);
+        let note = identity_note_with_position(0);
+        seed_pir_cache(&db, &current_imt, std::slice::from_ref(&note.nullifier));
+        seed_pir_cache(&db, &old_imt, std::slice::from_ref(&note.nullifier));
+        let old_root = old_imt.root().to_repr();
+        db.conn()
+            .execute(
+                "UPDATE pir_proof_cache
+                 SET created_at = strftime('%s','now') - ?1 - 1
+                 WHERE root = ?2",
+                rusqlite::params![queries::PIR_PROOF_CACHE_TTL_SECS, &old_root[..]],
+            )
+            .unwrap();
+
+        let transport = std::sync::Arc::new(ConfigurableRootPirTransport::new(current_imt.root()));
+        let pir_client = pir_client::PirClientBlocking::with_transport(
+            "https://pir.test",
+            pir_types::COMPILED_PIR_LAYOUT,
+            transport.clone(),
+        )
+        .unwrap();
+
+        let result = db
+            .precompute_pir_proof_cache(
+                std::slice::from_ref(&note),
+                BundlePolicy::default(),
+                Network::Testnet,
+                &pir_client,
+            )
+            .unwrap();
+
+        assert_eq!(result.cached_count, 1);
+        assert_eq!(result.fetched_count, 0);
+        assert_eq!(transport.query_post_count(), 0);
+        assert_eq!(pir_cache_row_count(&db), 1);
+        assert!(queries::load_pir_cache_row(
+            &db.conn(),
+            W,
+            Network::Testnet,
+            &old_root,
+            &note.nullifier,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

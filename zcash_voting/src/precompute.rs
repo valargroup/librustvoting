@@ -198,7 +198,8 @@ pub fn delegation_pir(
 /// against a round's expected root with [`validate_cached_pir_proofs`]. The
 /// delegation prove path reads the same cache, so real-note proofs warmed here
 /// are never refetched at proving time. A cached row that fails to decode or
-/// verify is treated as a miss and overwritten.
+/// verify is treated as a miss and overwritten. Each call prunes cache rows
+/// created more than four weeks ago before checking or fetching proofs.
 pub fn precompute_pir_proofs(
     db: &VotingDb,
     notes: &[NoteInfo],

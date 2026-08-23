@@ -57,7 +57,8 @@ stage-oriented API:
   `BundlePolicy` first so a dust tail is not fetched. The delegation prove path
   reads the same cache. `validate_cached_pir_proofs` checks warmed proofs against
   a round's `nullifier_imt_root` offline. Snapshots coexist in the cache;
-  leftover roots are unused, not harmful.
+  leftover roots are unused, and background warmup prunes cache rows created
+  more than four weeks ago.
 - `delegate::*` builds delegation PCZTs, proves delegation, prepares signing
   requests, and assembles signed delegation submissions. Wallets keep root seed
   material outside this crate, sign requests at the wallet boundary, and pass
