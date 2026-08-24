@@ -41,6 +41,8 @@ pub mod share;
 pub mod share_policy;
 mod shielded_protocol;
 pub mod storage;
+#[cfg(feature = "tor")]
+mod tor_transport;
 pub mod transport;
 pub mod tree_sync;
 pub mod tx1;
@@ -54,6 +56,8 @@ pub mod zkp1;
 pub mod zkp2;
 
 pub use http_transport::HyperTransport;
+#[cfg(feature = "tor")]
+pub use tor_transport::TorTransport;
 pub use pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, ImtProofData, NegotiatedPirLayout,
     PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,

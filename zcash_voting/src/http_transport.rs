@@ -17,8 +17,14 @@ type HyperClient = Client<HttpsConnector<HttpConnector>, RequestBody>;
 // generous fixed ceiling in the built-in transport so a server cannot force an
 // unbounded allocation before the client validates the negotiated geometry,
 // and bound the complete request so a slow or endless body cannot stall setup.
-const MAX_PIR_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const PIR_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+//
+// The PIR pair is `pub(crate)` so every built-in transport enforces the same
+// limits. A `Transport` impl is handed a bare URL and cannot tell `/tier0` from
+// a query response, so the ceiling is not something an implementor can derive;
+// leaving each one to rediscover it is how a transport ends up with no ceiling
+// at all.
+pub(crate) const MAX_PIR_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const PIR_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 // Tree pages are JSON encoded and can be larger than the compact state
 // responses. Bound every tree response before buffering or parsing it, and
 // cover connection setup plus the complete body read with one deadline.
@@ -38,13 +44,16 @@ struct HyperResponse {
 /// cleartext/HTTPS traffic without providing their own transport.
 pub struct HyperTransport {
     client: HyperClient,
-    runtime: BlockingRuntime,
+    /// Only the synchronous vote-tree trait needs this, so a PIR-only consumer
+    /// never spawns a worker thread pool it will not use. Constructing this type
+    /// is therefore cheap and thread-agnostic: callers may build it on an async
+    /// worker and hand it to a blocking one.
+    runtime: OnceLock<BlockingRuntime>,
 }
 
 impl HyperTransport {
     pub fn new() -> Self {
         ensure_rustls_provider();
-        let runtime = BlockingRuntime::new();
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
         let https = hyper_rustls::HttpsConnectorBuilder::new()
@@ -55,7 +64,10 @@ impl HyperTransport {
             .wrap_connector(connector);
         let client = Client::builder(TokioExecutor::new()).build(https);
 
-        Self { client, runtime }
+        Self {
+            client,
+            runtime: OnceLock::new(),
+        }
     }
 
     async fn request(
@@ -118,6 +130,11 @@ impl Default for HyperTransport {
     }
 }
 
+/// Owns a runtime so a synchronous transport trait can drive async HTTP.
+///
+/// `vote_commitment_tree_client`'s `Transport::get` is synchronous, so some
+/// runtime has to block. Callers must therefore stay off an async worker when
+/// they reach a synchronous transport method.
 struct BlockingRuntime {
     inner: Option<tokio::runtime::Runtime>,
 }
@@ -193,6 +210,7 @@ impl vote_commitment_tree_client::transport::Transport for HyperTransport {
         vote_commitment_tree_client::transport::TransportError,
     > {
         self.runtime
+            .get_or_init(BlockingRuntime::new)
             .block_on(async {
                 tokio::time::timeout(
                     TREE_REQUEST_TIMEOUT,
@@ -215,7 +233,7 @@ impl vote_commitment_tree_client::transport::Transport for HyperTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::BlockingRuntime;
+    use super::{BlockingRuntime, HyperTransport};
 
     #[test]
     fn blocking_runtime_drop_does_not_panic_inside_tokio_context() {
@@ -224,6 +242,30 @@ mod tests {
             outer.block_on(async {
                 let runtime = BlockingRuntime::new();
                 drop(runtime);
+            });
+        });
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn pir_only_use_never_builds_a_blocking_runtime() {
+        let transport = HyperTransport::new();
+
+        assert!(
+            transport.runtime.get().is_none(),
+            "constructing a transport must not spawn a thread pool the PIR path never uses"
+        );
+    }
+
+    #[test]
+    fn construct_and_drop_inside_tokio_context_does_not_panic() {
+        // Lets a host build the transport on an async worker and hand it to a
+        // blocking one, rather than deferring construction behind a closure.
+        let outer = tokio::runtime::Runtime::new().unwrap();
+        let result = std::panic::catch_unwind(|| {
+            outer.block_on(async {
+                drop(HyperTransport::new());
             });
         });
 

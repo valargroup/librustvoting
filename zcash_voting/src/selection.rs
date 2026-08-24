@@ -98,7 +98,7 @@ pub async fn select_notes_with_lwd(
 ) -> Result<SelectedNotes, VotingError> {
     let wallet_id = voting_db.wallet_id();
     let anchor_tree_state =
-        crate::lwd::anchor_tree_state_with_retry(lightwalletd_url, snapshot_height).await?;
+        crate::lwd::anchor_tree_state_retrying_dial(lightwalletd_url, snapshot_height).await?;
     // Open after the await so async callers do not capture rusqlite state in
     // generated Send futures.
     let conn = rusqlite::Connection::open(db_path).map_err(|e| VotingError::Internal {

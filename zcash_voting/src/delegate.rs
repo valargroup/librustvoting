@@ -181,7 +181,8 @@ impl LightwalletdBranchIdProvider {
     /// Round delegation setup should use [`Self::for_height`] with the round
     /// snapshot height so PCZT construction matches note selection and witnesses.
     pub async fn resolve(lightwalletd_url: &str, network: Network) -> Result<Self, VotingError> {
-        let branch_height = crate::lwd::latest_block_height_with_retry(lightwalletd_url).await?;
+        let branch_height =
+            crate::lwd::latest_block_height_retrying_dial(lightwalletd_url).await?;
         let resolved = crate::lwd::branch_id_for_height(network, branch_height)?;
         Ok(Self { resolved })
     }
@@ -353,7 +354,7 @@ pub async fn gather_delegation_lwd_inputs(
     crate::validate_round_params(&params.round_params)?;
     let resolved_round_name =
         crate::round::delegation_round_name(&params.round_params, params.round_name);
-    let anchor_tree_state_bytes = crate::lwd::anchor_tree_state_bytes_with_retry(
+    let anchor_tree_state_bytes = crate::lwd::anchor_tree_state_bytes_retrying_dial(
         params.lightwalletd_url,
         params.round_params.snapshot_height,
     )

@@ -47,6 +47,9 @@ zakura = [
     "dep:zakura-primitives",
 ]
 test-fixtures = []
+# Enables `transport::TorTransport`. Off by default because it pulls the whole
+# arti dependency tree, which a server-side or CI consumer has no use for.
+tor = ["zakura-client-backend?/tor", "zcash_client_backend?/tor"]
 
 [dependencies]
 # Randomness

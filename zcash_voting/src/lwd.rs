@@ -24,6 +24,13 @@ const LIGHTWALLETD_UNARY_RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const LIGHTWALLETD_RETRY_ATTEMPTS: u32 = 3;
 
 /// Opens a tonic gRPC channel to a lightwalletd URL.
+///
+/// This is the crate's convenience dialer and it always connects directly, the
+/// same way [`crate::HyperTransport`] is the convenience HTTP transport. A host
+/// that owns a network route — Tor, a proxy, a pooled or pinned connection, a
+/// test double — should build its own [`CompactTxStreamerClient`] and pass it to
+/// the `_on` variants in this module instead of calling any helper here that
+/// takes a URL.
 pub async fn open_channel(
     lightwalletd_url: &str,
 ) -> Result<CompactTxStreamerClient<Channel>, VotingError> {
@@ -78,31 +85,26 @@ pub async fn get_latest_block(
 }
 
 /// Opens lightwalletd and returns the latest known block height.
+#[deprecated(
+    since = "3.1.0",
+    note = "dials its own direct channel, overriding any host network route; \
+            open a channel on the route you want and call `get_latest_block` \
+            (`open_channel` is the direct-only convenience dialer)"
+)]
 pub async fn latest_block_height(lightwalletd_url: &str) -> Result<u64, VotingError> {
     let mut client = open_channel(lightwalletd_url).await?;
     Ok(get_latest_block(&mut client).await?.height)
 }
 
 /// Opens lightwalletd and returns the latest known block height with bounded retry behavior.
+#[deprecated(
+    since = "3.1.0",
+    note = "dials its own direct channel, overriding any host network route; \
+            open a channel on the route you want and call `get_latest_block` \
+            (`open_channel` is the direct-only convenience dialer)"
+)]
 pub async fn latest_block_height_with_retry(lightwalletd_url: &str) -> Result<u64, VotingError> {
-    let mut last_error = None;
-    for attempt in 1..=LIGHTWALLETD_RETRY_ATTEMPTS {
-        match latest_block_height(lightwalletd_url).await {
-            Ok(height) => return Ok(height),
-            Err(error) => {
-                if attempt == LIGHTWALLETD_RETRY_ATTEMPTS {
-                    last_error = Some(error);
-                    break;
-                }
-                last_error = Some(error);
-                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| VotingError::Internal {
-        message: "chain height fetch failed".to_string(),
-    }))
+    latest_block_height_retrying_dial(lightwalletd_url).await
 }
 
 /// Returns the note commitment tree state for `height`.
@@ -126,28 +128,48 @@ pub async fn get_tree_state(
 }
 
 /// Opens lightwalletd and returns the serialized `TreeState` for `height`.
+#[deprecated(
+    since = "3.1.0",
+    note = "dials its own direct channel, overriding any host network route; \
+            open a channel on the route you want and call `get_tree_state` \
+            (`open_channel` is the direct-only convenience dialer)"
+)]
 pub async fn tree_state_bytes(lightwalletd_url: &str, height: u64) -> Result<Vec<u8>, VotingError> {
     let mut client = open_channel(lightwalletd_url).await?;
     Ok(get_tree_state(&mut client, height).await?.encode_to_vec())
 }
 
-/// Fetches a snapshot anchor `TreeState` with bounded retry behavior around
+/// Fetches a snapshot anchor `TreeState` on a caller-owned client, retrying
 /// transient lightwalletd failures.
-pub async fn anchor_tree_state_with_retry(
-    lightwalletd_url: &str,
+///
+/// This is the anchor fetch to prefer. Because the caller owns the channel, the
+/// host's network route is preserved: a wallet that routes lightwalletd over Tor
+/// keeps that route, and a wallet whose route is unavailable gets its own
+/// fail-closed error instead of a silent direct connection.
+///
+/// Only the RPC is retried — the caller owns the channel, so a dial failure
+/// never reaches this function. That cuts both ways, and the host has to choose:
+/// a host whose route may be transiently unreachable must retry its own open
+/// call to match what [`anchor_tree_state_with_retry`] did, while a host that
+/// fails closed on an unavailable route now gets that error immediately instead
+/// of after the full backoff schedule.
+///
+/// # Errors
+///
+/// Returns the last lightwalletd error if every attempt fails.
+pub async fn anchor_tree_state_with_retry_on(
+    client: &mut CompactTxStreamerClient<Channel>,
     snapshot_height: u64,
 ) -> Result<TreeState, VotingError> {
     let mut last_error = None;
     for attempt in 1..=LIGHTWALLETD_RETRY_ATTEMPTS {
-        match fetch_tree_state(lightwalletd_url, snapshot_height).await {
+        match get_tree_state(client, snapshot_height).await {
             Ok(tree_state) => return Ok(tree_state),
             Err(error) => {
-                if attempt == LIGHTWALLETD_RETRY_ATTEMPTS {
-                    last_error = Some(error);
-                    break;
-                }
                 last_error = Some(error);
-                tokio::time::sleep(Duration::from_millis(500 * u64::from(attempt))).await;
+                if attempt < LIGHTWALLETD_RETRY_ATTEMPTS {
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                }
             }
         }
     }
@@ -157,16 +179,104 @@ pub async fn anchor_tree_state_with_retry(
     }))
 }
 
+/// Fetches a snapshot anchor `TreeState` with bounded retry behavior around
+/// transient lightwalletd failures.
+#[deprecated(
+    since = "3.1.0",
+    note = "dials its own direct channel, overriding any host network route; \
+            use `anchor_tree_state_with_retry_on` with a caller-owned client"
+)]
+pub async fn anchor_tree_state_with_retry(
+    lightwalletd_url: &str,
+    snapshot_height: u64,
+) -> Result<TreeState, VotingError> {
+    anchor_tree_state_retrying_dial(lightwalletd_url, snapshot_height).await
+}
+
 /// Fetches a snapshot anchor `TreeState` as protobuf bytes.
+#[deprecated(
+    since = "3.1.0",
+    note = "dials its own direct channel, overriding any host network route; \
+            use `anchor_tree_state_with_retry_on` with a caller-owned client"
+)]
 pub async fn anchor_tree_state_bytes_with_retry(
     lightwalletd_url: &str,
     snapshot_height: u64,
 ) -> Result<Vec<u8>, VotingError> {
     Ok(
-        anchor_tree_state_with_retry(lightwalletd_url, snapshot_height)
+        anchor_tree_state_retrying_dial(lightwalletd_url, snapshot_height)
             .await?
             .encode_to_vec(),
     )
+}
+
+/// Backoff before the attempt following `attempt`.
+fn retry_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(500) * attempt
+}
+
+/// Body shared by the deprecated URL-taking chain-tip helpers and this crate's
+/// other URL-taking entry points, so deprecating the public surface does not
+/// warn inside the crate. Retries the dial as well as the RPC.
+pub(crate) async fn latest_block_height_retrying_dial(
+    lightwalletd_url: &str,
+) -> Result<u64, VotingError> {
+    let mut last_error = None;
+    for attempt in 1..=LIGHTWALLETD_RETRY_ATTEMPTS {
+        let attempted = async {
+            let mut client = open_channel(lightwalletd_url).await?;
+            Ok(get_latest_block(&mut client).await?.height)
+        }
+        .await;
+        match attempted {
+            Ok(height) => return Ok(height),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < LIGHTWALLETD_RETRY_ATTEMPTS {
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| VotingError::Internal {
+        message: "chain height fetch failed".to_string(),
+    }))
+}
+
+/// Protobuf-encoded form of [`anchor_tree_state_retrying_dial`], so callers
+/// outside this module do not need `prost::Message` in scope.
+pub(crate) async fn anchor_tree_state_bytes_retrying_dial(
+    lightwalletd_url: &str,
+    snapshot_height: u64,
+) -> Result<Vec<u8>, VotingError> {
+    Ok(anchor_tree_state_retrying_dial(lightwalletd_url, snapshot_height)
+        .await?
+        .encode_to_vec())
+}
+
+/// Body shared by the deprecated URL-taking anchor helpers and this crate's
+/// other URL-taking entry points. Retries the dial as well as the RPC.
+pub(crate) async fn anchor_tree_state_retrying_dial(
+    lightwalletd_url: &str,
+    snapshot_height: u64,
+) -> Result<TreeState, VotingError> {
+    let mut last_error = None;
+    for attempt in 1..=LIGHTWALLETD_RETRY_ATTEMPTS {
+        match fetch_tree_state(lightwalletd_url, snapshot_height).await {
+            Ok(tree_state) => return Ok(tree_state),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < LIGHTWALLETD_RETRY_ATTEMPTS {
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| VotingError::Internal {
+        message: "snapshot tree state fetch failed".to_string(),
+    }))
 }
 
 /// Resolves the consensus branch ID active at `height` for `network`.
