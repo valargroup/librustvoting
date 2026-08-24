@@ -11,6 +11,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   tree on a caller-owned lightwalletd client, so a wallet that already holds a
   channel (Tor, a proxy, a pool) keeps that route instead of the crate dialing
   a second, always-direct connection.
+- `precompute_snapshot_bundles` persists the canonical bundle plan for a
+  snapshot-stable note set, samples padded-note secrets, and warms PIR for
+  real notes plus padded-slot nullifiers. The round must already exist; no
+  hotkey or wallet DB is required. Once the wallet is scanned through
+  `snapshot_height`, historical note selection is frozen, so first-write-wins
+  bundle rows are the intended lock-in rather than a stale-plan hazard.
+  Witnesses still come from `prepare_delegation_bundle`. New type:
+  `SnapshotBundlePrecomputeReport`.
 - Added a bundle- and round-independent PIR proof cache. `precompute_pir_proofs`
   fetches and persists IMT non-membership proofs for notes that survive the
   caller-supplied `BundlePolicy` (the same plan round setup uses: sub-ballot
