@@ -10,8 +10,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Added a shared helper selection policy for wallet clients. Helper readiness
   uses a two-second initial window, keeps racing until enough helpers respond,
   and stops at 30 seconds. Ranked batch candidate plans normally cap one helper
-  at eight of a complete vote's 16 shares, while retaining every configured
-  helper as a liveness fallback.
+  at eight of a complete vote's 16 shares, including across interrupted and
+  resumed submissions, while retaining every configured helper as a liveness
+  fallback.
 
 ## v3.1.0-rc.9
 

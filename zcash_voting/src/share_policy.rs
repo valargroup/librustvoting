@@ -477,6 +477,21 @@ pub fn ranked_share_submission_server_candidates(
     share_count: usize,
     ranked_server_urls: &[String],
 ) -> Result<Vec<Vec<String>>, VotingError> {
+    ranked_share_submission_server_candidates_with_usage(share_count, ranked_server_urls, &[])
+}
+
+/// Plan helper candidates while preserving usage from an interrupted attempt.
+///
+/// `previously_selected_server_urls` contains one entry for every share a
+/// helper already accepted for this same commitment. Repeated URLs are
+/// intentional. They seed the per-helper counts so a resumed submission does
+/// not forget earlier assignments and exceed the normal privacy cap while
+/// uncapped configured helpers remain.
+pub fn ranked_share_submission_server_candidates_with_usage(
+    share_count: usize,
+    ranked_server_urls: &[String],
+    previously_selected_server_urls: &[String],
+) -> Result<Vec<Vec<String>>, VotingError> {
     if share_count == 0 {
         return Ok(Vec::new());
     }
@@ -485,6 +500,15 @@ pub fn ranked_share_submission_server_candidates(
     let target_count = share_submission_target_count(ranked_server_urls.len());
     let max_shares_per_server = SHARE_HELPER_MAX_SHARES_PER_SERVER;
     let mut usage = std::collections::HashMap::<String, usize>::new();
+    let configured_servers: HashSet<&str> = ranked_server_urls.iter().map(String::as_str).collect();
+    for server_url in previously_selected_server_urls {
+        if !configured_servers.contains(server_url.as_str()) {
+            return Err(VotingError::InvalidInput {
+                message: "previously selected server URLs must be configured".to_string(),
+            });
+        }
+        *usage.entry(server_url.clone()).or_default() += 1;
+    }
     let mut candidates = Vec::with_capacity(share_count);
 
     for _ in 0..share_count {
@@ -1506,6 +1530,37 @@ mod tests {
 
         assert!(matches!(
             ranked_share_submission_server_candidates(16, &servers),
+            Err(VotingError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn ranked_candidates_preserve_usage_across_resume() {
+        let servers: Vec<String> = (0..10)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+        let previously_selected: Vec<String> = servers[..5]
+            .iter()
+            .flat_map(|server| std::iter::repeat_n(server.clone(), 8))
+            .collect();
+
+        let candidates =
+            ranked_share_submission_server_candidates_with_usage(8, &servers, &previously_selected)
+                .unwrap();
+
+        assert!(candidates.iter().all(|row| row[..5] == servers[5..]));
+    }
+
+    #[test]
+    fn ranked_candidates_reject_usage_for_an_unknown_helper() {
+        let servers = vec!["https://helper.example.com".to_string()];
+
+        assert!(matches!(
+            ranked_share_submission_server_candidates_with_usage(
+                1,
+                &servers,
+                &["https://unknown.example.com".to_string()],
+            ),
             Err(VotingError::InvalidInput { .. })
         ));
     }
