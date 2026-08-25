@@ -306,6 +306,9 @@ that should stay consistent across SDKs:
   timing
 - delayed helper-share `submit_at` scheduling, capped at 100 hours while still
   ending before the round's last-moment window
+- a 20-minute cap on the first batched share's delay when the vote started
+  within the last 24 hours, so a freshly activated round shows helper traffic
+  quickly
 - helper target counts and randomized helper ordering
 - batch share planning with independent entropy per share
 - resubmission ordering with untried helpers before already-sent helpers

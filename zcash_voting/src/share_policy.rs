@@ -25,6 +25,14 @@ pub const SHARE_MIN_TRACKING_DELAY_SECONDS: u64 = 3;
 pub const SHARE_SUBMIT_AT_RANDOM_BYTES: usize = 8;
 /// Maximum randomized delay before an initial helper share submission.
 pub const SHARE_SUBMIT_AT_MAX_DELAY_SECONDS: u64 = 100 * 60 * 60;
+/// Maximum randomized delay for the first share of a freshly started vote.
+///
+/// Operators activating a round need to see helper traffic quickly to confirm
+/// the submission pipeline is live, so the first share of a batch skips the
+/// long randomized tail.
+pub const SHARE_FIRST_SUBMIT_AT_FRESH_VOTE_MAX_DELAY_SECONDS: u64 = 20 * 60;
+/// Age since ceremony start below which a vote counts as freshly started.
+pub const SHARE_FRESH_VOTE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const VOTE_COMMITMENT_SHARE_COUNT: usize = 16;
 /// Numerator for the last-moment share window fraction.
 pub const LAST_MOMENT_BUFFER_FRACTION_NUMERATOR: u64 = 2;
@@ -295,6 +303,7 @@ pub fn share_submit_at_random_bytes_required(
         vote_end_time_seconds,
         last_moment_buffer_seconds,
         single_share,
+        None,
     )
     .is_some()
     {
@@ -325,6 +334,7 @@ pub fn scheduled_share_submit_at_from_random_unit(
         vote_end_time_seconds,
         last_moment_buffer_seconds,
         single_share,
+        None,
     ) else {
         return Ok(0);
     };
@@ -354,11 +364,34 @@ pub fn scheduled_share_submit_at_from_entropy(
     single_share: bool,
     submit_at_random_bytes: &[u8],
 ) -> Result<u64, VotingError> {
+    scheduled_share_submit_at_from_entropy_capped(
+        now_seconds,
+        vote_end_time_seconds,
+        last_moment_buffer_seconds,
+        single_share,
+        None,
+        submit_at_random_bytes,
+    )
+}
+
+/// Plan the delayed helper submission time under an extra delay ceiling.
+///
+/// `max_delay_seconds` shortens the sampling window without changing how many
+/// entropy bytes are required.
+fn scheduled_share_submit_at_from_entropy_capped(
+    now_seconds: u64,
+    vote_end_time_seconds: u64,
+    last_moment_buffer_seconds: Option<u64>,
+    single_share: bool,
+    max_delay_seconds: Option<u64>,
+    submit_at_random_bytes: &[u8],
+) -> Result<u64, VotingError> {
     let Some(window_seconds) = delayed_share_window_seconds(
         now_seconds,
         vote_end_time_seconds,
         last_moment_buffer_seconds,
         single_share,
+        max_delay_seconds,
     ) else {
         return Ok(0);
     };
@@ -380,12 +413,15 @@ pub fn scheduled_share_submit_at_from_entropy(
 /// Return the nonempty randomized delay window for an initial helper share.
 ///
 /// The window ends no later than the round's last-moment boundary and is capped
-/// at 100 hours from `now_seconds`.
+/// at 100 hours from `now_seconds`. `max_delay_seconds` applies an additional
+/// caller-supplied ceiling; it never turns a delayed share into an immediate
+/// one unless the ceiling itself is zero.
 fn delayed_share_window_seconds(
     now_seconds: u64,
     vote_end_time_seconds: u64,
     last_moment_buffer_seconds: Option<u64>,
     single_share: bool,
+    max_delay_seconds: Option<u64>,
 ) -> Option<u64> {
     if single_share {
         return None;
@@ -401,7 +437,39 @@ fn delayed_share_window_seconds(
         return None;
     }
 
-    Some((deadline - now_seconds).min(SHARE_SUBMIT_AT_MAX_DELAY_SECONDS))
+    let window = (deadline - now_seconds).min(SHARE_SUBMIT_AT_MAX_DELAY_SECONDS);
+    let window = match max_delay_seconds {
+        Some(max_delay_seconds) => window.min(max_delay_seconds),
+        None => window,
+    };
+    if window == 0 {
+        return None;
+    }
+
+    Some(window)
+}
+
+/// Return true when `now_seconds` is within 24 hours of the vote's start.
+///
+/// Clock skew that puts `ceremony_start_seconds` in the future is treated as
+/// freshly started, so operators still get the fast first share.
+fn is_freshly_started_vote(now_seconds: u64, ceremony_start_seconds: u64) -> bool {
+    now_seconds.saturating_sub(ceremony_start_seconds) < SHARE_FRESH_VOTE_MAX_AGE_SECONDS
+}
+
+/// Return the delay ceiling for one share of a batch.
+///
+/// Only the first share of a freshly started vote is capped.
+fn batch_share_max_delay_seconds(
+    share_index: usize,
+    now_seconds: u64,
+    ceremony_start_seconds: u64,
+) -> Option<u64> {
+    if share_index == 0 && is_freshly_started_vote(now_seconds, ceremony_start_seconds) {
+        Some(SHARE_FIRST_SUBMIT_AT_FRESH_VOTE_MAX_DELAY_SECONDS)
+    } else {
+        None
+    }
 }
 
 /// Return how many helpers should receive each initial share.
@@ -601,10 +669,17 @@ pub fn plan_share_submission(
 /// does not parse URLs or probe helper health. Callers are responsible for
 /// validating endpoints and assessing health before planning, because
 /// unavailable helpers can prevent reaching the returned `target_count`.
+///
+/// The first plan's randomized delay is capped at
+/// `SHARE_FIRST_SUBMIT_AT_FRESH_VOTE_MAX_DELAY_SECONDS` when `now_seconds` is
+/// within `SHARE_FRESH_VOTE_MAX_AGE_SECONDS` of `ceremony_start_seconds`, so
+/// operators activating a round see helper traffic promptly. Later shares keep
+/// the full window.
 pub fn plan_share_submissions(
     share_count: usize,
     server_urls: &[String],
     now_seconds: u64,
+    ceremony_start_seconds: u64,
     vote_end_time_seconds: u64,
     last_moment_buffer_seconds: Option<u64>,
     single_share: bool,
@@ -662,11 +737,12 @@ pub fn plan_share_submissions(
             spread_initial_targets,
             &server_random_bytes[server_start..server_end],
         )?;
-        let submit_at = scheduled_share_submit_at_from_entropy(
+        let submit_at = scheduled_share_submit_at_from_entropy_capped(
             now_seconds,
             vote_end_time_seconds,
             last_moment_buffer_seconds,
             single_share,
+            batch_share_max_delay_seconds(share_index, now_seconds, ceremony_start_seconds),
             &submit_at_random_bytes[submit_at_start..submit_at_end],
         )?;
         plans.push(build_share_submission_plan(
@@ -1007,6 +1083,7 @@ mod tests {
                 vote_end,
                 Some(LAST_MOMENT_BUFFER_MAX_SECONDS),
                 false,
+                None,
             ),
             Some(SHARE_SUBMIT_AT_MAX_DELAY_SECONDS)
         );
@@ -1034,6 +1111,7 @@ mod tests {
                 vote_end,
                 Some(LAST_MOMENT_BUFFER_MAX_SECONDS),
                 false,
+                None,
             ),
             Some(30 * 60 * 60)
         );
@@ -1045,11 +1123,11 @@ mod tests {
         let buffer = LAST_MOMENT_BUFFER_MAX_SECONDS;
 
         assert_eq!(
-            delayed_share_window_seconds(now, now + buffer, Some(buffer), false),
+            delayed_share_window_seconds(now, now + buffer, Some(buffer), false, None),
             None
         );
         assert_eq!(
-            delayed_share_window_seconds(now, now + buffer - 1, Some(buffer), false),
+            delayed_share_window_seconds(now, now + buffer - 1, Some(buffer), false, None),
             None
         );
     }
@@ -1057,10 +1135,13 @@ mod tests {
     #[test]
     fn delayed_share_window_handles_clock_skew_without_underflow() {
         assert_eq!(
-            delayed_share_window_seconds(u64::MAX, u64::MAX - 1, Some(1), false),
+            delayed_share_window_seconds(u64::MAX, u64::MAX - 1, Some(1), false, None),
             None
         );
-        assert_eq!(delayed_share_window_seconds(1, 5, Some(10), false), None);
+        assert_eq!(
+            delayed_share_window_seconds(1, 5, Some(10), false, None),
+            None
+        );
         assert_eq!(
             scheduled_share_submit_at_from_entropy(u64::MAX, u64::MAX - 1, Some(1), false, &[])
                 .unwrap(),
@@ -1505,6 +1586,7 @@ mod tests {
             2,
             &servers,
             1_000,
+            900,
             2_000,
             Some(100),
             false,
@@ -1533,6 +1615,152 @@ mod tests {
     }
 
     #[test]
+    fn batch_plan_caps_first_share_delay_for_freshly_started_vote() {
+        let servers = vec![
+            "https://one.example.com".to_string(),
+            "https://two.example.com".to_string(),
+        ];
+        let now = 1_000_000;
+        let vote_end = now + 30 * 24 * 60 * 60;
+        let max_samples = [u64::MAX; 2];
+
+        let plans = plan_share_submissions(
+            2,
+            &servers,
+            now,
+            now - 60 * 60,
+            vote_end,
+            Some(LAST_MOMENT_BUFFER_MAX_SECONDS),
+            false,
+            &random_bytes(&max_samples),
+            &random_bytes(&[0u64; 4]),
+        )
+        .unwrap();
+
+        assert!(plans[0].submit_at >= now);
+        assert!(plans[0].submit_at < now + SHARE_FIRST_SUBMIT_AT_FRESH_VOTE_MAX_DELAY_SECONDS);
+        assert!(plans[1].submit_at > now + SHARE_FIRST_SUBMIT_AT_FRESH_VOTE_MAX_DELAY_SECONDS);
+        assert!(plans[1].submit_at < now + SHARE_SUBMIT_AT_MAX_DELAY_SECONDS);
+    }
+
+    #[test]
+    fn batch_plan_leaves_first_share_uncapped_for_older_vote() {
+        let servers = vec![
+            "https://one.example.com".to_string(),
+            "https://two.example.com".to_string(),
+        ];
+        let now = 1_000_000;
+        let vote_end = now + 30 * 24 * 60 * 60;
+        let max_samples = [u64::MAX; 2];
+
+        let plans = plan_share_submissions(
+            2,
+            &servers,
+            now,
+            now - SHARE_FRESH_VOTE_MAX_AGE_SECONDS,
+            vote_end,
+            Some(LAST_MOMENT_BUFFER_MAX_SECONDS),
+            false,
+            &random_bytes(&max_samples),
+            &random_bytes(&[0u64; 4]),
+        )
+        .unwrap();
+
+        assert_eq!(plans[0].submit_at, plans[1].submit_at);
+        assert!(plans[0].submit_at > now + SHARE_FIRST_SUBMIT_AT_FRESH_VOTE_MAX_DELAY_SECONDS);
+    }
+
+    #[test]
+    fn batch_plan_first_share_cap_respects_shorter_windows() {
+        let servers = vec![
+            "https://one.example.com".to_string(),
+            "https://two.example.com".to_string(),
+        ];
+        let now = 1_000_000;
+        let buffer = LAST_MOMENT_BUFFER_MAX_SECONDS;
+        let vote_end = now + buffer + 5 * 60;
+
+        let plans = plan_share_submissions(
+            2,
+            &servers,
+            now,
+            now - 60 * 60,
+            vote_end,
+            Some(buffer),
+            false,
+            &random_bytes(&[u64::MAX, u64::MAX]),
+            &random_bytes(&[0u64; 4]),
+        )
+        .unwrap();
+
+        assert!(plans[0].submit_at < now + 5 * 60);
+        assert!(plans[1].submit_at < now + 5 * 60);
+    }
+
+    #[test]
+    fn batch_plan_first_share_cap_handles_future_ceremony_start() {
+        let servers = vec![
+            "https://one.example.com".to_string(),
+            "https://two.example.com".to_string(),
+        ];
+        let now = 1_000_000;
+        let vote_end = now + 30 * 24 * 60 * 60;
+
+        let plans = plan_share_submissions(
+            2,
+            &servers,
+            now,
+            now + 60 * 60,
+            vote_end,
+            Some(LAST_MOMENT_BUFFER_MAX_SECONDS),
+            false,
+            &random_bytes(&[u64::MAX, u64::MAX]),
+            &random_bytes(&[0u64; 4]),
+        )
+        .unwrap();
+
+        assert!(plans[0].submit_at < now + SHARE_FIRST_SUBMIT_AT_FRESH_VOTE_MAX_DELAY_SECONDS);
+    }
+
+    #[test]
+    fn batch_plan_first_share_cap_keeps_immediate_shares_immediate() {
+        let servers = vec![
+            "https://one.example.com".to_string(),
+            "https://two.example.com".to_string(),
+        ];
+        let now = 1_000_000;
+        let vote_end = now + 30 * 24 * 60 * 60;
+
+        let single_share_plans = plan_share_submissions(
+            2,
+            &servers,
+            now,
+            now - 60 * 60,
+            vote_end,
+            Some(LAST_MOMENT_BUFFER_MAX_SECONDS),
+            true,
+            &[],
+            &random_bytes(&[0u64; 4]),
+        )
+        .unwrap();
+        assert!(single_share_plans.iter().all(|plan| plan.submit_at == 0));
+
+        let no_buffer_plans = plan_share_submissions(
+            2,
+            &servers,
+            now,
+            now - 60 * 60,
+            vote_end,
+            None,
+            false,
+            &[],
+            &random_bytes(&[0u64; 4]),
+        )
+        .unwrap();
+        assert!(no_buffer_plans.iter().all(|plan| plan.submit_at == 0));
+    }
+
+    #[test]
     fn share_submission_batch_plan_selects_spread_targets_before_returning_plans() {
         let servers = vec![
             "https://one.example.com".to_string(),
@@ -1545,6 +1773,7 @@ mod tests {
             16,
             &servers,
             1_000,
+            900,
             2_000,
             None,
             false,
@@ -1594,6 +1823,7 @@ mod tests {
             VOTE_COMMITMENT_SHARE_COUNT,
             &servers,
             1_000,
+            900,
             2_000,
             None,
             false,
@@ -1625,6 +1855,7 @@ mod tests {
             16,
             &servers,
             1_000,
+            900,
             2_000,
             None,
             false,
@@ -1649,7 +1880,7 @@ mod tests {
         let servers = vec!["https://only.example.com".to_string()];
 
         let plans =
-            plan_share_submissions(16, &servers, 1_000, 2_000, None, false, &[], &[]).unwrap();
+            plan_share_submissions(16, &servers, 1_000, 900, 2_000, None, false, &[], &[]).unwrap();
 
         assert!(plans.iter().all(|plan| plan.target_servers == servers));
     }
@@ -1667,6 +1898,7 @@ mod tests {
                 2,
                 &servers,
                 1_000,
+                900,
                 2_000,
                 Some(100),
                 false,
@@ -1680,6 +1912,7 @@ mod tests {
                 2,
                 &servers,
                 1_000,
+                900,
                 2_000,
                 Some(100),
                 false,

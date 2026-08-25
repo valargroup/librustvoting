@@ -4,6 +4,21 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+- **Breaking:** `plan_share_submissions` takes a new `ceremony_start_seconds`
+  argument between `now_seconds` and `vote_end_time_seconds`. When the vote
+  started within `SHARE_FRESH_VOTE_MAX_AGE_SECONDS` (24 hours), the first plan's
+  randomized delay window is capped at
+  `SHARE_FIRST_SUBMIT_AT_FRESH_VOTE_MAX_DELAY_SECONDS` (20 minutes) so operators
+  activating a round see helper traffic promptly instead of waiting out a
+  multi-hour uniform draw. Later shares keep the full window, and callers
+  already compute `last_moment_buffer_seconds(ceremony_start, vote_end)`, so the
+  value is available at every call site. New public constants:
+  `SHARE_FIRST_SUBMIT_AT_FRESH_VOTE_MAX_DELAY_SECONDS`,
+  `SHARE_FRESH_VOTE_MAX_AGE_SECONDS`.
+
 ## v3.1.0-rc.9
 
 ### Added
