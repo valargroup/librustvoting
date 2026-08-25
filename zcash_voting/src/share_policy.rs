@@ -25,7 +25,14 @@ pub const SHARE_MIN_TRACKING_DELAY_SECONDS: u64 = 3;
 pub const SHARE_SUBMIT_AT_RANDOM_BYTES: usize = 8;
 /// Maximum randomized delay before an initial helper share submission.
 pub const SHARE_SUBMIT_AT_MAX_DELAY_SECONDS: u64 = 100 * 60 * 60;
-const VOTE_COMMITMENT_SHARE_COUNT: usize = 16;
+/// Number of encrypted shares in one complete vote commitment.
+pub const VOTE_COMMITMENT_SHARE_COUNT: usize = 16;
+/// Normal maximum number of one commitment's shares sent to one helper.
+pub const SHARE_HELPER_MAX_SHARES_PER_SERVER: usize = VOTE_COMMITMENT_SHARE_COUNT / 2;
+/// Initial helper readiness window before slower transports keep racing.
+pub const SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS: u64 = 2_000;
+/// Absolute deadline for the helper readiness race.
+pub const SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS: u64 = 30_000;
 /// Numerator for the last-moment share window fraction.
 pub const LAST_MOMENT_BUFFER_FRACTION_NUMERATOR: u64 = 2;
 /// Denominator for the last-moment share window fraction.
@@ -68,6 +75,27 @@ pub struct ShareSubmissionPlan {
     pub target_count: u32,
     /// Helper targets selected for initial share submission.
     pub target_servers: Vec<String>,
+}
+
+/// Shared helper selection values for one complete vote commitment.
+///
+/// Clients own the HTTP requests, but should use these values to keep probe
+/// timing and privacy limits consistent. Start every readiness probe at once,
+/// inspect the responses available after `preflight_soft_timeout_milliseconds`,
+/// and keep waiting until `target_count` helpers are ready or the hard timeout
+/// expires. Pass ready helpers to
+/// [`ranked_share_submission_server_candidates`] in response order, followed by
+/// the remaining configured helpers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareServerSelectionPolicy {
+    /// Number of helpers each share should reach.
+    pub target_count: u32,
+    /// Normal maximum number of one commitment's shares sent to one helper.
+    pub max_shares_per_server: u32,
+    /// Time to collect the first group of fast helper responses.
+    pub preflight_soft_timeout_milliseconds: u64,
+    /// Absolute deadline for collecting enough ready helper responses.
+    pub preflight_hard_timeout_milliseconds: u64,
 }
 
 /// Random byte counts needed to plan one or more share submissions.
@@ -416,6 +444,70 @@ pub fn share_submission_target_count(server_count: usize) -> usize {
     }
 }
 
+/// Return the shared helper probe and privacy policy for a complete commitment.
+pub fn share_server_selection_policy(
+    server_count: usize,
+) -> Result<ShareServerSelectionPolicy, VotingError> {
+    let target_count = share_submission_target_count(server_count);
+    let max_shares_per_server = SHARE_HELPER_MAX_SHARES_PER_SERVER;
+
+    Ok(ShareServerSelectionPolicy {
+        target_count: bounded_u32(target_count, "target_count")?,
+        max_shares_per_server: bounded_u32(max_shares_per_server, "max_shares_per_server")?,
+        preflight_soft_timeout_milliseconds: SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS,
+        preflight_hard_timeout_milliseconds: SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS,
+    })
+}
+
+/// Plan each share's complete helper candidate order from fastest to slowest.
+///
+/// `ranked_server_urls` should contain every configured helper exactly once.
+/// Helpers that passed the progressive readiness probe come first in response
+/// order; helpers that did not respond before the deadline follow in stable
+/// configured order.
+///
+/// The first `share_submission_target_count(ranked_server_urls.len())` entries
+/// of each returned row are the planned targets. For a normal 16-share vote and
+/// ten helpers, no helper is a planned target for more than eight shares. Once
+/// every remaining helper has reached that cap, the least-used helpers are
+/// selected again so liveness wins when the configured or healthy helper set is
+/// too small to satisfy the cap. The rest of each row is the failover order;
+/// callers should keep trying it until the target count accepts the share.
+pub fn ranked_share_submission_server_candidates(
+    share_count: usize,
+    ranked_server_urls: &[String],
+) -> Result<Vec<Vec<String>>, VotingError> {
+    if share_count == 0 {
+        return Ok(Vec::new());
+    }
+    require_share_servers(ranked_server_urls)?;
+
+    let target_count = share_submission_target_count(ranked_server_urls.len());
+    let max_shares_per_server = SHARE_HELPER_MAX_SHARES_PER_SERVER;
+    let mut usage = std::collections::HashMap::<String, usize>::new();
+    let mut candidates = Vec::with_capacity(share_count);
+
+    for _ in 0..share_count {
+        let targets = select_targets_with_usage_cap(
+            ranked_server_urls,
+            target_count,
+            max_shares_per_server,
+            &mut usage,
+        );
+        let target_set: HashSet<String> = targets.iter().cloned().collect();
+        let mut server_candidates = targets;
+        server_candidates.extend(
+            ranked_server_urls
+                .iter()
+                .filter(|server| !target_set.contains(server.as_str()))
+                .cloned(),
+        );
+        candidates.push(server_candidates);
+    }
+
+    Ok(candidates)
+}
+
 /// Return the number of random bytes needed to shuffle a server list.
 ///
 /// The bytes should come from a cryptographically secure RNG. The crate owns the
@@ -589,12 +681,12 @@ pub fn plan_share_submission(
 /// share. Use `share_submission_random_bytes_required` to size the two entropy
 /// inputs.
 ///
-/// For a complete normal 16-share commitment with multiple helpers, initial
-/// targets are spread so that no helper receives every share by default. Each
-/// returned plan already contains its final initial target list. This guarantee
-/// applies only to initial submission. Fallback and recovery may send an
-/// initially omitted share to any configured helper, including one that
-/// ultimately receives all 16 shares, when needed to preserve liveness.
+/// For a complete normal 16-share commitment, planned targets stop using a
+/// helper after eight shares while uncapped helpers remain. When the helper set
+/// is too small to fill every target slot under that cap, the least-used helper
+/// is selected again so liveness wins. Each returned plan already contains its
+/// final initial target list. Fallback and recovery may exceed the planned cap
+/// when needed to preserve liveness.
 ///
 /// `server_urls` must contain distinct, valid helper endpoint URLs. This
 /// function checks only that the list is non-empty and has no duplicates; it
@@ -646,8 +738,12 @@ pub fn plan_share_submissions(
     }
 
     let target_count = share_submission_target_count(server_urls.len());
-    let spread_initial_targets =
-        !single_share && share_count == VOTE_COMMITMENT_SHARE_COUNT && server_urls.len() > 1;
+    let max_shares_per_server = if !single_share && share_count == VOTE_COMMITMENT_SHARE_COUNT {
+        SHARE_HELPER_MAX_SHARES_PER_SERVER
+    } else {
+        usize::MAX
+    };
+    let mut server_usage = std::collections::HashMap::<String, usize>::new();
 
     let mut plans = Vec::with_capacity(share_count);
     for share_index in 0..share_count {
@@ -656,10 +752,10 @@ pub fn plan_share_submissions(
         let server_start = share_index * server_bytes_per_share;
         let server_end = server_start + server_bytes_per_share;
         let target_servers = select_batch_share_submission_targets(
-            share_index,
             server_urls,
             target_count,
-            spread_initial_targets,
+            max_shares_per_server,
+            &mut server_usage,
             &server_random_bytes[server_start..server_end],
         )?;
         let submit_at = scheduled_share_submit_at_from_entropy(
@@ -738,13 +834,17 @@ fn build_share_submission_plan(
 ) -> Result<ShareSubmissionPlan, VotingError> {
     Ok(ShareSubmissionPlan {
         submit_at,
-        target_count: BoundedU32::try_from(target_count)
-            .map_err(|_| VotingError::InvalidInput {
-                message: format!("target_count {target_count} does not fit u32"),
-            })?
-            .0,
+        target_count: bounded_u32(target_count, "target_count")?,
         target_servers,
     })
+}
+
+fn bounded_u32(value: usize, name: &str) -> Result<u32, VotingError> {
+    BoundedU32::try_from(value)
+        .map(|value| value.0)
+        .map_err(|_| VotingError::InvalidInput {
+            message: format!("{name} {value} does not fit u32"),
+        })
 }
 
 fn require_share_servers(server_urls: &[String]) -> Result<(), VotingError> {
@@ -771,33 +871,61 @@ fn require_unique_share_servers(server_urls: &[String]) -> Result<(), VotingErro
 }
 
 /// Select the final targets for one share before its batch plan is constructed.
-///
-/// For a complete commitment, every helper is assigned to one share index that
-/// must omit it. The remaining targets keep that share's randomized order.
 fn select_batch_share_submission_targets(
-    share_index: usize,
     server_urls: &[String],
     target_count: usize,
-    spread_initial_targets: bool,
+    max_shares_per_server: usize,
+    server_usage: &mut std::collections::HashMap<String, usize>,
     server_random_bytes: &[u8],
 ) -> Result<Vec<String>, VotingError> {
     let randomized_order = shuffled_share_server_order(server_urls, server_random_bytes)?;
-    let required_omissions: HashSet<&str> = server_urls
-        .iter()
-        .enumerate()
-        .filter_map(|(server_index, server_url)| {
-            (spread_initial_targets && server_index % VOTE_COMMITMENT_SHARE_COUNT == share_index)
-                .then_some(server_url.as_str())
-        })
-        .collect();
-    let target_servers: Vec<String> = randomized_order
-        .into_iter()
-        .filter(|server_url| !required_omissions.contains(server_url.as_str()))
-        .take(target_count)
-        .collect();
+    Ok(select_targets_with_usage_cap(
+        &randomized_order,
+        target_count,
+        max_shares_per_server,
+        server_usage,
+    ))
+}
 
-    debug_assert_eq!(target_servers.len(), target_count);
-    Ok(target_servers)
+fn select_targets_with_usage_cap(
+    server_order: &[String],
+    target_count: usize,
+    max_shares_per_server: usize,
+    server_usage: &mut std::collections::HashMap<String, usize>,
+) -> Vec<String> {
+    let target_count = target_count.min(server_order.len());
+    let mut selected = Vec::with_capacity(target_count);
+
+    for server in server_order {
+        if server_usage.get(server).copied().unwrap_or(0) < max_shares_per_server {
+            selected.push(server.clone());
+            if selected.len() == target_count {
+                break;
+            }
+        }
+    }
+
+    if selected.len() < target_count {
+        let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
+        let mut remaining: Vec<(usize, &String)> = server_order
+            .iter()
+            .enumerate()
+            .filter(|(_, server)| !selected_set.contains(server.as_str()))
+            .collect();
+        remaining
+            .sort_by_key(|(rank, server)| (server_usage.get(*server).copied().unwrap_or(0), *rank));
+        selected.extend(
+            remaining
+                .into_iter()
+                .take(target_count - selected.len())
+                .map(|(_, server)| server.clone()),
+        );
+    }
+
+    for server in &selected {
+        *server_usage.entry(server.clone()).or_default() += 1;
+    }
+    selected
 }
 
 fn checked_random_bytes_required(
@@ -1329,6 +1457,60 @@ mod tests {
     }
 
     #[test]
+    fn complete_vote_helper_policy_uses_progressive_timeouts_and_half_share_cap() {
+        assert_eq!(
+            share_server_selection_policy(10).unwrap(),
+            ShareServerSelectionPolicy {
+                target_count: 5,
+                max_shares_per_server: 8,
+                preflight_soft_timeout_milliseconds: 2_000,
+                preflight_hard_timeout_milliseconds: 30_000,
+            }
+        );
+    }
+
+    #[test]
+    fn ranked_candidates_reselect_after_fast_helpers_reach_the_share_cap() {
+        let servers: Vec<String> = (0..10)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+
+        let candidates =
+            ranked_share_submission_server_candidates(VOTE_COMMITMENT_SHARE_COUNT, &servers)
+                .unwrap();
+
+        assert_eq!(candidates.len(), VOTE_COMMITMENT_SHARE_COUNT);
+        assert!(candidates.iter().all(|row| row.len() == servers.len()));
+        assert!(candidates[..8].iter().all(|row| row[..5] == servers[..5]));
+        assert!(candidates[8..].iter().all(|row| row[..5] == servers[5..]));
+
+        let mut planned_counts = std::collections::HashMap::<&str, usize>::new();
+        for row in &candidates {
+            let unique: HashSet<&str> = row.iter().map(String::as_str).collect();
+            assert_eq!(unique.len(), servers.len());
+            for server in &row[..5] {
+                *planned_counts.entry(server.as_str()).or_default() += 1;
+            }
+        }
+        assert!(servers
+            .iter()
+            .all(|server| planned_counts[server.as_str()] == 8));
+    }
+
+    #[test]
+    fn ranked_candidates_reject_duplicate_helpers() {
+        let servers = vec![
+            "https://helper.example.com".to_string(),
+            "https://helper.example.com".to_string(),
+        ];
+
+        assert!(matches!(
+            ranked_share_submission_server_candidates(16, &servers),
+            Err(VotingError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
     fn helper_order_random_bytes_required_matches_shuffle_steps() {
         assert_eq!(share_server_order_random_bytes_required(0), 0);
         assert_eq!(share_server_order_random_bytes_required(1), 0);
@@ -1533,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn share_submission_batch_plan_selects_spread_targets_before_returning_plans() {
+    fn share_submission_batch_plan_reselects_after_repeated_targets_reach_the_cap() {
         let servers = vec![
             "https://one.example.com".to_string(),
             "https://two.example.com".to_string(),
@@ -1558,17 +1740,12 @@ mod tests {
             plans[0].target_servers,
             vec![servers[1].clone(), servers[2].clone()]
         );
-        assert_eq!(
-            plans[1].target_servers,
-            vec![servers[2].clone(), servers[0].clone()]
-        );
-        assert_eq!(
-            plans[2].target_servers,
-            vec![servers[1].clone(), servers[0].clone()]
-        );
-        assert!(plans[3..]
+        assert!(plans[..8]
             .iter()
             .all(|plan| plan.target_servers == vec![servers[1].clone(), servers[2].clone()]));
+        assert!(plans[8..]
+            .iter()
+            .all(|plan| plan.target_servers.contains(&servers[0])));
         for server in &servers {
             assert!(
                 plans
@@ -1577,6 +1754,39 @@ mod tests {
                 "{server} must be omitted from at least one share"
             );
         }
+    }
+
+    #[test]
+    fn complete_vote_batch_plan_caps_ten_helpers_at_eight_shares_each() {
+        let servers: Vec<String> = (0..10)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+        let server_random_bytes = vec![
+            0;
+            VOTE_COMMITMENT_SHARE_COUNT
+                * share_server_order_random_bytes_required(servers.len())
+        ];
+
+        let plans = plan_share_submissions(
+            VOTE_COMMITMENT_SHARE_COUNT,
+            &servers,
+            1_000,
+            2_000,
+            None,
+            false,
+            &[],
+            &server_random_bytes,
+        )
+        .unwrap();
+
+        let mut counts = std::collections::HashMap::<&str, usize>::new();
+        for plan in &plans {
+            assert_eq!(plan.target_servers.len(), 5);
+            for server in &plan.target_servers {
+                *counts.entry(server.as_str()).or_default() += 1;
+            }
+        }
+        assert!(servers.iter().all(|server| counts[server.as_str()] == 8));
     }
 
     #[test]

@@ -4,6 +4,15 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- Added a shared helper selection policy for wallet clients. Helper readiness
+  uses a two-second initial window, keeps racing until enough helpers respond,
+  and stops at 30 seconds. Ranked batch candidate plans normally cap one helper
+  at eight of a complete vote's 16 shares, while retaining every configured
+  helper as a liveness fallback.
+
 ## v3.1.0-rc.9
 
 ### Added
