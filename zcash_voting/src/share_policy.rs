@@ -85,7 +85,9 @@ pub struct ShareSubmissionPlan {
 /// and keep waiting until `target_count` helpers are ready or the hard timeout
 /// expires. Pass ready helpers to
 /// [`ranked_share_submission_server_candidates`] in response order, followed by
-/// the remaining configured helpers.
+/// the remaining configured helpers. When resuming interrupted work, use
+/// [`ranked_share_submission_server_candidates_with_usage`] so prior accepted
+/// assignments still count toward the privacy cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareServerSelectionPolicy {
     /// Number of helpers each share should reach.
@@ -473,6 +475,8 @@ pub fn share_server_selection_policy(
 /// selected again so liveness wins when the configured or healthy helper set is
 /// too small to satisfy the cap. The rest of each row is the failover order;
 /// callers should keep trying it until the target count accepts the share.
+/// Use [`ranked_share_submission_server_candidates_with_usage`] instead when
+/// some shares from the same commitment were already accepted.
 pub fn ranked_share_submission_server_candidates(
     share_count: usize,
     ranked_server_urls: &[String],
