@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -628,30 +628,54 @@ pub fn ranked_share_submission_server_candidates_with_usage(
         });
     }
     let rebalance_prior_usage = !usage.is_empty();
+    let accepted_server_sets: Vec<HashSet<String>> = previously_accepted_server_urls_by_share
+        .iter()
+        .map(|accepted_server_urls| {
+            accepted_server_urls
+                .iter()
+                .filter(|server| configured_servers.contains(server.as_str()))
+                .cloned()
+                .collect()
+        })
+        .collect();
+    let remaining_target_counts: Vec<usize> = accepted_server_sets
+        .iter()
+        .map(|accepted_servers| target_count.saturating_sub(accepted_servers.len()))
+        .collect();
+    let capped_targets = rebalance_prior_usage.then(|| {
+        plan_targets_under_usage_cap(
+            ranked_server_urls,
+            &accepted_server_sets,
+            &remaining_target_counts,
+            max_shares_per_server,
+            &usage,
+        )
+    });
+    let capped_targets = capped_targets.flatten();
     let mut candidates = Vec::with_capacity(share_count);
 
-    for accepted_server_urls in previously_accepted_server_urls_by_share {
-        let accepted_servers: HashSet<&str> = accepted_server_urls
-            .iter()
-            .filter_map(|server| {
-                configured_servers
-                    .contains(server.as_str())
-                    .then_some(server.as_str())
-            })
-            .collect();
-        let remaining_target_count = target_count.saturating_sub(accepted_servers.len());
+    for (share_index, accepted_servers) in accepted_server_sets.iter().enumerate() {
+        let remaining_target_count = remaining_target_counts[share_index];
         let available_servers: Vec<String> = ranked_server_urls
             .iter()
-            .filter(|server| !accepted_servers.contains(server.as_str()))
+            .filter(|server| !accepted_servers.contains(*server))
             .cloned()
             .collect();
-        let targets = select_targets_with_usage_cap(
-            &available_servers,
-            remaining_target_count,
-            max_shares_per_server,
-            rebalance_prior_usage,
-            &mut usage,
-        );
+        let targets = if let Some(capped_targets) = &capped_targets {
+            let targets = capped_targets[share_index].clone();
+            for server in &targets {
+                *usage.entry(server.clone()).or_default() += 1;
+            }
+            targets
+        } else {
+            select_targets_with_usage_cap(
+                &available_servers,
+                remaining_target_count,
+                max_shares_per_server,
+                rebalance_prior_usage,
+                &mut usage,
+            )
+        };
         let target_set: HashSet<&str> = targets.iter().map(String::as_str).collect();
         let server_candidates = targets
             .iter()
@@ -1099,6 +1123,145 @@ fn select_targets_with_usage_cap(
         *server_usage.entry(server.clone()).or_default() += 1;
     }
     selected
+}
+
+/// Find a cap-respecting assignment for the whole resumed batch.
+///
+/// A per-row greedy choice can consume the only remaining capacity usable by a
+/// later partial share. This small max-flow graph either returns a complete
+/// assignment under the cap or lets the caller fall back to the liveness-first
+/// selector when no such assignment exists.
+fn plan_targets_under_usage_cap(
+    server_order: &[String],
+    accepted_servers_by_share: &[HashSet<String>],
+    target_counts: &[usize],
+    max_shares_per_server: usize,
+    server_usage: &HashMap<String, usize>,
+) -> Option<Vec<Vec<String>>> {
+    let share_count = target_counts.len();
+    let server_count = server_order.len();
+    let source = 0;
+    let share_offset = 1;
+    let server_offset = share_offset + share_count;
+    let sink = server_offset + server_count;
+    let node_count = sink + 1;
+    let mut residual = vec![vec![0usize; node_count]; node_count];
+    let mut adjacent = vec![Vec::<usize>::new(); node_count];
+
+    let mut add_edge = |from: usize, to: usize, capacity: usize| {
+        if capacity == 0 {
+            return;
+        }
+        residual[from][to] = capacity;
+        adjacent[from].push(to);
+        adjacent[to].push(from);
+    };
+
+    let mut shares: Vec<usize> = (0..share_count).collect();
+    shares.sort_by_key(|share_index| {
+        let available_capacity = server_order
+            .iter()
+            .filter(|server| {
+                !accepted_servers_by_share[*share_index].contains(*server)
+                    && server_usage.get(*server).copied().unwrap_or(0) < max_shares_per_server
+            })
+            .count();
+        (
+            available_capacity.saturating_sub(target_counts[*share_index]),
+            *share_index,
+        )
+    });
+    for share_index in shares {
+        add_edge(
+            source,
+            share_offset + share_index,
+            target_counts[share_index],
+        );
+        let mut servers: Vec<usize> = (0..server_count)
+            .filter(|server_index| {
+                !accepted_servers_by_share[share_index].contains(&server_order[*server_index])
+                    && server_usage
+                        .get(&server_order[*server_index])
+                        .copied()
+                        .unwrap_or(0)
+                        < max_shares_per_server
+            })
+            .collect();
+        servers.sort_by_key(|server_index| {
+            (
+                server_usage
+                    .get(&server_order[*server_index])
+                    .copied()
+                    .unwrap_or(0),
+                *server_index,
+            )
+        });
+        for server_index in servers {
+            add_edge(share_offset + share_index, server_offset + server_index, 1);
+        }
+    }
+    for (server_index, server) in server_order.iter().enumerate() {
+        let capacity =
+            max_shares_per_server.saturating_sub(server_usage.get(server).copied().unwrap_or(0));
+        add_edge(server_offset + server_index, sink, capacity);
+    }
+    drop(add_edge);
+
+    let required_flow: usize = target_counts.iter().sum();
+    let mut flow = 0usize;
+    loop {
+        let mut parent = vec![usize::MAX; node_count];
+        parent[source] = source;
+        let mut queue = VecDeque::from([source]);
+        while let Some(from) = queue.pop_front() {
+            for &to in &adjacent[from] {
+                if parent[to] == usize::MAX && residual[from][to] > 0 {
+                    parent[to] = from;
+                    queue.push_back(to);
+                }
+            }
+        }
+        if parent[sink] == usize::MAX {
+            break;
+        }
+        let mut path_capacity = usize::MAX;
+        let mut node = sink;
+        while node != source {
+            let previous = parent[node];
+            path_capacity = path_capacity.min(residual[previous][node]);
+            node = previous;
+        }
+        node = sink;
+        while node != source {
+            let previous = parent[node];
+            residual[previous][node] -= path_capacity;
+            residual[node][previous] += path_capacity;
+            node = previous;
+        }
+        flow += path_capacity;
+    }
+    if flow != required_flow {
+        return None;
+    }
+
+    Some(
+        (0..share_count)
+            .map(|share_index| {
+                server_order
+                    .iter()
+                    .enumerate()
+                    .filter(|(server_index, server)| {
+                        !accepted_servers_by_share[share_index].contains(*server)
+                            && server_usage.get(*server).copied().unwrap_or(0)
+                                < max_shares_per_server
+                            && residual[share_offset + share_index][server_offset + *server_index]
+                                == 0
+                    })
+                    .map(|(_, server)| server.clone())
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
 fn checked_random_bytes_required(
@@ -1790,6 +1953,38 @@ mod tests {
                 *usage.entry(server.clone()).or_default() += 1;
             }
         }
+        assert!(servers.iter().all(|server| usage[server] == 8));
+    }
+
+    #[test]
+    fn ranked_candidates_reserve_capacity_for_a_late_partial_share() {
+        let servers: Vec<String> = (0..10)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+        let previously_selected = vec![servers[8].clone()];
+        let mut previously_accepted_by_share = vec![Vec::new(); VOTE_COMMITMENT_SHARE_COUNT];
+        previously_accepted_by_share[VOTE_COMMITMENT_SHARE_COUNT - 1] = previously_selected.clone();
+
+        let candidates = ranked_share_submission_server_candidates_with_usage(
+            VOTE_COMMITMENT_SHARE_COUNT,
+            &servers,
+            &previously_selected,
+            &previously_accepted_by_share,
+        )
+        .unwrap();
+        let mut usage = previously_selected.into_iter().fold(
+            std::collections::HashMap::<String, usize>::new(),
+            |mut usage, server| {
+                *usage.entry(server).or_default() += 1;
+                usage
+            },
+        );
+        for plan in candidates {
+            for server in &plan.candidate_servers[..plan.remaining_target_count as usize] {
+                *usage.entry(server.clone()).or_default() += 1;
+            }
+        }
+
         assert!(servers.iter().all(|server| usage[server] == 8));
     }
 
