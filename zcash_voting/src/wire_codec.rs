@@ -449,6 +449,47 @@ impl From<recovery::VoteRecovery> for VoteRecoveryView {
     }
 }
 
+impl<'de> serde::Deserialize<'de> for ShareDelegationRecordView {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct SerializedShareDelegationRecordView {
+            round_id: String,
+            bundle_index: u32,
+            proposal_id: u32,
+            share_index: u32,
+            sent_to_urls: Vec<String>,
+            attempted_server_urls: Option<Vec<String>>,
+            nullifier: Vec<u8>,
+            phase: String,
+            confirmed: bool,
+            submit_at: u64,
+            created_at: u64,
+        }
+
+        let record =
+            <SerializedShareDelegationRecordView as serde::Deserialize>::deserialize(deserializer)?;
+        let attempted_server_urls = record
+            .attempted_server_urls
+            .unwrap_or_else(|| record.sent_to_urls.clone());
+        Ok(Self {
+            round_id: record.round_id,
+            bundle_index: record.bundle_index,
+            proposal_id: record.proposal_id,
+            share_index: record.share_index,
+            sent_to_urls: record.sent_to_urls,
+            attempted_server_urls,
+            nullifier: record.nullifier,
+            phase: record.phase,
+            confirmed: record.confirmed,
+            submit_at: record.submit_at,
+            created_at: record.created_at,
+        })
+    }
+}
+
 impl From<crate::types::ShareDelegationRecord> for ShareDelegationRecordView {
     fn from(record: crate::types::ShareDelegationRecord) -> Self {
         Self {
@@ -1166,6 +1207,33 @@ mod tests {
         let legacy: crate::share_policy::ShareSubmissionPlan =
             serde_json::from_value(json).unwrap();
         assert!(!legacy.immediate);
+    }
+
+    #[test]
+    fn legacy_share_delegation_view_defaults_attempts_to_acceptances() {
+        let sent_to_urls = vec!["https://helper.example".to_string()];
+        let view = ShareDelegationRecordView {
+            round_id: "round".to_string(),
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 2,
+            sent_to_urls: sent_to_urls.clone(),
+            attempted_server_urls: sent_to_urls.clone(),
+            nullifier: vec![3; 32],
+            phase: "submitted_share".to_string(),
+            confirmed: false,
+            submit_at: 4,
+            created_at: 5,
+        };
+        let mut legacy = serde_json::to_value(view).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("attempted_server_urls");
+
+        let decoded: ShareDelegationRecordView = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(decoded.attempted_server_urls, sent_to_urls);
     }
 
     #[test]

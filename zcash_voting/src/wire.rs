@@ -278,13 +278,14 @@ pub struct RecoverableCommitmentBundle {
     pub vc_tree_position: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ShareDelegationRecordView {
     pub round_id: String,
     pub bundle_index: u32,
     pub proposal_id: u32,
     pub share_index: u32,
     pub sent_to_urls: Vec<String>,
+    /// Includes known acceptances when decoding records written before this field existed.
     pub attempted_server_urls: Vec<String>,
     pub nullifier: Vec<u8>,
     pub phase: String,
