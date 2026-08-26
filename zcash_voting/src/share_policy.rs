@@ -27,12 +27,25 @@ pub const SHARE_SUBMIT_AT_RANDOM_BYTES: usize = 8;
 pub const SHARE_SUBMIT_AT_MAX_DELAY_SECONDS: u64 = 100 * 60 * 60;
 /// Number of encrypted shares in one complete vote commitment.
 pub const VOTE_COMMITMENT_SHARE_COUNT: usize = 16;
+/// Desired number of distinct helpers that should accept each encrypted share.
+pub const SHARE_HELPER_TARGET_COUNT: usize = 5;
 /// Normal maximum number of one commitment's shares sent to one helper.
 pub const SHARE_HELPER_MAX_SHARES_PER_SERVER: usize = VOTE_COMMITMENT_SHARE_COUNT / 2;
+/// Minimum helper count that can satisfy the target and normal privacy cap.
+pub const SHARE_HELPER_MIN_SERVER_COUNT: usize =
+    (VOTE_COMMITMENT_SHARE_COUNT * SHARE_HELPER_TARGET_COUNT + SHARE_HELPER_MAX_SHARES_PER_SERVER
+        - 1)
+        / SHARE_HELPER_MAX_SHARES_PER_SERVER;
 /// Initial helper readiness window before slower transports keep racing.
 pub const SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS: u64 = 2_000;
 /// Absolute deadline for the helper readiness race.
 pub const SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS: u64 = 30_000;
+/// Maximum time for one helper share POST over the wallet's privacy transport.
+pub const SHARE_HELPER_POST_TIMEOUT_MILLISECONDS: u64 = 30_000;
+/// Maximum time for one initial share-delivery phase before recovery takes over.
+pub const SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS: u64 = 60_000;
+/// Maximum helper share POSTs a client should keep in flight at once.
+pub const SHARE_HELPER_MAX_CONCURRENT_POSTS: usize = VOTE_COMMITMENT_SHARE_COUNT;
 /// Numerator for the last-moment share window fraction.
 pub const LAST_MOMENT_BUFFER_FRACTION_NUMERATOR: u64 = 2;
 /// Denominator for the last-moment share window fraction.
@@ -94,10 +107,20 @@ pub struct ShareServerSelectionPolicy {
     pub target_count: u32,
     /// Normal maximum number of one commitment's shares sent to one helper.
     pub max_shares_per_server: u32,
+    /// Minimum configured helpers needed to honor the target and privacy cap.
+    pub min_server_count: u32,
+    /// Whether this configured fleet can honor the normal privacy cap.
+    pub privacy_cap_feasible: bool,
     /// Time to collect the first group of fast helper responses.
     pub preflight_soft_timeout_milliseconds: u64,
     /// Absolute deadline for collecting enough ready helper responses.
     pub preflight_hard_timeout_milliseconds: u64,
+    /// Maximum duration of one helper share POST.
+    pub post_timeout_milliseconds: u64,
+    /// Overall deadline for initial helper delivery before durable recovery.
+    pub initial_delivery_timeout_milliseconds: u64,
+    /// Maximum helper share POSTs a client should keep in flight at once.
+    pub max_concurrent_posts: u32,
 }
 
 /// Random byte counts needed to plan one or more share submissions.
@@ -436,14 +459,10 @@ fn delayed_share_window_seconds(
 
 /// Return how many helpers should receive each initial share.
 ///
-/// This is half of the available helpers, rounded up, and 0 when there are no
-/// helpers.
+/// This is five when at least five helpers are configured, otherwise every
+/// available helper. It is 0 when there are no helpers.
 pub fn share_submission_target_count(server_count: usize) -> usize {
-    if server_count == 0 {
-        0
-    } else {
-        server_count / 2 + server_count % 2
-    }
+    server_count.min(SHARE_HELPER_TARGET_COUNT)
 }
 
 /// Return the shared helper probe and privacy policy for a complete commitment.
@@ -452,12 +471,21 @@ pub fn share_server_selection_policy(
 ) -> Result<ShareServerSelectionPolicy, VotingError> {
     let target_count = share_submission_target_count(server_count);
     let max_shares_per_server = SHARE_HELPER_MAX_SHARES_PER_SERVER;
+    let privacy_cap_feasible = server_count >= SHARE_HELPER_MIN_SERVER_COUNT;
 
     Ok(ShareServerSelectionPolicy {
         target_count: bounded_u32(target_count, "target_count")?,
         max_shares_per_server: bounded_u32(max_shares_per_server, "max_shares_per_server")?,
+        min_server_count: bounded_u32(SHARE_HELPER_MIN_SERVER_COUNT, "min_server_count")?,
+        privacy_cap_feasible,
         preflight_soft_timeout_milliseconds: SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS,
         preflight_hard_timeout_milliseconds: SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS,
+        post_timeout_milliseconds: SHARE_HELPER_POST_TIMEOUT_MILLISECONDS,
+        initial_delivery_timeout_milliseconds: SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS,
+        max_concurrent_posts: bounded_u32(
+            SHARE_HELPER_MAX_CONCURRENT_POSTS,
+            "max_concurrent_posts",
+        )?,
     })
 }
 
@@ -470,10 +498,12 @@ pub fn share_server_selection_policy(
 ///
 /// The first `share_submission_target_count(ranked_server_urls.len())` entries
 /// of each returned row are the planned targets. For a normal 16-share vote and
-/// ten helpers, no helper is a planned target for more than eight shares. Once
-/// every remaining helper has reached that cap, the least-used helpers are
-/// selected again so liveness wins when the configured or healthy helper set is
-/// too small to satisfy the cap. The rest of each row is the failover order;
+/// at least ten helpers, no helper is a planned target for more than eight
+/// shares. Once every remaining helper has reached that cap, the least-used
+/// helpers are selected again so liveness wins when the configured or healthy
+/// helper set is too small to satisfy the cap. Callers can inspect
+/// [`ShareServerSelectionPolicy::privacy_cap_feasible`] before submission. The
+/// rest of each row is the failover order;
 /// callers should keep trying it until the target count accepts the share.
 /// Use [`ranked_share_submission_server_candidates_with_usage`] instead when
 /// some shares from the same commitment were already accepted.
@@ -1476,24 +1506,41 @@ mod tests {
     }
 
     #[test]
-    fn helper_target_count_is_half_rounded_up() {
+    fn helper_target_count_is_fixed_at_five_when_available() {
         assert_eq!(share_submission_target_count(0), 0);
         assert_eq!(share_submission_target_count(1), 1);
-        assert_eq!(share_submission_target_count(2), 1);
-        assert_eq!(share_submission_target_count(3), 2);
-        assert_eq!(share_submission_target_count(5), 3);
+        assert_eq!(share_submission_target_count(2), 2);
+        assert_eq!(share_submission_target_count(3), 3);
+        assert_eq!(share_submission_target_count(5), 5);
+        assert_eq!(share_submission_target_count(10), 5);
+        assert_eq!(share_submission_target_count(33), 5);
     }
 
     #[test]
-    fn complete_vote_helper_policy_uses_progressive_timeouts_and_half_share_cap() {
+    fn complete_vote_helper_policy_exposes_transport_and_privacy_limits() {
         assert_eq!(
             share_server_selection_policy(10).unwrap(),
             ShareServerSelectionPolicy {
                 target_count: 5,
                 max_shares_per_server: 8,
+                min_server_count: 10,
+                privacy_cap_feasible: true,
                 preflight_soft_timeout_milliseconds: 2_000,
                 preflight_hard_timeout_milliseconds: 30_000,
+                post_timeout_milliseconds: 30_000,
+                initial_delivery_timeout_milliseconds: 60_000,
+                max_concurrent_posts: 16,
             }
+        );
+        assert!(
+            !share_server_selection_policy(9)
+                .unwrap()
+                .privacy_cap_feasible
+        );
+        assert!(
+            share_server_selection_policy(11)
+                .unwrap()
+                .privacy_cap_feasible
         );
     }
 
@@ -1661,12 +1708,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.submit_at, 1_450);
-        assert_eq!(plan.target_count, 2);
+        assert_eq!(plan.target_count, 3);
         assert_eq!(
             plan.target_servers,
             vec![
                 "https://three.example.com".to_string(),
-                "https://one.example.com".to_string()
+                "https://one.example.com".to_string(),
+                "https://two.example.com".to_string()
             ]
         );
     }
@@ -1760,7 +1808,8 @@ mod tests {
             plans[0].target_servers,
             vec![
                 "https://three.example.com".to_string(),
-                "https://one.example.com".to_string()
+                "https://one.example.com".to_string(),
+                "https://two.example.com".to_string()
             ]
         );
         assert_eq!(plans[1].submit_at, 1_450);
@@ -1768,13 +1817,14 @@ mod tests {
             plans[1].target_servers,
             vec![
                 "https://three.example.com".to_string(),
-                "https://two.example.com".to_string()
+                "https://two.example.com".to_string(),
+                "https://one.example.com".to_string()
             ]
         );
     }
 
     #[test]
-    fn share_submission_batch_plan_reselects_after_repeated_targets_reach_the_cap() {
+    fn share_submission_batch_plan_degrades_when_fleet_is_below_minimum() {
         let servers = vec![
             "https://one.example.com".to_string(),
             "https://two.example.com".to_string(),
@@ -1794,25 +1844,15 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plans.iter().all(|plan| plan.target_servers.len() == 2));
-        assert_eq!(
-            plans[0].target_servers,
-            vec![servers[1].clone(), servers[2].clone()]
+        assert!(
+            !share_server_selection_policy(servers.len())
+                .unwrap()
+                .privacy_cap_feasible
         );
-        assert!(plans[..8]
-            .iter()
-            .all(|plan| plan.target_servers == vec![servers[1].clone(), servers[2].clone()]));
-        assert!(plans[8..]
-            .iter()
-            .all(|plan| plan.target_servers.contains(&servers[0])));
-        for server in &servers {
-            assert!(
-                plans
-                    .iter()
-                    .any(|plan| !plan.target_servers.contains(server)),
-                "{server} must be omitted from at least one share"
-            );
-        }
+        assert!(plans.iter().all(|plan| {
+            plan.target_servers.len() == servers.len()
+                && plan.target_servers.iter().collect::<HashSet<_>>().len() == servers.len()
+        }));
     }
 
     #[test]
@@ -1849,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn share_submission_batch_plan_spreads_more_helpers_than_shares() {
+    fn share_submission_batch_plan_keeps_fixed_target_with_large_fleet() {
         let servers: Vec<String> = (0..33)
             .map(|index| format!("https://helper-{index}.example.com"))
             .collect();
@@ -1871,19 +1911,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plans.iter().all(|plan| plan.target_servers.len() == 17));
-        for server in &servers {
-            assert!(
-                plans
-                    .iter()
-                    .any(|plan| !plan.target_servers.contains(server)),
-                "{server} must be omitted from at least one share"
-            );
+        assert!(plans.iter().all(|plan| plan.target_servers.len() == 5));
+        let mut counts = std::collections::HashMap::<&str, usize>::new();
+        for plan in &plans {
+            for server in &plan.target_servers {
+                *counts.entry(server.as_str()).or_default() += 1;
+            }
         }
+        assert!(counts.values().all(|count| *count <= 8));
     }
 
     #[test]
-    fn share_submission_batch_plan_spreads_two_helpers() {
+    fn share_submission_batch_plan_uses_all_helpers_below_target() {
         let servers = vec![
             "https://one.example.com".to_string(),
             "https://two.example.com".to_string(),
@@ -1902,15 +1941,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plans.iter().all(|plan| plan.target_servers.len() == 1));
-        for server in &servers {
-            assert!(
-                plans
-                    .iter()
-                    .any(|plan| !plan.target_servers.contains(server)),
-                "{server} must be omitted from at least one share"
-            );
-        }
+        assert!(plans.iter().all(|plan| {
+            plan.target_servers.len() == servers.len()
+                && plan.target_servers.iter().collect::<HashSet<_>>().len() == servers.len()
+        }));
     }
 
     #[test]
@@ -1971,12 +2005,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.submit_at, 1_000);
-        assert_eq!(plan.target_count, 2);
+        assert_eq!(plan.target_count, 3);
         assert_eq!(
             plan.target_servers,
             vec![
                 "https://one.example.com".to_string(),
-                "https://two.example.com".to_string()
+                "https://two.example.com".to_string(),
+                "https://three.example.com".to_string()
             ]
         );
     }
