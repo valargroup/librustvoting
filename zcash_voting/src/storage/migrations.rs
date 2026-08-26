@@ -164,7 +164,10 @@ mod tests {
     }
 
     fn without_attempted_server_urls(schema: &str) -> String {
-        let stripped = schema.replace("    attempted_server_urls TEXT NOT NULL,\n", "");
+        let stripped = schema.replace(
+            "    attempted_server_urls TEXT NOT NULL DEFAULT '[]',\n",
+            "",
+        );
         assert_ne!(
             stripped, schema,
             "version-15 schema must drop the column added at version 16"
@@ -358,9 +361,9 @@ mod tests {
             "pir_proof_cache",
         ] {
             assert_eq!(
-                table_columns(&migrated, table),
-                table_columns(&fresh, table),
-                "column mismatch in {table}"
+                table_definition(&migrated, table),
+                table_definition(&fresh, table),
+                "schema mismatch in {table}"
             );
         }
     }
@@ -598,6 +601,26 @@ mod tests {
             .query_map([], |row| row.get(1))
             .unwrap()
             .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    }
+
+    fn table_definition(
+        conn: &Connection,
+        table: &str,
+    ) -> Vec<(String, String, bool, Option<String>, bool)> {
+        conn.prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get(4)?,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap()
     }
 
