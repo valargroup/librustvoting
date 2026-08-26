@@ -316,6 +316,13 @@ that should stay consistent across SDKs:
 Wallet SDKs should provide fresh CSPRNG bytes from their platform RNG and let the
 crate own the sampling and ordering policy.
 
+A helper-share POST timeout is ambiguous because the helper may have accepted
+the share before its response was lost. Wallets should continue with the next
+candidate instead of immediately retrying the same helper, then let overdue
+recovery revisit helpers later if the share remains unconfirmed. Persisted
+usage for endpoints removed from the current helper configuration is ignored
+when planning resumed submissions.
+
 ## Secret boundaries
 
 Wallet seed material should stay in the wallet integration. For v2 integrations,

@@ -14,7 +14,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   candidate plans normally cap one helper at eight of a complete vote's 16
   shares, including across interrupted and resumed submissions, while retaining
   every configured helper as a liveness fallback. Clients can detect when fewer
-  than ten configured helpers make the normal privacy cap infeasible.
+  than ten configured helpers make the normal privacy cap infeasible. Timed-out
+  POSTs are treated as potentially accepted, and resumed plans ignore helpers
+  removed from the current configuration.
 
 ## v3.1.0-rc.9
 

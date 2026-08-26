@@ -100,7 +100,10 @@ pub struct ShareSubmissionPlan {
 /// [`ranked_share_submission_server_candidates`] in response order, followed by
 /// the remaining configured helpers. When resuming interrupted work, use
 /// [`ranked_share_submission_server_candidates_with_usage`] so prior accepted
-/// assignments still count toward the privacy cap.
+/// assignments still count toward the privacy cap. Treat a timed-out share POST
+/// as ambiguous because the helper may have accepted it before the response was
+/// lost. Continue with the next candidate instead of immediately retrying the
+/// same helper; overdue recovery can revisit it later if needed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareServerSelectionPolicy {
     /// Number of helpers each share should reach.
@@ -115,7 +118,9 @@ pub struct ShareServerSelectionPolicy {
     pub preflight_soft_timeout_milliseconds: u64,
     /// Absolute deadline for collecting enough ready helper responses.
     pub preflight_hard_timeout_milliseconds: u64,
-    /// Maximum duration of one helper share POST.
+    /// Maximum duration of one helper share POST. A timeout is ambiguous, so
+    /// callers should continue with another candidate rather than retrying the
+    /// same helper immediately.
     pub post_timeout_milliseconds: u64,
     /// Overall deadline for initial helper delivery before durable recovery.
     pub initial_delivery_timeout_milliseconds: u64,
@@ -504,7 +509,9 @@ pub fn share_server_selection_policy(
 /// helper set is too small to satisfy the cap. Callers can inspect
 /// [`ShareServerSelectionPolicy::privacy_cap_feasible`] before submission. The
 /// rest of each row is the failover order;
-/// callers should keep trying it until the target count accepts the share.
+/// callers should keep trying it until the target count accepts the share. A
+/// timed-out POST may already have been accepted, so advance to the next
+/// candidate rather than immediately retrying the same helper.
 /// Use [`ranked_share_submission_server_candidates_with_usage`] instead when
 /// some shares from the same commitment were already accepted.
 pub fn ranked_share_submission_server_candidates(
@@ -520,7 +527,9 @@ pub fn ranked_share_submission_server_candidates(
 /// helper already accepted for this same commitment. Repeated URLs are
 /// intentional. They seed the per-helper counts so a resumed submission does
 /// not forget earlier assignments and exceed the normal privacy cap while
-/// uncapped configured helpers remain.
+/// uncapped configured helpers remain. Entries for helpers no longer present in
+/// `ranked_server_urls` are ignored so recovery can continue after endpoint
+/// rotation.
 pub fn ranked_share_submission_server_candidates_with_usage(
     share_count: usize,
     ranked_server_urls: &[String],
@@ -536,12 +545,9 @@ pub fn ranked_share_submission_server_candidates_with_usage(
     let mut usage = std::collections::HashMap::<String, usize>::new();
     let configured_servers: HashSet<&str> = ranked_server_urls.iter().map(String::as_str).collect();
     for server_url in previously_selected_server_urls {
-        if !configured_servers.contains(server_url.as_str()) {
-            return Err(VotingError::InvalidInput {
-                message: "previously selected server URLs must be configured".to_string(),
-            });
+        if configured_servers.contains(server_url.as_str()) {
+            *usage.entry(server_url.clone()).or_default() += 1;
         }
-        *usage.entry(server_url.clone()).or_default() += 1;
     }
     let mut candidates = Vec::with_capacity(share_count);
 
@@ -936,7 +942,12 @@ fn select_batch_share_submission_targets(
     server_usage: &mut std::collections::HashMap<String, usize>,
     server_random_bytes: &[u8],
 ) -> Result<Vec<String>, VotingError> {
-    let randomized_order = shuffled_share_server_order(server_urls, server_random_bytes)?;
+    let mut randomized_order = shuffled_share_server_order(server_urls, server_random_bytes)?;
+    if max_shares_per_server != usize::MAX {
+        // Stable sorting keeps the randomized order as the tie-break while
+        // balancing usage enough to avoid stranding capacity under the cap.
+        randomized_order.sort_by_key(|server| server_usage.get(server).copied().unwrap_or(0));
+    }
     Ok(select_targets_with_usage_cap(
         &randomized_order,
         target_count,
@@ -1099,6 +1110,8 @@ fn min_second(current: Option<u64>, candidate: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use rand::{rngs::StdRng, RngCore, SeedableRng};
+
     use super::*;
 
     fn share(submit_at: u64, created_at: u64) -> ShareDelegationRecord {
@@ -1603,17 +1616,17 @@ mod tests {
     }
 
     #[test]
-    fn ranked_candidates_reject_usage_for_an_unknown_helper() {
+    fn ranked_candidates_ignore_usage_for_a_retired_helper() {
         let servers = vec!["https://helper.example.com".to_string()];
 
-        assert!(matches!(
-            ranked_share_submission_server_candidates_with_usage(
-                1,
-                &servers,
-                &["https://unknown.example.com".to_string()],
-            ),
-            Err(VotingError::InvalidInput { .. })
-        ));
+        let candidates = ranked_share_submission_server_candidates_with_usage(
+            1,
+            &servers,
+            &["https://retired.example.com".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(candidates, vec![servers]);
     }
 
     #[test]
@@ -1886,6 +1899,47 @@ mod tests {
             }
         }
         assert!(servers.iter().all(|server| counts[server.as_str()] == 8));
+    }
+
+    #[test]
+    fn complete_vote_batch_plan_caps_feasible_fleets_with_independent_entropy() {
+        for server_count in [10, 11] {
+            let servers: Vec<String> = (0..server_count)
+                .map(|index| format!("https://helper-{index}.example.com"))
+                .collect();
+            let entropy_bytes = VOTE_COMMITMENT_SHARE_COUNT
+                * share_server_order_random_bytes_required(servers.len());
+
+            for seed in 0..128 {
+                let mut server_random_bytes = vec![0; entropy_bytes];
+                StdRng::seed_from_u64(seed).fill_bytes(&mut server_random_bytes);
+                let plans = plan_share_submissions(
+                    VOTE_COMMITMENT_SHARE_COUNT,
+                    &servers,
+                    1_000,
+                    2_000,
+                    None,
+                    false,
+                    &[],
+                    &server_random_bytes,
+                )
+                .unwrap();
+
+                let mut counts = std::collections::HashMap::<&str, usize>::new();
+                for plan in &plans {
+                    for server in &plan.target_servers {
+                        *counts.entry(server.as_str()).or_default() += 1;
+                    }
+                }
+                for server in &servers {
+                    let count = counts.get(server.as_str()).copied().unwrap_or(0);
+                    assert!(
+                        count <= SHARE_HELPER_MAX_SHARES_PER_SERVER,
+                        "fleet size {server_count}, seed {seed}, helper {server} received {count} shares"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
