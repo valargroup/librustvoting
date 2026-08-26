@@ -23,3 +23,7 @@ zcash_client_sqlite = { version = "0.22.0-rc.7", default-features = false, featu
 zcash_keys = { version = "0.16.1", features = ["orchard"] }
 zcash_primitives = { version = "0.30.0" }
 zcash_protocol = { version = "0.10.4" }
+
+[patch.crates-io]
+voting-circuits = { git = "https://github.com/valargroup/voting-circuits.git", rev = "644f9bc4c809341064d0529f274caedc4f8fea6f" }
+voting-crypto-deps = { git = "https://github.com/valargroup/voting-circuits.git", rev = "644f9bc4c809341064d0529f274caedc4f8fea6f" }
