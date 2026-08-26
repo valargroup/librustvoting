@@ -737,19 +737,19 @@ pub fn share_submission_random_bytes_required(
 /// Return the random bytes needed for `resubmission_server_order`.
 pub fn resubmission_server_order_random_bytes_required(
     configured_server_urls: &[String],
-    sent_to_urls: &[String],
+    attempted_server_urls: &[String],
 ) -> usize {
-    let sent: HashSet<&str> = sent_to_urls.iter().map(String::as_str).collect();
+    let attempted: HashSet<&str> = attempted_server_urls.iter().map(String::as_str).collect();
     let untried_count = configured_server_urls
         .iter()
-        .filter(|server| !sent.contains(server.as_str()))
+        .filter(|server| !attempted.contains(server.as_str()))
         .count();
-    let already_sent_count = configured_server_urls
+    let attempted_count = configured_server_urls
         .iter()
-        .filter(|server| sent.contains(server.as_str()))
+        .filter(|server| attempted.contains(server.as_str()))
         .count();
     share_server_order_random_bytes_required(untried_count)
-        .saturating_add(share_server_order_random_bytes_required(already_sent_count))
+        .saturating_add(share_server_order_random_bytes_required(attempted_count))
 }
 
 /// Return a randomized helper-server order using caller-provided entropy.
@@ -1280,51 +1280,55 @@ fn checked_random_bytes_required(
 /// Return resubmission order from separately ordered helper groups.
 ///
 /// The returned order always tries untried helpers before helpers that already
-/// received the share. This is deterministic for tests and callers that have
-/// already made an explicit ordering decision. Production resubmission paths
-/// should prefer `resubmission_server_order`.
+/// received a delivery attempt, including helpers whose result was ambiguous.
+/// This is deterministic for tests and callers that have already made an
+/// explicit ordering decision. Production resubmission paths should prefer
+/// `resubmission_server_order`.
 pub fn resubmission_server_order_from_groups(
     untried_server_urls: &[String],
-    already_sent_server_urls: &[String],
+    attempted_server_urls: &[String],
 ) -> Vec<String> {
     untried_server_urls
         .iter()
-        .chain(already_sent_server_urls.iter())
+        .chain(attempted_server_urls.iter())
         .cloned()
         .collect()
 }
 
 /// Return randomized resubmission order with untried helpers first.
 ///
-/// The configured server list is split into untried and already-sent groups.
+/// The configured server list is split into untried and already-attempted
+/// groups. Ambiguous attempts such as timeouts belong to the attempted group.
 /// `configured_server_urls` must not contain duplicates because retry order is
 /// based on distinct helper endpoints.
 /// Each group is shuffled separately using `server_random_bytes`, then the
-/// shuffled untried group is followed by the shuffled already-sent group.
+/// shuffled untried group is followed by the shuffled attempted group.
 /// Callers can use `resubmission_server_order_random_bytes_required` to size
 /// the entropy input.
 pub fn resubmission_server_order(
     configured_server_urls: &[String],
-    sent_to_urls: &[String],
+    attempted_server_urls: &[String],
     server_random_bytes: &[u8],
 ) -> Result<Vec<String>, VotingError> {
     require_unique_share_servers(configured_server_urls)?;
-    let sent: HashSet<&str> = sent_to_urls.iter().map(String::as_str).collect();
+    let attempted: HashSet<&str> = attempted_server_urls.iter().map(String::as_str).collect();
     let untried: Vec<String> = configured_server_urls
         .iter()
-        .filter(|server| !sent.contains(server.as_str()))
+        .filter(|server| !attempted.contains(server.as_str()))
         .cloned()
         .collect();
-    let already_sent: Vec<String> = configured_server_urls
+    let previously_attempted: Vec<String> = configured_server_urls
         .iter()
-        .filter(|server| sent.contains(server.as_str()))
+        .filter(|server| attempted.contains(server.as_str()))
         .cloned()
         .collect();
 
     let untried_bytes = share_server_order_random_bytes_required(untried.len());
-    let already_sent_bytes = share_server_order_random_bytes_required(already_sent.len());
-    let needed =
-        resubmission_server_order_random_bytes_required(configured_server_urls, sent_to_urls);
+    let attempted_bytes = share_server_order_random_bytes_required(previously_attempted.len());
+    let needed = resubmission_server_order_random_bytes_required(
+        configured_server_urls,
+        attempted_server_urls,
+    );
     if server_random_bytes.len() < needed {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -1335,17 +1339,17 @@ pub fn resubmission_server_order(
 
     let randomized_untried =
         shuffled_share_server_order(&untried, &server_random_bytes[..untried_bytes])?;
-    let randomized_already_sent = shuffled_share_server_order(
-        &already_sent,
-        &server_random_bytes[untried_bytes..untried_bytes + already_sent_bytes],
+    let randomized_attempted = shuffled_share_server_order(
+        &previously_attempted,
+        &server_random_bytes[untried_bytes..untried_bytes + attempted_bytes],
     )?;
     Ok(resubmission_server_order_from_groups(
         &randomized_untried,
-        &randomized_already_sent,
+        &randomized_attempted,
     ))
 }
 
-/// Return resubmission order from configured helper order and already-sent set.
+/// Return resubmission order from configured helper order and attempted set.
 ///
 /// This preserves the configured order within each group. It is useful for
 /// deterministic tests and callers that have already made an explicit ordering
@@ -1353,20 +1357,20 @@ pub fn resubmission_server_order(
 /// `resubmission_server_order`.
 pub fn resubmission_server_order_from_configured_order(
     configured_server_urls: &[String],
-    sent_to_urls: &[String],
+    attempted_server_urls: &[String],
 ) -> Vec<String> {
-    let sent: HashSet<&str> = sent_to_urls.iter().map(String::as_str).collect();
+    let attempted: HashSet<&str> = attempted_server_urls.iter().map(String::as_str).collect();
     let untried: Vec<String> = configured_server_urls
         .iter()
-        .filter(|server| !sent.contains(server.as_str()))
+        .filter(|server| !attempted.contains(server.as_str()))
         .cloned()
         .collect();
-    let already_sent: Vec<String> = configured_server_urls
+    let previously_attempted: Vec<String> = configured_server_urls
         .iter()
-        .filter(|server| sent.contains(server.as_str()))
+        .filter(|server| attempted.contains(server.as_str()))
         .cloned()
         .collect();
-    resubmission_server_order_from_groups(&untried, &already_sent)
+    resubmission_server_order_from_groups(&untried, &previously_attempted)
 }
 
 fn min_second(current: Option<u64>, candidate: u64) -> Option<u64> {
@@ -2026,13 +2030,13 @@ mod tests {
             "https://untried-two.example.com".to_string(),
             "https://already-two.example.com".to_string(),
         ];
-        let sent = vec![
+        let attempted = vec![
             "https://already-one.example.com".to_string(),
             "https://already-two.example.com".to_string(),
         ];
 
         assert_eq!(
-            resubmission_server_order_random_bytes_required(&configured, &sent),
+            resubmission_server_order_random_bytes_required(&configured, &attempted),
             16
         );
     }
@@ -2585,14 +2589,14 @@ mod tests {
             "https://untried-two.example.com".to_string(),
             "https://untried-one.example.com".to_string(),
         ];
-        let already_sent = vec!["https://already.example.com".to_string()];
+        let attempted = vec!["https://attempted.example.com".to_string()];
 
         assert_eq!(
-            resubmission_server_order_from_groups(&untried, &already_sent),
+            resubmission_server_order_from_groups(&untried, &attempted),
             vec![
                 "https://untried-two.example.com".to_string(),
                 "https://untried-one.example.com".to_string(),
-                "https://already.example.com".to_string()
+                "https://attempted.example.com".to_string()
             ]
         );
     }
@@ -2605,13 +2609,13 @@ mod tests {
             "https://untried-two.example.com".to_string(),
             "https://already-two.example.com".to_string(),
         ];
-        let sent = vec![
+        let attempted = vec![
             "https://already-one.example.com".to_string(),
             "https://already-two.example.com".to_string(),
         ];
 
         assert_eq!(
-            resubmission_server_order(&configured, &sent, &random_bytes(&[0, 0])).unwrap(),
+            resubmission_server_order(&configured, &attempted, &random_bytes(&[0, 0])).unwrap(),
             vec![
                 "https://untried-two.example.com".to_string(),
                 "https://untried-one.example.com".to_string(),
@@ -2653,13 +2657,30 @@ mod tests {
             "https://already.example.com".to_string(),
             "https://untried.example.com".to_string(),
         ];
-        let sent = vec!["https://already.example.com".to_string()];
+        let attempted = vec!["https://already.example.com".to_string()];
 
         assert_eq!(
-            resubmission_server_order_from_configured_order(&configured, &sent),
+            resubmission_server_order_from_configured_order(&configured, &attempted),
             vec![
                 "https://untried.example.com".to_string(),
                 "https://already.example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resubmission_order_puts_timed_out_helpers_after_untried_helpers() {
+        let configured = vec![
+            "https://timed-out.example.com".to_string(),
+            "https://untried.example.com".to_string(),
+        ];
+        let attempted = vec!["https://timed-out.example.com".to_string()];
+
+        assert_eq!(
+            resubmission_server_order_from_configured_order(&configured, &attempted),
+            vec![
+                "https://untried.example.com".to_string(),
+                "https://timed-out.example.com".to_string(),
             ]
         );
     }
