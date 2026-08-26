@@ -38,6 +38,22 @@ Derive this key from durable round state in `session::resume_plan`. Do not use
 open or incomplete proposals, because those sets shrink as work completes and
 could select a different share after restart.
 
+### Host lifecycle contract
+
+The host collects every proposal decision on one selection screen and does not
+submit votes or helper shares until the user confirms the final submission.
+During selection, recording another lower-ID choice can change the derived
+`immediate_share_key`; that key is provisional and MUST NOT trigger network
+work.
+
+The host may consume `immediate_share_key` only after every proposal has a
+terminal `Choice` or `Skipped` decision and the user has confirmed submission.
+At that point the set of voted proposals is complete, so the lowest voted
+proposal cannot change. Restarts after final submission therefore derive the
+same key. Integrations that submit proposals incrementally do not satisfy this
+contract and must persist the first designation or otherwise prevent a second
+immediate submission.
+
 The selector should accept the highest eligible bundle index directly instead
 of converting it to a bundle count and subtracting one again.
 
