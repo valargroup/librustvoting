@@ -71,9 +71,14 @@ pub use crate::session::{
     VoteRecoveryWork, VoteRecoveryWorkKind,
 };
 pub use crate::share::{
-    add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,
-    record as record_share, recover_payload, recover_wire_json, unconfirmed as unconfirmed_shares,
-    SharePlan, ShareRecord, ShareTimingPolicy, ShareTrackingSummary,
+    add_sent_servers, compute_nullifier, confirm as confirm_share, confirmed_by_any_helper,
+    helper_share_status_url, list as share_records, record as record_share, recover_payload,
+    recover_wire_json, unconfirmed as unconfirmed_shares, HelperAttemptDiagnostic,
+    HelperAttemptResult, HelperConfirmationOutcome, HelperConfirmationReport, HelperEndpoint,
+    HelperEndpointDiagnostic, HelperHealthClock, HelperHealthTracker, HelperHttpFuture,
+    HelperHttpResponse, HelperHttpTransport, HelperHttpTransportError, HelperStatusCancellation,
+    HelperStatusRequestError, HelperStatusRetryPolicy, SharePlan, ShareRecord, ShareTimingPolicy,
+    ShareTrackingSummary,
 };
 pub use crate::types::{
     validate_proposal_id, validate_vote_decision, validate_vote_options, DelegationProgressBridge,

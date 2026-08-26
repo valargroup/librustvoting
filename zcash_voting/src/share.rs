@@ -16,6 +16,13 @@ use crate::{
 use pasta_curves::group::ff::PrimeField;
 use pasta_curves::pallas;
 
+pub use crate::helper_http::{
+    confirmed_by_any_helper, helper_share_status_url, HelperAttemptDiagnostic, HelperAttemptResult,
+    HelperConfirmationOutcome, HelperConfirmationReport, HelperEndpoint, HelperEndpointDiagnostic,
+    HelperHealthClock, HelperHealthTracker, HelperHttpFuture, HelperHttpResponse,
+    HelperHttpTransport, HelperHttpTransportError, HelperStatusCancellation,
+    HelperStatusRequestError, HelperStatusRetryPolicy,
+};
 pub use crate::types::ShareDelegationRecord as ShareRecord;
 
 /// One persisted round that still has unconfirmed helper shares.

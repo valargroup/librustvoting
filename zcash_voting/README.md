@@ -59,7 +59,7 @@ precompute → delegate → vote → share lifecycle:
 | `delegate` | PCZT setup, proof generation, submission assembly, and chain recovery writes. |
 | `confirmation` | Chain tx event parsing plus atomic delegation and cast-vote confirmation recording. |
 | `vote` | ZKP2 construction, cast-vote signing, and vote recovery bundle persistence. |
-| `share` | Helper-share payload recovery, nullifier computation, and share confirmation state. |
+| `share` | Helper-share payload recovery, nullifier computation, caller-transported status checks, and share confirmation state. |
 | `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `config` | Static and dynamic voting config validation, signature checks, and switch decisions. |
@@ -69,6 +69,22 @@ precompute → delegate → vote → share lifecycle:
 
 Wallet integrations should use the lifecycle modules above instead of writing
 storage rows directly.
+
+### Helper share-status transport
+
+`share::confirmed_by_any_helper` owns construction and parsing of the helper
+route
+`/shielded-vote/v1/share-status/{round_id}/{share_id}`. Integrations pass
+stable `HelperEndpoint::id` values separately from each endpoint's current
+`transport_base_url`, instantiate a `HelperHealthTracker`, and inject a
+`HelperHttpTransport`. The transport receives the complete URL and raw-response
+contract; it must not append the route. This keeps proxy/Tor/platform HTTP
+policy in the wallet while keeping retries, health ordering, confirmation
+short-circuiting, and `pending`/`confirmed` semantics in the SDK.
+
+The API never creates `HyperTransport`. A cancellation handle is passed through
+to the caller's transport so an integration can abort in-flight work; cancelled
+checks do not degrade helper health.
 
 ## Config resolution
 

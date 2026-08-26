@@ -23,6 +23,7 @@ pub mod delegate;
 pub mod delegation_capability;
 pub mod error;
 pub mod governance;
+pub mod helper_http;
 pub mod hotkey;
 mod http_transport;
 pub mod lwd;
@@ -53,6 +54,13 @@ pub mod witness;
 pub mod zkp1;
 pub mod zkp2;
 
+pub use helper_http::{
+    confirmed_by_any_helper, helper_share_status_url, HelperAttemptDiagnostic, HelperAttemptResult,
+    HelperConfirmationOutcome, HelperConfirmationReport, HelperEndpoint, HelperEndpointDiagnostic,
+    HelperHealthClock, HelperHealthTracker, HelperHttpFuture, HelperHttpResponse,
+    HelperHttpTransport, HelperHttpTransportError, HelperStatusCancellation,
+    HelperStatusRequestError, HelperStatusRetryPolicy,
+};
 pub use http_transport::HyperTransport;
 pub use pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, ImtProofData, NegotiatedPirLayout,

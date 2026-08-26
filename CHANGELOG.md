@@ -4,6 +4,16 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- Added `share::confirmed_by_any_helper`, a caller-transported helper
+  share-status API that standardizes endpoint health ordering, bounded
+  transient retries, response parsing, cancellation, and first-confirmation
+  aggregation across wallet clients. Hosts inject `HelperHttpTransport` and
+  keep ownership of Tor, proxy, pooling, and platform HTTP policy; the SDK
+  never opens a separate direct connection.
+
 ## v3.1.0-rc.9
 
 ### Added
