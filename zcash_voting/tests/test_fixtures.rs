@@ -219,16 +219,8 @@ fn downstream_fixture_replacement_clears_stale_share_tracking() {
     let mut fixture = recovery_fixture();
     fixture.share_blinds[0] = [0x01; 32];
     insert_recovery_fixture(&db, &fixture).unwrap();
-    share::record(
-        &db,
-        ROUND_ID,
-        0,
-        1,
-        0,
-        &["https://helper.example".to_string()],
-        99,
-    )
-    .unwrap();
+    let helper_urls = ["https://helper.example".to_string()];
+    share::record(&db, ROUND_ID, 0, 1, 0, &helper_urls, &helper_urls, 99).unwrap();
     share::confirm(&db, ROUND_ID, 0, 1, 0).unwrap();
 
     insert_recovery_fixture(&db, &fixture).unwrap();
