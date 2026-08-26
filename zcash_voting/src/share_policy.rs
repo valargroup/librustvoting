@@ -725,8 +725,8 @@ pub fn ranked_share_submission_server_candidates_with_attempts(
         .zip(&remaining_target_counts)
         .map(|(untried, remaining)| (*remaining).min(untried.len()))
         .collect();
-    let capped_targets = rebalance_prior_usage.then(|| {
-        plan_targets_under_usage_cap(
+    let capped_candidate_prefixes = rebalance_prior_usage.then(|| {
+        plan_candidate_prefixes_under_usage_cap(
             ranked_server_urls,
             &attempted_server_sets,
             &untried_target_counts,
@@ -734,17 +734,18 @@ pub fn ranked_share_submission_server_candidates_with_attempts(
             &usage,
         )
     });
-    let capped_targets = capped_targets.flatten();
-    let mut targets_by_share = Vec::with_capacity(share_count);
+    let capped_candidate_prefixes = capped_candidate_prefixes.flatten();
+    let mut candidate_servers_by_share = Vec::with_capacity(share_count);
+    let mut planned_untried_counts = Vec::with_capacity(share_count);
 
     for (share_index, untried_servers) in untried_servers_by_share.iter().enumerate() {
         let remaining_target_count = remaining_target_counts[share_index];
-        let mut targets = if let Some(capped_targets) = &capped_targets {
-            let targets = capped_targets[share_index].clone();
-            for server in &targets {
+        let mut candidates = if let Some(capped_prefixes) = &capped_candidate_prefixes {
+            let candidates = capped_prefixes[share_index].clone();
+            for server in &candidates {
                 *usage.entry(server.clone()).or_default() += 1;
             }
-            targets
+            candidates
         } else {
             select_targets_with_usage_cap(
                 untried_servers,
@@ -754,22 +755,21 @@ pub fn ranked_share_submission_server_candidates_with_attempts(
                 &mut usage,
             )
         };
-        targets.extend(
+        planned_untried_counts.push(candidates.len());
+        candidates.extend(
             attempted_retry_servers_by_share[share_index]
                 .iter()
-                .take(remaining_target_count.saturating_sub(targets.len()))
+                .take(remaining_target_count.saturating_sub(candidates.len()))
                 .cloned(),
         );
-        targets_by_share.push(targets);
+        candidate_servers_by_share.push(candidates);
     }
 
     let mut excluded_server_sets_by_share: Vec<HashSet<String>> = attempted_server_sets
         .iter()
-        .zip(&targets_by_share)
-        .map(|(attempted, targets)| attempted.iter().chain(targets).cloned().collect())
+        .zip(&candidate_servers_by_share)
+        .map(|(attempted, candidates)| attempted.iter().chain(candidates).cloned().collect())
         .collect();
-    let mut candidate_servers_by_share = targets_by_share;
-    let mut planned_untried_counts = untried_target_counts;
     loop {
         let fallback_counts: Vec<usize> = planned_untried_counts
             .iter()
@@ -1411,6 +1411,55 @@ fn plan_targets_under_usage_cap(
             })
             .collect(),
     )
+}
+
+/// Plan the largest cap-respecting untried candidate prefix for a resumed batch.
+fn plan_candidate_prefixes_under_usage_cap(
+    server_order: &[String],
+    excluded_servers_by_share: &[HashSet<String>],
+    target_counts: &[usize],
+    max_shares_per_server: usize,
+    server_usage: &HashMap<String, usize>,
+) -> Option<Vec<Vec<String>>> {
+    let mut candidate_counts = target_counts.to_vec();
+    let mut candidates = plan_targets_under_usage_cap(
+        server_order,
+        excluded_servers_by_share,
+        &candidate_counts,
+        max_shares_per_server,
+        server_usage,
+    )?;
+
+    loop {
+        let next_counts: Vec<usize> = candidate_counts
+            .iter()
+            .enumerate()
+            .map(|(share_index, count)| {
+                let available_count = server_order
+                    .len()
+                    .saturating_sub(excluded_servers_by_share[share_index].len());
+                if target_counts[share_index] > 0 && *count < available_count {
+                    count + 1
+                } else {
+                    *count
+                }
+            })
+            .collect();
+        if next_counts == candidate_counts {
+            return Some(candidates);
+        }
+        let Some(next_candidates) = plan_targets_under_usage_cap(
+            server_order,
+            excluded_servers_by_share,
+            &next_counts,
+            max_shares_per_server,
+            server_usage,
+        ) else {
+            return Some(candidates);
+        };
+        candidate_counts = next_counts;
+        candidates = next_candidates;
+    }
 }
 
 fn checked_random_bytes_required(
@@ -2263,6 +2312,58 @@ mod tests {
         }
 
         assert!(servers.iter().all(|server| usage[server] == 8));
+    }
+
+    #[test]
+    fn ranked_candidates_reserve_capacity_for_resumed_share_failovers() {
+        let servers: Vec<String> = (0..10)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+        let prior_usage = [7, 6, 7, 1, 7, 3, 7, 7, 6, 0];
+        let previously_selected: Vec<String> = prior_usage
+            .into_iter()
+            .enumerate()
+            .flat_map(|(index, count)| std::iter::repeat_n(servers[index].clone(), count))
+            .collect();
+        let attempted_by_share = vec![
+            Vec::new(),
+            Vec::new(),
+            vec![
+                servers[2].clone(),
+                servers[4].clone(),
+                servers[6].clone(),
+                servers[7].clone(),
+            ],
+        ];
+
+        let candidates = ranked_share_submission_server_candidates_with_attempts(
+            3,
+            &servers,
+            &previously_selected,
+            &attempted_by_share,
+            &vec![Vec::new(); 3],
+        )
+        .unwrap();
+        let mut exposure_counts = previously_selected.into_iter().fold(
+            HashMap::<String, usize>::new(),
+            |mut counts, server| {
+                *counts.entry(server).or_default() += 1;
+                counts
+            },
+        );
+        for plan in &candidates {
+            for server in plan
+                .candidate_servers
+                .iter()
+                .take(plan.remaining_target_count as usize + 1)
+            {
+                *exposure_counts.entry(server.clone()).or_default() += 1;
+            }
+        }
+
+        assert!(servers.iter().all(|server| {
+            exposure_counts.get(server).copied().unwrap_or(0) <= SHARE_HELPER_MAX_SHARES_PER_SERVER
+        }));
     }
 
     #[test]
