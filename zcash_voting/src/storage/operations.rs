@@ -1854,28 +1854,6 @@ impl VotingDb {
             new_urls,
         )
     }
-
-    /// Append helper URLs before attempting delivery to those helpers.
-    pub fn add_attempted_servers(
-        &self,
-        round_id: &str,
-        bundle_index: u32,
-        proposal_id: u32,
-        share_index: u32,
-        new_urls: &[String],
-    ) -> Result<(), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::add_attempted_servers(
-            &conn,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            proposal_id,
-            share_index,
-            new_urls,
-        )
-    }
 }
 
 /// Accepts missing or matching text fields and rejects conflicting values.
@@ -5209,7 +5187,7 @@ mod tests {
 
         // Ambiguous failures count as attempts without becoming acceptances.
         let timed_out_urls = vec!["https://helper-timeout.example".to_string()];
-        db.add_attempted_servers(ROUND_ID, 0, 0, 1, &timed_out_urls)
+        db.record_share_delegation(ROUND_ID, 0, 0, 1, &[], &timed_out_urls, &nf, 2000)
             .unwrap();
         let share1 = db
             .get_share_delegations(ROUND_ID)

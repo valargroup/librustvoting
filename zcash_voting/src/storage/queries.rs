@@ -3814,30 +3814,6 @@ pub fn add_sent_servers(
     )
 }
 
-/// Append helper URLs before attempting delivery to those helpers.
-pub fn add_attempted_servers(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    share_index: u32,
-    new_urls: &[String],
-) -> Result<(), VotingError> {
-    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    append_share_server_urls(
-        conn,
-        round_id,
-        wallet_id,
-        bundle_index,
-        proposal_id,
-        share_index,
-        "attempted_server_urls",
-        new_urls,
-        false,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn append_share_server_urls(
     conn: &Connection,

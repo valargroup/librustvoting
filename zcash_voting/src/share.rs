@@ -185,6 +185,9 @@ pub fn add_sent_servers(
 }
 
 /// Adds helper URLs to the durable exposure history before delivery starts.
+///
+/// Creates the share record when this is the first delivery attempt. `submit_at`
+/// is the share's scheduled submission time and is stored with that new record.
 pub fn add_attempted_servers(
     db: &VotingDb,
     round_id: &str,
@@ -192,8 +195,18 @@ pub fn add_attempted_servers(
     proposal_id: u32,
     share_index: u32,
     new_urls: &[String],
+    submit_at: u64,
 ) -> Result<(), VotingError> {
-    db.add_attempted_servers(round_id, bundle_index, proposal_id, share_index, new_urls)
+    record(
+        db,
+        round_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        &[],
+        new_urls,
+        submit_at,
+    )
 }
 
 /// Reconstructs one helper-server payload from a persisted vote recovery bundle.
@@ -459,6 +472,7 @@ mod tests {
             1,
             1,
             &["https://helper-timeout.example".to_string()],
+            99,
         )
         .unwrap();
         let records = list(&db, ROUND_ID).unwrap();
@@ -503,6 +517,20 @@ mod tests {
         confirm(&db, ROUND_ID, 0, 1, 1).unwrap();
         assert!(unconfirmed(&db, ROUND_ID).unwrap().is_empty());
         assert_eq!(list(&db, ROUND_ID).unwrap()[0].confirmed, true);
+    }
+
+    #[test]
+    fn first_attempt_creates_share_tracking_record() {
+        let db = db_with_vote_recovery();
+        let attempted = vec!["https://helper-timeout.example".to_string()];
+
+        add_attempted_servers(&db, ROUND_ID, 0, 1, 1, &attempted, 123).unwrap();
+
+        let records = list(&db, ROUND_ID).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].sent_to_urls.is_empty());
+        assert_eq!(records[0].attempted_server_urls, attempted);
+        assert_eq!(records[0].submit_at, 123);
     }
 
     #[test]

@@ -374,6 +374,7 @@ impl CommittedVote {
         db: &VotingDb,
         share_index: u32,
         new_urls: &[String],
+        submit_at: u64,
     ) -> Result<(), VotingError> {
         crate::share::add_attempted_servers(
             db,
@@ -382,6 +383,7 @@ impl CommittedVote {
             self.commit.proposal_id,
             share_index,
             new_urls,
+            submit_at,
         )
     }
 
