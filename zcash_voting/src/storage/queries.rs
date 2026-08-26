@@ -3324,11 +3324,63 @@ pub(crate) fn record_share_delegation(
     submit_at: u64,
 ) -> Result<(), VotingError> {
     ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    let urls_json = serde_json::to_string(sent_to_urls).map_err(|e| VotingError::Internal {
+    let existing = conn
+        .query_row(
+            "SELECT sent_to_urls, attempted_server_urls, nullifier \
+             FROM share_delegations \
+             WHERE round_id = :round_id AND wallet_id = :wallet_id \
+             AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index,
+                ":proposal_id": proposal_id,
+                ":share_index": share_index,
+            },
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read existing share delegation: {e}"),
+        })?;
+
+    let (mut merged_sent, mut merged_attempted) = match existing {
+        Some((sent_json, attempted_json, existing_nullifier)) => {
+            if existing_nullifier != nullifier {
+                return Err(share_nullifier_conflict(
+                    round_id,
+                    wallet_id,
+                    bundle_index,
+                    proposal_id,
+                    share_index,
+                ));
+            }
+            let sent = serde_json::from_str(&sent_json).map_err(|e| VotingError::Internal {
+                message: format!("failed to deserialize sent_to_urls: {e}"),
+            })?;
+            let attempted =
+                serde_json::from_str(&attempted_json).map_err(|e| VotingError::Internal {
+                    message: format!("failed to deserialize attempted_server_urls: {e}"),
+                })?;
+            (sent, attempted)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    append_unique_urls(&mut merged_sent, sent_to_urls);
+    append_unique_urls(&mut merged_attempted, attempted_server_urls);
+    append_unique_urls(&mut merged_attempted, &merged_sent);
+
+    let urls_json = serde_json::to_string(&merged_sent).map_err(|e| VotingError::Internal {
         message: format!("failed to serialize sent_to_urls: {}", e),
     })?;
     let attempted_urls_json =
-        serde_json::to_string(attempted_server_urls).map_err(|e| VotingError::Internal {
+        serde_json::to_string(&merged_attempted).map_err(|e| VotingError::Internal {
             message: format!("failed to serialize attempted_server_urls: {}", e),
         })?;
     let now = std::time::SystemTime::now()
@@ -3362,16 +3414,39 @@ pub(crate) fn record_share_delegation(
     })
     .and_then(|rows| {
         if rows == 0 {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "share nullifier conflict for round={}, wallet={}, bundle={}, proposal={}, share={}",
-                    round_id, wallet_id, bundle_index, proposal_id, share_index
-                ),
-            });
+            return Err(share_nullifier_conflict(
+                round_id,
+                wallet_id,
+                bundle_index,
+                proposal_id,
+                share_index,
+            ));
         }
         Ok(())
     })?;
     Ok(())
+}
+
+fn append_unique_urls(existing: &mut Vec<String>, additions: &[String]) {
+    for url in additions {
+        if !existing.contains(url) {
+            existing.push(url.clone());
+        }
+    }
+}
+
+fn share_nullifier_conflict(
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> VotingError {
+    VotingError::InvalidInput {
+        message: format!(
+            "share nullifier conflict for round={round_id}, wallet={wallet_id}, bundle={bundle_index}, proposal={proposal_id}, share={share_index}"
+        ),
+    }
 }
 
 /// Load all share delegations for a round.

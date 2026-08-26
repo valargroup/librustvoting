@@ -92,7 +92,8 @@ pub fn compute_nullifier(
 /// `sent_to_urls` contains known acceptances. `attempted_server_urls` also
 /// includes ambiguous delivery attempts such as timeouts so later planning can
 /// preserve the privacy exposure cap. Known acceptances are added to the
-/// attempt set if the caller omitted them.
+/// attempt set if the caller omitted them. Re-recording a share appends to both
+/// histories rather than replacing prior delivery state.
 pub fn record(
     db: &VotingDb,
     round_id: &str,

@@ -1760,10 +1760,15 @@ impl VotingDb {
         nullifier: &[u8],
         submit_at: u64,
     ) -> Result<(), VotingError> {
-        let conn = self.conn();
+        let mut conn = self.conn();
         let wallet_id = self.wallet_id();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to begin share delegation transaction: {e}"),
+            })?;
         queries::record_share_delegation(
-            &conn,
+            &tx,
             round_id,
             &wallet_id,
             bundle_index,
@@ -1773,7 +1778,10 @@ impl VotingDb {
             attempted_server_urls,
             nullifier,
             submit_at,
-        )
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("failed to commit share delegation transaction: {e}"),
+        })
     }
 
     /// Load all share delegations for a round.
@@ -5177,7 +5185,7 @@ mod tests {
         // Record two share delegations (share 0 and share 1)
         db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &urls_a, &nf, 1000)
             .unwrap();
-        db.record_share_delegation(ROUND_ID, 0, 0, 1, &urls_b, &urls_b, &nf, 2000)
+        db.record_share_delegation(ROUND_ID, 0, 0, 1, &[], &[], &nf, 2000)
             .unwrap();
 
         // Query all — should return both
@@ -5212,6 +5220,18 @@ mod tests {
         assert!(!share1.sent_to_urls.contains(&timed_out_urls[0]));
         assert!(share1.attempted_server_urls.contains(&timed_out_urls[0]));
         assert_eq!(share1.submit_at, 2000);
+
+        // Re-recording stale delivery state must not erase prior exposure.
+        db.record_share_delegation(ROUND_ID, 0, 0, 1, &urls_b, &urls_b, &nf, 2000)
+            .unwrap();
+        let share1 = db
+            .get_share_delegations(ROUND_ID)
+            .unwrap()
+            .into_iter()
+            .find(|share| share.share_index == 1)
+            .unwrap();
+        assert_eq!(share1.sent_to_urls, urls_b);
+        assert!(share1.attempted_server_urls.contains(&timed_out_urls[0]));
 
         // Resubmit share 1 to an additional server that accepts it.
         let urls_c = vec!["https://helper-c.example".to_string()];
