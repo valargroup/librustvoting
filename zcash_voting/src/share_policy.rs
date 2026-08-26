@@ -687,30 +687,60 @@ pub fn ranked_share_submission_server_candidates_with_usage(
         targets_by_share.push(targets);
     }
 
-    let mut candidate_sets_by_share: Vec<HashSet<String>> = targets_by_share
+    let mut candidate_sets_by_share: Vec<HashSet<String>> = accepted_server_sets
         .iter()
-        .map(|targets| targets.iter().cloned().collect())
+        .zip(&targets_by_share)
+        .map(|(accepted, targets)| accepted.iter().chain(targets).cloned().collect())
         .collect();
     let mut candidate_servers_by_share = targets_by_share;
     while candidate_servers_by_share
         .iter()
         .zip(&available_servers_by_share)
-        .any(|(candidates, available)| candidates.len() < available.len())
+        .zip(&remaining_target_counts)
+        .any(|((candidates, available), remaining)| {
+            *remaining > 0 && candidates.len() < available.len()
+        })
     {
+        let fallback_counts: Vec<usize> = candidate_servers_by_share
+            .iter()
+            .zip(&available_servers_by_share)
+            .zip(&remaining_target_counts)
+            .map(|((candidates, available), remaining)| {
+                usize::from(*remaining > 0 && candidates.len() < available.len())
+            })
+            .collect();
+        let capped_fallbacks = plan_targets_under_usage_cap(
+            ranked_server_urls,
+            &candidate_sets_by_share,
+            &fallback_counts,
+            max_shares_per_server,
+            &usage,
+        );
         for (share_index, available_servers) in available_servers_by_share.iter().enumerate() {
-            let Some((_, server)) = available_servers
-                .iter()
-                .enumerate()
-                .filter(|(_, server)| !candidate_sets_by_share[share_index].contains(*server))
-                .min_by_key(|(rank, server)| {
-                    let projected_usage = usage.get(*server).copied().unwrap_or(0);
-                    (
-                        projected_usage >= max_shares_per_server,
-                        projected_usage,
-                        *rank,
-                    )
-                })
-            else {
+            if fallback_counts[share_index] == 0 {
+                continue;
+            }
+            let server = capped_fallbacks
+                .as_ref()
+                .and_then(|fallbacks| fallbacks[share_index].first())
+                .or_else(|| {
+                    available_servers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, server)| {
+                            !candidate_sets_by_share[share_index].contains(*server)
+                        })
+                        .min_by_key(|(rank, server)| {
+                            let projected_usage = usage.get(*server).copied().unwrap_or(0);
+                            (
+                                projected_usage >= max_shares_per_server,
+                                projected_usage,
+                                *rank,
+                            )
+                        })
+                        .map(|(_, server)| server)
+                });
+            let Some(server) = server else {
                 continue;
             };
             *usage.entry(server.clone()).or_default() += 1;
@@ -1168,7 +1198,7 @@ fn select_targets_with_usage_cap(
 /// selector when no such assignment exists.
 fn plan_targets_under_usage_cap(
     server_order: &[String],
-    accepted_servers_by_share: &[HashSet<String>],
+    excluded_servers_by_share: &[HashSet<String>],
     target_counts: &[usize],
     max_shares_per_server: usize,
     server_usage: &HashMap<String, usize>,
@@ -1197,7 +1227,7 @@ fn plan_targets_under_usage_cap(
         let available_capacity = server_order
             .iter()
             .filter(|server| {
-                !accepted_servers_by_share[*share_index].contains(*server)
+                !excluded_servers_by_share[*share_index].contains(*server)
                     && server_usage.get(*server).copied().unwrap_or(0) < max_shares_per_server
             })
             .count();
@@ -1214,7 +1244,7 @@ fn plan_targets_under_usage_cap(
         );
         let mut servers: Vec<usize> = (0..server_count)
             .filter(|server_index| {
-                !accepted_servers_by_share[share_index].contains(&server_order[*server_index])
+                !excluded_servers_by_share[share_index].contains(&server_order[*server_index])
                     && server_usage
                         .get(&server_order[*server_index])
                         .copied()
@@ -1286,7 +1316,7 @@ fn plan_targets_under_usage_cap(
                     .iter()
                     .enumerate()
                     .filter(|(server_index, server)| {
-                        !accepted_servers_by_share[share_index].contains(*server)
+                        !excluded_servers_by_share[share_index].contains(*server)
                             && server_usage.get(*server).copied().unwrap_or(0)
                                 < max_shares_per_server
                             && residual[share_offset + share_index][server_offset + *server_index]
@@ -2031,6 +2061,46 @@ mod tests {
             }
         }
         assert!(servers.iter().all(|server| usage[server] == 8));
+    }
+
+    #[test]
+    fn ranked_candidates_do_not_project_failovers_for_completed_shares() {
+        let servers: Vec<String> = (0..12)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+        let previously_selected = servers[..5].to_vec();
+        let mut previously_accepted_by_share = vec![Vec::new(); VOTE_COMMITMENT_SHARE_COUNT];
+        previously_accepted_by_share[0] = previously_selected.clone();
+
+        let candidates = ranked_share_submission_server_candidates_with_usage(
+            VOTE_COMMITMENT_SHARE_COUNT,
+            &servers,
+            &previously_selected,
+            &previously_accepted_by_share,
+        )
+        .unwrap();
+
+        assert_eq!(candidates[0].remaining_target_count, 0);
+        assert!(candidates[0].candidate_servers.is_empty());
+        let mut exposure_counts = previously_selected.into_iter().fold(
+            HashMap::<String, usize>::new(),
+            |mut counts, server| {
+                *counts.entry(server).or_default() += 1;
+                counts
+            },
+        );
+        for plan in &candidates[1..] {
+            for server in plan
+                .candidate_servers
+                .iter()
+                .take(plan.remaining_target_count as usize + 1)
+            {
+                *exposure_counts.entry(server.clone()).or_default() += 1;
+            }
+        }
+        assert!(servers.iter().all(|server| {
+            exposure_counts.get(server).copied().unwrap_or(0) <= SHARE_HELPER_MAX_SHARES_PER_SERVER
+        }));
     }
 
     #[test]
