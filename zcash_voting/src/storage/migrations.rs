@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 15;
+const CURRENT_VERSION: u32 = 16;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -48,6 +48,11 @@ SELECT i.wallet_id, r.network, i.nullifier, i.root, i.nf_bounds, i.leaf_pos, i.p
 FROM imt_proofs i
 JOIN rounds r ON r.round_id = i.round_id AND r.wallet_id = i.wallet_id;
 DROP TABLE imt_proofs;",
+    ),
+    (
+        15,
+        "ALTER TABLE share_delegations ADD COLUMN attempted_server_urls TEXT NOT NULL DEFAULT '[]';
+UPDATE share_delegations SET attempted_server_urls = sent_to_urls;",
     ),
 ];
 
@@ -158,6 +163,15 @@ mod tests {
         format!("{}{}", &schema[..start], &schema[end..])
     }
 
+    fn without_attempted_server_urls(schema: &str) -> String {
+        let stripped = schema.replace("    attempted_server_urls TEXT NOT NULL,\n", "");
+        assert_ne!(
+            stripped, schema,
+            "version-15 schema must drop the column added at version 16"
+        );
+        stripped
+    }
+
     /// The bundle-scoped `imt_proofs` table that version 15 replaced with
     /// `pir_proof_cache`, exactly as `001_init.sql` created it through v14.
     const V14_IMT_PROOFS_SQL: &str = "CREATE TABLE imt_proofs (
@@ -176,11 +190,18 @@ mod tests {
 
     /// The version-14 schema: no `pir_proof_cache` yet, `imt_proofs` still present.
     fn v14_schema() -> String {
+        let schema = without_attempted_server_urls(include_str!("migrations/001_init.sql"));
         format!(
             "{}\n{}\n",
-            without_pir_proof_cache(include_str!("migrations/001_init.sql")),
+            without_pir_proof_cache(&schema),
             V14_IMT_PROOFS_SQL
         )
+    }
+
+    /// The version-15 schema, before helper delivery attempts were separated
+    /// from known acceptances.
+    fn v15_schema() -> String {
+        without_attempted_server_urls(include_str!("migrations/001_init.sql"))
     }
 
     /// The launch schema, before `bundle_policy_json` and `pir_proof_cache` were added.
@@ -413,6 +434,42 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn migrate_from_v15_seeds_attempts_from_known_acceptances() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v15_schema()).unwrap();
+        queries::insert_round(
+            &conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
+        conn.execute(
+            "INSERT INTO share_delegations
+             (round_id, wallet_id, bundle_index, proposal_id, share_index,
+              sent_to_urls, nullifier, created_at)
+             VALUES ('test-round', 'wallet', 0, 1, 0,
+                     '[\"https://helper.example\"]', X'01', 42)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 15).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let attempted_server_urls: String = conn
+            .query_row(
+                "SELECT attempted_server_urls FROM share_delegations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempted_server_urls, "[\"https://helper.example\"]");
     }
 
     #[test]

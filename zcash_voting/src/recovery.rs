@@ -341,6 +341,7 @@ mod tests {
             1,
             0,
             &["https://helper-a.example".to_string()],
+            &["https://helper-a.example".to_string()],
             &[0x44; 32],
             1234,
         )
@@ -396,6 +397,7 @@ mod tests {
             0,
             1,
             0,
+            &["https://helper-a.example".to_string()],
             &["https://helper-a.example".to_string()],
             &[0x44; 32],
             0,

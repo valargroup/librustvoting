@@ -3319,6 +3319,7 @@ pub(crate) fn record_share_delegation(
     proposal_id: u32,
     share_index: u32,
     sent_to_urls: &[String],
+    attempted_server_urls: &[String],
     nullifier: &[u8],
     submit_at: u64,
 ) -> Result<(), VotingError> {
@@ -3326,16 +3327,21 @@ pub(crate) fn record_share_delegation(
     let urls_json = serde_json::to_string(sent_to_urls).map_err(|e| VotingError::Internal {
         message: format!("failed to serialize sent_to_urls: {}", e),
     })?;
+    let attempted_urls_json =
+        serde_json::to_string(attempted_server_urls).map_err(|e| VotingError::Internal {
+            message: format!("failed to serialize attempted_server_urls: {}", e),
+        })?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     conn.execute(
         "INSERT INTO share_delegations \
-         (round_id, wallet_id, bundle_index, proposal_id, share_index, sent_to_urls, nullifier, confirmed, submit_at, created_at) \
-         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :sent_to_urls, :nullifier, 0, :submit_at, :created_at) \
+         (round_id, wallet_id, bundle_index, proposal_id, share_index, sent_to_urls, attempted_server_urls, nullifier, confirmed, submit_at, created_at) \
+         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :sent_to_urls, :attempted_server_urls, :nullifier, 0, :submit_at, :created_at) \
          ON CONFLICT (round_id, wallet_id, bundle_index, proposal_id, share_index) DO UPDATE SET \
          sent_to_urls = excluded.sent_to_urls, \
+         attempted_server_urls = excluded.attempted_server_urls, \
          submit_at = excluded.submit_at \
          WHERE share_delegations.nullifier = excluded.nullifier",
         named_params! {
@@ -3345,6 +3351,7 @@ pub(crate) fn record_share_delegation(
             ":proposal_id": proposal_id,
             ":share_index": share_index,
             ":sent_to_urls": urls_json,
+            ":attempted_server_urls": attempted_urls_json,
             ":nullifier": nullifier,
             ":submit_at": submit_at,
             ":created_at": now,
@@ -3375,7 +3382,7 @@ pub fn get_share_delegations(
 ) -> Result<Vec<ShareDelegationRecord>, VotingError> {
     load_share_delegations(
         conn,
-        "SELECT bundle_index, proposal_id, share_index, sent_to_urls, nullifier, confirmed, submit_at, created_at, round_id \
+        "SELECT bundle_index, proposal_id, share_index, sent_to_urls, attempted_server_urls, nullifier, confirmed, submit_at, created_at, round_id \
          FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id \
          ORDER BY proposal_id, share_index",
         round_id,
@@ -3391,7 +3398,7 @@ pub fn get_unconfirmed_delegations(
 ) -> Result<Vec<ShareDelegationRecord>, VotingError> {
     load_share_delegations(
         conn,
-        "SELECT bundle_index, proposal_id, share_index, sent_to_urls, nullifier, confirmed, submit_at, created_at, round_id \
+        "SELECT bundle_index, proposal_id, share_index, sent_to_urls, attempted_server_urls, nullifier, confirmed, submit_at, created_at, round_id \
          FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id AND confirmed = 0 \
          ORDER BY proposal_id, share_index",
         round_id,
@@ -3449,18 +3456,20 @@ fn load_share_delegations(
             named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
             |row| {
                 let urls_json: String = row.get(3)?;
-                let nullifier_blob: Vec<u8> = row.get(4)?;
-                let confirmed_int: i32 = row.get(5)?;
-                let round_id_val: String = row.get(8)?;
+                let attempted_urls_json: String = row.get(4)?;
+                let nullifier_blob: Vec<u8> = row.get(5)?;
+                let confirmed_int: i32 = row.get(6)?;
+                let round_id_val: String = row.get(9)?;
                 Ok((
                     row.get::<_, u32>(0)?,
                     row.get::<_, u32>(1)?,
                     row.get::<_, u32>(2)?,
                     urls_json,
+                    attempted_urls_json,
                     nullifier_blob,
                     confirmed_int != 0,
-                    row.get::<_, u64>(6)?,
                     row.get::<_, u64>(7)?,
+                    row.get::<_, u64>(8)?,
                     round_id_val,
                 ))
             },
@@ -3476,6 +3485,7 @@ fn load_share_delegations(
             proposal_id,
             share_index,
             urls_json,
+            attempted_urls_json,
             nullifier,
             confirmed,
             submit_at,
@@ -3488,12 +3498,17 @@ fn load_share_delegations(
             serde_json::from_str(&urls_json).map_err(|e| VotingError::Internal {
                 message: format!("failed to deserialize sent_to_urls: {}", e),
             })?;
+        let attempted_server_urls: Vec<String> = serde_json::from_str(&attempted_urls_json)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to deserialize attempted_server_urls: {}", e),
+            })?;
         results.push(ShareDelegationRecord {
             round_id: round_id_val,
             bundle_index,
             proposal_id,
             share_index,
             sent_to_urls,
+            attempted_server_urls,
             nullifier,
             confirmed,
             submit_at,
@@ -3700,12 +3715,75 @@ pub fn add_sent_servers(
     new_urls: &[String],
 ) -> Result<(), VotingError> {
     ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    // Read current URLs
+    append_share_server_urls(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        "attempted_server_urls",
+        new_urls,
+        false,
+    )?;
+    append_share_server_urls(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        "sent_to_urls",
+        new_urls,
+        true,
+    )
+}
+
+/// Append helper URLs before attempting delivery to those helpers.
+pub fn add_attempted_servers(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    new_urls: &[String],
+) -> Result<(), VotingError> {
+    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
+    append_share_server_urls(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        "attempted_server_urls",
+        new_urls,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_share_server_urls(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    column: &'static str,
+    new_urls: &[String],
+    reset_submit_at: bool,
+) -> Result<(), VotingError> {
+    debug_assert!(matches!(column, "sent_to_urls" | "attempted_server_urls"));
+    let select_sql = format!(
+        "SELECT {column} FROM share_delegations \
+         WHERE round_id = :round_id AND wallet_id = :wallet_id \
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index"
+    );
     let current_json: String = conn
         .query_row(
-            "SELECT sent_to_urls FROM share_delegations \
-             WHERE round_id = :round_id AND wallet_id = :wallet_id \
-             AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
+            &select_sql,
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
@@ -3716,15 +3794,14 @@ pub fn add_sent_servers(
             |row| row.get(0),
         )
         .map_err(|e| VotingError::Internal {
-            message: format!("failed to read sent_to_urls for update: {}", e),
+            message: format!("failed to read {column} for update: {e}"),
         })?;
 
     let mut urls: Vec<String> =
         serde_json::from_str(&current_json).map_err(|e| VotingError::Internal {
-            message: format!("failed to deserialize sent_to_urls: {}", e),
+            message: format!("failed to deserialize {column}: {e}"),
         })?;
 
-    // Append new URLs (deduplicated)
     for url in new_urls {
         if !urls.contains(url) {
             urls.push(url.clone());
@@ -3732,13 +3809,20 @@ pub fn add_sent_servers(
     }
 
     let updated_json = serde_json::to_string(&urls).map_err(|e| VotingError::Internal {
-        message: format!("failed to serialize updated sent_to_urls: {}", e),
+        message: format!("failed to serialize updated {column}: {e}"),
     })?;
-
-    conn.execute(
-        "UPDATE share_delegations SET sent_to_urls = :urls, submit_at = 0 \
+    let submit_at_update = if reset_submit_at {
+        ", submit_at = 0"
+    } else {
+        ""
+    };
+    let update_sql = format!(
+        "UPDATE share_delegations SET {column} = :urls{submit_at_update} \
          WHERE round_id = :round_id AND wallet_id = :wallet_id \
-         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index"
+    );
+    conn.execute(
+        &update_sql,
         named_params! {
             ":urls": updated_json,
             ":round_id": round_id,
@@ -3749,7 +3833,7 @@ pub fn add_sent_servers(
         },
     )
     .map_err(|e| VotingError::Internal {
-        message: format!("failed to update sent_to_urls: {}", e),
+        message: format!("failed to update {column}: {e}"),
     })?;
     Ok(())
 }

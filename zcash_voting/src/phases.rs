@@ -578,6 +578,7 @@ mod tests {
             1,
             1,
             &["https://helper.example".to_string()],
+            &["https://helper.example".to_string()],
             &[0x44; 32],
             0,
         )

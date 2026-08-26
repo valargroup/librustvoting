@@ -319,12 +319,13 @@ impl CommittedVote {
         })
     }
 
-    /// Records a helper-share submission using recovery-owned nullifier material.
+    /// Records known acceptances and all attempted helper assignments.
     pub fn record_share(
         &self,
         db: &VotingDb,
         share_index: u32,
         sent_to_urls: &[String],
+        attempted_server_urls: &[String],
         submit_at: u64,
     ) -> Result<(), VotingError> {
         crate::share::record(
@@ -334,6 +335,7 @@ impl CommittedVote {
             self.commit.proposal_id,
             share_index,
             sent_to_urls,
+            attempted_server_urls,
             submit_at,
         )
     }
@@ -357,6 +359,23 @@ impl CommittedVote {
         new_urls: &[String],
     ) -> Result<(), VotingError> {
         crate::share::add_sent_servers(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            share_index,
+            new_urls,
+        )
+    }
+
+    /// Adds helper URLs to the durable exposure history before delivery starts.
+    pub fn add_attempted_servers(
+        &self,
+        db: &VotingDb,
+        share_index: u32,
+        new_urls: &[String],
+    ) -> Result<(), VotingError> {
+        crate::share::add_attempted_servers(
             db,
             &self.round_id,
             self.bundle_index,
@@ -2664,7 +2683,13 @@ mod tests {
         assert_eq!(submission.vote_auth_sig, [0x17; 64]);
 
         recovered
-            .record_share(&db, 0, &["https://helper-a.example".to_string()], 1234)
+            .record_share(
+                &db,
+                0,
+                &["https://helper-a.example".to_string()],
+                &["https://helper-a.example".to_string()],
+                1234,
+            )
             .unwrap();
         recovered
             .add_sent_servers(&db, 0, &["https://helper-b.example".to_string()])

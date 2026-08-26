@@ -13,7 +13,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   Complete-vote plans normally cap each helper at eight shares, preserve prior
   usage and partial per-share acceptances when resumed, and retain every
   configured helper as a fallback. The cap requires at least ten helpers; POST
-  timeouts are treated as ambiguous.
+  timeouts are treated as ambiguous and their attempted assignments are stored
+  separately from known acceptances.
 
 ## v3.1.0-rc.10
 

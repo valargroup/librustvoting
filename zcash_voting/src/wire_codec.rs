@@ -457,6 +457,7 @@ impl From<crate::types::ShareDelegationRecord> for ShareDelegationRecordView {
             proposal_id: record.proposal_id,
             share_index: record.share_index,
             sent_to_urls: record.sent_to_urls,
+            attempted_server_urls: record.attempted_server_urls,
             nullifier: record.nullifier,
             phase: if record.confirmed {
                 WorkflowPhase::Confirmed.as_str().to_string()

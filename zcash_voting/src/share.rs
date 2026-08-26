@@ -87,7 +87,12 @@ pub fn compute_nullifier(
     Ok(nullifier.to_repr())
 }
 
-/// Records a helper-share submission using nullifier material from recovery state.
+/// Records helper-share delivery state using nullifier material from recovery.
+///
+/// `sent_to_urls` contains known acceptances. `attempted_server_urls` also
+/// includes ambiguous delivery attempts such as timeouts so later planning can
+/// preserve the privacy exposure cap. Known acceptances are added to the
+/// attempt set if the caller omitted them.
 pub fn record(
     db: &VotingDb,
     round_id: &str,
@@ -95,6 +100,7 @@ pub fn record(
     proposal_id: u32,
     share_index: u32,
     sent_to_urls: &[String],
+    attempted_server_urls: &[String],
     submit_at: u64,
 ) -> Result<(), VotingError> {
     let bundle = crate::vote::recovery_bundle(db, round_id, bundle_index, proposal_id)?
@@ -106,12 +112,19 @@ pub fn record(
     let payload = recover_payload(&bundle, share_index)?;
     let primary_blind = array32("primary_blind", payload.primary_blind.clone())?;
     let nullifier = compute_nullifier(&bundle.vote_commitment, share_index, &primary_blind)?;
+    let mut attempted_server_urls = attempted_server_urls.to_vec();
+    for server_url in sent_to_urls {
+        if !attempted_server_urls.contains(server_url) {
+            attempted_server_urls.push(server_url.clone());
+        }
+    }
     db.record_share_delegation(
         round_id,
         bundle_index,
         proposal_id,
         share_index,
         sent_to_urls,
+        &attempted_server_urls,
         &nullifier,
         submit_at,
     )
@@ -168,6 +181,18 @@ pub fn add_sent_servers(
     new_urls: &[String],
 ) -> Result<(), VotingError> {
     db.add_sent_servers(round_id, bundle_index, proposal_id, share_index, new_urls)
+}
+
+/// Adds helper URLs to the durable exposure history before delivery starts.
+pub fn add_attempted_servers(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    new_urls: &[String],
+) -> Result<(), VotingError> {
+    db.add_attempted_servers(round_id, bundle_index, proposal_id, share_index, new_urls)
 }
 
 /// Reconstructs one helper-server payload from a persisted vote recovery bundle.
@@ -415,7 +440,7 @@ mod tests {
     fn share_tracking_apis_happy_path() {
         let db = db_with_vote_recovery();
         let initial_urls = vec!["https://helper-1.example".to_string()];
-        record(&db, ROUND_ID, 0, 1, 1, &initial_urls, 99).unwrap();
+        record(&db, ROUND_ID, 0, 1, 1, &initial_urls, &initial_urls, 99).unwrap();
 
         let records = list(&db, ROUND_ID).unwrap();
         let unconfirmed_records = unconfirmed(&db, ROUND_ID).unwrap();
@@ -423,7 +448,21 @@ mod tests {
         assert_eq!(unconfirmed_records.len(), 1);
         assert_eq!(records[0].share_index, 1);
         assert_eq!(records[0].sent_to_urls, initial_urls);
+        assert_eq!(records[0].attempted_server_urls, initial_urls);
         assert!(!records[0].confirmed);
+
+        add_attempted_servers(
+            &db,
+            ROUND_ID,
+            0,
+            1,
+            1,
+            &["https://helper-timeout.example".to_string()],
+        )
+        .unwrap();
+        let records = list(&db, ROUND_ID).unwrap();
+        assert_eq!(records[0].sent_to_urls.len(), 1);
+        assert_eq!(records[0].attempted_server_urls.len(), 2);
 
         add_sent_servers(
             &db,
@@ -436,6 +475,7 @@ mod tests {
         .unwrap();
         let records = list(&db, ROUND_ID).unwrap();
         assert_eq!(records[0].sent_to_urls.len(), 2);
+        assert_eq!(records[0].attempted_server_urls.len(), 3);
         assert_eq!(records[0].submit_at, 0);
 
         db.conn()
@@ -453,7 +493,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let err = record(&db, ROUND_ID, 0, 1, 1, &initial_urls, 99).unwrap_err();
+        let err = record(&db, ROUND_ID, 0, 1, 1, &initial_urls, &initial_urls, 99).unwrap_err();
         assert!(
             err.to_string().contains("share nullifier conflict"),
             "unexpected error: {err}"
@@ -470,8 +510,8 @@ mod tests {
         let db = db_with_vote_recovery_and_session(Some(session_json));
         let urls = vec!["https://helper.example".to_string()];
 
-        record(&db, ROUND_ID, 0, 1, 0, &urls, 99).unwrap();
-        record(&db, ROUND_ID, 0, 1, 1, &urls, 100).unwrap();
+        record(&db, ROUND_ID, 0, 1, 0, &urls, &urls, 99).unwrap();
+        record(&db, ROUND_ID, 0, 1, 1, &urls, &urls, 100).unwrap();
 
         assert_eq!(
             pending_rounds(&db).unwrap(),

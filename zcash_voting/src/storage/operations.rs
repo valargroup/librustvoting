@@ -1756,6 +1756,7 @@ impl VotingDb {
         proposal_id: u32,
         share_index: u32,
         sent_to_urls: &[String],
+        attempted_server_urls: &[String],
         nullifier: &[u8],
         submit_at: u64,
     ) -> Result<(), VotingError> {
@@ -1769,6 +1770,7 @@ impl VotingDb {
             proposal_id,
             share_index,
             sent_to_urls,
+            attempted_server_urls,
             nullifier,
             submit_at,
         )
@@ -1835,6 +1837,28 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::add_sent_servers(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+            new_urls,
+        )
+    }
+
+    /// Append helper URLs before attempting delivery to those helpers.
+    pub fn add_attempted_servers(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        new_urls: &[String],
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::add_attempted_servers(
             &conn,
             round_id,
             &wallet_id,
@@ -5151,9 +5175,9 @@ mod tests {
         let nf = vec![0xDD; 32];
 
         // Record two share delegations (share 0 and share 1)
-        db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &nf, 1000)
+        db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &urls_a, &nf, 1000)
             .unwrap();
-        db.record_share_delegation(ROUND_ID, 0, 0, 1, &urls_b, &nf, 2000)
+        db.record_share_delegation(ROUND_ID, 0, 0, 1, &urls_b, &urls_b, &nf, 2000)
             .unwrap();
 
         // Query all — should return both
@@ -5175,7 +5199,21 @@ mod tests {
         // Confirming again is idempotent
         db.mark_share_confirmed(ROUND_ID, 0, 0, 0).unwrap();
 
-        // Resubmit share 1 to additional servers
+        // Ambiguous failures count as attempts without becoming acceptances.
+        let timed_out_urls = vec!["https://helper-timeout.example".to_string()];
+        db.add_attempted_servers(ROUND_ID, 0, 0, 1, &timed_out_urls)
+            .unwrap();
+        let share1 = db
+            .get_share_delegations(ROUND_ID)
+            .unwrap()
+            .into_iter()
+            .find(|share| share.share_index == 1)
+            .unwrap();
+        assert!(!share1.sent_to_urls.contains(&timed_out_urls[0]));
+        assert!(share1.attempted_server_urls.contains(&timed_out_urls[0]));
+        assert_eq!(share1.submit_at, 2000);
+
+        // Resubmit share 1 to an additional server that accepts it.
         let urls_c = vec!["https://helper-c.example".to_string()];
         db.add_sent_servers(ROUND_ID, 0, 0, 1, &urls_c).unwrap();
 
@@ -5189,12 +5227,13 @@ mod tests {
             .sent_to_urls
             .contains(&"https://helper-c.example".to_string()));
         assert_eq!(share1.sent_to_urls.len(), 2);
+        assert_eq!(share1.attempted_server_urls.len(), 3);
         // submit_at reset to 0 after resubmission
         assert_eq!(share1.submit_at, 0);
 
         let conflicting_nf = vec![0xEE; 32];
         let err = db
-            .record_share_delegation(ROUND_ID, 0, 0, 1, &urls_b, &conflicting_nf, 2000)
+            .record_share_delegation(ROUND_ID, 0, 0, 1, &urls_b, &urls_b, &conflicting_nf, 2000)
             .unwrap_err();
         assert!(
             err.to_string().contains("share nullifier conflict"),
@@ -5202,7 +5241,7 @@ mod tests {
         );
 
         // Re-record a confirmed share (e.g. recovery path) — confirmed must be preserved
-        db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &nf, 3000)
+        db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &urls_a, &nf, 3000)
             .unwrap();
         let all = db.get_share_delegations(ROUND_ID).unwrap();
         let share0 = all.iter().find(|s| s.share_index == 0).unwrap();

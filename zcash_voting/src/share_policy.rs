@@ -569,11 +569,12 @@ pub fn ranked_share_submission_server_candidates(
 
 /// Plan helper candidates while preserving usage from an interrupted attempt.
 ///
-/// `previously_selected_server_urls` contains one entry for every share a
-/// helper already accepted for this same commitment. Repeated URLs are
-/// intentional. They seed the per-helper counts so a resumed submission does
-/// not forget earlier assignments and exceed the normal privacy cap while
-/// uncapped configured helpers remain. Entries for helpers no longer present in
+/// `previously_selected_server_urls` contains one entry for every helper-share
+/// assignment already attempted for this commitment, including ambiguous
+/// failures such as timeouts. Repeated URLs are intentional. They seed the
+/// per-helper exposure counts so a resumed submission does not forget earlier
+/// assignments and exceed the normal privacy cap while uncapped configured
+/// helpers remain. Entries for helpers no longer present in
 /// `ranked_server_urls` are ignored so recovery can continue after endpoint
 /// rotation.
 ///
@@ -1388,6 +1389,7 @@ mod tests {
             proposal_id: 1,
             share_index: 0,
             sent_to_urls: vec!["https://helper.example.com".to_string()],
+            attempted_server_urls: vec!["https://helper.example.com".to_string()],
             nullifier: vec![7; 32],
             confirmed: false,
             submit_at,

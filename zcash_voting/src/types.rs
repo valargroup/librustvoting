@@ -643,7 +643,7 @@ pub struct SharePayload {
 }
 
 /// A share delegation record from the local DB.
-/// Tracks which helper servers received each share and its on-chain confirmation status.
+/// Tracks helper delivery attempts, known acceptances, and on-chain confirmation status.
 #[derive(Clone, Debug)]
 pub struct ShareDelegationRecord {
     pub round_id: String,
@@ -652,6 +652,10 @@ pub struct ShareDelegationRecord {
     pub share_index: u32,
     /// JSON-decoded list of helper server URLs that received this share.
     pub sent_to_urls: Vec<String>,
+    /// JSON-decoded list of helper server URLs where delivery was attempted.
+    ///
+    /// This includes known acceptances and ambiguous failures such as timeouts.
+    pub attempted_server_urls: Vec<String>,
     /// Pre-computed share reveal nullifier (32 bytes).
     pub nullifier: Vec<u8>,
     /// Whether the share has been confirmed on-chain.

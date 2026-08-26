@@ -41,7 +41,10 @@ pub struct WalletVoteCommitBatchRequest<'a> {
 /// One helper-share delivery result produced outside the wallet library.
 pub struct WalletShareDelivery<'a> {
     pub share_index: u32,
+    /// Helpers that acknowledged accepting the share.
     pub sent_to_urls: &'a [String],
+    /// Every helper where delivery started, including ambiguous failures.
+    pub attempted_server_urls: &'a [String],
     pub submit_at: u64,
     pub confirmed: bool,
 }
@@ -193,6 +196,7 @@ pub fn record_committed_vote_execution(
                 voting_db,
                 delivery.share_index,
                 delivery.sent_to_urls,
+                delivery.attempted_server_urls,
                 delivery.submit_at,
             )
             .context("record helper-share submission")?;
