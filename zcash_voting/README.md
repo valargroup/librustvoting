@@ -320,8 +320,10 @@ A helper-share POST timeout is ambiguous because the helper may have accepted
 the share before its response was lost. Wallets should continue with the next
 candidate instead of immediately retrying the same helper, then let overdue
 recovery revisit helpers later if the share remains unconfirmed. Persisted
-usage for endpoints removed from the current helper configuration is ignored
-when planning resumed submissions.
+usage and accepted-helper sets should be supplied when planning resumed
+submissions so partially delivered shares request only their remaining
+acceptances. Endpoints removed from the current helper configuration are
+ignored.
 
 ## Secret boundaries
 

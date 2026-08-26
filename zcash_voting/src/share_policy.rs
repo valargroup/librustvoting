@@ -134,6 +134,16 @@ pub struct ShareServerSelectionPolicy {
     pub max_concurrent_posts: u32,
 }
 
+/// Remaining delivery work and ordered helpers for one encrypted share.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareServerCandidatePlan {
+    /// Additional distinct helpers needed to reach the shared target.
+    pub remaining_target_count: u32,
+    /// Helpers not already known to have accepted this share, with planned
+    /// targets first and liveness fallbacks after them.
+    pub candidate_servers: Vec<String>,
+}
+
 /// Identifies the round's single designated immediate helper share.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImmediateShareKey {
@@ -531,24 +541,30 @@ pub fn share_server_selection_policy(server_count: usize) -> ShareServerSelectio
 /// order; helpers that did not respond before the deadline follow in stable
 /// configured order.
 ///
-/// The first `share_submission_target_count(ranked_server_urls.len())` entries
-/// of each returned row are the planned targets. For a normal 16-share vote and
-/// at least ten helpers, no helper is a planned target for more than eight
-/// shares. Once every remaining helper has reached that cap, the least-used
-/// helpers are selected again so liveness wins when the configured or healthy
-/// helper set is too small to satisfy the cap. Callers can inspect
+/// Each returned plan needs `remaining_target_count` acceptances from the first
+/// helpers in `candidate_servers`. For a normal 16-share vote and at least ten
+/// helpers, no helper is a planned target for more than eight shares. Once every
+/// remaining helper has reached that cap, the least-used helpers are selected
+/// again so liveness wins when the configured or healthy helper set is too small
+/// to satisfy the cap. Callers can inspect
 /// [`ShareServerSelectionPolicy::privacy_cap_feasible`] before submission. The
-/// rest of each row is the failover order;
-/// callers should keep trying it until the target count accepts the share. A
-/// timed-out POST may already have been accepted, so advance to the next
-/// candidate rather than immediately retrying the same helper.
+/// rest of each candidate list is the failover order; callers should keep trying
+/// it until the remaining target count accepts the share. A timed-out POST may
+/// already have been accepted, so advance to the next candidate rather than
+/// immediately retrying the same helper.
 /// Use [`ranked_share_submission_server_candidates_with_usage`] instead when
 /// some shares from the same commitment were already accepted.
 pub fn ranked_share_submission_server_candidates(
     share_count: usize,
     ranked_server_urls: &[String],
-) -> Result<Vec<Vec<String>>, VotingError> {
-    ranked_share_submission_server_candidates_with_usage(share_count, ranked_server_urls, &[])
+) -> Result<Vec<ShareServerCandidatePlan>, VotingError> {
+    let previously_accepted_server_urls_by_share = vec![Vec::new(); share_count];
+    ranked_share_submission_server_candidates_with_usage(
+        share_count,
+        ranked_server_urls,
+        &[],
+        &previously_accepted_server_urls_by_share,
+    )
 }
 
 /// Plan helper candidates while preserving usage from an interrupted attempt.
@@ -560,11 +576,25 @@ pub fn ranked_share_submission_server_candidates(
 /// uncapped configured helpers remain. Entries for helpers no longer present in
 /// `ranked_server_urls` are ignored so recovery can continue after endpoint
 /// rotation.
+///
+/// `previously_accepted_server_urls_by_share` must contain one row for every
+/// share being planned. It identifies the helpers that already accepted that
+/// specific share, so the returned plan requests only the remaining acceptances
+/// and does not retry those helpers. Each configured entry in these rows must
+/// also occur in `previously_selected_server_urls`.
 pub fn ranked_share_submission_server_candidates_with_usage(
     share_count: usize,
     ranked_server_urls: &[String],
     previously_selected_server_urls: &[String],
-) -> Result<Vec<Vec<String>>, VotingError> {
+    previously_accepted_server_urls_by_share: &[Vec<String>],
+) -> Result<Vec<ShareServerCandidatePlan>, VotingError> {
+    if previously_accepted_server_urls_by_share.len() != share_count {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "previously_accepted_server_urls_by_share must contain {share_count} rows"
+            ),
+        });
+    }
     if share_count == 0 {
         return Ok(Vec::new());
     }
@@ -579,13 +609,45 @@ pub fn ranked_share_submission_server_candidates_with_usage(
             *usage.entry(server_url.clone()).or_default() += 1;
         }
     }
+    let mut resumed_usage = HashMap::<String, usize>::new();
+    for accepted_server_urls in previously_accepted_server_urls_by_share {
+        require_unique_share_servers(accepted_server_urls)?;
+        for server_url in accepted_server_urls {
+            if configured_servers.contains(server_url.as_str()) {
+                *resumed_usage.entry(server_url.clone()).or_default() += 1;
+            }
+        }
+    }
+    if resumed_usage
+        .iter()
+        .any(|(server, count)| usage.get(server).copied().unwrap_or(0) < *count)
+    {
+        return Err(VotingError::InvalidInput {
+            message: "per-share accepted helpers must be included in prior helper usage"
+                .to_string(),
+        });
+    }
     let rebalance_prior_usage = !usage.is_empty();
     let mut candidates = Vec::with_capacity(share_count);
 
-    for _ in 0..share_count {
+    for accepted_server_urls in previously_accepted_server_urls_by_share {
+        let accepted_servers: HashSet<&str> = accepted_server_urls
+            .iter()
+            .filter_map(|server| {
+                configured_servers
+                    .contains(server.as_str())
+                    .then_some(server.as_str())
+            })
+            .collect();
+        let remaining_target_count = target_count.saturating_sub(accepted_servers.len());
+        let available_servers: Vec<String> = ranked_server_urls
+            .iter()
+            .filter(|server| !accepted_servers.contains(server.as_str()))
+            .cloned()
+            .collect();
         let targets = select_targets_with_usage_cap(
-            ranked_server_urls,
-            target_count,
+            &available_servers,
+            remaining_target_count,
             max_shares_per_server,
             rebalance_prior_usage,
             &mut usage,
@@ -595,13 +657,16 @@ pub fn ranked_share_submission_server_candidates_with_usage(
             .iter()
             .cloned()
             .chain(
-                ranked_server_urls
+                available_servers
                     .iter()
                     .filter(|server| !target_set.contains(server.as_str()))
                     .cloned(),
             )
             .collect();
-        candidates.push(server_candidates);
+        candidates.push(ShareServerCandidatePlan {
+            remaining_target_count: remaining_target_count as u32,
+            candidate_servers: server_candidates,
+        });
     }
 
     Ok(candidates)
@@ -1599,15 +1664,21 @@ mod tests {
                 .unwrap();
 
         assert_eq!(candidates.len(), VOTE_COMMITMENT_SHARE_COUNT);
-        assert!(candidates.iter().all(|row| row.len() == servers.len()));
-        assert!(candidates[..8].iter().all(|row| row[..5] == servers[..5]));
-        assert!(candidates[8..].iter().all(|row| row[..5] == servers[5..]));
+        assert!(candidates.iter().all(|plan| {
+            plan.remaining_target_count == 5 && plan.candidate_servers.len() == servers.len()
+        }));
+        assert!(candidates[..8]
+            .iter()
+            .all(|plan| plan.candidate_servers[..5] == servers[..5]));
+        assert!(candidates[8..]
+            .iter()
+            .all(|plan| plan.candidate_servers[..5] == servers[5..]));
 
         let mut planned_counts = std::collections::HashMap::<&str, usize>::new();
-        for row in &candidates {
-            let unique: HashSet<&str> = row.iter().map(String::as_str).collect();
+        for plan in &candidates {
+            let unique: HashSet<&str> = plan.candidate_servers.iter().map(String::as_str).collect();
             assert_eq!(unique.len(), servers.len());
-            for server in &row[..5] {
+            for server in &plan.candidate_servers[..5] {
                 *planned_counts.entry(server.as_str()).or_default() += 1;
             }
         }
@@ -1639,11 +1710,17 @@ mod tests {
             .flat_map(|server| std::iter::repeat_n(server.clone(), 8))
             .collect();
 
-        let candidates =
-            ranked_share_submission_server_candidates_with_usage(8, &servers, &previously_selected)
-                .unwrap();
+        let candidates = ranked_share_submission_server_candidates_with_usage(
+            8,
+            &servers,
+            &previously_selected,
+            &vec![Vec::new(); 8],
+        )
+        .unwrap();
 
-        assert!(candidates.iter().all(|row| row[..5] == servers[5..]));
+        assert!(candidates.iter().all(|plan| {
+            plan.remaining_target_count == 5 && plan.candidate_servers[..5] == servers[5..]
+        }));
     }
 
     #[test]
@@ -1660,6 +1737,7 @@ mod tests {
             12,
             &servers,
             &previously_selected,
+            &vec![Vec::new(); 12],
         )
         .unwrap();
         let mut usage = previously_selected.into_iter().fold(
@@ -1669,12 +1747,49 @@ mod tests {
                 usage
             },
         );
-        for row in candidates {
-            for server in &row[..5] {
+        for plan in candidates {
+            for server in &plan.candidate_servers[..plan.remaining_target_count as usize] {
                 *usage.entry(server.clone()).or_default() += 1;
             }
         }
 
+        assert!(servers.iter().all(|server| usage[server] == 8));
+    }
+
+    #[test]
+    fn ranked_candidates_budget_only_remaining_targets_for_partial_share() {
+        let servers: Vec<String> = (0..10)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+        let previously_selected = servers[..2].to_vec();
+        let mut previously_accepted_by_share = vec![Vec::new(); VOTE_COMMITMENT_SHARE_COUNT];
+        previously_accepted_by_share[0] = previously_selected.clone();
+
+        let candidates = ranked_share_submission_server_candidates_with_usage(
+            VOTE_COMMITMENT_SHARE_COUNT,
+            &servers,
+            &previously_selected,
+            &previously_accepted_by_share,
+        )
+        .unwrap();
+
+        assert_eq!(candidates[0].remaining_target_count, 3);
+        assert!(candidates[0]
+            .candidate_servers
+            .iter()
+            .all(|server| !previously_selected.contains(server)));
+        let mut usage = previously_selected.into_iter().fold(
+            std::collections::HashMap::<String, usize>::new(),
+            |mut usage, server| {
+                *usage.entry(server).or_default() += 1;
+                usage
+            },
+        );
+        for plan in candidates {
+            for server in &plan.candidate_servers[..plan.remaining_target_count as usize] {
+                *usage.entry(server.clone()).or_default() += 1;
+            }
+        }
         assert!(servers.iter().all(|server| usage[server] == 8));
     }
 
@@ -1686,10 +1801,17 @@ mod tests {
             1,
             &servers,
             &["https://retired.example.com".to_string()],
+            &[vec!["https://retired.example.com".to_string()]],
         )
         .unwrap();
 
-        assert_eq!(candidates, vec![servers]);
+        assert_eq!(
+            candidates,
+            vec![ShareServerCandidatePlan {
+                remaining_target_count: 1,
+                candidate_servers: servers,
+            }]
+        );
     }
 
     #[test]
