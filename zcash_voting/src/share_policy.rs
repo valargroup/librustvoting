@@ -105,11 +105,12 @@ pub struct ShareSubmissionPlan {
 /// expires. Pass ready helpers to
 /// [`ranked_share_submission_server_candidates`] in response order, followed by
 /// the remaining configured helpers. When resuming interrupted work, use
-/// [`ranked_share_submission_server_candidates_with_usage`] so prior accepted
-/// assignments still count toward the privacy cap. Treat a timed-out share POST
-/// as ambiguous because the helper may have accepted it before the response was
-/// lost. Continue with the next candidate instead of immediately retrying the
-/// same helper; overdue recovery can revisit it later if needed.
+/// [`ranked_share_submission_server_candidates_with_attempts`] so prior
+/// attempts still count toward the privacy cap and each share tries untried
+/// helpers first. Treat a timed-out share POST as ambiguous because the helper
+/// may have accepted it before the response was lost. Continue with the next
+/// candidate instead of immediately retrying the same helper; overdue recovery
+/// can revisit it later if needed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareServerSelectionPolicy {
     /// Number of helpers each share should reach.
@@ -554,8 +555,8 @@ pub fn share_server_selection_policy(server_count: usize) -> ShareServerSelectio
 /// count accepts the share. A timed-out POST may already have been accepted, so
 /// advance to the next candidate rather than immediately retrying the same
 /// helper.
-/// Use [`ranked_share_submission_server_candidates_with_usage`] instead when
-/// some shares from the same commitment were already accepted.
+/// Use [`ranked_share_submission_server_candidates_with_attempts`] instead when
+/// resuming shares from an interrupted submission.
 pub fn ranked_share_submission_server_candidates(
     share_count: usize,
     ranked_server_urls: &[String],
@@ -569,7 +570,28 @@ pub fn ranked_share_submission_server_candidates(
     )
 }
 
-/// Plan helper candidates while preserving usage from an interrupted attempt.
+/// Plan helper candidates while preserving aggregate accepted-helper usage.
+///
+/// This compatibility entry point cannot distinguish each share's ambiguous
+/// attempts. New recovery integrations should use
+/// [`ranked_share_submission_server_candidates_with_attempts`] so those helpers
+/// are ordered after helpers untried for that share.
+pub fn ranked_share_submission_server_candidates_with_usage(
+    share_count: usize,
+    ranked_server_urls: &[String],
+    previously_selected_server_urls: &[String],
+    previously_accepted_server_urls_by_share: &[Vec<String>],
+) -> Result<Vec<ShareServerCandidatePlan>, VotingError> {
+    ranked_share_submission_server_candidates_with_attempts(
+        share_count,
+        ranked_server_urls,
+        previously_selected_server_urls,
+        previously_accepted_server_urls_by_share,
+        previously_accepted_server_urls_by_share,
+    )
+}
+
+/// Plan helper candidates while preserving per-share attempt history.
 ///
 /// `previously_selected_server_urls` contains one entry for every helper-share
 /// assignment already attempted for this commitment, including ambiguous
@@ -580,17 +602,26 @@ pub fn ranked_share_submission_server_candidates(
 /// `ranked_server_urls` are ignored so recovery can continue after endpoint
 /// rotation.
 ///
-/// `previously_accepted_server_urls_by_share` must contain one row for every
-/// share being planned. It identifies the helpers that already accepted that
-/// specific share, so the returned plan requests only the remaining acceptances
-/// and does not retry those helpers. Each configured entry in these rows must
-/// also occur in `previously_selected_server_urls`.
-pub fn ranked_share_submission_server_candidates_with_usage(
+/// `previously_attempted_server_urls_by_share` and
+/// `previously_accepted_server_urls_by_share` must each contain one row for
+/// every share being planned. Attempted helpers are placed after every helper
+/// untried for that share. Accepted helpers are omitted and reduce the remaining
+/// target count. Accepted helpers must also occur in the corresponding attempted
+/// row, and configured attempts must occur in `previously_selected_server_urls`.
+pub fn ranked_share_submission_server_candidates_with_attempts(
     share_count: usize,
     ranked_server_urls: &[String],
     previously_selected_server_urls: &[String],
+    previously_attempted_server_urls_by_share: &[Vec<String>],
     previously_accepted_server_urls_by_share: &[Vec<String>],
 ) -> Result<Vec<ShareServerCandidatePlan>, VotingError> {
+    if previously_attempted_server_urls_by_share.len() != share_count {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "previously_attempted_server_urls_by_share must contain {share_count} rows"
+            ),
+        });
+    }
     if previously_accepted_server_urls_by_share.len() != share_count {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -613,53 +644,92 @@ pub fn ranked_share_submission_server_candidates_with_usage(
         }
     }
     let mut resumed_usage = HashMap::<String, usize>::new();
-    for accepted_server_urls in previously_accepted_server_urls_by_share {
+    let mut attempted_server_sets = Vec::with_capacity(share_count);
+    let mut accepted_server_sets = Vec::with_capacity(share_count);
+    for (attempted_server_urls, accepted_server_urls) in previously_attempted_server_urls_by_share
+        .iter()
+        .zip(previously_accepted_server_urls_by_share)
+    {
+        require_unique_share_servers(attempted_server_urls)?;
         require_unique_share_servers(accepted_server_urls)?;
-        for server_url in accepted_server_urls {
+        let attempted_servers: HashSet<&str> =
+            attempted_server_urls.iter().map(String::as_str).collect();
+        if accepted_server_urls
+            .iter()
+            .any(|server| !attempted_servers.contains(server.as_str()))
+        {
+            return Err(VotingError::InvalidInput {
+                message: "per-share accepted helpers must be included in per-share attempts"
+                    .to_string(),
+            });
+        }
+        for server_url in attempted_server_urls {
             if configured_servers.contains(server_url.as_str()) {
                 *resumed_usage.entry(server_url.clone()).or_default() += 1;
             }
         }
+        attempted_server_sets.push(
+            attempted_server_urls
+                .iter()
+                .filter(|server| configured_servers.contains(server.as_str()))
+                .cloned()
+                .collect::<HashSet<_>>(),
+        );
+        accepted_server_sets.push(
+            accepted_server_urls
+                .iter()
+                .filter(|server| configured_servers.contains(server.as_str()))
+                .cloned()
+                .collect::<HashSet<_>>(),
+        );
     }
     if resumed_usage
         .iter()
         .any(|(server, count)| usage.get(server).copied().unwrap_or(0) < *count)
     {
         return Err(VotingError::InvalidInput {
-            message: "per-share accepted helpers must be included in prior helper usage"
+            message: "per-share attempted helpers must be included in prior helper usage"
                 .to_string(),
         });
     }
     let rebalance_prior_usage = !usage.is_empty();
-    let accepted_server_sets: Vec<HashSet<String>> = previously_accepted_server_urls_by_share
-        .iter()
-        .map(|accepted_server_urls| {
-            accepted_server_urls
-                .iter()
-                .filter(|server| configured_servers.contains(server.as_str()))
-                .cloned()
-                .collect()
-        })
-        .collect();
     let remaining_target_counts: Vec<usize> = accepted_server_sets
         .iter()
         .map(|accepted_servers| target_count.saturating_sub(accepted_servers.len()))
         .collect();
-    let available_servers_by_share: Vec<Vec<String>> = accepted_server_sets
+    let untried_servers_by_share: Vec<Vec<String>> = attempted_server_sets
         .iter()
-        .map(|accepted_servers| {
+        .map(|attempted_servers| {
             ranked_server_urls
                 .iter()
-                .filter(|server| !accepted_servers.contains(*server))
+                .filter(|server| !attempted_servers.contains(*server))
                 .cloned()
                 .collect()
         })
         .collect();
+    let attempted_retry_servers_by_share: Vec<Vec<String>> = attempted_server_sets
+        .iter()
+        .zip(&accepted_server_sets)
+        .map(|(attempted_servers, accepted_servers)| {
+            ranked_server_urls
+                .iter()
+                .filter(|server| {
+                    attempted_servers.contains(*server) && !accepted_servers.contains(*server)
+                })
+                .cloned()
+                .collect()
+        })
+        .collect();
+    let untried_target_counts: Vec<usize> = untried_servers_by_share
+        .iter()
+        .zip(&remaining_target_counts)
+        .map(|(untried, remaining)| (*remaining).min(untried.len()))
+        .collect();
     let capped_targets = rebalance_prior_usage.then(|| {
         plan_targets_under_usage_cap(
             ranked_server_urls,
-            &accepted_server_sets,
-            &remaining_target_counts,
+            &attempted_server_sets,
+            &untried_target_counts,
             max_shares_per_server,
             &usage,
         )
@@ -667,9 +737,9 @@ pub fn ranked_share_submission_server_candidates_with_usage(
     let capped_targets = capped_targets.flatten();
     let mut targets_by_share = Vec::with_capacity(share_count);
 
-    for (share_index, available_servers) in available_servers_by_share.iter().enumerate() {
+    for (share_index, untried_servers) in untried_servers_by_share.iter().enumerate() {
         let remaining_target_count = remaining_target_counts[share_index];
-        let targets = if let Some(capped_targets) = &capped_targets {
+        let mut targets = if let Some(capped_targets) = &capped_targets {
             let targets = capped_targets[share_index].clone();
             for server in &targets {
                 *usage.entry(server.clone()).or_default() += 1;
@@ -677,46 +747,49 @@ pub fn ranked_share_submission_server_candidates_with_usage(
             targets
         } else {
             select_targets_with_usage_cap(
-                available_servers,
-                remaining_target_count,
+                untried_servers,
+                untried_target_counts[share_index],
                 max_shares_per_server,
                 rebalance_prior_usage,
                 &mut usage,
             )
         };
+        targets.extend(
+            attempted_retry_servers_by_share[share_index]
+                .iter()
+                .take(remaining_target_count.saturating_sub(targets.len()))
+                .cloned(),
+        );
         targets_by_share.push(targets);
     }
 
-    let mut candidate_sets_by_share: Vec<HashSet<String>> = accepted_server_sets
+    let mut excluded_server_sets_by_share: Vec<HashSet<String>> = attempted_server_sets
         .iter()
         .zip(&targets_by_share)
-        .map(|(accepted, targets)| accepted.iter().chain(targets).cloned().collect())
+        .map(|(attempted, targets)| attempted.iter().chain(targets).cloned().collect())
         .collect();
     let mut candidate_servers_by_share = targets_by_share;
-    while candidate_servers_by_share
-        .iter()
-        .zip(&available_servers_by_share)
-        .zip(&remaining_target_counts)
-        .any(|((candidates, available), remaining)| {
-            *remaining > 0 && candidates.len() < available.len()
-        })
-    {
-        let fallback_counts: Vec<usize> = candidate_servers_by_share
+    let mut planned_untried_counts = untried_target_counts;
+    loop {
+        let fallback_counts: Vec<usize> = planned_untried_counts
             .iter()
-            .zip(&available_servers_by_share)
+            .zip(&untried_servers_by_share)
             .zip(&remaining_target_counts)
-            .map(|((candidates, available), remaining)| {
-                usize::from(*remaining > 0 && candidates.len() < available.len())
+            .map(|((planned, untried), remaining)| {
+                usize::from(*remaining > 0 && *planned < untried.len())
             })
             .collect();
+        if fallback_counts.iter().all(|count| *count == 0) {
+            break;
+        }
         let capped_fallbacks = plan_targets_under_usage_cap(
             ranked_server_urls,
-            &candidate_sets_by_share,
+            &excluded_server_sets_by_share,
             &fallback_counts,
             max_shares_per_server,
             &usage,
         );
-        for (share_index, available_servers) in available_servers_by_share.iter().enumerate() {
+        for (share_index, untried_servers) in untried_servers_by_share.iter().enumerate() {
             if fallback_counts[share_index] == 0 {
                 continue;
             }
@@ -724,11 +797,11 @@ pub fn ranked_share_submission_server_candidates_with_usage(
                 .as_ref()
                 .and_then(|fallbacks| fallbacks[share_index].first())
                 .or_else(|| {
-                    available_servers
+                    untried_servers
                         .iter()
                         .enumerate()
                         .filter(|(_, server)| {
-                            !candidate_sets_by_share[share_index].contains(*server)
+                            !excluded_server_sets_by_share[share_index].contains(*server)
                         })
                         .min_by_key(|(rank, server)| {
                             let projected_usage = usage.get(*server).copied().unwrap_or(0);
@@ -744,8 +817,19 @@ pub fn ranked_share_submission_server_candidates_with_usage(
                 continue;
             };
             *usage.entry(server.clone()).or_default() += 1;
-            candidate_sets_by_share[share_index].insert(server.clone());
+            excluded_server_sets_by_share[share_index].insert(server.clone());
             candidate_servers_by_share[share_index].push(server.clone());
+            planned_untried_counts[share_index] += 1;
+        }
+    }
+    for share_index in 0..share_count {
+        if remaining_target_counts[share_index] == 0 {
+            continue;
+        }
+        for server in &attempted_retry_servers_by_share[share_index] {
+            if !candidate_servers_by_share[share_index].contains(server) {
+                candidate_servers_by_share[share_index].push(server.clone());
+            }
         }
     }
 
@@ -1991,6 +2075,52 @@ mod tests {
         assert!(candidates.iter().all(|plan| {
             plan.remaining_target_count == 5 && plan.candidate_servers[..5] == servers[5..]
         }));
+    }
+
+    #[test]
+    fn ranked_candidates_try_untried_helpers_before_each_shares_timeouts() {
+        let servers: Vec<String> = (0..10)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+        let attempted_by_share: Vec<Vec<String>> = (0..VOTE_COMMITMENT_SHARE_COUNT)
+            .map(|share_index| vec![servers[share_index % servers.len()].clone()])
+            .collect();
+        let previously_selected = attempted_by_share
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let candidates = ranked_share_submission_server_candidates_with_attempts(
+            VOTE_COMMITMENT_SHARE_COUNT,
+            &servers,
+            &previously_selected,
+            &attempted_by_share,
+            &vec![Vec::new(); VOTE_COMMITMENT_SHARE_COUNT],
+        )
+        .unwrap();
+
+        for (plan, attempted) in candidates.iter().zip(&attempted_by_share) {
+            assert_eq!(plan.remaining_target_count, 5);
+            assert!(!plan.candidate_servers[..5].contains(&attempted[0]));
+            assert_eq!(plan.candidate_servers.last(), Some(&attempted[0]));
+        }
+    }
+
+    #[test]
+    fn ranked_candidates_require_acceptances_to_have_an_attempt() {
+        let servers = vec!["https://helper.example.com".to_string()];
+
+        assert!(matches!(
+            ranked_share_submission_server_candidates_with_attempts(
+                1,
+                &servers,
+                &servers,
+                &[Vec::new()],
+                &[servers.clone()],
+            ),
+            Err(VotingError::InvalidInput { .. })
+        ));
     }
 
     #[test]

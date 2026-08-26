@@ -34,6 +34,7 @@ pub mod policy {
         last_moment_deadline_seconds, next_tracking_delay_seconds, overdue_threshold_seconds,
         plan_share_submission, plan_share_submission_from_order, plan_share_submissions,
         ranked_share_submission_server_candidates,
+        ranked_share_submission_server_candidates_with_attempts,
         ranked_share_submission_server_candidates_with_usage, resubmission_server_order,
         resubmission_server_order_from_configured_order, resubmission_server_order_from_groups,
         resubmission_server_order_random_bytes_required, scheduled_share_submit_at_from_entropy,
