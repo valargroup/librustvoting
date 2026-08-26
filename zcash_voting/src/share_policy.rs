@@ -548,11 +548,12 @@ pub fn share_server_selection_policy(server_count: usize) -> ShareServerSelectio
 /// again so liveness wins when the configured or healthy helper set is too small
 /// to satisfy the cap. Callers can inspect
 /// [`ShareServerSelectionPolicy::privacy_cap_feasible`] before submission. The
-/// rest of each candidate list is the failover order, with helpers below the
-/// projected cap ahead of capped helpers. Callers should keep trying it until
-/// the remaining target count accepts the share. A timed-out POST may already
-/// have been accepted, so advance to the next candidate rather than immediately
-/// retrying the same helper.
+/// rest of each candidate list is the failover order. Failover positions are
+/// balanced across the whole batch, with helpers below the projected cap ahead
+/// of capped helpers. Callers should keep trying until the remaining target
+/// count accepts the share. A timed-out POST may already have been accepted, so
+/// advance to the next candidate rather than immediately retrying the same
+/// helper.
 /// Use [`ranked_share_submission_server_candidates_with_usage`] instead when
 /// some shares from the same commitment were already accepted.
 pub fn ranked_share_submission_server_candidates(
@@ -686,28 +687,48 @@ pub fn ranked_share_submission_server_candidates_with_usage(
         targets_by_share.push(targets);
     }
 
-    let mut candidates = Vec::with_capacity(share_count);
-    for (share_index, available_servers) in available_servers_by_share.iter().enumerate() {
-        let remaining_target_count = remaining_target_counts[share_index];
-        let targets = &targets_by_share[share_index];
-        let target_set: HashSet<&str> = targets.iter().map(String::as_str).collect();
-        let mut fallbacks: Vec<String> = available_servers
-            .iter()
-            .filter(|server| !target_set.contains(server.as_str()))
-            .cloned()
-            .collect();
-        fallbacks.sort_by_key(|server| {
-            let projected_usage = usage.get(server).copied().unwrap_or(0);
-            (projected_usage >= max_shares_per_server, projected_usage)
-        });
-        let server_candidates = targets.iter().cloned().chain(fallbacks).collect();
-        candidates.push(ShareServerCandidatePlan {
-            remaining_target_count: remaining_target_count as u32,
-            candidate_servers: server_candidates,
-        });
+    let mut candidate_sets_by_share: Vec<HashSet<String>> = targets_by_share
+        .iter()
+        .map(|targets| targets.iter().cloned().collect())
+        .collect();
+    let mut candidate_servers_by_share = targets_by_share;
+    while candidate_servers_by_share
+        .iter()
+        .zip(&available_servers_by_share)
+        .any(|(candidates, available)| candidates.len() < available.len())
+    {
+        for (share_index, available_servers) in available_servers_by_share.iter().enumerate() {
+            let Some((_, server)) = available_servers
+                .iter()
+                .enumerate()
+                .filter(|(_, server)| !candidate_sets_by_share[share_index].contains(*server))
+                .min_by_key(|(rank, server)| {
+                    let projected_usage = usage.get(*server).copied().unwrap_or(0);
+                    (
+                        projected_usage >= max_shares_per_server,
+                        projected_usage,
+                        *rank,
+                    )
+                })
+            else {
+                continue;
+            };
+            *usage.entry(server.clone()).or_default() += 1;
+            candidate_sets_by_share[share_index].insert(server.clone());
+            candidate_servers_by_share[share_index].push(server.clone());
+        }
     }
 
-    Ok(candidates)
+    Ok(candidate_servers_by_share
+        .into_iter()
+        .zip(remaining_target_counts)
+        .map(
+            |(candidate_servers, remaining_target_count)| ShareServerCandidatePlan {
+                remaining_target_count: remaining_target_count as u32,
+                candidate_servers,
+            },
+        )
+        .collect())
 }
 
 /// Return the number of random bytes needed to shuffle a server list.
@@ -1881,6 +1902,29 @@ mod tests {
 
         assert_eq!(candidates[0].candidate_servers[..5], servers[..5]);
         assert_eq!(candidates[0].candidate_servers[5], servers[10]);
+    }
+
+    #[test]
+    fn ranked_candidates_distribute_failover_capacity_across_shares() {
+        let servers: Vec<String> = (0..12)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+
+        let candidates =
+            ranked_share_submission_server_candidates(VOTE_COMMITMENT_SHARE_COUNT, &servers)
+                .unwrap();
+        let mut exposure_counts = HashMap::<&str, usize>::new();
+        for plan in &candidates {
+            for server in &plan.candidate_servers[..6] {
+                *exposure_counts.entry(server.as_str()).or_default() += 1;
+            }
+        }
+
+        assert_eq!(exposure_counts[servers[10].as_str()], 8);
+        assert_eq!(exposure_counts[servers[11].as_str()], 8);
+        assert!(servers.iter().all(|server| {
+            exposure_counts[server.as_str()] <= SHARE_HELPER_MAX_SHARES_PER_SERVER
+        }));
     }
 
     #[test]
