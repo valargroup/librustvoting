@@ -1833,7 +1833,7 @@ impl VotingDb {
         )
     }
 
-    /// Append new server URLs to a share delegation's sent_to_urls.
+    /// Append accepted server URLs without changing the submission schedule.
     pub fn add_sent_servers(
         &self,
         round_id: &str,
@@ -5226,8 +5226,7 @@ mod tests {
             .contains(&"https://helper-c.example".to_string()));
         assert_eq!(share1.sent_to_urls.len(), 2);
         assert_eq!(share1.attempted_server_urls.len(), 3);
-        // submit_at reset to 0 after resubmission
-        assert_eq!(share1.submit_at, 0);
+        assert_eq!(share1.submit_at, 2000);
 
         let conflicting_nf = vec![0xEE; 32];
         let err = db

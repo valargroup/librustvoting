@@ -351,7 +351,7 @@ impl CommittedVote {
         )
     }
 
-    /// Adds helper URLs to a previously recorded share submission.
+    /// Records helper acceptances without changing the share's submission schedule.
     pub fn add_sent_servers(
         &self,
         db: &VotingDb,

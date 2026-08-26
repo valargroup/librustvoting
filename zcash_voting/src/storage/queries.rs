@@ -3778,8 +3778,7 @@ fn load_vote_choice_for_intent_check(
     })
 }
 
-/// Append new server URLs to a share delegation's sent_to_urls.
-/// Used after resubmitting an overdue share to additional servers.
+/// Append accepted server URLs without changing the submission schedule.
 pub fn add_sent_servers(
     conn: &Connection,
     round_id: &str,
@@ -3799,7 +3798,6 @@ pub fn add_sent_servers(
         share_index,
         "attempted_server_urls",
         new_urls,
-        false,
     )?;
     append_share_server_urls(
         conn,
@@ -3810,7 +3808,6 @@ pub fn add_sent_servers(
         share_index,
         "sent_to_urls",
         new_urls,
-        true,
     )
 }
 
@@ -3824,7 +3821,6 @@ fn append_share_server_urls(
     share_index: u32,
     column: &'static str,
     new_urls: &[String],
-    reset_submit_at: bool,
 ) -> Result<(), VotingError> {
     debug_assert!(matches!(column, "sent_to_urls" | "attempted_server_urls"));
     let select_sql = format!(
@@ -3862,13 +3858,8 @@ fn append_share_server_urls(
     let updated_json = serde_json::to_string(&urls).map_err(|e| VotingError::Internal {
         message: format!("failed to serialize updated {column}: {e}"),
     })?;
-    let submit_at_update = if reset_submit_at {
-        ", submit_at = 0"
-    } else {
-        ""
-    };
     let update_sql = format!(
-        "UPDATE share_delegations SET {column} = :urls{submit_at_update} \
+        "UPDATE share_delegations SET {column} = :urls \
          WHERE round_id = :round_id AND wallet_id = :wallet_id \
          AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index"
     );

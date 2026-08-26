@@ -173,7 +173,7 @@ pub fn confirm(
     db.mark_share_confirmed(round_id, bundle_index, proposal_id, share_index)
 }
 
-/// Adds helper URLs to an existing share record after resubmission.
+/// Records helper acceptances without changing the share's submission schedule.
 pub fn add_sent_servers(
     db: &VotingDb,
     round_id: &str,
@@ -492,7 +492,7 @@ mod tests {
         let records = list(&db, ROUND_ID).unwrap();
         assert_eq!(records[0].sent_to_urls.len(), 2);
         assert_eq!(records[0].attempted_server_urls.len(), 3);
-        assert_eq!(records[0].submit_at, 0);
+        assert_eq!(records[0].submit_at, 99);
 
         db.conn()
             .execute(
@@ -521,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn first_attempt_creates_share_tracking_record() {
+    fn first_attempt_and_acceptance_preserve_the_schedule() {
         let db = db_with_vote_recovery();
         let attempted = vec!["https://helper-timeout.example".to_string()];
 
@@ -531,6 +531,12 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].sent_to_urls.is_empty());
         assert_eq!(records[0].attempted_server_urls, attempted);
+        assert_eq!(records[0].submit_at, 123);
+
+        add_sent_servers(&db, ROUND_ID, 0, 1, 1, &attempted).unwrap();
+
+        let records = list(&db, ROUND_ID).unwrap();
+        assert_eq!(records[0].sent_to_urls, attempted);
         assert_eq!(records[0].submit_at, 123);
     }
 
