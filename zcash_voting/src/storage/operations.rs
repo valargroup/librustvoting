@@ -5212,6 +5212,17 @@ mod tests {
         assert!(share1.attempted_server_urls.contains(&timed_out_urls[0]));
 
         // Resubmit share 1 to an additional server that accepts it.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER require_atomic_share_acceptance
+                 BEFORE UPDATE OF attempted_server_urls, sent_to_urls ON share_delegations
+                 WHEN NEW.attempted_server_urls != OLD.attempted_server_urls
+                  AND NEW.sent_to_urls = OLD.sent_to_urls
+                 BEGIN
+                   SELECT RAISE(ABORT, 'acceptance columns must change together');
+                 END;",
+            )
+            .unwrap();
         let urls_c = vec!["https://helper-c.example".to_string()];
         db.add_sent_servers(ROUND_ID, 0, 0, 1, &urls_c).unwrap();
 

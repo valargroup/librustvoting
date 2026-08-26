@@ -3789,48 +3789,11 @@ pub fn add_sent_servers(
     new_urls: &[String],
 ) -> Result<(), VotingError> {
     ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    append_share_server_urls(
-        conn,
-        round_id,
-        wallet_id,
-        bundle_index,
-        proposal_id,
-        share_index,
-        "attempted_server_urls",
-        new_urls,
-    )?;
-    append_share_server_urls(
-        conn,
-        round_id,
-        wallet_id,
-        bundle_index,
-        proposal_id,
-        share_index,
-        "sent_to_urls",
-        new_urls,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_share_server_urls(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    share_index: u32,
-    column: &'static str,
-    new_urls: &[String],
-) -> Result<(), VotingError> {
-    debug_assert!(matches!(column, "sent_to_urls" | "attempted_server_urls"));
-    let select_sql = format!(
-        "SELECT {column} FROM share_delegations \
-         WHERE round_id = :round_id AND wallet_id = :wallet_id \
-         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index"
-    );
-    let current_json: String = conn
+    let (sent_json, attempted_json): (String, String) = conn
         .query_row(
-            &select_sql,
+            "SELECT sent_to_urls, attempted_server_urls FROM share_delegations \
+         WHERE round_id = :round_id AND wallet_id = :wallet_id \
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
@@ -3838,35 +3801,39 @@ fn append_share_server_urls(
                 ":proposal_id": proposal_id,
                 ":share_index": share_index,
             },
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| VotingError::Internal {
-            message: format!("failed to read {column} for update: {e}"),
+            message: format!("failed to read share server URLs for update: {e}"),
         })?;
 
-    let mut urls: Vec<String> =
-        serde_json::from_str(&current_json).map_err(|e| VotingError::Internal {
-            message: format!("failed to deserialize {column}: {e}"),
+    let mut sent_to_urls: Vec<String> =
+        serde_json::from_str(&sent_json).map_err(|e| VotingError::Internal {
+            message: format!("failed to deserialize sent_to_urls: {e}"),
         })?;
+    let mut attempted_server_urls: Vec<String> =
+        serde_json::from_str(&attempted_json).map_err(|e| VotingError::Internal {
+            message: format!("failed to deserialize attempted_server_urls: {e}"),
+        })?;
+    append_unique_urls(&mut sent_to_urls, new_urls);
+    append_unique_urls(&mut attempted_server_urls, new_urls);
 
-    for url in new_urls {
-        if !urls.contains(url) {
-            urls.push(url.clone());
-        }
-    }
-
-    let updated_json = serde_json::to_string(&urls).map_err(|e| VotingError::Internal {
-        message: format!("failed to serialize updated {column}: {e}"),
+    let sent_json = serde_json::to_string(&sent_to_urls).map_err(|e| VotingError::Internal {
+        message: format!("failed to serialize updated sent_to_urls: {e}"),
     })?;
-    let update_sql = format!(
-        "UPDATE share_delegations SET {column} = :urls \
-         WHERE round_id = :round_id AND wallet_id = :wallet_id \
-         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index"
-    );
+    let attempted_json =
+        serde_json::to_string(&attempted_server_urls).map_err(|e| VotingError::Internal {
+            message: format!("failed to serialize updated attempted_server_urls: {e}"),
+        })?;
     conn.execute(
-        &update_sql,
+        "UPDATE share_delegations
+         SET sent_to_urls = :sent_to_urls,
+             attempted_server_urls = :attempted_server_urls
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
         named_params! {
-            ":urls": updated_json,
+            ":sent_to_urls": sent_json,
+            ":attempted_server_urls": attempted_json,
             ":round_id": round_id,
             ":wallet_id": wallet_id,
             ":bundle_index": bundle_index,
@@ -3875,7 +3842,7 @@ fn append_share_server_urls(
         },
     )
     .map_err(|e| VotingError::Internal {
-        message: format!("failed to update {column}: {e}"),
+        message: format!("failed to update accepted share server URLs: {e}"),
     })?;
     Ok(())
 }
