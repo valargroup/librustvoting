@@ -2,10 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    types::{ShareDelegationRecord, VotingError},
-    wire::BoundedU32,
-};
+use crate::types::{ShareDelegationRecord, VotingError};
 
 /// Seconds to wait after helper submission time before polling share status.
 pub const SHARE_STATUS_CHECK_GRACE_SECONDS: u64 = 10;
@@ -471,27 +468,20 @@ pub fn share_submission_target_count(server_count: usize) -> usize {
 }
 
 /// Return the shared helper probe and privacy policy for a complete commitment.
-pub fn share_server_selection_policy(
-    server_count: usize,
-) -> Result<ShareServerSelectionPolicy, VotingError> {
+pub fn share_server_selection_policy(server_count: usize) -> ShareServerSelectionPolicy {
     let target_count = share_submission_target_count(server_count);
-    let max_shares_per_server = SHARE_HELPER_MAX_SHARES_PER_SERVER;
-    let privacy_cap_feasible = server_count >= SHARE_HELPER_MIN_SERVER_COUNT;
 
-    Ok(ShareServerSelectionPolicy {
-        target_count: bounded_u32(target_count, "target_count")?,
-        max_shares_per_server: bounded_u32(max_shares_per_server, "max_shares_per_server")?,
-        min_server_count: bounded_u32(SHARE_HELPER_MIN_SERVER_COUNT, "min_server_count")?,
-        privacy_cap_feasible,
+    ShareServerSelectionPolicy {
+        target_count: target_count as u32,
+        max_shares_per_server: SHARE_HELPER_MAX_SHARES_PER_SERVER as u32,
+        min_server_count: SHARE_HELPER_MIN_SERVER_COUNT as u32,
+        privacy_cap_feasible: server_count >= SHARE_HELPER_MIN_SERVER_COUNT,
         preflight_soft_timeout_milliseconds: SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS,
         preflight_hard_timeout_milliseconds: SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS,
         post_timeout_milliseconds: SHARE_HELPER_POST_TIMEOUT_MILLISECONDS,
         initial_delivery_timeout_milliseconds: SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS,
-        max_concurrent_posts: bounded_u32(
-            SHARE_HELPER_MAX_CONCURRENT_POSTS,
-            "max_concurrent_posts",
-        )?,
-    })
+        max_concurrent_posts: SHARE_HELPER_MAX_CONCURRENT_POSTS as u32,
+    }
 }
 
 /// Plan each share's complete helper candidate order from fastest to slowest.
@@ -734,7 +724,11 @@ pub fn plan_share_submission(
         submit_at_random_bytes,
     )?;
 
-    build_share_submission_plan(target_count, target_servers, submit_at)
+    Ok(build_share_submission_plan(
+        target_count,
+        target_servers,
+        submit_at,
+    ))
 }
 
 /// Plan independent timing and initial helper targets for multiple shares.
@@ -833,7 +827,7 @@ pub fn plan_share_submissions(
             target_count,
             target_servers,
             submit_at,
-        )?);
+        ));
     }
 
     Ok(plans)
@@ -888,27 +882,23 @@ fn plan_share_submission_with_targets(
         random_unit,
     )?;
 
-    build_share_submission_plan(target_count, target_servers, submit_at)
+    Ok(build_share_submission_plan(
+        target_count,
+        target_servers,
+        submit_at,
+    ))
 }
 
 fn build_share_submission_plan(
     target_count: usize,
     target_servers: Vec<String>,
     submit_at: u64,
-) -> Result<ShareSubmissionPlan, VotingError> {
-    Ok(ShareSubmissionPlan {
+) -> ShareSubmissionPlan {
+    ShareSubmissionPlan {
         submit_at,
-        target_count: bounded_u32(target_count, "target_count")?,
+        target_count: target_count as u32,
         target_servers,
-    })
-}
-
-fn bounded_u32(value: usize, name: &str) -> Result<u32, VotingError> {
-    BoundedU32::try_from(value)
-        .map(|value| value.0)
-        .map_err(|_| VotingError::InvalidInput {
-            message: format!("{name} {value} does not fit u32"),
-        })
+    }
 }
 
 fn require_share_servers(server_urls: &[String]) -> Result<(), VotingError> {
@@ -963,33 +953,24 @@ fn select_targets_with_usage_cap(
     server_usage: &mut std::collections::HashMap<String, usize>,
 ) -> Vec<String> {
     let target_count = target_count.min(server_order.len());
-    let mut selected = Vec::with_capacity(target_count);
-
-    for server in server_order {
-        if server_usage.get(server).copied().unwrap_or(0) < max_shares_per_server {
-            selected.push(server.clone());
-            if selected.len() == target_count {
-                break;
-            }
-        }
-    }
-
-    if selected.len() < target_count {
-        let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
-        let mut remaining: Vec<(usize, &String)> = server_order
-            .iter()
-            .enumerate()
-            .filter(|(_, server)| !selected_set.contains(server.as_str()))
-            .collect();
-        remaining
-            .sort_by_key(|(rank, server)| (server_usage.get(*server).copied().unwrap_or(0), *rank));
-        selected.extend(
-            remaining
-                .into_iter()
-                .take(target_count - selected.len())
-                .map(|(_, server)| server.clone()),
-        );
-    }
+    let mut ranked: Vec<_> = server_order.iter().enumerate().collect();
+    ranked.sort_by_key(|(rank, server)| {
+        let usage = server_usage.get(*server).copied().unwrap_or(0);
+        (
+            usage >= max_shares_per_server,
+            if usage >= max_shares_per_server {
+                usage
+            } else {
+                0
+            },
+            *rank,
+        )
+    });
+    let selected: Vec<_> = ranked
+        .into_iter()
+        .take(target_count)
+        .map(|(_, server)| server.clone())
+        .collect();
 
     for server in &selected {
         *server_usage.entry(server.clone()).or_default() += 1;
@@ -1532,7 +1513,7 @@ mod tests {
     #[test]
     fn complete_vote_helper_policy_exposes_transport_and_privacy_limits() {
         assert_eq!(
-            share_server_selection_policy(10).unwrap(),
+            share_server_selection_policy(10),
             ShareServerSelectionPolicy {
                 target_count: 5,
                 max_shares_per_server: 8,
@@ -1545,16 +1526,8 @@ mod tests {
                 max_concurrent_posts: 16,
             }
         );
-        assert!(
-            !share_server_selection_policy(9)
-                .unwrap()
-                .privacy_cap_feasible
-        );
-        assert!(
-            share_server_selection_policy(11)
-                .unwrap()
-                .privacy_cap_feasible
-        );
+        assert!(!share_server_selection_policy(9).privacy_cap_feasible);
+        assert!(share_server_selection_policy(11).privacy_cap_feasible);
     }
 
     #[test]
@@ -1857,11 +1830,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            !share_server_selection_policy(servers.len())
-                .unwrap()
-                .privacy_cap_feasible
-        );
+        assert!(!share_server_selection_policy(servers.len()).privacy_cap_feasible);
         assert!(plans.iter().all(|plan| {
             plan.target_servers.len() == servers.len()
                 && plan.target_servers.iter().collect::<HashSet<_>>().len() == servers.len()
