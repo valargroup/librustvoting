@@ -108,9 +108,9 @@ pub struct ShareSubmissionPlan {
 /// [`ranked_share_submission_server_candidates_with_attempts`] so prior
 /// attempts still count toward the privacy cap and each share tries untried
 /// helpers first. Treat a timed-out share POST as ambiguous because the helper
-/// may have accepted it before the response was lost. Continue with the next
-/// candidate instead of immediately retrying the same helper; overdue recovery
-/// can revisit it later if needed.
+/// may have accepted it before the response was lost. Persist every wave's
+/// attempts and acceptances, then replan before sending replacements. Overdue
+/// recovery can revisit attempted helpers later if needed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareServerSelectionPolicy {
     /// Number of helpers each share should reach.
@@ -135,13 +135,13 @@ pub struct ShareServerSelectionPolicy {
     pub max_concurrent_posts: u32,
 }
 
-/// Remaining delivery work and ordered helpers for one encrypted share.
+/// Remaining delivery work and the next helper attempt wave for one share.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareServerCandidatePlan {
     /// Additional distinct helpers needed to reach the shared target.
     pub remaining_target_count: u32,
-    /// Helpers not already known to have accepted this share, with planned
-    /// targets first and liveness fallbacks after them.
+    /// Helpers selected for the next attempt wave. Replan from the resulting
+    /// durable attempt and acceptance state before sending any replacements.
     pub candidate_servers: Vec<String>,
 }
 
@@ -535,26 +535,25 @@ pub fn share_server_selection_policy(server_count: usize) -> ShareServerSelectio
     }
 }
 
-/// Plan each share's complete helper candidate order from fastest to slowest.
+/// Plan the next helper attempt wave for every share.
 ///
 /// `ranked_server_urls` should contain every configured helper exactly once.
 /// Helpers that passed the progressive readiness probe come first in response
 /// order; helpers that did not respond before the deadline follow in stable
 /// configured order.
 ///
-/// Each returned plan needs `remaining_target_count` acceptances from the first
-/// helpers in `candidate_servers`. For a normal 16-share vote and at least ten
-/// helpers, no helper is a planned target for more than eight shares. Once every
-/// remaining helper has reached that cap, the least-used helpers are selected
-/// again so liveness wins when the configured or healthy helper set is too small
-/// to satisfy the cap. Callers can inspect
+/// Each returned plan needs `remaining_target_count` acceptances and contains
+/// exactly that many assignments in `candidate_servers`. For a normal 16-share
+/// vote and at least ten helpers, no helper is selected for more than eight
+/// shares while a cap-respecting assignment remains. Once no such assignment
+/// exists, the least-used helpers are selected again so liveness wins. Callers
+/// can inspect
 /// [`ShareServerSelectionPolicy::privacy_cap_feasible`] before submission. The
-/// rest of each candidate list is the failover order. Failover positions are
-/// balanced across the whole batch, with helpers below the projected cap ahead
-/// of capped helpers. Callers should keep trying until the remaining target
-/// count accepts the share. A timed-out POST may already have been accepted, so
-/// advance to the next candidate rather than immediately retrying the same
-/// helper.
+/// caller must durably record every attempt and known acceptance, wait for the
+/// current wave to settle, and call this planner again for replacements. This
+/// keeps later choices based on actual exposure instead of hypothetical
+/// lockstep failovers. A timed-out POST may already have been accepted, so keep
+/// it in the attempt history rather than immediately retrying the same helper.
 /// Use [`ranked_share_submission_server_candidates_with_attempts`] instead when
 /// resuming shares from an interrupted submission.
 pub fn ranked_share_submission_server_candidates(
@@ -604,10 +603,10 @@ pub fn ranked_share_submission_server_candidates_with_usage(
 ///
 /// `previously_attempted_server_urls_by_share` and
 /// `previously_accepted_server_urls_by_share` must each contain one row for
-/// every share being planned. Attempted helpers are placed after every helper
-/// untried for that share. Accepted helpers are omitted and reduce the remaining
-/// target count. Accepted helpers must also occur in the corresponding attempted
-/// row, and configured attempts must occur in `previously_selected_server_urls`.
+/// every share being planned. Untried helpers are preferred over ambiguous
+/// retries. Accepted helpers are omitted and reduce the remaining target count.
+/// Accepted helpers must also occur in the corresponding attempted row, and
+/// configured attempts must occur in `previously_selected_server_urls`.
 pub fn ranked_share_submission_server_candidates_with_attempts(
     share_count: usize,
     ranked_server_urls: &[String],
@@ -725,8 +724,8 @@ pub fn ranked_share_submission_server_candidates_with_attempts(
         .zip(&remaining_target_counts)
         .map(|(untried, remaining)| (*remaining).min(untried.len()))
         .collect();
-    let capped_candidate_prefixes = rebalance_prior_usage.then(|| {
-        plan_candidate_prefixes_under_usage_cap(
+    let capped_targets = rebalance_prior_usage.then(|| {
+        plan_targets_under_usage_cap(
             ranked_server_urls,
             &attempted_server_sets,
             &untried_target_counts,
@@ -734,14 +733,13 @@ pub fn ranked_share_submission_server_candidates_with_attempts(
             &usage,
         )
     });
-    let capped_candidate_prefixes = capped_candidate_prefixes.flatten();
+    let capped_targets = capped_targets.flatten();
     let mut candidate_servers_by_share = Vec::with_capacity(share_count);
-    let mut planned_untried_counts = Vec::with_capacity(share_count);
 
     for (share_index, untried_servers) in untried_servers_by_share.iter().enumerate() {
         let remaining_target_count = remaining_target_counts[share_index];
-        let mut candidates = if let Some(capped_prefixes) = &capped_candidate_prefixes {
-            let candidates = capped_prefixes[share_index].clone();
+        let mut candidates = if let Some(capped_targets) = &capped_targets {
+            let candidates = capped_targets[share_index].clone();
             for server in &candidates {
                 *usage.entry(server.clone()).or_default() += 1;
             }
@@ -755,7 +753,6 @@ pub fn ranked_share_submission_server_candidates_with_attempts(
                 &mut usage,
             )
         };
-        planned_untried_counts.push(candidates.len());
         candidates.extend(
             attempted_retry_servers_by_share[share_index]
                 .iter()
@@ -763,74 +760,6 @@ pub fn ranked_share_submission_server_candidates_with_attempts(
                 .cloned(),
         );
         candidate_servers_by_share.push(candidates);
-    }
-
-    let mut excluded_server_sets_by_share: Vec<HashSet<String>> = attempted_server_sets
-        .iter()
-        .zip(&candidate_servers_by_share)
-        .map(|(attempted, candidates)| attempted.iter().chain(candidates).cloned().collect())
-        .collect();
-    loop {
-        let fallback_counts: Vec<usize> = planned_untried_counts
-            .iter()
-            .zip(&untried_servers_by_share)
-            .zip(&remaining_target_counts)
-            .map(|((planned, untried), remaining)| {
-                usize::from(*remaining > 0 && *planned < untried.len())
-            })
-            .collect();
-        if fallback_counts.iter().all(|count| *count == 0) {
-            break;
-        }
-        let capped_fallbacks = plan_targets_under_usage_cap(
-            ranked_server_urls,
-            &excluded_server_sets_by_share,
-            &fallback_counts,
-            max_shares_per_server,
-            &usage,
-        );
-        for (share_index, untried_servers) in untried_servers_by_share.iter().enumerate() {
-            if fallback_counts[share_index] == 0 {
-                continue;
-            }
-            let server = capped_fallbacks
-                .as_ref()
-                .and_then(|fallbacks| fallbacks[share_index].first())
-                .or_else(|| {
-                    untried_servers
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, server)| {
-                            !excluded_server_sets_by_share[share_index].contains(*server)
-                        })
-                        .min_by_key(|(rank, server)| {
-                            let projected_usage = usage.get(*server).copied().unwrap_or(0);
-                            (
-                                projected_usage >= max_shares_per_server,
-                                projected_usage,
-                                *rank,
-                            )
-                        })
-                        .map(|(_, server)| server)
-                });
-            let Some(server) = server else {
-                continue;
-            };
-            *usage.entry(server.clone()).or_default() += 1;
-            excluded_server_sets_by_share[share_index].insert(server.clone());
-            candidate_servers_by_share[share_index].push(server.clone());
-            planned_untried_counts[share_index] += 1;
-        }
-    }
-    for share_index in 0..share_count {
-        if remaining_target_counts[share_index] == 0 {
-            continue;
-        }
-        for server in &attempted_retry_servers_by_share[share_index] {
-            if !candidate_servers_by_share[share_index].contains(server) {
-                candidate_servers_by_share[share_index].push(server.clone());
-            }
-        }
     }
 
     Ok(candidate_servers_by_share
@@ -1413,55 +1342,6 @@ fn plan_targets_under_usage_cap(
     )
 }
 
-/// Plan the largest cap-respecting untried candidate prefix for a resumed batch.
-fn plan_candidate_prefixes_under_usage_cap(
-    server_order: &[String],
-    excluded_servers_by_share: &[HashSet<String>],
-    target_counts: &[usize],
-    max_shares_per_server: usize,
-    server_usage: &HashMap<String, usize>,
-) -> Option<Vec<Vec<String>>> {
-    let mut candidate_counts = target_counts.to_vec();
-    let mut candidates = plan_targets_under_usage_cap(
-        server_order,
-        excluded_servers_by_share,
-        &candidate_counts,
-        max_shares_per_server,
-        server_usage,
-    )?;
-
-    loop {
-        let next_counts: Vec<usize> = candidate_counts
-            .iter()
-            .enumerate()
-            .map(|(share_index, count)| {
-                let available_count = server_order
-                    .len()
-                    .saturating_sub(excluded_servers_by_share[share_index].len());
-                if target_counts[share_index] > 0 && *count < available_count {
-                    count + 1
-                } else {
-                    *count
-                }
-            })
-            .collect();
-        if next_counts == candidate_counts {
-            return Some(candidates);
-        }
-        let Some(next_candidates) = plan_targets_under_usage_cap(
-            server_order,
-            excluded_servers_by_share,
-            &next_counts,
-            max_shares_per_server,
-            server_usage,
-        ) else {
-            return Some(candidates);
-        };
-        candidate_counts = next_counts;
-        candidates = next_candidates;
-    }
-}
-
 fn checked_random_bytes_required(
     per_share: usize,
     share_count: usize,
@@ -2030,9 +1910,9 @@ mod tests {
                 .unwrap();
 
         assert_eq!(candidates.len(), VOTE_COMMITMENT_SHARE_COUNT);
-        assert!(candidates.iter().all(|plan| {
-            plan.remaining_target_count == 5 && plan.candidate_servers.len() == servers.len()
-        }));
+        assert!(candidates
+            .iter()
+            .all(|plan| { plan.remaining_target_count == 5 && plan.candidate_servers.len() == 5 }));
         assert!(candidates[..8]
             .iter()
             .all(|plan| plan.candidate_servers[..5] == servers[..5]));
@@ -2043,8 +1923,8 @@ mod tests {
         let mut planned_counts = std::collections::HashMap::<&str, usize>::new();
         for plan in &candidates {
             let unique: HashSet<&str> = plan.candidate_servers.iter().map(String::as_str).collect();
-            assert_eq!(unique.len(), servers.len());
-            for server in &plan.candidate_servers[..5] {
+            assert_eq!(unique.len(), 5);
+            for server in &plan.candidate_servers {
                 *planned_counts.entry(server.as_str()).or_default() += 1;
             }
         }
@@ -2054,40 +1934,76 @@ mod tests {
     }
 
     #[test]
-    fn ranked_candidates_put_uncapped_helpers_first_in_failover_order() {
-        let servers: Vec<String> = (0..11)
-            .map(|index| format!("https://helper-{index}.example.com"))
-            .collect();
-
-        let candidates =
-            ranked_share_submission_server_candidates(VOTE_COMMITMENT_SHARE_COUNT, &servers)
-                .unwrap();
-
-        assert_eq!(candidates[0].candidate_servers[..5], servers[..5]);
-        assert_eq!(candidates[0].candidate_servers[5], servers[10]);
-    }
-
-    #[test]
-    fn ranked_candidates_distribute_failover_capacity_across_shares() {
+    fn ranked_candidates_replan_concentrated_failures_from_actual_usage() {
         let servers: Vec<String> = (0..12)
             .map(|index| format!("https://helper-{index}.example.com"))
             .collect();
 
-        let candidates =
+        let initial =
             ranked_share_submission_server_candidates(VOTE_COMMITMENT_SHARE_COUNT, &servers)
                 .unwrap();
-        let mut exposure_counts = HashMap::<&str, usize>::new();
-        for plan in &candidates {
-            for server in &plan.candidate_servers[..6] {
-                *exposure_counts.entry(server.as_str()).or_default() += 1;
-            }
-        }
+        let mut attempted_by_share = initial
+            .iter()
+            .map(|plan| plan.candidate_servers.clone())
+            .collect::<Vec<_>>();
+        let mut accepted_by_share = attempted_by_share.clone();
+        accepted_by_share[0].pop();
+        let mut previously_selected = attempted_by_share
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
 
-        assert_eq!(exposure_counts[servers[10].as_str()], 8);
-        assert_eq!(exposure_counts[servers[11].as_str()], 8);
-        assert!(servers.iter().all(|server| {
-            exposure_counts[server.as_str()] <= SHARE_HELPER_MAX_SHARES_PER_SERVER
-        }));
+        let after_first_timeout = ranked_share_submission_server_candidates_with_attempts(
+            VOTE_COMMITMENT_SHARE_COUNT,
+            &servers,
+            &previously_selected,
+            &attempted_by_share,
+            &accepted_by_share,
+        )
+        .unwrap();
+
+        assert_eq!(after_first_timeout[0].remaining_target_count, 1);
+        assert_eq!(
+            after_first_timeout[0].candidate_servers,
+            vec![servers[10].clone()]
+        );
+        assert!(after_first_timeout[1..]
+            .iter()
+            .all(|plan| plan.candidate_servers.is_empty()));
+
+        attempted_by_share[0].push(servers[10].clone());
+        previously_selected.push(servers[10].clone());
+        let after_second_timeout = ranked_share_submission_server_candidates_with_attempts(
+            VOTE_COMMITMENT_SHARE_COUNT,
+            &servers,
+            &previously_selected,
+            &attempted_by_share,
+            &accepted_by_share,
+        )
+        .unwrap();
+
+        assert_eq!(after_second_timeout[0].remaining_target_count, 1);
+        assert_eq!(
+            after_second_timeout[0].candidate_servers,
+            vec![servers[11].clone()]
+        );
+        assert!(after_second_timeout[1..]
+            .iter()
+            .all(|plan| plan.candidate_servers.is_empty()));
+
+        let exposure_counts = previously_selected.into_iter().fold(
+            HashMap::<String, usize>::new(),
+            |mut counts, server| {
+                *counts.entry(server).or_default() += 1;
+                counts
+            },
+        );
+        for server in &servers[..10] {
+            assert_eq!(exposure_counts[server], SHARE_HELPER_MAX_SHARES_PER_SERVER);
+        }
+        assert_eq!(exposure_counts[&servers[10]], 1);
+        assert!(!exposure_counts.contains_key(&servers[11]));
     }
 
     #[test]
@@ -2151,8 +2067,8 @@ mod tests {
 
         for (plan, attempted) in candidates.iter().zip(&attempted_by_share) {
             assert_eq!(plan.remaining_target_count, 5);
-            assert!(!plan.candidate_servers[..5].contains(&attempted[0]));
-            assert_eq!(plan.candidate_servers.last(), Some(&attempted[0]));
+            assert_eq!(plan.candidate_servers.len(), 5);
+            assert!(!plan.candidate_servers.contains(&attempted[0]));
         }
     }
 
@@ -2243,7 +2159,7 @@ mod tests {
     }
 
     #[test]
-    fn ranked_candidates_do_not_project_failovers_for_completed_shares() {
+    fn ranked_candidates_do_not_plan_completed_shares() {
         let servers: Vec<String> = (0..12)
             .map(|index| format!("https://helper-{index}.example.com"))
             .collect();
@@ -2269,11 +2185,7 @@ mod tests {
             },
         );
         for plan in &candidates[1..] {
-            for server in plan
-                .candidate_servers
-                .iter()
-                .take(plan.remaining_target_count as usize + 1)
-            {
+            for server in &plan.candidate_servers {
                 *exposure_counts.entry(server.clone()).or_default() += 1;
             }
         }
@@ -2315,7 +2227,7 @@ mod tests {
     }
 
     #[test]
-    fn ranked_candidates_reserve_capacity_for_resumed_share_failovers() {
+    fn ranked_candidates_keep_resumed_wave_within_cap() {
         let servers: Vec<String> = (0..10)
             .map(|index| format!("https://helper-{index}.example.com"))
             .collect();
@@ -2352,11 +2264,11 @@ mod tests {
             },
         );
         for plan in &candidates {
-            for server in plan
-                .candidate_servers
-                .iter()
-                .take(plan.remaining_target_count as usize + 1)
-            {
+            assert_eq!(
+                plan.candidate_servers.len(),
+                plan.remaining_target_count as usize
+            );
+            for server in &plan.candidate_servers {
                 *exposure_counts.entry(server.clone()).or_default() += 1;
             }
         }

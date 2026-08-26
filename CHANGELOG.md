@@ -12,9 +12,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   attempts within a 60-second initial-delivery window, and bound concurrency.
   Complete-vote plans normally cap each helper at eight shares, preserve prior
   per-share attempts and acceptances when resumed, try untried helpers before
-  ambiguous retries, and retain every configured helper as a fallback. The cap
-  requires at least ten helpers; POST timeouts are treated as ambiguous and
-  their attempted assignments are stored separately from known acceptances.
+  ambiguous retries, and replan each replacement wave from durable actual
+  progress. The cap requires at least ten helpers; POST timeouts are treated as
+  ambiguous and their attempted assignments are stored separately from known
+  acceptances.
 
 ## v3.1.0-rc.10
 
