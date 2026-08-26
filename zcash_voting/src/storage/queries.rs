@@ -574,7 +574,31 @@ pub fn list_rounds(conn: &Connection, wallet_id: &str) -> Result<Vec<RoundSummar
 
 /// Delete a round and all associated data. Child tables (bundles, cached_tree_state,
 /// proofs, witnesses, votes) are removed automatically via ON DELETE CASCADE.
+///
+/// # This is a development-only operation
+///
+/// **It is irreversible, and what it destroys cannot be regenerated from the
+/// wallet seed.** The cascade takes `bundles` with it, and `bundles`
+/// holds `van_comm_rand`: a 32-byte Pallas blinding factor sampled from `OsRng`,
+/// derived from nothing, with no import path exposed over the FFI. Its VAN
+/// commitment is published on chain, so once the row is gone the round is
+/// permanently unvotable even though the wallet's stake is still committed to
+/// it. `alpha`, `rseed_signed`, `rseed_output` and `padded_note_secrets` are
+/// sampled the same way, and the cascade also takes Keystone signatures the
+/// user's hardware wallet may not be able to produce again.
+///
+/// Nothing in a production flow should reach this. A wallet that wants to start
+/// a round over wants an idempotent re-initialisation, which resets the
+/// derivable columns and leaves the sampled ones alone -- not a delete. Calling
+/// this because a network read came back empty is how a round gets destroyed by
+/// a dropped packet.
+///
+/// [`warn_if_destroying_unrecoverable_material`] logs what is about to be lost;
+/// it is the only warning that crosses the FFI boundary, since Swift callers see
+/// neither this documentation nor the `#[deprecated]` marker on
+/// [`crate::storage::VotingDb::clear_round`].
 pub fn clear_round(conn: &Connection, round_id: &str, wallet_id: &str) -> Result<(), VotingError> {
+    warn_if_destroying_unrecoverable_material(conn, round_id, wallet_id);
     conn.execute(
         "DELETE FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -583,6 +607,47 @@ pub fn clear_round(conn: &Connection, round_id: &str, wallet_id: &str) -> Result
         message: format!("failed to clear round: {}", e),
     })?;
     Ok(())
+}
+
+/// Logs a warning naming what a round deletion is about to destroy for good.
+///
+/// Deliberately best-effort and non-fatal: a failed count must not turn a
+/// deletion into an error, and the caller has already decided. This exists so
+/// the loss appears in the device log at the moment it happens, rather than
+/// being reconstructed weeks later from a WAL carve.
+fn warn_if_destroying_unrecoverable_material(conn: &Connection, round_id: &str, wallet_id: &str) {
+    let counted = conn.query_row(
+        "SELECT
+             COUNT(*),
+             COUNT(van_comm_rand),
+             (SELECT COUNT(*) FROM keystone_signatures
+               WHERE round_id = :round_id AND wallet_id = :wallet_id)
+         FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    );
+
+    let Ok((bundles, van_comm_rands, signatures)) = counted else {
+        return;
+    };
+    if van_comm_rands == 0 && signatures == 0 {
+        return;
+    }
+
+    eprintln!(
+        "[clear_round] DESTROYING UNRECOVERABLE MATERIAL for round {round_id}: \
+         {bundles} bundle(s), {van_comm_rands} van_comm_rand value(s), \
+         {signatures} Keystone signature(s). These are sampled from an RNG, are not \
+         derived from the wallet seed, and cannot be restored -- any on-chain VAN \
+         commitment among them becomes permanently unvotable. clear_round is a \
+         development-only operation and must not be reached from a production flow."
+    );
 }
 
 // --- Bundles ---

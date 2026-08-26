@@ -4,6 +4,33 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+- `VotingDb::clear_round` and `RoundApi::delete_round` are marked
+  `#[deprecated]` as a danger flag, not a removal schedule. Deprecation is the
+  only warning the compiler raises at every call site short of removing the
+  method, and these need one: the cascade takes `bundles` with it, and with that
+  `van_comm_rand` -- 32 bytes sampled from `OsRng`, derived from nothing, with no
+  import path over the FFI, and whose VAN commitment is already on chain. A round
+  that loses it is permanently unvotable. Callers that legitimately need the
+  operation can `#[allow(deprecated)]`, which is a reviewable line rather than a
+  silent call.
+- `clear_round` now logs what it is about to destroy -- bundle count,
+  `van_comm_rand` count, Keystone signature count -- before deleting. This is the
+  only warning that crosses the FFI boundary: Swift callers of
+  `zcashlc_voting_clear_round` see neither the documentation nor the
+  `#[deprecated]` marker. Best-effort and non-fatal; a failed count never turns a
+  deletion into an error.
+
+### Added
+- `zcash_voting::dev`, behind the new off-by-default `dev-destructive-apis`
+  feature, holding `destroy_round_and_its_unrecoverable_secrets` -- the same
+  operation under a name that cannot be read past at a call site. Cargo features
+  are additive and are not a security boundary; what the gate buys is that
+  compiling the operation into a production build is an opt-in line in a
+  manifest. Additive: nothing is removed and no existing caller breaks.
+
 ## v3.1.0-rc.10
 
 ### Added

@@ -47,6 +47,11 @@ zakura = [
     "dep:zakura-primitives",
 ]
 test-fixtures = []
+# Compiles `zcash_voting::dev`, which holds operations that irreversibly destroy
+# RNG-sampled material no seed can regenerate. Off by default; a production build
+# opting in should be a reviewed line in a manifest, not an accident. Cargo
+# features are additive and are not a security boundary.
+dev-destructive-apis = []
 
 [dependencies]
 # Randomness

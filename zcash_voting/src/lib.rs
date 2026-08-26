@@ -21,6 +21,7 @@ pub mod config;
 pub mod confirmation;
 pub mod delegate;
 pub mod delegation_capability;
+pub mod dev;
 pub mod error;
 pub mod governance;
 pub mod hotkey;

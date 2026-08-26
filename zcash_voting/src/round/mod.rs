@@ -361,7 +361,20 @@ impl VotingDb {
     }
 
     /// Deletes all persisted state for one round in the current wallet scope.
+    ///
+    /// # Development-only. Irreversible. Not seed-recoverable.
+    ///
+    /// A thin alias for [`crate::storage::VotingDb::clear_round`]; see there for
+    /// what is destroyed. The name is the problem this marker exists to offset:
+    /// `delete_round` reads like dropping a cache entry, and it is not.
+    #[deprecated(
+        since = "3.1.0",
+        note = "development-only and irreversible: see `VotingDb::clear_round`. \
+                Production flows that want a fresh round want an idempotent \
+                re-initialisation, not a delete. See `zcash_voting::dev`."
+    )]
     pub fn delete_round(&self, round_id: &str) -> Result<(), VotingError> {
+        #[allow(deprecated)]
         self.clear_round(round_id)
     }
 

@@ -1257,6 +1257,7 @@ mod tests {
         queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0, 42)
             .unwrap();
 
+        #[allow(deprecated)] // a test fixture is the one place this is legitimate
         customer.clear_round(&params.vote_round_id).unwrap();
         let mut corrected = capability.clone();
         corrected.bundles[1].delegation_tx_hash = "11".repeat(32);

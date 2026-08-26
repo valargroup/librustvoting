@@ -462,6 +462,32 @@ impl VotingDb {
     }
 
     /// Delete all data for a round.
+    ///
+    /// # Development-only. Irreversible. Not seed-recoverable.
+    ///
+    /// See [`queries::clear_round`] for what is destroyed and why none of it can
+    /// be rebuilt. In short: the cascade takes `bundles`, and with it
+    /// `van_comm_rand` -- sampled from `OsRng`, derived from nothing, its VAN
+    /// commitment already on chain. A round that loses it is unvotable forever.
+    ///
+    /// The `#[deprecated]` marker is a danger flag, not a removal schedule:
+    /// deprecation is the only warning the compiler will raise at every call
+    /// site short of deleting the method, and this method needs one. There is no
+    /// replacement to point at yet -- see [`crate::dev`] for the shape being
+    /// proposed. Callers that legitimately need it can `#[allow(deprecated)]`,
+    /// which is itself a useful thing to have to write down and review.
+    ///
+    /// Note this warning does not cross the FFI boundary. Swift callers of
+    /// `zcashlc_voting_clear_round` see nothing; they get the runtime log from
+    /// `warn_if_destroying_unrecoverable_material` instead.
+    #[deprecated(
+        since = "3.1.0",
+        note = "development-only and irreversible: this destroys `van_comm_rand` and Keystone \
+                signatures, which are RNG-sampled, are not derived from the wallet seed, and \
+                have no import path over the FFI. A round whose VAN is on chain becomes \
+                permanently unvotable. Production flows that want a fresh round want an \
+                idempotent re-initialisation, not a delete. See `zcash_voting::dev`."
+    )]
     pub fn clear_round(&self, round_id: &str) -> Result<(), VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
@@ -2414,6 +2440,7 @@ mod tests {
         let rounds = db.list_rounds().unwrap();
         assert_eq!(rounds.len(), 1);
 
+        #[allow(deprecated)] // a test fixture is the one place this is legitimate
         db.clear_round(ROUND_ID).unwrap();
         assert!(db.list_rounds().unwrap().is_empty());
     }
@@ -5119,6 +5146,7 @@ mod tests {
         drop(conn);
 
         // Verify cascade: clearing the round removes everything
+        #[allow(deprecated)] // a test fixture is the one place this is legitimate
         db.clear_round(ROUND_ID).unwrap();
         assert!(db.list_rounds().unwrap().is_empty());
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 0);
