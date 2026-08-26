@@ -81,6 +81,32 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   up, while balancing a complete commitment across the ready helper pool.
   Retries may exceed the initial distribution for liveness.
 
+### Fixed
+
+- Initial helper submission now journals each target before dispatch and
+  resolves it atomically to accepted, ambiguous, or definitely failed. A
+  process interruption or failed outcome write leaves the helper poll-only,
+  preventing replay of an outcome-unknown non-idempotent POST.
+- Helper-share recovery now preserves delayed schedules during early
+  replenishment, persists ambiguous attempts before contacting another helper,
+  fills the complete placement deficit in one pass, and rechecks the vote-end
+  cutoff before every recovery POST. A helper that definitely fails is tried
+  at most once per pass, even while a multi-helper deficit is being filled,
+  and early replenishment never re-POSTs to a helper that already accepted.
+- Helper tracking now keeps outcome-unknown deliveries ambiguous unless the
+  share is confirmed on-chain, uses the shared 30-second POST deadline,
+  canonicalizes helper identities, preserves delivery history and desired
+  placement across resumed fan-out, and waits for a confirmed VC-tree position
+  before recovery POSTs. Legacy delivery records retain the canonical-target
+  sentinel instead of deriving a smaller target from partial success; unsafe
+  legacy helper identities are isolated instead of making a round unreadable.
+- Initial fan-out now observes its shared 60-second deadline, clamps the last
+  request to the remaining budget, and treats post-dispatch helper 5xx
+  responses as outcome-unknown rather than retrying a non-idempotent POST.
+- Documented the helper-status trust boundary: configured helpers are trusted
+  as global on-chain confirmation oracles because their responses do not carry
+  independently verifiable chain proofs.
+
 ## v3.1.0-rc.11
 
 ### Added
@@ -97,11 +123,33 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## v3.1.0-rc.10
 
 ### Added
+- Added a helper-server client and host-owned `HelperTransport` abstraction for
+  readiness checks, share submission, and status polling. The client applies
+  endpoint-specific timeout and retry rules, bounds response bodies, and uses
+  process-local helper health scoring to deprioritize repeatedly failing
+  servers without blocking recovery. `HyperTransport` provides the default
+  direct HTTP implementation, while wallets can supply Tor or proxy-backed
+  transports without fallback to a different route.
+- Added `track_pending_shares` and related share-tracking APIs to confirm
+  persisted shares, resubmit overdue or under-placed shares to randomized
+  helpers, durably record progress, support cancellation between requests, and
+  report confirmations, resubmissions, unrecoverable shares, and the next
+  polling delay.
 - Added deterministic round-level immediate-share selection: share index 0 of
   the lowest voted proposal in the lowest-value eligible bundle is designated
   for immediate helper submission. `RoundPlan` and `RoundPlanView` expose the
   selected `ImmediateShareKey`, while batch submission plans mark the matching
   caller-supplied batch position with `immediate = true` and `submit_at = 0`.
+
+### Changed
+- Helper share delivery records now distinguish definite acceptances from
+  outcome-unknown attempts and persist the intended placement target. Schema
+  version 16 preserves existing records while adding this state, allowing the
+  tracker to replenish under-placed shares without discarding their delayed
+  reveal schedule, keep ambiguous helpers poll-only, and avoid retrying
+  non-idempotent submissions whose outcome is unknown. Successful submission
+  responses with a missing or unusable status are also retained as ambiguous,
+  because the helper may already have queued the share.
 
 ## v3.1.0-rc.9
 

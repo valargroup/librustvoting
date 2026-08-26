@@ -581,13 +581,20 @@ impl From<recovery::VoteRecovery> for VoteRecoveryView {
 }
 
 impl From<crate::types::ShareDelegationRecord> for ShareDelegationRecordView {
-    fn from(record: crate::types::ShareDelegationRecord) -> Self {
+    fn from(mut record: crate::types::ShareDelegationRecord) -> Self {
+        for url in record.attempting_urls {
+            if !record.ambiguous_urls.contains(&url) {
+                record.ambiguous_urls.push(url);
+            }
+        }
         Self {
             round_id: record.round_id,
             bundle_index: record.bundle_index,
             proposal_id: record.proposal_id,
             share_index: record.share_index,
             sent_to_urls: record.sent_to_urls,
+            ambiguous_urls: record.ambiguous_urls,
+            target_count: record.target_count,
             nullifier: record.nullifier,
             phase: if record.confirmed {
                 WorkflowPhase::Confirmed.as_str().to_string()

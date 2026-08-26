@@ -8,11 +8,49 @@
 pub(crate) use crate::backend::pasta_curves;
 use crate::{
     round::VotingDb,
+    share_tracking::ShareSubmissionReport,
     types::{
         ct_option_to_result, ShareDelegationRecord, SharePayload, VotingError, WireEncryptedShare,
     },
     vote::{validate_recovery_bundle_vote_fields, VoteRecoveryBundle},
 };
+
+/// Inputs for durably recording one helper-share fan-out.
+#[derive(Clone, Copy, Debug)]
+pub struct ShareDeliveryRecordParams<'a> {
+    /// Round that owns the share.
+    pub round_id: &'a str,
+    /// Vote bundle that owns the share.
+    pub bundle_index: u32,
+    /// Proposal that owns the share.
+    pub proposal_id: u32,
+    /// Share position within the proposal's commitment.
+    pub share_index: u32,
+    /// Definite and outcome-unknown helper attempts plus the placement target.
+    pub submission: &'a ShareSubmissionReport,
+    /// Unix seconds when helpers should submit the share, or zero for immediate.
+    pub submit_at: u64,
+}
+
+/// Identity and policy needed to durably journal a helper POST.
+#[derive(Clone, Copy, Debug)]
+pub struct ShareDeliveryAttemptParams<'a> {
+    pub round_id: &'a str,
+    pub bundle_index: u32,
+    pub proposal_id: u32,
+    pub share_index: u32,
+    pub server_url: &'a str,
+    pub target_count: usize,
+    pub submit_at: u64,
+}
+
+/// Definite state transition for a previously journaled helper POST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareDeliveryAttemptOutcome {
+    Accepted,
+    Ambiguous,
+    DefiniteFailure,
+}
 use pasta_curves::group::ff::PrimeField;
 use pasta_curves::pallas;
 
@@ -97,15 +135,7 @@ pub fn record(
     sent_to_urls: &[String],
     submit_at: u64,
 ) -> Result<(), VotingError> {
-    let bundle = crate::vote::recovery_bundle(db, round_id, bundle_index, proposal_id)?
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: format!(
-                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
-            ),
-        })?;
-    let payload = recover_payload(&bundle, share_index)?;
-    let primary_blind = array32("primary_blind", payload.primary_blind.clone())?;
-    let nullifier = compute_nullifier(&bundle.vote_commitment, share_index, &primary_blind)?;
+    let nullifier = delivery_nullifier(db, round_id, bundle_index, proposal_id, share_index)?;
     db.record_share_delegation(
         round_id,
         bundle_index,
@@ -115,6 +145,161 @@ pub fn record(
         &nullifier,
         submit_at,
     )
+}
+
+/// Records definite and outcome-unknown helper submissions for later tracking.
+///
+/// `params.submission.target_count` is the number of definite placements the
+/// tracker should maintain. Ambiguous helpers are polled for global on-chain
+/// confirmation but never count toward that target: `pending` does not prove
+/// that one helper possesses the share.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] when the target does not fit the
+/// persisted representation or the vote recovery bundle is missing or invalid.
+/// Storage failures are returned unchanged.
+pub fn record_delivery(
+    db: &VotingDb,
+    params: &ShareDeliveryRecordParams<'_>,
+) -> Result<(), VotingError> {
+    let target_count =
+        u32::try_from(params.submission.target_count).map_err(|_| VotingError::InvalidInput {
+            message: format!(
+                "target_count {} does not fit u32",
+                params.submission.target_count
+            ),
+        })?;
+    let nullifier = delivery_nullifier(
+        db,
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+    )?;
+    db.record_share_delivery(
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+        &params.submission.accepted_urls,
+        &params.submission.ambiguous_urls,
+        target_count,
+        &nullifier,
+        params.submit_at,
+    )
+}
+
+/// Writes an `attempting` marker before a helper POST may be dispatched.
+///
+/// Returns `false` if the helper is already accepted, ambiguous, or in flight.
+pub(crate) fn begin_delivery_attempt(
+    db: &VotingDb,
+    params: &ShareDeliveryAttemptParams<'_>,
+) -> Result<bool, VotingError> {
+    let target_count =
+        u32::try_from(params.target_count).map_err(|_| VotingError::InvalidInput {
+            message: format!("target_count {} does not fit u32", params.target_count),
+        })?;
+    let nullifier = delivery_nullifier(
+        db,
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+    )?;
+    db.record_share_delivery(
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+        &[],
+        &[],
+        target_count,
+        &nullifier,
+        params.submit_at,
+    )?;
+    db.add_attempting_server(
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+        params.server_url,
+    )
+}
+
+/// Journals a POST for a share record that recovery has already loaded.
+pub(crate) fn begin_existing_delivery_attempt(
+    db: &VotingDb,
+    params: &ShareDeliveryAttemptParams<'_>,
+) -> Result<bool, VotingError> {
+    db.add_attempting_server(
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+        params.server_url,
+    )
+}
+
+/// Resolves a journaled helper POST without ever making an unknown outcome
+/// eligible for another POST to the same helper.
+pub(crate) fn resolve_delivery_attempt(
+    db: &VotingDb,
+    params: &ShareDeliveryAttemptParams<'_>,
+    outcome: ShareDeliveryAttemptOutcome,
+    reset_submit_at: bool,
+) -> Result<(), VotingError> {
+    let url = [params.server_url.to_string()];
+    match outcome {
+        ShareDeliveryAttemptOutcome::Accepted if reset_submit_at => db.add_sent_servers(
+            params.round_id,
+            params.bundle_index,
+            params.proposal_id,
+            params.share_index,
+            &url,
+        ),
+        ShareDeliveryAttemptOutcome::Accepted => db.add_sent_servers_preserving_schedule(
+            params.round_id,
+            params.bundle_index,
+            params.proposal_id,
+            params.share_index,
+            &url,
+        ),
+        ShareDeliveryAttemptOutcome::Ambiguous => db.add_ambiguous_servers(
+            params.round_id,
+            params.bundle_index,
+            params.proposal_id,
+            params.share_index,
+            &url,
+            reset_submit_at,
+        ),
+        ShareDeliveryAttemptOutcome::DefiniteFailure => db.remove_attempting_server(
+            params.round_id,
+            params.bundle_index,
+            params.proposal_id,
+            params.share_index,
+            params.server_url,
+        ),
+    }
+}
+
+fn delivery_nullifier(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<[u8; 32], VotingError> {
+    let bundle = crate::vote::recovery_bundle(db, round_id, bundle_index, proposal_id)?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+            ),
+        })?;
+    let payload = recover_payload(&bundle, share_index)?;
+    let primary_blind = array32("primary_blind", payload.primary_blind.clone())?;
+    compute_nullifier(&bundle.vote_commitment, share_index, &primary_blind)
 }
 
 /// Lists all helper-share records for a round.
@@ -158,7 +343,7 @@ pub fn confirm(
     db.mark_share_confirmed(round_id, bundle_index, proposal_id, share_index)
 }
 
-/// Adds helper URLs to an existing share record after resubmission.
+/// Adds helper URLs after immediate resubmission and clears a delayed schedule.
 pub fn add_sent_servers(
     db: &VotingDb,
     round_id: &str,

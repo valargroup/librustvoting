@@ -284,7 +284,16 @@ pub fn should_resubmit_share(
         policy,
     ));
     now_seconds >= retry_at
-        && vote_end_time_seconds > now_seconds.saturating_add(policy.resubmit_cutoff_seconds)
+        && is_share_resubmission_window_open(now_seconds, vote_end_time_seconds, policy)
+}
+
+/// Return true while recovery POSTs are allowed before the vote-end cutoff.
+pub(crate) fn is_share_resubmission_window_open(
+    now_seconds: u64,
+    vote_end_time_seconds: u64,
+    policy: ShareTimingPolicy,
+) -> bool {
+    vote_end_time_seconds > now_seconds.saturating_add(policy.resubmit_cutoff_seconds)
 }
 
 /// Return the next delay after a share-status polling pass completes.
@@ -1137,6 +1146,9 @@ mod tests {
             proposal_id: 1,
             share_index: 0,
             sent_to_urls: vec!["https://helper.example.com".to_string()],
+            ambiguous_urls: Vec::new(),
+            attempting_urls: Vec::new(),
+            target_count: 1,
             nullifier: vec![7; 32],
             confirmed: false,
             submit_at,
@@ -1470,6 +1482,21 @@ mod tests {
 
         assert!(should_resubmit_share(&share, 130, 200, policy));
         assert!(!should_resubmit_share(&share, 190, 200, policy));
+    }
+
+    #[test]
+    fn resubmission_window_closes_exactly_at_the_cutoff() {
+        let policy = ShareTimingPolicy::default();
+        let vote_end = 200;
+
+        assert!(is_share_resubmission_window_open(189, vote_end, policy));
+        assert!(!is_share_resubmission_window_open(190, vote_end, policy));
+        assert!(!is_share_resubmission_window_open(200, vote_end, policy));
+        assert!(!is_share_resubmission_window_open(
+            u64::MAX,
+            vote_end,
+            policy
+        ));
     }
 
     #[test]

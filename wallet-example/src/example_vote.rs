@@ -53,7 +53,8 @@ pub struct WalletAtomicVoteBatchRequest<'a> {
 /// One helper-share delivery result produced outside the wallet library.
 pub struct WalletShareDelivery<'a> {
     pub share_index: u32,
-    pub sent_to_urls: &'a [String],
+    /// Result returned by `submit_share_to_helpers`.
+    pub submission: &'a zcash_voting::share_tracking::ShareSubmissionReport,
     pub submit_at: u64,
     pub confirmed: bool,
 }
@@ -222,10 +223,10 @@ pub fn record_committed_vote_execution(
 
     for delivery in request.share_deliveries {
         committed
-            .record_share(
+            .record_share_delivery(
                 voting_db,
                 delivery.share_index,
-                delivery.sent_to_urls,
+                delivery.submission,
                 delivery.submit_at,
             )
             .context("record helper-share submission")?;

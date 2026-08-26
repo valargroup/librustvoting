@@ -405,6 +405,27 @@ impl CommittedVote {
         )
     }
 
+    /// Records definite and outcome-unknown helper deliveries for one share.
+    pub fn record_share_delivery(
+        &self,
+        db: &VotingDb,
+        share_index: u32,
+        submission: &crate::share_tracking::ShareSubmissionReport,
+        submit_at: u64,
+    ) -> Result<(), VotingError> {
+        crate::share::record_delivery(
+            db,
+            &crate::share::ShareDeliveryRecordParams {
+                round_id: &self.round_id,
+                bundle_index: self.bundle_index,
+                proposal_id: self.commit.proposal_id,
+                share_index,
+                submission,
+                submit_at,
+            },
+        )
+    }
+
     /// Marks one helper-share submission confirmed.
     pub fn confirm_share(&self, db: &VotingDb, share_index: u32) -> Result<(), VotingError> {
         crate::share::confirm(
@@ -416,7 +437,7 @@ impl CommittedVote {
         )
     }
 
-    /// Adds helper URLs to a previously recorded share submission.
+    /// Adds helper URLs after immediate resubmission and clears its delay.
     pub fn add_sent_servers(
         &self,
         db: &VotingDb,

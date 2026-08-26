@@ -676,6 +676,18 @@ pub struct ShareDelegationRecord {
     pub share_index: u32,
     /// JSON-decoded list of helper server URLs that received this share.
     pub sent_to_urls: Vec<String>,
+    /// Helpers whose submission outcome is unknown. They remain poll-only and
+    /// do not count toward the desired placement.
+    pub ambiguous_urls: Vec<String>,
+    /// Helpers whose POST was durably recorded before dispatch but has not yet
+    /// reached a definite outcome. After restart these are treated as
+    /// outcome-unknown and remain poll-only.
+    pub attempting_urls: Vec<String>,
+    /// Desired number of definite helper placements.
+    ///
+    /// Zero identifies records created before placement targets were stored;
+    /// tracking derives the canonical target from the current helper set.
+    pub target_count: u32,
     /// Pre-computed share reveal nullifier (32 bytes).
     pub nullifier: Vec<u8>,
     /// Whether the share has been confirmed on-chain.

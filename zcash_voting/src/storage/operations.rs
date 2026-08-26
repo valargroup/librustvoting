@@ -1790,6 +1790,36 @@ impl VotingDb {
         nullifier: &[u8],
         submit_at: u64,
     ) -> Result<(), VotingError> {
+        self.record_share_delivery(
+            round_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+            sent_to_urls,
+            &[],
+            // Legacy callers do not supply the planned placement target. Zero
+            // tells tracking to derive the canonical target from the current
+            // helper fleet instead of mistaking partial success for the goal.
+            0,
+            nullifier,
+            submit_at,
+        )
+    }
+
+    /// Record definite and outcome-unknown helper deliveries with their target.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_share_delivery(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        sent_to_urls: &[String],
+        ambiguous_urls: &[String],
+        target_count: u32,
+        nullifier: &[u8],
+        submit_at: u64,
+    ) -> Result<(), VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::record_share_delegation(
@@ -1800,8 +1830,52 @@ impl VotingDb {
             proposal_id,
             share_index,
             sent_to_urls,
+            ambiguous_urls,
+            target_count,
             nullifier,
             submit_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_attempting_server(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        server_url: &str,
+    ) -> Result<bool, VotingError> {
+        let conn = self.conn();
+        queries::add_attempting_server(
+            &conn,
+            round_id,
+            &self.wallet_id(),
+            bundle_index,
+            proposal_id,
+            share_index,
+            server_url,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn remove_attempting_server(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        server_url: &str,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        queries::remove_attempting_server(
+            &conn,
+            round_id,
+            &self.wallet_id(),
+            bundle_index,
+            proposal_id,
+            share_index,
+            server_url,
         )
     }
 
@@ -1854,7 +1928,7 @@ impl VotingDb {
         )
     }
 
-    /// Append new server URLs to a share delegation's sent_to_urls.
+    /// Append new server URLs and make the share immediately actionable.
     pub fn add_sent_servers(
         &self,
         round_id: &str,
@@ -1873,6 +1947,53 @@ impl VotingDb {
             proposal_id,
             share_index,
             new_urls,
+        )
+    }
+
+    /// Append new server URLs without changing a delayed share's schedule.
+    pub(crate) fn add_sent_servers_preserving_schedule(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        new_urls: &[String],
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::add_sent_servers_preserving_schedule(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+            new_urls,
+        )
+    }
+
+    /// Append outcome-unknown helper attempts to a share delegation.
+    /// `reset_submit_at` distinguishes overdue recovery from early replenishment.
+    pub(crate) fn add_ambiguous_servers(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        new_urls: &[String],
+        reset_submit_at: bool,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::add_ambiguous_servers(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+            new_urls,
+            reset_submit_at,
         )
     }
 }
@@ -5292,21 +5413,49 @@ mod tests {
 
         let urls_a = vec!["https://helper-a.example".to_string()];
         let urls_b = vec!["https://helper-b.example".to_string()];
+        let urls_d = vec!["https://helper-d.example/".to_string()];
         let nf = vec![0xDD; 32];
 
         // Record two share delegations (share 0 and share 1)
         db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &nf, 1000)
             .unwrap();
-        db.record_share_delegation(ROUND_ID, 0, 0, 1, &urls_b, &nf, 2000)
+        let urls_c = vec!["https://helper-c.example".to_string()];
+        db.record_share_delivery(ROUND_ID, 0, 0, 1, &urls_b, &urls_c, 2, &nf, 2000)
             .unwrap();
 
         // Query all — should return both
         let all = db.get_share_delegations(ROUND_ID).unwrap();
         assert_eq!(all.len(), 2);
+        assert_eq!(
+            all.iter()
+                .find(|share| share.share_index == 0)
+                .unwrap()
+                .target_count,
+            0,
+            "legacy recording must preserve the canonical-target sentinel"
+        );
 
         // Both unconfirmed
         let unconfirmed = db.get_unconfirmed_delegations(ROUND_ID).unwrap();
         assert_eq!(unconfirmed.len(), 2);
+
+        // A resumed fan-out merges history: prior accepted URLs survive, a
+        // newly accepted URL outranks its old ambiguous state, and the desired
+        // placement cannot shrink.
+        db.record_share_delivery(ROUND_ID, 0, 0, 1, &urls_c, &urls_d, 1, &nf, 2500)
+            .unwrap();
+        let rerecorded = db
+            .get_share_delegations(ROUND_ID)
+            .unwrap()
+            .into_iter()
+            .find(|share| share.share_index == 1)
+            .unwrap();
+        assert_eq!(
+            rerecorded.sent_to_urls,
+            vec![urls_b[0].clone(), urls_c[0].clone()]
+        );
+        assert_eq!(rerecorded.ambiguous_urls, vec!["https://helper-d.example"]);
+        assert_eq!(rerecorded.target_count, 2);
 
         // Confirm share 0
         db.mark_share_confirmed(ROUND_ID, 0, 0, 0).unwrap();
@@ -5320,7 +5469,6 @@ mod tests {
         db.mark_share_confirmed(ROUND_ID, 0, 0, 0).unwrap();
 
         // Resubmit share 1 to additional servers
-        let urls_c = vec!["https://helper-c.example".to_string()];
         db.add_sent_servers(ROUND_ID, 0, 0, 1, &urls_c).unwrap();
 
         // Verify URLs merged and deduplicated
@@ -5333,6 +5481,8 @@ mod tests {
             .sent_to_urls
             .contains(&"https://helper-c.example".to_string()));
         assert_eq!(share1.sent_to_urls.len(), 2);
+        assert_eq!(share1.ambiguous_urls, vec!["https://helper-d.example"]);
+        assert_eq!(share1.target_count, 2);
         // submit_at reset to 0 after resubmission
         assert_eq!(share1.submit_at, 0);
 
@@ -5359,5 +5509,35 @@ mod tests {
         // Confirm non-existent share — should error
         let err = db.mark_share_confirmed(ROUND_ID, 0, 99, 0);
         assert!(err.is_err());
+
+        // Rows written before helper URL canonicalization may contain an
+        // identity that is no longer safe to contact. One such entry must not
+        // make the complete round unreadable, and the next update should
+        // discard it while retaining valid new history.
+        db.conn()
+            .execute(
+                "UPDATE share_delegations
+                 SET sent_to_urls = '[\"https://legacy.example/path?token=secret\"]',
+                     ambiguous_urls = '[\"https://legacy-ambiguous.example/#fragment\"]'
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND share_index = 1",
+                rusqlite::params![ROUND_ID, W],
+            )
+            .unwrap();
+        let all = db.get_share_delegations(ROUND_ID).unwrap();
+        assert_eq!(all.len(), 2);
+        let legacy = all.iter().find(|share| share.share_index == 1).unwrap();
+        assert!(legacy.sent_to_urls.is_empty());
+        assert!(legacy.ambiguous_urls.is_empty());
+
+        let replacement = vec!["https://replacement.example".to_string()];
+        db.add_sent_servers(ROUND_ID, 0, 0, 1, &replacement)
+            .unwrap();
+        let repaired = db
+            .get_share_delegations(ROUND_ID)
+            .unwrap()
+            .into_iter()
+            .find(|share| share.share_index == 1)
+            .unwrap();
+        assert_eq!(repaired.sent_to_urls, replacement);
     }
 }
