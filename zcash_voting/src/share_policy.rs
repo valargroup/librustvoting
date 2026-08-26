@@ -539,15 +539,25 @@ pub fn ranked_share_submission_server_candidates_with_usage(
             *usage.entry(server_url.clone()).or_default() += 1;
         }
     }
+    let rebalance_prior_usage = !usage.is_empty();
     let mut candidates = Vec::with_capacity(share_count);
 
     for _ in 0..share_count {
-        let targets = select_targets_with_usage_cap(
-            ranked_server_urls,
-            target_count,
-            max_shares_per_server,
-            &mut usage,
-        );
+        let targets = if rebalance_prior_usage {
+            select_balanced_targets_with_usage_cap(
+                ranked_server_urls.to_vec(),
+                target_count,
+                max_shares_per_server,
+                &mut usage,
+            )
+        } else {
+            select_targets_with_usage_cap(
+                ranked_server_urls,
+                target_count,
+                max_shares_per_server,
+                &mut usage,
+            )
+        };
         let target_set: HashSet<String> = targets.iter().cloned().collect();
         let mut server_candidates = targets;
         server_candidates.extend(
@@ -932,18 +942,32 @@ fn select_batch_share_submission_targets(
     server_usage: &mut std::collections::HashMap<String, usize>,
     server_random_bytes: &[u8],
 ) -> Result<Vec<String>, VotingError> {
-    let mut randomized_order = shuffled_share_server_order(server_urls, server_random_bytes)?;
-    if max_shares_per_server != usize::MAX {
-        // Stable sorting keeps the randomized order as the tie-break while
-        // balancing usage enough to avoid stranding capacity under the cap.
-        randomized_order.sort_by_key(|server| server_usage.get(server).copied().unwrap_or(0));
-    }
-    Ok(select_targets_with_usage_cap(
-        &randomized_order,
+    let randomized_order = shuffled_share_server_order(server_urls, server_random_bytes)?;
+    Ok(select_balanced_targets_with_usage_cap(
+        randomized_order,
         target_count,
         max_shares_per_server,
         server_usage,
     ))
+}
+
+fn select_balanced_targets_with_usage_cap(
+    mut server_order: Vec<String>,
+    target_count: usize,
+    max_shares_per_server: usize,
+    server_usage: &mut std::collections::HashMap<String, usize>,
+) -> Vec<String> {
+    if max_shares_per_server != usize::MAX {
+        // Stable sorting keeps the caller's order as the tie-break while
+        // balancing usage enough to avoid stranding capacity under the cap.
+        server_order.sort_by_key(|server| server_usage.get(server).copied().unwrap_or(0));
+    }
+    select_targets_with_usage_cap(
+        &server_order,
+        target_count,
+        max_shares_per_server,
+        server_usage,
+    )
 }
 
 fn select_targets_with_usage_cap(
@@ -1586,6 +1610,38 @@ mod tests {
                 .unwrap();
 
         assert!(candidates.iter().all(|row| row[..5] == servers[5..]));
+    }
+
+    #[test]
+    fn ranked_candidates_rebalance_partial_usage_without_stranding_capacity() {
+        let servers: Vec<String> = (0..10)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+        let previously_selected: Vec<String> = [0, 1, 2, 3, 5]
+            .into_iter()
+            .flat_map(|index| std::iter::repeat_n(servers[index].clone(), 4))
+            .collect();
+
+        let candidates = ranked_share_submission_server_candidates_with_usage(
+            12,
+            &servers,
+            &previously_selected,
+        )
+        .unwrap();
+        let mut usage = previously_selected.into_iter().fold(
+            std::collections::HashMap::<String, usize>::new(),
+            |mut usage, server| {
+                *usage.entry(server).or_default() += 1;
+                usage
+            },
+        );
+        for row in candidates {
+            for server in &row[..5] {
+                *usage.entry(server.clone()).or_default() += 1;
+            }
+        }
+
+        assert!(servers.iter().all(|server| usage[server] == 8));
     }
 
     #[test]
