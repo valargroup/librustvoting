@@ -310,9 +310,10 @@ pub fn get_round_state(
         })?;
     let network = network_from_storage(&network)?;
 
-    // proof_generated is true only when ALL bundles are locally proven or
-    // capability-imported AND all bundles have a VAN leaf position. This keeps
-    // the legacy UI field false until every delegation transaction lands.
+    // proof_generated is true only when ALL bundles are locally proven or use
+    // the validated minimal imported/recovered shape AND all bundles have a VAN
+    // leaf position. This keeps the legacy UI field false until every
+    // delegation lands, even when forensic recovery could not retain its hash.
     let bundle_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id",
@@ -345,7 +346,6 @@ pub fn get_round_state(
                            AND b.gov_comm IS NOT NULL
                            AND b.total_note_value IS NOT NULL
                            AND b.address_index = 0
-                           AND b.delegation_tx_hash IS NOT NULL
                        )
                    )",
                 named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -522,8 +522,8 @@ pub fn get_bundle_count(
     })
 }
 
-/// Imported bundles omit local note positions; local bundle insertion always stores them.
-fn round_has_imported_capability_bundles(
+/// Imported and forensically recovered bundles omit local note positions.
+fn round_has_external_delegation_bundles(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -540,12 +540,12 @@ fn round_has_imported_capability_bundles(
         |row| row.get::<_, bool>(0),
     )
     .map_err(|e| VotingError::Internal {
-        message: format!("failed to check for imported capability bundles: {e}"),
+        message: format!("failed to check for external delegation bundles: {e}"),
     })
 }
 
-/// Require every delegation in an imported capability round to be confirmed
-/// before fresh vote state is created.
+/// Require every externally supplied delegation to be confirmed before fresh
+/// vote state is created.
 ///
 /// Locally prepared rounds retain their existing per-bundle voting behavior.
 pub(crate) fn require_capability_delegations_confirmed(
@@ -553,7 +553,7 @@ pub(crate) fn require_capability_delegations_confirmed(
     round_id: &str,
     wallet_id: &str,
 ) -> Result<(), VotingError> {
-    if !round_has_imported_capability_bundles(conn, round_id, wallet_id)? {
+    if !round_has_external_delegation_bundles(conn, round_id, wallet_id)? {
         return Ok(());
     }
 
@@ -577,7 +577,7 @@ pub(crate) fn require_capability_delegations_confirmed(
     if let Some(bundle_index) = pending_bundle {
         return Err(VotingError::InvalidInput {
             message: format!(
-                "imported capability round {round_id} cannot create votes until every delegation is confirmed; bundle {bundle_index} is still unconfirmed"
+                "imported or recovered round {round_id} cannot create votes until every delegation is confirmed; bundle {bundle_index} is still unconfirmed"
             ),
         });
     }
@@ -2382,10 +2382,10 @@ pub fn delete_bundles_from(
             message: format!("failed to begin bundle deletion: {e}"),
         }
     })?;
-    if round_has_imported_capability_bundles(&tx, round_id, wallet_id)? {
+    if round_has_external_delegation_bundles(&tx, round_id, wallet_id)? {
         return Err(VotingError::InvalidInput {
             message: format!(
-                "imported capability round {round_id} cannot delete bundles independently; clear the round before importing a complete replacement capability"
+                "imported or recovered round {round_id} cannot delete bundles independently; clear the round before installing a complete replacement batch"
             ),
         });
     }

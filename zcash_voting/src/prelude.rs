@@ -30,6 +30,10 @@ pub use crate::delegation_capability::{
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
 pub use crate::error::VotingError;
+pub use crate::forensic_recovery::{
+    recover_delegation_from_forensic_evidence, ForensicDelegationBundle,
+    ForensicDelegationRecovery, RecoverDelegationFromForensicEvidenceParams,
+};
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::hotkey::{
     generate_random_voting_hotkey, VOTING_HOTKEY_ACCOUNT_INDEX, VOTING_HOTKEY_ADDRESS_INDEX,
@@ -70,6 +74,9 @@ pub use crate::share::{
     add_sent_servers, compute_nullifier, confirm as confirm_share, list as share_records,
     record as record_share, recover_payload, recover_wire_json, unconfirmed as unconfirmed_shares,
     SharePlan, ShareRecord, ShareTimingPolicy, ShareTrackingSummary,
+};
+pub use crate::tree_sync::{
+    verified_vote_tree_snapshot, VerifiedVoteTreeLeaf, VerifiedVoteTreeSnapshot,
 };
 pub use crate::types::{
     validate_proposal_id, validate_vote_decision, validate_vote_options, DelegationProgressBridge,

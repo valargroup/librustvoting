@@ -15,6 +15,7 @@ pub mod confirmation;
 pub mod delegate;
 pub mod delegation_capability;
 pub mod error;
+pub mod forensic_recovery;
 pub mod governance;
 pub mod hotkey;
 mod http_transport;
@@ -58,6 +59,10 @@ pub use delegation_capability::{
     ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
+pub use forensic_recovery::{
+    recover_delegation_from_forensic_evidence, ForensicDelegationBundle,
+    ForensicDelegationRecovery, RecoverDelegationFromForensicEvidenceParams,
+};
 pub use governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use note_bundling::{
     minimum_voting_eligibility_for_notes, validate_minimum_voting_eligibility_for_notes,
@@ -69,6 +74,7 @@ pub use selection::{
     gather_delegation_wallet_inputs, select_notes_with_wallet_db, select_snapshot_notes,
     DelegationWalletInputs, GatherDelegationWalletParams,
 };
+pub use tree_sync::{verified_vote_tree_snapshot, VerifiedVoteTreeLeaf, VerifiedVoteTreeSnapshot};
 pub use types::{
     validate_proposal_id, validate_round_params, validate_vote_decision, validate_vote_options,
     CastVoteSignature, DelegationAction, DelegationPirPrecomputeResult, DelegationProgressBridge,

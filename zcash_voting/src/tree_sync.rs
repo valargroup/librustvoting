@@ -4,16 +4,153 @@
 //! from a chain node via HTTP, then generates Merkle authentication paths
 //! (witnesses) for Vote Authority Notes (VANs) needed by ZKP #2.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use ff::PrimeField;
 use vote_commitment_tree::{MerklePath, TreeClient, TreeSyncApi};
 use vote_commitment_tree_client::http_sync_api::HttpTreeSyncApi;
 
 use crate::storage::{queries, VotingDb};
-use crate::types::VotingError;
+use crate::types::{validate_vote_round_id_hex, VotingError};
 use crate::vote::{VanWitness, VAN_AUTH_PATH_LEN};
 use crate::HyperTransport;
+
+/// One leaf from a root-validated snapshot of a round's public vote tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedVoteTreeLeaf {
+    /// Zero-based position in the round's vote commitment tree.
+    pub position: u32,
+    /// Canonical little-endian Pallas field encoding of the public commitment.
+    pub commitment: [u8; 32],
+}
+
+/// Complete public vote-tree state validated by recomputing its Merkle root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedVoteTreeSnapshot {
+    /// Vote-chain height that supplied the validated root.
+    pub anchor_height: u32,
+    /// Canonical little-endian encoding of the validated tree root.
+    pub root: [u8; 32],
+    /// Every leaf from position zero through the advertised tree tip.
+    pub leaves: Vec<VerifiedVoteTreeLeaf>,
+}
+
+struct RecordedVoteTreeLeaf {
+    position: u64,
+    commitment: [u8; 32],
+}
+
+/// Records the public leaves while `TreeClient` independently checks page
+/// continuity and every advertised Merkle root.
+struct RecordingTreeSyncApi<'a, A> {
+    inner: &'a A,
+    state: RefCell<Option<vote_commitment_tree::sync_api::TreeState>>,
+    leaves: RefCell<Vec<RecordedVoteTreeLeaf>>,
+}
+
+impl<'a, A> RecordingTreeSyncApi<'a, A> {
+    fn new(inner: &'a A) -> Self {
+        Self {
+            inner,
+            state: RefCell::new(None),
+            leaves: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl<A: TreeSyncApi> TreeSyncApi for RecordingTreeSyncApi<'_, A> {
+    type Error = A::Error;
+
+    fn get_block_commitments(
+        &self,
+        from_height: u32,
+        to_height: u32,
+    ) -> Result<vote_commitment_tree::sync_api::BlockCommitmentsPage, Self::Error> {
+        let page = self.inner.get_block_commitments(from_height, to_height)?;
+        let mut recorded = self.leaves.borrow_mut();
+        for block in &page.blocks {
+            for (offset, leaf) in block.leaves.iter().enumerate() {
+                recorded.push(RecordedVoteTreeLeaf {
+                    position: block.start_index + offset as u64,
+                    commitment: leaf.to_bytes(),
+                });
+            }
+        }
+        Ok(page)
+    }
+
+    fn get_root_at_height(&self, height: u32) -> Result<Option<pasta_curves::Fp>, Self::Error> {
+        self.inner.get_root_at_height(height)
+    }
+
+    fn get_tree_state(&self) -> Result<vote_commitment_tree::sync_api::TreeState, Self::Error> {
+        let state = self.inner.get_tree_state()?;
+        *self.state.borrow_mut() = Some(state.clone());
+        Ok(state)
+    }
+}
+
+/// Downloads every public leaf for `round_id` and recomputes the advertised
+/// tree root before returning any of them.
+pub fn verified_vote_tree_snapshot(
+    round_id: &str,
+    node_url: &str,
+) -> Result<VerifiedVoteTreeSnapshot, VotingError> {
+    validate_vote_round_id_hex(round_id)?;
+    let api = HttpTreeSyncApi::new(node_url, round_id, Arc::new(HyperTransport::new()));
+    verified_vote_tree_snapshot_with_api(&api)
+}
+
+pub(crate) fn verified_vote_tree_snapshot_with_api<A: TreeSyncApi>(
+    api: &A,
+) -> Result<VerifiedVoteTreeSnapshot, VotingError> {
+    let recording = RecordingTreeSyncApi::new(api);
+    let mut client = TreeClient::empty();
+    client.sync(&recording).map_err(|e| VotingError::Internal {
+        message: format!("vote tree snapshot validation failed: {e}"),
+    })?;
+
+    let state = recording
+        .state
+        .into_inner()
+        .ok_or_else(|| VotingError::Internal {
+            message: "vote tree snapshot returned no tree state".to_string(),
+        })?;
+
+    // TreeClient skips the root comparison for an empty tree. Compare here as
+    // well so an empty response cannot advertise an arbitrary root.
+    if client.size() != state.next_index || client.root() != state.root {
+        return Err(VotingError::Internal {
+            message: "vote tree snapshot does not match its advertised tip".to_string(),
+        });
+    }
+
+    let recorded = recording.leaves.into_inner();
+    if recorded.len() as u64 != state.next_index {
+        return Err(VotingError::Internal {
+            message: "vote tree snapshot did not retain every validated leaf".to_string(),
+        });
+    }
+    let leaves = recorded
+        .into_iter()
+        .map(|leaf| {
+            Ok(VerifiedVoteTreeLeaf {
+                position: u32::try_from(leaf.position).map_err(|_| VotingError::Internal {
+                    message: "vote tree leaf position exceeds u32".to_string(),
+                })?,
+                commitment: leaf.commitment,
+            })
+        })
+        .collect::<Result<Vec<_>, VotingError>>()?;
+
+    Ok(VerifiedVoteTreeSnapshot {
+        anchor_height: state.height,
+        root: state.root.to_repr(),
+        leaves,
+    })
+}
 
 impl From<(MerklePath, u32)> for VanWitness {
     fn from((path, anchor_height): (MerklePath, u32)) -> Self {
@@ -46,6 +183,66 @@ mod tests {
     const SECOND_ROUND_ID: &str =
         "0202020202020202020202020202020202020202020202020202020202020202";
     const WALLET_ID: &str = "wallet-tree-sync";
+
+    #[test]
+    fn verified_snapshot_returns_every_leaf_at_the_validated_tip() {
+        let server = server_with_single_leaf_blocks(3);
+
+        let snapshot = verified_vote_tree_snapshot_with_api(&server).unwrap();
+
+        assert_eq!(snapshot.anchor_height, 3);
+        assert_eq!(snapshot.root, server.root().to_repr());
+        assert_eq!(
+            snapshot.leaves,
+            (0..3)
+                .map(|position| VerifiedVoteTreeLeaf {
+                    position,
+                    commitment: Fp::from(u64::from(position + 1)).to_repr(),
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn verified_snapshot_rejects_an_invalid_empty_tree_root() {
+        struct InvalidEmptyRoot(MemoryTreeServer);
+
+        impl TreeSyncApi for InvalidEmptyRoot {
+            type Error = std::convert::Infallible;
+
+            fn get_block_commitments(
+                &self,
+                from_height: u32,
+                to_height: u32,
+            ) -> Result<vote_commitment_tree::sync_api::BlockCommitmentsPage, Self::Error>
+            {
+                self.0.get_block_commitments(from_height, to_height)
+            }
+
+            fn get_root_at_height(&self, height: u32) -> Result<Option<Fp>, Self::Error> {
+                self.0.get_root_at_height(height)
+            }
+
+            fn get_tree_state(
+                &self,
+            ) -> Result<vote_commitment_tree::sync_api::TreeState, Self::Error> {
+                let mut state = self.0.get_tree_state()?;
+                state.root = Fp::from(99);
+                Ok(state)
+            }
+        }
+
+        let error =
+            verified_vote_tree_snapshot_with_api(&InvalidEmptyRoot(MemoryTreeServer::empty()))
+                .expect_err("an empty tree must still advertise its canonical root");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its advertised tip"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn sync_rebuilds_when_recovery_marks_already_synced_position() {
