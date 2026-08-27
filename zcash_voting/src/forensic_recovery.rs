@@ -14,10 +14,7 @@ use crate::{
     governance::{construct_van, BALLOT_DIVISOR},
     storage::{queries, RoundPhase, VotingDb},
     tree_sync::{verified_vote_tree_snapshot, VerifiedVoteTreeSnapshot},
-    types::{
-        validate_round_params, validate_vote_chain_id, Network, VotingError, VotingHotkey,
-        VotingRoundParams,
-    },
+    types::{validate_round_params, Network, VotingError, VotingHotkey, VotingRoundParams},
 };
 
 /// One complete delegation bundle reconstructed from preserved database bytes.
@@ -46,8 +43,6 @@ pub struct ForensicDelegationBundle {
 pub struct RecoverDelegationFromForensicEvidenceParams<'a> {
     /// Voter-owned hotkey whose public target must reproduce every VAN.
     pub voting_hotkey: &'a VotingHotkey,
-    /// Vote chain identifier from the authenticated round configuration.
-    pub expected_chain_id: &'a str,
     /// Zcash network from the authenticated round configuration.
     pub expected_network: Network,
     /// Complete authenticated parameters for the already-stored round.
@@ -102,7 +97,6 @@ pub fn recover_delegation_from_forensic_evidence(
 fn validate_context(
     params: &RecoverDelegationFromForensicEvidenceParams<'_>,
 ) -> Result<(), VotingError> {
-    validate_vote_chain_id(params.expected_chain_id)?;
     validate_round_params(params.expected_round_params)?;
     i64::try_from(params.expected_round_params.snapshot_height)
         .map_err(|_| invalid("snapshot_height does not fit in SQLite INTEGER"))?;
@@ -521,7 +515,6 @@ mod tests {
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const WALLET_ID: &str = "forensic-recovery-wallet";
-    const CHAIN_ID: &str = "shielded-vote-test";
 
     type StoredBundleRow = (
         Option<Vec<u8>>,
@@ -548,7 +541,6 @@ mod tests {
         ) -> Result<ForensicDelegationRecovery, VotingError> {
             let params = RecoverDelegationFromForensicEvidenceParams {
                 voting_hotkey: &self.hotkey,
-                expected_chain_id: CHAIN_ID,
                 expected_network: Network::Testnet,
                 expected_round_params: &self.params,
                 node_url: "unused-in-unit-test",
