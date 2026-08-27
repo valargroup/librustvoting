@@ -80,9 +80,9 @@ struct ValidatedForensicBundle {
 /// needed to resume voting.
 ///
 /// This function is intentionally unsuitable for routine recovery. It requires
-/// a complete historical batch and will replace only locally constructed,
-/// unconfirmed delegation rows whose commitments are absent from the validated
-/// tree. Any partial, conflicting, or already-voted state is rejected.
+/// a complete historical batch and will replace only unsigned, never-submitted
+/// local delegation rows whose commitments are absent from the validated tree.
+/// Any partial, conflicting, or already-voted state is rejected.
 pub fn recover_delegation_from_forensic_evidence(
     db: &VotingDb,
     params: RecoverDelegationFromForensicEvidenceParams<'_>,
@@ -353,11 +353,18 @@ fn validate_replaceable_rows(
 ) -> Result<(), VotingError> {
     let mut stmt = conn
         .prepare(
-            "SELECT bundle_index, note_positions_blob IS NOT NULL,
-                    van_leaf_position, gov_comm
-             FROM bundles
-             WHERE round_id = :round_id AND wallet_id = :wallet_id
-             ORDER BY bundle_index",
+            "SELECT b.bundle_index, b.note_positions_blob IS NOT NULL,
+                    b.van_leaf_position, b.gov_comm,
+                    b.delegation_tx_hash IS NULL,
+                    NOT EXISTS (
+                        SELECT 1 FROM keystone_signatures ks
+                        WHERE ks.round_id = b.round_id
+                          AND ks.wallet_id = b.wallet_id
+                          AND ks.bundle_index = b.bundle_index
+                    )
+             FROM bundles b
+             WHERE b.round_id = :round_id AND b.wallet_id = :wallet_id
+             ORDER BY b.bundle_index",
         )
         .map_err(|e| internal(format!("prepare replaceable bundle check failed: {e}")))?;
     let rows = stmt
@@ -369,6 +376,8 @@ fn validate_replaceable_rows(
                     row.get::<_, bool>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, bool>(5)?,
                 ))
             },
         )
@@ -381,12 +390,24 @@ fn validate_replaceable_rows(
         ));
     }
 
-    for (expected_index, (index, has_local_notes, position, commitment)) in
-        rows.into_iter().enumerate()
+    for (
+        expected_index,
+        (index, has_local_notes, position, commitment, has_no_tx_hash, has_no_keystone_signature),
+    ) in rows.into_iter().enumerate()
     {
         if index != expected_index as i64 || !has_local_notes || position.is_some() {
             return Err(invalid(
                 "forensic recovery may replace only contiguous unconfirmed local bundles",
+            ));
+        }
+        if !has_no_tx_hash {
+            return Err(invalid(
+                "forensic recovery cannot replace a submitted delegation bundle",
+            ));
+        }
+        if !has_no_keystone_signature {
+            return Err(invalid(
+                "forensic recovery cannot replace a signed delegation bundle",
             ));
         }
         if let Some(commitment) = commitment {
@@ -793,6 +814,46 @@ mod tests {
             .expect_err("an on-chain replacement cannot be discarded");
 
         assert!(error.to_string().contains("already appears"), "{error}");
+        assert_eq!(local_bundle_count(&fixture.db), 2);
+    }
+
+    #[test]
+    fn submitted_replacement_is_rejected_without_mutation() {
+        let fixture = fixture();
+        let tx_hash = "22".repeat(32);
+        fixture
+            .db
+            .store_delegation_tx_hash(ROUND_ID, 0, &tx_hash)
+            .unwrap();
+
+        let error = fixture
+            .recover(&fixture.bundles)
+            .expect_err("a submitted delegation cannot be discarded");
+
+        assert!(error.to_string().contains("submitted"), "{error}");
+        assert_eq!(
+            fixture.db.get_delegation_tx_hash(ROUND_ID, 0).unwrap(),
+            Some(tx_hash)
+        );
+        assert_eq!(local_bundle_count(&fixture.db), 2);
+    }
+
+    #[test]
+    fn signed_replacement_is_rejected_without_mutation() {
+        let fixture = fixture();
+        fixture
+            .db
+            .store_keystone_signature(ROUND_ID, 0, &[0x11; 64], &[0x22; 32], &[0x33; 32])
+            .unwrap();
+
+        let error = fixture
+            .recover(&fixture.bundles)
+            .expect_err("a signed delegation cannot be discarded");
+
+        assert!(error.to_string().contains("signed"), "{error}");
+        let signatures = fixture.db.get_keystone_signatures(ROUND_ID).unwrap();
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].bundle_index, 0);
         assert_eq!(local_bundle_count(&fixture.db), 2);
     }
 
