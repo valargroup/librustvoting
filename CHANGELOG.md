@@ -9,9 +9,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ### Fixed
 - Added a fail-closed forensic recovery path for historical wallets whose
   already-confirmed delegation randomness was discarded. The path recomputes
-  every recovered VAN from the voter's hotkey, verifies the complete batch
-  against a root-validated public vote tree, and replaces only unsigned,
-  never-submitted local retry state in one transaction.
+  every supplied VAN from the voter's hotkey, verifies the recovered subset
+  against a root-validated public vote tree, and repairs only those unsigned,
+  never-submitted local rows in one transaction. Unsubmitted bundle rows remain
+  available to the ordinary delegation flow.
 
 ## v3.0.0
 

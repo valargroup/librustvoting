@@ -17,13 +17,13 @@ use crate::{
     types::{validate_round_params, Network, VotingError, VotingHotkey, VotingRoundParams},
 };
 
-/// One complete delegation bundle reconstructed from preserved database bytes.
+/// One delegation bundle reconstructed from preserved database bytes.
 ///
 /// The randomness is privacy-sensitive, so this type deliberately omits
 /// `Debug`. Callers must not log instances or their serialized form.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ForensicDelegationBundle {
-    /// Zero-based index in the complete original delegation batch.
+    /// Zero-based index in the original delegation batch.
     pub bundle_index: u32,
     /// Exact zatoshi weight committed by this bundle.
     pub total_note_value: u64,
@@ -49,7 +49,7 @@ pub struct RecoverDelegationFromForensicEvidenceParams<'a> {
     pub expected_round_params: &'a VotingRoundParams,
     /// Vote-chain REST endpoint used for an independent full-tree validation.
     pub node_url: &'a str,
-    /// Complete recovered batch, in contiguous bundle order.
+    /// Nonempty recovered subset, in strictly increasing bundle order.
     pub bundles: &'a [ForensicDelegationBundle],
 }
 
@@ -60,8 +60,10 @@ pub struct ForensicDelegationRecovery {
     pub anchor_height: u32,
     /// Root of the tree used to authorize the repair.
     pub tree_root: [u8; 32],
-    /// Number of bundles validated and restored as one batch.
+    /// Number of bundles validated and restored atomically.
     pub bundle_count: u32,
+    /// Exact original bundle indices validated by this recovery.
+    pub recovered_bundle_indices: Vec<u32>,
     /// True when the database already contained the exact repaired state.
     pub already_recovered: bool,
 }
@@ -79,10 +81,11 @@ struct ValidatedForensicBundle {
 /// root-validated public tree, then atomically installs only the minimal state
 /// needed to resume voting.
 ///
-/// This function is intentionally unsuitable for routine recovery. It requires
-/// a complete historical batch and will replace only unsigned, never-submitted
-/// local delegation rows whose commitments are absent from the validated tree.
-/// Any partial, conflicting, or already-voted state is rejected.
+/// This function is intentionally unsuitable for routine recovery. It accepts
+/// only a nonempty subset of unsigned, never-submitted local delegation rows
+/// and preserves every row outside that subset so the ordinary delegation flow
+/// can finish bundles that never landed. Conflicting or already-voted state is
+/// rejected.
 pub fn recover_delegation_from_forensic_evidence(
     db: &VotingDb,
     params: RecoverDelegationFromForensicEvidenceParams<'_>,
@@ -123,19 +126,26 @@ fn validate_bundles(
         .expect("validated round id must contain 32 bytes");
     let target = params.voting_hotkey.delegation_target();
     let (g_d_x, pk_d_x) = derive_hotkey_x_coords_from_raw_address(target.raw_orchard_address())?;
-    let mut batch_total = 0u64;
+    let mut recovered_total = 0u64;
     let mut commitments = HashSet::with_capacity(params.bundles.len());
     let mut positions = HashSet::with_capacity(params.bundles.len());
     let mut tx_hashes = HashSet::with_capacity(params.bundles.len());
     let mut validated = Vec::with_capacity(params.bundles.len());
 
-    for (expected_index, bundle) in params.bundles.iter().enumerate() {
-        if bundle.bundle_index != expected_index as u32 {
+    let mut previous_index = None;
+    for bundle in params.bundles {
+        if bundle.bundle_index as usize >= MAX_DELEGATION_CAPABILITY_BUNDLES {
             return Err(invalid(format!(
-                "forensic bundle indices must be contiguous from zero; expected {expected_index}, got {}",
+                "forensic bundle index {} exceeds the supported bundle range",
                 bundle.bundle_index
             )));
         }
+        if previous_index.is_some_and(|previous| bundle.bundle_index <= previous) {
+            return Err(invalid(
+                "forensic bundle indices must be unique and strictly increasing",
+            ));
+        }
+        previous_index = Some(bundle.bundle_index);
         if bundle.address_index != target.address_index() {
             return Err(invalid(
                 "forensic bundle address index does not match the voting hotkey",
@@ -149,7 +159,7 @@ fn validate_bundles(
                 "forensic bundle voting weight must be a positive whole ballot value",
             ));
         }
-        batch_total = batch_total
+        recovered_total = recovered_total
             .checked_add(bundle.total_note_value)
             .filter(|total| *total <= MAX_MONEY)
             .ok_or_else(|| invalid("forensic recovery voting weight exceeds MAX_MONEY"))?;
@@ -227,20 +237,20 @@ fn recover_with_verified_snapshot(
         ));
     }
     let stored_count = queries::get_bundle_count(&tx, round_id, &wallet_id)?;
-    if stored_count != bundles.len() as u32 {
+    if stored_count == 0 || bundles.iter().any(|bundle| bundle.index >= stored_count) {
         return Err(invalid(
-            "stored bundle count conflicts with the complete forensic batch",
+            "forensic bundle index falls outside the stored delegation batch",
         ));
     }
 
-    let exact = bundles.iter().try_fold(true, |matches, bundle| {
-        forensic_bundle_matches(&tx, round_id, &wallet_id, bundle)
-            .map(|bundle_matches| matches && bundle_matches)
-    })?;
-    if exact {
+    let exact_matches = bundles
+        .iter()
+        .map(|bundle| forensic_bundle_matches(&tx, round_id, &wallet_id, bundle))
+        .collect::<Result<Vec<_>, _>>()?;
+    if exact_matches.iter().all(|matches| *matches) {
         tx.commit()
             .map_err(|e| internal(format!("commit forensic recovery no-op failed: {e}")))?;
-        return Ok(recovery_result(snapshot, bundles.len(), true));
+        return Ok(recovery_result(snapshot, bundles, true));
     }
 
     let phase: i32 = tx
@@ -283,24 +293,15 @@ fn recover_with_verified_snapshot(
         &tx,
         round_id,
         &wallet_id,
-        bundles.len(),
+        bundles,
+        &exact_matches,
         &public_commitments,
     )?;
 
-    let deleted = tx
-        .execute(
-            "DELETE FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id",
-            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-        )
-        .map_err(|e| internal(format!("remove replaceable delegation bundles failed: {e}")))?;
-    if deleted != bundles.len() {
-        return Err(internal(
-            "forensic recovery did not remove the complete stored bundle batch",
-        ));
-    }
-
-    for bundle in bundles {
-        insert_recovered_bundle(&tx, round_id, &wallet_id, bundle)?;
+    for (bundle, exact) in bundles.iter().zip(exact_matches) {
+        if !exact {
+            replace_recovered_bundle(&tx, round_id, &wallet_id, bundle)?;
+        }
     }
     tx.execute(
         "UPDATE rounds SET phase = :phase
@@ -315,7 +316,7 @@ fn recover_with_verified_snapshot(
     tx.commit()
         .map_err(|e| internal(format!("commit forensic delegation recovery failed: {e}")))?;
 
-    Ok(recovery_result(snapshot, bundles.len(), false))
+    Ok(recovery_result(snapshot, bundles, false))
 }
 
 fn validate_snapshot_bindings(
@@ -348,56 +349,55 @@ fn validate_replaceable_rows(
     conn: &rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
-    expected_count: usize,
+    bundles: &[ValidatedForensicBundle],
+    exact_matches: &[bool],
     public_commitments: &HashSet<[u8; 32]>,
 ) -> Result<(), VotingError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT b.bundle_index, b.note_positions_blob IS NOT NULL,
-                    b.van_leaf_position, b.gov_comm,
-                    b.delegation_tx_hash IS NULL,
-                    NOT EXISTS (
-                        SELECT 1 FROM keystone_signatures ks
-                        WHERE ks.round_id = b.round_id
-                          AND ks.wallet_id = b.wallet_id
-                          AND ks.bundle_index = b.bundle_index
-                    )
-             FROM bundles b
-             WHERE b.round_id = :round_id AND b.wallet_id = :wallet_id
-             ORDER BY b.bundle_index",
-        )
-        .map_err(|e| internal(format!("prepare replaceable bundle check failed: {e}")))?;
-    let rows = stmt
-        .query_map(
-            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, bool>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, bool>(4)?,
-                    row.get::<_, bool>(5)?,
-                ))
-            },
-        )
-        .map_err(|e| internal(format!("query replaceable bundles failed: {e}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal(format!("read replaceable bundles failed: {e}")))?;
-    if rows.len() != expected_count {
-        return Err(invalid(
-            "stored bundle rows do not match the complete forensic batch",
-        ));
+    if bundles.len() != exact_matches.len() {
+        return Err(internal("forensic recovery match count is inconsistent"));
     }
 
-    for (
-        expected_index,
-        (index, has_local_notes, position, commitment, has_no_tx_hash, has_no_keystone_signature),
-    ) in rows.into_iter().enumerate()
-    {
-        if index != expected_index as i64 || !has_local_notes || position.is_some() {
+    for (bundle, exact) in bundles.iter().zip(exact_matches) {
+        if *exact {
+            continue;
+        }
+        let row = conn
+            .query_row(
+                "SELECT b.note_positions_blob IS NOT NULL,
+                        b.van_leaf_position, b.gov_comm,
+                        b.delegation_tx_hash IS NULL,
+                        NOT EXISTS (
+                            SELECT 1 FROM keystone_signatures ks
+                            WHERE ks.round_id = b.round_id
+                              AND ks.wallet_id = b.wallet_id
+                              AND ks.bundle_index = b.bundle_index
+                        )
+                 FROM bundles b
+                 WHERE b.round_id = :round_id AND b.wallet_id = :wallet_id
+                   AND b.bundle_index = :bundle_index",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": i64::from(bundle.index),
+                },
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, bool>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| internal(format!("check replaceable forensic bundle failed: {e}")))?
+            .ok_or_else(|| invalid("forensic recovery bundle row is missing"))?;
+        let (has_local_notes, position, commitment, has_no_tx_hash, has_no_keystone_signature) =
+            row;
+        if !has_local_notes || position.is_some() {
             return Err(invalid(
-                "forensic recovery may replace only contiguous unconfirmed local bundles",
+                "forensic recovery may repair only unconfirmed local bundles",
             ));
         }
         if !has_no_tx_hash {
@@ -436,8 +436,7 @@ fn forensic_bundle_matches(
     bundle: &ValidatedForensicBundle,
 ) -> Result<bool, VotingError> {
     conn.query_row(
-        "SELECT COALESCE(b.note_positions_blob IS NULL
-                AND b.note_identity_hashes_blob IS NULL
+        "SELECT COALESCE(b.note_positions_blob IS NOT NULL
                 AND b.dummy_nullifiers IS NULL AND b.rho_signed IS NULL
                 AND b.padded_note_data IS NULL AND b.nf_signed IS NULL
                 AND b.cmx_new IS NULL AND b.alpha IS NULL
@@ -474,31 +473,69 @@ fn forensic_bundle_matches(
     .map_err(|e| internal(format!("validate recovered forensic bundle failed: {e}")))
 }
 
-fn insert_recovered_bundle(
+fn replace_recovered_bundle(
     conn: &rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
     bundle: &ValidatedForensicBundle,
 ) -> Result<(), VotingError> {
     conn.execute(
-        "INSERT INTO bundles (
-             round_id, wallet_id, bundle_index, van_comm_rand, gov_comm,
-             total_note_value, address_index, van_leaf_position,
-             delegation_tx_hash
-         ) VALUES (:round_id, :wallet_id, :bundle_index, :rand, :van,
-                   :total, 0, :position, :tx_hash)",
+        "DELETE FROM proofs
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index",
         named_params! {
             ":round_id": round_id,
             ":wallet_id": wallet_id,
             ":bundle_index": i64::from(bundle.index),
-            ":rand": bundle.rand,
-            ":van": bundle.van,
-            ":total": bundle.total_note_value as i64,
-            ":position": i64::from(bundle.position),
-            ":tx_hash": bundle.tx_hash,
         },
     )
-    .map_err(|e| internal(format!("insert recovered forensic bundle failed: {e}")))?;
+    .map_err(|e| {
+        internal(format!(
+            "remove stale forensic delegation proof failed: {e}"
+        ))
+    })?;
+
+    let updated = conn
+        .execute(
+            "UPDATE bundles
+         SET van_comm_rand = :rand,
+             dummy_nullifiers = NULL,
+             rho_signed = NULL,
+             padded_note_data = NULL,
+             nf_signed = NULL,
+             cmx_new = NULL,
+             alpha = NULL,
+             rseed_signed = NULL,
+             rseed_output = NULL,
+             gov_comm = :van,
+             total_note_value = :total,
+             address_index = 0,
+             van_leaf_position = :position,
+             rk = NULL,
+             gov_nullifiers_blob = NULL,
+             padded_note_secrets = NULL,
+             pczt_sighash = NULL,
+             tx1_effects = NULL,
+             delegation_tx_hash = :tx_hash
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": i64::from(bundle.index),
+                ":rand": bundle.rand,
+                ":van": bundle.van,
+                ":total": bundle.total_note_value as i64,
+                ":position": i64::from(bundle.position),
+                ":tx_hash": bundle.tx_hash,
+            },
+        )
+        .map_err(|e| internal(format!("update recovered forensic bundle failed: {e}")))?;
+    if updated != 1 {
+        return Err(internal(
+            "forensic recovery did not update exactly one local bundle row",
+        ));
+    }
     Ok(())
 }
 
@@ -515,13 +552,14 @@ fn validate_hash(hash: &str) -> Result<(), VotingError> {
 
 fn recovery_result(
     snapshot: &VerifiedVoteTreeSnapshot,
-    bundle_count: usize,
+    bundles: &[ValidatedForensicBundle],
     already_recovered: bool,
 ) -> ForensicDelegationRecovery {
     ForensicDelegationRecovery {
         anchor_height: snapshot.anchor_height,
         tree_root: snapshot.root,
-        bundle_count: bundle_count as u32,
+        bundle_count: bundles.len() as u32,
+        recovered_bundle_indices: bundles.iter().map(|bundle| bundle.index).collect(),
         already_recovered,
     }
 }
@@ -622,7 +660,8 @@ mod tests {
         let result = fixture.recover(&fixture.bundles).unwrap();
 
         assert!(!result.already_recovered);
-        assert_eq!(result.bundle_count, 2);
+        assert_eq!(result.bundle_count, 3);
+        assert_eq!(result.recovered_bundle_indices, vec![0, 1, 2]);
         assert_eq!(result.anchor_height, fixture.snapshot.anchor_height);
         assert_eq!(result.tree_root, fixture.snapshot.root);
         assert_eq!(
@@ -646,7 +685,7 @@ mod tests {
                 .iter()
                 .filter(|step| matches!(step, crate::session::NextStep::CastVote { .. }))
                 .count(),
-            2
+            3
         );
         assert!(!plan.next_steps.iter().any(|step| matches!(
             step,
@@ -685,7 +724,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            assert_eq!(stored.0, None);
+            assert!(stored.0.is_some());
             assert_eq!(stored.1, expected.van_comm_rand);
             assert_eq!(stored.2, expected.van_commitment);
             assert_eq!(stored.3, expected.total_note_value);
@@ -721,6 +760,7 @@ mod tests {
         .unwrap();
 
         assert!(!result.already_recovered);
+        assert_eq!(result.recovered_bundle_indices, vec![0, 1, 2]);
         assert_eq!(result.anchor_height, fixture.snapshot.anchor_height);
         assert_eq!(result.tree_root, fixture.snapshot.root);
         assert!(
@@ -771,15 +811,88 @@ mod tests {
     }
 
     #[test]
-    fn partial_batch_is_rejected_without_mutation() {
-        let fixture = fixture();
+    fn restores_on_chain_subset_and_leaves_missing_bundles_retryable() {
+        let mut fixture = fixture();
+        let mut server = MemoryTreeServer::empty();
+        server.append(Fp::from(500)).unwrap();
+        server.checkpoint(1).unwrap();
+        fixture.bundles[0].van_leaf_position = server.size() as u32;
+        let landed_van =
+            Option::<Fp>::from(Fp::from_repr(fixture.bundles[0].van_commitment)).unwrap();
+        server.append(landed_van).unwrap();
+        server.checkpoint(2).unwrap();
+        server.append(Fp::from(502)).unwrap();
+        server.checkpoint(3).unwrap();
+        fixture.snapshot = verified_vote_tree_snapshot_with_api(&server).unwrap();
+        fixture
+            .db
+            .set_ballot_intent(ROUND_ID, 2, Decision::Choice(1), 3)
+            .unwrap();
+        fixture
+            .db
+            .clear_unsigned_delegation_setup_fields(ROUND_ID)
+            .unwrap();
 
-        let error = fixture
-            .recover(&fixture.bundles[..1])
-            .expect_err("a partial historical batch must not be installed");
+        let result = fixture.recover(&fixture.bundles[..1]).unwrap();
 
-        assert!(error.to_string().contains("stored bundle count"), "{error}");
-        assert_eq!(local_bundle_count(&fixture.db), 2);
+        assert_eq!(result.bundle_count, 1);
+        assert_eq!(result.recovered_bundle_indices, vec![0]);
+        assert_eq!(local_bundle_count(&fixture.db), 3);
+        let plan = crate::session::resume_plan(&fixture.db, ROUND_ID, &[2]).unwrap();
+        let delegation_indices = plan
+            .next_steps
+            .iter()
+            .filter_map(|step| match step {
+                crate::session::NextStep::Delegate { bundle_index } => Some(*bundle_index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(delegation_indices, vec![1, 2]);
+
+        let conn = fixture.db.conn();
+        for index in 0..3 {
+            let row = conn
+                .query_row(
+                    "SELECT note_positions_blob IS NOT NULL, van_comm_rand,
+                            gov_comm, van_leaf_position
+                     FROM bundles
+                     WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3",
+                    rusqlite::params![ROUND_ID, WALLET_ID, index],
+                    |row| {
+                        Ok((
+                            row.get::<_, bool>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                            row.get::<_, Option<u32>>(3)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert!(row.0);
+            if index == 0 {
+                assert_eq!(row.1, Some(fixture.bundles[0].van_comm_rand.to_vec()));
+                assert_eq!(row.2, Some(fixture.bundles[0].van_commitment.to_vec()));
+                assert_eq!(row.3, Some(fixture.bundles[0].van_leaf_position));
+            } else {
+                assert_eq!(row.1, None);
+                assert_eq!(row.2, None);
+                assert_eq!(row.3, None);
+            }
+        }
+        drop(conn);
+
+        let notes = (0u64..3)
+            .map(|index| test_note(index + 50))
+            .collect::<Vec<_>>();
+        let layout = fixture
+            .db
+            .ensure_bundles_with_skipped_suffix_with_policy(
+                ROUND_ID,
+                &notes,
+                crate::BundlePolicy::new(1).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(layout.bundle_count, 3);
     }
 
     #[test]
@@ -788,12 +901,26 @@ mod tests {
         let mut wrong_randomness = fixture.bundles.clone();
         wrong_randomness[0].van_comm_rand = Fp::from(999).to_repr();
         assert!(fixture.recover(&wrong_randomness).is_err());
-        assert_eq!(local_bundle_count(&fixture.db), 2);
+        assert_eq!(local_bundle_count(&fixture.db), 3);
 
         let mut wrong_position = fixture.bundles.clone();
         wrong_position[0].van_leaf_position += 1;
         assert!(fixture.recover(&wrong_position).is_err());
-        assert_eq!(local_bundle_count(&fixture.db), 2);
+        assert_eq!(local_bundle_count(&fixture.db), 3);
+    }
+
+    #[test]
+    fn subset_indices_must_be_sorted_and_inside_the_stored_batch() {
+        let fixture = fixture();
+        let unsorted = [fixture.bundles[1].clone(), fixture.bundles[0].clone()];
+        let error = fixture.recover(&unsorted).unwrap_err();
+        assert!(error.to_string().contains("strictly increasing"), "{error}");
+
+        let mut out_of_range = fixture.bundles[0].clone();
+        out_of_range.bundle_index = 3;
+        let error = fixture.recover(&[out_of_range]).unwrap_err();
+        assert!(error.to_string().contains("outside the stored"), "{error}");
+        assert_eq!(local_bundle_count(&fixture.db), 3);
     }
 
     #[test]
@@ -814,7 +941,7 @@ mod tests {
             .expect_err("an on-chain replacement cannot be discarded");
 
         assert!(error.to_string().contains("already appears"), "{error}");
-        assert_eq!(local_bundle_count(&fixture.db), 2);
+        assert_eq!(local_bundle_count(&fixture.db), 3);
     }
 
     #[test]
@@ -835,7 +962,7 @@ mod tests {
             fixture.db.get_delegation_tx_hash(ROUND_ID, 0).unwrap(),
             Some(tx_hash)
         );
-        assert_eq!(local_bundle_count(&fixture.db), 2);
+        assert_eq!(local_bundle_count(&fixture.db), 3);
     }
 
     #[test]
@@ -854,7 +981,7 @@ mod tests {
         let signatures = fixture.db.get_keystone_signatures(ROUND_ID).unwrap();
         assert_eq!(signatures.len(), 1);
         assert_eq!(signatures[0].bundle_index, 0);
-        assert_eq!(local_bundle_count(&fixture.db), 2);
+        assert_eq!(local_bundle_count(&fixture.db), 3);
     }
 
     #[test]
@@ -876,7 +1003,7 @@ mod tests {
             .expect_err("recovery must not cascade-delete vote state");
 
         assert!(error.to_string().contains("after voting began"), "{error}");
-        assert_eq!(local_bundle_count(&fixture.db), 2);
+        assert_eq!(local_bundle_count(&fixture.db), 3);
     }
 
     #[test]
@@ -896,33 +1023,33 @@ mod tests {
             .expect_err("a vote-ready round must not be replaced");
 
         assert!(error.to_string().contains("vote-ready"), "{error}");
-        assert_eq!(local_bundle_count(&fixture.db), 2);
+        assert_eq!(local_bundle_count(&fixture.db), 3);
     }
 
     #[test]
-    fn insert_failure_rolls_back_the_original_batch() {
+    fn subset_update_failure_rolls_back_every_recovered_bundle() {
         let fixture = fixture();
         fixture
             .db
             .conn()
             .execute_batch(
                 "CREATE TRIGGER fail_second_forensic_bundle
-                 BEFORE INSERT ON bundles
-                 WHEN NEW.note_positions_blob IS NULL AND NEW.bundle_index = 1
+                 BEFORE UPDATE OF van_comm_rand ON bundles
+                 WHEN NEW.bundle_index = 1
                  BEGIN
-                     SELECT RAISE(ABORT, 'injected forensic insert failure');
+                     SELECT RAISE(ABORT, 'injected forensic update failure');
                  END;",
             )
             .unwrap();
 
         let error = fixture
             .recover(&fixture.bundles)
-            .expect_err("the injected second insert must abort the transaction");
+            .expect_err("the injected second update must abort the transaction");
 
         assert!(error
             .to_string()
-            .contains("injected forensic insert failure"));
-        assert_eq!(local_bundle_count(&fixture.db), 2);
+            .contains("injected forensic update failure"));
+        assert_eq!(local_bundle_count(&fixture.db), 3);
     }
 
     fn fixture() -> Fixture {
@@ -937,7 +1064,7 @@ mod tests {
         let (g_d_x, pk_d_x) =
             derive_hotkey_x_coords_from_raw_address(hotkey.raw_orchard_address()).unwrap();
         let round_id: [u8; 32] = hex::decode(ROUND_ID).unwrap().try_into().unwrap();
-        let mut bundles = (0..2)
+        let mut bundles = (0..3)
             .map(|index| {
                 let rand = Fp::from(u64::from(index + 10)).to_repr();
                 let total_note_value = BALLOT_DIVISOR * u64::from(index + 1);
@@ -1017,6 +1144,20 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn test_note(position: u64) -> crate::NoteInfo {
+        crate::NoteInfo {
+            commitment: vec![position as u8; 32],
+            nullifier: vec![position as u8 + 1; 32],
+            value: BALLOT_DIVISOR,
+            position,
+            diversifier: vec![0x03; 11],
+            rho: vec![0x04; 32],
+            rseed: vec![0x05; 32],
+            scope: 0,
+            ufvk_str: "uview1test".to_string(),
+        }
     }
 
     fn start_tree_http_server(snapshot: &VerifiedVoteTreeSnapshot) -> String {

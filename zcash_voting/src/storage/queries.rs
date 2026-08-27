@@ -340,6 +340,7 @@ pub fn get_round_state(
                              AND p.bundle_index = b.bundle_index
                              AND p.success = 1
                        )
+                       OR b.van_leaf_position IS NOT NULL
                        OR (
                            b.note_positions_blob IS NULL
                            AND b.van_comm_rand IS NOT NULL
