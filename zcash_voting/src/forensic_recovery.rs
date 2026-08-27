@@ -25,7 +25,7 @@ use crate::{
 pub struct ForensicDelegationBundle {
     /// Zero-based index in the original delegation batch.
     pub bundle_index: u32,
-    /// Exact zatoshi weight committed by this bundle.
+    /// Exact raw zatoshi weight committed by this bundle.
     pub total_note_value: u64,
     /// Voting hotkey address index. Version 1 requires zero.
     pub address_index: u32,
@@ -151,12 +151,11 @@ fn validate_bundles(
                 "forensic bundle address index does not match the voting hotkey",
             ));
         }
-        if bundle.total_note_value == 0
-            || bundle.total_note_value > MAX_MONEY
-            || bundle.total_note_value % BALLOT_DIVISOR != 0
-        {
+        // Delegation stores the raw note sum. VAN construction quantizes it
+        // down to whole ballots, so a valid stored weight can have a remainder.
+        if bundle.total_note_value < BALLOT_DIVISOR || bundle.total_note_value > MAX_MONEY {
             return Err(invalid(
-                "forensic bundle voting weight must be a positive whole ballot value",
+                "forensic bundle voting weight must yield at least one ballot",
             ));
         }
         recovered_total = recovered_total
@@ -735,6 +734,31 @@ mod tests {
     }
 
     #[test]
+    fn accepts_raw_bundle_weights_with_sub_ballot_remainders() {
+        let fixture = fixture();
+        let params = RecoverDelegationFromForensicEvidenceParams {
+            voting_hotkey: &fixture.hotkey,
+            expected_network: Network::Testnet,
+            expected_round_params: &fixture.params,
+            node_url: "unused-in-unit-test",
+            bundles: &fixture.bundles,
+        };
+
+        let validated = validate_bundles(&params).unwrap();
+
+        assert_eq!(
+            validated
+                .iter()
+                .map(|bundle| bundle.total_note_value)
+                .collect::<Vec<_>>(),
+            vec![130_000_000, 130_000_000, 26_000_000]
+        );
+        assert!(validated
+            .iter()
+            .all(|bundle| bundle.total_note_value % BALLOT_DIVISOR != 0));
+    }
+
+    #[test]
     fn public_entrypoint_refetches_the_tree_and_restores_post_wipe_state() {
         let fixture = fixture();
         fixture
@@ -1064,10 +1088,13 @@ mod tests {
         let (g_d_x, pk_d_x) =
             derive_hotkey_x_coords_from_raw_address(hotkey.raw_orchard_address()).unwrap();
         let round_id: [u8; 32] = hex::decode(ROUND_ID).unwrap().try_into().unwrap();
-        let mut bundles = (0..3)
-            .map(|index| {
+        let raw_bundle_weights = [130_000_000, 130_000_000, 26_000_000];
+        let mut bundles = raw_bundle_weights
+            .into_iter()
+            .enumerate()
+            .map(|(index, total_note_value)| {
+                let index = index as u32;
                 let rand = Fp::from(u64::from(index + 10)).to_repr();
-                let total_note_value = BALLOT_DIVISOR * u64::from(index + 1);
                 let van_commitment =
                     construct_van(&g_d_x, &pk_d_x, total_note_value, &round_id, &rand)
                         .unwrap()
