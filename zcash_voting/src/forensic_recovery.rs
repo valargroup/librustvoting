@@ -524,8 +524,14 @@ mod tests {
         hotkey::generate_random_voting_hotkey, session::Decision,
         tree_sync::verified_vote_tree_snapshot_with_api,
     };
+    use base64::prelude::*;
     use pasta_curves::Fp;
-    use vote_commitment_tree::MemoryTreeServer;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+    use vote_commitment_tree::{MemoryTreeServer, MerkleHashVote};
 
     const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const WALLET_ID: &str = "forensic-recovery-wallet";
@@ -582,6 +588,14 @@ mod tests {
                  VALUES (?1, ?2, 0, X'01', 1, 1)",
                 rusqlite::params![ROUND_ID, WALLET_ID],
             )
+            .unwrap();
+
+        // This is the exact cleanup that stranded affected pre-3.10.2 rounds:
+        // the local bundle rows survive, but their unsigned delegation fields
+        // (including the VAN randomness and commitment) are cleared.
+        fixture
+            .db
+            .clear_unsigned_delegation_setup_fields(ROUND_ID)
             .unwrap();
 
         let result = fixture.recover(&fixture.bundles).unwrap();
@@ -658,6 +672,51 @@ mod tests {
             assert_eq!(stored.5, expected.van_leaf_position);
             assert_eq!(stored.6, expected.delegation_tx_hash);
         }
+    }
+
+    #[test]
+    fn public_entrypoint_refetches_the_tree_and_restores_post_wipe_state() {
+        let fixture = fixture();
+        fixture
+            .db
+            .set_ballot_intent(ROUND_ID, 2, Decision::Choice(1), 3)
+            .unwrap();
+        fixture
+            .db
+            .clear_unsigned_delegation_setup_fields(ROUND_ID)
+            .unwrap();
+        let node_url = start_tree_http_server(&fixture.snapshot);
+
+        let result = recover_delegation_from_forensic_evidence(
+            &fixture.db,
+            RecoverDelegationFromForensicEvidenceParams {
+                voting_hotkey: &fixture.hotkey,
+                expected_network: Network::Testnet,
+                expected_round_params: &fixture.params,
+                node_url: &node_url,
+                bundles: &fixture.bundles,
+            },
+        )
+        .unwrap();
+
+        assert!(!result.already_recovered);
+        assert_eq!(result.anchor_height, fixture.snapshot.anchor_height);
+        assert_eq!(result.tree_root, fixture.snapshot.root);
+        assert!(
+            fixture
+                .db
+                .get_round_state(ROUND_ID)
+                .unwrap()
+                .proof_generated
+        );
+        let plan = crate::session::resume_plan(&fixture.db, ROUND_ID, &[2]).unwrap();
+        assert_eq!(
+            plan.next_steps
+                .iter()
+                .filter(|step| matches!(step, crate::session::NextStep::CastVote { .. }))
+                .count(),
+            fixture.bundles.len()
+        );
     }
 
     #[test]
@@ -897,5 +956,68 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn start_tree_http_server(snapshot: &VerifiedVoteTreeSnapshot) -> String {
+        let mut tree = MemoryTreeServer::empty();
+        let mut blocks = Vec::with_capacity(snapshot.leaves.len());
+        for leaf in &snapshot.leaves {
+            let value = Option::<Fp>::from(Fp::from_repr(leaf.commitment)).unwrap();
+            let height = leaf.position + 1;
+            tree.append(value).unwrap();
+            tree.checkpoint(height).unwrap();
+            blocks.push(serde_json::json!({
+                "height": height,
+                "start_index": leaf.position,
+                "leaves": [BASE64_STANDARD.encode(MerkleHashVote::from_fp(value).to_bytes())],
+                "root": BASE64_STANDARD.encode(
+                    MerkleHashVote::from_fp(tree.root_at_height(height).unwrap()).to_bytes()
+                )
+            }));
+        }
+        assert_eq!(tree.root().to_repr(), snapshot.root);
+
+        let latest = serde_json::json!({
+            "tree": {
+                "next_index": snapshot.leaves.len(),
+                "root": BASE64_STANDARD.encode(snapshot.root),
+                "height": snapshot.anchor_height
+            }
+        })
+        .to_string();
+        let leaves = serde_json::json!({
+            "blocks": blocks,
+            "next_from_height": 0
+        })
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if path.ends_with("/latest") {
+                    &latest
+                } else if path.contains("/leaves?") {
+                    &leaves
+                } else {
+                    panic!("unexpected vote-tree request: {path}");
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        url
     }
 }
