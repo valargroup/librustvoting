@@ -243,6 +243,20 @@ fn recover_with_verified_snapshot(
         return Ok(recovery_result(snapshot, bundles.len(), true));
     }
 
+    let phase: i32 = tx
+        .query_row(
+            "SELECT phase FROM rounds
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| row.get(0),
+        )
+        .map_err(|e| internal(format!("check forensic recovery round phase failed: {e}")))?;
+    if phase > RoundPhase::DelegationProved as i32 {
+        return Err(invalid(
+            "forensic delegation recovery cannot replace a vote-ready round",
+        ));
+    }
+
     let downstream_count: i64 = tx
         .query_row(
             "SELECT
@@ -742,6 +756,26 @@ mod tests {
             .expect_err("recovery must not cascade-delete vote state");
 
         assert!(error.to_string().contains("after voting began"), "{error}");
+        assert_eq!(local_bundle_count(&fixture.db), 2);
+    }
+
+    #[test]
+    fn vote_ready_round_is_rejected_without_mutation() {
+        let fixture = fixture();
+        fixture
+            .db
+            .conn()
+            .execute(
+                "UPDATE rounds SET phase = ?1 WHERE round_id = ?2 AND wallet_id = ?3",
+                rusqlite::params![RoundPhase::VoteReady as i32, ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+
+        let error = fixture
+            .recover(&fixture.bundles)
+            .expect_err("a vote-ready round must not be replaced");
+
+        assert!(error.to_string().contains("vote-ready"), "{error}");
         assert_eq!(local_bundle_count(&fixture.db), 2);
     }
 
