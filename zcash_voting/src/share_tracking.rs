@@ -505,7 +505,23 @@ pub(crate) async fn submit_committed_share_to_helpers(
             message: "committed share payload identity does not match its vote handle".to_string(),
         });
     }
-    let share_wire_json = payload.to_wire_json(None, request.plan.submit_at)?;
+    let vc_tree_position =
+        match recovery::helper_recovery_material(db, round_id, bundle_index, proposal_id)? {
+            recovery::HelperRecoveryMaterial::Ready(bundle) => bundle.vc_tree_position,
+            recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
+                return Err(VotingError::InvalidInput {
+                    message: "committed vote must be confirmed before submitting helper shares"
+                        .to_string(),
+                });
+            }
+            recovery::HelperRecoveryMaterial::Missing => {
+                return Err(VotingError::Internal {
+                    message: "committed vote is missing durable helper recovery material"
+                        .to_string(),
+                });
+            }
+        };
+    let share_wire_json = payload.to_wire_json(Some(vc_tree_position), request.plan.submit_at)?;
     let mut candidates = planned;
     let fallback = configured
         .into_iter()
@@ -2263,6 +2279,17 @@ mod tests {
     async fn committed_vote_submission_derives_wire_identity_and_uses_planned_targets_first() {
         let db = db_with_recoverable_vote();
         let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE votes SET vc_tree_position = 789
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::named_params! {
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": WALLET_ID,
+                },
+            )
+            .unwrap();
         let configured = helpers(2);
         let plan = ShareSubmissionPlan {
             immediate: false,
@@ -2295,6 +2322,7 @@ mod tests {
         assert_eq!(body["vote_round_id"], ROUND_ID);
         assert_eq!(body["proposal_id"], 1);
         assert_eq!(body["share_index"], 0);
+        assert_eq!(body["tree_position"], 789);
         assert_eq!(body["submit_at"], 4_321);
         let stored = only_share(&db);
         assert_eq!(stored.bundle_index, 0);
