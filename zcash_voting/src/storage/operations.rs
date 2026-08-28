@@ -5512,8 +5512,10 @@ mod tests {
 
         // Rows written before helper URL canonicalization may contain an
         // identity that is no longer safe to contact. One such entry must not
-        // make the complete round unreadable, and the next update should
-        // discard it while retaining valid new history.
+        // make the complete round unreadable, and later updates must preserve
+        // it verbatim in the stored row while keeping it out of the in-memory
+        // view — it is recorded delivery history, even if never contacted
+        // again.
         db.conn()
             .execute(
                 "UPDATE share_delegations
@@ -5532,6 +5534,15 @@ mod tests {
         let replacement = vec!["https://replacement.example".to_string()];
         db.add_sent_servers(ROUND_ID, 0, 0, 1, &replacement)
             .unwrap();
+        db.add_ambiguous_servers(
+            ROUND_ID,
+            0,
+            0,
+            1,
+            &["https://maybe.example".to_string()],
+            false,
+        )
+        .unwrap();
         let repaired = db
             .get_share_delegations(ROUND_ID)
             .unwrap()
@@ -5539,5 +5550,24 @@ mod tests {
             .find(|share| share.share_index == 1)
             .unwrap();
         assert_eq!(repaired.sent_to_urls, replacement);
+        assert_eq!(repaired.ambiguous_urls, vec!["https://maybe.example"]);
+
+        let (raw_sent, raw_ambiguous): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT sent_to_urls, ambiguous_urls FROM share_delegations
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND share_index = 1",
+                rusqlite::params![ROUND_ID, W],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            raw_sent.contains("https://legacy.example/path?token=secret"),
+            "legacy sent entry must survive rewrites: {raw_sent}"
+        );
+        assert!(
+            raw_ambiguous.contains("https://legacy-ambiguous.example/#fragment"),
+            "legacy ambiguous entry must survive rewrites: {raw_ambiguous}"
+        );
     }
 }

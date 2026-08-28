@@ -3317,18 +3317,52 @@ fn canonical_helper_urls(urls: &[String]) -> Result<Vec<String>, VotingError> {
     Ok(canonical)
 }
 
-/// Canonicalize persisted helper identities while isolating entries accepted
-/// by older schemas that are no longer safe to contact.
-fn canonical_stored_helper_urls(urls: &[String]) -> Vec<String> {
+/// Splits persisted helper identities into canonical entries and legacy
+/// entries accepted by older schemas that no longer canonicalize. Legacy
+/// entries are never contacted or counted, but rewrites preserve them verbatim
+/// so recorded delivery history is not lost.
+fn partition_stored_helper_urls(urls: &[String]) -> (Vec<String>, Vec<String>) {
     let mut canonical = Vec::with_capacity(urls.len());
+    let mut legacy = Vec::new();
     for url in urls {
-        if let Ok(url) = canonicalize_helper_base_url(url) {
-            if !canonical.contains(&url) {
-                canonical.push(url);
+        match canonicalize_helper_base_url(url) {
+            Ok(url) => {
+                if !canonical.contains(&url) {
+                    canonical.push(url);
+                }
+            }
+            Err(_) => {
+                if !legacy.contains(url) {
+                    legacy.push(url.clone());
+                }
             }
         }
     }
-    canonical
+    (canonical, legacy)
+}
+
+/// Canonicalize persisted helper identities for read-only views, omitting
+/// legacy entries that no longer canonicalize.
+fn canonical_stored_helper_urls(urls: &[String]) -> Vec<String> {
+    partition_stored_helper_urls(urls).0
+}
+
+fn parse_url_list(json: &str, name: &str) -> Result<Vec<String>, VotingError> {
+    serde_json::from_str(json).map_err(|e| VotingError::Internal {
+        message: format!("failed to deserialize {name}: {e}"),
+    })
+}
+
+/// Serializes canonical entries followed by preserved legacy entries.
+fn serialize_url_list(
+    canonical: &[String],
+    legacy: &[String],
+    name: &str,
+) -> Result<String, VotingError> {
+    let combined: Vec<&String> = canonical.iter().chain(legacy.iter()).collect();
+    serde_json::to_string(&combined).map_err(|e| VotingError::Internal {
+        message: format!("failed to serialize {name}: {e}"),
+    })
 }
 
 fn merge_helper_urls(existing: &mut Vec<String>, new_urls: &[String]) {
@@ -3523,7 +3557,7 @@ pub(crate) fn record_share_delegation(
             message: format!("failed to read existing share delivery: {e}"),
         })?;
 
-    let (mut sent, mut ambiguous, mut attempting, effective_target) = if let Some((
+    let (stored_sent, stored_ambiguous, stored_attempting, effective_target) = if let Some((
         sent_json,
         ambiguous_json,
         attempting_json,
@@ -3538,42 +3572,28 @@ pub(crate) fn record_share_delegation(
                 ),
             });
         }
-        let stored_sent: Vec<String> =
-            serde_json::from_str(&sent_json).map_err(|e| VotingError::Internal {
-                message: format!("failed to deserialize sent_to_urls: {e}"),
-            })?;
-        let stored_ambiguous: Vec<String> =
-            serde_json::from_str(&ambiguous_json).map_err(|e| VotingError::Internal {
-                message: format!("failed to deserialize ambiguous_urls: {e}"),
-            })?;
-        let stored_attempting: Vec<String> =
-            serde_json::from_str(&attempting_json).map_err(|e| VotingError::Internal {
-                message: format!("failed to deserialize attempting_urls: {e}"),
-            })?;
         (
-            canonical_stored_helper_urls(&stored_sent),
-            canonical_stored_helper_urls(&stored_ambiguous),
-            canonical_stored_helper_urls(&stored_attempting),
+            parse_url_list(&sent_json, "sent_to_urls")?,
+            parse_url_list(&ambiguous_json, "ambiguous_urls")?,
+            parse_url_list(&attempting_json, "attempting_urls")?,
             existing_target.max(target_count),
         )
     } else {
         (Vec::new(), Vec::new(), Vec::new(), target_count)
     };
+    let (mut sent, legacy_sent) = partition_stored_helper_urls(&stored_sent);
+    let (mut ambiguous, mut legacy_ambiguous) = partition_stored_helper_urls(&stored_ambiguous);
+    let (mut attempting, mut legacy_attempting) = partition_stored_helper_urls(&stored_attempting);
     merge_helper_urls(&mut sent, &incoming_sent);
     merge_helper_urls(&mut ambiguous, &incoming_ambiguous);
     ambiguous.retain(|url| !sent.contains(url));
     attempting.retain(|url| !sent.contains(url) && !ambiguous.contains(url));
+    legacy_ambiguous.retain(|url| !legacy_sent.contains(url));
+    legacy_attempting.retain(|url| !legacy_sent.contains(url) && !legacy_ambiguous.contains(url));
 
-    let urls_json = serde_json::to_string(&sent).map_err(|e| VotingError::Internal {
-        message: format!("failed to serialize sent_to_urls: {e}"),
-    })?;
-    let ambiguous_json = serde_json::to_string(&ambiguous).map_err(|e| VotingError::Internal {
-        message: format!("failed to serialize ambiguous_urls: {e}"),
-    })?;
-    let attempting_json =
-        serde_json::to_string(&attempting).map_err(|e| VotingError::Internal {
-            message: format!("failed to serialize attempting_urls: {e}"),
-        })?;
+    let urls_json = serialize_url_list(&sent, &legacy_sent, "sent_to_urls")?;
+    let ambiguous_json = serialize_url_list(&ambiguous, &legacy_ambiguous, "ambiguous_urls")?;
+    let attempting_json = serialize_url_list(&attempting, &legacy_attempting, "attempting_urls")?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -4012,106 +4032,22 @@ pub fn add_sent_servers_preserving_schedule(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn update_sent_servers(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    share_index: u32,
-    new_urls: &[String],
-    reset_submit_at: bool,
-) -> Result<(), VotingError> {
-    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    let (current_json, ambiguous_json, attempting_json): (String, String, String) = conn
-        .query_row(
-            "SELECT sent_to_urls, ambiguous_urls, attempting_urls FROM share_delegations \
-             WHERE round_id = :round_id AND wallet_id = :wallet_id \
-             AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": bundle_index,
-                ":proposal_id": proposal_id,
-                ":share_index": share_index,
-            },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to read sent_to_urls for update: {}", e),
-        })?;
-
-    let urls: Vec<String> =
-        serde_json::from_str(&current_json).map_err(|e| VotingError::Internal {
-            message: format!("failed to deserialize sent_to_urls: {}", e),
-        })?;
-    let ambiguous: Vec<String> =
-        serde_json::from_str(&ambiguous_json).map_err(|e| VotingError::Internal {
-            message: format!("failed to deserialize ambiguous_urls: {}", e),
-        })?;
-    let attempting: Vec<String> =
-        serde_json::from_str(&attempting_json).map_err(|e| VotingError::Internal {
-            message: format!("failed to deserialize attempting_urls: {e}"),
-        })?;
-    let mut urls = canonical_stored_helper_urls(&urls);
-    let mut ambiguous = canonical_stored_helper_urls(&ambiguous);
-    let mut attempting = canonical_stored_helper_urls(&attempting);
-    let new_urls = canonical_helper_urls(new_urls)?;
-
-    // Append new URLs (deduplicated)
-    for url in &new_urls {
-        if !urls.contains(url) {
-            urls.push(url.clone());
-        }
-        ambiguous.retain(|candidate| candidate != url);
-        attempting.retain(|candidate| candidate != url);
-    }
-
-    let updated_json = serde_json::to_string(&urls).map_err(|e| VotingError::Internal {
-        message: format!("failed to serialize updated sent_to_urls: {}", e),
-    })?;
-    let updated_ambiguous =
-        serde_json::to_string(&ambiguous).map_err(|e| VotingError::Internal {
-            message: format!("failed to serialize ambiguous_urls: {}", e),
-        })?;
-    let updated_attempting =
-        serde_json::to_string(&attempting).map_err(|e| VotingError::Internal {
-            message: format!("failed to serialize attempting_urls: {e}"),
-        })?;
-
-    let sql = if reset_submit_at {
-        "UPDATE share_delegations SET sent_to_urls = :urls, ambiguous_urls = :ambiguous_urls, attempting_urls = :attempting_urls, submit_at = 0 \
-         WHERE round_id = :round_id AND wallet_id = :wallet_id \
-         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index"
-    } else {
-        "UPDATE share_delegations SET sent_to_urls = :urls, ambiguous_urls = :ambiguous_urls, attempting_urls = :attempting_urls \
-         WHERE round_id = :round_id AND wallet_id = :wallet_id \
-         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index"
-    };
-    conn.execute(
-        sql,
-        named_params! {
-            ":urls": updated_json,
-            ":ambiguous_urls": updated_ambiguous,
-            ":attempting_urls": updated_attempting,
-            ":round_id": round_id,
-            ":wallet_id": wallet_id,
-            ":bundle_index": bundle_index,
-            ":proposal_id": proposal_id,
-            ":share_index": share_index,
-        },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to update sent_to_urls: {}", e),
-    })?;
-    Ok(())
+/// How [`merge_share_delegation_urls`] folds newly reported helpers into the
+/// persisted delivery state.
+enum HelperUrlMerge {
+    /// Definite deliveries: append to `sent_to_urls` and clear the helper from
+    /// the ambiguous set.
+    Sent,
+    /// Outcome-unknown attempts: append to `ambiguous_urls` unless the helper
+    /// already has a definite delivery.
+    Ambiguous,
 }
 
-/// Append outcome-unknown helper attempts without overriding definite deliveries.
-/// `reset_submit_at` makes overdue recovery immediately actionable; early
-/// replenishment leaves the delayed schedule intact.
-pub fn add_ambiguous_servers(
+/// Shared read-modify-write for the per-share helper delivery lists. Every
+/// merged helper also leaves `attempting_urls`, and legacy entries that no
+/// longer canonicalize are preserved verbatim.
+#[allow(clippy::too_many_arguments)]
+fn merge_share_delegation_urls(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -4119,6 +4055,7 @@ pub fn add_ambiguous_servers(
     proposal_id: u32,
     share_index: u32,
     new_urls: &[String],
+    merge: HelperUrlMerge,
     reset_submit_at: bool,
 ) -> Result<(), VotingError> {
     ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
@@ -4139,49 +4076,43 @@ pub fn add_ambiguous_servers(
         .map_err(|e| VotingError::Internal {
             message: format!("failed to read helper delivery state for update: {e}"),
         })?;
-    let sent: Vec<String> =
-        serde_json::from_str(&sent_json).map_err(|e| VotingError::Internal {
-            message: format!("failed to deserialize sent_to_urls: {e}"),
-        })?;
-    let ambiguous: Vec<String> =
-        serde_json::from_str(&ambiguous_json).map_err(|e| VotingError::Internal {
-            message: format!("failed to deserialize ambiguous_urls: {e}"),
-        })?;
-    let attempting: Vec<String> =
-        serde_json::from_str(&attempting_json).map_err(|e| VotingError::Internal {
-            message: format!("failed to deserialize attempting_urls: {e}"),
-        })?;
-    let sent = canonical_stored_helper_urls(&sent);
-    let mut ambiguous = canonical_stored_helper_urls(&ambiguous);
-    let mut attempting = canonical_stored_helper_urls(&attempting);
+    let (mut sent, legacy_sent) =
+        partition_stored_helper_urls(&parse_url_list(&sent_json, "sent_to_urls")?);
+    let (mut ambiguous, legacy_ambiguous) =
+        partition_stored_helper_urls(&parse_url_list(&ambiguous_json, "ambiguous_urls")?);
+    let (mut attempting, legacy_attempting) =
+        partition_stored_helper_urls(&parse_url_list(&attempting_json, "attempting_urls")?);
     let new_urls = canonical_helper_urls(new_urls)?;
     for url in &new_urls {
-        if !sent.contains(url) && !ambiguous.contains(url) {
-            ambiguous.push(url.clone());
+        match merge {
+            HelperUrlMerge::Sent => {
+                if !sent.contains(url) {
+                    sent.push(url.clone());
+                }
+                ambiguous.retain(|candidate| candidate != url);
+            }
+            HelperUrlMerge::Ambiguous => {
+                if !sent.contains(url) && !ambiguous.contains(url) {
+                    ambiguous.push(url.clone());
+                }
+            }
         }
         attempting.retain(|candidate| candidate != url);
     }
-    let updated = serde_json::to_string(&ambiguous).map_err(|e| VotingError::Internal {
-        message: format!("failed to serialize ambiguous_urls: {e}"),
-    })?;
+    let updated_sent = serialize_url_list(&sent, &legacy_sent, "sent_to_urls")?;
+    let updated_ambiguous = serialize_url_list(&ambiguous, &legacy_ambiguous, "ambiguous_urls")?;
     let updated_attempting =
-        serde_json::to_string(&attempting).map_err(|e| VotingError::Internal {
-            message: format!("failed to serialize attempting_urls: {e}"),
-        })?;
-    let sql = if reset_submit_at {
-        "UPDATE share_delegations SET ambiguous_urls = :ambiguous_urls, attempting_urls = :attempting_urls, submit_at = 0 \
-         WHERE round_id = :round_id AND wallet_id = :wallet_id \
-         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index"
-    } else {
-        "UPDATE share_delegations SET ambiguous_urls = :ambiguous_urls, attempting_urls = :attempting_urls \
-         WHERE round_id = :round_id AND wallet_id = :wallet_id \
-         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index"
-    };
+        serialize_url_list(&attempting, &legacy_attempting, "attempting_urls")?;
     conn.execute(
-        sql,
+        "UPDATE share_delegations SET sent_to_urls = :sent_to_urls, ambiguous_urls = :ambiguous_urls, \
+         attempting_urls = :attempting_urls, submit_at = iif(:reset_submit_at, 0, submit_at) \
+         WHERE round_id = :round_id AND wallet_id = :wallet_id \
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
         named_params! {
-            ":ambiguous_urls": updated,
+            ":sent_to_urls": updated_sent,
+            ":ambiguous_urls": updated_ambiguous,
             ":attempting_urls": updated_attempting,
+            ":reset_submit_at": reset_submit_at,
             ":round_id": round_id,
             ":wallet_id": wallet_id,
             ":bundle_index": bundle_index,
@@ -4190,7 +4121,57 @@ pub fn add_ambiguous_servers(
         },
     )
     .map_err(|e| VotingError::Internal {
-        message: format!("failed to update ambiguous_urls: {e}"),
+        message: format!("failed to update helper delivery state: {e}"),
     })?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_sent_servers(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    new_urls: &[String],
+    reset_submit_at: bool,
+) -> Result<(), VotingError> {
+    merge_share_delegation_urls(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        new_urls,
+        HelperUrlMerge::Sent,
+        reset_submit_at,
+    )
+}
+
+/// Append outcome-unknown helper attempts without overriding definite deliveries.
+/// `reset_submit_at` makes overdue recovery immediately actionable; early
+/// replenishment leaves the delayed schedule intact.
+pub fn add_ambiguous_servers(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    new_urls: &[String],
+    reset_submit_at: bool,
+) -> Result<(), VotingError> {
+    merge_share_delegation_urls(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        new_urls,
+        HelperUrlMerge::Ambiguous,
+        reset_submit_at,
+    )
 }
