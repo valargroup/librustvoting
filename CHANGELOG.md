@@ -80,6 +80,18 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Initial share delivery continues to target half the configured fleet, rounded
   up, while balancing a complete commitment across the ready helper pool.
   Retries may exceed the initial distribution for liveness.
+- **Breaking:** `submit_share_to_helpers` and `track_pending_shares` now reject
+  helper URLs that fail canonicalization with `VotingError::InvalidInput`
+  before any network I/O, instead of silently dropping them — an
+  all-misconfigured fleet previously produced a permanent, error-free no-op.
+  `helper::url::canonicalize_helper_base_url` and `canonical_helper_url_list`
+  are now public and define the URL contract that the share recording APIs
+  (`record_share`, `record_share_delivery`, `add_sent_servers`) also enforce;
+  previous releases accepted some now-rejected spellings, so validate helper
+  configuration before delivering over the network.
+- **Breaking:** removed `HELPER_PREFLIGHT_TIMEOUT_SECONDS`; the client's
+  preflight timeout is now derived from
+  `share_policy::SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS`.
 
 ### Fixed
 
@@ -98,11 +110,22 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   canonicalizes helper identities, preserves delivery history and desired
   placement across resumed fan-out, and waits for a confirmed VC-tree position
   before recovery POSTs. Legacy delivery records retain the canonical-target
-  sentinel instead of deriving a smaller target from partial success; unsafe
-  legacy helper identities are isolated instead of making a round unreadable.
+  sentinel instead of deriving a smaller target from partial success; legacy
+  helper identities that no longer canonicalize are kept out of delivery and
+  polling but preserved verbatim across rewrites instead of being silently
+  erased or making a round unreadable.
+- An outcome-unknown (ambiguous) helper is no longer permanently excluded from
+  delivery of its share: overdue recovery re-POSTs it after untried helpers
+  and before already-accepted ones, converging via helper-side duplicate
+  detection, so one transient 5xx across a small fleet can no longer lock a
+  share out for the round. Early replenishment keeps ambiguous helpers
+  poll-only.
 - Initial fan-out now observes its shared 60-second deadline, clamps the last
   request to the remaining budget, and treats post-dispatch helper 5xx
-  responses as outcome-unknown rather than retrying a non-idempotent POST.
+  responses as outcome-unknown rather than retrying a non-idempotent POST. A
+  retry backoff that would cross the delivery deadline returns its held
+  definite error instead of letting cancellation mark the helper
+  outcome-unknown, and no attempt starts with less than one second of budget.
 - Documented the helper-status trust boundary: configured helpers are trusted
   as global on-chain confirmation oracles because their responses do not carry
   independently verifiable chain proofs.

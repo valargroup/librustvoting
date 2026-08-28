@@ -329,7 +329,8 @@ that should stay consistent across SDKs:
 - share-count-derived batch planning with independent entropy per share, a
   minimum capacity pool, and a hard initial quota of `floor(3S / 4)` shares per
   helper (12 when `S = 16`); retries remain liveness-first and may exceed it
-- resubmission ordering with untried helpers before already-sent helpers
+- resubmission ordering with untried helpers first; overdue recovery then
+  retries outcome-unknown helpers before falling back to already-sent helpers
 - share tracking summaries, readiness checks, retry thresholds, and polling delay
 
 Wallet SDKs should provide fresh CSPRNG bytes from their platform RNG and let the
