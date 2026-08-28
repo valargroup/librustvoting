@@ -29,7 +29,7 @@ use std::{
 use crate::{
     helper::{
         client::{HelperClient, HelperError, ShareStatus},
-        url::canonicalize_helper_base_url,
+        url::canonical_helper_url_list,
     },
     recovery,
     round::VotingDb,
@@ -263,6 +263,16 @@ async fn poll_share_helpers(
 /// their final state, while definite pre-dispatch failures clear the marker.
 /// A process death or failed outcome write therefore leaves a poll-only marker
 /// and can never cause the same non-idempotent POST to be replayed.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] when the share JSON is malformed or
+/// when any candidate URL fails
+/// [`crate::helper::url::canonicalize_helper_base_url`]. Validation happens
+/// before any network I/O and is all-or-nothing: one invalid configured URL
+/// fails the call so a misconfigured fleet is surfaced instead of silently
+/// shrinking delivery. Pre-filter with that function to tolerate individual
+/// invalid entries.
 pub async fn submit_share_to_helpers(
     db: &VotingDb,
     client: &HelperClient,
@@ -299,12 +309,7 @@ pub async fn submit_share_to_helpers(
         .ok_or_else(|| VotingError::Internal {
             message: "newly journaled helper share was not found".to_string(),
         })?;
-    let candidates: Vec<String> = dedupe_preserving_order(
-        params
-            .candidate_servers
-            .iter()
-            .filter_map(|url| canonicalize_helper_base_url(url).ok()),
-    );
+    let candidates = canonical_helper_url_list(params.candidate_servers)?;
     let mut accepted = dedupe_preserving_order(
         stored
             .sent_to_urls
@@ -424,11 +429,8 @@ async fn submit_share_to_helpers_unrecorded(
 ) -> ShareSubmissionReport {
     let mut accepted = Vec::new();
     let mut ambiguous = Vec::new();
-    let mut remaining = dedupe_preserving_order(
-        candidate_servers
-            .iter()
-            .filter_map(|url| canonicalize_helper_base_url(url).ok()),
-    );
+    let mut remaining = canonical_helper_url_list(candidate_servers)
+        .expect("test candidate URLs must canonicalize");
     let attempt_target = target_count.min(remaining.len());
     let deadline = tokio::time::Instant::now()
         + Duration::from_millis(SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS);
@@ -493,6 +495,13 @@ async fn submit_share_to_helpers_unrecorded(
 /// [`ShareTrackingReport::cancelled`] set; nothing is rolled back, because
 /// every effect recorded so far actually happened.
 ///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] when any configured URL fails
+/// [`crate::helper::url::canonicalize_helper_base_url`] — a misconfigured
+/// fleet is surfaced on every pass instead of silently excluding the invalid
+/// helper. Storage failures are returned unchanged.
+///
 /// # Trust
 ///
 /// A `confirmed` response from any configured helper is persisted without an
@@ -519,12 +528,7 @@ async fn track_pending_shares_with_elapsed(
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
 ) -> Result<ShareTrackingReport, VotingError> {
     let mut report = ShareTrackingReport::default();
-    let configured_urls = dedupe_preserving_order(
-        params
-            .configured_server_urls
-            .iter()
-            .filter_map(|url| canonicalize_helper_base_url(url).ok()),
-    );
+    let configured_urls = canonical_helper_url_list(params.configured_server_urls)?;
     let configured: HashSet<&str> = configured_urls.iter().map(String::as_str).collect();
 
     for share in share::unconfirmed(db, params.round_id)? {
@@ -621,6 +625,7 @@ async fn track_pending_shares_with_elapsed(
                     client,
                     &ResubmitRequest {
                         share: &share,
+                        configured_urls: &configured_urls,
                         accepted_urls: &accepted,
                         ambiguous_urls: &ambiguous,
                         schedule,
@@ -702,6 +707,8 @@ struct ResubmitReport {
 
 struct ResubmitRequest<'a> {
     share: &'a ShareDelegationRecord,
+    /// The configured helper fleet, already canonicalized by the caller.
+    configured_urls: &'a [String],
     accepted_urls: &'a [String],
     ambiguous_urls: &'a [String],
     schedule: ResubmissionSchedule,
@@ -791,15 +798,15 @@ async fn resubmit_to_next_helper(
     let eligible_servers: Vec<String> = {
         let attempted: HashSet<&str> = attempted_urls.iter().map(String::as_str).collect();
         dedupe_preserving_order(
-            params
-                .configured_server_urls
+            request
+                .configured_urls
                 .iter()
-                .filter_map(|url| canonicalize_helper_base_url(url).ok())
                 .filter(|url| !ambiguous.contains(url.as_str()))
                 .filter(|url| !attempted.contains(url.as_str()))
                 .filter(|url| {
                     request.schedule.reset_submit_at() || !accepted.contains(url.as_str())
-                }),
+                })
+                .cloned(),
         )
     };
     let needed =
@@ -1894,6 +1901,52 @@ mod tests {
         let stored = only_share(&db);
         assert_eq!(stored.sent_to_urls, vec![helper(1)]);
         assert!(stored.attempting_urls.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn submit_rejects_invalid_candidate_url_before_any_network_io() {
+        let db = db_with_delivery(&[], &[], 1);
+        let transport = Arc::new(MockTransport::default());
+        let client = client_with(transport.clone());
+        let servers = vec![helper(1), "helper.example:443".to_string()];
+
+        let error =
+            submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+                .await
+                .unwrap_err();
+
+        assert!(
+            matches!(error, VotingError::InvalidInput { .. }),
+            "unexpected error: {error}"
+        );
+        assert_eq!(transport.call_count(&helper(1)), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tracking_rejects_invalid_configured_url() {
+        let configured = vec![
+            helper(1),
+            "https://helper.example/vote?tenant=1".to_string(),
+        ];
+        let db = db_with_share(&[helper(1)]);
+        let transport = Arc::new(MockTransport::default());
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+
+        let error = track_pending_shares(
+            &db,
+            &params(&configured, ready_not_overdue(), &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, VotingError::InvalidInput { .. }),
+            "unexpected error: {error}"
+        );
+        assert_eq!(transport.call_count(&helper(1)), 0);
     }
 
     #[tokio::test(start_paused = true)]

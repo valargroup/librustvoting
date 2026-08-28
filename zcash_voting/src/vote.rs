@@ -387,6 +387,13 @@ impl CommittedVote {
     }
 
     /// Records a helper-share submission using recovery-owned nullifier material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when any entry in `sent_to_urls`
+    /// fails [`crate::helper::url::canonicalize_helper_base_url`]; validate
+    /// helper URLs with that function before delivering a share over the
+    /// network.
     pub fn record_share(
         &self,
         db: &VotingDb,
@@ -406,6 +413,12 @@ impl CommittedVote {
     }
 
     /// Records definite and outcome-unknown helper deliveries for one share.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] when any reported URL fails
+    /// [`crate::helper::url::canonicalize_helper_base_url`]; validate helper
+    /// URLs with that function before delivering a share over the network.
     pub fn record_share_delivery(
         &self,
         db: &VotingDb,

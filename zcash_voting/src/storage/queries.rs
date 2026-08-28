@@ -3306,16 +3306,7 @@ pub fn clear_recovery_state(
 
 // --- Share delegation tracking ---
 
-fn canonical_helper_urls(urls: &[String]) -> Result<Vec<String>, VotingError> {
-    let mut canonical = Vec::with_capacity(urls.len());
-    for url in urls {
-        let url = canonicalize_helper_base_url(url)?;
-        if !canonical.contains(&url) {
-            canonical.push(url);
-        }
-    }
-    Ok(canonical)
-}
+use crate::helper::url::canonical_helper_url_list as canonical_helper_urls;
 
 /// Splits persisted helper identities into canonical entries and legacy
 /// entries accepted by older schemas that no longer canonicalize. Legacy

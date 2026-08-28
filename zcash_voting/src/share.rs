@@ -126,6 +126,13 @@ pub fn compute_nullifier(
 }
 
 /// Records a helper-share submission using nullifier material from recovery state.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] when any entry in `sent_to_urls`
+/// fails [`crate::helper::url::canonicalize_helper_base_url`]. Validate
+/// helper URLs with that function before delivering a share over the
+/// network, so an already-delivered share can always be recorded.
 pub fn record(
     db: &VotingDb,
     round_id: &str,
@@ -157,8 +164,11 @@ pub fn record(
 /// # Errors
 ///
 /// Returns [`VotingError::InvalidInput`] when the target does not fit the
-/// persisted representation or the vote recovery bundle is missing or invalid.
-/// Storage failures are returned unchanged.
+/// persisted representation, the vote recovery bundle is missing or invalid,
+/// or any reported URL fails
+/// [`crate::helper::url::canonicalize_helper_base_url`] — validate helper
+/// URLs before delivering over the network. Storage failures are returned
+/// unchanged.
 pub fn record_delivery(
     db: &VotingDb,
     params: &ShareDeliveryRecordParams<'_>,
@@ -344,6 +354,12 @@ pub fn confirm(
 }
 
 /// Adds helper URLs after immediate resubmission and clears a delayed schedule.
+///
+/// # Errors
+///
+/// Returns [`VotingError::InvalidInput`] when any entry in `new_urls` fails
+/// [`crate::helper::url::canonicalize_helper_base_url`]; validate helper URLs
+/// before delivering over the network.
 pub fn add_sent_servers(
     db: &VotingDb,
     round_id: &str,

@@ -127,6 +127,7 @@ pub fn canonical_helper_url_list(urls: &[String]) -> Result<Vec<String>, VotingE
     }
     Ok(canonical)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
