@@ -3411,7 +3411,7 @@ pub fn add_attempting_server(
     Ok(true)
 }
 
-/// Clears a definitely pre-dispatch failed attempt so the helper remains
+/// Clears an attempt with a definite non-acceptance so the helper remains
 /// eligible for a later retry.
 pub fn remove_attempting_server(
     conn: &Connection,

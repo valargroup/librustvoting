@@ -120,10 +120,11 @@ pub struct ResubmittedShare {
 
 /// Results of an initial fan-out across helper servers.
 ///
-/// Pass this report through [`share::ShareDeliveryRecordParams`] to
-/// [`share::record_delivery`]. Ambiguous attempts remain poll-only and do not
-/// count toward `target_count`: the current status endpoint reports on-chain
-/// confirmation, not whether one helper possesses the share.
+/// [`submit_share_to_helpers`] journals every attempt and outcome before this
+/// report is returned, so callers must not treat it as pending persistence.
+/// Ambiguous attempts remain poll-only and do not count toward `target_count`:
+/// the current status endpoint reports on-chain confirmation, not whether one
+/// helper possesses the share.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShareSubmissionReport {
     /// Helpers that definitively accepted the share.

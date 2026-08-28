@@ -916,6 +916,35 @@ mod tests {
     }
 
     #[test]
+    fn share_delegation_view_treats_attempting_helpers_as_ambiguous() {
+        let view = ShareDelegationRecordView::from(crate::types::ShareDelegationRecord {
+            round_id: "round".to_string(),
+            bundle_index: 1,
+            proposal_id: 2,
+            share_index: 3,
+            sent_to_urls: vec!["https://accepted.example".to_string()],
+            ambiguous_urls: vec!["https://ambiguous.example".to_string()],
+            attempting_urls: vec![
+                "https://attempting.example".to_string(),
+                "https://ambiguous.example".to_string(),
+            ],
+            target_count: 2,
+            nullifier: vec![7; 32],
+            confirmed: false,
+            submit_at: 100,
+            created_at: 50,
+        });
+
+        assert_eq!(
+            view.ambiguous_urls,
+            vec![
+                "https://ambiguous.example".to_string(),
+                "https://attempting.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn voting_hotkey_target_json_roundtrip_validates_expected_context() {
         let wire = valid_voting_hotkey_target_wire();
         let json = wire.to_json().unwrap();
