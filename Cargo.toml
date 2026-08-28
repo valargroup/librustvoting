@@ -6,6 +6,18 @@ members = [
     "vote-commitment-tree-client",
     "wallet-example",
 ]
+# zcash_voting-zakura shares `voting-crypto-deps` with zcash_voting via one
+# Cargo.lock, and the two request mutually exclusive features of it. Without
+# `default-members`, a bare `cargo check`/`cargo test` (no `-p`/`--workspace`)
+# defaults to every member on a virtual manifest and hits that clash. Keep it
+# out of the default set; `--workspace` or `-p zcash_voting-zakura` still
+# reach it explicitly.
+default-members = [
+    "zcash_voting",
+    "vote-commitment-tree",
+    "vote-commitment-tree-client",
+    "wallet-example",
+]
 resolver = "2"
 
 [workspace.dependencies]
