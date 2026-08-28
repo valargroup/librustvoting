@@ -487,8 +487,10 @@ async fn submit_share_to_helpers_unrecorded(
 /// 4. Before the vote-end cutoff, when overdue or below the desired placement,
 ///    walk a health-aware randomized resubmission order and durably retain each
 ///    attempt before contacting another helper. Early replenishment preserves
-///    the persisted `submit_at`; overdue recovery uses zero so the replacement
-///    helper acts immediately. Ambiguous helpers remain poll-only.
+///    the persisted `submit_at` and keeps ambiguous helpers poll-only; overdue
+///    recovery uses zero so the replacement helper acts immediately, and after
+///    untried helpers it re-POSTs outcome-unknown helpers once, converging via
+///    helper-side duplicate detection.
 ///
 /// `cancel` is polled between every helper and every share. When it fires the
 /// pass returns what it has already durably recorded with
@@ -638,14 +640,17 @@ async fn track_pending_shares_with_elapsed(
                 for server_url in resubmission.ambiguous_urls {
                     if !ambiguous.contains(&server_url) {
                         ambiguous.push(server_url.clone());
+                        report.ambiguous.push(ResubmittedShare {
+                            share: ShareKey::of(&share),
+                            server_url,
+                        });
                     }
-                    report.ambiguous.push(ResubmittedShare {
-                        share: ShareKey::of(&share),
-                        server_url,
-                    });
                 }
                 match resubmission.outcome {
                     ResubmitOutcome::Accepted(server_url) => {
+                        // An overdue re-POST can convert an outcome-unknown
+                        // helper into a definite placement.
+                        ambiguous.retain(|url| url != &server_url);
                         let is_new_placement = !accepted.contains(&server_url);
                         if is_new_placement {
                             accepted.push(server_url.clone());
@@ -735,16 +740,21 @@ impl ResubmissionSchedule {
 
 /// Walks the randomized resubmission order until one helper accepts.
 ///
-/// Untried helpers come before definitely accepted ones. Early replenishment
-/// uses only untried helpers because another POST to an accepted helper cannot
-/// add a placement; genuinely overdue recovery may fall back to accepted
-/// helpers after exhausting untried ones. Ambiguous helpers are excluded
-/// entirely: their prior POST remains poll-only until resolved.
+/// Untried helpers come first. Early replenishment uses only untried helpers
+/// because another POST to an accepted helper cannot add a placement, and it
+/// keeps ambiguous helpers poll-only. Genuinely overdue recovery is
+/// liveness-critical, so after exhausting untried helpers it re-POSTs each
+/// outcome-unknown helper once — its earlier POST may never have arrived, and
+/// helper-side duplicate detection makes the re-POST converge instead of
+/// double-counting — and only then falls back to accepted helpers.
 ///
 /// Randomization is preserved within the untried and previously attempted
-/// groups, while degraded helpers move behind healthy peers in their group.
-/// Every POST is journaled before dispatch, and every accepted or ambiguous
-/// outcome is persisted before returning or advancing to another helper.
+/// groups; the outcome-unknown retry group is a deterministic last resort
+/// ranked only by health, since its membership is already persisted. Degraded
+/// helpers move behind healthy peers in their group. Every POST is journaled
+/// before dispatch (an outcome-unknown helper is already durably journaled),
+/// and every accepted or ambiguous outcome is persisted before returning or
+/// advancing to another helper.
 async fn resubmit_to_next_helper(
     db: &VotingDb,
     params: &ShareTrackingParams<'_>,
@@ -825,6 +835,18 @@ async fn resubmit_to_next_helper(
         .health()
         .candidate_servers(untried, params.now_seconds);
     if request.schedule.reset_submit_at() {
+        let ambiguous_retry: Vec<String> = request
+            .ambiguous_urls
+            .iter()
+            .filter(|url| !attempted_urls.contains(url))
+            .filter(|url| !accepted.contains(url.as_str()))
+            .cloned()
+            .collect();
+        order.extend(
+            client
+                .health()
+                .candidate_servers(&ambiguous_retry, params.now_seconds),
+        );
         order.extend(
             client
                 .health()
@@ -849,6 +871,7 @@ async fn resubmit_to_next_helper(
             });
         }
         attempted_urls.push(server_url.clone());
+        let is_ambiguous_retry = ambiguous.contains(server_url.as_str());
         let attempt = share::ShareDeliveryAttemptParams {
             round_id: params.round_id,
             bundle_index: share.bundle_index,
@@ -858,7 +881,10 @@ async fn resubmit_to_next_helper(
             target_count: usize::try_from(share.target_count).unwrap_or(usize::MAX),
             submit_at: request.schedule.submit_at(),
         };
-        if !share::begin_existing_delivery_attempt(db, &attempt)? {
+        // An outcome-unknown helper is already durably journaled, so the
+        // journal-before-dispatch invariant holds without a new attempting
+        // marker (which the guard would refuse).
+        if !is_ambiguous_retry && !share::begin_existing_delivery_attempt(db, &attempt)? {
             continue;
         }
         match client
@@ -884,8 +910,13 @@ async fn resubmit_to_next_helper(
                     share::ShareDeliveryAttemptOutcome::Ambiguous,
                     request.schedule.reset_submit_at(),
                 )?;
-                ambiguous_urls.push(server_url);
+                if !is_ambiguous_retry {
+                    ambiguous_urls.push(server_url);
+                }
             }
+            // A definite failure of a re-POST says nothing about the original
+            // outcome-unknown POST, so that persisted state is kept.
+            Err(_) if is_ambiguous_retry => {}
             Err(_) => share::resolve_delivery_attempt(
                 db,
                 &attempt,
@@ -2716,7 +2747,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn persisted_ambiguous_helper_is_excluded_from_recovery_posts() {
+    async fn early_replenishment_excludes_ambiguous_helpers() {
         let configured = helpers(3);
         let db = db_with_delivery(&[helper(1)], &[helper(2)], 2);
         db.conn()
@@ -2752,6 +2783,146 @@ mod tests {
         let stored = only_share(&db);
         assert_eq!(stored.sent_to_urls, vec![helper(1)]);
         assert_eq!(stored.ambiguous_urls, vec![helper(2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overdue_recovery_retries_ambiguous_helper_after_untried() {
+        let configured = helpers(2);
+        let db = db_with_delivery(&[], &[helper(2)], 2);
+        let share_id = share_id_of(&db);
+        let now = overdue();
+
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(2)
+            ),
+            json_status("pending"),
+        );
+        // The untried helper is contacted first and definitely refuses.
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(1)),
+            http_status(400),
+        );
+        // The outcome-unknown helper is then re-POSTed and accepts.
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(2)),
+            json_status("queued"),
+        );
+
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, now, &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            report.resubmitted,
+            vec![ResubmittedShare {
+                share: ShareKey {
+                    bundle_index: 0,
+                    proposal_id: 1,
+                    share_index: 0
+                },
+                server_url: helper(2),
+            }]
+        );
+        let stored = only_share(&db);
+        assert_eq!(stored.sent_to_urls, vec![helper(2)]);
+        assert!(stored.ambiguous_urls.is_empty());
+        assert_eq!(stored.submit_at, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn small_fleet_all_ambiguous_still_recovers() {
+        // The review scenario: every helper produced one outcome-unknown POST
+        // during initial fan-out, and all have since recovered. An overdue
+        // pass must still deliver instead of locking the share out.
+        let configured = helpers(2);
+        let db = db_with_delivery(&[], &[helper(1), helper(2)], 1);
+        let share_id = share_id_of(&db);
+        let now = overdue();
+
+        let transport = Arc::new(MockTransport::default());
+        for index in 1..=2 {
+            transport.queue_get(
+                &format!(
+                    "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                    helper(index)
+                ),
+                json_status("pending"),
+            );
+        }
+        // The helper kept the original POST after all: `duplicate` converges
+        // to a definite acceptance without double-counting.
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(1)),
+            json_status("duplicate"),
+        );
+
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, now, &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.resubmitted.len(), 1);
+        let stored = only_share(&db);
+        assert_eq!(stored.sent_to_urls, vec![helper(1)]);
+        assert_eq!(stored.ambiguous_urls, vec![helper(2)]);
+        assert_eq!(stored.submit_at, 0);
+        assert_eq!(transport.call_count(&helper(2)), 1, "status poll only");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_repost_failure_keeps_ambiguous_state() {
+        let configured = helpers(1);
+        let db = db_with_delivery(&[], &[helper(1)], 1);
+        let share_id = share_id_of(&db);
+        let now = overdue();
+
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(1)
+            ),
+            json_status("pending"),
+        );
+        // A definite refusal of the re-POST says nothing about the original
+        // outcome-unknown POST.
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(1)),
+            http_status(400),
+        );
+
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, now, &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.resubmitted.is_empty());
+        assert!(report.ambiguous.is_empty());
+        let stored = only_share(&db);
+        assert!(stored.sent_to_urls.is_empty());
+        assert_eq!(stored.ambiguous_urls, vec![helper(1)]);
     }
 
     #[tokio::test(start_paused = true)]
