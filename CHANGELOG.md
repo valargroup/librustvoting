@@ -7,12 +7,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Changed
-- `zcash_voting` retains its `upstream`/`zakura` feature pair while depending
-  directly on the selected backend family instead of `zakura-wallet-lib`.
-  The new published `zcash_voting-lrz` facade force-selects `upstream`, making
-  `zcash_voting` transitive so disabled Zakura packages stay out of upstream
-  consumers' Cargo lockfiles and metadata. Zakura consumers continue selecting
-  `zcash_voting/zakura`. See the "Dependency notes" section of
+- `zcash_voting` now defaults to Zakura and exposes upstream librustzcash
+  through the mutually exclusive `lrz` feature while depending directly on
+  the selected backend family instead of `zakura-wallet-lib`. The new
+  published `zcash_voting-lrz` facade selects `lrz`, making `zcash_voting`
+  transitive so disabled Zakura packages stay out of LRZ consumers' Cargo
+  lockfiles and metadata. See the "Dependency notes" section of
   `zcash_voting/README.md`.
 
 ## v3.1.0-rc.12

@@ -6,13 +6,11 @@ members = [
     "vote-commitment-tree-client",
     "wallet-example",
 ]
-# Keep the upstream/LRZ family as the default root build. Validate
-# zcash_voting's Zakura feature explicitly in its dedicated CI job.
+# The default root build is the Zakura application path. LRZ and the
+# lower-level VCT packages are validated in separate invocations because their
+# backend features are mutually exclusive within one Cargo resolve.
 default-members = [
     "zcash_voting",
-    "zcash_voting-lrz",
-    "vote-commitment-tree",
-    "vote-commitment-tree-client",
     "wallet-example",
 ]
 resolver = "2"

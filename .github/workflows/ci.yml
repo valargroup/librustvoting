@@ -51,16 +51,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.138
-      - name: Test workspace with fixtures
+      - name: Test default Zakura stack with fixtures
         run: |
-          cargo nextest run --workspace \
+          cargo nextest run -p zcash_voting -p zcash-voting-wallet-example \
             --features test-fixtures \
             --partition count:${{ matrix.partition }}/2 \
             --locked
       - name: Test documentation
         if: matrix.partition == 1
         run: |
-          cargo test --workspace --doc \
+          cargo test -p zcash_voting -p zcash-voting-wallet-example --doc \
             --features test-fixtures \
             --locked
 
@@ -76,9 +76,14 @@ jobs:
           tool: cargo-nextest@0.9.138
       # The end-to-end delegation proof runs keygen plus proving, so it is
       # marked #[ignore] for the default suite and run here under --release.
-      - name: Run ignored proof tests
+      - name: Run ignored Zakura proof tests
         run: |
           cargo nextest run --release -p zcash_voting \
+            --locked --run-ignored ignored-only
+      - name: Run ignored LRZ proof tests
+        run: |
+          cargo nextest run --release -p zcash_voting \
+            --no-default-features --features lrz \
             --locked --run-ignored ignored-only
 
   zakura-vct:
@@ -91,6 +96,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.138
+      - name: Test LRZ VCT crates
+        run: |
+          cargo nextest run -p vote-commitment-tree -p vote-commitment-tree-client \
+            --all-targets --features vote-commitment-tree-client/cli \
+            --locked
       - name: Test Zakura VCT crates
         run: |
           cargo nextest run -p vote-commitment-tree -p vote-commitment-tree-client \
@@ -125,8 +135,8 @@ jobs:
             exit 1
           fi
 
-  zakura-wallet:
-    name: Zakura wallet backend
+  lrz-wallet:
+    name: LRZ wallet backend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -135,27 +145,27 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.138
-      - name: Test Zakura wallet stack
-        # The wallet example verifies that direct Zakura feature selection
-        # preserves the consumer API used by Vizor.
+      - name: Test LRZ wallet stack
+        # The wallet example verifies the forced-LRZ facade and direct
+        # `zcash_voting/lrz` feature expose the same consumer API.
         run: |
           cargo nextest run -p zcash_voting -p zcash-voting-wallet-example \
             --all-targets --no-default-features \
-            --features zcash_voting/zakura,zcash-voting-wallet-example/zakura \
+            --features lrz \
             --locked
       - name: Check wallet backend contracts
         run: |
           # The LRZ facade must expose only the upstream family.
-          if cargo tree -p zcash_voting-lrz -e all --prefix none --locked \
+          if cargo tree -p zcash_voting-lrz -e all --prefix none \
+            --no-default-features --features lrz --locked \
             | grep -Eq '^zakura-(pczt|client-backend|client-sqlite|orchard|keys|primitives) v'; then
-            echo "Zakura wallet crates entered the upstream graph"
+            echo "Zakura wallet crates entered the LRZ graph"
             exit 1
           fi
 
-          if cargo tree -p zcash_voting -e all --prefix none \
-            --no-default-features --features zakura --locked \
+          if cargo tree -p zcash_voting -e all --prefix none --locked \
             | grep -Eq '^(pczt|zcash_client_backend|zcash_client_sqlite|orchard|zcash_keys|zcash_primitives) v'; then
-            echo "Upstream wallet crates entered the Zakura graph"
+            echo "LRZ wallet crates entered the default Zakura graph"
             exit 1
           fi
 
@@ -185,8 +195,8 @@ jobs:
           ).strip()
           consumers = pathlib.Path(os.environ["CONSUMER_DIR"])
           dependencies = {
-              "upstream": f'zcash_voting = {{ package = "zcash_voting-lrz", git = "file://{root}", rev = "{revision}" }}',
-              "zakura": f'zcash_voting = {{ git = "file://{root}", rev = "{revision}", default-features = false, features = ["zakura"] }}',
+              "gemini": f'zcash_voting = {{ package = "zcash_voting-lrz", git = "file://{root}", rev = "{revision}", default-features = false, features = ["lrz"] }}',
+              "vizor": f'zcash_voting = {{ git = "file://{root}", rev = "{revision}" }}',
           }
           for name, dependency in dependencies.items():
               consumer = consumers / name
@@ -207,13 +217,13 @@ jobs:
                   "fn main() { let _ = std::mem::size_of::<VotingRoundParams>(); }\n"
               )
           PY
-          cargo generate-lockfile --manifest-path "$CONSUMER_DIR/upstream/Cargo.toml"
-          if grep -Eq '^name = "zakura-' "$CONSUMER_DIR/upstream/Cargo.lock"; then
-            echo "Zakura packages entered an external upstream consumer's lockfile"
+          cargo generate-lockfile --manifest-path "$CONSUMER_DIR/gemini/Cargo.toml"
+          if grep -Eq '^name = "zakura-' "$CONSUMER_DIR/gemini/Cargo.lock"; then
+            echo "Zakura packages entered Gemini's LRZ lockfile"
             exit 1
           fi
-          cargo metadata --manifest-path "$CONSUMER_DIR/upstream/Cargo.toml" \
-            --format-version 1 > "$CONSUMER_DIR/upstream/metadata.json"
+          cargo metadata --manifest-path "$CONSUMER_DIR/gemini/Cargo.toml" \
+            --format-version 1 > "$CONSUMER_DIR/gemini/metadata.json"
           python3 - <<'PY'
           import json
           import os
@@ -221,7 +231,7 @@ jobs:
 
           metadata_path = (
               pathlib.Path(os.environ["CONSUMER_DIR"])
-              / "upstream"
+              / "gemini"
               / "metadata.json"
           )
           metadata = json.loads(metadata_path.read_text())
@@ -237,12 +247,12 @@ jobs:
           }
           if packages or resolved:
               raise SystemExit(
-                  "Zakura packages entered external upstream Cargo metadata: "
+                  "Zakura packages entered Gemini's LRZ Cargo metadata: "
                   f"packages={sorted(packages)}, resolved={sorted(resolved)}"
               )
           PY
-          cargo check --manifest-path "$CONSUMER_DIR/upstream/Cargo.toml"
-          cargo check --manifest-path "$CONSUMER_DIR/zakura/Cargo.toml"
+          cargo check --manifest-path "$CONSUMER_DIR/gemini/Cargo.toml"
+          cargo check --manifest-path "$CONSUMER_DIR/vizor/Cargo.toml"
       - name: Package voting crates
         run: |
           cargo package -p zcash_voting --locked
@@ -258,8 +268,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
-      - name: Check workspace at MSRV
+      - name: Check packages at MSRV
         run: |
-          cargo check --workspace --all-targets \
-            --features test-fixtures,vote-commitment-tree-client/cli \
+          cargo check -p zcash_voting -p zcash-voting-wallet-example \
+            --all-targets --features test-fixtures \
+            --locked
+          cargo check -p zcash_voting -p zcash_voting-lrz \
+            -p zcash-voting-wallet-example --all-targets \
+            --no-default-features --features lrz \
+            --locked
+          cargo check -p vote-commitment-tree -p vote-commitment-tree-client \
+            --all-targets --features vote-commitment-tree-client/cli \
             --locked

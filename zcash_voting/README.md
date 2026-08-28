@@ -338,12 +338,11 @@ The crate no longer accepts root wallet seed material for delegation signing.
 ## Dependency notes
 
 This crate contains the canonical implementation and retains mutually
-exclusive `upstream`/`zakura` features. Its default is `upstream`; use
-`--no-default-features --features zakura` for the Zakura wallet-libraries
-family.
+exclusive `lrz`/`zakura` features. Its default is the Zakura wallet-libraries
+family; use `--no-default-features --features lrz` for upstream librustzcash.
 
 The separately published `zcash_voting-lrz` facade always selects this crate's
-`upstream` feature. Upstream consumers that need a minimal Cargo/Bazel graph
+`lrz` feature. LRZ consumers that need a minimal Cargo/Bazel graph
 should depend on that facade and may alias its package to the Rust crate name
 `zcash_voting`. With this crate behind the facade, it is transitive, so Cargo
 does not put its disabled optional Zakura dependencies into the consumer's

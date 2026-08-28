@@ -136,8 +136,7 @@ The workspace uses the published `voting-circuits 0.10.3` release.
 
 ## Dependency Strategy
 
-The default `upstream` feature keeps one Ironwood dependency stack for every
-workspace member:
+The LRZ backend uses one Ironwood dependency stack:
 
 - **`orchard 0.15`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths.
@@ -154,15 +153,15 @@ proving stack (`voting-crypto-deps` / VCT) via mutually exclusive
 `upstream`/`zakura` features; build with `--no-default-features --features
 zakura` on those crates for the Zakura VCT backend.
 
-The published `zcash_voting` crate retains mutually exclusive
-`upstream`/`zakura` features and contains the canonical implementation.
-The separately published `zcash_voting-lrz` facade always selects
-`zcash_voting/upstream`. Upstream consumers that need a minimal Cargo/Bazel
+The published `zcash_voting` crate contains the canonical implementation,
+defaults to Zakura, and exposes LRZ through a mutually exclusive `lrz`
+feature. The separately published `zcash_voting-lrz` facade selects
+`zcash_voting/lrz`. LRZ consumers that need a minimal Cargo/Bazel
 dependency graph should depend on that facade (and may alias it to the Rust
 crate name `zcash_voting`). Because the feature-selected implementation is
 then transitive, its disabled Zakura dependencies do not enter the consumer's
-lockfile or Cargo metadata. Zakura consumers depend directly on
-`zcash_voting` with `default-features = false` and `features = ["zakura"]`.
+lockfile or Cargo metadata. Zakura consumers such as Vizor depend directly on
+`zcash_voting` without feature flags.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.

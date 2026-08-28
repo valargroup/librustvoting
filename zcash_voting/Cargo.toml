@@ -9,8 +9,8 @@ repository = "https://github.com/valargroup/zcash_voting"
 readme = "README.md"
 
 [features]
-default = ["upstream"]
-upstream = [
+default = ["zakura"]
+lrz = [
     "voting-crypto-deps/upstream",
     "voting-circuits/upstream",
     "pir-client/upstream",

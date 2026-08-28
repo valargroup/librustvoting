@@ -135,15 +135,16 @@ Do not rewrite historical sections.
 Run:
 
 ```bash
-cargo check --workspace
-cargo test --workspace --locked
+cargo check
+cargo test --locked
 cargo test -p zcash_voting -p zcash-voting-wallet-example \
-  --all-targets --no-default-features \
-  --features zcash_voting/zakura,zcash-voting-wallet-example/zakura \
+  --all-targets --no-default-features --features lrz \
   --locked
 git diff --check
 ```
 
+Do not combine the Zakura-default and LRZ package sets in one Cargo
+invocation; their transitive cryptography features are mutually exclusive.
 Also run focused or feature-specific tests indicated by the changed code or
 repository documentation. Resolve failures before proceeding.
 

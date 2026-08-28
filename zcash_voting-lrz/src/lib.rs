@@ -1,7 +1,7 @@
-//! Upstream librustzcash facade for Zcash shielded voting.
+//! LRZ (upstream librustzcash) facade for Zcash shielded voting.
 //!
 //! The implementation lives in `zcash_voting`; this crate fixes its backend
-//! to the upstream librustzcash family.
+//! to the LRZ family through its `lrz` feature.
 
 pub use zcash_voting_impl::*;
 

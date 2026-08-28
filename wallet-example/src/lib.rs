@@ -1,13 +1,13 @@
-#[cfg(all(feature = "upstream", feature = "zakura"))]
-compile_error!("features `upstream` and `zakura` cannot be enabled together");
+#[cfg(all(feature = "lrz", feature = "zakura"))]
+compile_error!("features `lrz` and `zakura` cannot be enabled together");
 
-#[cfg(not(any(feature = "upstream", feature = "zakura")))]
-compile_error!("enable exactly one of the `upstream` or `zakura` features");
+#[cfg(not(any(feature = "lrz", feature = "zakura")))]
+compile_error!("enable exactly one of the `lrz` or `zakura` features");
 
 // The LRZ facade is bound to the name the rest of this crate uses. Under the
 // `zakura` feature, the direct `zcash_voting` dependency already has that
 // extern name and selects the implementation's Zakura backend.
-#[cfg(feature = "upstream")]
+#[cfg(feature = "lrz")]
 extern crate zcash_voting_lrz as zcash_voting;
 
 pub mod example_capability_handoff;
