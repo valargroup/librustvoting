@@ -416,6 +416,19 @@ pub fn pending_rounds(db: &VotingDb) -> Result<Vec<PendingShareRound>, VotingErr
     })
 }
 
+/// Re-reads whether one helper-share record is durably confirmed.
+pub(crate) fn is_confirmed(
+    db: &VotingDb,
+    params: &ShareDeliveryAttemptParams<'_>,
+) -> Result<bool, VotingError> {
+    db.share_is_confirmed(
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+    )
+}
+
 /// Marks one helper-share record confirmed.
 pub fn confirm(
     db: &VotingDb,

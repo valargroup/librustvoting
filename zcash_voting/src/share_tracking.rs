@@ -997,8 +997,16 @@ async fn resubmit_to_next_helper(
         };
         // An outcome-unknown helper is already durably journaled, so the
         // journal-before-dispatch invariant holds without a new attempting
-        // marker (which the guard would refuse).
-        if !is_ambiguous_retry && !share::begin_existing_delivery_attempt(db, &attempt)? {
+        // marker (which the guard would refuse). It still re-reads durable
+        // confirmation here so a concurrent confirmation after this pass's
+        // initial snapshot suppresses the re-POST just like the fresh-attempt
+        // guard below.
+        let may_dispatch = if is_ambiguous_retry {
+            !share::is_confirmed(db, &attempt)?
+        } else {
+            share::begin_existing_delivery_attempt(db, &attempt)?
+        };
+        if !may_dispatch {
             continue;
         }
         match client
@@ -3323,6 +3331,63 @@ mod tests {
         assert_eq!(stored.sent_to_urls, vec![helper(2)]);
         assert!(stored.ambiguous_urls.is_empty());
         assert_eq!(stored.submit_at, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_confirmation_stops_outcome_unknown_retry() {
+        let configured = helpers(2);
+        let db = Arc::new(db_with_delivery(&[], &[helper(2)], 2));
+        let share_id = share_id_of(&db);
+        let now = overdue();
+
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(2)
+            ),
+            json_status("pending"),
+        );
+        // The fresh helper refuses after another task confirms the share.
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(1)),
+            http_status(400),
+        );
+        // This response is intentionally queued: reaching it would reproduce
+        // the stale-snapshot bug by re-POSTing the outcome-unknown helper.
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(2)),
+            json_status("queued"),
+        );
+        let confirming_db = db.clone();
+        transport.observe_posts(move |url| {
+            if url.contains("helper-1") {
+                share::confirm(&confirming_db, ROUND_ID, 0, 1, 0).unwrap();
+            }
+        });
+
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, now, &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.resubmitted.is_empty());
+        assert!(report.ambiguous.is_empty());
+        assert_eq!(transport.call_count(&helper(1)), 1);
+        assert_eq!(transport.call_count(&helper(2)), 1, "status GET only");
+        assert_eq!(transport.call_count("/shares"), 1);
+        let stored = only_share(&db);
+        assert!(stored.confirmed);
+        assert!(stored.sent_to_urls.is_empty());
+        assert_eq!(stored.ambiguous_urls, vec![helper(2)]);
+        assert_eq!(stored.submit_at, SUBMIT_AT);
+        assert_eq!(report.next_delay_seconds, None);
     }
 
     #[tokio::test(start_paused = true)]

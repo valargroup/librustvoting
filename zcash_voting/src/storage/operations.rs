@@ -1910,6 +1910,26 @@ impl VotingDb {
         queries::pending_share_rounds(&conn, &wallet_id)
     }
 
+    /// Read the durable confirmation bit for one helper-share record.
+    pub(crate) fn share_is_confirmed(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+    ) -> Result<bool, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::share_is_confirmed(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+        )
+    }
+
     /// Mark a share delegation as confirmed on-chain.
     pub fn mark_share_confirmed(
         &self,

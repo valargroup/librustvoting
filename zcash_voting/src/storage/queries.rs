@@ -3788,6 +3788,35 @@ fn load_share_delegations(
     Ok(results)
 }
 
+/// Read the durable confirmation bit for one helper-share record.
+pub fn share_is_confirmed(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<bool, VotingError> {
+    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
+    conn.query_row(
+        "SELECT confirmed FROM share_delegations
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index AND proposal_id = :proposal_id
+           AND share_index = :share_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index,
+            ":proposal_id": proposal_id,
+            ":share_index": share_index,
+        },
+        |row| row.get(0),
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to read helper-share confirmation: {e}"),
+    })
+}
+
 /// Mark a share delegation as confirmed on-chain.
 pub fn mark_share_confirmed(
     conn: &Connection,

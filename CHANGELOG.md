@@ -114,9 +114,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Helper-share recovery now preserves delayed schedules during early
   replenishment, persists ambiguous attempts before contacting another helper,
   fills the complete placement deficit in one pass, and rechecks the vote-end
-  cutoff before every recovery POST. A helper that definitely fails is tried
-  at most once per pass, even while a multi-helper deficit is being filled,
-  and early replenishment never re-POSTs to a helper that already accepted.
+  cutoff and durable confirmation state before every recovery POST. A helper
+  that definitely fails is tried at most once per pass, even while a
+  multi-helper deficit is being filled, and early replenishment never re-POSTs
+  to a helper that already accepted.
 - Helper tracking now keeps outcome-unknown deliveries ambiguous unless the
   share is confirmed on-chain, uses the shared 30-second POST deadline,
   canonicalizes helper identities, preserves delivery history and desired
