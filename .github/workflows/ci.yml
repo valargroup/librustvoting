@@ -21,7 +21,7 @@ jobs:
           import subprocess
 
           tracked = subprocess.check_output(
-              ["git", "ls-files", "-z", "--", "*.rs", "*.sql", "Cargo.toml", "*/Cargo.toml", "Cargo.lock"]
+              ["git", "ls-files", "-z"]
           ).split(b"\0")
           for raw_path in tracked:
               if not raw_path:
@@ -41,9 +41,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: test-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*', '.cargo/config.toml') }}-${{ hashFiles('**/*.rs', '**/*.sql') }}
+          key: test-target-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*', '.cargo/config.toml') }}-${{ hashFiles('**/*.rs', '**/*.sql', '**/*.json') }}
           restore-keys: |
-            test-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*', '.cargo/config.toml') }}-
+            test-target-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*', '.cargo/config.toml') }}-
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.138
