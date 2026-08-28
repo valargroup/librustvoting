@@ -119,6 +119,7 @@ impl HelperResponse {
     pub fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
     }
+
     /// Returns true for a 2xx status.
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)

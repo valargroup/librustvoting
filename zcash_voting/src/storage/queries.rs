@@ -3403,7 +3403,8 @@ pub fn add_attempting_server(
     };
     let sent = canonical_stored_helper_urls(&parse(&sent_json, "sent_to_urls")?);
     let ambiguous = canonical_stored_helper_urls(&parse(&ambiguous_json, "ambiguous_urls")?);
-    let mut attempting = canonical_stored_helper_urls(&parse(&attempting_json, "attempting_urls")?);
+    let (mut attempting, legacy_attempting) =
+        partition_stored_helper_urls(&parse(&attempting_json, "attempting_urls")?);
     if confirmed
         || sent.contains(&server_url)
         || ambiguous.contains(&server_url)
@@ -3412,10 +3413,7 @@ pub fn add_attempting_server(
         return Ok(false);
     }
     attempting.push(server_url);
-    let attempting_json =
-        serde_json::to_string(&attempting).map_err(|e| VotingError::Internal {
-            message: format!("failed to serialize attempting_urls: {e}"),
-        })?;
+    let attempting_json = serialize_url_list(&attempting, &legacy_attempting, "attempting_urls")?;
     conn.execute(
         "UPDATE share_delegations SET attempting_urls = :attempting_urls
          WHERE round_id = :round_id AND wallet_id = :wallet_id
@@ -3471,12 +3469,9 @@ pub fn remove_attempting_server(
         serde_json::from_str(&attempting_json).map_err(|e| VotingError::Internal {
             message: format!("failed to deserialize attempting_urls: {e}"),
         })?;
-    let mut attempting = canonical_stored_helper_urls(&attempting);
+    let (mut attempting, legacy_attempting) = partition_stored_helper_urls(&attempting);
     attempting.retain(|candidate| candidate != &server_url);
-    let attempting_json =
-        serde_json::to_string(&attempting).map_err(|e| VotingError::Internal {
-            message: format!("failed to serialize attempting_urls: {e}"),
-        })?;
+    let attempting_json = serialize_url_list(&attempting, &legacy_attempting, "attempting_urls")?;
     conn.execute(
         "UPDATE share_delegations SET attempting_urls = :attempting_urls
          WHERE round_id = :round_id AND wallet_id = :wallet_id

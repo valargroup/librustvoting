@@ -63,7 +63,6 @@ pub struct WalletShareDelivery<'a> {
 pub struct WalletVoteExecutionRequest<'a> {
     pub vote_tx_hash: &'a str,
     pub vc_tree_position: u64,
-    pub share_deliveries: &'a [WalletShareDelivery<'a>],
 }
 
 /// Chain and helper-server payloads derived from a committed vote.
@@ -204,11 +203,11 @@ pub fn committed_vote_signed_commitment(
         .context("build signed vote commitment")
 }
 
-/// Persists successful vote-chain and helper-share submissions.
+/// Persists successful vote-chain submission fields.
 ///
-/// Call this after the vote transaction has been accepted and the caller has
-/// submitted helper shares. Confirmed helper responses are marked immediately;
-/// unconfirmed records remain available for retry and polling.
+/// Helper-share submission persists each attempt inside
+/// `CommittedVote::submit_share_to_helpers`; it is intentionally absent here
+/// so a wallet cannot accidentally record a post-hoc result twice.
 pub fn record_committed_vote_execution(
     voting_db: &VotingDb,
     committed: &CommittedVote,
@@ -220,22 +219,6 @@ pub fn record_committed_vote_execution(
     committed
         .record_vc_position(voting_db, request.vc_tree_position)
         .context("record vote commitment tree position")?;
-
-    for delivery in request.share_deliveries {
-        committed
-            .record_share_delivery(
-                voting_db,
-                delivery.share_index,
-                delivery.submission,
-                delivery.submit_at,
-            )
-            .context("record helper-share submission")?;
-        if delivery.confirmed {
-            committed
-                .confirm_share(voting_db, delivery.share_index)
-                .context("confirm helper-share submission")?;
-        }
-    }
 
     Ok(())
 }

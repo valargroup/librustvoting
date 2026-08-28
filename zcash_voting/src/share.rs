@@ -17,7 +17,7 @@ use crate::{
 
 /// Inputs for durably recording one helper-share fan-out.
 #[derive(Clone, Copy, Debug)]
-pub struct ShareDeliveryRecordParams<'a> {
+pub(crate) struct ShareDeliveryRecordParams<'a> {
     /// Round that owns the share.
     pub round_id: &'a str,
     /// Vote bundle that owns the share.
@@ -133,7 +133,7 @@ pub fn compute_nullifier(
 /// fails [`crate::helper::url::canonicalize_helper_base_url`]. Validate
 /// helper URLs with that function before delivering a share over the
 /// network, so an already-delivered share can always be recorded.
-pub fn record(
+pub(crate) fn record(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
@@ -169,7 +169,7 @@ pub fn record(
 /// [`crate::helper::url::canonicalize_helper_base_url`] — validate helper
 /// URLs before delivering over the network. Storage failures are returned
 /// unchanged.
-pub fn record_delivery(
+pub(crate) fn record_delivery(
     db: &VotingDb,
     params: &ShareDeliveryRecordParams<'_>,
 ) -> Result<(), VotingError> {
@@ -360,7 +360,7 @@ pub fn confirm(
 /// Returns [`VotingError::InvalidInput`] when any entry in `new_urls` fails
 /// [`crate::helper::url::canonicalize_helper_base_url`]; validate helper URLs
 /// before delivering over the network.
-pub fn add_sent_servers(
+pub(crate) fn add_sent_servers(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
