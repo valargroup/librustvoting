@@ -199,7 +199,7 @@ pub fn record(
 /// [`crate::helper::url::canonicalize_helper_base_url`] — validate helper
 /// URLs before delivering over the network. Storage failures are returned
 /// unchanged.
-pub(crate) fn record_delivery(
+fn record_delivery_impl(
     db: &VotingDb,
     params: &ShareDeliveryRecordParams<'_>,
 ) -> Result<(), VotingError> {
@@ -227,6 +227,50 @@ pub(crate) fn record_delivery(
         target_count,
         &nullifier,
         params.submit_at,
+    )
+}
+
+pub(crate) fn record_delivery(
+    db: &VotingDb,
+    params: &ShareDeliveryRecordParams<'_>,
+) -> Result<(), VotingError> {
+    record_delivery_impl(db, params)
+}
+
+/// Seeds complete helper-delivery metadata for integration-test fixtures.
+///
+/// This bypasses network dispatch and is unavailable without the
+/// `test-fixtures` feature. Production callers must use
+/// [`crate::vote::CommittedVote::submit_share_to_helpers`].
+#[cfg(feature = "test-fixtures")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn record_delivery_fixture(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    accepted_urls: &[String],
+    ambiguous_urls: &[String],
+    target_count: usize,
+    submit_at: u64,
+) -> Result<(), VotingError> {
+    let submission = ShareSubmissionReport {
+        accepted_urls: accepted_urls.to_vec(),
+        ambiguous_urls: ambiguous_urls.to_vec(),
+        target_count,
+    };
+    record_delivery_impl(
+        db,
+        &ShareDeliveryRecordParams {
+            round_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+            submission: &submission,
+            submit_at,
+        },
     )
 }
 
