@@ -327,7 +327,10 @@ that should stay consistent across SDKs:
 - 30-second helper POST attempts with bounded initial-delivery concurrency
 - half-fleet batch planning with independent entropy per share and balanced
   initial assignments across the ready helper pool; with ten ready helpers,
-  each receives eight shares, while retries remain liveness-first
+  each receives eight shares, while retries remain liveness-first. A pool with
+  no more ready helpers than the target widens one helper past the target so no
+  single helper is initially assigned every share of a commitment unless the
+  configured fleet contains only one helper
 - resubmission ordering with untried helpers before already-sent helpers
 - share tracking summaries, readiness checks, retry thresholds, and polling delay
 

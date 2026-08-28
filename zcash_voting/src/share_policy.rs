@@ -729,13 +729,19 @@ pub fn plan_share_submissions(
 /// `ranked_server_urls` contains ready helpers first in response order, then
 /// every remaining configured helper in stable order. `preferred_server_count`
 /// is the number of ready helpers in that prefix. When fewer than the target
-/// are ready, the planner includes enough fallback helpers to return a complete
-/// plan. For a complete 16-share commitment, targets are balanced across the
-/// planning pool and use independent caller-provided entropy for tie-breaking.
+/// are ready, the planner includes enough fallback helpers to return a
+/// complete plan — one more than the target, so that even a degraded pool
+/// never hands any single helper every share. For a complete 16-share
+/// commitment, targets are balanced across the planning pool and use
+/// independent caller-provided entropy for tie-breaking.
 /// The fleet-derived balanced maximum from [`share_server_selection_policy`] is
 /// guaranteed when the planning pool has at least that policy's
-/// `min_server_count` and is best effort for smaller pools. Recovery is outside
-/// this initial-only contract and may use any configured helper.
+/// `min_server_count` and is best effort for smaller pools; even then, every
+/// planning-pool helper is omitted from at least one share whenever more than
+/// `target_count` helpers are configured. Full coverage of one helper can
+/// occur only for a one-helper fleet. One omission bounds a single helper's
+/// view, not the combined view of colluding helpers. Recovery is outside this
+/// initial-only contract and may use any configured helper.
 pub fn plan_share_submissions_with_preferred_servers(
     share_count: usize,
     ranked_server_urls: &[String],
@@ -794,9 +800,16 @@ pub fn plan_share_submissions_with_preferred_servers(
     }
 
     let target_count = share_submission_target_count(ranked_server_urls.len());
-    let planning_server_count = preferred_server_count
-        .max(target_count)
-        .min(ranked_server_urls.len());
+    // A ready pool at or below the per-share target is widened one helper past
+    // the target: a pool of exactly `target_count` would hand every pool helper
+    // all 16 shares, while one extra fallback keeps every pool helper omitted
+    // from at least one share whenever the fleet allows it.
+    let planning_server_count = if preferred_server_count > target_count {
+        preferred_server_count
+    } else {
+        target_count + 1
+    }
+    .min(ranked_server_urls.len());
     let planning_servers = &ranked_server_urls[..planning_server_count];
     let mut server_usage = HashMap::<String, usize>::new();
 
@@ -1914,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_pool_adds_fallbacks_to_reach_target() {
+    fn preferred_pool_widens_past_target_for_omission() {
         let servers: Vec<String> = (0..10)
             .map(|index| format!("https://helper-{index}.example.com"))
             .collect();
@@ -1938,13 +1951,102 @@ mod tests {
         )
         .unwrap();
 
+        // A degraded pool widens to target + 1, never to exactly the target:
+        // a pool of 5 would hand each pool helper every share.
         assert!(plans.iter().all(|plan| {
             plan.target_servers.len() == 5
                 && plan
                     .target_servers
                     .iter()
-                    .all(|server| servers[..5].contains(server))
+                    .all(|server| servers[..6].contains(server))
         }));
+    }
+
+    #[test]
+    fn every_pool_helper_is_omitted_from_at_least_one_share() {
+        let servers: Vec<String> = (0..10)
+            .map(|index| format!("https://helper-{index}.example.com"))
+            .collect();
+        let server_random_bytes = vec![
+            0;
+            VOTE_COMMITMENT_SHARE_COUNT
+                * share_server_order_random_bytes_required(servers.len())
+        ];
+
+        let plans = plan_share_submissions_with_preferred_servers(
+            VOTE_COMMITMENT_SHARE_COUNT,
+            &servers,
+            3,
+            1_000,
+            2_000,
+            None,
+            false,
+            None,
+            &[],
+            &server_random_bytes,
+        )
+        .unwrap();
+
+        let mut usage = HashMap::<&String, usize>::new();
+        for plan in &plans {
+            for server in &plan.target_servers {
+                *usage.entry(server).or_default() += 1;
+            }
+        }
+        assert!(
+            usage
+                .values()
+                .all(|count| *count < VOTE_COMMITMENT_SHARE_COUNT),
+            "no helper may receive every share of a commitment: {usage:?}"
+        );
+    }
+
+    #[test]
+    fn preferred_pool_equal_to_target_widens_for_omission() {
+        for (server_count, target_count) in [(2, 1), (3, 2)] {
+            let servers: Vec<String> = (0..server_count)
+                .map(|index| format!("https://helper-{index}.example.com"))
+                .collect();
+            let server_random_bytes =
+                vec![
+                    0;
+                    VOTE_COMMITMENT_SHARE_COUNT
+                        * share_server_order_random_bytes_required(servers.len())
+                ];
+
+            let plans = plan_share_submissions_with_preferred_servers(
+                VOTE_COMMITMENT_SHARE_COUNT,
+                &servers,
+                target_count,
+                1_000,
+                2_000,
+                None,
+                false,
+                None,
+                &[],
+                &server_random_bytes,
+            )
+            .unwrap();
+
+            let mut usage = HashMap::<&String, usize>::new();
+            for plan in &plans {
+                assert_eq!(plan.target_servers.len(), target_count);
+                for server in &plan.target_servers {
+                    *usage.entry(server).or_default() += 1;
+                }
+            }
+            assert_eq!(
+                usage.len(),
+                server_count,
+                "the fallback helper must enter the pool"
+            );
+            assert!(
+                usage
+                    .values()
+                    .all(|count| *count < VOTE_COMMITMENT_SHARE_COUNT),
+                "no helper may receive every share of a commitment: {usage:?}"
+            );
+        }
     }
 
     #[test]

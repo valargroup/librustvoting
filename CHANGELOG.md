@@ -80,6 +80,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Initial share delivery continues to target half the configured fleet, rounded
   up, while balancing a complete commitment across the ready helper pool.
   Retries may exceed the initial distribution for liveness.
+- A ready helper pool no larger than the per-share target now plans across
+  `target_count + 1` helpers instead of exactly the target, so every
+  planning-pool helper is omitted from at least one of a commitment's 16
+  initial shares whenever the configured fleet has an alternative.
 
 ## v3.1.0-rc.11
 
