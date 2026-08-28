@@ -3592,8 +3592,7 @@ pub(crate) fn record_share_delegation(
          sent_to_urls = excluded.sent_to_urls, \
          ambiguous_urls = excluded.ambiguous_urls, \
          attempting_urls = excluded.attempting_urls, \
-         target_count = excluded.target_count, \
-         submit_at = excluded.submit_at \
+         target_count = excluded.target_count \
          WHERE share_delegations.nullifier = excluded.nullifier",
         named_params! {
             ":round_id": round_id,

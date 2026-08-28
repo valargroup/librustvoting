@@ -14,8 +14,10 @@
 //! Helper responses are authenticated only by the host transport's connection
 //! to configured endpoints. They are not chain proofs. This module requires
 //! matching `confirmed` replies from two distinct currently configured helpers
-//! before persisting confirmation. The configured helper fleet is therefore a
-//! trusted quorum for the share nullifier's global on-chain state.
+//! before persisting confirmation when the fleet has at least two members. A
+//! one-helper fleet necessarily uses its only configured helper. The configured
+//! fleet is therefore the trusted quorum for the share nullifier's global
+//! on-chain state.
 
 use std::{
     collections::HashSet,
@@ -159,7 +161,8 @@ pub(crate) struct InitialShareSubmissionParams<'a> {
     pub proposal_id: u32,
     pub share_index: u32,
     pub share_wire_json: &'a str,
-    pub candidate_servers: &'a [String],
+    pub planned_servers: &'a [String],
+    pub fallback_servers: &'a [String],
     pub target_count: usize,
     pub submit_at: u64,
     pub now_seconds: u64,
@@ -223,6 +226,10 @@ async fn poll_share_helpers(
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> ShareStatusOutcome {
     const REQUIRED_CONFIRMATIONS: usize = 2;
+    let required_confirmations = REQUIRED_CONFIRMATIONS.min(server_urls.len());
+    if required_confirmations == 0 {
+        return ShareStatusOutcome::NotConfirmed;
+    }
     let mut confirmations = 0usize;
     for server_url in client.health().candidate_servers(server_urls, now_seconds) {
         if cancel() {
@@ -234,7 +241,7 @@ async fn poll_share_helpers(
         {
             Ok(ShareStatus::Confirmed) => {
                 confirmations += 1;
-                if confirmations == REQUIRED_CONFIRMATIONS {
+                if confirmations == required_confirmations {
                     return ShareStatusOutcome::Confirmed;
                 }
             }
@@ -286,7 +293,19 @@ pub(crate) async fn submit_share_to_helpers(
     })?;
     // The fleet is part of the request contract. Validate it before creating
     // or merging any durable row so invalid input is storage-atomic.
-    let candidates = canonical_helper_url_list(params.candidate_servers)?;
+    let planned = canonical_helper_url_list(params.planned_servers)?;
+    let fallback = canonical_helper_url_list(params.fallback_servers)?;
+    if planned.len() != params.planned_servers.len()
+        || fallback.len() != params.fallback_servers.len()
+        || fallback.iter().any(|url| planned.contains(url))
+    {
+        return Err(VotingError::InvalidInput {
+            message: "planned and fallback helper groups must contain distinct canonical helpers"
+                .to_string(),
+        });
+    }
+    let planned_set: HashSet<&str> = planned.iter().map(String::as_str).collect();
+    let candidates = planned.iter().chain(&fallback).cloned().collect::<Vec<_>>();
     let empty = ShareSubmissionReport {
         target_count: params.target_count,
         ..ShareSubmissionReport::default()
@@ -337,9 +356,21 @@ pub(crate) async fn submit_share_to_helpers(
         if cancel() {
             break;
         }
+        let active_group = if remaining
+            .iter()
+            .any(|url| planned_set.contains(url.as_str()))
+        {
+            remaining
+                .iter()
+                .filter(|url| planned_set.contains(url.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            remaining.clone()
+        };
         let ordered = client
             .health()
-            .candidate_servers(&remaining, params.now_seconds);
+            .candidate_servers(&active_group, params.now_seconds);
         let Some(server_url) = ordered.into_iter().next() else {
             break;
         };
@@ -514,7 +545,8 @@ pub(crate) async fn submit_committed_share_to_helpers(
             proposal_id,
             share_index: request.share_index,
             share_wire_json: &share_wire_json,
-            candidate_servers: &candidates,
+            planned_servers: &candidates[..planned_target],
+            fallback_servers: &candidates[planned_target..],
             target_count: planned_target,
             submit_at: request.plan.submit_at,
             now_seconds: request.now_seconds,
@@ -587,11 +619,12 @@ async fn submit_share_to_helpers_unrecorded(
 /// For each unconfirmed share, in persisted order:
 ///
 /// 1. Compute [`ShareTrackingFlags`] and the configured definite placement.
-/// 2. When ready, poll definite and ambiguous helpers for on-chain
+/// 2. When ready, poll the current configured fleet for global on-chain
 ///    confirmation. `pending` never proves helper possession, so ambiguous
 ///    attempts remain ambiguous.
-/// 3. When two distinct configured helpers report confirmation, persist it
-///    with [`share::confirm`] and move on.
+/// 3. When two distinct configured helpers report confirmation—or the only
+///    configured helper in a one-helper fleet does—persist it with
+///    [`share::confirm`] and move on.
 /// 4. Before the vote-end cutoff, when overdue or below the desired placement,
 ///    walk a health-aware randomized resubmission order and durably retain each
 ///    attempt before contacting another helper. Early replenishment preserves
@@ -683,14 +716,13 @@ async fn track_pending_shares_with_elapsed(
             continue;
         }
 
-        let polled_urls = dedupe_preserving_order(accepted.iter().chain(ambiguous.iter()).cloned());
-        if flags.ready_for_status_check && !polled_urls.is_empty() {
+        if flags.ready_for_status_check && !configured_urls.is_empty() {
             let share_id = hex::encode(&share.nullifier);
             let poll = poll_share_helpers(
                 client,
                 params.round_id,
                 &share_id,
-                &polled_urls,
+                &configured_urls,
                 current_time,
                 cancel,
             )
@@ -986,6 +1018,7 @@ async fn resubmit_to_next_helper(
         }
         attempted_urls.push(server_url.clone());
         let is_ambiguous_retry = ambiguous.contains(server_url.as_str());
+        let is_accepted_retry = accepted.contains(server_url.as_str());
         let attempt = share::ShareDeliveryAttemptParams {
             round_id: params.round_id,
             bundle_index: share.bundle_index,
@@ -995,13 +1028,11 @@ async fn resubmit_to_next_helper(
             target_count: usize::try_from(share.target_count).unwrap_or(usize::MAX),
             submit_at: request.schedule.submit_at(),
         };
-        // An outcome-unknown helper is already durably journaled, so the
-        // journal-before-dispatch invariant holds without a new attempting
-        // marker (which the guard would refuse). It still re-reads durable
-        // confirmation here so a concurrent confirmation after this pass's
-        // initial snapshot suppresses the re-POST just like the fresh-attempt
-        // guard below.
-        let may_dispatch = if is_ambiguous_retry {
+        // Outcome-unknown and previously accepted helpers are already durably
+        // journaled, so the journal-before-dispatch invariant holds without a
+        // new attempting marker (which the guard would refuse). Re-read
+        // confirmation immediately before either last-resort re-POST.
+        let may_dispatch = if is_ambiguous_retry || is_accepted_retry {
             !share::is_confirmed(db, &attempt)?
         } else {
             share::begin_existing_delivery_attempt(db, &attempt)?
@@ -1025,6 +1056,9 @@ async fn resubmit_to_next_helper(
                     ambiguous_urls,
                 });
             }
+            // A weaker outcome from a recovery re-POST cannot downgrade the
+            // durable acceptance established by the original request.
+            Err(error) if error.is_ambiguous() && is_accepted_retry => {}
             Err(error) if error.is_ambiguous() => {
                 share::resolve_delivery_attempt(
                     db,
@@ -1122,7 +1156,7 @@ mod tests {
 
     use crate::helper::{
         client::{HelperClient, HelperClientConfig},
-        health::HelperHealth,
+        health::{HelperHealth, HELPER_FAILURE_THRESHOLD},
         transport::{
             HelperFuture, HelperResponse, HelperTransport, HelperTransportError,
             MAX_HELPER_RESPONSE_BYTES,
@@ -1370,6 +1404,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn one_helper_fleet_uses_its_only_available_confirmation() {
+        let round_id = "ab".repeat(32);
+        let share_id = "cd".repeat(32);
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{round_id}/{share_id}",
+                helper(1)
+            ),
+            json_status("confirmed"),
+        );
+
+        let client = client_with(transport.clone());
+        let outcome = poll_share_helpers(
+            &client,
+            &round_id,
+            &share_id,
+            &helpers(1),
+            1_000,
+            &never_cancel(),
+        )
+        .await;
+
+        assert_eq!(outcome, ShareStatusOutcome::Confirmed);
+        assert_eq!(transport.calls().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn every_helper_pending_reports_not_confirmed() {
         let round_id = "ab".repeat(32);
         let share_id = "cd".repeat(32);
@@ -1443,6 +1505,35 @@ mod tests {
 
         assert_eq!(outcome, ShareStatusOutcome::Cancelled);
         assert_eq!(transport.call_count(&helper(2)), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_after_final_failed_poll_is_propagated() {
+        let round_id = "ab".repeat(32);
+        let share_id = "cd".repeat(32);
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{round_id}/{share_id}",
+                helper(1)
+            ),
+            http_status(400),
+        );
+        let cancel_after_request = || transport.call_count(&helper(1)) > 0;
+
+        let client = client_with(transport.clone());
+        let outcome = poll_share_helpers(
+            &client,
+            &round_id,
+            &share_id,
+            &helpers(1),
+            1_000,
+            &cancel_after_request,
+        )
+        .await;
+
+        assert_eq!(outcome, ShareStatusOutcome::Cancelled);
+        assert_eq!(client.health().failure_count(&helper(1)), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2210,7 +2301,8 @@ mod tests {
             proposal_id: 1,
             share_index: 0,
             share_wire_json: r#"{"share_index":0}"#,
-            candidate_servers: servers,
+            planned_servers: servers,
+            fallback_servers: &[],
             target_count: 1,
             submit_at: SUBMIT_AT,
             now_seconds: SUBMIT_AT + 1,
@@ -2287,7 +2379,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn committed_vote_submission_derives_wire_identity_and_uses_planned_targets_first() {
+    async fn committed_vote_submission_keeps_degraded_planned_target_before_healthy_fallback() {
         let db = db_with_recoverable_vote();
         let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
         db.conn()
@@ -2311,7 +2403,11 @@ mod tests {
         let post_url = format!("{}/shielded-vote/v1/shares", helper(2));
         let transport = Arc::new(MockTransport::default());
         transport.queue_post(&post_url, json_status("queued"));
-        let client = client_with(transport.clone());
+        let health = HelperHealth::default();
+        for _ in 0..HELPER_FAILURE_THRESHOLD {
+            health.record_failure(&helper(2), SUBMIT_AT);
+        }
+        let client = HelperClient::new(transport.clone(), health);
 
         let report = committed
             .submit_share_to_helpers(
@@ -2340,6 +2436,55 @@ mod tests {
         assert_eq!(stored.proposal_id, 1);
         assert_eq!(stored.share_index, 0);
         assert_eq!(stored.sent_to_urls, vec![helper(2)]);
+        assert_eq!(transport.call_count(&helper(1)), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_committed_submission_preserves_the_original_schedule() {
+        let db = db_with_recoverable_vote();
+        let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+        let configured = helpers(2);
+        let first_plan = ShareSubmissionPlan {
+            immediate: false,
+            submit_at: 4_321,
+            target_count: 1,
+            target_servers: vec![helper(1)],
+        };
+        let second_plan = ShareSubmissionPlan {
+            immediate: false,
+            submit_at: 9_876,
+            target_count: 1,
+            target_servers: vec![helper(2)],
+        };
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(1)),
+            json_status("queued"),
+        );
+        let client = client_with(transport.clone());
+
+        for plan in [&first_plan, &second_plan] {
+            committed
+                .submit_share_to_helpers(
+                    &db,
+                    &client,
+                    ShareSubmissionRequest {
+                        share_index: 0,
+                        plan,
+                        configured_server_urls: &configured,
+                        now_seconds: SUBMIT_AT,
+                    },
+                    &never_cancel(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let stored = only_share(&db);
+        assert_eq!(stored.submit_at, first_plan.submit_at);
+        assert_eq!(stored.sent_to_urls, vec![helper(1)]);
+        assert_eq!(transport.call_count(&helper(1)), 1);
+        assert_eq!(transport.call_count(&helper(2)), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2699,6 +2844,97 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn two_helper_fleet_polls_beyond_its_single_placement() {
+        let configured = helpers(2);
+        let db = db_with_delivery(&[helper(1)], &[], 1);
+        let share_id = share_id_of(&db);
+        let transport = Arc::new(MockTransport::default());
+        for index in 1..=2 {
+            transport.queue_get(
+                &format!(
+                    "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                    helper(index)
+                ),
+                json_status("confirmed"),
+            );
+        }
+
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, ready_not_overdue(), &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.confirmed.len(), 1);
+        assert!(only_share(&db).confirmed);
+        assert_eq!(transport.call_count(&helper(1)), 1);
+        assert_eq!(transport.call_count(&helper(2)), 1);
+        assert_eq!(transport.call_count("/shares"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_confirmation_does_not_suppress_under_placement_recovery() {
+        let configured = helpers(3);
+        let db = db_with_delivery(&[helper(1)], &[], 2);
+        let share_id = share_id_of(&db);
+        let post_url = format!("{}/shielded-vote/v1/shares", helper(2));
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(1)
+            ),
+            json_status("confirmed"),
+        );
+        for index in 2..=3 {
+            transport.queue_get(
+                &format!(
+                    "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                    helper(index)
+                ),
+                json_status("pending"),
+            );
+        }
+        transport.queue_post(&post_url, json_status("queued"));
+
+        let client = client_with(transport.clone());
+        let random = preserve_two_server_order;
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, ready_not_overdue(), &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.confirmed.is_empty());
+        assert_eq!(
+            report.resubmitted,
+            vec![ResubmittedShare {
+                share: ShareKey {
+                    bundle_index: 0,
+                    proposal_id: 1,
+                    share_index: 0,
+                },
+                server_url: helper(2),
+            }]
+        );
+        let stored = only_share(&db);
+        assert!(!stored.confirmed);
+        assert_eq!(stored.sent_to_urls, vec![helper(1), helper(2)]);
+        assert_eq!(stored.submit_at, SUBMIT_AT);
+        assert_eq!(transport.call_count("share-status"), 3);
+        assert_eq!(transport.call_count("/shares"), 1);
+        assert_eq!(transport.posted_submit_at(&post_url), SUBMIT_AT);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn overdue_share_reaches_an_untried_helper_and_records_it() {
         let configured = helpers(2);
         let db = db_with_share(&[helper(1)]);
@@ -2710,6 +2946,13 @@ mod tests {
             &format!(
                 "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
                 helper(1)
+            ),
+            json_status("pending"),
+        );
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(2)
             ),
             json_status("pending"),
         );
@@ -2750,6 +2993,92 @@ mod tests {
             transport.posted_submit_at(&format!("{}/shielded-vote/v1/shares", helper(2))),
             0
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overdue_recovery_reposts_to_accepted_helper_after_untried_helpers_fail() {
+        let configured = helpers(2);
+        let db = db_with_delivery(&[helper(1)], &[], 1);
+        let share_id = share_id_of(&db);
+        let transport = Arc::new(MockTransport::default());
+        for index in 1..=2 {
+            transport.queue_get(
+                &format!(
+                    "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                    helper(index)
+                ),
+                json_status("pending"),
+            );
+        }
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(2)),
+            http_status(400),
+        );
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(1)),
+            json_status("duplicate"),
+        );
+
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, overdue(), &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.resubmitted.len(), 1);
+        assert_eq!(report.resubmitted[0].server_url, helper(1));
+        assert_eq!(transport.call_count("/shares"), 2);
+        assert_eq!(only_share(&db).sent_to_urls, vec![helper(1)]);
+        assert_eq!(only_share(&db).submit_at, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_accepted_helper_retry_preserves_the_stronger_delivery_state() {
+        let configured = helpers(2);
+        let db = db_with_delivery(&[helper(1)], &[], 1);
+        let share_id = share_id_of(&db);
+        let transport = Arc::new(MockTransport::default());
+        for index in 1..=2 {
+            transport.queue_get(
+                &format!(
+                    "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                    helper(index)
+                ),
+                json_status("pending"),
+            );
+        }
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(2)),
+            http_status(400),
+        );
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(1)),
+            http_status(503),
+        );
+
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, overdue(), &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.resubmitted.is_empty());
+        assert!(report.ambiguous.is_empty());
+        assert_eq!(transport.call_count("/shares"), 2);
+        let stored = only_share(&db);
+        assert_eq!(stored.sent_to_urls, vec![helper(1)]);
+        assert!(stored.ambiguous_urls.is_empty());
+        assert_eq!(stored.submit_at, SUBMIT_AT);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3344,6 +3673,13 @@ mod tests {
         transport.queue_get(
             &format!(
                 "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(1)
+            ),
+            json_status("pending"),
+        );
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
                 helper(2)
             ),
             json_status("pending"),
@@ -3379,8 +3715,13 @@ mod tests {
 
         assert!(report.resubmitted.is_empty());
         assert!(report.ambiguous.is_empty());
-        assert_eq!(transport.call_count(&helper(1)), 1);
+        assert_eq!(
+            transport.call_count(&helper(1)),
+            2,
+            "status GET plus recovery POST"
+        );
         assert_eq!(transport.call_count(&helper(2)), 1, "status GET only");
+        assert_eq!(transport.call_count("share-status"), 2);
         assert_eq!(transport.call_count("/shares"), 1);
         let stored = only_share(&db);
         assert!(stored.confirmed);

@@ -95,10 +95,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   and health-ordering time; the crate derives the durable identity, confirmed
   VC-tree position, wire payload, target, and schedule. Raw submission and
   post-hoc delivery mutators are crate-private.
-- **Breaking:** helper confirmation now requires matching responses from two
-  distinct currently configured helpers. `track_pending_shares` encapsulates
-  that quorum and persists confirmation before returning it in `confirmed`;
-  hosts no longer implement confirmation polling or persistence separately.
+- **Breaking:** helper confirmation now polls the complete current configured
+  fleet and requires matching responses from two distinct helpers whenever at
+  least two are configured. A one-helper fleet uses its only available
+  confirmation. `track_pending_shares` encapsulates that quorum and persists
+  confirmation before returning it in `confirmed`; hosts no longer implement
+  confirmation polling or persistence separately.
 - `HelperClientConfig` now uses validated builders for nonzero deadlines and at
   most two nonzero retry delays.
 - **Breaking:** removed `HELPER_PREFLIGHT_TIMEOUT_SECONDS`; the client's
@@ -118,6 +120,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   that definitely fails is tried at most once per pass, even while a
   multi-helper deficit is being filled, and early replenishment never re-POSTs
   to a helper that already accepted.
+- Overdue recovery now reaches its documented previously accepted fallback
+  after untried and outcome-unknown helpers fail, using the existing durable
+  acceptance as its journal entry before the duplicate-safe immediate re-POST.
+- Repeated initial submission preserves the first durable `submit_at`, so a
+  newly recomputed planner result cannot replace the schedule already sent to
+  a helper. Only overdue recovery resets the schedule to zero.
 - Helper tracking now keeps outcome-unknown deliveries ambiguous unless the
   share is confirmed on-chain, uses the shared 30-second POST deadline,
   canonicalizes helper identities, preserves delivery history and desired
@@ -142,10 +150,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Helper clients now enforce deadlines, response-size limits, and JSON content
   types around custom transports, including transports that ignore their
   supplied timeout. Successful responses expose content-type metadata through
-  `HelperResponse`.
-- One helper confirmation claim can no longer suppress durable recovery; two
-  distinct currently configured helpers must agree before the crate persists
-  confirmation.
+  `HelperResponse`; oversized non-2xx bodies are rejected before diagnostic
+  string conversion without losing HTTP retry or ambiguity classification.
+- Initial delivery keeps planned and fallback helpers in separate health-ranked
+  groups, so a healthy fallback cannot bypass a degraded planned assignment.
+- Cancellation observed after a failed final or non-retryable helper request
+  is returned as cancellation and is not scored as a helper failure.
+- In fleets with at least two helpers, one confirmation claim can no longer
+  suppress durable recovery; two distinct currently configured helpers must
+  agree before the crate persists confirmation.
 - Initial helper payloads use the durably confirmed VC-tree position, not the
   draft position retained in the committed share payload.
 

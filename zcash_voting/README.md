@@ -53,9 +53,10 @@ precompute → delegate → vote → share lifecycle:
    shares, and call `CommittedVote::submit_share_to_helpers`. The crate
    reconstructs each wire payload with the durable confirmed VC position and
    journals every delivery attempt before dispatch. `track_pending_shares`
-   requires two distinct currently configured helpers to report confirmation
-   and persists the result internally. `Decision::Skipped` is terminal, so
-   `open_proposals`
+   polls the complete current fleet and requires two distinct confirmations
+   when at least two helpers are configured; a one-helper fleet uses its only
+   available confirmation. The result is persisted internally.
+   `Decision::Skipped` is terminal, so `open_proposals`
    contains only proposals that have no recorded decision.
 
 ## Crate layout

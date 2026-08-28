@@ -5478,6 +5478,10 @@ mod tests {
         );
         assert_eq!(rerecorded.ambiguous_urls, vec!["https://helper-d.example"]);
         assert_eq!(rerecorded.target_count, 2);
+        assert_eq!(
+            rerecorded.submit_at, 2000,
+            "resumed fan-out must preserve the originally delivered schedule"
+        );
 
         // Confirm share 0
         db.mark_share_confirmed(ROUND_ID, 0, 0, 0).unwrap();
@@ -5517,7 +5521,8 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        // Re-record a confirmed share (e.g. recovery path) — confirmed must be preserved
+        // Re-record a confirmed share (e.g. recovery path) — confirmation and
+        // the originally delivered schedule must both be preserved.
         db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &nf, 3000)
             .unwrap();
         let all = db.get_share_delegations(ROUND_ID).unwrap();
@@ -5526,7 +5531,7 @@ mod tests {
             share0.confirmed,
             "ON CONFLICT must preserve confirmed status"
         );
-        assert_eq!(share0.submit_at, 3000, "submit_at should be updated");
+        assert_eq!(share0.submit_at, 1000, "submit_at must remain write-once");
 
         // Confirm non-existent share — should error
         let err = db.mark_share_confirmed(ROUND_ID, 0, 99, 0);
