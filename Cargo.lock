@@ -3357,7 +3357,7 @@ dependencies = [
 [[package]]
 name = "zakura-client-backend"
 version = "0.1.0-rc3"
-source = "git+https://github.com/zakura-core/wallet-libraries?rev=e875e7446235ec5b0f0e3a8fdbd29272f2a25e07#e875e7446235ec5b0f0e3a8fdbd29272f2a25e07"
+source = "git+https://github.com/zakura-core/wallet-libraries?rev=0fdefd93cad9f1ed420e1164b186d5ccac4d2122#0fdefd93cad9f1ed420e1164b186d5ccac4d2122"
 dependencies = [
  "base64",
  "bech32",
@@ -3405,7 +3405,7 @@ dependencies = [
 [[package]]
 name = "zakura-client-sqlite"
 version = "0.1.0-rc3"
-source = "git+https://github.com/zakura-core/wallet-libraries?rev=e875e7446235ec5b0f0e3a8fdbd29272f2a25e07#e875e7446235ec5b0f0e3a8fdbd29272f2a25e07"
+source = "git+https://github.com/zakura-core/wallet-libraries?rev=0fdefd93cad9f1ed420e1164b186d5ccac4d2122#0fdefd93cad9f1ed420e1164b186d5ccac4d2122"
 dependencies = [
  "bitflags 2.13.1",
  "bs58",
@@ -3609,7 +3609,7 @@ dependencies = [
 [[package]]
 name = "zakura-pczt"
 version = "0.1.0-rc1"
-source = "git+https://github.com/zakura-core/wallet-libraries?rev=e875e7446235ec5b0f0e3a8fdbd29272f2a25e07#e875e7446235ec5b0f0e3a8fdbd29272f2a25e07"
+source = "git+https://github.com/zakura-core/wallet-libraries?rev=0fdefd93cad9f1ed420e1164b186d5ccac4d2122#0fdefd93cad9f1ed420e1164b186d5ccac4d2122"
 dependencies = [
  "blake2b_simd",
  "document-features",
@@ -3745,16 +3745,29 @@ dependencies = [
 [[package]]
 name = "zakura-wallet-lib"
 version = "0.1.0-rc3"
-source = "git+https://github.com/zakura-core/wallet-libraries?rev=e875e7446235ec5b0f0e3a8fdbd29272f2a25e07#e875e7446235ec5b0f0e3a8fdbd29272f2a25e07"
+source = "git+https://github.com/zakura-core/wallet-libraries?rev=0fdefd93cad9f1ed420e1164b186d5ccac4d2122#0fdefd93cad9f1ed420e1164b186d5ccac4d2122"
 dependencies = [
  "orchard",
  "pczt",
+ "zakura-bellman",
+ "zakura-bls12-381",
  "zakura-client-backend",
  "zakura-client-sqlite",
+ "zakura-halo2-gadgets",
+ "zakura-halo2-legacy-pdqsort",
+ "zakura-halo2-poseidon",
+ "zakura-halo2-proofs",
+ "zakura-jubjub",
  "zakura-keys",
  "zakura-orchard",
+ "zakura-pairing",
+ "zakura-pasta-curves",
  "zakura-pczt",
  "zakura-primitives",
+ "zakura-reddsa",
+ "zakura-redjubjub",
+ "zakura-sapling-crypto",
+ "zakura-sinsemilla",
  "zcash_client_backend",
  "zcash_client_sqlite",
  "zcash_keys",
