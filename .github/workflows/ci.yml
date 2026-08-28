@@ -141,12 +141,14 @@ jobs:
         with:
           tool: cargo-nextest@0.9.138
       - name: Test Zakura wallet stack
+        # One invocation: nextest exits with an error on a run with zero
+        # tests, and zcash-voting-wallet-example alone has none (it's an
+        # example crate, no [[test]]/[[example]] of its own — see the
+        # comment in zcash_voting-zakura/Cargo.toml). zcash_voting-zakura's
+        # 592 lib unit tests keep the combined run non-empty; --all-targets
+        # only matters for the example crate.
         run: |
-          # zcash_voting-zakura has no [[test]]/[[example]] of its own — see
-          # the comment in its Cargo.toml — so this covers only the shared
-          # library's unit tests; --all-targets is for the example crate.
-          cargo nextest run -p zcash_voting-zakura --lib --locked
-          cargo nextest run -p zcash-voting-wallet-example \
+          cargo nextest run -p zcash_voting-zakura -p zcash-voting-wallet-example \
             --all-targets --no-default-features --features zakura --locked
       - name: Check wallet backend contracts
         run: |
