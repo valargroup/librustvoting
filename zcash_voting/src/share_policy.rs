@@ -50,6 +50,12 @@ pub const SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS: u64 = 30_000;
 pub const SHARE_HELPER_POST_TIMEOUT_MILLISECONDS: u64 = 30_000;
 /// Maximum time for initial share delivery before recovery takes over.
 pub const SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS: u64 = 60_000;
+/// Minimum delivery budget required to start another initial POST attempt.
+///
+/// An attempt started with less remaining budget than this is all but
+/// guaranteed to be cut off by the overall delivery deadline, which would
+/// burn the helper into an outcome-unknown state for that share.
+pub const SHARE_DELIVERY_MIN_ATTEMPT_BUDGET_MILLISECONDS: u64 = 1_000;
 /// Maximum helper share POSTs a client should keep in flight at once.
 pub const SHARE_HELPER_MAX_CONCURRENT_POSTS: usize = VOTE_COMMITMENT_SHARE_COUNT;
 /// Numerator for the last-moment share window fraction.

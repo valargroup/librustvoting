@@ -38,7 +38,8 @@ use crate::{
         is_share_ready_for_status_check, is_share_resubmission_window_open,
         next_tracking_delay_seconds, resubmission_server_order,
         resubmission_server_order_random_bytes_required, share_submission_target_count,
-        should_resubmit_share, ShareTimingPolicy, SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS,
+        should_resubmit_share, ShareTimingPolicy, SHARE_DELIVERY_MIN_ATTEMPT_BUDGET_MILLISECONDS,
+        SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS,
     },
     types::{ShareDelegationRecord, VotingError},
 };
@@ -344,7 +345,9 @@ pub async fn submit_share_to_helpers(
         remaining.retain(|url| url != &server_url);
 
         let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining_time.is_zero() {
+        if remaining_time < Duration::from_millis(SHARE_DELIVERY_MIN_ATTEMPT_BUDGET_MILLISECONDS) {
+            // An attempt started with almost no budget is guaranteed to end
+            // as an unknown outcome; leave the helper untouched instead.
             break;
         }
 
@@ -369,13 +372,17 @@ pub async fn submit_share_to_helpers(
                 params.now_seconds,
                 cancel,
                 remaining_time,
+                Some(deadline),
             ),
         )
         .await;
         match submission {
             Err(_) => {
-                // Cancelling the POST future at the overall deadline leaves
-                // its transport outcome unknown, so retain it for polling.
+                // The client returns a held definite error rather than
+                // sleeping a retry backoff into this deadline, so an elapse
+                // here can only cancel an in-flight HTTP attempt, whose
+                // transport outcome is genuinely unknown; retain it for
+                // polling.
                 share::resolve_delivery_attempt(
                     db,
                     &attempt,
@@ -444,7 +451,7 @@ async fn submit_share_to_helpers_unrecorded(
         };
         remaining.retain(|url| url != &server_url);
         let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining_time.is_zero() {
+        if remaining_time < Duration::from_millis(SHARE_DELIVERY_MIN_ATTEMPT_BUDGET_MILLISECONDS) {
             break;
         }
         match tokio::time::timeout_at(
@@ -455,6 +462,7 @@ async fn submit_share_to_helpers_unrecorded(
                 now_seconds,
                 cancel,
                 remaining_time,
+                Some(deadline),
             ),
         )
         .await
@@ -1725,6 +1733,78 @@ mod tests {
         assert_eq!(transport.timeout_for(&first_url), Duration::from_secs(60));
         assert_eq!(transport.timeout_for(&second_url), Duration::from_secs(10));
         assert_eq!(transport.call_count(&helper(3)), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn definite_failure_in_backoff_is_not_marked_ambiguous() {
+        let transport = Arc::new(MockTransport::default());
+        let first_url = format!("{}/shielded-vote/v1/shares", helper(1));
+        // The attempt definitely fails 100 ms before the overall deadline, so
+        // the 200 ms retry backoff would cross it. The held definite error
+        // must surface instead of the deadline converting it into an unknown
+        // outcome mid-sleep.
+        transport.queue_post_after(
+            &first_url,
+            Duration::from_millis(59_900),
+            Err(HelperTransportError::Transport(
+                "connect refused".to_string(),
+            )),
+        );
+        let config = HelperClientConfig {
+            post_timeout: Duration::from_secs(90),
+            ..HelperClientConfig::default()
+        };
+        let client = HelperClient::with_config(transport.clone(), HelperHealth::default(), config);
+
+        let report = submit_share_to_helpers_unrecorded(
+            &client,
+            r#"{"share_index":0}"#,
+            &helpers(2),
+            2,
+            10,
+            &never_cancel(),
+        )
+        .await;
+
+        assert!(report.accepted_urls.is_empty());
+        assert!(
+            report.ambiguous_urls.is_empty(),
+            "a definite pre-response failure must stay definite: {:?}",
+            report.ambiguous_urls
+        );
+        assert_eq!(transport.call_count(&helper(2)), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_attempt_starts_under_minimum_budget() {
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_post_after(
+            &format!("{}/shielded-vote/v1/shares", helper(1)),
+            Duration::from_millis(59_500),
+            json_status("queued"),
+        );
+        let config = HelperClientConfig {
+            post_timeout: Duration::from_secs(90),
+            retry_delays: Vec::new(),
+            ..HelperClientConfig::default()
+        };
+        let client = HelperClient::with_config(transport.clone(), HelperHealth::default(), config);
+
+        let report = submit_share_to_helpers_unrecorded(
+            &client,
+            r#"{"share_index":0}"#,
+            &helpers(2),
+            2,
+            10,
+            &never_cancel(),
+        )
+        .await;
+
+        assert_eq!(report.accepted_urls, vec![helper(1)]);
+        assert!(report.ambiguous_urls.is_empty());
+        // 500 ms of budget is below the minimum, so the second helper is
+        // never contacted rather than burned into ambiguity.
+        assert_eq!(transport.call_count(&helper(2)), 0);
     }
 
     #[tokio::test(start_paused = true)]
