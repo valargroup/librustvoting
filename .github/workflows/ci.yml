@@ -4,12 +4,36 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Restore tracked source mtimes
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          tracked = subprocess.check_output(
+              ["git", "ls-files", "-z", "--", "*.rs", "*.sql", "Cargo.toml", "*/Cargo.toml", "Cargo.lock"]
+          ).split(b"\0")
+          for raw_path in tracked:
+              if not raw_path:
+                  continue
+              path = os.fsdecode(raw_path)
+              timestamp = int(
+                  subprocess.check_output(
+                      ["git", "log", "-1", "--format=%ct", "--", path], text=True
+                  ).strip()
+              )
+              os.utime(path, (timestamp, timestamp))
+          PY
       - uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
@@ -17,9 +41,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: test-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*', '.cargo/config.toml') }}-${{ hashFiles('**/*.rs', '**/*.sql') }}
+          key: test-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*', '.cargo/config.toml') }}-${{ hashFiles('**/*.rs', '**/*.sql') }}
           restore-keys: |
-            test-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*', '.cargo/config.toml') }}-
+            test-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*', '.cargo/config.toml') }}-
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.138
@@ -27,8 +51,10 @@ jobs:
         run: |
           cargo nextest run --workspace \
             --features zcash_voting/test-fixtures \
+            --partition count:${{ matrix.partition }}/2 \
             --locked
       - name: Test documentation
+        if: matrix.partition == 1
         run: |
           cargo test --workspace --doc \
             --features zcash_voting/test-fixtures \
