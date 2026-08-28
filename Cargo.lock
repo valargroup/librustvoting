@@ -3776,63 +3776,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zcash-voting-impl"
-version = "3.1.0-rc.12"
-dependencies = [
- "anyhow",
- "base64",
- "blake2b_simd",
- "bytes",
- "ed25519-dalek",
- "hex",
- "http",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "imt-tree",
- "incrementalmerkletree",
- "nonempty",
- "orchard",
- "pczt",
- "pir-client",
- "pir-types",
- "prost",
- "rand 0.8.7",
- "rusqlite",
- "rustls",
- "secrecy",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "subtle",
- "thiserror 2.0.20",
- "tokio",
- "tonic",
- "uuid",
- "valar-spiral-rs",
- "valar-ypir",
- "vote-commitment-tree",
- "vote-commitment-tree-client",
- "voting-circuits",
- "voting-crypto-deps",
- "zakura-client-backend",
- "zakura-client-sqlite",
- "zakura-keys",
- "zakura-orchard",
- "zakura-pczt",
- "zakura-primitives",
- "zcash_client_backend",
- "zcash_client_sqlite",
- "zcash_keys",
- "zcash_note_encryption",
- "zcash_primitives",
- "zcash_protocol",
- "zeroize",
- "zip32",
-]
-
-[[package]]
 name = "zcash-voting-wallet-example"
 version = "0.1.0"
 dependencies = [
@@ -3851,7 +3794,7 @@ dependencies = [
  "voting-crypto-deps",
  "zcash_protocol",
  "zcash_voting",
- "zcash_voting-zakura",
+ "zcash_voting-lrz",
  "zip32",
 ]
 
@@ -4137,26 +4080,62 @@ version = "3.1.0-rc.12"
 dependencies = [
  "anyhow",
  "base64",
+ "blake2b_simd",
  "bytes",
  "ed25519-dalek",
  "hex",
  "http",
  "http-body-util",
+ "hyper",
  "hyper-rustls",
  "hyper-util",
+ "imt-tree",
+ "incrementalmerkletree",
+ "nonempty",
+ "orchard",
+ "pczt",
+ "pir-client",
+ "pir-types",
+ "prost",
+ "rand 0.8.7",
+ "rusqlite",
+ "rustls",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.20",
  "tokio",
+ "tonic",
+ "uuid",
+ "valar-spiral-rs",
+ "valar-ypir",
+ "vote-commitment-tree",
+ "vote-commitment-tree-client",
+ "voting-circuits",
  "voting-crypto-deps",
- "zcash-voting-impl",
+ "zakura-client-backend",
+ "zakura-client-sqlite",
+ "zakura-keys",
+ "zakura-orchard",
+ "zakura-pczt",
+ "zakura-primitives",
+ "zcash_client_backend",
+ "zcash_client_sqlite",
+ "zcash_keys",
+ "zcash_note_encryption",
+ "zcash_primitives",
+ "zcash_protocol",
+ "zeroize",
+ "zip32",
 ]
 
 [[package]]
-name = "zcash_voting-zakura"
+name = "zcash_voting-lrz"
 version = "3.1.0-rc.12"
 dependencies = [
- "zcash-voting-impl",
+ "zcash_voting",
 ]
 
 [[package]]

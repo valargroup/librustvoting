@@ -52,20 +52,16 @@ jobs:
         with:
           tool: cargo-nextest@0.9.138
       - name: Test workspace with fixtures
-        # Selecting both voting packages in one invocation would activate
-        # `voting-crypto-deps`'s mutually-exclusive upstream/zakura features
-        # in the same resolve. Exclude the sibling here; it is covered by the
-        # zakura-wallet job below.
         run: |
-          cargo nextest run --workspace --exclude zcash_voting-zakura \
-            --features zcash_voting/test-fixtures \
+          cargo nextest run --workspace \
+            --features test-fixtures \
             --partition count:${{ matrix.partition }}/2 \
             --locked
       - name: Test documentation
         if: matrix.partition == 1
         run: |
-          cargo test --workspace --exclude zcash_voting-zakura --doc \
-            --features zcash_voting/test-fixtures \
+          cargo test --workspace --doc \
+            --features test-fixtures \
             --locked
 
   proofs:
@@ -82,7 +78,7 @@ jobs:
       # marked #[ignore] for the default suite and run here under --release.
       - name: Run ignored proof tests
         run: |
-          cargo nextest run --release -p zcash-voting-impl \
+          cargo nextest run --release -p zcash_voting \
             --locked --run-ignored ignored-only
 
   zakura-vct:
@@ -140,35 +136,36 @@ jobs:
         with:
           tool: cargo-nextest@0.9.138
       - name: Test Zakura wallet stack
-        # The implementation owns the shared unit tests; the wallet example
-        # verifies that the published Zakura facade preserves the consumer API.
+        # The wallet example verifies that direct Zakura feature selection
+        # preserves the consumer API used by Vizor.
         run: |
-          cargo nextest run -p zcash-voting-impl -p zcash-voting-wallet-example \
+          cargo nextest run -p zcash_voting -p zcash-voting-wallet-example \
             --all-targets --no-default-features \
-            --features zcash-voting-impl/zakura,zcash-voting-wallet-example/zakura \
+            --features zcash_voting/zakura,zcash-voting-wallet-example/zakura \
             --locked
       - name: Check wallet backend contracts
         run: |
-          # Each facade selects exactly one implementation feature.
-          if cargo tree -p zcash_voting -e all --prefix none --locked \
+          # The LRZ facade must expose only the upstream family.
+          if cargo tree -p zcash_voting-lrz -e all --prefix none --locked \
             | grep -Eq '^zakura-(pczt|client-backend|client-sqlite|orchard|keys|primitives) v'; then
             echo "Zakura wallet crates entered the upstream graph"
             exit 1
           fi
 
-          if cargo tree -p zcash_voting-zakura -e all --prefix none --locked \
+          if cargo tree -p zcash_voting -e all --prefix none \
+            --no-default-features --features zakura --locked \
             | grep -Eq '^(pczt|zcash_client_backend|zcash_client_sqlite|orchard|zcash_keys|zcash_primitives) v'; then
             echo "Upstream wallet crates entered the Zakura graph"
             exit 1
           fi
 
-          if cargo check -p zcash-voting-impl --no-default-features --locked; then
-            echo "The implementation must require one wallet backend"
+          if cargo check -p zcash_voting --no-default-features --locked; then
+            echo "zcash_voting must require one wallet backend"
             exit 1
           fi
 
-          if cargo check -p zcash-voting-impl --all-features --locked; then
-            echo "The implementation backends must remain mutually exclusive"
+          if cargo check -p zcash_voting --all-features --locked; then
+            echo "zcash_voting backends must remain mutually exclusive"
             exit 1
           fi
       - name: Check external git consumers
@@ -188,8 +185,8 @@ jobs:
           ).strip()
           consumers = pathlib.Path(os.environ["CONSUMER_DIR"])
           dependencies = {
-              "upstream": f'zcash_voting = {{ git = "file://{root}", rev = "{revision}" }}',
-              "zakura": f'zcash_voting = {{ package = "zcash_voting-zakura", git = "file://{root}", rev = "{revision}" }}',
+              "upstream": f'zcash_voting = {{ package = "zcash_voting-lrz", git = "file://{root}", rev = "{revision}" }}',
+              "zakura": f'zcash_voting = {{ git = "file://{root}", rev = "{revision}", default-features = false, features = ["zakura"] }}',
           }
           for name, dependency in dependencies.items():
               consumer = consumers / name
@@ -248,12 +245,11 @@ jobs:
           cargo check --manifest-path "$CONSUMER_DIR/zakura/Cargo.toml"
       - name: Package voting crates
         run: |
-          cargo package -p zcash-voting-impl --locked
-          # Full facade packaging becomes available after this exact
-          # implementation version is published. Before that bootstrap step,
-          # validate their package file sets and build them as consumers above.
-          cargo package -p zcash_voting --list
-          cargo package -p zcash_voting-zakura --list
+          cargo package -p zcash_voting --locked
+          # Full LRZ facade verification must use the exact zcash_voting
+          # version published immediately before it. CI validates its file set
+          # and builds it through the external consumer above.
+          cargo package -p zcash_voting-lrz --list
 
   msrv:
     name: Rust 1.88
@@ -264,6 +260,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check workspace at MSRV
         run: |
-          cargo check --workspace --exclude zcash_voting-zakura --all-targets \
-            --features zcash_voting/test-fixtures,vote-commitment-tree-client/cli \
+          cargo check --workspace --all-targets \
+            --features test-fixtures,vote-commitment-tree-client/cli \
             --locked

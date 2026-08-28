@@ -1,8 +1,8 @@
 //! Selected wallet and proving crates.
 //!
-//! The public facade selects exactly one implementation feature. This module
-//! re-exports that feature's concrete crates under stable internal names so
-//! the rest of the implementation remains backend-agnostic.
+//! Exactly one crate feature selects the concrete dependency family. This
+//! module re-exports that family's crates under stable internal names so the
+//! rest of the implementation remains backend-agnostic.
 
 pub use voting_crypto_deps::{halo2_gadgets, halo2_proofs, pasta_curves};
 

@@ -9,10 +9,97 @@ repository = "https://github.com/valargroup/zcash_voting"
 readme = "README.md"
 
 [features]
-test-fixtures = ["zcash-voting-impl/test-fixtures"]
+default = ["upstream"]
+upstream = [
+    "voting-crypto-deps/upstream",
+    "voting-circuits/upstream",
+    "pir-client/upstream",
+    "pir-types/upstream",
+    "imt-tree/upstream",
+    "vote-commitment-tree/upstream",
+    "vote-commitment-tree-client/upstream",
+    "dep:orchard",
+    "dep:pczt",
+    "dep:zcash_client_backend",
+    "dep:zcash_client_sqlite",
+    "dep:zcash_keys",
+    "dep:zcash_primitives",
+]
+zakura = [
+    "voting-crypto-deps/zakura",
+    "voting-circuits/zakura",
+    "pir-client/zakura",
+    "pir-types/zakura",
+    "imt-tree/zakura",
+    "vote-commitment-tree/zakura",
+    "vote-commitment-tree-client/zakura",
+    "dep:zakura-orchard",
+    "dep:zakura-pczt",
+    "dep:zakura-client-backend",
+    "dep:zakura-client-sqlite",
+    "dep:zakura-keys",
+    "dep:zakura-primitives",
+]
+test-fixtures = []
 
 [dependencies]
-zcash-voting-impl = { path = "../zcash-voting-impl", version = "=3.1.0-rc.12", default-features = false, features = ["upstream"] }
+rand = "0.8"
+blake2b_simd = "1"
+voting-crypto-deps = { workspace = true }
+
+base64 = "0.22"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.14"
+sha2 = "0.10"
+ed25519-dalek = "2"
+
+pir-client = { version = "=0.6.0", default-features = false }
+pir-types = { version = "=0.5.0", default-features = false }
+valar-spiral-rs = { version = "=0.5.2", default-features = false }
+valar-ypir = { version = "=0.2.0", default-features = false }
+imt-tree = { version = "=0.4.0", default-features = false }
+
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tonic = { version = "0.14", features = ["channel", "tls-webpki-roots", "tls-ring"] }
+
+vote-commitment-tree = { path = "../vote-commitment-tree", version = "=0.5.2", default-features = false }
+vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "=0.7.2", default-features = false, features = ["http"] }
+
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+anyhow = "1"
+thiserror = "2"
+zeroize = "1"
+
+subtle = "2.6"
+voting-circuits = { workspace = true }
+nonempty = "0.11"
+zip32 = "0.2"
+incrementalmerkletree = "0.8"
+
+zcash_protocol = { workspace = true }
+pczt = { workspace = true, optional = true }
+orchard = { workspace = true, optional = true }
+zcash_client_backend = { workspace = true, optional = true }
+zcash_client_sqlite = { workspace = true, optional = true }
+zcash_keys = { workspace = true, optional = true }
+zcash_primitives = { workspace = true, optional = true }
+zakura-orchard = { package = "zakura-orchard", version = "1.0.0-rc.3", default-features = false, optional = true, features = ["circuit", "std", "unstable-voting-circuits"] }
+zakura-pczt = { package = "zakura-pczt", version = "0.1.0-rc1", optional = true, features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
+zakura-client-backend = { package = "zakura-client-backend", version = "0.1.0-rc2", default-features = false, optional = true, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
+zakura-client-sqlite = { package = "zakura-client-sqlite", version = "0.1.0-rc2", default-features = false, optional = true, features = ["orchard"] }
+zakura-keys = { package = "zakura-keys", version = "1.0.0-rc.3", default-features = false, optional = true, features = ["orchard"] }
+zakura-primitives = { package = "zakura-primitives", version = "1.0.0-rc.3", default-features = false, optional = true, features = ["std", "circuits"] }
+uuid = "1.23.1"
 
 [dev-dependencies]
 anyhow = "1"
@@ -27,8 +114,9 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-voting-crypto-deps = { workspace = true, features = ["upstream"] }
+secrecy = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
+zcash_note_encryption = "0.4.2"
 
 # Smoke-only CLI invoked by tests/pir-smoke.sh / `make pir-smoke`.
 # An example target keeps Cargo test filters from being forwarded as commands.

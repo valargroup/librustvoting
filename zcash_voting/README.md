@@ -337,17 +337,17 @@ The crate no longer accepts root wallet seed material for delegation signing.
 
 ## Dependency notes
 
-This crate is the published upstream facade over `zcash-voting-impl`. It has
-no backend feature switch and always selects the upstream librustzcash family.
-The implementation crate is a transitive dependency, so its disabled Zakura
-dependencies do not enter this facade's consumers' lockfiles.
+This crate contains the canonical implementation and retains mutually
+exclusive `upstream`/`zakura` features. Its default is `upstream`; use
+`--no-default-features --features zakura` for the Zakura wallet-libraries
+family.
 
-Use the separately published `zcash_voting-zakura` facade for the Zakura
-wallet-libraries family. Applications should depend on exactly one facade;
-selecting both in one Cargo invocation would enable the implementation's
-mutually exclusive backend features. Both facades pin the same implementation
-version and expose the same API. The canonical implementation lives in
-`../zcash-voting-impl/src`.
+The separately published `zcash_voting-lrz` facade always selects this crate's
+`upstream` feature. Upstream consumers that need a minimal Cargo/Bazel graph
+should depend on that facade and may alias its package to the Rust crate name
+`zcash_voting`. With this crate behind the facade, it is transitive, so Cargo
+does not put its disabled optional Zakura dependencies into the consumer's
+lockfile or resolved metadata.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.
@@ -355,7 +355,7 @@ This release line requires Rust 1.88 or newer.
 
 - **`orchard 0.15`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths
-  (or `zakura-orchard 1.0.0-rc.3` in `zcash_voting-zakura`).
+  (or `zakura-orchard 1.0.0-rc.3` with the `zakura` feature).
 - **`voting-circuits 0.10.2`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
 - **`vote-commitment-tree 0.5.0`** and
@@ -365,7 +365,7 @@ This release line requires Rust 1.88 or newer.
   `zcash_client_sqlite 0.22.0-rc.7`, `zcash_keys 0.16.1`,
   `zcash_primitives 0.30.0`, and `zcash_protocol 0.10.4`** from published
   librustzcash releases (or the `zakura-*` wallet-libraries forks in
-  `zcash_voting-zakura`).
+  `zakura` builds).
 
 ## Downstream test fixtures
 

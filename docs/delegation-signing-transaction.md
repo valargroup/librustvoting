@@ -519,16 +519,16 @@ The complete caller-oriented flows are implemented in
 ## Implementation references
 
 - TX1 construction:
-  [`zcash-voting-impl/src/action.rs`](../zcash-voting-impl/src/action.rs)
+  [`zcash_voting/src/action.rs`](../zcash_voting/src/action.rs)
 - TX1 effect encoding and cross-repository fixture:
-  [`zcash-voting-impl/src/tx1.rs`](../zcash-voting-impl/src/tx1.rs),
-  [`zcash-voting-impl/test-vectors/delegation_tx1_effects_v1.json`](../zcash-voting-impl/test-vectors/delegation_tx1_effects_v1.json)
+  [`zcash_voting/src/tx1.rs`](../zcash_voting/src/tx1.rs),
+  [`zcash_voting/test-vectors/delegation_tx1_effects_v1.json`](../zcash_voting/test-vectors/delegation_tx1_effects_v1.json)
 - Prepared signing API:
-  [`zcash-voting-impl/src/delegate.rs`](../zcash-voting-impl/src/delegate.rs)
+  [`zcash_voting/src/delegate.rs`](../zcash_voting/src/delegate.rs)
 - Wallet integration example:
   [`wallet-example/src/example_delegation.rs`](../wallet-example/src/example_delegation.rs)
 - ZIP-244:
   <https://zips.z.cash/zip-0244>
 
-[prepared]: ../zcash-voting-impl/src/delegate.rs
+[prepared]: ../zcash_voting/src/delegate.rs
 [example]: ../wallet-example/src/example_delegation.rs

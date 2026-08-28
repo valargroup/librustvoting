@@ -1,18 +1,16 @@
 [workspace]
 members = [
     "zcash_voting",
-    "zcash_voting-zakura",
-    "zcash-voting-impl",
+    "zcash_voting-lrz",
     "vote-commitment-tree",
     "vote-commitment-tree-client",
     "wallet-example",
 ]
-# The two facades select mutually exclusive implementation backends. Keep the
-# upstream family as the default root build; validate the implementation's
-# Zakura feature and zcash_voting-zakura explicitly.
+# Keep the upstream/LRZ family as the default root build. Validate
+# zcash_voting's Zakura feature explicitly in its dedicated CI job.
 default-members = [
     "zcash_voting",
-    "zcash-voting-impl",
+    "zcash_voting-lrz",
     "vote-commitment-tree",
     "vote-commitment-tree-client",
     "wallet-example",

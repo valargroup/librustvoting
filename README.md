@@ -154,14 +154,15 @@ proving stack (`voting-crypto-deps` / VCT) via mutually exclusive
 `upstream`/`zakura` features; build with `--no-default-features --features
 zakura` on those crates for the Zakura VCT backend.
 
-The published `zcash_voting` and `zcash_voting-zakura` crates are thin
-backend-specific facades over the published `zcash-voting-impl` crate.
-`zcash_voting` selects only the upstream librustzcash family;
-`zcash_voting-zakura` selects only the Zakura wallet-libraries family.
-Applications should depend on exactly one facade. Because the implementation
-crate is transitive, disabled backend dependencies do not enter an upstream
-consumer's lockfile. The canonical implementation lives in
-`zcash-voting-impl/src`.
+The published `zcash_voting` crate retains mutually exclusive
+`upstream`/`zakura` features and contains the canonical implementation.
+The separately published `zcash_voting-lrz` facade always selects
+`zcash_voting/upstream`. Upstream consumers that need a minimal Cargo/Bazel
+dependency graph should depend on that facade (and may alias it to the Rust
+crate name `zcash_voting`). Because the feature-selected implementation is
+then transitive, its disabled Zakura dependencies do not enter the consumer's
+lockfile or Cargo metadata. Zakura consumers depend directly on
+`zcash_voting` with `default-features = false` and `features = ["zakura"]`.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.

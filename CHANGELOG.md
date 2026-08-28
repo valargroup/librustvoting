@@ -7,13 +7,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Changed
-- **Breaking:** `zcash_voting` no longer has `upstream`/`zakura` features.
-  It is now a thin facade that selects the upstream feature of the published
-  `zcash-voting-impl` crate, so downstream lockfiles do not contain disabled
-  Zakura dependencies. The separately published `zcash_voting-zakura` facade
-  selects the same implementation's Zakura feature. `wallet-example` keeps
-  its `upstream`/`zakura` feature pair and selects between the two facades.
-  See the "Dependency notes" section of `zcash_voting/README.md`.
+- `zcash_voting` retains its `upstream`/`zakura` feature pair while depending
+  directly on the selected backend family instead of `zakura-wallet-lib`.
+  The new published `zcash_voting-lrz` facade force-selects `upstream`, making
+  `zcash_voting` transitive so disabled Zakura packages stay out of upstream
+  consumers' Cargo lockfiles and metadata. Zakura consumers continue selecting
+  `zcash_voting/zakura`. See the "Dependency notes" section of
+  `zcash_voting/README.md`.
 
 ## v3.1.0-rc.12
 

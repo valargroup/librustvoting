@@ -1,0 +1,15 @@
+[package]
+name = "zcash_voting-lrz"
+version = "3.1.0-rc.12"
+edition = "2021"
+rust-version = "1.88"
+description = "Upstream librustzcash backend facade for Zcash shielded voting."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/valargroup/zcash_voting"
+readme = "README.md"
+
+[features]
+test-fixtures = ["zcash_voting_impl/test-fixtures"]
+
+[dependencies]
+zcash_voting_impl = { package = "zcash_voting", path = "../zcash_voting", version = "=3.1.0-rc.12", default-features = false, features = ["upstream"] }
