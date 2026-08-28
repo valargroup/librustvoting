@@ -12,10 +12,10 @@
 //! # Trust model
 //!
 //! Helper responses are authenticated only by the host transport's connection
-//! to a configured endpoint. They are not chain proofs. A `confirmed` reply is
-//! therefore reported as an observation and suppresses duplicate recovery only
-//! for the current pass. The host must verify the nullifier through a trusted
-//! chain source before calling [`share::confirm`] to persist confirmation.
+//! to configured endpoints. They are not chain proofs. This module requires
+//! matching `confirmed` replies from two distinct currently configured helpers
+//! before persisting confirmation. The configured helper fleet is therefore a
+//! trusted quorum for the share nullifier's global on-chain state.
 
 use std::{
     collections::HashSet,
@@ -100,9 +100,9 @@ pub fn share_tracking_flags(
 
 /// Result of polling helpers about one share.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ShareStatusOutcome {
-    /// One helper reported the share confirmed.
-    Confirmed { server_url: String },
+enum ShareStatusOutcome {
+    /// Two distinct configured helpers reported the share confirmed.
+    Confirmed,
     /// Every helper answered without confirming, or could not answer.
     NotConfirmed,
     /// The caller asked to stop mid-poll. Nothing was decided.
@@ -113,14 +113,6 @@ pub enum ShareStatusOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResubmittedShare {
     pub share: ShareKey,
-    pub server_url: String,
-}
-
-/// An untrusted helper observation that requires independent verification.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObservedShareConfirmation {
-    pub share: ShareKey,
-    pub reveal_nullifier: String,
     pub server_url: String,
 }
 
@@ -176,9 +168,8 @@ pub(crate) struct InitialShareSubmissionParams<'a> {
 /// What one tracking pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShareTrackingReport {
-    /// Helper-reported confirmations requiring trusted chain verification.
-    /// These are not persisted; call [`share::confirm`] only after verification.
-    pub confirmation_observations: Vec<ObservedShareConfirmation>,
+    /// Shares durably marked confirmed during this pass.
+    pub confirmed: Vec<ShareKey>,
     /// Shares that reached a new helper during this pass.
     pub resubmitted: Vec<ResubmittedShare>,
     /// Outcome-unknown attempts durably retained during this pass.
@@ -222,25 +213,6 @@ pub fn os_random_bytes(len: usize) -> Vec<u8> {
     bytes
 }
 
-/// Observes whether a helper reports a share confirmed.
-///
-/// # Policy
-///
-/// The endpoint reports only whether the nullifier is confirmed on-chain; it
-/// does not inspect a helper's local queue. One valid `confirmed` response is
-/// stops the walk for this call, while `pending` provides no possession
-/// evidence and only keeps polling alive. This never mutates durable state.
-pub async fn observe_share_confirmation_by_any_helper(
-    client: &HelperClient,
-    round_id: &str,
-    share_id: &str,
-    server_urls: &[String],
-    now_seconds: u64,
-    cancel: &(dyn Fn() -> bool + Send + Sync),
-) -> ShareStatusOutcome {
-    poll_share_helpers(client, round_id, share_id, server_urls, now_seconds, cancel).await
-}
-
 /// Polls helpers for the share's global on-chain confirmation state.
 async fn poll_share_helpers(
     client: &HelperClient,
@@ -250,6 +222,8 @@ async fn poll_share_helpers(
     now_seconds: u64,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> ShareStatusOutcome {
+    const REQUIRED_CONFIRMATIONS: usize = 2;
+    let mut confirmations = 0usize;
     for server_url in client.health().candidate_servers(server_urls, now_seconds) {
         if cancel() {
             return ShareStatusOutcome::Cancelled;
@@ -259,7 +233,10 @@ async fn poll_share_helpers(
             .await
         {
             Ok(ShareStatus::Confirmed) => {
-                return ShareStatusOutcome::Confirmed { server_url };
+                confirmations += 1;
+                if confirmations == REQUIRED_CONFIRMATIONS {
+                    return ShareStatusOutcome::Confirmed;
+                }
             }
             // The helper is alive but has not revealed yet. Keep walking.
             Ok(ShareStatus::Pending) => {}
@@ -613,9 +590,8 @@ async fn submit_share_to_helpers_unrecorded(
 /// 2. When ready, poll definite and ambiguous helpers for on-chain
 ///    confirmation. `pending` never proves helper possession, so ambiguous
 ///    attempts remain ambiguous.
-/// 3. On a helper confirmation claim, report an observation and skip recovery
-///    for this pass. Persistence requires trusted verification followed by
-///    [`share::confirm`].
+/// 3. When two distinct configured helpers report confirmation, persist it
+///    with [`share::confirm`] and move on.
 /// 4. Before the vote-end cutoff, when overdue or below the desired placement,
 ///    walk a health-aware randomized resubmission order and durably retain each
 ///    attempt before contacting another helper. Early replenishment preserves
@@ -724,14 +700,15 @@ async fn track_pending_shares_with_elapsed(
                     report.cancelled = true;
                     break;
                 }
-                ShareStatusOutcome::Confirmed { server_url } => {
-                    report
-                        .confirmation_observations
-                        .push(ObservedShareConfirmation {
-                            share: ShareKey::of(&share),
-                            reveal_nullifier: share_id,
-                            server_url,
-                        });
+                ShareStatusOutcome::Confirmed => {
+                    share::confirm(
+                        db,
+                        params.round_id,
+                        share.bundle_index,
+                        share.proposal_id,
+                        share.share_index,
+                    )?;
+                    report.confirmed.push(ShareKey::of(&share));
                     continue;
                 }
                 ShareStatusOutcome::NotConfirmed => {}
@@ -1320,7 +1297,7 @@ mod tests {
     // ---- Confirmation policy --------------------------------------------
 
     #[tokio::test(start_paused = true)]
-    async fn first_confirmation_observation_stops_status_checks() {
+    async fn two_distinct_confirmations_stop_status_checks() {
         let round_id = "ab".repeat(32);
         let share_id = "cd".repeat(32);
         let transport = Arc::new(MockTransport::default());
@@ -1333,9 +1310,10 @@ mod tests {
 
         transport.queue_get(&status_url(1), json_status("pending"));
         transport.queue_get(&status_url(2), json_status("confirmed"));
+        transport.queue_get(&status_url(3), json_status("confirmed"));
 
         let client = client_with(transport.clone());
-        let outcome = observe_share_confirmation_by_any_helper(
+        let outcome = poll_share_helpers(
             &client,
             &round_id,
             &share_id,
@@ -1345,17 +1323,42 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            outcome,
-            ShareStatusOutcome::Confirmed {
-                server_url: helper(2)
-            }
-        );
-        // Helpers 3-5 are never contacted once helper 2 confirms.
-        assert_eq!(transport.calls().len(), 2);
-        for index in 3..=5 {
+        assert_eq!(outcome, ShareStatusOutcome::Confirmed);
+        // Helpers 4-5 are never contacted once a distinct second helper agrees.
+        assert_eq!(transport.calls().len(), 3);
+        for index in 4..=5 {
             assert_eq!(transport.call_count(&helper(index)), 0);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_confirmation_is_not_enough() {
+        let round_id = "ab".repeat(32);
+        let share_id = "cd".repeat(32);
+        let transport = Arc::new(MockTransport::default());
+        for (index, status) in [(1, "confirmed"), (2, "pending")] {
+            transport.queue_get(
+                &format!(
+                    "{}/shielded-vote/v1/share-status/{round_id}/{share_id}",
+                    helper(index)
+                ),
+                json_status(status),
+            );
+        }
+
+        let client = client_with(transport.clone());
+        let outcome = poll_share_helpers(
+            &client,
+            &round_id,
+            &share_id,
+            &helpers(2),
+            1_000,
+            &never_cancel(),
+        )
+        .await;
+
+        assert_eq!(outcome, ShareStatusOutcome::NotConfirmed);
+        assert_eq!(transport.calls().len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1374,7 +1377,7 @@ mod tests {
         }
 
         let client = client_with(transport.clone());
-        let outcome = observe_share_confirmation_by_any_helper(
+        let outcome = poll_share_helpers(
             &client,
             &round_id,
             &share_id,
@@ -1420,7 +1423,7 @@ mod tests {
         };
 
         let client = client_with(transport.clone());
-        let outcome = observe_share_confirmation_by_any_helper(
+        let outcome = poll_share_helpers(
             &client,
             &round_id,
             &share_id,
@@ -2648,6 +2651,7 @@ mod tests {
         // Helper 1 answers outside the protocol's two states.
         transport.queue_get(&status_url(1), json_status("not_found"));
         transport.queue_get(&status_url(2), json_status("confirmed"));
+        transport.queue_get(&status_url(3), json_status("confirmed"));
 
         let client = client_with(transport.clone());
         let random = zero_bytes;
@@ -2660,21 +2664,17 @@ mod tests {
         .await
         .unwrap();
 
-        // A helper claim is surfaced but never persisted as chain truth.
+        // Two distinct configured helpers form the trusted confirmation quorum.
         assert_eq!(
-            report.confirmation_observations,
-            vec![ObservedShareConfirmation {
-                share: ShareKey {
-                    bundle_index: 0,
-                    proposal_id: 1,
-                    share_index: 0
-                },
-                reveal_nullifier: share_id,
-                server_url: helper(2),
+            report.confirmed,
+            vec![ShareKey {
+                bundle_index: 0,
+                proposal_id: 1,
+                share_index: 0
             }]
         );
-        assert!(!only_share(&db).confirmed);
-        assert_eq!(share::unconfirmed(&db, ROUND_ID).unwrap().len(), 1);
+        assert!(only_share(&db).confirmed);
+        assert!(share::unconfirmed(&db, ROUND_ID).unwrap().is_empty());
 
         // The invalid answer cost helper 1 health.
         assert_eq!(client.health().failure_count(&helper(1)), 1);
@@ -2682,16 +2682,12 @@ mod tests {
         // Confirmation short-circuited the remaining helpers and any repair.
         assert_eq!(transport.call_count("/shielded-vote/v1/shares"), 0);
         assert!(report.resubmitted.is_empty());
-        for index in 3..=5 {
+        for index in 4..=5 {
             assert_eq!(transport.call_count(&helper(index)), 0);
         }
 
         // Existing definite placement history is unchanged.
         assert_eq!(only_share(&db).sent_to_urls.len(), 5);
-
-        share::confirm(&db, ROUND_ID, 0, 1, 0).unwrap();
-        assert!(only_share(&db).confirmed);
-        assert!(share::unconfirmed(&db, ROUND_ID).unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -3444,9 +3440,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn observed_confirmation_is_not_resubmitted_in_the_same_pass() {
+    async fn confirmed_share_is_never_resubmitted_even_when_overdue() {
         let configured = helpers(2);
-        let db = db_with_share(&[helper(1)]);
+        let db = db_with_share(&configured);
         let share_id = share_id_of(&db);
         let now = overdue();
 
@@ -3455,6 +3451,13 @@ mod tests {
             &format!(
                 "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
                 helper(1)
+            ),
+            json_status("confirmed"),
+        );
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(2)
             ),
             json_status("confirmed"),
         );
@@ -3470,12 +3473,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(report.confirmation_observations.len(), 1);
-        assert!(!only_share(&db).confirmed);
+        assert_eq!(report.confirmed.len(), 1);
+        assert!(only_share(&db).confirmed);
         assert!(report.resubmitted.is_empty());
         // Confirmation short-circuits the overdue branch entirely.
         assert_eq!(transport.call_count("/shielded-vote/v1/shares"), 0);
-        assert_eq!(only_share(&db).sent_to_urls, vec![helper(1)]);
+        assert_eq!(only_share(&db).sent_to_urls, configured);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3496,7 +3499,7 @@ mod tests {
         .unwrap();
 
         assert!(transport.calls().is_empty());
-        assert!(report.confirmation_observations.is_empty());
+        assert!(report.confirmed.is_empty());
         // Still pending, so the caller is told when to come back.
         assert!(report.next_delay_seconds.is_some());
     }

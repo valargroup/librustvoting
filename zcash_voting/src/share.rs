@@ -133,6 +133,7 @@ pub fn compute_nullifier(
 /// fails [`crate::helper::url::canonicalize_helper_base_url`]. Validate
 /// helper URLs with that function before delivering a share over the
 /// network, so an already-delivered share can always be recorded.
+#[cfg(any(test, feature = "test-fixtures"))]
 fn record_impl(
     db: &VotingDb,
     round_id: &str,
@@ -161,30 +162,9 @@ fn record_impl(
 /// journal-before-dispatch lifecycle. This lower-level entry point exists only
 /// for the `test-fixtures` feature so integration tests can seed durable state
 /// without opening a network connection.
-#[cfg(feature = "test-fixtures")]
+#[cfg(any(test, feature = "test-fixtures"))]
 #[doc(hidden)]
 pub fn record(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    share_index: u32,
-    sent_to_urls: &[String],
-    submit_at: u64,
-) -> Result<(), VotingError> {
-    record_impl(
-        db,
-        round_id,
-        bundle_index,
-        proposal_id,
-        share_index,
-        sent_to_urls,
-        submit_at,
-    )
-}
-
-#[cfg(not(feature = "test-fixtures"))]
-pub(crate) fn record(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
@@ -410,6 +390,7 @@ pub fn confirm(
 /// Returns [`VotingError::InvalidInput`] when any entry in `new_urls` fails
 /// [`crate::helper::url::canonicalize_helper_base_url`]; validate helper URLs
 /// before delivering over the network.
+#[cfg(test)]
 pub(crate) fn add_sent_servers(
     db: &VotingDb,
     round_id: &str,

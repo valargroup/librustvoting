@@ -84,10 +84,9 @@ pub use crate::share::{
     ShareServerSelectionPolicy, ShareTimingPolicy, ShareTrackingSummary,
 };
 pub use crate::share_tracking::{
-    observe_share_confirmation_by_any_helper, os_random_bytes, share_tracking_flags,
-    track_pending_shares, ObservedShareConfirmation, ResubmittedShare, ShareKey,
-    ShareStatusOutcome, ShareSubmissionReport, ShareSubmissionRequest, ShareTrackingFlags,
-    ShareTrackingParams, ShareTrackingReport,
+    os_random_bytes, share_tracking_flags, track_pending_shares, ResubmittedShare, ShareKey,
+    ShareSubmissionReport, ShareSubmissionRequest, ShareTrackingFlags, ShareTrackingParams,
+    ShareTrackingReport,
 };
 pub use crate::types::{
     validate_proposal_id, validate_vote_decision, validate_vote_options, DelegationProgressBridge,

@@ -49,9 +49,13 @@ precompute → delegate → vote → share lifecycle:
    canonical `batch_json` once, persist the shared hash with
    `vote::record_batch_submission`, and confirm with
    `confirm_vote_batch_submission`. After confirmation, call
-   `vote::recover_commit` again and use its helper-share payloads so they carry
-   the confirmed VC position, then record each accepted helper share with
-   `share::record`. `Decision::Skipped` is terminal, so `open_proposals`
+   `vote::recover_commit` again, plan the recovered `CommittedVote`'s helper
+   shares, and call `CommittedVote::submit_share_to_helpers`. The crate
+   reconstructs each wire payload with the durable confirmed VC position and
+   journals every delivery attempt before dispatch. `track_pending_shares`
+   requires two distinct currently configured helpers to report confirmation
+   and persists the result internally. `Decision::Skipped` is terminal, so
+   `open_proposals`
    contains only proposals that have no recorded decision.
 
 ## Crate layout

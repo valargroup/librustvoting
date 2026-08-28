@@ -85,10 +85,22 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   before any network I/O, instead of silently dropping them — an
   all-misconfigured fleet previously produced a permanent, error-free no-op.
   `helper::url::canonicalize_helper_base_url` and `canonical_helper_url_list`
-  are now public and define the URL contract that the share recording APIs
-  (`record_share`, `record_share_delivery`, `add_sent_servers`) also enforce;
+  are now public and define the URL contract that typed committed-share
+  submission and tracking enforce;
   previous releases accepted some now-rejected spellings, so validate helper
   configuration before delivering over the network.
+- **Breaking:** initial helper delivery is now
+  `CommittedVote::submit_share_to_helpers(ShareSubmissionRequest)`. The public
+  request contains only a share index, planner-produced plan, configured fleet,
+  and health-ordering time; the crate derives the durable identity, confirmed
+  VC-tree position, wire payload, target, and schedule. Raw submission and
+  post-hoc delivery mutators are crate-private.
+- **Breaking:** helper confirmation now requires matching responses from two
+  distinct currently configured helpers. `track_pending_shares` encapsulates
+  that quorum and persists confirmation before returning it in `confirmed`;
+  hosts no longer implement confirmation polling or persistence separately.
+- `HelperClientConfig` now uses validated builders for nonzero deadlines and at
+  most two nonzero retry delays.
 - **Breaking:** removed `HELPER_PREFLIGHT_TIMEOUT_SECONDS`; the client's
   preflight timeout is now derived from
   `share_policy::SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS`.
@@ -126,9 +138,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   retry backoff that would cross the delivery deadline returns its held
   definite error instead of letting cancellation mark the helper
   outcome-unknown, and no attempt starts with less than one second of budget.
-- Documented the helper-status trust boundary: configured helpers are trusted
-  as global on-chain confirmation oracles because their responses do not carry
-  independently verifiable chain proofs.
+- Helper clients now enforce deadlines, response-size limits, and JSON content
+  types around custom transports, including transports that ignore their
+  supplied timeout. Successful responses expose content-type metadata through
+  `HelperResponse`.
+- One helper confirmation claim can no longer suppress durable recovery; two
+  distinct currently configured helpers must agree before the crate persists
+  confirmation.
+- Initial helper payloads use the durably confirmed VC-tree position, not the
+  draft position retained in the committed share payload.
 
 ## v3.1.0-rc.11
 

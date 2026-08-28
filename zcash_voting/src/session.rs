@@ -241,9 +241,9 @@ pub enum NextStep {
     /// This covers the crash boundary after the cast-vote transaction confirms
     /// and before every helper-share row has been durably recorded. The
     /// `share_index` identifies the missing helper share to submit. Wallets
-    /// should reconstruct the vote with `vote::recover_commit`, submit that
-    /// recovered share payload to helper servers, then record each accepted
-    /// share with `share::record`.
+    /// should recover the `CommittedVote`, recompute its planner output, and
+    /// call `CommittedVote::submit_share_to_helpers`; that method journals
+    /// every attempt and outcome.
     SubmitShares {
         bundle_index: u32,
         proposal_id: u32,

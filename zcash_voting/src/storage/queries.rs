@@ -3496,8 +3496,8 @@ pub fn remove_attempting_server(
 ///
 /// This raw SQL helper is crate-internal because callers must provide a
 /// nullifier that matches the persisted vote recovery bundle. Wallet
-/// integrations should use `share::record`, which derives that nullifier from
-/// recovery state before storing the helper delivery state.
+/// integrations should use `CommittedVote::submit_share_to_helpers`, which
+/// derives that nullifier and owns journaled delivery.
 pub(crate) fn record_share_delegation(
     conn: &Connection,
     round_id: &str,
@@ -3975,7 +3975,7 @@ fn load_vote_choice_for_intent_check(
 
 /// Append definite deliveries, remove them from the ambiguous set, and make
 /// the share immediately actionable.
-pub fn add_sent_servers(
+pub(crate) fn add_sent_servers(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,

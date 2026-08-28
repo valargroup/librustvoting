@@ -1778,8 +1778,10 @@ impl VotingDb {
     ///
     /// This raw storage helper is crate-internal because callers must provide a
     /// nullifier that matches the persisted vote recovery bundle. Wallet
-    /// integrations should use `share::record`, which derives that nullifier
-    /// from recovery state.
+    /// integrations should use
+    /// `CommittedVote::submit_share_to_helpers`, which derives the nullifier
+    /// and owns journaled delivery.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) fn record_share_delegation(
         &self,
         round_id: &str,
@@ -1929,7 +1931,7 @@ impl VotingDb {
     }
 
     /// Append new server URLs and make the share immediately actionable.
-    pub fn add_sent_servers(
+    pub(crate) fn add_sent_servers(
         &self,
         round_id: &str,
         bundle_index: u32,
