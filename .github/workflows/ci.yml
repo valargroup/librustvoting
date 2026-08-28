@@ -52,15 +52,20 @@ jobs:
         with:
           tool: cargo-nextest@0.9.138
       - name: Test workspace with fixtures
+        # zcash_voting-zakura shares `voting-crypto-deps` with zcash_voting via
+        # one Cargo.lock; a bare `--workspace` build would ask Cargo to
+        # activate that dependency's mutually-exclusive upstream/zakura
+        # features in the same resolve. Exclude it here; it's covered by the
+        # zakura-wallet job below.
         run: |
-          cargo nextest run --workspace \
+          cargo nextest run --workspace --exclude zcash_voting-zakura \
             --features zcash_voting/test-fixtures \
             --partition count:${{ matrix.partition }}/2 \
             --locked
       - name: Test documentation
         if: matrix.partition == 1
         run: |
-          cargo test --workspace --doc \
+          cargo test --workspace --exclude zcash_voting-zakura --doc \
             --features zcash_voting/test-fixtures \
             --locked
 
@@ -137,30 +142,26 @@ jobs:
           tool: cargo-nextest@0.9.138
       - name: Test Zakura wallet stack
         run: |
-          cargo nextest run -p zcash_voting -p zcash-voting-wallet-example \
+          # zcash_voting-zakura has no [[test]]/[[example]] of its own — see
+          # the comment in its Cargo.toml — so this covers only the shared
+          # library's unit tests; --all-targets is for the example crate.
+          cargo nextest run -p zcash_voting-zakura --lib --locked
+          cargo nextest run -p zcash-voting-wallet-example \
             --all-targets --no-default-features --features zakura --locked
       - name: Check wallet backend contracts
         run: |
+          # `zcash_voting` and `zcash_voting-zakura` are now separate crates
+          # with unconditional (non-optional) family deps, so each graph is
+          # pure by construction; these checks just confirm that stays true.
           if cargo tree -p zcash_voting -e all --prefix none --locked \
             | grep -Eq '^zakura-(pczt|client-backend|client-sqlite|orchard|keys|primitives) v'; then
-            echo "Zakura wallet crates entered the default upstream graph"
+            echo "Zakura wallet crates entered the upstream graph"
             exit 1
           fi
 
-          if cargo tree -p zcash_voting -e all --prefix none \
-            --no-default-features --features zakura --locked \
+          if cargo tree -p zcash_voting-zakura -e all --prefix none --locked \
             | grep -Eq '^(pczt|zcash_client_backend|zcash_client_sqlite|orchard|zcash_keys|zcash_primitives) v'; then
             echo "Upstream wallet crates entered the Zakura graph"
-            exit 1
-          fi
-
-          if cargo check -p zcash_voting --no-default-features --locked; then
-            echo "A wallet backend must be selected"
-            exit 1
-          fi
-
-          if cargo check -p zcash_voting --all-features --locked; then
-            echo "The upstream and Zakura backends must remain mutually exclusive"
             exit 1
           fi
 
@@ -173,6 +174,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check workspace at MSRV
         run: |
-          cargo check --workspace --all-targets \
+          cargo check --workspace --exclude zcash_voting-zakura --all-targets \
             --features zcash_voting/test-fixtures,vote-commitment-tree-client/cli \
             --locked

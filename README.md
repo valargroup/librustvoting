@@ -149,10 +149,20 @@ workspace member:
   [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
 
-Build with `--no-default-features --features zakura` to select the Zakura
-proving stack (`voting-crypto-deps` / VCT) and the Zakura wallet-libraries
-forks (`zakura-wallet-lib`). The `upstream` and `zakura` features are mutually
-exclusive.
+`vote-commitment-tree` and `vote-commitment-tree-client` still select their
+proving stack (`voting-crypto-deps` / VCT) via mutually exclusive
+`upstream`/`zakura` features; build with `--no-default-features --features
+zakura` on those crates for the Zakura VCT backend.
+
+`zcash_voting` itself no longer has an `upstream`/`zakura` feature pair —
+depending on it always pulls the upstream librustzcash family, with zero
+optional dependencies, so downstream tooling (e.g. Bazel's `crate_universe`)
+sees one unambiguous graph. To build against the Zakura wallet-libraries
+forks instead, depend on the sibling `zcash_voting-zakura` crate, which
+compiles `zcash_voting`'s own source (`zcash_voting/src/lib.rs`) against
+that family — see `zcash_voting/src/backend.rs` and
+`zcash_voting-zakura/Cargo.toml`. It is never published; use it via a `path`
+or `git` dependency the way `wallet-example`'s `zakura` feature does.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.

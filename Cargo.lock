@@ -3776,26 +3776,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zakura-wallet-lib"
-version = "0.1.0-rc2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28b53acd746f74acdbdd39401cba4ad1516c8e82d54da461a8de6dbb2da47ff4"
-dependencies = [
- "orchard",
- "pczt",
- "zakura-client-backend",
- "zakura-client-sqlite",
- "zakura-keys",
- "zakura-orchard",
- "zakura-pczt",
- "zakura-primitives",
- "zcash_client_backend",
- "zcash_client_sqlite",
- "zcash_keys",
- "zcash_primitives",
-]
-
-[[package]]
 name = "zcash-voting-wallet-example"
 version = "0.1.0"
 dependencies = [
@@ -3812,9 +3792,9 @@ dependencies = [
  "serde",
  "serde_json",
  "voting-crypto-deps",
- "zakura-wallet-lib",
  "zcash_protocol",
  "zcash_voting",
+ "zcash_voting-zakura",
  "zip32",
 ]
 
@@ -4135,18 +4115,62 @@ dependencies = [
  "vote-commitment-tree-client",
  "voting-circuits",
  "voting-crypto-deps",
+ "zcash_client_backend",
+ "zcash_client_sqlite",
+ "zcash_keys",
+ "zcash_note_encryption",
+ "zcash_primitives",
+ "zcash_protocol",
+ "zeroize",
+ "zip32",
+]
+
+[[package]]
+name = "zcash_voting-zakura"
+version = "3.1.0-rc.12"
+dependencies = [
+ "anyhow",
+ "base64",
+ "blake2b_simd",
+ "bytes",
+ "ed25519-dalek",
+ "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "imt-tree",
+ "incrementalmerkletree",
+ "nonempty",
+ "pir-client",
+ "pir-types",
+ "prost",
+ "rand 0.8.7",
+ "rusqlite",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
+ "uuid",
+ "valar-spiral-rs",
+ "valar-ypir",
+ "vote-commitment-tree",
+ "vote-commitment-tree-client",
+ "voting-circuits",
+ "voting-crypto-deps",
  "zakura-client-backend",
  "zakura-client-sqlite",
  "zakura-keys",
  "zakura-orchard",
  "zakura-pczt",
  "zakura-primitives",
- "zakura-wallet-lib",
- "zcash_client_backend",
- "zcash_client_sqlite",
- "zcash_keys",
  "zcash_note_encryption",
- "zcash_primitives",
  "zcash_protocol",
  "zeroize",
  "zip32",

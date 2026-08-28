@@ -4,6 +4,19 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+- **Breaking:** `zcash_voting` no longer has `upstream`/`zakura` features.
+  It now depends unconditionally on upstream librustzcash, with no optional
+  dependencies, so any consumer (Cargo or otherwise, e.g. Bazel's
+  `crate_universe`) resolves one unambiguous dependency graph. To build
+  against the Zakura wallet-libraries forks, depend on the new sibling crate
+  `zcash_voting-zakura` (never published) instead, which compiles the same
+  source against that family. `wallet-example`'s `upstream`/`zakura`
+  features still exist and now select between the two crates. See the
+  "Dependency notes" section of `zcash_voting/README.md`.
+
 ## v3.1.0-rc.12
 
 ### Added
