@@ -341,12 +341,15 @@ This crate contains the canonical implementation and retains mutually
 exclusive `lrz`/`zakura` features. Its default is the Zakura wallet-libraries
 family; use `--no-default-features --features lrz` for upstream librustzcash.
 
-The separately published `zcash_voting-lrz` facade always selects this crate's
-`lrz` feature. LRZ consumers that need a minimal Cargo/Bazel graph
-should depend on that facade and may alias its package to the Rust crate name
-`zcash_voting`. With this crate behind the facade, it is transitive, so Cargo
-does not put its disabled optional Zakura dependencies into the consumer's
-lockfile or resolved metadata.
+Wallet-family selection is consolidated in `zakura-wallet-lib` using explicit
+`zakura-voting` and `lrz-voting` capability sets. Unlike its former generic
+`orchard` selector, those features never weak-reference both optional backend
+families. External-consumer regression tests verify that selecting
+`zcash_voting/lrz` puts no Zakura forks in Cargo lockfiles or resolved
+metadata. This POC tracks
+[wallet-libraries #7](https://github.com/zakura-core/wallet-libraries/pull/7)
+and its stacked
+[dependency-isolation fix](https://github.com/zakura-core/wallet-libraries/pull/8).
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.

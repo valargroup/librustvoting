@@ -153,15 +153,15 @@ proving stack (`voting-crypto-deps` / VCT) via mutually exclusive
 `upstream`/`zakura` features; build with `--no-default-features --features
 zakura` on those crates for the Zakura VCT backend.
 
-The published `zcash_voting` crate contains the canonical implementation,
-defaults to Zakura, and exposes LRZ through a mutually exclusive `lrz`
-feature. The separately published `zcash_voting-lrz` facade selects
-`zcash_voting/lrz`. LRZ consumers that need a minimal Cargo/Bazel
-dependency graph should depend on that facade (and may alias it to the Rust
-crate name `zcash_voting`). Because the feature-selected implementation is
-then transitive, its disabled Zakura dependencies do not enter the consumer's
-lockfile or Cargo metadata. Zakura consumers such as Vizor depend directly on
-`zcash_voting` without feature flags.
+The published `zcash_voting` crate defaults to Zakura and exposes LRZ through
+the mutually exclusive `lrz` feature. Wallet-family selection is consolidated
+in `zakura-wallet-lib` using the leak-free feature model proposed by
+[wallet-libraries #7](https://github.com/zakura-core/wallet-libraries/pull/7)
+and its stacked
+[dependency-isolation fix](https://github.com/zakura-core/wallet-libraries/pull/8).
+Gemini selects `zcash_voting` with `default-features = false, features =
+["lrz"]`; Vizor uses the defaults. External-consumer regression tests verify
+that Gemini's Cargo lockfile and resolved metadata contain no Zakura forks.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.

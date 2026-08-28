@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "zcash_voting",
-    "zcash_voting-lrz",
     "vote-commitment-tree",
     "vote-commitment-tree-client",
     "wallet-example",

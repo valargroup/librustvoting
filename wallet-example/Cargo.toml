@@ -6,8 +6,8 @@ publish = false
 
 [features]
 default = ["zakura"]
-lrz = ["dep:zcash_voting_lrz", "voting-crypto-deps/upstream"]
-zakura = ["dep:zcash_voting", "voting-crypto-deps/zakura"]
+lrz = ["zcash_voting/lrz", "voting-crypto-deps/upstream"]
+zakura = ["zcash_voting/zakura", "voting-crypto-deps/zakura"]
 
 [dependencies]
 anyhow = "1"
@@ -24,8 +24,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 voting-crypto-deps = { workspace = true }
 zcash_protocol = { workspace = true }
-# Mutually exclusive backends; the active one is bound to the extern name
-# `zcash_voting` (see `src/lib.rs`).
-zcash_voting = { path = "../zcash_voting", optional = true, default-features = false, features = ["zakura"] }
-zcash_voting_lrz = { package = "zcash_voting-lrz", path = "../zcash_voting-lrz", optional = true, default-features = false, features = ["lrz"] }
+zcash_voting = { path = "../zcash_voting", default-features = false }
 zip32 = "0.2"

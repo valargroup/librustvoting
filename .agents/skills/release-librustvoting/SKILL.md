@@ -15,7 +15,6 @@ The publishable release chain is:
 1. `vote-commitment-tree`
 2. `vote-commitment-tree-client`
 3. `zcash_voting`
-4. `zcash_voting-lrz`
 
 Derive the actual subset and order from current path dependencies. Do not
 publish `wallet-example`.
@@ -123,7 +122,6 @@ the complete plan.
 Update:
 
 - each released package's `version`
-- `zcash_voting` and `zcash_voting-lrz` in lockstep
 - exact internal dependency versions in dependent manifests
 - `Cargo.lock`
 - the top changelog section

@@ -18,12 +18,7 @@ lrz = [
     "imt-tree/upstream",
     "vote-commitment-tree/upstream",
     "vote-commitment-tree-client/upstream",
-    "dep:orchard",
-    "dep:pczt",
-    "dep:zcash_client_backend",
-    "dep:zcash_client_sqlite",
-    "dep:zcash_keys",
-    "dep:zcash_primitives",
+    "zakura-wallet-lib/lrz-voting",
 ]
 zakura = [
     "voting-crypto-deps/zakura",
@@ -33,12 +28,7 @@ zakura = [
     "imt-tree/zakura",
     "vote-commitment-tree/zakura",
     "vote-commitment-tree-client/zakura",
-    "dep:zakura-orchard",
-    "dep:zakura-pczt",
-    "dep:zakura-client-backend",
-    "dep:zakura-client-sqlite",
-    "dep:zakura-keys",
-    "dep:zakura-primitives",
+    "zakura-wallet-lib/zakura-voting",
 ]
 test-fixtures = []
 
@@ -87,18 +77,7 @@ zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
 zcash_protocol = { workspace = true }
-pczt = { workspace = true, optional = true }
-orchard = { workspace = true, optional = true }
-zcash_client_backend = { workspace = true, optional = true }
-zcash_client_sqlite = { workspace = true, optional = true }
-zcash_keys = { workspace = true, optional = true }
-zcash_primitives = { workspace = true, optional = true }
-zakura-orchard = { package = "zakura-orchard", version = "1.0.0-rc.3", default-features = false, optional = true, features = ["circuit", "std", "unstable-voting-circuits"] }
-zakura-pczt = { package = "zakura-pczt", version = "0.1.0-rc1", optional = true, features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-zakura-client-backend = { package = "zakura-client-backend", version = "0.1.0-rc2", default-features = false, optional = true, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zakura-client-sqlite = { package = "zakura-client-sqlite", version = "0.1.0-rc2", default-features = false, optional = true, features = ["orchard"] }
-zakura-keys = { package = "zakura-keys", version = "1.0.0-rc.3", default-features = false, optional = true, features = ["orchard"] }
-zakura-primitives = { package = "zakura-primitives", version = "1.0.0-rc.3", default-features = false, optional = true, features = ["std", "circuits"] }
+zakura-wallet-lib = { git = "https://github.com/zakura-core/wallet-libraries", rev = "6e2cb0db7cef9625155766195a987799083d62d8", default-features = false }
 uuid = "1.23.1"
 
 [dev-dependencies]

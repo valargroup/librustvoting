@@ -146,8 +146,7 @@ jobs:
         with:
           tool: cargo-nextest@0.9.138
       - name: Test LRZ wallet stack
-        # The wallet example verifies the forced-LRZ facade and direct
-        # `zcash_voting/lrz` feature expose the same consumer API.
+        # The wallet example verifies direct `zcash_voting/lrz` selection.
         run: |
           cargo nextest run -p zcash_voting -p zcash-voting-wallet-example \
             --all-targets --no-default-features \
@@ -155,8 +154,7 @@ jobs:
             --locked
       - name: Check wallet backend contracts
         run: |
-          # The LRZ facade must expose only the upstream family.
-          if cargo tree -p zcash_voting-lrz -e all --prefix none \
+          if cargo tree -p zcash_voting -e all --prefix none \
             --no-default-features --features lrz --locked \
             | grep -Eq '^zakura-(pczt|client-backend|client-sqlite|orchard|keys|primitives) v'; then
             echo "Zakura wallet crates entered the LRZ graph"
@@ -195,7 +193,7 @@ jobs:
           ).strip()
           consumers = pathlib.Path(os.environ["CONSUMER_DIR"])
           dependencies = {
-              "gemini": f'zcash_voting = {{ package = "zcash_voting-lrz", git = "file://{root}", rev = "{revision}", default-features = false, features = ["lrz"] }}',
+              "gemini": f'zcash_voting = {{ git = "file://{root}", rev = "{revision}", default-features = false, features = ["lrz"] }}',
               "vizor": f'zcash_voting = {{ git = "file://{root}", rev = "{revision}" }}',
           }
           for name, dependency in dependencies.items():
@@ -218,48 +216,55 @@ jobs:
               )
           PY
           cargo generate-lockfile --manifest-path "$CONSUMER_DIR/gemini/Cargo.toml"
-          if grep -Eq '^name = "zakura-' "$CONSUMER_DIR/gemini/Cargo.lock"; then
-            echo "Zakura packages entered Gemini's LRZ lockfile"
-            exit 1
-          fi
           cargo metadata --manifest-path "$CONSUMER_DIR/gemini/Cargo.toml" \
             --format-version 1 > "$CONSUMER_DIR/gemini/metadata.json"
           python3 - <<'PY'
           import json
           import os
           import pathlib
+          import re
 
-          metadata_path = (
-              pathlib.Path(os.environ["CONSUMER_DIR"])
-              / "gemini"
-              / "metadata.json"
-          )
+          consumer = pathlib.Path(os.environ["CONSUMER_DIR"]) / "gemini"
+          metadata_path = consumer / "metadata.json"
           metadata = json.loads(metadata_path.read_text())
-          packages = {
-              package["name"]
+          allowed = {"zakura-wallet-lib"}
+          packages_by_id = {
+              package["id"]: package["name"]
               for package in metadata["packages"]
-              if package["name"].startswith("zakura-")
           }
+          packages = {
+              name for name in packages_by_id.values()
+              if name.startswith("zakura-")
+          } - allowed
           resolved = {
-              node["id"]
+              packages_by_id[node["id"]]
               for node in metadata["resolve"]["nodes"]
-              if "#zakura-" in node["id"]
-          }
-          if packages or resolved:
+              if packages_by_id[node["id"]].startswith("zakura-")
+          } - allowed
+          lockfile = set(re.findall(
+              r'^name = "([^"]+)"$',
+              (consumer / "Cargo.lock").read_text(),
+              re.MULTILINE,
+          ))
+          lockfile = {
+              name for name in lockfile if name.startswith("zakura-")
+          } - allowed
+          if packages or resolved or lockfile:
               raise SystemExit(
                   "Zakura packages entered Gemini's LRZ Cargo metadata: "
-                  f"packages={sorted(packages)}, resolved={sorted(resolved)}"
+                  f"packages={sorted(packages)}, "
+                  f"resolved={sorted(resolved)}, "
+                  f"lockfile={sorted(lockfile)}"
               )
           PY
           cargo check --manifest-path "$CONSUMER_DIR/gemini/Cargo.toml"
           cargo check --manifest-path "$CONSUMER_DIR/vizor/Cargo.toml"
       - name: Package voting crates
         run: |
-          cargo package -p zcash_voting --locked
-          # Full LRZ facade verification must use the exact zcash_voting
-          # version published immediately before it. CI validates its file set
-          # and builds it through the external consumer above.
-          cargo package -p zcash_voting-lrz --list
+          # This POC pins the stacked wallet-libraries PR by Git revision.
+          # Restore full package verification after its release is available
+          # through a versioned registry dependency.
+          cargo package -p zcash_voting --list
 
   msrv:
     name: Rust 1.88
@@ -273,8 +278,7 @@ jobs:
           cargo check -p zcash_voting -p zcash-voting-wallet-example \
             --all-targets --features test-fixtures \
             --locked
-          cargo check -p zcash_voting -p zcash_voting-lrz \
-            -p zcash-voting-wallet-example --all-targets \
+          cargo check -p zcash_voting -p zcash-voting-wallet-example --all-targets \
             --no-default-features --features lrz \
             --locked
           cargo check -p vote-commitment-tree -p vote-commitment-tree-client \
