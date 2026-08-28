@@ -8,14 +8,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Changed
 - **Breaking:** `zcash_voting` no longer has `upstream`/`zakura` features.
-  It now depends unconditionally on upstream librustzcash, with no optional
-  dependencies, so any consumer (Cargo or otherwise, e.g. Bazel's
-  `crate_universe`) resolves one unambiguous dependency graph. To build
-  against the Zakura wallet-libraries forks, depend on the new sibling crate
-  `zcash_voting-zakura` (never published) instead, which compiles the same
-  source against that family. `wallet-example`'s `upstream`/`zakura`
-  features still exist and now select between the two crates. See the
-  "Dependency notes" section of `zcash_voting/README.md`.
+  It is now a thin facade that selects the upstream feature of the published
+  `zcash-voting-impl` crate, so downstream lockfiles do not contain disabled
+  Zakura dependencies. The separately published `zcash_voting-zakura` facade
+  selects the same implementation's Zakura feature. `wallet-example` keeps
+  its `upstream`/`zakura` feature pair and selects between the two facades.
+  See the "Dependency notes" section of `zcash_voting/README.md`.
 
 ## v3.1.0-rc.12
 

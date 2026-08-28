@@ -9,78 +9,26 @@ repository = "https://github.com/valargroup/zcash_voting"
 readme = "README.md"
 
 [features]
-test-fixtures = []
+test-fixtures = ["zcash-voting-impl/test-fixtures"]
 
 [dependencies]
-# Randomness
-rand = "0.8"
-
-# Hashing
-blake2b_simd = "1"
-voting-crypto-deps = { workspace = true, features = ["upstream"] }
-
-# Serialization
-base64 = "0.22"
-hex = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-prost = "0.14"
-sha2 = "0.10"
-ed25519-dalek = "2"
-
-# PIR (private nullifier exclusion proofs).
-pir-client = { version = "=0.6.0", default-features = false, features = ["upstream"] }
-# Supply-chain pins for the Valar-owned PIR/tree dependency surface. These
-# direct dependencies constrain the versions Cargo may resolve, but they do not
-# change whether upstream build scripts execute.
-pir-types = { version = "=0.5.0", default-features = false, features = ["upstream"] }
-valar-spiral-rs = { version = "=0.5.2", default-features = false }
-valar-ypir = { version = "=0.2.0", default-features = false }
-imt-tree = { version = "=0.4.0", default-features = false, features = ["upstream"] }
-
-bytes = { version = "1" }
-http = { version = "1" }
-http-body-util = { version = "0.1" }
-hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
-tonic = { version = "0.14", features = ["channel", "tls-webpki-roots", "tls-ring"] }
-
-vote-commitment-tree = { path = "../vote-commitment-tree", version = "=0.5.2", default-features = false, features = ["upstream"] }
-vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "=0.7.2", default-features = false, features = ["http", "upstream"] }
-
-# Storage
-rusqlite = { version = "0.37", features = ["bundled"] }
-
-# Error handling
-anyhow = "1"
-thiserror = "2"
-zeroize = "1"
-
-# Upstream wallet and proving stack. `zcash_voting-zakura` is a sibling crate
-# (never published) that compiles this same source (`src/lib.rs`) against the
-# Zakura wallet-libraries forks instead; see `src/backend.rs`.
-subtle = "2.6"
-voting-circuits = { workspace = true, features = ["upstream"] }
-nonempty = "0.11"
-zip32 = "0.2"
-incrementalmerkletree = "0.8"
-
-zcash_protocol = { workspace = true }
-pczt = { workspace = true }
-orchard = { workspace = true }
-zcash_client_backend = { workspace = true }
-zcash_client_sqlite = { workspace = true }
-zcash_keys = { workspace = true }
-zcash_primitives = { workspace = true }
-uuid = "1.23.1"
+zcash-voting-impl = { path = "../zcash-voting-impl", version = "=3.1.0-rc.12", default-features = false, features = ["upstream"] }
 
 [dev-dependencies]
-secrecy = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
-zcash_note_encryption = "0.4.2"
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+ed25519-dalek = "2"
+hex = "0.4"
+http = "1"
+http-body-util = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+voting-crypto-deps = { workspace = true, features = ["upstream"] }
 
 # Smoke-only CLI invoked by tests/pir-smoke.sh / `make pir-smoke`.
 # An example target keeps Cargo test filters from being forwarded as commands.

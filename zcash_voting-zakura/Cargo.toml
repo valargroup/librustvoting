@@ -1,98 +1,15 @@
 [package]
-# Never published. This crate compiles `zcash_voting`'s own source
-# (`../zcash_voting/src/lib.rs`) against the Zakura wallet-libraries forks
-# instead of upstream librustzcash — see `zcash_voting/src/backend.rs` for
-# how the two manifests land on the same extern names. Kept in lockstep with
-# `zcash_voting`'s version; bump both together.
 name = "zcash_voting-zakura"
 version = "3.1.0-rc.12"
 edition = "2021"
 rust-version = "1.88"
-publish = false
+description = "Zakura wallet-libraries backend for Zcash shielded voting."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/valargroup/zcash_voting"
+readme = "README.md"
 
-[lib]
-path = "../zcash_voting/src/lib.rs"
-
-# Declared (unused by any target here) only so `#[cfg(feature = "test-fixtures")]`
-# in the shared `src/vote.rs` doesn't trip rustc's unexpected-cfg-value lint.
 [features]
-test-fixtures = []
+test-fixtures = ["zcash-voting-impl/test-fixtures"]
 
 [dependencies]
-# Randomness
-rand = "0.8"
-
-# Hashing
-blake2b_simd = "1"
-voting-crypto-deps = { workspace = true, features = ["zakura"] }
-
-# Serialization
-base64 = "0.22"
-hex = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-prost = "0.14"
-sha2 = "0.10"
-ed25519-dalek = "2"
-
-# PIR (private nullifier exclusion proofs).
-pir-client = { version = "=0.6.0", default-features = false, features = ["zakura"] }
-# Supply-chain pins for the Valar-owned PIR/tree dependency surface. These
-# direct dependencies constrain the versions Cargo may resolve, but they do not
-# change whether upstream build scripts execute.
-pir-types = { version = "=0.5.0", default-features = false, features = ["zakura"] }
-valar-spiral-rs = { version = "=0.5.2", default-features = false }
-valar-ypir = { version = "=0.2.0", default-features = false }
-imt-tree = { version = "=0.4.0", default-features = false, features = ["zakura"] }
-
-bytes = { version = "1" }
-http = { version = "1" }
-http-body-util = { version = "0.1" }
-hyper = { version = "1", features = ["client", "http1", "http2"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
-tonic = { version = "0.14", features = ["channel", "tls-webpki-roots", "tls-ring"] }
-
-vote-commitment-tree = { path = "../vote-commitment-tree", version = "=0.5.2", default-features = false, features = ["zakura"] }
-vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "=0.7.2", default-features = false, features = ["http", "zakura"] }
-
-# Storage
-rusqlite = { version = "0.37", features = ["bundled"] }
-
-# Error handling
-anyhow = "1"
-thiserror = "2"
-zeroize = "1"
-
-# Zakura wallet and proving stack, renamed to the extern names
-# `zcash_voting/src/backend.rs` re-exports (see that file for why).
-subtle = "2.6"
-voting-circuits = { workspace = true, features = ["zakura"] }
-nonempty = "0.11"
-zip32 = "0.2"
-incrementalmerkletree = "0.8"
-
-zcash_protocol = { workspace = true }
-pczt = { package = "zakura-pczt", version = "0.1.0-rc1", features = ["orchard", "io-finalizer", "signer", "zcp-builder"] }
-orchard = { package = "zakura-orchard", version = "1.0.0-rc.3", default-features = false, features = ["circuit", "std", "unstable-voting-circuits"] }
-zcash_client_backend = { package = "zakura-client-backend", version = "0.1.0-rc2", default-features = false, features = ["orchard", "lightwalletd-tonic", "lightwalletd-tonic-tls-webpki-roots"] }
-zcash_client_sqlite = { package = "zakura-client-sqlite", version = "0.1.0-rc2", default-features = false, features = ["orchard"] }
-zcash_keys = { package = "zakura-keys", version = "1.0.0-rc.3", default-features = false, features = ["orchard"] }
-zcash_primitives = { package = "zakura-primitives", version = "1.0.0-rc.3", default-features = false, features = ["std", "circuits"] }
-uuid = "1.23.1"
-
-[dev-dependencies]
-secrecy = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
-zcash_note_encryption = "0.4.2"
-
-# No [[test]]/[[example]] here: `tests/test_fixtures.rs` and `examples/*.rs`
-# are downstream-consumer simulations that hardcode the published crate name
-# `zcash_voting`, which only exists for the upstream crate — unlike
-# `src/lib.rs`, whose internal `crate::` paths are name-agnostic, they aren't
-# portable to this crate's different package name. This crate's contract is
-# that the shared library source compiles and passes its own unit tests
-# against the Zakura family; run `cargo test -p zcash_voting-zakura --lib`,
-# not `--all-targets`.
+zcash-voting-impl = { path = "../zcash-voting-impl", version = "=3.1.0-rc.12", default-features = false, features = ["zakura"] }

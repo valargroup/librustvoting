@@ -1,8 +1,7 @@
-//! Upstream librustzcash facade for Zcash shielded voting.
+//! Zakura wallet-libraries facade for Zcash shielded voting.
 //!
 //! The implementation lives in `zcash-voting-impl`; this crate fixes its
-//! backend to the upstream librustzcash family and preserves the public
-//! `zcash_voting` crate name.
+//! backend to the Zakura wallet-libraries family.
 
 pub use zcash_voting_impl::*;
 

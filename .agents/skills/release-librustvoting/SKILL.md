@@ -14,7 +14,9 @@ The publishable release chain is:
 
 1. `vote-commitment-tree`
 2. `vote-commitment-tree-client`
-3. `zcash_voting`
+3. `zcash-voting-impl`
+4. `zcash_voting`
+5. `zcash_voting-zakura`
 
 Derive the actual subset and order from current path dependencies. Do not
 publish `wallet-example`.
@@ -22,7 +24,7 @@ publish `wallet-example`.
 Use these tag forms:
 
 - `zcash_voting`: `v<version>`
-- Other crates: `<crate-name>-v<version>`
+- Other crates: `<package-name>-v<version>`
 
 ## Hard guards
 
@@ -122,6 +124,8 @@ the complete plan.
 Update:
 
 - each released package's `version`
+- all three voting package versions in lockstep: `zcash-voting-impl`,
+  `zcash_voting`, and `zcash_voting-zakura`
 - exact internal dependency versions in dependent manifests
 - `Cargo.lock`
 - the top changelog section
@@ -133,8 +137,12 @@ Do not rewrite historical sections.
 Run:
 
 ```bash
-cargo check --workspace
-cargo test --workspace --locked
+cargo check --workspace --exclude zcash_voting-zakura
+cargo test --workspace --exclude zcash_voting-zakura --locked
+cargo test -p zcash-voting-impl -p zcash-voting-wallet-example \
+  --all-targets --no-default-features \
+  --features zcash-voting-impl/zakura,zcash-voting-wallet-example/zakura \
+  --locked
 git diff --check
 ```
 

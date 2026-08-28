@@ -2,6 +2,17 @@
 members = [
     "zcash_voting",
     "zcash_voting-zakura",
+    "zcash-voting-impl",
+    "vote-commitment-tree",
+    "vote-commitment-tree-client",
+    "wallet-example",
+]
+# The two facades select mutually exclusive implementation backends. Keep the
+# upstream family as the default root build; validate the implementation's
+# Zakura feature and zcash_voting-zakura explicitly.
+default-members = [
+    "zcash_voting",
+    "zcash-voting-impl",
     "vote-commitment-tree",
     "vote-commitment-tree-client",
     "wallet-example",

@@ -337,23 +337,17 @@ The crate no longer accepts root wallet seed material for delegation signing.
 
 ## Dependency notes
 
-This crate depends unconditionally on the upstream librustzcash family — it
-has no `upstream`/`zakura` feature pair and no optional dependencies, so any
-consumer (including non-Cargo tooling like Bazel's `crate_universe`) sees one
-unambiguous dependency graph.
+This crate is the published upstream facade over `zcash-voting-impl`. It has
+no backend feature switch and always selects the upstream librustzcash family.
+The implementation crate is a transitive dependency, so its disabled Zakura
+dependencies do not enter this facade's consumers' lockfiles.
 
-The sibling crate `zcash_voting-zakura` (never published, path
-`../zcash_voting-zakura` from here) compiles this crate's own source
-(`src/lib.rs`, via a `[lib] path` override) against the Zakura
-wallet-libraries forks instead — see `src/backend.rs` for how both manifests
-land on the same extern names (`orchard`, `pczt`, `zcash_client_backend`,
-`zcash_client_sqlite`, `zcash_keys`, `zcash_primitives`) so the rest of the
-crate's code is backend-agnostic. Depend on `zcash_voting-zakura` (via `path`
-or `git`) instead of `zcash_voting` to build against Zakura; the two must
-never both be built in one Cargo invocation (e.g. `--workspace`), since they
-share `voting-crypto-deps` and its `upstream`/`zakura` features are mutually
-exclusive — pass `--exclude zcash_voting-zakura`, or select packages
-explicitly with `-p`.
+Use the separately published `zcash_voting-zakura` facade for the Zakura
+wallet-libraries family. Applications should depend on exactly one facade;
+selecting both in one Cargo invocation would enable the implementation's
+mutually exclusive backend features. Both facades pin the same implementation
+version and expose the same API. The canonical implementation lives in
+`../zcash-voting-impl/src`.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.
