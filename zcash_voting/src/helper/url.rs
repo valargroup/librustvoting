@@ -7,9 +7,11 @@ use crate::types::VotingError;
 /// Returns the stable base URL used for helper identity and persistence.
 ///
 /// Helper bases may include a mount path, but not credentials, a query, or a
-/// fragment. The returned form has a normalized origin, no default port, and
-/// no trailing slash, so equivalent configuration spellings cannot bypass
-/// delivery-history checks.
+/// fragment. The returned form has a normalized origin, no default port, no
+/// trailing slash, and canonical percent escapes in the path, so equivalent
+/// configuration spellings cannot bypass delivery-history checks. Escapes for
+/// unreserved ASCII characters are decoded; all other escapes use uppercase
+/// hexadecimal digits and remain escaped.
 ///
 /// This is the identity contract for every share delivery and persistence
 /// API: a URL this function rejects is rejected by those APIs with
@@ -57,9 +59,56 @@ pub fn canonicalize_helper_base_url(value: &str) -> Result<String, VotingError> 
         })?;
     }
 
+    let path = normalize_percent_escapes(url.path()).map_err(|_| VotingError::InvalidInput {
+        message: format!("invalid percent escape in helper server path {trimmed:?}"),
+    })?;
+    url.set_path(&path);
+
     // Query and fragment components are forbidden above, so trimming the
     // serialized suffix cannot alter anything except redundant path slashes.
     Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn normalize_percent_escapes(path: &str) -> Result<String, ()> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut normalized = String::with_capacity(path.len());
+    let mut remaining = path;
+    while let Some(index) = remaining.find('%') {
+        normalized.push_str(&remaining[..index]);
+
+        let bytes = remaining.as_bytes();
+        let high = bytes
+            .get(index + 1)
+            .copied()
+            .and_then(hex_value)
+            .ok_or(())?;
+        let low = bytes
+            .get(index + 2)
+            .copied()
+            .and_then(hex_value)
+            .ok_or(())?;
+        let value = (high << 4) | low;
+        if value.is_ascii_alphanumeric() || matches!(value, b'-' | b'.' | b'_' | b'~') {
+            normalized.push(char::from(value));
+        } else {
+            normalized.push('%');
+            normalized.push(char::from(HEX[usize::from(high)]));
+            normalized.push(char::from(HEX[usize::from(low)]));
+        }
+        remaining = &remaining[index + 3..];
+    }
+    normalized.push_str(remaining);
+    Ok(normalized)
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Canonicalizes a helper URL list, deduplicating equivalent spellings.
@@ -112,12 +161,31 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_percent_escapes_without_decoding_reserved_characters() {
+        assert_eq!(
+            canonicalize_helper_base_url("https://helper.example/%7eoperator/%41").unwrap(),
+            "https://helper.example/~operator/A"
+        );
+        assert_eq!(
+            canonicalize_helper_base_url("https://helper.example/vote%2fmount/caf%c3%a9").unwrap(),
+            "https://helper.example/vote%2Fmount/caf%C3%A9"
+        );
+        assert_ne!(
+            canonicalize_helper_base_url("https://helper.example/vote%2fmount").unwrap(),
+            canonicalize_helper_base_url("https://helper.example/vote/mount").unwrap()
+        );
+    }
+
+    #[test]
     fn rejects_non_base_or_credentialed_urls() {
         for value in [
             "file:///tmp/helper",
             "https://user@example.com",
             "https://example.com?helper=1",
             "https://example.com/#fragment",
+            "https://example.com/%",
+            "https://example.com/%2",
+            "https://example.com/%GG",
         ] {
             assert!(canonicalize_helper_base_url(value).is_err(), "{value}");
         }
@@ -129,12 +197,16 @@ mod tests {
             "HTTPS://Helper.Example:443/vote/".to_string(),
             "https://helper.example/vote".to_string(),
             "https://helper.example./vote".to_string(),
+            "https://helper.example/%76ote".to_string(),
+            "https://helper.example/vote%2fmount".to_string(),
+            "https://helper.example/vote%2Fmount".to_string(),
             "https://other.example".to_string(),
         ];
         assert_eq!(
             canonical_helper_url_list(&urls).unwrap(),
             vec![
                 "https://helper.example/vote".to_string(),
+                "https://helper.example/vote%2Fmount".to_string(),
                 "https://other.example".to_string(),
             ]
         );

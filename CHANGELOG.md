@@ -15,8 +15,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   first failure after expiry, and never removes them from candidate lists.
 - Added public helper URL canonicalization for stable server identity. Helper
   base URLs may use HTTP or HTTPS and a mount path, but not credentials, query
-  parameters, or fragments; equivalent default ports and trailing slashes are
-  normalized before comparison or persistence.
+  parameters, or fragments; equivalent default ports, trailing slashes, and
+  mount-path percent escapes are normalized before comparison or persistence.
 
 ### Changed
 - Initial share delivery continues to target half the configured fleet, rounded
