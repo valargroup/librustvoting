@@ -154,17 +154,15 @@ build with `--no-default-features --features lrz` for the LRZ VCT backend.
 
 The published `zcash_voting` crate defaults to Zakura and exposes LRZ through
 the mutually exclusive `lrz` feature. Wallet-family selection is consolidated
-in `zakura-wallet-lib` using the leak-free feature model proposed by
-[wallet-libraries #7](https://github.com/zakura-core/wallet-libraries/pull/7)
-and its stacked
-[dependency-isolation fix](https://github.com/zakura-core/wallet-libraries/pull/8).
-Gemini selects `zcash_voting` with `default-features = false, features =
-["lrz"]`; Vizor uses the defaults. External-consumer regression tests verify
-that Gemini's Cargo lockfile and resolved metadata contain no Zakura forks.
+in published `zakura-wallet-lib 0.1.0-rc4`, whose complete `zakura` and `lrz`
+modes never weak-reference both backend families. Gemini selects
+`zcash_voting` with `default-features = false, features = ["lrz"]`; Vizor uses
+the defaults. External-consumer regression tests verify that Gemini's Cargo
+lockfile and resolved metadata contain no Zakura forks.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.
-The RC5 PIR and IMT crates require Rust 1.91 or newer.
+The current PIR and IMT releases require Rust 1.91 or newer.
 
 ## FFI
 

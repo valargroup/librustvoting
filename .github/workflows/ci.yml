@@ -261,9 +261,9 @@ jobs:
           cargo check --manifest-path "$CONSUMER_DIR/vizor/Cargo.toml"
       - name: Package voting crates
         run: |
-          # The POC changes the VCT feature contract without reusing its
-          # published 0.5.2/0.7.2 package contents. Verify the package file set
-          # until the VCT crates receive their release version bumps.
+          # Full verification follows the VCT release-version bumps because
+          # the published 0.5.2/0.7.2 manifests expose the previous feature
+          # contract. Until then, validate the release file set.
           cargo package -p zcash_voting --list
 
   msrv:
