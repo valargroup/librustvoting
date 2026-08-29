@@ -54,6 +54,23 @@ fallback, replenishment, overdue recovery, fleet changes, incomplete or
 independently planned batches, and single-share mode fall outside it. The
 statement also makes no claim about the combined view of colluding helpers.
 
+## Confidentiality statement
+
+The primary confidentiality adversary considered by the helper-distribution
+policy is collusion by the MPC validator committee. Decrypting an encrypted
+share requires control of at least the protocol's two-thirds validator
+threshold. For a complete normal commitment planned as one batch with at least
+two configured helpers, an adversary controlling that threshold together with
+one helper can obtain at most 12 of the 16 plaintext shares from that helper's
+returned initial target assignments.
+
+This is a 75-percent share-count bound, not necessarily a bound on the
+percentage of voting balance revealed. It is an initial-planning statement,
+not a lifetime possession bound: ambiguous delivery, initial-delivery
+fallback, replenishment, overdue recovery, fleet changes, incomplete or
+independently planned batches, and single-share mode fall outside it. The
+statement also makes no claim about the combined view of colluding helpers.
+
 ## Terminology and state model
 
 A **configured helper** is a canonical HTTP or HTTPS helper endpoint in the
