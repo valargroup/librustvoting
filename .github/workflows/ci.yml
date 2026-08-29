@@ -261,9 +261,9 @@ jobs:
           cargo check --manifest-path "$CONSUMER_DIR/vizor/Cargo.toml"
       - name: Package voting crates
         run: |
-          # This POC pins wallet-libraries main by Git revision.
-          # Restore full package verification after its release is available
-          # through a versioned registry dependency.
+          # The POC changes the VCT feature contract without reusing its
+          # published 0.5.2/0.7.2 package contents. Verify the package file set
+          # until the VCT crates receive their release version bumps.
           cargo package -p zcash_voting --list
 
   msrv:

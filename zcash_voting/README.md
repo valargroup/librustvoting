@@ -357,8 +357,8 @@ This release line requires Rust 1.91 or newer.
 
 - **`orchard 0.15`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths
-  (or `zakura-orchard 1.0.0-rc.5` with the `zakura` feature).
-- **`voting-circuits 0.11.1`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
+  (or `zakura-orchard 1.0.0` with the `zakura` feature).
+- **`voting-circuits 0.11.2`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
 - **`vote-commitment-tree 0.5.2`** and
   **`vote-commitment-tree-client 0.7.2`** for vote commitment tree state
@@ -366,7 +366,7 @@ This release line requires Rust 1.91 or newer.
 - **`pczt 0.9.2`, `zcash_client_backend 0.24.0-rc.7`,
   `zcash_client_sqlite 0.22.0-rc.7`, `zcash_keys 0.16.1`,
   `zcash_primitives 0.30.0`, and `zcash_protocol 0.10.4`** from published
-  librustzcash releases (or the RC5 `zakura-*` family and RC4 wallet crates in
+  librustzcash releases (or the stable `zakura-*` family and RC4 wallet crates in
   `zakura` builds).
 
 ## Downstream test fixtures
