@@ -33,8 +33,8 @@ use crate::{
     round::VotingDb,
     share,
     share_policy::{
-        is_share_ready_for_status_check, is_share_resubmission_window_open,
-        next_tracking_delay_seconds, resubmission_server_order,
+        effective_share_submission_target_count, is_share_ready_for_status_check,
+        is_share_resubmission_window_open, next_tracking_delay_seconds, resubmission_server_order,
         resubmission_server_order_random_bytes_required, share_submission_target_count,
         should_resubmit_share, ShareSubmissionPlan, ShareTimingPolicy,
         SHARE_DELIVERY_MIN_ATTEMPT_BUDGET_MILLISECONDS,
@@ -699,12 +699,8 @@ async fn track_pending_shares_with_elapsed(
         // this pass so filling a multi-helper deficit never contacts the same
         // failing endpoint again.
         let mut attempted_this_pass = Vec::new();
-        let target_count = if share.target_count == 0 {
-            share_submission_target_count(configured_urls.len())
-        } else {
-            usize::try_from(share.target_count).unwrap_or(usize::MAX)
-        }
-        .min(configured_urls.len());
+        let target_count =
+            effective_share_submission_target_count(share.target_count, configured_urls.len());
         let mut current_time = params.now_seconds.saturating_add(elapsed_seconds());
         let mut flags = share_tracking_flags(
             &share,
@@ -2364,6 +2360,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn committed_vote_submission_rejects_uncapped_large_fleet_target() {
+        let db = db_with_recoverable_vote();
+        let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+        let configured = helpers(33);
+        let plan = ShareSubmissionPlan {
+            immediate: false,
+            submit_at: 4_321,
+            target_count: 11,
+            target_servers: configured[..11].to_vec(),
+        };
+        let transport = Arc::new(MockTransport::default());
+        let client = client_with(transport.clone());
+
+        let error = committed
+            .submit_share_to_helpers(
+                &db,
+                &client,
+                ShareSubmissionRequest {
+                    share_index: 0,
+                    plan: &plan,
+                    configured_server_urls: &configured,
+                    now_seconds: SUBMIT_AT,
+                },
+                &never_cancel(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, VotingError::InvalidInput { .. }));
+        assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn tracking_rejects_invalid_configured_url() {
         let configured = vec![
             helper(1),
@@ -3113,6 +3143,30 @@ mod tests {
         let stored = only_share(&db);
         assert_eq!(stored.target_count, 3);
         assert_eq!(stored.sent_to_urls, configured);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_target_above_protocol_cap_is_effectively_clamped() {
+        let configured = helpers(30);
+        let accepted = configured[..crate::share_policy::SHARE_HELPER_TARGET_COUNT_CAP].to_vec();
+        let db = db_with_delivery(&accepted, &[], 99);
+        let transport = Arc::new(MockTransport::default());
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, SUBMIT_AT - 1, &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert!(report.resubmitted.is_empty());
+        assert!(transport.calls().is_empty());
+        assert_eq!(only_share(&db).target_count, 99);
+        assert_eq!(only_share(&db).sent_to_urls, accepted);
     }
 
     #[tokio::test(start_paused = true)]

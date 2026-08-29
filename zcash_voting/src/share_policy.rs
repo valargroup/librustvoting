@@ -512,6 +512,21 @@ pub fn share_submission_target_count(server_count: usize) -> usize {
     (server_count / 2 + server_count % 2).min(SHARE_HELPER_TARGET_COUNT_CAP)
 }
 
+/// Return the effective target for a durable share and current helper fleet.
+pub(crate) fn effective_share_submission_target_count(
+    stored_target_count: u32,
+    server_count: usize,
+) -> usize {
+    let target_count = if stored_target_count == 0 {
+        share_submission_target_count(server_count)
+    } else {
+        usize::try_from(stored_target_count).unwrap_or(usize::MAX)
+    };
+    target_count
+        .min(SHARE_HELPER_TARGET_COUNT_CAP)
+        .min(server_count)
+}
+
 fn minimum_complete_batch_planning_server_count(target_count: usize) -> usize {
     if target_count == 0 {
         return 0;
@@ -1581,6 +1596,9 @@ mod tests {
         assert_eq!(share_submission_target_count(100), 10);
         assert_eq!(SHARE_HELPER_TARGET_COUNT_CAP, 10);
         assert_eq!(SHARE_HELPER_MAX_INITIAL_SHARES_PER_SERVER, 12);
+        assert_eq!(effective_share_submission_target_count(0, 33), 10);
+        assert_eq!(effective_share_submission_target_count(99, 30), 10);
+        assert_eq!(effective_share_submission_target_count(99, 10), 10);
     }
 
     #[test]
