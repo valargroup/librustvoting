@@ -6,8 +6,8 @@ publish = false
 
 [features]
 default = ["zakura"]
-lrz = ["zcash_voting/lrz", "voting-crypto-deps/upstream"]
-zakura = ["zcash_voting/zakura", "voting-crypto-deps/zakura"]
+lrz = ["zcash_voting/lrz", "voting-crypto-deps/lrz"]
+zakura = ["zcash_voting/zakura", "voting-crypto-deps/default"]
 
 [dependencies]
 anyhow = "1"

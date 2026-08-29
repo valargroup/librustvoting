@@ -132,7 +132,7 @@ Pre-launch wallet databases with older schema versions are reset when opened by
 this branch; callers that need to preserve test data should export it before
 upgrading the crate.
 
-The workspace uses the published `voting-circuits 0.10.3` release.
+The workspace uses the published `voting-circuits 0.11.1` release.
 
 ## Dependency Strategy
 
@@ -144,14 +144,13 @@ The LRZ backend uses one Ironwood dependency stack:
   `zcash_client_sqlite 0.22.0-rc.7`, `zcash_keys 0.16.1`,
   `zcash_primitives 0.30.0`, and `zcash_protocol 0.10.4`** from published
   librustzcash releases.
-- **`voting-circuits 0.10.3`** from
+- **`voting-circuits 0.11.1`** from
   [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
 
-`vote-commitment-tree` and `vote-commitment-tree-client` still select their
-proving stack (`voting-crypto-deps` / VCT) via mutually exclusive
-`upstream`/`zakura` features; build with `--no-default-features --features
-zakura` on those crates for the Zakura VCT backend.
+`vote-commitment-tree` and `vote-commitment-tree-client` default to Zakura and
+select their proving stack through mutually exclusive `zakura`/`lrz` features;
+build with `--no-default-features --features lrz` for the LRZ VCT backend.
 
 The published `zcash_voting` crate defaults to Zakura and exposes LRZ through
 the mutually exclusive `lrz` feature. Wallet-family selection is consolidated
@@ -165,7 +164,7 @@ that Gemini's Cargo lockfile and resolved metadata contain no Zakura forks.
 
 `Cargo.toml` is the source of truth for version and feature requirements, and
 `Cargo.lock` records the exact package sources and versions used by this branch.
-The Zcash wallet crates require Rust 1.88 or newer.
+The RC5 PIR and IMT crates require Rust 1.91 or newer.
 
 ## FFI
 

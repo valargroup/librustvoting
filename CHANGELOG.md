@@ -14,6 +14,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   preventing disabled Zakura forks from entering LRZ consumers' Cargo
   lockfiles and metadata. See the "Dependency notes" section of
   `zcash_voting/README.md`.
+- Updated the Zakura stack to wallet-libraries RC4 and crypto RC5,
+  `voting-crypto-deps 0.2.1`, `voting-circuits 0.11.1`, `imt-tree 0.5.1`,
+  `pir-types 0.6.1`, and `pir-client 0.7.1`. This raises the workspace MSRV to
+  Rust 1.91.
 
 ## v3.1.0-rc.12
 

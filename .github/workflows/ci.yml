@@ -86,12 +86,12 @@ jobs:
             --no-default-features --features lrz \
             --locked --run-ignored ignored-only
 
-  zakura-vct:
-    name: Zakura VCT backend
+  vct-backends:
+    name: VCT backends
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -99,29 +99,29 @@ jobs:
       - name: Test LRZ VCT crates
         run: |
           cargo nextest run -p vote-commitment-tree -p vote-commitment-tree-client \
-            --all-targets --features vote-commitment-tree-client/cli \
+            --all-targets --no-default-features \
+            --features vote-commitment-tree/lrz,vote-commitment-tree-client/lrz,vote-commitment-tree-client/cli \
             --locked
       - name: Test Zakura VCT crates
         run: |
           cargo nextest run -p vote-commitment-tree -p vote-commitment-tree-client \
-            --all-targets --no-default-features \
-            --features vote-commitment-tree/zakura,vote-commitment-tree-client/zakura,vote-commitment-tree-client/cli \
+            --all-targets --features vote-commitment-tree-client/cli \
             --locked
       - name: Check backend contracts
         run: |
           if cargo tree -p vote-commitment-tree -p vote-commitment-tree-client \
             -e all --prefix none --locked \
-            | grep -Eq '^zakura-(pasta-curves|halo2-gadgets|halo2-poseidon|halo2-proofs|orchard|sinsemilla) v'; then
-            echo "Zakura crypto crates entered the default upstream VCT graph"
+            | grep -Eq '^(pasta_curves|halo2_gadgets|halo2_poseidon|halo2_proofs|orchard|sinsemilla) v'; then
+            echo "LRZ crypto crates entered the default Zakura VCT graph"
             exit 1
           fi
 
           if cargo tree -p vote-commitment-tree -p vote-commitment-tree-client \
             -e all --prefix none --no-default-features \
-            --features vote-commitment-tree/zakura,vote-commitment-tree-client/zakura,vote-commitment-tree-client/cli \
+            --features vote-commitment-tree/lrz,vote-commitment-tree-client/lrz,vote-commitment-tree-client/cli \
             --locked \
-            | grep -Eq '^(pasta_curves|halo2_gadgets|halo2_poseidon|halo2_proofs|orchard|sinsemilla) v'; then
-            echo "Upstream crypto crates entered the Zakura VCT graph"
+            | grep -Eq '^zakura-(pasta-curves|halo2-gadgets|halo2-poseidon|halo2-proofs|orchard|sinsemilla) v'; then
+            echo "Zakura crypto crates entered the LRZ VCT graph"
             exit 1
           fi
 
@@ -131,7 +131,7 @@ jobs:
           fi
 
           if cargo check -p vote-commitment-tree --all-features --locked; then
-            echo "The upstream and Zakura backends must remain mutually exclusive"
+            echo "The LRZ and Zakura backends must remain mutually exclusive"
             exit 1
           fi
 
@@ -140,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -261,17 +261,17 @@ jobs:
           cargo check --manifest-path "$CONSUMER_DIR/vizor/Cargo.toml"
       - name: Package voting crates
         run: |
-          # This POC pins the stacked wallet-libraries PR by Git revision.
+          # This POC pins wallet-libraries main by Git revision.
           # Restore full package verification after its release is available
           # through a versioned registry dependency.
           cargo package -p zcash_voting --list
 
   msrv:
-    name: Rust 1.88
+    name: Rust 1.91
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       - name: Check packages at MSRV
         run: |

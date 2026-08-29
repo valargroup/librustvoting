@@ -2,7 +2,7 @@
 name = "zcash_voting"
 version = "3.1.0-rc.12"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.91"
 description = "Client-side library for Zcash shielded voting: ZKP delegation and vote-commitment proofs (Halo 2), ElGamal encryption, governance PCZT construction, Merkle witness generation, and SQLite round-state persistence."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/valargroup/zcash_voting"
@@ -11,18 +11,18 @@ readme = "README.md"
 [features]
 default = ["zakura"]
 lrz = [
-    "voting-crypto-deps/upstream",
-    "voting-circuits/upstream",
+    "voting-crypto-deps/lrz",
+    "voting-circuits/lrz",
     "pir-client/upstream",
     "pir-types/upstream",
     "imt-tree/upstream",
-    "vote-commitment-tree/upstream",
-    "vote-commitment-tree-client/upstream",
+    "vote-commitment-tree/lrz",
+    "vote-commitment-tree-client/lrz",
     "zakura-wallet-lib/lrz",
 ]
 zakura = [
-    "voting-crypto-deps/zakura",
-    "voting-circuits/zakura",
+    "voting-crypto-deps/default",
+    "voting-circuits/default",
     "pir-client/zakura",
     "pir-types/zakura",
     "imt-tree/zakura",
@@ -45,11 +45,11 @@ prost = "0.14"
 sha2 = "0.10"
 ed25519-dalek = "2"
 
-pir-client = { version = "=0.6.0", default-features = false }
-pir-types = { version = "=0.5.0", default-features = false }
+pir-client = { version = "=0.7.1", default-features = false }
+pir-types = { version = "=0.6.1", default-features = false }
 valar-spiral-rs = { version = "=0.5.2", default-features = false }
 valar-ypir = { version = "=0.2.0", default-features = false }
-imt-tree = { version = "=0.4.0", default-features = false }
+imt-tree = { version = "=0.5.1", default-features = false }
 
 bytes = "1"
 http = "1"
@@ -77,7 +77,7 @@ zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
 zcash_protocol = { workspace = true }
-zakura-wallet-lib = { git = "https://github.com/zakura-core/wallet-libraries", rev = "e8f0a0edb9322c80cbe53f8eb4bac4f559fdf155", default-features = false }
+zakura-wallet-lib = { git = "https://github.com/zakura-core/wallet-libraries", rev = "6a210cfb5077437dc18c8d03507647cda5ebbc73", default-features = false }
 uuid = "1.23.1"
 
 [dev-dependencies]
