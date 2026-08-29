@@ -101,8 +101,10 @@ for cases where the funds controller and voter are separate parties, including
 custody provider integrations.
 The proposed
 [recoverable voting authority design](docs/recoverable-voting-authority.md)
-defines a canonical, round-scoped derivation for software wallets and Keystone
-so a restored wallet can reconstruct its voting hotkey and VAN blindings.
+defines one canonical authority-root expansion for deterministic software
+recovery and backed-up current Keystone integrations. It reconstructs the
+voting hotkey and VAN blindings without requiring a firmware change, while
+preserving a provider boundary for future hardware derivation.
 
 ## Migrating 0.11 to 0.12
 

@@ -6,58 +6,76 @@ This document is a proposal for review. It does not describe behavior that is
 implemented today.
 
 The review goal is to approve the authority model, derivation boundaries,
-hardware-wallet flow, recovery contract, and migration boundary before code is
-written. Approval fixes the version 1 decisions below. Implementation must
-freeze their byte-for-byte encodings and public test vectors in `zcash_voting`
-before production activation.
+backup contract, recovery behavior, batching compatibility, and migration
+boundary before code is written. Approval fixes the version 1 decisions below.
+Implementation must freeze the byte encodings and public test vectors in
+`zcash_voting` before production activation.
+
+Deterministic Keystone hotkey derivation is explicitly outside this version.
+The version 1 Keystone path uses the firmware and transaction-signing flow that
+exist today.
 
 ## Executive summary
 
-A voter currently needs two randomly generated secrets after delegation:
+A voter currently needs two kinds of randomly generated secrets after
+delegation:
 
-- the voting hotkey, which authorizes later votes; and
-- `van_comm_rand`, the secret blinding factor for each Vote Authority Note
-  (VAN). Some existing code calls the same value `gov_comm_rand`.
+- one voting hotkey, which authorizes later votes; and
+- one `van_comm_rand` blinding factor for each Vote Authority Note (VAN).
+  Some existing code calls the same value `gov_comm_rand`.
 
 If a delegation reaches the vote chain and the wallet later loses either
-secret, restoring the wallet seed is not enough to recreate that VAN. The
-voter can still see that their Zcash account participated, but cannot prove
-control of the voting authority that was placed on-chain.
+secret, restoring the Zcash wallet is not enough to recreate that VAN. This is
+especially harmful when only part of a multi-bundle delegation was submitted
+or confirmed before local state was lost.
 
-This proposal replaces those independent random secrets with one deterministic,
-round-scoped **voting capability**. A software wallet derives the capability
-locally from its wallet seed. A Keystone derives the same capability on-device
-and returns only that one round-scoped secret to the wallet in an encrypted QR
-response. `zcash_voting` then expands the capability into the voting hotkey and
-one independent VAN blinding factor per canonical delegation bundle.
+Version 1 introduces one 64-byte **voting authority root** for each Zcash
+account, network, vote chain, and round. `zcash_voting` expands that root into:
+
+- one Orchard voting hotkey; and
+- one deterministic, independent VAN blinding factor for each canonical
+  delegation bundle.
+
+The root can come from more than one source without changing the expansion:
+
+- a software wallet derives it from its wallet seed; or
+- an integration that cannot derive it from its seed, including today's
+  Keystone integrations, generates it randomly and makes a durable encrypted
+  backup before delegation can be submitted.
 
 ```text
-Software wallet seed -- local registered KDF --+
-                                                |
-                                                +--> round voting capability
-                                                |             |
-Keystone seed -------- device registered KDF --+             v
-                                                        zcash_voting
-                                                     /                \
-                                           voting hotkey        bundle VAN blinds
+Software wallet seed ---- software seed provider ---+
+                                                     |
+Stored random root ------- encrypted backup --------+--> authority root v1
+                                                               |
+                                                               v
+                                                         zcash_voting
+                                                      /                \
+                                            voting hotkey        bundle VAN blinds
 ```
 
-The capability cannot spend ZEC. Possession authorizes voting only for one
-account, network, vote chain, and round. Different accounts and rounds derive
-unlinkable capabilities.
+For a current Keystone wallet, the hotkey is therefore not recoverable from the
+Keystone mnemonic. It is recoverable from the separate voting-authority backup.
+Keystone continues to sign the completed delegation PCZT or PCZT batch exactly
+as it does today; no new firmware operation or QR type is required.
 
-The change is client-side. The voting circuits and vote-chain verification do
-not need to know how the private witnesses were derived.
+The root-provider boundary is intentional. A future Keystone firmware feature
+can derive and return the same kind of root. The hotkey expansion, bundle
+identity, VAN blinding derivation, recovery state machine, circuits, and
+vote-chain messages would not need to change.
+
+The change is client-side. The voting circuits and vote-chain verifier do not
+need to know whether a private witness was sampled or derived.
 
 ### Recovery at a glance
 
-| Material available after loss | `registered-v1` recovery path |
-| --- | --- |
-| Original software-wallet seed or mnemonic | Re-derive the capability locally |
-| Keystone restored from the same seed | Approve one encrypted capability export |
-| UFVK or watch-only wallet | Cannot derive voting authority |
-| Account-level Unified Spending Key only | Cannot derive the registered root |
-| Legacy `random-v0` round | Requires the original secrets or a full-round backup |
+| Authority source | Recovery material | Result |
+| --- | --- | --- |
+| Software seed provider | Original wallet seed or mnemonic | Re-derive the same authority root |
+| Current Keystone integration | Keystone wallet plus the encrypted voting-authority backup | Restore the root; use existing Keystone signing for any remaining delegations |
+| Current Keystone integration with only the mnemonic | No recovery | The mnemonic does not contain the randomly generated root |
+| UFVK or watch-only wallet | No recovery by itself | Public keys cannot reveal voting authority |
+| Legacy `random-v0` round | Original hotkey and every original bundle blinding | Version 1 cannot recreate already-lost random values |
 
 ## Motivating failure
 
@@ -66,9 +84,9 @@ Consider a voter whose snapshot notes produce three delegation bundles:
 1. Bundle 0 is signed and confirmed on the vote chain.
 2. The app crashes or its voting database is lost before all local recovery
    state is durable.
-3. The user restores the same Zcash wallet.
+3. The user restores the same Zcash account.
 
-Today the restored app samples a different hotkey and different VAN blinding
+Today the restored app samples a different hotkey and a different VAN blinding
 factor. It therefore computes a different VAN for bundle 0. Rebuilding the
 delegation transaction does not help because the original eligible notes may
 already be represented by the confirmed delegation, and later vote proofs must
@@ -81,40 +99,82 @@ vote tree.
 
 ## Goals
 
-- Restore the same voting hotkey from the same wallet seed, account, network,
-  vote chain, and round.
+- Restore the same software-wallet voting hotkey from the same wallet seed,
+  account, network, vote chain, and round.
+- Restore the same current-Keystone voting hotkey from a durable encrypted
+  voting-authority backup, without changing Keystone firmware.
 - Restore a different, deterministic VAN blinding factor for every canonical
   delegation bundle.
-- Give software wallets and Keystone wallets the same derivation result and
-  the same `zcash_voting` API after the seed boundary.
-- Keep the wallet root seed, account spending key, and broader registered-key
-  subtrees out of `zcash_voting` and off the QR channel.
+- Give every integration one canonical `zcash_voting` API after the authority
+  root has been supplied.
+- Keep the wallet root seed, account spending key, and registered-key subtrees
+  out of `zcash_voting`.
 - Preserve one fresh, unlinkable voting authority per account and round.
 - Recover confirmed partial delegation from VAN commitments rather than exact
   transaction bytes.
-- Version every persisted and wire-level derivation artifact so legacy random
-  rounds continue to work without reinterpretation.
+- Work unchanged with atomic vote batches and Keystone PCZT batch signing.
+- Version every persisted derivation artifact so legacy random rounds continue
+  to work without reinterpretation.
 - Consolidate the normative encoding, expansion, bundle identity, recovery,
   documentation, and test vectors in `zcash_voting`.
+- Preserve a narrow provider seam for a future on-device Keystone root without
+  making that firmware work part of version 1.
 
 ## Non-goals
 
+- Derive a deterministic hotkey or authority root from a Keystone seed in
+  version 1.
+- Add a Keystone firmware operation, private-key export, UR type, or encrypted
+  QR response in version 1.
+- Claim that a Keystone mnemonic restores a `stored-random-v1` authority.
 - Recover random secrets that were already lost in a legacy round.
 - Change the ZKP statements, on-chain messages, or vote-chain verifier.
-- Move ZKP generation into Keystone.
-- Give Keystone an arbitrary registered-key or wallet-secret export API.
-- Remove the normal user confirmation required before a hardware wallet
-  releases voting authority.
-- Make an imported UFVK or account-level Unified Spending Key sufficient to
-  reconstruct the registered tree. Version 1 recovery starts from the original
-  wallet seed or mnemonic.
+- Move ZKP generation or vote signing into Keystone.
+- Make an imported UFVK sufficient to reconstruct private voting authority.
 - Guarantee recovery for a manually selected note subset or custom bundle
   policy that is not itself recoverably described.
 - Replace the existing public-target custody handoff in the first version.
   A future version can add a two-party exchange for deterministic bundle
   blindings without changing the self-custody design in this document.
+- Specify the transport or user interface of a possible future Keystone root
+  provider.
 
 ## Terms
+
+### Voting authority context
+
+The canonical account and round identity used by every version 1 expansion:
+
+```text
+authority_context_v1 =
+    0x01
+    || network_tag
+    || account_index_u32_le
+    || vote_chain_id_length_u16_le
+    || vote_chain_id_utf8
+    || vote_round_id_32
+```
+
+`network_tag` is `0` for mainnet, `1` for testnet, and `2` for regtest.
+`vote_chain_id` must first pass the crate's canonical chain-ID validation.
+`vote_round_id_32` is the canonical little-endian 32-byte Pallas base-field
+encoding used by the round. The ZIP-32 account index must be below `2^31`.
+
+The encoding is prefix-free because variable-length fields carry an explicit
+length and all remaining fields have fixed lengths.
+
+### Voting authority root
+
+An opaque 64-byte secret supplied to `zcash_voting` for one authority context.
+The root is the stable boundary between secret custody and voting protocol
+logic. It cannot spend the Zcash account, but possession is sufficient to
+reconstruct and exercise that round's voting authority.
+
+### Authority root source
+
+The local method used to obtain a root. Version 1 defines
+`registered-seed-v1` and `stored-random-v1`. The source is recovery metadata; it
+does not alter root expansion or appear on-chain.
 
 ### Voting hotkey
 
@@ -127,119 +187,143 @@ actions. It cannot spend the Zcash account that delegated the voting weight.
 The Pallas base-field element used to hide the address and weight in a VAN
 commitment. The storage and delegation code call it `van_comm_rand`. Some vote
 builder APIs call the same value `gov_comm_rand`; version 1 should use the VAN
-name consistently.
-
-### Round voting capability
-
-A 64-byte secret derived for exactly one Zcash account, network, vote chain,
-and voting round. It is the narrowest secret transferred across the software
-or hardware seed boundary. `zcash_voting` expands it into the hotkey and bundle
-blindings but cannot use it to derive another account, round, or wallet key.
+name consistently at new API boundaries.
 
 ## Design decisions
 
-### 1. Use the ZIP 32 registered-key construction
+### 1. Standardize one provider-independent root boundary
 
-The seed-owning component derives the round capability using the
-[ZIP 32 registered-key construction][zip32-registered]. Version 1 uses the
-application-owned context `ZcashShieldedVoting` and a fixed numeric namespace
-constant, `VOTING_KDF_ID_V1`, defined by `zcash_voting`. Neither requires
-external assignment or a standalone ZIP before deployment.
+`zcash_voting` owns these concepts:
 
-`VOTING_KDF_ID_V1` occupies the construction's numeric `ZipNumber` slot, but its
-meaning here is a versioned `zcash_voting` protocol ID. It is not contingent on
-publication of a ZIP with that number.
+```text
+VotingAuthorityContextV1
+VotingAuthorityRootV1(64 bytes)
+AuthorityRootSourceV1
+```
+
+A root provider accepts the canonical context and returns exactly one 64-byte
+root. After that call, all providers use the same `zcash_voting` expansion.
+Integrations must not independently define hotkey, bundle-ID, or VAN-blinding
+derivation.
+
+The provider source is selected before the first delegation is built and is
+persisted explicitly. It must not be inferred from application version, secret
+length, device type, or the presence of local rows. Once any delegation may
+have been submitted, the provider and root are immutable for that authority.
+
+The root source is intentionally not included in the expansion. If two
+conforming providers return the same root for the same context, they produce
+the same voting authority. This is what allows a future Keystone provider to
+join without another downstream derivation scheme.
+
+### 2. Derive software-wallet roots from the wallet seed
+
+A software wallet uses the [ZIP 32 registered-key construction][zip32-registered]
+under the application-owned context `ZcashShieldedVoting` and a fixed numeric
+namespace constant, `VOTING_KDF_ID_V1`, defined by `zcash_voting`.
+
+Neither the context nor the numeric namespace requires external assignment or
+a standalone ZIP before deployment. They are version 1 protocol constants and
+must be frozen before interoperable vectors are published. Changing either
+requires a new root-source version because it changes every derived root. A
+later ZIP may document the deployed values without renumbering version 1.
 
 Conceptually, the tree is:
 
 ```text
 RegKD("ZcashShieldedVoting", wallet_seed, VOTING_KDF_ID_V1)
     / coin_type(network)'
-    / account'
-    / round-capability=0'(network, vote_chain_id, vote_round_id)
+    / account_index'
+    / authority-root=0'(tag = authority_context_v1)
 ```
 
 The coin-type and account elements use empty tags. `coin_type(network)` is 133
 for mainnet and 1 for testnet or regtest, matching the account path used by the
 wallet. The account-level registered key is never exported. The final operation
-uses `derive_child_cryptovalue` at hardened child index zero to produce one
-64-byte leaf for the round. The network, vote-chain identifier, and round
-identifier are encoded in that child's tag.
+uses `derive_child_cryptovalue` at hardened child index zero to produce the
+64-byte `VotingAuthorityRootV1`.
 
-The version 1 tag encoding is:
+The wallet-facing library API does not accept a mnemonic, root seed, account
+spending key, or registered subtree key. A narrow software seed-provider helper
+may live outside the ordinary API so integrations do not duplicate the path.
 
-```text
-0x01
-|| network_tag
-|| vote_chain_id_length_u16_le
-|| vote_chain_id_utf8
-|| vote_round_id_32
-```
+The registered cryptovalue is not passed into any ZIP-32 KDF. The next section
+defines a direct Orchard-key expansion instead.
 
-`network_tag` is `0` for mainnet, `1` for testnet, and `2` for regtest.
-`vote_chain_id` must first pass the crate's canonical chain-ID validation.
-`vote_round_id_32` is the canonical little-endian 32-byte Pallas field encoding
-used by the round. The ZIP-32 account index must be below `2^31`.
+### 3. Back up randomly generated roots before Keystone delegation
 
-The context and numeric namespace ID are version 1 protocol constants owned by
-`zcash_voting`. They are frozen before interoperable vectors are published and
-before deployment. Changing either requires a new derivation version because
-it changes every derived authority. A later ZIP may document the deployed
-constants, but it is not a prerequisite and must not renumber version 1.
+Today's Keystone firmware cannot supply the registered seed-derived root. A
+Keystone integration therefore uses `stored-random-v1`:
 
-### 2. Keep the root seed outside `zcash_voting`
+1. Ask `zcash_voting` to generate 64 bytes with the operating system CSPRNG.
+2. Bind the root to the canonical authority context in a typed backup record.
+3. Store the live copy in platform secure storage.
+4. Commit an authenticated, encrypted backup that can survive deletion or loss
+   of the app's voting database.
+5. Read back and validate the backup before allowing any delegation submission.
 
-`zcash_voting` owns a canonical `VotingCapabilityRequestV1` descriptor. That
-descriptor contains the registered context, application-owned numeric namespace
-ID, account path, and round tag. A seed provider executes the registered-key
-construction and returns only `VotingRoundCapabilityV1`.
+The canonical plaintext payload is `VotingAuthorityBackupV1`. It contains the
+format version, `stored-random-v1` source identifier, complete authority
+context, and 64-byte root. `zcash_voting` owns this payload and its validation;
+the wallet integration owns encryption, authentication, storage, and restore
+UX. The plaintext payload must never be logged, placed in a transaction memo,
+or included in diagnostics.
 
-This produces two equivalent providers:
+Acceptable storage can include an integration's existing end-to-end encrypted
+wallet backup or an explicit encrypted export. A second row in the same voting
+database is not a backup. A device-only Keychain entry is useful live storage
+but is not sufficient by itself if it disappears with the device or app.
 
-- a software provider calls the registered KDF locally; and
-- a Keystone provider sends the descriptor's typed round context to firmware.
+If the integration cannot complete and verify the durable backup, it must not
+label the authority recoverable or submit a delegation under
+`authority-root-v1`. This is a real safety gate: after a delegation reaches the
+vote chain, no different root can take over its authority.
 
-The normal wallet-facing API does not accept a mnemonic, root seed, account
-spending key, or registered subtree key. A reference helper may exist behind a
-narrow seed-provider boundary so test vectors and software integrations do not
-duplicate the registered path.
+The backup replaces the need to preserve every bundle blinding separately. It
+does not replace the Keystone mnemonic or Zcash account backup; recovery may
+need both the Zcash account and the voting-authority root.
 
-### 3. Derive the hotkey directly from the capability
+### 4. Derive the hotkey directly from the authority root
 
-The 64-byte registered cryptovalue must not be passed into any ZIP-32 KDF. In
-particular, it must not be treated as a seed for
-`UnifiedSpendingKey::from_seed`, which is how today's random 64-byte hotkey
-secret is interpreted.
-
-Version 1 derives a direct Orchard spending key instead:
+Version 1 derives a direct Orchard spending key:
 
 ```text
 candidate(i) = BLAKE2b-256(
-    key = round_capability_64,
+    key = authority_root_64,
     personalization = "ZcashVoteHotkey",
-    message = i_u32_le,
+    message = authority_context_v1 || i_u32_le,
 )
 ```
 
-Starting with `i = 0`, interpret `candidate(i)` with
-`Orchard::SpendingKey::from_bytes`. Increment `i` until the result is valid.
-The expected number of iterations is one; the counter makes the function
-interoperable even for a rare invalid candidate. Return a derivation error
-rather than wrapping if the `u32` counter is exhausted.
+The ASCII personalization is copied into BLAKE2b's 16-byte personalization
+field and zero-padded on the right. Starting with `i = 0`, interpret
+`candidate(i)` with `Orchard::SpendingKey::from_bytes`. Increment `i` until the
+result is valid. The expected number of iterations is one; the counter makes
+the function interoperable for a rare invalid candidate. Return a derivation
+error rather than wrapping if the `u32` counter is exhausted.
 
-The hotkey uses external Orchard address index zero. The persisted secret is a
-versioned typed value, not an untagged byte string whose meaning is guessed
-from its length:
+The hotkey uses external Orchard address index zero. Its persisted authority is
+a typed root, not an untagged byte string whose meaning is guessed from length:
 
 ```text
-VotingHotkeySecret::RandomV0(64 bytes)
-VotingHotkeySecret::RegisteredV1(32-byte Orchard SpendingKey)
+VotingAuthoritySecret::RandomV0(64-byte legacy hotkey seed)
+VotingAuthoritySecret::RootV1 {
+    source,
+    context,
+    authority_root_64,
+}
 ```
 
-Both variants remain zeroized in memory and storage adapters continue to treat
-them as voting authority.
+Implementations may cache the derived 32-byte Orchard spending key, but the
+root remains the recovery source. Both root and derived key are zeroized after
+use.
 
-### 4. Bind each VAN blinding factor to a canonical bundle identity
+This direct expansion deliberately differs from today's
+`VotingHotkey::from_stored_secret`, which treats a random 64-byte value as a
+ZIP-32 wallet seed. Existing rounds retain that interpretation as
+`random-v0`; new version 1 roots have one uniform meaning regardless of source.
+
+### 5. Bind each VAN blinding factor to a canonical bundle identity
 
 A round can have multiple delegation bundles that share one hotkey. Each bundle
 must receive independent blinding material. Bundle index alone is not enough:
@@ -247,7 +331,7 @@ an SDK policy change could assign different notes to the same index after a
 database loss.
 
 `zcash_voting` defines `VotingBundleIdV1` before any random padding notes, PCZT
-fields, proofs, or transaction bytes are created:
+fields, proofs, batch digest, or transaction bytes are created:
 
 ```text
 bundle_id = BLAKE2b-256(
@@ -263,34 +347,38 @@ bundle_id = BLAKE2b-256(
 )
 ```
 
-The note commitment must be its canonical 32-byte encoding. Canonical bundle
-order is the order returned by the version 1 snapshot-selection and bundle
-planning policy. Padding notes are excluded because their randomness is not
-recoverable and they do not define the real voting weight.
+The ASCII personalization is copied into BLAKE2b's 16-byte personalization
+field and zero-padded on the right. The note commitment must be its canonical
+32-byte encoding. Canonical bundle order is the order returned by the version 1
+snapshot-selection and bundle-planning policy. Padding notes are excluded
+because their randomness is not recoverable and they do not define real voting
+weight.
 
 The blinding factor is then:
 
 ```text
 wide = BLAKE2b-512(
-    key = round_capability_64,
+    key = authority_root_64,
     personalization = "ZcashVoteVANv1",
-    message = bundle_id,
+    message = authority_context_v1 || bundle_id,
 )
 
 van_comm_rand = PallasBase::from_uniform_bytes(wide)
 ```
 
-The capability, rather than the derived hotkey bytes, is the key for this
-expansion. The hotkey and VAN blindings are sibling outputs with separate
-domains. This avoids turning an Orchard signing key into a general-purpose KDF
-key and keeps the bundle derivation stable if the hotkey representation changes
-in a future scheme.
+The ASCII personalization is copied into BLAKE2b's 16-byte personalization
+field and zero-padded on the right. `from_uniform_bytes` avoids biased modular
+reduction and always produces a canonical Pallas base-field element.
 
-This mapping avoids biased reduction and always returns a canonical field
-element. The bundle ID may be persisted for diagnostics and conflict checks,
-but it is privacy-sensitive metadata and is not published on-chain.
+The authority root, rather than the derived hotkey bytes, is the KDF key. The
+hotkey and bundle blindings are sibling outputs with separate domains. This
+keeps the bundle derivation stable if a future provider changes how it obtains
+the root and avoids using a signing key as a general-purpose KDF key.
 
-### 5. Freeze the recoverable note-selection policy
+The bundle ID may be persisted for diagnostics and conflict checks, but it is
+privacy-sensitive metadata and is not published on-chain.
+
+### 6. Freeze the recoverable note-selection policy
 
 Deterministic secrets are necessary but not sufficient if a restored wallet
 cannot reconstruct the original bundle weights. Version 1 recovery therefore
@@ -299,7 +387,7 @@ owned by `zcash_voting`.
 
 The authenticated round configuration identifies:
 
-- `voting_authority_scheme = "registered-v1"`; and
+- `voting_authority_scheme = "authority-root-v1"`; and
 - `bundle_policy = "recoverable-v1"`.
 
 `recoverable-v1` selects the account's canonical eligible note set at the
@@ -328,33 +416,42 @@ require a new policy identifier. They do not silently change version 1.
 
 Wallets may continue to support manual note subsets or custom policies, but
 those flows must either carry their own recoverable selection descriptor or
-tell the user that seed-only voting recovery is unavailable. They must not be
-labelled `recoverable-v1`.
+tell the user that voting recovery is unavailable. They must not be labelled
+`recoverable-v1`.
 
 An intentionally skipped suffix of the canonical bundle plan does not change
-earlier bundle identities. Recovery can discover which prefix reached the
-vote chain and let the user make a new decision about bundles that were never
+earlier bundle identities. Recovery can discover which prefix reached the vote
+chain and let the user make a new decision about bundles that were never
 submitted.
 
-### 6. Select the scheme through authenticated round configuration
+### 7. Select the expansion through authenticated round configuration
 
 Rounds created before activation do not contain a scheme and remain
-`random-v0`. New recoverable rounds explicitly select `registered-v1` in the
-authenticated configuration consumed by `zcash_voting`.
+`random-v0`. New recoverable rounds explicitly select `authority-root-v1` in
+the authenticated configuration consumed by `zcash_voting`.
 
-The crate fails closed on an unknown scheme or policy. A wallet must not decide
-between random and deterministic authority from an application version, date,
-secret length, or whether local rows happen to exist.
+The round configuration selects the canonical expansion and bundle policy. It
+does not select the local root source. A software wallet can use
+`registered-seed-v1`, while today's Keystone integration uses
+`stored-random-v1`; both result in an indistinguishable version 1 authority on
+the vote chain.
+
+The chosen source and root are persisted together before delegation. A wallet
+must not silently fall back to a new random root when seed derivation or backup
+restore fails.
+
+The crate fails closed on an unknown scheme, source, or policy. A wallet must
+not decide between legacy and version 1 behavior from an application version,
+date, secret length, or whether local rows happen to exist.
 
 The vote chain does not need the scheme to verify proofs or signatures. A
-future vote-chain field may make capability negotiation more visible, but it
+future vote-chain field may make scheme negotiation more visible, but it
 is not required for the first implementation if the existing authenticated
 round configuration carries the value.
 
-Deployment must still prevent an older wallet that ignores the new field from
-joining a `registered-v1` round under random behavior. The configuration switch
-should therefore be activated only for wallet versions that require and
-understand the scheme.
+Deployment must prevent an older wallet that ignores the new field from
+joining an `authority-root-v1` round under random behavior. Activate the
+configuration only for wallet versions that require and understand the scheme.
 
 ## Software-wallet flow
 
@@ -363,173 +460,136 @@ understand the scheme.
 1. Resolve and authenticate the round configuration.
 2. Reconstruct the canonical snapshot note set and `recoverable-v1` bundle
    plan.
-3. Ask the software seed provider for the registered round capability.
-4. Construct the hotkey and every bundle ID and blinding factor in
+3. Ask the software seed provider for the version 1 authority root.
+4. Construct the hotkey, every bundle ID, and every blinding factor in
    `zcash_voting`.
-5. Persist the scheme, hotkey secret, bundle IDs, blindings, and plan for normal
-   operation. Persistence is a cache and resume optimization, not the only
-   backup.
+5. Persist the source, context, root, bundle IDs, blindings, and plan for normal
+   operation. The seed remains the independent recovery source.
 6. Build proofs, sign, submit, and confirm delegation through the existing
    lifecycle.
 
 ### Recovery
 
-After a fresh install, the same seed provider and round context produce the
-same capability. The wallet can reconstruct the plan and recover on-chain VANs
-without a separate voting-secret backup.
+After a fresh install, the same seed provider and authority context produce the
+same root. The wallet can reconstruct the plan and recover on-chain VANs without
+a separate voting-secret backup.
 
-A watch-only wallet, imported UFVK, or account-level Unified Spending Key cannot
-derive the capability because none contains the registered root. That is an
-intentional authority boundary. Recovery requires the original wallet seed or
-mnemonic; otherwise voting authority must arrive through an external handoff or
-an encrypted backup.
+A watch-only wallet or imported UFVK cannot derive the root. Recovery requires
+the original wallet seed or the exact authority root through an authenticated,
+encrypted handoff.
 
-## Keystone flow
+## Current Keystone flow
 
-### Why the existing transaction signature is not the KDF
+Version 1 does not ask Keystone to derive, store, or export voting authority.
+The host wallet uses `stored-random-v1` and the existing hardware interaction:
 
-The current Keystone Orchard signing path uses fresh randomness for RedPallas
-signatures, so signing the same bytes again does not reproduce the same
-signature. Making that signature deterministic would still not solve the
-ordering problem: the delegation PCZT already contains the hotkey address and
-VAN that would supposedly be derived from its signature.
+1. Resolve and authenticate the round configuration.
+2. Generate the authority root and complete the durable encrypted backup gate.
+3. Let `zcash_voting` derive the hotkey, bundle IDs, VAN blindings, and
+   delegation proof inputs.
+4. Build the delegation PCZT or PCZT batch.
+5. Ask Keystone to sign it through the existing Zcash signing flow.
+6. Submit and confirm delegation through the existing lifecycle.
 
-A separate derivation request is therefore required before delegation PCZTs
-are built. It is a key-derivation operation, not a synthetic transaction or
-message signature.
+Multiple delegation PCZTs can continue to use the existing Keystone batch
+signing path. A batch contains already-constructed transactions, so grouping
+them for one signing interaction does not alter any authority derivation.
 
-### Typed request and encrypted response
+After delegation, the host-held voting hotkey signs vote-chain actions as it
+does today. No additional Keystone operation is introduced.
 
-Define these dedicated UR registry types:
+### Keystone recovery
 
-- `zcash-voting-key-request`; and
-- `zcash-voting-key`.
+Restoring the Keystone mnemonic restores the Zcash account but not the random
+voting-authority root. The wallet must also restore and validate the encrypted
+`VotingAuthorityBackupV1` payload.
 
-`zcash_voting` owns the host-side request and response model, deterministic CBOR
-encoding, UR type names, and golden bytes. Keystone mirrors that encoding and
-the shared vectors rather than defining a second wallet-specific format.
+Once the root is restored, `zcash_voting` recreates the hotkey and every
+canonical bundle blinding. Keystone is needed only when a remaining delegation
+transaction still requires the Zcash account signature. A voter whose
+delegation is already confirmed can reconstruct and use the host-side voting
+authority without a new device derivation operation.
 
-The request contains:
+If the exact root backup is unavailable, recovery fails closed. The wallet must
+not generate a replacement root and present it as the original authority.
 
-- a 16-byte random request ID;
-- derivation scheme version;
-- 32-byte expected Zcash seed fingerprint;
-- ZIP-32 account index;
-- network;
-- vote-chain identifier;
-- canonical 32-byte vote-round identifier; and
-- a 32-byte HPKE recipient public key generated by the wallet for this request.
+## Future Keystone provider seam
 
-The firmware supports only the registered shielded-voting descriptor. The host
-cannot supply an arbitrary context, numeric namespace ID, child path, or export
-scope. Firmware rejects a request whose expected seed fingerprint does not
-match the selected wallet seed.
+A future firmware project may implement an authority-root provider for the same
+canonical context and 64-byte result. That feature could match
+`registered-seed-v1` or define a separately versioned provider source. Its user
+approval, transport confidentiality, account authentication, and firmware
+resource limits would receive a separate design review.
 
-After the user approves, firmware derives the final round capability leaf and
-encrypts it to the wallet with the [RFC 9180][rfc9180] base-mode suite:
+Nothing after the provider boundary changes:
 
-```text
-DHKEM(X25519, HKDF-SHA256)
-HKDF-SHA256
-ChaCha20-Poly1305
-```
+- `VotingAuthorityContextV1` remains the request context;
+- `VotingAuthorityRootV1` remains the returned secret type;
+- hotkey expansion remains byte-for-byte identical;
+- `VotingBundleIdV1` and `van_comm_rand` derivation remain identical;
+- recovery continues to locate canonical VANs; and
+- circuits and vote-chain messages remain unchanged.
 
-The canonical request bytes are authenticated as associated data. The response
-echoes the request ID and scheme version and carries the HPKE encapsulated key
-and ciphertext. HPKE uses the ASCII bytes `ZcashVotingKeyV1` as its `info` value
-and the complete canonical request bytes as associated data. The encrypted
-plaintext contains the 64-byte capability, firmware-version string, and a
-randomized RedPallas signature by the selected account's unrandomized Orchard
-SpendAuthorizingKey. The signed digest is:
+A future deterministic provider applies to newly created authorities. It
+cannot retroactively derive a previously sampled `stored-random-v1` root from
+the Keystone mnemonic. Existing random-root rounds continue to recover from
+their backups.
 
-```text
-auth_digest = BLAKE2b-256(
-    personalization = "ZcashVoteAuthV1",
-    message = canonical_request_bytes
-              || firmware_version_length_u16_le
-              || firmware_version_utf8
-              || round_capability_64,
-)
-```
+This seam also allows a future device to import or retain an exact root if that
+custody model is separately approved. Version 1 neither requires nor specifies
+that behavior.
 
-The canonical request includes the ephemeral HPKE recipient key, so the
-signature binds the capability to this request and recipient. The wallet
-verifies the signature against the Orchard SpendValidatingKey in its
-independently held UFVK before handing the capability to `zcash_voting`. This
-domain is distinct from a Zcash transaction signature digest.
+## Batching compatibility
 
-The wallet accepts a response only for one outstanding request ID and ephemeral
-recipient key, then deletes the recipient private key whether the request is
-accepted or cancelled.
+Authority derivation happens before transaction batching and is keyed to a
+canonical delegation bundle, not to a transaction container.
 
-HPKE base mode provides confidentiality but does not by itself authenticate the
-sender: anyone who sees the wallet's recipient public key could encrypt a
-substitute capability. The account signature prevents that substitution from
-delegating the vote to attacker-known material. It is an authentication result,
-not derivation entropy, and may remain randomized.
+The current atomic vote API carries multiple ordered proposal actions for one
+delegation `bundle_index`. All actions use the same hotkey and begin from that
+bundle's VAN. `authority-root-v1` reconstructs that starting authority exactly.
+The existing atomic-batch code then performs the ordered VAN transitions,
+binds every action to the shared batch digest, and persists or confirms the
+batch as one unit.
 
-The capability is never shown in plaintext QR data, logs, crash reports, or UI
-diagnostics. Firmware zeroizes the capability, account-level registered key,
-HPKE shared secret, and seed-backed intermediates after encoding the response.
+The following values must not enter the authority-root, hotkey, bundle-ID, or
+initial VAN-blinding derivation:
 
-Encryption protects the response from cameras and unrelated QR readers. It
-does not make an approved malicious wallet harmless: the requesting wallet
-owns the recipient key and will receive the capability. Human-readable device
-review remains the authorization boundary.
+- number of actions placed in an atomic transaction;
+- proposal order in that transaction;
+- batch digest;
+- transaction hash;
+- proof or signature randomness; and
+- whether the same action was first prepared as a singleton.
 
-### Device review
+This lets an unsubmitted batch be rebuilt without changing its starting
+authority. Once any member may have been submitted, the existing atomic batch
+recovery rules remain authoritative.
 
-The confirmation screen identifies:
-
-- the operation as **Export voting authority**;
-- Zcash network and account;
-- vote-chain identifier;
-- a short fingerprint of the round ID;
-- that the authority can vote in this round but cannot spend ZEC; and
-- that the requesting wallet will receive the round-scoped secret.
-
-A host-provided round title may be shown as unverified convenience text. The
-canonical round fingerprint must remain visible because the device cannot
-independently authenticate the title.
-
-### Delegation and recovery interactions
-
-Initial delegation requires two hardware interactions:
-
-1. derive and export the encrypted round capability; then
-2. sign the completed delegation PCZTs using the existing Zcash batch-signing
-   request.
-
-The first result is needed before the wallet can compute the hotkey, VANs, and
-ZKP #1 inputs, so these interactions cannot be collapsed without moving proof
-generation or transaction construction onto Keystone. Multiple delegation
-PCZTs remain one batch-signing interaction and do not become dependent
-on-chain transactions.
-
-Recovery requires only the first interaction. Keystone does not need to keep a
-per-round record in secure storage: the same restored device seed derives the
-same capability on demand.
-
-The firmware's existing public HD-key request may provide reusable parsing and
-UI plumbing, but it must not be extended to return private material generically.
+If a future vote-chain transaction can carry actions from several delegation
+bundle indices, each bundle still has its own root-derived blinding and
+independent VAN transition chain. The transaction layer may commit those chains
+atomically, but it does not merge their identities or derive a batch-wide
+`van_comm_rand`. No version 1 derivation change would be required.
 
 ## Recovery state machine
 
-Given the restored account seed or Keystone seed and independently
-authenticated round configuration, `zcash_voting` recovery proceeds as follows:
+Given the exact authority root and independently authenticated round
+configuration, `zcash_voting` recovery proceeds as follows:
 
-1. Rescan the account at the round's snapshot height, including notes that are
+1. Validate that the restored root source, context, scheme, and policy match.
+2. Rescan the account at the round's snapshot height, including notes that are
    spent at the current tip but were eligible at the snapshot.
-2. Reconstruct the frozen `recoverable-v1` bundle plan.
-3. Re-derive the round capability, hotkey, bundle IDs, blinding factors, weights,
-   and candidate VAN commitments.
-4. Sync and root-validate the public vote-commitment tree.
-5. Locate every candidate VAN in that tree.
-6. Atomically import only unambiguous matches with their confirmed positions.
-7. Continue normal delegation for a candidate with no match only after the
+3. Reconstruct the frozen `recoverable-v1` bundle plan.
+4. Re-derive the hotkey, bundle IDs, blinding factors, weights, and candidate
+   VAN commitments.
+5. Sync and root-validate the public vote-commitment tree.
+6. Locate every candidate VAN in that tree.
+7. Atomically import only complete, unambiguous matches with their confirmed
+   positions.
+8. Continue normal delegation for a candidate with no match only after the
    wallet establishes that its source notes remain usable and no ambiguous
    broadcast can still land.
-8. Reject duplicate, conflicting, partial, or root-inconsistent recovery state.
+9. Reject duplicate, conflicting, partial, or root-inconsistent recovery state.
 
 A confirmed VAN is authoritative even if the original transaction hash is
 missing. A transaction hash remains useful for normal polling but does not
@@ -537,15 +597,17 @@ replace commitment recovery.
 
 Once voting has begun, the same hotkey and VAN blinding factor reconstruct the
 authority transitions. Existing vote recovery continues to use confirmed
-vote-commitment positions and proposal-authority state. One-time proof and
-signature randomizers may be freshly generated when unsubmitted work is
-rebuilt.
+vote-commitment positions and proposal-authority state. An atomic vote batch is
+recovered as one ordered unit under its existing digest and action checks.
+One-time proof and signature randomizers may be freshly generated when work
+that was never submitted is rebuilt.
 
 ## Legacy migration
 
 Existing rows and rounds remain `random-v0`:
 
-- their 64-byte stored hotkey secret keeps its current interpretation;
+- their 64-byte stored hotkey secret keeps its current ZIP-32-seed
+  interpretation;
 - their persisted `van_comm_rand` values remain authoritative; and
 - no code attempts to replace them with version 1 derivations.
 
@@ -554,12 +616,18 @@ legacy secrets are already gone, version 1 cannot recover them retroactively.
 
 As a short-term mitigation, a wallet that still has a live legacy round may
 offer an encrypted full-round backup containing the hotkey secret and every
-bundle blinding factor. The existing delegation capability package is not such
-a backup because it deliberately excludes the hotkey secret.
+bundle blinding factor. That legacy package is distinct from
+`VotingAuthorityBackupV1`.
 
-Persisted state adds explicit scheme and bundle-ID columns. Migration assigns
-`random-v0` to all existing rows. It never infers a scheme from secret length
-or recomputes a value merely because a column is empty.
+Persisted state adds explicit authority scheme, root source, authority context,
+and bundle-ID columns. Migration assigns `random-v0` to all existing rows. It
+never infers a scheme from secret length or recomputes a value merely because a
+column is empty.
+
+Changing roots or providers is allowed only before the wallet has built work
+that could have been submitted. After a definite pre-submission reset, the
+wallet may create a new authority. After submission or an ambiguous broadcast,
+the original authority remains mandatory.
 
 ## Public-target and custody boundary
 
@@ -567,77 +635,105 @@ The existing public-target flow separates a voter who owns the hotkey from a
 funds controller who selects and proves the delegation bundles. Version 1 of
 this proposal does not silently change that protocol.
 
-A future deterministic extension can use the same round capability, but the
+A future deterministic extension can use the same authority root, but the
 funds controller must first send canonical bundle IDs to the voter and receive
 the corresponding secret blindings over its existing authenticated,
 confidential channel. The voter does not need the underlying notes, and the
-funds controller never receives the round capability or hotkey secret. That
+funds controller never receives the authority root or hotkey secret. That
 additional two-party exchange should be reviewed with the custody handoff as a
 separate version.
 
 ## Security properties
 
-### Seed and fund separation
+### Root and fund separation
 
-The exported capability does not reveal the root seed, account spending key,
-full viewing key, account metadata key, or a registered subtree key. Compromise
-allows voting only for the bound round and account context. It does not allow
-the attacker to spend ZEC or derive another round.
+The software seed provider returns only a round-scoped root, not the root seed,
+account spending key, viewing key, or registered subtree key. The current
+Keystone path does not export any seed-derived secret at all. Compromise of an
+authority root allows voting for its bound context but does not allow spending
+ZEC or deriving another Zcash account.
+
+The authority context is included again in both root expansions. Accidental
+reuse of one random root across two contexts therefore produces different
+hotkeys and blindings, although integrations must still reject such reuse as a
+state error.
 
 ### Privacy and unlinkability
 
-The capability is pseudorandom to anyone without the wallet seed. Determinism
-does not make it publicly guessable. Account, network, chain, and round domain
-separation produce different hotkeys. Bundle IDs produce different VAN
-blindings within one round.
+The root is uniformly random or pseudorandom to anyone without the recovery
+source. Determinism does not make it publicly guessable. Account, network,
+chain, and round separation produce different authorities. Bundle IDs produce
+different VAN blindings within one round.
 
-No capability, hotkey secret, VAN blinding factor, or bundle ID is published
-in transaction memos or vote-chain messages.
+No authority root, hotkey secret, VAN blinding factor, or bundle ID is
+published in transaction memos or vote-chain messages.
+
+### Backup compromise
+
+The `stored-random-v1` backup contains full voting authority for one context.
+Its encryption and authentication are security boundaries, not mere data-at-
+rest conveniences. A copied plaintext root lets an attacker vote but still
+does not let the attacker spend ZEC.
+
+Deleting the live root after delegation does not revoke a copied backup or
+change the on-chain authority. Wallet UX must describe backup deletion as a
+custody action, not revocation.
 
 ### Wallet compromise
 
-A wallet that holds the decrypted round capability can vote for that round.
-This is the same authority the wallet holds today when it stores the hotkey and
-VAN blindings. Hardware derivation improves backup and scope; it does not turn
-an actively compromised voting host into a trusted prover.
+A wallet that holds the authority root can vote for that context. This is the
+same authority the wallet holds today when it stores the hotkey and VAN
+blindings. Seed derivation or hardware-backed Zcash transaction signing does
+not turn an actively compromised voting host into a trusted prover.
 
 ### Cross-protocol separation
 
-The design uses its own application-owned registered-KDF context and numeric
-namespace. ZIP 325's Account Metadata Key tree is not used as the voting
-signing authority. ZIP 325 may be appropriate for encrypting off-chain backups,
-but its current purpose is metadata encryption and it does not standardize a
-voting authority.
+The software source uses its own application-owned registered-KDF context and
+numeric namespace. ZIP 325's Account Metadata Key tree is not used as the
+voting signing authority. ZIP 325 may be appropriate for encrypting an
+off-chain backup, but its current purpose is metadata encryption and it does
+not standardize voting authority.
 
 ## Rejected alternatives
 
+### Require deterministic Keystone authority in version 1
+
+Rejected because a safe, purpose-specific, seed-derived private output requires
+new firmware behavior and a separately reviewed transport. Recovery can ship
+without that dependency by backing up a host-generated random root.
+
 ### Derive from an ordinary Keystone transaction signature
 
-Rejected because current RedPallas signatures are randomized, the delegation
-transaction already depends on the hotkey, and signature determinism is a
-fragile cross-vendor KDF contract.
+Rejected because current RedPallas signatures are randomized, and the
+delegation PCZT already contains the hotkey address and VAN that would
+supposedly be derived from its signature.
 
 ### Add a deterministic sign-message request
 
-Rejected as the primary design because it would still be a separate hardware
-interaction while coupling key derivation to signature encoding. A registered
-KDF communicates the actual purpose and has a cleaner scope.
+Rejected because it is still a firmware change and would couple key derivation
+to a signing protocol and its user-interface semantics. A future provider
+should return the typed authority-root result directly.
 
-### Feed the registered cryptovalue into `UnifiedSpendingKey::from_seed`
+### Reuse today's random hotkey seed as the version 1 root
 
-Rejected because ZIP 32 explicitly prohibits using a full-width registered
-cryptovalue as input to a ZIP-32 KDF. The capability derives a direct Orchard
-spending key instead.
+Rejected because software-derived registered cryptovalues must not be fed back
+into ZIP-32 key derivation. Keeping today's seed-to-USK interpretation for one
+provider and direct Orchard expansion for another would give the same root type
+two meanings. Version 1 instead uses one direct expansion and leaves all
+existing hotkeys under `random-v0`.
 
-### Derive from an account Unified Spending Key
+### Derive bundle blindings from the hotkey spending key
 
-Rejected for version 1 because treating a serialized account key as new root
-entropy would not be ZIP 32 Registered Key Derivation and would couple the
-voting protocol to a composite key format. The dedicated registered tree gives
-the application an independently scoped key under a fixed, application-owned
-context. The resulting tradeoff is explicit: root-seed restoration works,
-while an account-key-only import does not. Supporting the latter would require
-a separately specified derivation version.
+Rejected because it turns a signing key into a general-purpose KDF key and
+couples recovery to the hotkey's serialized representation. Sibling expansion
+from the authority root gives each purpose its own domain.
+
+### Back up every independently sampled bundle blinding
+
+Rejected as the canonical version 1 design because the backup grows with the
+bundle plan, can capture only a partial plan, and does not consolidate
+integrators on one reproducible `zcash_voting` derivation. The single root is
+enough to recover every canonical bundle.
 
 ### Derive every bundle blind from only its index
 
@@ -650,20 +746,19 @@ binds the blinding to the actual snapshot notes.
 Rejected because an observer could recompute the supposedly secret blind and
 brute-force VAN contents.
 
-### Store the hotkey only in Keystone secure storage
+### Store the root only in Keystone secure storage
 
-Rejected because later ZKP #2 construction currently requires the host to
-possess the hotkey secret, and device-local persistence would reintroduce a
-second backup problem. Deterministic on-demand derivation works on a restored
-device without per-round secure-element state.
+Rejected for version 1 because the host needs voting authority for proof and
+vote construction, and device-only persistence would create another hardware
+backup and migration problem. The current design needs no per-round Keystone
+state.
 
 ### Use ZIP 325 directly
 
 Rejected because [ZIP 325][zip325] is a draft metadata-encryption tree, not a
-signing authority namespace. The generic registered-KDF mechanism is reusable;
-the metadata tree is not.
+signing-authority namespace. It may help an integration protect backups, but it
+does not define the authority itself.
 
-[rfc9180]: https://www.rfc-editor.org/rfc/rfc9180.html
 [zip32-registered]: https://zips.z.cash/zip-0032#specification-registered-key-derivation
 [zip325]: https://zips.z.cash/zip-0325
 
@@ -671,62 +766,79 @@ the metadata tree is not.
 
 ### `zcash_voting`
 
-- normative derivation descriptor and encodings;
-- typed round capability and versioned hotkey secret;
+- normative authority-context and root types;
+- root-source identifiers and backup payload validation;
 - direct Orchard hotkey expansion;
 - canonical bundle ID and VAN blinding expansion;
 - recoverable version 1 note-selection and bundle policy;
 - authenticated scheme selection;
 - persistence migration and legacy separation;
-- VAN-based recovery state machine; and
+- VAN-based recovery state machine;
+- atomic-batch compatibility rules; and
 - public golden vectors, documentation, and integration fixtures.
 
 ### Software-wallet integrations
 
 - root-seed provider implementation;
-- secure in-memory handling and optional platform-secure caching;
+- secure in-memory handling;
 - snapshot rescan and recovery UX; and
 - fail-closed handling for unsupported schemes or custom non-recoverable note
   selection.
 
+### Current Keystone integrations
+
+- calling the canonical stored-random root generator;
+- platform-secure live storage;
+- authenticated encrypted backup and restore UX;
+- the pre-delegation backup-completion gate; and
+- existing Keystone PCZT or PCZT-batch signing.
+
 ### Keystone firmware
 
-- whitelisted shielded-voting registered derivation;
-- typed UR request and HPKE response;
-- account, fingerprint, and round-context review;
-- zeroization and resource limits; and
-- compatibility vectors matching `zcash_voting`.
+No version 1 change is required.
+
+A future firmware project may implement a root provider against the canonical
+context, root type, and expansion vectors. That work is not an activation gate
+for this design.
 
 ### `voting-circuits`
 
-No circuit change is required. Cross-repository fixtures should prove that the
-derived hotkey and VAN blinding factor produce the expected public VAN and
-valid ZKP #1 and ZKP #2 statements.
+No circuit change is required. Builder documentation that currently requires
+`van_comm_rand` to be sampled directly from a CSPRNG must also permit a
+domain-separated PRF output that is uniformly mapped into the Pallas base
+field. Cross-repository fixtures should prove that the derived hotkey and VAN
+blinding factor produce the expected public VAN and valid ZKP #1 and ZKP #2
+statements.
 
 ### `vote-sdk`
 
 No consensus or message change is required for authority derivation. End-to-end
-fixtures should verify delegation, partial recovery, and subsequent voting.
-An explicit on-chain scheme identifier may be considered later if authenticated
-client configuration is not sufficient for rollout coordination.
+fixtures should verify delegation, partial recovery, and subsequent singleton
+and atomic-batch voting. An explicit on-chain scheme identifier may be
+considered later if authenticated client configuration is not sufficient for
+rollout coordination.
 
 ## Validation and rollout gates
 
 Before activation, require:
 
-- frozen test vectors from a public test seed through registered capability,
-  hotkey secret, raw Orchard address, bundle ID, VAN blinding factor, and VAN;
-- software and Keystone implementations producing byte-identical vectors;
+- frozen expansion vectors from a public 64-byte root through the direct
+  hotkey, raw Orchard address, bundle ID, VAN blinding factor, and VAN;
+- frozen software-provider vectors from a public test seed and authority
+  context through the registered root and the same expansion vectors;
 - separation tests for account, network, vote chain, round, bundle index, note
   identity, and derivation version;
 - invalid-hotkey-candidate counter coverage;
-- HPKE round trips, tampering, replay, wrong-request, wrong-account, cancellation,
-  forged-account-signature, and zeroization tests;
-- simulator and real-device Keystone interoperability;
+- `stored-random-v1` generation, backup encryption, restore, wrong-context,
+  corruption, and pre-delegation durability-gate tests;
+- proof verification through both circuit backends used by supported wallets;
 - database-loss recovery with no delegation, one of several delegations
   confirmed, all delegations confirmed, a missing transaction hash, one vote
   confirmed, and an ambiguous broadcast;
-- proof verification through both circuit backends used by supported wallets;
+- a fresh multi-action atomic batch, restart recovery, confirmation,
+  idempotent replay, and rollback after a later conflict;
+- Keystone-host integration tests using the existing PCZT batch signing path,
+  with no new firmware request;
 - explicit legacy `random-v0` compatibility and no-silent-migration tests;
 - downstream software-wallet integration tests; and
 - frozen application-owned KDF constants and a published derivation
@@ -734,33 +846,39 @@ Before activation, require:
 
 Rollout order:
 
-1. Land the normative `zcash_voting` types, encodings, and vectors without
-   activating the scheme.
-2. Implement and validate the software seed provider.
-3. Implement the Keystone UR and firmware path against the same vectors.
-4. Land VAN-based deterministic recovery and downstream UX.
-5. Activate `registered-v1` only in authenticated round configuration that
+1. Land the normative `zcash_voting` types, encodings, backup payload, and
+   vectors without activating the scheme.
+2. Implement the software seed provider and `stored-random-v1` provider.
+3. Land VAN-based recovery and downstream backup and recovery UX.
+4. Validate the existing Keystone PCZT batch-signing integration with restored
+   authority roots.
+5. Activate `authority-root-v1` only in authenticated round configuration that
    excludes unsupported wallet versions.
+
+No firmware release is part of this rollout order.
 
 ## Approval checklist
 
 Reviewers are asked to approve or reject these decisions explicitly:
 
-- one deterministic round capability as the shared software/hardware boundary;
-- recovery from the original wallet seed, with UFVK and account-level Unified
-  Spending Key imports outside the version 1 guarantee;
-- the ZIP 32 registered-key construction under a versioned namespace owned by
-  `zcash_voting`, without an external ZIP-assignment gate;
+- one 64-byte authority root as the canonical provider boundary;
+- deterministic software roots and backed-up random roots as version 1
+  sources;
+- deterministic Keystone hotkey derivation and all firmware work outside
+  version 1;
+- the existing Keystone PCZT batch-signing path remaining unchanged;
 - direct Orchard hotkey derivation instead of re-seeding ZIP 32;
 - per-bundle blindings bound to canonical snapshot bundle identities;
 - one frozen recoverable note-selection and bundle policy for version 1;
-- an encrypted, user-approved Keystone export followed by the existing batch
-  signing interaction;
-- authenticated round configuration selecting the derivation scheme;
+- atomic vote batching remaining outside the authority derivation;
+- authenticated round configuration selecting the expansion, with root source
+  kept as explicit local recovery metadata;
 - forward-only migration with all existing rounds remaining `random-v0`;
-- no circuit or consensus change for the first version; and
+- no circuit or consensus change for the first version;
+- a future Keystone root provider fitting the same post-provider expansion;
+  and
 - public-target custody determinism as a separately versioned follow-up.
 
 Approval of this document fixes the version 1 design so implementation PRs can
 proceed against it. It does not by itself activate the scheme for a production
-round or approve release of firmware or wallet changes.
+round or approve a wallet release.
