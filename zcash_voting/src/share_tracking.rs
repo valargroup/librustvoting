@@ -1056,6 +1056,12 @@ async fn resubmit_to_next_helper(
                     ambiguous_urls,
                 });
             }
+            Err(HelperError::Cancelled) => {
+                return Ok(ResubmitReport {
+                    outcome: ResubmitOutcome::Cancelled,
+                    ambiguous_urls,
+                });
+            }
             // A weaker outcome from a recovery re-POST cannot downgrade the
             // durable acceptance established by the original request.
             Err(error) if error.is_ambiguous() && is_accepted_retry => {}
@@ -1534,6 +1540,47 @@ mod tests {
 
         assert_eq!(outcome, ShareStatusOutcome::Cancelled);
         assert_eq!(client.health().failure_count(&helper(1)), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_after_final_failed_resubmission_is_propagated() {
+        let configured = helpers(1);
+        let db = db_with_delivery(&[helper(1)], &[], 1);
+        let share_id = share_id_of(&db);
+        let transport = Arc::new(MockTransport::default());
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(1)
+            ),
+            json_status("pending"),
+        );
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(1)),
+            http_status(400),
+        );
+        let cancel_after_post = || transport.call_count("/shares") > 0;
+
+        let client = client_with(transport.clone());
+        let random = zero_bytes;
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, overdue(), &random),
+            &client,
+            &cancel_after_post,
+        )
+        .await
+        .unwrap();
+
+        assert!(report.cancelled);
+        assert!(report.resubmitted.is_empty());
+        assert!(report.ambiguous.is_empty());
+        assert_eq!(transport.call_count("/shares"), 1);
+        assert_eq!(client.health().failure_count(&helper(1)), 0);
+        let stored = only_share(&db);
+        assert_eq!(stored.sent_to_urls, vec![helper(1)]);
+        assert!(stored.ambiguous_urls.is_empty());
+        assert_eq!(stored.submit_at, SUBMIT_AT);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3461,7 +3508,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ambiguous_attempt_is_durable_before_recovery_advances() {
         let configured = helpers(3);
-        let db = db_with_delivery(&[helper(1)], &[], 2);
+        let db = Arc::new(db_with_delivery(&[helper(1)], &[], 2));
         let transport = Arc::new(MockTransport::default());
         transport.queue_post(
             &format!("{}/shielded-vote/v1/shares", helper(2)),
@@ -3471,31 +3518,31 @@ mod tests {
             &format!("{}/shielded-vote/v1/shares", helper(3)),
             json_status("queued"),
         );
+        let observed_db = db.clone();
+        transport.observe_posts(move |url| {
+            if url.contains("helper-3") {
+                let stored = only_share(&observed_db);
+                assert_eq!(stored.ambiguous_urls, vec![helper(2)]);
+                assert_eq!(stored.submit_at, SUBMIT_AT);
+            }
+        });
 
         let client = client_with(transport.clone());
         let random = preserve_two_server_order;
-        let cancel_before_second_helper = || {
-            if transport.call_count(&helper(2)) == 0 {
-                return false;
-            }
-            let stored = only_share(&db);
-            assert_eq!(stored.ambiguous_urls, vec![helper(2)]);
-            assert_eq!(stored.submit_at, SUBMIT_AT);
-            true
-        };
         let report = track_pending_shares(
             &db,
             &params(&configured, SUBMIT_AT, &random),
             &client,
-            &cancel_before_second_helper,
+            &never_cancel(),
         )
         .await
         .unwrap();
 
-        assert!(report.cancelled);
+        assert!(!report.cancelled);
         assert_eq!(report.ambiguous.len(), 1);
         assert_eq!(report.ambiguous[0].server_url, helper(2));
-        assert_eq!(transport.call_count(&helper(3)), 0);
+        assert_eq!(report.resubmitted[0].server_url, helper(3));
+        assert_eq!(transport.call_count(&helper(3)), 1);
     }
 
     #[tokio::test(start_paused = true)]
