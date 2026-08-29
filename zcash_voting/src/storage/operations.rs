@@ -1931,7 +1931,7 @@ impl VotingDb {
     }
 
     /// Mark a share delegation as confirmed on-chain.
-    pub fn mark_share_confirmed(
+    pub(crate) fn mark_share_confirmed(
         &self,
         round_id: &str,
         bundle_index: u32,

@@ -3817,7 +3817,7 @@ pub fn share_is_confirmed(
 }
 
 /// Mark a share delegation as confirmed on-chain.
-pub fn mark_share_confirmed(
+pub(crate) fn mark_share_confirmed(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,

@@ -420,17 +420,6 @@ impl CommittedVote {
         signed_commitment_from_parts(&self.commit, &recovery)
     }
 
-    /// Marks one helper-share submission confirmed.
-    pub fn confirm_share(&self, db: &VotingDb, share_index: u32) -> Result<(), VotingError> {
-        crate::share::confirm(
-            db,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-            share_index,
-        )
-    }
-
     /// Records the cast-vote transaction hash for this vote.
     pub fn record_submission(&self, db: &VotingDb, tx_hash: &str) -> Result<(), VotingError> {
         record_submission(
@@ -4458,7 +4447,7 @@ mod tests {
             ]
         );
 
-        recovered.confirm_share(&db, 0).unwrap();
+        crate::share::confirm(&db, ROUND_ID, 0, 1, 0).unwrap();
         assert!(crate::share::unconfirmed(&db, ROUND_ID).unwrap().is_empty());
 
         recovered.record_submission(&db, "vote-tx").unwrap();

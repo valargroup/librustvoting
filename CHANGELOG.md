@@ -100,7 +100,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   least two are configured. A one-helper fleet uses its only available
   confirmation. `track_pending_shares` encapsulates that quorum and persists
   confirmation before returning it in `confirmed`; hosts no longer implement
-  confirmation polling or persistence separately.
+  confirmation polling or persistence separately. The direct
+  `share::confirm`, prelude `confirm_share`,
+  `CommittedVote::confirm_share`, `VotingDb::mark_share_confirmed`, and raw
+  query mutation are no longer public, so supported callers cannot bypass the
+  quorum.
 - `HelperClientConfig` now uses validated builders for nonzero deadlines and at
   most two nonzero retry delays.
 - **Breaking:** removed `HELPER_PREFLIGHT_TIMEOUT_SECONDS`; the client's

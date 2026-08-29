@@ -79,9 +79,9 @@ pub use crate::session::{
     VoteRecoveryWork, VoteRecoveryWorkKind,
 };
 pub use crate::share::{
-    compute_nullifier, confirm as confirm_share, list as share_records, recover_payload,
-    recover_wire_json, unconfirmed as unconfirmed_shares, SharePlan, ShareRecord,
-    ShareServerSelectionPolicy, ShareTimingPolicy, ShareTrackingSummary,
+    compute_nullifier, list as share_records, recover_payload, recover_wire_json,
+    unconfirmed as unconfirmed_shares, SharePlan, ShareRecord, ShareServerSelectionPolicy,
+    ShareTimingPolicy, ShareTrackingSummary,
 };
 pub use crate::share_tracking::{
     os_random_bytes, share_tracking_flags, track_pending_shares, ResubmittedShare, ShareKey,

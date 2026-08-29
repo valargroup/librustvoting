@@ -430,7 +430,7 @@ pub(crate) fn is_confirmed(
 }
 
 /// Marks one helper-share record confirmed.
-pub fn confirm(
+pub(crate) fn confirm(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
