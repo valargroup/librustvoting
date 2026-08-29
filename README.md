@@ -99,6 +99,10 @@ The companion
 documents the public-target, delivery-receipt, and zero-migration import flow
 for cases where the funds controller and voter are separate parties, including
 custody provider integrations.
+The proposed
+[recoverable voting authority design](docs/recoverable-voting-authority.md)
+defines a canonical, round-scoped derivation for software wallets and Keystone
+so a restored wallet can reconstruct its voting hotkey and VAN blindings.
 
 ## Migrating 0.11 to 0.12
 
