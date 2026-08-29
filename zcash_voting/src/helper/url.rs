@@ -10,6 +10,11 @@ use crate::types::VotingError;
 /// fragment. The returned form has a normalized origin, no default port, and
 /// no trailing slash, so equivalent configuration spellings cannot bypass
 /// delivery-history checks.
+///
+/// This is the identity contract for every share delivery and persistence
+/// API: a URL this function rejects is rejected by those APIs with
+/// [`VotingError::InvalidInput`]. Validate helper configuration with it
+/// before submitting shares over the network.
 pub fn canonicalize_helper_base_url(value: &str) -> Result<String, VotingError> {
     let trimmed = value.trim();
     let mut url = Url::parse(trimmed).map_err(|error| VotingError::InvalidInput {
