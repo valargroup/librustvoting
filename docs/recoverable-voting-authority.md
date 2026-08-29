@@ -17,8 +17,8 @@ exist today.
 
 ## Executive summary
 
-A voter currently needs two kinds of randomly generated secrets after
-delegation:
+Creating a delegation currently requires two kinds of randomly generated
+secret material, both of which must remain available afterward:
 
 - one voting hotkey, which authorizes later votes; and
 - one `van_comm_rand` blinding factor for each Vote Authority Note (VAN).
