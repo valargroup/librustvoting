@@ -1110,7 +1110,7 @@ mod tests {
 
     fn share_record(confirmed: bool, submit_at: u64) -> ShareDelegationRecord {
         ShareDelegationRecord {
-            round_id: "ab".repeat(32),
+            round_id: field_hex(1),
             bundle_index: 0,
             proposal_id: 1,
             share_index: 0,
@@ -1157,14 +1157,59 @@ mod tests {
     // ---- Mock transport -------------------------------------------------
 
     use std::collections::{HashMap, VecDeque};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::time::Duration;
+
+    use crate::backend::pasta_curves::{
+        group::{ff::PrimeField, Group, GroupEncoding},
+        pallas,
+    };
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
     use crate::helper::{
         client::{HelperClient, HelperClientConfig},
         health::{HelperHealth, HELPER_FAILURE_THRESHOLD},
         transport::{HelperFuture, HelperResponse, HelperTransport, HelperTransportError},
     };
+    use crate::wire::VoteShareWire;
+
+    fn point_bytes(multiplier: u64) -> Vec<u8> {
+        (pallas::Point::generator() * pallas::Scalar::from(multiplier))
+            .to_bytes()
+            .to_vec()
+    }
+
+    fn field_hex(value: u64) -> String {
+        hex::encode(pallas::Base::from(value).to_repr())
+    }
+
+    fn valid_share_json() -> &'static str {
+        static JSON: LazyLock<String> = LazyLock::new(|| {
+            VoteShareWire {
+                vote_round_id: "01".repeat(32),
+                shares_hash: BASE64_STANDARD.encode(pallas::Base::from(1).to_repr()),
+                proposal_id: 1,
+                vote_decision: 0,
+                encrypted_share: crate::WireEncryptedShare {
+                    c1: point_bytes(2),
+                    c2: point_bytes(3),
+                    share_index: 0,
+                },
+                share_index: 0,
+                vc_tree_position: 1,
+                share_comms: (0..crate::share_policy::VOTE_COMMITMENT_SHARE_COUNT)
+                    .map(|index| {
+                        BASE64_STANDARD.encode(pallas::Base::from(index as u64 + 10).to_repr())
+                    })
+                    .collect(),
+                primary_blind: BASE64_STANDARD.encode(pallas::Base::from(4).to_repr()),
+                submit_at: 0,
+            }
+            .to_json()
+            .unwrap()
+        });
+        JSON.as_str()
+    }
 
     type Reply = Result<HelperResponse, HelperTransportError>;
 
@@ -1343,7 +1388,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn two_distinct_confirmations_stop_status_checks() {
-        let round_id = "ab".repeat(32);
+        let round_id = field_hex(1);
         let share_id = "cd".repeat(32);
         let transport = Arc::new(MockTransport::default());
         let status_url = |index: usize| {
@@ -1378,7 +1423,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn one_confirmation_is_not_enough() {
-        let round_id = "ab".repeat(32);
+        let round_id = field_hex(1);
         let share_id = "cd".repeat(32);
         let transport = Arc::new(MockTransport::default());
         for (index, status) in [(1, "confirmed"), (2, "pending")] {
@@ -1408,7 +1453,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn one_helper_fleet_uses_its_only_available_confirmation() {
-        let round_id = "ab".repeat(32);
+        let round_id = field_hex(1);
         let share_id = "cd".repeat(32);
         let transport = Arc::new(MockTransport::default());
         transport.queue_get(
@@ -1436,7 +1481,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn every_helper_pending_reports_not_confirmed() {
-        let round_id = "ab".repeat(32);
+        let round_id = field_hex(1);
         let share_id = "cd".repeat(32);
         let transport = Arc::new(MockTransport::default());
         for index in 1..=3 {
@@ -1466,7 +1511,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancel_between_helpers_stops_without_confirming() {
-        let round_id = "ab".repeat(32);
+        let round_id = field_hex(1);
         let share_id = "cd".repeat(32);
         let transport = Arc::new(MockTransport::default());
         transport.queue_get(
@@ -1512,7 +1557,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn late_cancellation_does_not_replace_final_failed_poll() {
-        let round_id = "ab".repeat(32);
+        let round_id = field_hex(1);
         let share_id = "cd".repeat(32);
         let transport = Arc::new(MockTransport::default());
         transport.queue_get(
@@ -1595,7 +1640,7 @@ mod tests {
         let client = client_with(transport.clone());
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &helpers(5),
             3,
             10,
@@ -1624,7 +1669,7 @@ mod tests {
         let client = client_with(transport.clone());
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &helpers(3),
             1,
             10,
@@ -1647,7 +1692,7 @@ mod tests {
         let client = client_with(transport.clone());
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &[helper(1)],
             3,
             10,
@@ -1675,7 +1720,7 @@ mod tests {
         let client = client_with(transport.clone());
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &helpers(2),
             2,
             10,
@@ -1704,7 +1749,7 @@ mod tests {
         let client = client_with(transport.clone());
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &helpers(2),
             1,
             10,
@@ -1731,7 +1776,7 @@ mod tests {
         let client = client_with(transport.clone());
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &helpers(2),
             1,
             10,
@@ -1758,7 +1803,7 @@ mod tests {
         let client = client_with(transport.clone());
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &helpers(2),
             1,
             10,
@@ -1791,7 +1836,7 @@ mod tests {
 
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &helpers(3),
             3,
             10,
@@ -1832,7 +1877,7 @@ mod tests {
 
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &helpers(2),
             2,
             10,
@@ -1901,7 +1946,7 @@ mod tests {
 
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &helpers(2),
             2,
             10,
@@ -1927,7 +1972,7 @@ mod tests {
         let client = client_with(transport.clone());
         let report = submit_share_to_helpers_unrecorded(
             &client,
-            r#"{"share_index":0}"#,
+            valid_share_json(),
             &[helper(1), format!("{}/", helper(1))],
             3,
             10,
@@ -1996,22 +2041,25 @@ mod tests {
             vote_auth_sig: [0x17; 64],
             encrypted_shares: vec![
                 EncryptedShare {
-                    c1: vec![0x21; 32],
-                    c2: vec![0x22; 32],
+                    c1: point_bytes(1),
+                    c2: point_bytes(2),
                     share_index: 0,
                     plaintext_value: 5,
                     randomness: vec![0x23; 32],
                 },
                 EncryptedShare {
-                    c1: vec![0x31; 32],
-                    c2: vec![0x32; 32],
+                    c1: point_bytes(3),
+                    c2: point_bytes(4),
                     share_index: 1,
                     plaintext_value: 6,
                     randomness: vec![0x33; 32],
                 },
             ],
             share_blinds: vec![field_bytes(1), field_bytes(2)],
-            share_comms: vec![[0x51; 32], [0x52; 32]],
+            share_comms: (0..crate::share_policy::VOTE_COMMITMENT_SHARE_COUNT)
+                .map(|index| field_bytes(index as u8 + 10))
+                .collect(),
+            batch: None,
         }
     }
 
@@ -2094,7 +2142,7 @@ mod tests {
             bundle_index: 0,
             proposal_id: 1,
             share_index: 0,
-            share_wire_json: r#"{"share_index":0}"#,
+            share_wire_json: valid_share_json(),
             planned_servers: servers,
             fallback_servers: &[],
             target_count: 1,
