@@ -261,9 +261,10 @@ jobs:
           cargo check --manifest-path "$CONSUMER_DIR/vizor/Cargo.toml"
       - name: Package voting crates
         run: |
-          # Full verification follows the VCT release-version bumps because
-          # the published 0.5.2/0.7.2 manifests expose the previous feature
-          # contract. Until then, validate the release file set.
+          cargo package -p vote-commitment-tree --locked
+          # The client and primary crate depend on the new VCT versions.
+          # Validate their release file sets before those dependencies publish.
+          cargo package -p vote-commitment-tree-client --list
           cargo package -p zcash_voting --list
 
   msrv:

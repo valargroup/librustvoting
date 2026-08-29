@@ -30,8 +30,8 @@ transport.
 ## Building
 
 ```bash
-cargo check                    # check all crates
-cargo build -p zcash_voting   # build just the core library
+cargo check                   # check the default Zakura wallet path
+cargo build -p zcash_voting  # build just the core library
 ```
 
 Run the Ironwood / NU6.3 tests with:

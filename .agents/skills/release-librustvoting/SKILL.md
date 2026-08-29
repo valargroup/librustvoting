@@ -138,6 +138,12 @@ cargo test --locked
 cargo test -p zcash_voting -p zcash-voting-wallet-example \
   --all-targets --no-default-features --features lrz \
   --locked
+cargo test -p vote-commitment-tree -p vote-commitment-tree-client \
+  --all-targets --features vote-commitment-tree-client/cli --locked
+cargo test -p vote-commitment-tree -p vote-commitment-tree-client \
+  --all-targets --no-default-features \
+  --features vote-commitment-tree/lrz,vote-commitment-tree-client/lrz,vote-commitment-tree-client/cli \
+  --locked
 git diff --check
 ```
 

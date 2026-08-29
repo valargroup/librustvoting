@@ -1,6 +1,6 @@
 [package]
 name = "vote-commitment-tree"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.91"
 description = "Append-only Poseidon Merkle tree for Vote Authority Notes and Vote Commitments in the Zcash shielded-voting protocol."

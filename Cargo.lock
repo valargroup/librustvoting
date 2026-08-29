@@ -3260,7 +3260,7 @@ dependencies = [
 
 [[package]]
 name = "vote-commitment-tree"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "imt-tree",
@@ -3275,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "vote-commitment-tree-client"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "base64",
  "bytes",
@@ -4276,7 +4276,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_voting"
-version = "3.1.0-rc.12"
+version = "3.1.0-rc.13"
 dependencies = [
  "anyhow",
  "base64",

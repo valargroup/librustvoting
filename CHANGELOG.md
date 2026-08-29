@@ -4,7 +4,7 @@ All notable changes to this workspace will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## v3.1.0-rc.13
 
 ### Changed
 - `zcash_voting` now defaults to Zakura and exposes upstream librustzcash
@@ -18,6 +18,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   `voting-crypto-deps 0.2.2`, `voting-circuits 0.11.2`, `imt-tree 0.5.2`,
   `pir-types 0.6.2`, and `pir-client 0.7.2`. This raises the workspace MSRV to
   Rust 1.91.
+- Prepared `vote-commitment-tree 0.6.0` and
+  `vote-commitment-tree-client 0.8.0` for their Zakura-default feature
+  contracts; publish them before `zcash_voting 3.1.0-rc.13`.
 
 ## v3.1.0-rc.12
 

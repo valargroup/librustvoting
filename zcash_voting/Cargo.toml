@@ -1,6 +1,6 @@
 [package]
 name = "zcash_voting"
-version = "3.1.0-rc.12"
+version = "3.1.0-rc.13"
 edition = "2021"
 rust-version = "1.91"
 description = "Client-side library for Zcash shielded voting: ZKP delegation and vote-commitment proofs (Halo 2), ElGamal encryption, governance PCZT construction, Merkle witness generation, and SQLite round-state persistence."
@@ -62,8 +62,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 tonic = { version = "0.14", features = ["channel", "tls-webpki-roots", "tls-ring"] }
 
-vote-commitment-tree = { path = "../vote-commitment-tree", version = "=0.5.2", default-features = false }
-vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "=0.7.2", default-features = false, features = ["http"] }
+vote-commitment-tree = { path = "../vote-commitment-tree", version = "=0.6.0", default-features = false }
+vote-commitment-tree-client = { path = "../vote-commitment-tree-client", version = "=0.8.0", default-features = false, features = ["http"] }
 
 rusqlite = { version = "0.37", features = ["bundled"] }
 

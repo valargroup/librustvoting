@@ -358,8 +358,8 @@ This release line requires Rust 1.91 or newer.
   (or `zakura-orchard 1.0.0` with the `zakura` feature).
 - **`voting-circuits 0.11.2`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
   for the delegation and vote proof circuits.
-- **`vote-commitment-tree 0.5.2`** and
-  **`vote-commitment-tree-client 0.7.2`** for vote commitment tree state
+- **`vote-commitment-tree 0.6.0`** and
+  **`vote-commitment-tree-client 0.8.0`** for vote commitment tree state
   and optional HTTP sync.
 - **`pczt 0.9.2`, `zcash_client_backend 0.24.0-rc.7`,
   `zcash_client_sqlite 0.22.0-rc.7`, `zcash_keys 0.16.1`,
