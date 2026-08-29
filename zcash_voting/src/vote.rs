@@ -1315,7 +1315,6 @@ pub fn insert_recovery_fixture(
     })
 }
 
-#[cfg(test)]
 fn store_recovery_json_for_vote(
     db: &VotingDb,
     round_id: &str,
