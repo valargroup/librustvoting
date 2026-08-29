@@ -77,7 +77,7 @@ zip32 = "0.2"
 incrementalmerkletree = "0.8"
 
 zcash_protocol = { workspace = true }
-zakura-wallet-lib = { git = "https://github.com/zakura-core/wallet-libraries", rev = "0fdefd93cad9f1ed420e1164b186d5ccac4d2122", default-features = false }
+zakura-wallet-lib = { git = "https://github.com/zakura-core/wallet-libraries", rev = "ee6e1f0e1cd108990bba242eae628fcb3c820d82", default-features = false }
 uuid = "1.23.1"
 
 [dev-dependencies]
