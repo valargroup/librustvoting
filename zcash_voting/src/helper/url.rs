@@ -1,6 +1,6 @@
 //! Canonical helper-server identity.
 
-use url::Url;
+use url::{Host, Url};
 
 use crate::types::VotingError;
 
@@ -29,6 +29,16 @@ pub fn canonicalize_helper_base_url(value: &str) -> Result<String, VotingError> 
         return Err(VotingError::InvalidInput {
             message: "helper server url must not contain a query or fragment".to_string(),
         });
+    }
+
+    if let Some(Host::Domain(domain)) = url.host() {
+        if let Some(domain) = domain.strip_suffix('.') {
+            let domain = domain.to_string();
+            url.set_host(Some(&domain))
+                .map_err(|error| VotingError::InvalidInput {
+                    message: format!("invalid helper server host in {trimmed}: {error}"),
+                })?;
+        }
     }
 
     let default_port = match url.scheme() {
@@ -78,6 +88,10 @@ mod tests {
             canonicalize_helper_base_url("http://helper.example:80/").unwrap(),
             "http://helper.example"
         );
+        assert_eq!(
+            canonicalize_helper_base_url("http://helper.example./").unwrap(),
+            "http://helper.example"
+        );
     }
 
     #[test]
@@ -109,6 +123,7 @@ mod tests {
         let urls = vec![
             "HTTPS://Helper.Example:443/vote/".to_string(),
             "https://helper.example/vote".to_string(),
+            "https://helper.example./vote".to_string(),
             "https://other.example".to_string(),
         ];
         assert_eq!(
