@@ -341,10 +341,10 @@ This crate contains the canonical implementation and retains mutually
 exclusive `lrz`/`zakura` features. Its default is the Zakura wallet-libraries
 family; use `--no-default-features --features lrz` for upstream librustzcash.
 
-Wallet-family selection is consolidated in `zakura-wallet-lib` using explicit
-`zakura-voting` and `lrz-voting` capability sets. Unlike its former generic
-`orchard` selector, those features never weak-reference both optional backend
-families. External-consumer regression tests verify that selecting
+Wallet-family selection is consolidated in `zakura-wallet-lib` using its only
+two complete backend modes: `zakura` and `lrz`. Unlike its former generic
+capability selectors, those features never weak-reference both optional
+backend families. External-consumer regression tests verify that selecting
 `zcash_voting/lrz` puts no Zakura forks in Cargo lockfiles or resolved
 metadata. This POC tracks
 [wallet-libraries #7](https://github.com/zakura-core/wallet-libraries/pull/7)
