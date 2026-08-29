@@ -72,8 +72,9 @@ need to know whether a private witness was sampled or derived.
 | Authority source | Recovery material | Result |
 | --- | --- | --- |
 | Software seed provider | Original wallet seed or mnemonic | Re-derive the same authority root |
-| Current Keystone integration | Keystone wallet plus the encrypted voting-authority backup | Restore the root; use existing Keystone signing for any remaining delegations |
-| Current Keystone integration with only the mnemonic | No recovery | The mnemonic does not contain the randomly generated root |
+| Current Keystone integration with a confirmed delegation | Encrypted voting-authority backup | Restore the root and vote; Keystone is not needed |
+| Current Keystone integration with remaining delegation transactions | Encrypted voting-authority backup plus access to the original Zcash account, normally through Keystone | Restore the root, then sign the remaining delegation PCZTs |
+| Keystone wallet or mnemonic without the voting-authority backup | No recovery | The Keystone seed does not contain the randomly generated root |
 | UFVK or watch-only wallet | No recovery by itself | Public keys cannot reveal voting authority |
 | Legacy `random-v0` round | Original hotkey and every original bundle blinding | Version 1 cannot recreate already-lost random values |
 
