@@ -1511,7 +1511,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_after_final_failed_poll_is_propagated() {
+    async fn late_cancellation_does_not_replace_final_failed_poll() {
         let round_id = "ab".repeat(32);
         let share_id = "cd".repeat(32);
         let transport = Arc::new(MockTransport::default());
@@ -1535,12 +1535,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, ShareStatusOutcome::Cancelled);
-        assert_eq!(client.health().failure_count(&helper(1)), 0);
+        assert_eq!(outcome, ShareStatusOutcome::NotConfirmed);
+        assert_eq!(client.health().failure_count(&helper(1)), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_after_final_failed_resubmission_is_propagated() {
+    async fn late_cancellation_does_not_replace_final_failed_resubmission() {
         let configured = helpers(1);
         let db = db_with_delivery(&[helper(1)], &[], 1);
         let share_id = share_id_of(&db);
@@ -1569,11 +1569,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(report.cancelled);
+        assert!(!report.cancelled);
         assert!(report.resubmitted.is_empty());
         assert!(report.ambiguous.is_empty());
         assert_eq!(transport.call_count("/shares"), 1);
-        assert_eq!(client.health().failure_count(&helper(1)), 0);
+        assert_eq!(client.health().failure_count(&helper(1)), 1);
         let stored = only_share(&db);
         assert_eq!(stored.sent_to_urls, vec![helper(1)]);
         assert!(stored.ambiguous_urls.is_empty());
