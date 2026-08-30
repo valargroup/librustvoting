@@ -1053,9 +1053,9 @@ contains:
   share with `immediate`, `submit_at`, `target_count`, and canonical distinct
   `target_servers`;
 - the optional helper-delivery journal for each share, including its identity,
-  original `created_at`, `submit_at`, target count, accepted (`sent_to_urls`),
-  `ambiguous_urls`, and `attempting_urls` helper sets, and confirmation state;
-  and
+  original `created_at`, effective durable `submit_at`, target count, accepted
+  (`sent_to_urls`), `ambiguous_urls`, and `attempting_urls` helper sets, and
+  confirmation state; and
 - a stable record ID, monotonic revision, and prior-revision digest.
 
 The record ID is stable across confirmation and helper-journal updates:
@@ -1125,6 +1125,26 @@ action's complete stored plan is invalid. A share with a stored plan but no
 journal resumes through typed initial delivery with that exact plan; a present
 journal is imported before the helper tracker resumes.
 
+The original plan's `submit_at` is immutable. A journal's effective durable
+`submit_at` starts at that value and may change only from nonzero to zero when
+the tracker enters overdue recovery; an initial zero remains zero. Along one
+validated revision chain, equal values agree, a descendant zero may replace an
+ancestor nonzero value, and zero-to-nonzero or unequal-nonzero changes fail
+closed. Restore and helper payload construction use the journaled effective
+value, not a value reconstructed from the original plan. Before another helper
+POST depends on an overdue zero, the revision carrying that zero and the updated
+collection head are committed and read back. Later revisions preserve zero.
+
+This changes the current outcome-dependent reset. Before the first overdue POST
+uses zero, the tracker prepares that durable transition. For a fresh helper it
+includes both zero and the `attempting_urls` reservation; for a duplicate-safe
+retry it changes only the schedule and preserves the existing helper evidence.
+The integration commits and reads back the pending revision and collection head
+before applying the same transition to `VotingDb` and dispatching the request.
+If the local update then fails, no POST starts and restore conservatively imports
+the already committed zero and any attempting-helper marker. Neither store may
+roll the schedule back to a delayed value.
+
 The backup is a collection of immutable revisions addressed by `record_id` and
 revision digest, not one shared slot. Each record's revisions have a monotonic
 number and prior-revision digest. A collection head selects one latest live or
@@ -1170,10 +1190,10 @@ outcomes preserve `ambiguous_urls`. An accepted helper is a last-resort overdue
 target, and a weaker outcome cannot downgrade its acceptance. Fresh helper
 results and confirmation are recorded before another helper is contacted.
 Restore keeps accepted, ambiguous, and attempting evidence, never reduces the
-target count or changes the original schedule, and resumes the helper tracker
-against the current validated helper configuration. Conflicting identity,
-schedule, batch, or tree-position data fails closed. Its ordering and retry
-rules are the ones defined by the helper submission invariants.
+target count or changes the journaled effective schedule, and resumes the
+helper tracker against the current validated helper configuration. Conflicting
+identity, schedule, batch, or tree-position data fails closed. Its ordering and
+retry rules are the ones defined by the helper submission invariants.
 
 All actions in an atomic batch are committed to one record together; a partial
 batch record is invalid. Helper tracking remains per action and share. Replacing
@@ -1268,7 +1288,7 @@ capability format, or additional custody exchange changes in version 1.
   use;
 - the durable helper tracker defined by the helper submission invariants,
   including accepted, ambiguous, and attempting sets, target counts, and
-  pre-dispatch reservations;
+  pre-dispatch reservations and monotonic overdue schedule resets;
 - the pending-tally record and collection-head encodings, digests, and
   original-plan and helper-journal restore rules;
 - the typed vote-chain recovery checkpoint and target-bound tree and transition
@@ -1282,8 +1302,9 @@ capability format, or additional custody exchange changes in version 1.
 - obtain a new vote-chain recovery checkpoint from an independently
   authenticated current view of finalized chain state for each recovery
   attempt;
-- durably store and read back each encrypted pending-tally record before vote or
-  helper network effects;
+- durably store and read back each encrypted pending-tally revision before vote
+  or helper network effects, including an overdue revision that changes the
+  effective `submit_at` to zero;
 - retain and reuse each complete original helper plan, and never replan only
   shares whose journals are absent;
 - compare-and-swap and read back the collection head in rollback-resistant
