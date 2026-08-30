@@ -1042,6 +1042,7 @@ Version 1 adds a library-owned `PendingTallyRecoveryV1` record for the interval
 between committing a vote and confirming all of its expected helper shares. It
 contains:
 
+- the complete canonical `authority_context_v1` bytes;
 - one `PendingVoteActionRecoveryV1` per action, containing every current
   `VoteRecoveryBundle` field except `vc_tree_position`, including its secret
   share material;
@@ -1068,7 +1069,9 @@ atomic-batch record_identity = 0x01 || batch_digest_32
 ```
 
 The batch digest already binds its complete ordered action list. Restore
-recomputes the ID from the record body and rejects a mismatched storage key.
+validates the record context against the authority selection and collection
+head, requires every action to match the context's round and one bundle index,
+recomputes the ID from the record body, and rejects a mismatched storage key.
 
 For each action, `confirmed_vc_tree_position` is the pending record's only
 authoritative tree position. `None` means that confirmation has not supplied
