@@ -22,8 +22,9 @@ controller. The signed round configuration selects this common version 1
 framework and authenticates the snapshot height used to reconstruct its bundle
 plan. After data loss, the restored root and bundle material let the
 wallet find its latest VANs in the validated vote tree and continue after
-partial delegation or singleton and atomic votes. Existing rounds remain
-unchanged.
+partial delegation or singleton and atomic votes. While helper-share delivery
+is incomplete, a separate encrypted pending-tally record keeps that vote
+recoverable if the voting database is lost. Existing rounds remain unchanged.
 
 ## Executive summary
 
@@ -95,6 +96,7 @@ find its matching VANs in the validated vote tree and continue voting.
 | Current Keystone integration with remaining delegation transactions | Encrypted voting-authority backup plus access to the original Zcash account, normally through Keystone | Restore the root, then sign the remaining delegation PCZTs |
 | Public-target custody with retained capability | Voter's seed or encrypted authority-root backup plus the exact custody capability package | Re-derive the hotkey, import the original bundle weights and blindings, then recover matching VANs |
 | Public-target custody without either retained or redeliverable capability | No bundle recovery | The root recreates the hotkey but not custody-provider blindings |
+| Confirmed vote with helper shares still incomplete | Encrypted pending-tally record | Restore the exact vote recovery bundle and resume helper delivery |
 | Keystone wallet or mnemonic without the voting-authority backup | No recovery | The Keystone seed does not contain the randomly generated root |
 | UFVK or watch-only wallet | No recovery by itself | Public keys cannot reveal voting authority |
 | Legacy `random-v0` round | Original hotkey and every original bundle blinding | Version 1 cannot recreate already-lost random values |
@@ -150,6 +152,8 @@ requiring the controller's bundle secrets to become root-derived.
   transaction bytes.
 - Recover the latest confirmed VAN state after singleton or atomic voting
   without requiring the wallet's prior transaction history.
+- Resume incomplete helper-share delivery after voting-database loss without
+  retaining complete confirmed vote history.
 - Work unchanged with atomic vote batches and Keystone PCZT batch signing.
 - Version every persisted derivation artifact so legacy random rounds continue
   to work without reinterpretation.
@@ -171,8 +175,9 @@ requiring the controller's bundle secrets to become root-derived.
 - Change the ZKP statements, on-chain messages, or vote-chain verifier.
 - Move ZKP generation or vote signing into Keystone.
 - Make an imported UFVK sufficient to reconstruct private voting authority.
-- Recover an earlier ballot choice, helper-delivery state, or exact unconfirmed
-  transaction after the local voting database is lost.
+- Recover an earlier ballot after all of its helper shares are confirmed, or
+  reproduce the exact outer transaction bytes after the local voting database
+  is lost.
 - Guarantee recovery for a manually selected note subset or custom bundle
   policy that is not itself recoverably described.
 - Make public-target custody recovery root-only. Its bundle material still
@@ -934,7 +939,8 @@ block scan or an index that proves both inclusion and absence against
 authenticated chain state. A best-effort transaction search is not sufficient:
 absence is used only when completeness through the selected height is known.
 Each record exposes the consumed VAN nullifier, ordered proposal IDs, action
-nullifiers and successor commitments, and final VAN leaf position.
+nullifiers and successor commitments, each vote commitment and its confirmed
+vote-commitment tree position, and the final VAN leaf position.
 
 Validation recomputes every native authority transition from the recovered
 hotkey, bundle material, and current mask. It requires the first nullifier to
@@ -964,12 +970,57 @@ This requires complete public round transition data, not the wallet's prior
 transaction database or ballot choices. A stale vote built from an earlier VAN
 is rejected by the chain as a spent nullifier; recovery finds the current VAN
 instead of using submission as a probe. A stale or withholding chain source
-stops recovery rather than making absence evidence that a VAN is unused.
+stops recovery rather than making absence evidence that a VAN is unused. It
+still cannot recreate a missing custody capability.
 
-Version 1 does not reconstruct an earlier choice, helper-delivery state, atomic
-batch order, or exact unconfirmed transaction after the voting database is
-lost. It also cannot recreate a missing custody capability. Those are separate
-transaction and backup concerns.
+### Pending tally recovery
+
+Finding the current VAN does not recover a confirmed vote whose helper shares
+are still incomplete. Version 1 therefore adds a library-owned
+`PendingTallyRecoveryV1` record for the interval between committing a vote and
+confirming all of its expected helper shares. It contains:
+
+- the exact serialized `VoteRecoveryBundle` for each action, including its
+  secret share material and, for an atomic batch, the common digest and complete
+  action order;
+- each real confirmed vote-commitment tree position once known;
+- the helper-delivery journal for each share, including its identity, original
+  `created_at`, `submit_at`, target count, accepted (`sent_to_urls`),
+  `ambiguous_urls`, and `attempting_urls` helper sets, and confirmation state;
+  and
+- a stable record ID, monotonic revision, and prior-revision digest.
+
+`zcash_voting` owns the versioned record, validation, and conservative merge
+rules. The integration stores it in authenticated encrypted storage that
+survives loss of `VotingDb`; it is not sent to the vote chain or helpers. The
+record is written and read back before the first vote broadcast. Confirmation
+adds the authenticated tree position before helper delivery starts. If the
+database was lost first, the position may instead be recovered from the exact
+matching action in validated chain data. A placeholder position is never used.
+An action not found there remains subject to ordinary transaction
+reconciliation; its recovered message or complete batch can be resubmitted
+without preserving the original outer transaction bytes.
+
+The backup slot must atomically retain and return its latest committed revision;
+an older but otherwise valid snapshot is not sufficient. Updates use
+compare-and-swap or an append-only equivalent, and restore rejects a broken
+revision chain or two different records at the same revision.
+
+Before each helper POST, the corresponding attempting state is made durable.
+The accepted, ambiguous, definite-failure, or confirmed transition is then
+recorded before another helper is contacted. Restore keeps accepted,
+ambiguous, and attempting evidence, never reduces the target count or changes
+the original schedule, and resumes the existing helper tracker against the
+current validated helper configuration. Conflicting identity, schedule, batch,
+or tree-position data fails closed. These are the same ordering and retry rules
+used by the live tracker, not a second delivery policy.
+
+All actions in an atomic batch are committed to this backup together; a partial
+batch record is invalid. Helper tracking remains per action and share. Once all
+expected shares are confirmed on the vote chain, the record is deleted. The
+wallet does not retain complete vote history: after deletion, VAN transition
+recovery can still show that a proposal was already consumed, but it does not
+recover the earlier ballot choice.
 
 ## Legacy migration
 
@@ -1046,9 +1097,18 @@ capability format, or additional custody exchange changes in version 1.
 - canonical validation and recovery of imported custody capabilities;
 - fail-closed reconciliation of typed source candidates with external authority
   use;
+- the pending-tally record and helper-journal restore rules;
 - the recoverable bundle policy and round-auth version 3 verification;
 - legacy migration and bounded nullifier-to-successor VAN recovery; and
 - atomic-batch rules, public vectors, and integration fixtures.
+
+### All wallet integrations
+
+- durably store and read back the encrypted pending-tally record before vote or
+  helper network effects;
+- restore it outside `VotingDb` and pass it back through the canonical
+  `zcash_voting` importer; and
+- delete it only after all expected helper shares are confirmed.
 
 ### Software-wallet integrations
 
