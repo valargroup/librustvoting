@@ -9,6 +9,7 @@ use orchard::{
 };
 use pasta_curves::group::ff::PrimeField;
 use pasta_curves::pallas;
+use rusqlite::TransactionBehavior;
 use voting_circuits::delegation::synthetic_padding_note_parts;
 use zcash_keys::keys::UnifiedFullViewingKey;
 
@@ -498,9 +499,11 @@ impl VotingDb {
                 plan.dropped_count,
             );
         }
-        let tx = conn.transaction().map_err(|e| VotingError::Internal {
-            message: format!("failed to begin bundle setup transaction: {e}"),
-        })?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to begin bundle setup transaction: {e}"),
+            })?;
         for (i, chunk) in plan.bundles.iter().enumerate() {
             queries::insert_bundle_notes(&tx, round_id, &wallet_id, i as u32, chunk)?;
         }
@@ -1285,9 +1288,11 @@ impl VotingDb {
         // inputs are checked against the PCZT fields before any partial proof
         // success state is committed.
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| VotingError::Internal {
-            message: format!("failed to begin proof result transaction: {e}"),
-        })?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to begin proof result transaction: {e}"),
+            })?;
         queries::store_proof(&tx, round_id, &wallet_id, bundle_index, &result.proof)?;
         queries::store_proof_result_fields_with_van_comm(
             &tx,
@@ -1637,9 +1642,11 @@ impl VotingDb {
     ) -> Result<(), VotingError> {
         let wallet_id = self.wallet_id();
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| VotingError::Internal {
-            message: format!("begin delegation submitted transaction failed: {e}"),
-        })?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin delegation submitted transaction failed: {e}"),
+            })?;
         let stored = queries::get_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index)?;
         check_text_conflict(stored.as_deref(), tx_hash, "delegation tx_hash")?;
         queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
@@ -1661,9 +1668,11 @@ impl VotingDb {
     ) -> Result<(), VotingError> {
         let wallet_id = self.wallet_id();
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| VotingError::Internal {
-            message: format!("begin vote submitted transaction failed: {e}"),
-        })?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin vote submitted transaction failed: {e}"),
+            })?;
         crate::vote::ensure_singleton_vote_update_with_conn(
             &tx,
             &wallet_id,
@@ -5183,6 +5192,113 @@ mod tests {
         assert!(vote_tx_conflict
             .to_string()
             .contains("vote tx_hash conflict"));
+    }
+
+    #[test]
+    fn mark_vote_submitted_waits_instead_of_writing_through_a_stale_snapshot() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zcash-voting-immediate-submission-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let db_a = VotingDb::open(&path_string).unwrap();
+        db_a.set_wallet_id(W);
+        db_a.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db_a.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db_a.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+
+        let db_b = VotingDb::open(&path_string).unwrap();
+        db_b.set_wallet_id(W);
+
+        // Reproduce the old deferred-transaction failure: A reads, B commits a
+        // write, and A can no longer upgrade its stale WAL snapshot to a writer.
+        {
+            let mut conn_a = db_a.conn();
+            let stale_tx = conn_a.transaction().unwrap();
+            assert_eq!(
+                queries::get_vote_tx_hash(&stale_tx, ROUND_ID, W, 0, 1).unwrap(),
+                None
+            );
+            db_b.conn()
+                .execute(
+                    "UPDATE rounds SET phase = 1 WHERE round_id = ?1 AND wallet_id = ?2",
+                    rusqlite::params![ROUND_ID, W],
+                )
+                .unwrap();
+            let err = stale_tx
+                .execute(
+                    "UPDATE votes SET tx_hash = 'stale-write'
+                     WHERE round_id = ?1 AND wallet_id = ?2
+                       AND bundle_index = 0 AND proposal_id = 1",
+                    rusqlite::params![ROUND_ID, W],
+                )
+                .unwrap_err();
+            match err {
+                rusqlite::Error::SqliteFailure(code, _) => {
+                    assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_BUSY_SNAPSHOT);
+                }
+                other => panic!("expected SQLITE_BUSY_SNAPSHOT, got {other}"),
+            }
+        }
+
+        // The production operation reserves the writer before its first read.
+        // If another writer already owns it, busy_timeout makes this call wait
+        // until that writer commits, after which the read and update both succeed.
+        {
+            let mut writer_conn = db_b.conn();
+            let writer_tx = writer_conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            writer_tx
+                .execute(
+                    "UPDATE rounds SET phase = 2 WHERE round_id = ?1 AND wallet_id = ?2",
+                    rusqlite::params![ROUND_ID, W],
+                )
+                .unwrap();
+
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    started_tx.send(()).unwrap();
+                    let started = std::time::Instant::now();
+                    let result = db_a.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx");
+                    result_tx.send((started.elapsed(), result)).unwrap();
+                });
+
+                started_rx.recv().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                assert!(matches!(
+                    result_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+
+                writer_tx.commit().unwrap();
+                let (elapsed, result) = result_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert!(elapsed >= std::time::Duration::from_millis(150));
+                result.unwrap();
+            });
+        }
+
+        assert_eq!(
+            queries::get_vote_tx_hash(&db_a.conn(), ROUND_ID, W, 0, 1).unwrap(),
+            Some("vote-tx".to_string())
+        );
+
+        drop(db_b);
+        drop(db_a);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
     }
 
     #[test]

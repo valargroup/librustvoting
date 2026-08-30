@@ -1096,6 +1096,11 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
     on that wallet and the exact persisted share nullifier. A deleted or
     replacement generation is left untouched, and its stale helper result is
     omitted from reports.
+13. Storage operations that validate durable state before updating it begin an
+    immediate SQLite transaction. The writer reservation is acquired before
+    the validation read, so a concurrent WAL writer waits or is waited on
+    within the configured busy timeout instead of invalidating the operation's
+    snapshot with `SQLITE_BUSY_SNAPSHOT`.
 
 Enforcement:
 [`share.rs`](../zcash_voting/src/share.rs),
@@ -1111,8 +1116,10 @@ Regression coverage: `test_share_delegation_lifecycle` in
 `initial_delivery_rejects_a_replaced_share_generation`, and
 `initial_delivery_does_not_recreate_share_after_recovery_cleanup`,
 `interrupted_retry_does_not_resolve_a_replaced_share_generation` in
-`share_tracking/tests`, and `changed_choice_ignores_stale_share_confirmations` and
-`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
+`share_tracking/tests`,
+`mark_vote_submitted_waits_instead_of_writing_through_a_stale_snapshot` in
+`storage/operations.rs`, and `changed_choice_ignores_stale_share_confirmations`
+and `skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
 
 ### Configuration and migration
 
