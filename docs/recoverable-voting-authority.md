@@ -1049,14 +1049,18 @@ valid collection snapshot is not sufficient. Adding one key while tombstoning
 another is one collection transaction. An append-only implementation is also
 valid if it provides the same enumeration and freshness guarantees.
 
-Before each helper POST, the corresponding attempting state is made durable.
-The accepted, ambiguous, definite-failure, or confirmed transition is then
-recorded before another helper is contacted. Restore keeps accepted,
-ambiguous, and attempting evidence, never reduces the target count or changes
-the original schedule, and resumes the existing helper tracker against the
-current validated helper configuration. Conflicting identity, schedule, batch,
-or tree-position data fails closed. These are the same ordering and retry rules
-used by the live tracker, not a second delivery policy.
+Before a POST to a fresh helper, its `attempting_urls` reservation is made
+durable. An overdue duplicate-safe re-POST to a helper already in
+`sent_to_urls`, `ambiguous_urls`, or `attempting_urls` preserves that state
+before dispatch; it does not downgrade stronger evidence to `attempting_urls`.
+Definite acceptance may move the helper to `sent_to_urls`, while any other
+re-POST outcome leaves its prior state unchanged. Fresh helper results and
+confirmation are recorded before another helper is contacted. Restore keeps
+accepted, ambiguous, and attempting evidence, never reduces the target count
+or changes the original schedule, and resumes the existing helper tracker
+against the current validated helper configuration. Conflicting identity,
+schedule, batch, or tree-position data fails closed. These are the same
+ordering and retry rules used by the live tracker, not a second delivery policy.
 
 All actions in an atomic batch are committed to one record together; a partial
 batch record is invalid. Helper tracking remains per action and share. Replacing
