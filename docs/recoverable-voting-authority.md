@@ -165,6 +165,8 @@ requiring the controller's bundle secrets to become root-derived.
 - Add a Keystone firmware operation, private-key export, UR type, or encrypted
   QR response in version 1.
 - Claim that a Keystone mnemonic restores a `stored-random-v1` authority.
+- Rotate or replace a `stored-random-v1` authority after its backup record is
+  created.
 - Recover random secrets that were already lost in a legacy round.
 - Change the ZKP statements, on-chain messages, or vote-chain verifier.
 - Move ZKP generation or vote signing into Keystone.
@@ -394,11 +396,19 @@ rejected. A parser can enforce this by validating the decoded object,
 serializing it canonically, and requiring byte-for-byte equality with the
 input.
 
-The read-back gate requires the decoded root, both sources, and context to equal
-the live authority selection byte-for-byte. Any allowed change before
-publication or direct submission invalidates the backup and repeats the gate.
-After data loss, restore uses the record's typed selection and still checks the
-account fingerprint below.
+The root, both sources, and context become final when the wallet creates the
+first backup record for that authority context. It must never create another
+`VotingAuthorityBackupV1` for the same context with a different selection. A
+failed or interrupted store is retried with the same canonical plaintext.
+Additional backup copies and later re-encryption are allowed only when the
+decoded plaintext remains byte-for-byte identical.
+
+The read-back gate requires the decoded selection to equal that final
+plaintext. This single-assignment rule means any authenticated backup for the
+context restores the same authority, without relying on the deleted voting
+database to identify a newer copy. Restore still checks the account fingerprint
+below. If the final root is lost before the gate succeeds, version 1 cannot use
+or replace that authority.
 
 This public fixture freezes the encoding. It uses regtest, account index zero,
 fingerprint bytes `00` through `1f`, vote chain `vote-chain-1`, little-endian
@@ -907,11 +917,12 @@ not add the version 1 root or a cached Orchard spending key to `VotingDb`.
 Migration assigns `random-v0` to all existing rows. It never infers a scheme
 from secret length or recomputes a value merely because a column is empty.
 
-Changing the root, root source, bundle source, or context is allowed only before
-a public target is published or any direct delegation may have been submitted.
-For `stored-random-v1`, a change invalidates the old backup and must pass the
-replacement gate before either action. After either point, the original
-authority remains mandatory.
+Version 1 does not supersede a `stored-random-v1` backup. Its root, root source,
+bundle source, and context remain fixed from creation, including before a public
+target is published or a direct delegation is submitted. A later design that
+supports authority rotation must give restore an authenticated, durable way to
+distinguish generations. After publication or possible submission, every
+authority source remains immutable.
 
 ## Public-target custody
 
