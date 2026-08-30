@@ -74,7 +74,10 @@ An **attempting helper** is an initial-submission or recovery target durably
 reserved in `attempting_urls` before its POST is dispatched. A process
 interruption can leave that reservation without a classified response; on
 restart it is treated as outcome-unknown and receives one duplicate-safe
-reconciliation attempt per pass after untried helpers.
+reconciliation attempt per pass after untried helpers. Cancellation that is
+observed before a fresh reservation dispatches is different: because the POST
+is definitely unsent, the reservation is cleared as a definite failure rather
+than retained as outcome-unknown.
 
 An **interrupted helper** is an attempting helper whose durable reservation is
 loaded by a later tracking operation with no corresponding live request in
@@ -660,21 +663,28 @@ a planner-produced `ShareSubmissionPlan`, the complete configured fleet, and
 the current health-ordering time. It derives the round, bundle, proposal,
 payload, confirmed VC-tree position, target, and schedule from the committed
 vote and durable confirmation state. It rejects an empty, duplicated, or
-noncanonical fleet, a plan that does not exactly match that fleet, or a missing
-confirmed VC position before touching storage or the network. The raw
-journaled submission routine is crate-private, and there is no public
-post-hoc delivery mutator.
+noncanonical fleet, a plan that does not exactly match that fleet, a missing
+confirmed VC position, or a committed handle whose vote commitment no longer
+matches the current durable recovery bundle before touching storage or the
+network. The raw journaled submission routine is crate-private, and there is
+no public post-hoc delivery mutator.
 
 The `test-fixtures` feature exposes hidden `share::record` and
 `share::record_delivery_fixture` seed helpers for external integration tests.
 They do not exist in production builds and MUST NOT be used to model wallet
 submission behavior.
 
-After validation it creates or merges the durable share record. Planned
-targets are attempted first, followed by the remaining configured fleet.
-Health ranking is applied independently within those groups, so a healthy
-fallback never moves ahead of a degraded planned target. For every selected
-helper it writes
+After validation it creates or merges the durable share record. Persistence
+returns the effective write-once `submit_at`; resumed fan-out rebuilds the wire
+payload with that durable schedule before contacting any newly selected
+helper. A recomputed plan therefore cannot split one share across different
+schedules, and an existing immediate schedule (`submit_at = 0`) cannot be
+resurrected as delayed.
+
+Planned targets are attempted first, followed by the remaining configured
+fleet. Health ranking is applied independently within those groups, so a
+healthy fallback never moves ahead of a degraded planned target. For every
+selected helper it writes
 `attempting_urls` before dispatch, then:
 
 1. re-evaluates helper health before each attempt;
@@ -707,7 +717,10 @@ covered by `initial_post_is_journaled_before_transport_dispatch`,
 `failed_attempt_write_prevents_network_dispatch`. Typed-boundary coverage is
 provided by
 `committed_vote_submission_keeps_degraded_planned_target_before_healthy_fallback`,
+`stale_committed_vote_submission_is_rejected_before_side_effects`,
 `repeated_committed_submission_preserves_the_original_schedule`,
+`repeated_partial_committed_submission_sends_original_schedule_to_new_helper`,
+`repeated_committed_submission_does_not_resurrect_zero_schedule`,
 `committed_vote_submission_rejects_mismatched_plan_before_side_effects`, and
 `invalid_candidate_url_does_not_create_a_share_record`. Cleanup concurrency is
 covered by `initial_delivery_does_not_recreate_share_after_recovery_cleanup`.
@@ -934,6 +947,12 @@ suppresses pending work. Once the final observed request has completed, its
 result takes precedence: cancellation observed afterward does not replace that
 result or suppress its health score.
 
+If cancellation becomes visible after a fresh helper has been reserved but
+before its POST dispatches, recovery resolves that reservation as a definite
+failure so the helper remains eligible on the next pass. Cancellation before a
+retry backed by an interrupted, explicitly ambiguous, or accepted durable
+state does not weaken or erase that existing evidence.
+
 The concurrent status poller responds to caller cancellation, confirmation
 quorum, or its ten-second budget by signalling its status clients and aborting
 the task set. This drops in-flight status transport futures instead of waiting
@@ -944,6 +963,10 @@ not generally interrupt an already-running custom transport request because
 result is treated as ambiguous.
 
 Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
+`fresh_recovery_cancelled_before_dispatch_clears_marker_and_remains_retryable`,
+`cancellation_before_interrupted_retry_keeps_the_crash_marker`,
+`cancelled_outcome_unknown_retry_preserves_ambiguous_state`,
+`cancelled_accepted_fallback_preserves_acceptance`,
 `cancelled_pass_reports_cancellation_and_keeps_durable_effects`,
 `cancellation_before_request_is_not_scored`,
 `late_cancellation_does_not_replace_final_failed_poll`, and

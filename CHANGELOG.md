@@ -118,8 +118,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 - Initial helper submission now journals each target before dispatch and
   resolves it atomically to accepted, ambiguous, or definitely failed. A
-  process interruption or failed outcome write leaves the helper poll-only,
-  preventing replay of an outcome-unknown non-idempotent POST.
+  process interruption or failed outcome write leaves a distinct crash marker,
+  reports that helper as outcome-unknown to callers, and reconciles it once per
+  pass through the duplicate-safe endpoint after untried helpers. A completed
+  non-acceptance consumes the crash marker into explicit ambiguity, preventing
+  repeated early replay.
 - Helper-share recovery now preserves delayed schedules during early
   replenishment, persists ambiguous attempts before contacting another helper,
   fills the complete placement deficit in one pass, and rechecks the vote-end
@@ -132,7 +135,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   acceptance as its journal entry before the duplicate-safe immediate re-POST.
 - Repeated initial submission preserves the first durable `submit_at`, so a
   newly recomputed planner result cannot replace the schedule already sent to
-  a helper. Only overdue recovery resets the schedule to zero.
+  a helper. Newly contacted helpers receive that same durable schedule, an
+  existing zero schedule cannot be resurrected, and only overdue recovery
+  resets a delayed schedule to zero.
 - Helper tracking now keeps outcome-unknown deliveries ambiguous unless the
   share is confirmed on-chain, uses the shared 30-second POST deadline,
   canonicalizes helper identities, preserves delivery history and desired
@@ -162,13 +167,18 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Initial delivery keeps planned and fallback helpers in separate health-ranked
   groups, so a healthy fallback cannot bypass a degraded planned assignment.
 - Cancellation before a pending retry or single-attempt recovery POST returns
-  cancellation without scoring a helper failure. Once a request completes,
-  its final or non-retryable result is preserved despite late cancellation.
+  cancellation without scoring a helper failure. A definitely unsent fresh
+  recovery reservation is cleared so it remains retryable, while cancellation
+  of an interrupted, ambiguous, or accepted retry preserves its existing
+  durable evidence. Once a request completes, its final or non-retryable result
+  is preserved despite late cancellation.
 - In fleets with at least two helpers, one confirmation claim can no longer
   suppress durable recovery; two distinct currently configured helpers must
   agree before the crate persists confirmation.
 - Initial helper payloads use the durably confirmed VC-tree position, not the
-  draft position retained in the committed share payload.
+  draft position retained in the committed share payload. Submission also
+  rejects a stale `CommittedVote` handle whose commitment no longer matches the
+  current durable recovery bundle before storage or network side effects.
 
 ## v3.1.0-rc.11
 
