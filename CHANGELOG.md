@@ -121,7 +121,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   complete current helper fleet before any POST, and route delivery only
   through crate-owned durable journaling. Compatible fleet churn is accepted;
   removed planned targets and target-count drift fail without remapping or
-  replanning missing shares.
+  replanning missing shares, and malformed complete plans cannot exceed the
+  aggregate per-helper initial-assignment quota.
 - Single-share helper planning now rejects any batch whose payload count is not
   exactly one, and the wallet planning example rejects exact or canonically
   equivalent duplicate configured helpers instead of silently shrinking the

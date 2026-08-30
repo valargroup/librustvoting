@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use zcash_voting::prelude::{
@@ -10,6 +12,7 @@ use zcash_voting::prelude::{
 };
 use zcash_voting::share::policy::{
     plan_share_submissions, share_submission_random_bytes_required, share_submission_target_count,
+    SHARE_HELPER_MAX_INITIAL_SHARES_PER_SERVER, VOTE_COMMITMENT_SHARE_COUNT,
 };
 
 /// Inputs for deriving a Merkle witness for one confirmed delegation bundle.
@@ -364,6 +367,7 @@ fn validate_helper_submission_plan(
 
     let configured_server_urls = canonical_distinct_helper_urls(configured_server_urls)?;
     let expected_target = share_submission_target_count(configured_server_urls.len());
+    let mut assignment_counts = BTreeMap::<String, usize>::new();
     for (share_index, plan) in persisted_plan.share_plans.iter().enumerate() {
         let planned = canonical_helper_url_list(&plan.target_servers)
             .with_context(|| format!("validate helper-share plan {share_index}"))?;
@@ -383,6 +387,21 @@ fn validate_helper_submission_plan(
         {
             bail!(
                 "helper-share plan {share_index} targets helper removed from current configuration: {server_url}"
+            );
+        }
+        for server_url in planned {
+            *assignment_counts.entry(server_url).or_default() += 1;
+        }
+    }
+
+    let complete_normal_batch = share_count == VOTE_COMMITMENT_SHARE_COUNT;
+    if complete_normal_batch && configured_server_urls.len() >= 2 {
+        if let Some((server_url, assignment_count)) = assignment_counts
+            .iter()
+            .find(|(_, count)| **count > SHARE_HELPER_MAX_INITIAL_SHARES_PER_SERVER)
+        {
+            bail!(
+                "persisted helper-share plan assigns {assignment_count} shares to {server_url}, exceeding the complete-batch maximum of {SHARE_HELPER_MAX_INITIAL_SHARES_PER_SERVER}"
             );
         }
     }
@@ -437,6 +456,7 @@ pub fn record_committed_vote_execution(
 mod tests {
     use super::{
         canonical_distinct_helper_urls, validate_helper_submission_plan, WalletHelperSharePlan,
+        SHARE_HELPER_MAX_INITIAL_SHARES_PER_SERVER, VOTE_COMMITMENT_SHARE_COUNT,
     };
     use zcash_voting::prelude::SharePlan;
 
@@ -453,6 +473,23 @@ mod tests {
                 target_count,
                 target_servers: target_servers.iter().copied().map(helper).collect(),
             }],
+        }
+    }
+
+    fn full_persisted_plan(targets_for_share: impl Fn(usize) -> Vec<u32>) -> WalletHelperSharePlan {
+        WalletHelperSharePlan {
+            configured_server_urls: (1..=3).map(helper).collect(),
+            share_plans: (0..VOTE_COMMITMENT_SHARE_COUNT)
+                .map(|share_index| SharePlan {
+                    immediate: false,
+                    submit_at: 1_000 + share_index as u64,
+                    target_count: 2,
+                    target_servers: targets_for_share(share_index)
+                        .into_iter()
+                        .map(helper)
+                        .collect(),
+                })
+                .collect(),
         }
     }
 
@@ -532,6 +569,58 @@ mod tests {
         let current = (1..=5).map(helper).collect::<Vec<_>>();
 
         assert!(validate_helper_submission_plan(&plan, &current, 1).is_err());
+    }
+
+    #[test]
+    fn helper_submission_accepts_complete_batch_at_assignment_quota() {
+        let plan = full_persisted_plan(|share_index| {
+            if share_index < SHARE_HELPER_MAX_INITIAL_SHARES_PER_SERVER {
+                vec![1, 2 + (share_index % 2) as u32]
+            } else {
+                vec![2, 3]
+            }
+        });
+        let current = vec![helper(1), helper(2), helper(3)];
+
+        assert!(
+            validate_helper_submission_plan(&plan, &current, VOTE_COMMITMENT_SHARE_COUNT).is_ok()
+        );
+    }
+
+    #[test]
+    fn helper_submission_rejects_complete_batch_assignment_quota_violation() {
+        let plan = full_persisted_plan(|share_index| {
+            if share_index <= SHARE_HELPER_MAX_INITIAL_SHARES_PER_SERVER {
+                vec![1, 2 + (share_index % 2) as u32]
+            } else {
+                vec![2, 3]
+            }
+        });
+        let current = vec![helper(1), helper(2), helper(3)];
+
+        assert!(
+            validate_helper_submission_plan(&plan, &current, VOTE_COMMITMENT_SHARE_COUNT).is_err()
+        );
+    }
+
+    #[test]
+    fn helper_submission_preserves_the_one_helper_complete_batch_exception() {
+        let plan = WalletHelperSharePlan {
+            configured_server_urls: vec![helper(1)],
+            share_plans: (0..VOTE_COMMITMENT_SHARE_COUNT)
+                .map(|share_index| SharePlan {
+                    immediate: false,
+                    submit_at: 1_000 + share_index as u64,
+                    target_count: 1,
+                    target_servers: vec![helper(1)],
+                })
+                .collect(),
+        };
+        let current = vec![helper(1)];
+
+        assert!(
+            validate_helper_submission_plan(&plan, &current, VOTE_COMMITMENT_SHARE_COUNT).is_ok()
+        );
     }
 
     #[test]

@@ -781,7 +781,11 @@ submission loop; `helper_submission_allows_compatible_current_fleet_churn`,
 `helper_submission_rejects_a_removed_planned_target`,
 `helper_submission_rejects_current_fleet_target_drift`, and
 `helper_submission_validates_every_plan_before_delivery` cover its current-
-fleet boundary.
+fleet boundary. `helper_submission_accepts_complete_batch_at_assignment_quota`,
+`helper_submission_rejects_complete_batch_assignment_quota_violation`, and
+`helper_submission_preserves_the_one_helper_complete_batch_exception` ensure a
+persisted complete plan cannot bypass the aggregate per-helper assignment
+limit before delivery begins.
 
 ## Confirmation and health invariants
 
