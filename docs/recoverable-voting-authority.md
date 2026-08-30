@@ -64,14 +64,9 @@ vote-chain messages would not need to change.
 
 The authority derivation is client-side. The voting circuits and vote-chain
 verifier do not need to know whether a private witness was sampled or derived.
-Rollout additionally requires authenticated client configuration and a complete
-read-only confirmed-history source.
-
-The root recovers the secret side of voting authority. Full database-loss
-recovery also needs the account's snapshot note data, authenticated round
-configuration, root-validated vote-tree data, and complete confirmed vote
-history. An exact encrypted write-ahead record is additionally required for a
-vote that may have been broadcast but is not yet confirmed.
+After restoration, the same root recreates the hotkey and bundle blindings so
+the wallet can find its matching VANs in the validated vote tree and continue
+voting.
 
 ### Recovery at a glance
 
@@ -125,16 +120,13 @@ vote tree.
 - Preserve one fresh, unlinkable voting authority per account and round.
 - Recover confirmed partial delegation from VAN commitments rather than exact
   transaction bytes.
-- Recover confirmed singleton and atomic-batch vote transitions from complete
-  authenticated chain history after loss of the local voting database.
-- Preserve exact possibly-broadcast vote work in a durable encrypted
-  write-ahead record so an ambiguous singleton or batch is never rebuilt under
-  different intent or randomness.
+- Recover the latest confirmed VAN state after singleton or atomic voting
+  without requiring transaction history.
 - Work unchanged with atomic vote batches and Keystone PCZT batch signing.
 - Version every persisted derivation artifact so legacy random rounds continue
   to work without reinterpretation.
-- Consolidate the normative encoding, expansion, bundle identity, recovery,
-  documentation, and test vectors in `zcash_voting`.
+- Consolidate the encoding, expansion, bundle identity, recovery, and test
+  vectors in `zcash_voting`.
 - Preserve a narrow provider seam for a future on-device Keystone root without
   making that firmware work part of version 1.
 
@@ -149,9 +141,8 @@ vote tree.
 - Change the ZKP statements, on-chain messages, or vote-chain verifier.
 - Move ZKP generation or vote signing into Keystone.
 - Make an imported UFVK sufficient to reconstruct private voting authority.
-- Make the authority root alone sufficient to reconstruct snapshot notes,
-  confirmed transaction history, or an unconfirmed vote whose exact broadcast
-  record was also lost.
+- Recover an earlier ballot choice, helper-delivery state, or exact unconfirmed
+  transaction after the local voting database is lost.
 - Guarantee recovery for a manually selected note subset or custom bundle
   policy that is not itself recoverably described.
 - Replace the existing public-target custody handoff in the first version.
@@ -215,9 +206,8 @@ length and all remaining fields have fixed lengths.
 
 An opaque 64-byte secret supplied to `zcash_voting` for one authority context.
 The root is the stable boundary between secret custody and voting protocol
-logic. It cannot spend the Zcash account. Possession is sufficient to recreate
-the hotkey and bundle blindings, but exercising recovered authority also needs
-the authenticated public and account data named in the recovery state machine.
+logic. It recreates the hotkey and bundle blindings but cannot spend the Zcash
+account.
 
 ### Authority root source
 
@@ -278,10 +268,10 @@ under the application-owned context `ZcashShieldedVoting` and a fixed numeric
 namespace constant, `VOTING_KDF_ID_V1`, defined by `zcash_voting`.
 
 Neither the context nor the numeric namespace requires external assignment or
-a standalone ZIP before deployment. They are version 1 protocol constants and
-must be frozen before interoperable vectors are published. Changing either
-requires a new root-source version because it changes every derived root. A
-later ZIP may document the deployed values without renumbering version 1.
+a standalone ZIP before deployment. `zcash_voting` defines both as version 1
+protocol constants. Changing either produces different roots and therefore a
+new root-source version. A later ZIP may document the deployed values without
+renumbering version 1.
 
 Conceptually, the tree is:
 
@@ -652,26 +642,10 @@ Authority derivation happens before transaction batching and is keyed to a
 canonical delegation bundle, not to a transaction container.
 
 The current atomic vote API carries multiple ordered proposal actions for one
-delegation `bundle_index`. All actions use the same hotkey and begin from that
-bundle's VAN. `authority-root-v1` reconstructs that starting authority exactly.
-The existing atomic-batch code then performs the ordered VAN transitions,
-binds every action to the shared batch digest, and persists or confirms the
-batch as one unit.
-
-The following values must not enter the authority-root, hotkey, bundle-ID, or
-initial VAN-blinding derivation:
-
-- number of actions placed in an atomic transaction;
-- proposal order in that transaction;
-- batch digest;
-- transaction hash;
-- proof or signature randomness; and
-- whether the same action was first prepared as a singleton.
-
-This lets a batch with a definite pre-dispatch outcome be rebuilt without
-changing its starting authority. Once any action may have been submitted, the
-exact `VoteBroadcastRecoveryV1` record and the atomic batch recovery rules
-remain authoritative.
+delegation `bundle_index`. The actions share a hotkey, start from that bundle's
+VAN, and use the existing ordered transition and batch-digest rules. Batch size,
+proposal order, digest, transaction hash, and proof or signature randomness do
+not enter the root, hotkey, bundle ID, or initial VAN-blinding derivation.
 
 If a future vote-chain transaction can carry actions from several delegation
 bundle indices, each bundle still has its own root-derived blinding and
@@ -681,161 +655,43 @@ atomically, but it does not merge their identities or derive a batch-wide
 
 ## Recovery state machine
 
-Recovery has three inputs in addition to the authority root: the restored
-account's snapshot notes, independently authenticated round and proposal
-configuration, and authenticated vote-chain data. The root does not replace
-any of them.
+`zcash_voting` recovers one bundle as follows:
 
-### Initial delegation recovery
+1. Validate the root source, authority context, account fingerprint, scheme,
+   and bundle policy.
+2. Rescan the account at the round snapshot and rebuild the canonical bundle
+   plan, including notes spent since the snapshot.
+3. Re-derive the hotkey, bundle ID, blinding, weight, and initial VAN.
+4. Sync and root-validate the vote-commitment tree.
+5. Derive the VAN for every mask obtainable by clearing a subset of the
+   round's proposal bits and locate matching commitments in the tree.
+6. Require each later tree match's set bits to be a strict subset of the
+   previous match's set bits, then select the unique match with the most
+   consumed proposal bits.
 
-`zcash_voting` first recovers the original delegation state:
+The current circuit has 15 usable proposal bits, so this search has at most
+`2^15` candidates per bundle. The initial mask is `0xFFFF`. Bit 0 remains set;
+bits 1 through 15 identify unused proposals. A singleton appends each successor
+VAN. An atomic batch appends only its final VAN, but that commitment still
+contains the final mask, which is all recovery needs to continue voting.
 
-1. Validate that the restored root source, authority context including account
-   fingerprint, scheme, and policy match.
-2. Rescan the account at the round's snapshot height, including notes that are
-   spent at the current tip but were eligible at the snapshot.
-3. Reconstruct the frozen `recoverable-v1` bundle plan.
-4. Re-derive the hotkey, bundle IDs, blinding factors, weights, and initial
-   candidate VAN commitments.
-5. Sync and root-validate the public vote-commitment tree.
-6. Locate every initial candidate VAN in that tree.
-7. Atomically import only complete, unambiguous matches with their confirmed
-   positions and initial proposal-authority masks.
-8. Continue normal delegation for a candidate with no match only after the
-   wallet establishes that its source notes remain usable and no ambiguous
-   delegation broadcast can still land.
-9. Reject duplicate, conflicting, partial, wrong-account, or
-   root-inconsistent recovery state.
+The selected match provides the current VAN position and proposal-authority
+mask. For a bundle known to have a confirmed delegation, no match, incomparable
+matches, multiple terminal matches, or any tree mismatch fail closed. A bundle
+with no matches may continue normal delegation only after ordinary transaction
+reconciliation establishes that it was never confirmed and its source notes
+remain usable.
 
-A confirmed VAN is authoritative even if the original transaction hash is
-missing. A transaction hash remains useful for normal polling but does not
-replace commitment recovery.
+Transaction history can improve status and diagnostics, but it is not a
+recovery requirement. A stale vote built from an earlier VAN is rejected by the
+chain as a spent nullifier; recovery should find the current VAN instead of
+using submission as a probe. If a future circuit expands the authority mask
+enough to make enumeration impractical, a targeted nullifier-to-successor query
+can replace the search without changing authority derivation.
 
-### Confirmed vote-history contract
-
-Recovering beyond the initial VAN requires complete confirmed action history,
-not only the current commitment tree. The history provider must return, for a
-round and VAN nullifier:
-
-- the finalized block height and transaction hash;
-- the exact canonical singleton message or ordered atomic-batch messages;
-- every action's VAN nullifier, successor VAN, vote commitment, proposal ID,
-  anchor height, and randomized verification key;
-- for a batch, the canonical action order and batch digest; and
-- the matching confirmed event attributes, including the final VAN position
-  and every vote-commitment position.
-
-The transaction body is required because the current singleton event does not
-contain the nullifier or proposal ID. A tree-leaf stream alone is also
-insufficient for an atomic batch because intermediate VANs are not appended as
-leaves and the final VAN does not reveal proposal order.
-
-The provider may be backed by complete indexed block and transaction history
-or by a dedicated read-only query, but production activation requires a
-retention and completeness guarantee for the full round. Results are checked
-against finalized vote-chain state, and all referenced VAN and vote-commitment
-positions are checked against the root-validated tree. If complete history is
-unavailable, recovery fails closed rather than treating an initial VAN as the
-current unspent authority.
-
-### Vote broadcast write-ahead record
-
-Chain history cannot distinguish work that was never submitted from a valid
-signed vote that was broadcast but has not yet landed. A missing transaction
-is not an expiry signal: under the current vote-chain rules, its stored anchor
-can remain valid while the round is active.
-
-Before the first network dispatch of a singleton or atomic batch,
-`zcash_voting` therefore produces a canonical `VoteBroadcastRecoveryV1`
-plaintext record containing:
-
-- the format version, authority context, bundle index, and bundle ID;
-- the ordered proposal IDs, choices, option counts, and share modes;
-- the complete library-owned `VoteRecoveryBundle` for every action;
-- the exact canonical signed singleton request or atomic-batch request bytes;
-  and
-- the batch digest, action indices, and batch size when the record represents
-  an atomic batch.
-
-The integration encrypts and authenticates this record and commits it to a
-durable write-ahead journal outside the voting database. It must read back and
-validate the journal entry before dispatch. The journal's restore mechanism
-must guarantee that it returns the latest committed state rather than a stale
-snapshot; an old manual export that predates a vote cannot provide ambiguous
-broadcast recovery. A second row in the voting database is not sufficient.
-
-The journal state is monotonically versioned, including an authenticated empty
-state and tombstones for removed records. A verified latest state with no
-record is affirmative evidence that no request passed the dispatch gate for
-that authority state. Mere absence of a file or row from an unversioned or
-potentially stale restore is not that evidence.
-
-An atomic batch has exactly one journal entry and is restored as one unit. A
-record may be removed only after the confirmed action is finalized and
-discoverable through the complete history provider. The root backup remains a
-small, static authority backup; these write-ahead records preserve the
-non-derivable intent, proof, and signature material created later.
-
-### Confirmed post-vote recovery
-
-For each recovered delegation bundle, `zcash_voting` walks the authority chain
-from its initial VAN:
-
-1. Start with the recovered VAN, its root-validated position, weight, blinding
-   factor, and current proposal-authority mask.
-2. Derive that VAN's spend nullifier with the same native construction used by
-   ZKP #2 and query the complete confirmed history by round and nullifier.
-3. If there is no match, the VAN is the current unspent authority at the
-   finalized recovery height, subject to the write-ahead-journal rules below.
-4. If there is one singleton match, recompute the authority transition and
-   require its proposal ID, old mask, successor VAN, and nullifier to match the
-   confirmed message.
-5. Enumerate the round's valid choice and share-mode inputs, re-derive the
-   deterministic encrypted shares and vote commitment, and require exactly one
-   candidate to match the confirmed vote commitment. This recovers the private
-   choice and helper-share material without reusing or guessing proof and
-   signature randomness.
-6. Validate the confirmed event and root-validate the successor VAN and vote
-   commitment at their advertised positions. Atomically import the confirmed
-   transaction hash, proposal state, positions, recovered choice, and
-   helper-share recovery material.
-7. Advance to the successor VAN and repeat until its nullifier has no confirmed
-   match.
-
-For an atomic batch, the first action must spend the current VAN. Every later
-action must spend the preceding synthetic successor, and every native
-transition and nullifier must match the ordered confirmed messages. Recovery
-recomputes the batch digest from those message fields, including their
-confirmed randomized verification keys, and compares it with the event. It
-root-validates the final VAN and every vote commitment, then imports all actions
-or none. The digest is recovered from and verified against confirmed chain
-data; it is not re-derived from the authority root.
-
-After import, existing helper recovery can check delivery status and submit any
-still-needed deterministic payloads using the recovered vote-commitment
-positions. Conflicting history, multiple transactions for one VAN nullifier,
-non-unique choice reconstruction, an invalid batch chain, or any tree mismatch
-rejects the whole affected singleton or batch.
-
-### Ambiguous and unconfirmed vote recovery
-
-If a write-ahead record exists but no confirmed history match exists, the vote
-is still possibly submitted. While the round is active, recovery may only
-resubmit the exact signed request bytes from that record and continue polling
-by its nullifiers and, for a batch, digest. It must not rebuild the action with
-fresh proof or signature randomness, change a choice, change batch membership
-or order, or prepare another action from the same VAN.
-
-If the local database is lost and restore cannot produce the authenticated
-latest journal state, the authority root cannot prove that an absent vote was
-never broadcast. The wallet fails closed for that VAN while an old signed
-request could still land; it must not present a newly chosen vote as safe
-recovery. This is why the write-ahead durability gate is part of the version 1
-recovery guarantee. A verified latest empty state is not this failure case.
-
-Fresh one-time proof and signature randomness is permitted only for work with a
-definite pre-dispatch outcome. Once a request may have been dispatched, exact
-record recovery or confirmed chain recovery is mandatory.
+Version 1 does not reconstruct an earlier choice, helper-delivery state, atomic
+batch order, or exact unconfirmed transaction after the voting database is
+lost. Those are separate transaction-recovery concerns.
 
 ## Legacy migration
 
@@ -859,10 +715,8 @@ and bundle-ID columns. Migration assigns `random-v0` to all existing rows. It
 never infers a scheme from secret length or recomputes a value merely because a
 column is empty.
 
-Changing roots or providers is allowed only before the wallet has built work
-that could have been submitted. After a definite pre-submission reset, the
-wallet may create a new authority. After submission or an ambiguous broadcast,
-the original authority remains mandatory.
+Changing roots or providers is allowed only before any delegation may have been
+submitted. After that point, the original authority remains mandatory.
 
 ## Public-target and custody boundary
 
@@ -919,12 +773,6 @@ Deleting the live root after delegation does not revoke a copied backup or
 change the on-chain authority. Wallet UX must describe backup deletion as a
 custody action, not revocation.
 
-A `VoteBroadcastRecoveryV1` record additionally contains private choices,
-helper-share recovery material, and an exact signed request. Its encryption,
-authentication, latest-state guarantee, retention, and deletion are therefore
-security and ballot-privacy boundaries. Restoring a stale journal can be as
-unsafe as losing it because it can hide a still-valid ambiguous broadcast.
-
 ### Wallet compromise
 
 A wallet that holds the authority root can vote for that context. This is the
@@ -942,76 +790,26 @@ not standardize voting authority.
 
 ## Rejected alternatives
 
-### Require deterministic Keystone authority in version 1
-
-Rejected because a safe, purpose-specific, seed-derived private output requires
-new firmware behavior and a separately reviewed transport. Recovery can ship
-without that dependency by backing up a host-generated random root.
-
-### Derive from an ordinary Keystone transaction signature
-
-Rejected because current RedPallas signatures are randomized, and the
-delegation PCZT already contains the hotkey address and VAN that would
-supposedly be derived from its signature.
-
-### Add a deterministic sign-message request
-
-Rejected because it is still a firmware change and would couple key derivation
-to a signing protocol and its user-interface semantics. A future provider
-should return the typed authority-root result directly.
-
-### Reuse today's random hotkey seed as the version 1 root
-
-Rejected because software-derived registered cryptovalues must not be fed back
-into ZIP-32 key derivation. Keeping today's seed-to-USK interpretation for one
-provider and direct Orchard expansion for another would give the same root type
-two meanings. Version 1 instead uses one direct expansion and leaves all
-existing hotkeys under `random-v0`.
-
-### Derive bundle blindings from the hotkey spending key
-
-Rejected because it turns a signing key into a general-purpose KDF key and
-couples recovery to the hotkey's serialized representation. Sibling expansion
-from the authority root gives each purpose its own domain.
-
-### Back up every independently sampled bundle blinding
-
-Rejected as the canonical version 1 design because the backup grows with the
-bundle plan, can capture only a partial plan, and does not consolidate
-integrators on one reproducible `zcash_voting` derivation. The single root is
-enough to recover every canonical bundle.
-
-### Derive every bundle blind from only its index
-
-Rejected because a bundle-planning change could assign different notes and
-weight to the same index after restoration. The canonical bundle identity
-binds the blinding to the actual snapshot notes.
-
-### Derive a blind from public hotkey material
-
-Rejected because an observer could recompute the supposedly secret blind and
-brute-force VAN contents.
-
-### Store the root only in Keystone secure storage
-
-Rejected for version 1 because the host needs voting authority for proof and
-vote construction, and device-only persistence would create another hardware
-backup and migration problem. The current design needs no per-round Keystone
-state.
-
-### Use ZIP 325 directly
-
-Rejected because [ZIP 325][zip325] is a draft metadata-encryption tree, not a
-signing-authority namespace. It may help an integration protect backups, but it
-does not define the authority itself.
-
-### Recover an ambiguous vote from the authority root alone
-
-Rejected because the root deliberately does not derive the user's choice,
-proof randomizer, signature randomizer, or atomic-batch digest. While the round
-is active, absence from confirmed history does not prove that signed bytes were
-never broadcast or cannot still land. The durable exact write-ahead record is
-the version 1 recovery boundary for that state.
+- **Require deterministic Keystone authority now:** a purpose-specific private
+  output needs new firmware and transport. A backed-up host-generated root does
+  not.
+- **Use an ordinary signature or deterministic sign-message request:** current
+  RedPallas signatures are randomized, and either approach couples derivation
+  to a signing protocol. A future device should return the typed root directly.
+- **Reuse today's random hotkey seed as the root:** legacy code interprets those
+  bytes as a ZIP-32 seed. Version 1 gives every root one direct-expansion
+  meaning and leaves old authorities under `random-v0`.
+- **Derive blindings from the hotkey or public key:** a signing key should not
+  become a general KDF key, and a public derivation would reveal the blind.
+- **Derive blindings from only the bundle index:** the same index can identify
+  different notes after a planning change, so the actual bundle identity must
+  be bound.
+- **Back up every sampled blinding:** the backup grows with the plan and can
+  capture only a partial plan. One root recovers every canonical bundle.
+- **Store the root only on Keystone:** the host needs it for vote construction,
+  and device-only state creates another backup problem.
+- **Use ZIP 325 as the authority:** [ZIP 325][zip325] describes metadata
+  encryption, not a voting-signing namespace. It may still protect a backup.
 
 [zip32-registered]: https://zips.z.cash/zip-0032#specification-registered-key-derivation
 [zip325]: https://zips.z.cash/zip-0325
@@ -1020,28 +818,17 @@ the version 1 recovery boundary for that state.
 
 ### `zcash_voting`
 
-- normative account-fingerprint, authority-context, and root types;
-- root-source identifiers and backup payload validation;
-- direct Orchard hotkey expansion;
-- canonical bundle ID and VAN blinding expansion;
-- recoverable version 1 note-selection and bundle policy;
-- byte-for-byte round-auth version 3 verification and authenticated scheme
-  selection;
-- persistence migration and legacy separation;
-- initial and post-vote VAN recovery state machines;
-- the confirmed-history provider interface and native VAN-nullifier derivation;
-- deterministic recovery of confirmed choice and helper-share material;
-- canonical `VoteBroadcastRecoveryV1` construction and validation;
-- atomic-batch compatibility rules; and
-- public golden vectors, documentation, and integration fixtures.
+- account fingerprint, authority context, root, source, and backup types;
+- hotkey, bundle-ID, and VAN-blinding derivation;
+- the recoverable bundle policy and round-auth version 3 verification;
+- legacy migration and current-VAN tree recovery; and
+- atomic-batch rules, public vectors, and integration fixtures.
 
 ### Software-wallet integrations
 
 - root-seed provider implementation;
-- secure in-memory handling;
-- snapshot rescan and recovery UX;
-- authenticated encrypted root backup where applicable;
-- a durable, latest-state vote-broadcast journal with a read-back gate; and
+- secure root handling and backup where applicable;
+- snapshot rescan and recovery UX; and
 - fail-closed handling for unsupported schemes or custom non-recoverable note
   selection.
 
@@ -1049,11 +836,9 @@ the version 1 recovery boundary for that state.
 
 - calling the canonical stored-random root generator;
 - deriving and validating the account fingerprint from the paired UFVK;
-- platform-secure live storage;
-- authenticated encrypted root backup and restored account-viewing-state UX;
-- the pre-delegation backup-completion gate;
-- the same durable vote-broadcast journal and read-back gate used by software
-  integrations; and
+- secure live storage, encrypted root backup, and the pre-delegation backup
+  gate;
+- restored account-viewing-state UX; and
 - existing Keystone PCZT or PCZT-batch signing.
 
 ### Keystone firmware
@@ -1078,65 +863,36 @@ statements.
 No consensus rule or vote-action message change is required for authority
 derivation. `vote-sdk` must add the round-auth version 3 config fields,
 canonical signing preimage, signer and config-PR support, and verification
-fixtures shared with `zcash_voting`.
-
-It must also provide or designate a complete confirmed-history source that
-returns canonical singleton and atomic-batch messages plus their event metadata
-for the full round. This may use retained indexed transaction history or a new
-read-only query; it is an application query and availability contract, not a
-change to vote verification. End-to-end fixtures must cover delegation,
-confirmed-history recovery, helper-share continuation, and subsequent
-singleton and atomic-batch voting. An explicit on-chain authority-scheme field
-may be considered later, but is not needed when round-auth version 3 is
-enforced.
+fixtures shared with `zcash_voting`. An explicit on-chain scheme field may be
+considered later, but is not needed when round-auth version 3 is enforced.
 
 ## Validation and rollout gates
 
 Before activation, require:
 
-- frozen expansion vectors from a public 64-byte root through the direct
-  hotkey, raw Orchard address, bundle ID, VAN blinding factor, and VAN;
-- frozen software-provider vectors from a public test seed and authority
-  context through the registered root and the same expansion vectors;
-- separation tests for Orchard account fingerprint, account index, network,
-  vote chain, round, bundle index, note identity, and derivation version;
-- invalid-hotkey-candidate counter coverage;
-- `stored-random-v1` generation, backup encryption, restore, wrong-context,
-  wrong-account, corruption, and pre-delegation durability-gate tests;
-- round-auth version 3 byte vectors, signature-tampering tests for both new
-  fields, rejection of unsigned fields on versions 1 and 2, and rejection by an
-  older version 2-only client;
-- proof verification through both circuit backends used by supported wallets;
-- database-loss recovery with no delegation, one of several delegations
-  confirmed, all delegations confirmed, and a missing delegation transaction
-  hash;
-- database-loss recovery after confirmed singleton and multi-action atomic
-  votes, including recovery of choices, current proposal authority, batch
-  order and digest, tree positions, and pending helper-share material;
-- complete-history omission, duplicate-history, invalid-transition,
-  non-unique-choice, and root-mismatch failures;
-- ambiguous singleton and atomic-batch recovery by exact journal resubmission,
-  plus fail-closed coverage when the latest journal record is unavailable;
-- a fresh multi-action atomic batch, restart recovery, confirmation, idempotent
-  replay, and rollback after a later conflict;
-- Keystone-host integration tests using the existing PCZT batch signing path,
-  restored authority backup, and restored account viewing state, with no new
-  firmware operation or request type;
-- explicit legacy `random-v0` compatibility and no-silent-migration tests;
-- downstream software-wallet integration tests; and
-- frozen application-owned KDF constants and a published derivation
-  specification.
+- public vectors for the account fingerprint, software root provider, hotkey,
+  bundle ID, VAN blinding, and VAN;
+- separation tests for account, network, vote chain, round, bundle identity,
+  and version, including invalid hotkey candidates;
+- random-root generation, encrypted backup, restore, wrong-context,
+  wrong-account, corruption, and backup-gate tests;
+- round-auth version 3 vectors, signature-tampering coverage, and old-client
+  rejection;
+- proof verification through both supported circuit backends;
+- database-loss recovery before delegation, after partial delegation, and
+  after confirmed singleton and atomic votes, including invalid or
+  incomparable tree matches;
+- Keystone-host recovery with existing PCZT batch signing and no new firmware
+  request; and
+- legacy `random-v0` and downstream integration coverage.
 
 Rollout order:
 
-1. Land the normative `zcash_voting` fingerprint, context, root, backup,
-   broadcast-record types, encodings, and vectors without activating the
-   scheme.
+1. Land the normative `zcash_voting` types, encodings, recovery, and vectors
+   without activating the scheme.
 2. Implement the software seed provider and `stored-random-v1` provider.
-3. Land round-auth version 3 production and verification plus the complete
-   confirmed-history source in `vote-sdk`.
-4. Land initial and post-vote VAN recovery, the durable write-ahead journal,
-   and downstream backup and recovery UX.
+3. Land round-auth version 3 production and verification in `vote-sdk`.
+4. Land downstream backup and recovery UX.
 5. Validate the existing Keystone PCZT batch-signing integration with restored
    authority roots.
 6. Activate `authority-root-v1` only in authenticated round configuration that
@@ -1144,33 +900,10 @@ Rollout order:
 
 No firmware release is part of this rollout order.
 
-## Approval checklist
+## Review focus
 
-Reviewers are asked to approve or reject these decisions explicitly:
-
-- one 64-byte authority root as the canonical provider boundary;
-- one Orchard full-viewing-key fingerprint binding the context and backups to
-  the actual account;
-- deterministic software roots and backed-up random roots as version 1
-  sources;
-- deterministic Keystone hotkey derivation and all firmware work outside
-  version 1;
-- the existing Keystone PCZT batch-signing path remaining unchanged;
-- direct Orchard hotkey derivation instead of re-seeding ZIP 32;
-- per-bundle blindings bound to canonical snapshot bundle identities;
-- one frozen recoverable note-selection and bundle policy for version 1;
-- atomic vote batching remaining outside the authority derivation;
-- signed round-auth version 3 configuration selecting the expansion and bundle
-  policy, with root source kept as explicit local recovery metadata;
-- complete confirmed vote history driving post-vote authority recovery;
-- an exact durable write-ahead record gating every possibly-broadcast vote;
-- forward-only migration with all existing rounds remaining `random-v0`;
-- no circuit, consensus-rule, or vote-action-message change for the first
-  version;
-- a future Keystone root provider fitting the same post-provider expansion;
-  and
-- public-target custody determinism as a separately versioned follow-up.
-
-Approval of this document fixes the version 1 design so implementation PRs can
-proceed against it. It does not by itself activate the scheme for a production
-round or approve a wallet release.
+The main decisions are the 64-byte root boundary, account and bundle binding,
+software-derived versus backed-up random roots, signed version selection, and
+forward-only legacy migration. Version 1 changes no circuit, vote-chain
+message, or Keystone firmware behavior. Public-target custody derivation
+remains a separate follow-up.
