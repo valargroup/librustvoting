@@ -1101,6 +1101,10 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
     the validation read, so a concurrent WAL writer waits or is waited on
     within the configured busy timeout instead of invalidating the operation's
     snapshot with `SQLITE_BUSY_SNAPSHOT`.
+13. Confirmation and sent-server updates carry the nullifier of the share
+    generation whose helper result they apply. The transactional read and
+    update require that exact nullifier, so a delayed result for a cleared
+    generation cannot confirm or add placement evidence to its replacement.
 
 Enforcement:
 [`share.rs`](../zcash_voting/src/share.rs),
@@ -1122,7 +1126,9 @@ in `storage/operations.rs` for public submission and VC-position writes, and
 `helper_share_writers_reserve_before_validation_and_reject_stale_intent` in
 `storage/operations.rs` for share recording, confirmation, and server updates,
 `record_derives_share_identity_after_reserving_wal_writer` in `share.rs` for
-recovery-identity derivation under the same reservation, and
+recovery-identity derivation under the same reservation,
+`stale_helper_results_do_not_mutate_replacement_share` in `share.rs` for
+identity-bound confirmation and placement updates, and
 `changed_choice_ignores_stale_share_confirmations` and
 `skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
 

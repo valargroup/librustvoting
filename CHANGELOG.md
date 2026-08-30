@@ -195,7 +195,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   use immediate transactions, preventing concurrent WAL writers from causing
   stale-snapshot `database is locked` failures during submission and
   confirmation recording, including direct VC-position and helper-share
-  writes.
+  writes. Helper confirmation and sent-server updates additionally require the
+  exact submitted share nullifier, so delayed network results cannot mutate a
+  replacement share generation.
 
 ## v3.1.0-rc.13
 
