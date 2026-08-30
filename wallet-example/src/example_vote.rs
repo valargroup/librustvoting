@@ -1,9 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use zcash_voting::prelude::{
-    commit_atomic_vote_batch, commit_batch, sync_vote_tree, van_witness, CommittedVote, DraftVote,
-    NoopProgressReporter, SharePayload, SignedVoteBatch, SignedVoteCommitment,
-    SignedVoteCommitments, VanWitness, VoteSigner, VoteSubmission, VotingDb, VotingHotkey,
+    canonical_helper_url_list, commit_atomic_vote_batch, commit_batch, os_random_bytes,
+    sync_vote_tree, track_pending_shares, van_witness, CommittedVote, DraftVote, HelperClient,
+    NoopProgressReporter, SharePayload, SharePlan, ShareSubmissionReport, ShareSubmissionRequest,
+    ShareTimingPolicy, ShareTrackingParams, ShareTrackingReport, SignedVoteBatch,
+    SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteSigner, VoteSubmission, VotingDb,
+    VotingHotkey,
 };
+use zcash_voting::share::policy::{plan_share_submissions, share_submission_random_bytes_required};
 
 /// Inputs for deriving a Merkle witness for one confirmed delegation bundle.
 ///
@@ -50,13 +55,41 @@ pub struct WalletAtomicVoteBatchRequest<'a> {
     pub voting_hotkey: &'a VotingHotkey,
 }
 
-/// One helper-share delivery result produced outside the wallet library.
-pub struct WalletShareDelivery<'a> {
+/// Persist this complete plan set before submitting its first helper share.
+///
+/// Keeping the canonical fleet with the plans lets restart recovery reuse the
+/// same commitment-wide balancing and quota context.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletHelperSharePlan {
+    pub configured_server_urls: Vec<String>,
+    pub share_plans: Vec<SharePlan>,
+}
+
+/// Inputs for planning all helper shares in one committed vote.
+pub struct WalletHelperSharePlanningRequest<'a> {
+    pub configured_server_urls: &'a [String],
+    pub now_seconds: u64,
+    pub vote_end_time_seconds: u64,
+    pub last_moment_buffer_seconds: Option<u64>,
+    pub single_share: bool,
+    /// Position in this committed vote's share payloads, not a domain share ID.
+    pub immediate_share_index: Option<u32>,
+}
+
+/// One durably journaled initial helper-share delivery result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalletShareDelivery {
     pub share_index: u32,
-    /// Result returned by `submit_share_to_helpers`.
-    pub submission: &'a zcash_voting::share_tracking::ShareSubmissionReport,
-    pub submit_at: u64,
-    pub confirmed: bool,
+    pub submission: ShareSubmissionReport,
+}
+
+/// Inputs for one confirmation and recovery pass over a round.
+pub struct WalletShareTrackingRequest<'a> {
+    pub round_id: &'a str,
+    /// The complete current helper fleet, which may differ from initial plans.
+    pub configured_server_urls: &'a [String],
+    pub now_seconds: u64,
+    pub vote_end_time_seconds: Option<u64>,
 }
 
 /// Network-side results to persist after the caller submits a committed vote.
@@ -201,6 +234,121 @@ pub fn committed_vote_signed_commitment(
     committed
         .signed_commitment(voting_db)
         .context("build signed vote commitment")
+}
+
+/// Plans every helper share together using fresh independent OS entropy.
+///
+/// The helper URLs are canonicalized before planning because placement counts
+/// distinct endpoint identities. Persist the returned value before calling
+/// [`submit_committed_vote_shares`] and reuse it after restart; planning only
+/// missing shares would lose commitment-wide balancing and quota context.
+pub fn plan_committed_vote_shares(
+    committed: &CommittedVote,
+    request: WalletHelperSharePlanningRequest<'_>,
+) -> Result<WalletHelperSharePlan> {
+    let configured_server_urls = canonical_helper_url_list(request.configured_server_urls)
+        .context("validate helper URLs")?;
+    let share_count = committed.share_payloads().len();
+    let required = share_submission_random_bytes_required(
+        share_count,
+        configured_server_urls.len(),
+        request.now_seconds,
+        request.vote_end_time_seconds,
+        request.last_moment_buffer_seconds,
+        request.single_share,
+    );
+    let submit_at_random_bytes = os_random_bytes(required.submit_at_random_bytes);
+    let server_random_bytes = os_random_bytes(required.server_random_bytes);
+    let share_plans = plan_share_submissions(
+        share_count,
+        &configured_server_urls,
+        request.now_seconds,
+        request.vote_end_time_seconds,
+        request.last_moment_buffer_seconds,
+        request.single_share,
+        request.immediate_share_index,
+        &submit_at_random_bytes,
+        &server_random_bytes,
+    )
+    .context("plan helper-share submissions")?;
+
+    Ok(WalletHelperSharePlan {
+        configured_server_urls,
+        share_plans,
+    })
+}
+
+/// Submits every committed helper share through crate-owned durable journaling.
+///
+/// `client` is caller-owned so a wallet can enforce its Tor or proxy route.
+/// Each returned report describes state already persisted by
+/// `CommittedVote::submit_share_to_helpers`; do not record it a second time.
+pub async fn submit_committed_vote_shares(
+    voting_db: &VotingDb,
+    committed: &CommittedVote,
+    client: &HelperClient,
+    persisted_plan: &WalletHelperSharePlan,
+    now_seconds: u64,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<Vec<WalletShareDelivery>> {
+    let share_count = committed.share_payloads().len();
+    if persisted_plan.share_plans.len() != share_count {
+        bail!(
+            "persisted helper-share plan count {} does not match committed share count {share_count}",
+            persisted_plan.share_plans.len()
+        );
+    }
+
+    let mut deliveries = Vec::with_capacity(share_count);
+    for (share_index, plan) in persisted_plan.share_plans.iter().enumerate() {
+        if cancel() {
+            break;
+        }
+        let share_index = u32::try_from(share_index).context("share index exceeds u32")?;
+        let submission = committed
+            .submit_share_to_helpers(
+                voting_db,
+                client,
+                ShareSubmissionRequest {
+                    share_index,
+                    plan,
+                    configured_server_urls: &persisted_plan.configured_server_urls,
+                    now_seconds,
+                },
+                cancel,
+            )
+            .await
+            .with_context(|| format!("submit helper share {share_index}"))?;
+        deliveries.push(WalletShareDelivery {
+            share_index,
+            submission,
+        });
+    }
+
+    Ok(deliveries)
+}
+
+/// Runs one crate-owned confirmation and recovery pass.
+///
+/// Schedule the next pass from `next_delay_seconds`. The caller retains
+/// ownership of the timer, app-lock and round-expiry cancellation lifecycle.
+pub async fn track_committed_vote_shares(
+    voting_db: &VotingDb,
+    client: &HelperClient,
+    request: WalletShareTrackingRequest<'_>,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<ShareTrackingReport> {
+    let params = ShareTrackingParams {
+        round_id: request.round_id,
+        configured_server_urls: request.configured_server_urls,
+        now_seconds: request.now_seconds,
+        vote_end_time_seconds: request.vote_end_time_seconds,
+        policy: ShareTimingPolicy::default(),
+        random_bytes: &os_random_bytes,
+    };
+    track_pending_shares(voting_db, &params, client, cancel)
+        .await
+        .context("track pending helper shares")
 }
 
 /// Persists successful vote-chain submission fields.
