@@ -293,9 +293,9 @@ authority.
 
 The provider and bundle sources are selected before direct delegation or
 publication of a public target and are persisted explicitly. They must not be
-inferred from application version, secret length, device type, or the presence
-of local rows. Once any delegation may have been submitted, both sources and
-the root are immutable for that authority.
+inferred from application version, secret length, device type, or local rows.
+Once a public target is published or any direct delegation may have been
+submitted, both sources, the context, and the root are immutable.
 
 The root source is intentionally not included in the expansion. If two
 conforming providers return the same root for the same context, they produce
@@ -394,10 +394,10 @@ serializing it canonically, and requiring byte-for-byte equality with the
 input.
 
 The read-back gate requires the decoded root, both sources, and context to equal
-the live authority selection byte-for-byte. Any pre-submission change to one of
-those values invalidates the backup and repeats the complete gate. After data
-loss, restore uses the record's typed selection and still checks the account
-fingerprint below.
+the live authority selection byte-for-byte. Any allowed change before
+publication or direct submission invalidates the backup and repeats the gate.
+After data loss, restore uses the record's typed selection and still checks the
+account fingerprint below.
 
 This public fixture freezes the encoding. It uses regtest, account index zero,
 fingerprint bytes `00` through `1f`, vote chain `vote-chain-1`, little-endian
