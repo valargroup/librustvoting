@@ -126,7 +126,8 @@ pub struct ResubmittedShare {
 pub struct ShareSubmissionReport {
     /// Helpers that definitively accepted the share.
     pub accepted_urls: Vec<String>,
-    /// Helpers that may have accepted the share before the response failed.
+    /// Helpers that may have accepted the share, including attempts interrupted
+    /// before their outcome was durably classified.
     pub ambiguous_urls: Vec<String>,
     /// Desired number of definite helper placements.
     pub target_count: usize,

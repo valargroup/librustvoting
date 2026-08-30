@@ -979,7 +979,7 @@ async fn ambiguous_initial_failure_is_not_replayed_by_initial_delivery() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn failed_outcome_write_leaves_attempting_marker() {
+async fn failed_outcome_write_is_reported_as_ambiguous_on_resume() {
     let db = Arc::new(db_with_delivery(&[], &[], 1));
     let transport = Arc::new(MockTransport::default());
     let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
@@ -1010,9 +1010,18 @@ async fn failed_outcome_write_leaves_attempting_marker() {
         .execute_batch("DROP TRIGGER fail_delivery_promotion")
         .unwrap();
     transport.queue_post(&post_url, json_status("queued"));
-    submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
-        .await
-        .unwrap();
+    let resumed =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+            .await
+            .unwrap();
+
+    assert!(resumed.accepted_urls.is_empty());
+    assert_eq!(resumed.ambiguous_urls, vec![helper(1)]);
+    assert_eq!(resumed.target_count, 1);
+    let stored = only_share(&db);
+    assert!(stored.sent_to_urls.is_empty());
+    assert!(stored.ambiguous_urls.is_empty());
+    assert_eq!(stored.attempting_urls, vec![helper(1)]);
     assert_eq!(transport.call_count(&post_url), 1);
 }
 

@@ -274,7 +274,12 @@ async fn dispatch_share_to_canonical_helpers(
     }
     Ok(ShareSubmissionReport {
         accepted_urls: delivery_state.accepted_urls().to_vec(),
-        ambiguous_urls: delivery_state.outcome_unknown_urls().to_vec(),
+        ambiguous_urls: delivery_state
+            .outcome_unknown_urls()
+            .iter()
+            .chain(delivery_state.in_flight_urls())
+            .cloned()
+            .collect(),
         target_count: params.target_count,
     })
 }
