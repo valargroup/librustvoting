@@ -23,8 +23,9 @@ framework and authenticates the snapshot block used to reconstruct its bundle
 plan. After data loss, the restored root and bundle material let the
 wallet find its latest VANs in the validated vote tree and continue after
 partial delegation or singleton and atomic votes. While helper-share delivery
-is incomplete, a separate encrypted pending-tally record keeps that vote
-recoverable if the voting database is lost. Existing rounds remain unchanged.
+is incomplete, an encrypted pending-tally collection and independently stored
+head keep that vote recoverable if the voting database is lost. Existing
+rounds remain unchanged.
 
 ## Executive summary
 
@@ -96,7 +97,7 @@ find its matching VANs in the validated vote tree and continue voting.
 | Current Keystone integration with remaining delegation transactions | Encrypted voting-authority backup plus access to the original Zcash account, normally through Keystone | Restore the root, then sign the remaining delegation PCZTs |
 | Public-target custody with retained capability | Voter's seed or encrypted authority-root backup plus the exact custody capability package | Re-derive the hotkey, import the original bundle weights and blindings, then recover matching VANs |
 | Public-target custody without either retained or redeliverable capability | No bundle recovery | The root recreates the hotkey but not custody-provider blindings |
-| Confirmed vote with helper shares still incomplete | Encrypted pending-tally record | Restore the exact vote recovery bundle and resume helper delivery |
+| Confirmed vote with helper shares still incomplete | Encrypted pending-tally collection plus its independently stored collection head | Restore the exact vote recovery bundle and resume helper delivery |
 | Keystone wallet or mnemonic without the voting-authority backup | No recovery | The Keystone seed does not contain the randomly generated root |
 | UFVK or watch-only wallet | No recovery by itself | Public keys cannot reveal voting authority |
 | Legacy `random-v0` round | Original hotkey and every original bundle blinding | Version 1 cannot recreate already-lost random values |
@@ -1091,15 +1092,38 @@ action not found there remains subject to ordinary transaction
 reconciliation; its recovered message or complete batch can be resubmitted
 without preserving the original outer transaction bytes.
 
-The backup is an enumerable collection keyed by `record_id`, not one shared
-slot. Each key has its own compare-and-swap revision chain, and creating,
-updating, or deleting one key cannot replace another pending vote. Restore
-lists every key, loads every latest live revision and tombstone, and rejects a
-broken revision chain or two different records at the same revision. The store
-must atomically retain and return those latest revisions; an older but otherwise
-valid collection snapshot is not sufficient. Adding one key while tombstoning
-another is one collection transaction. An append-only implementation is also
-valid if it provides the same enumeration and freshness guarantees.
+The backup is a collection of immutable revisions addressed by `record_id` and
+revision digest, not one shared slot. Each record's revisions have a monotonic
+number and prior-revision digest. A collection head selects one latest live or
+tombstone revision for every record.
+
+Every collection change also advances a `PendingTallyCollectionHeadV1`. The
+head contains the account fingerprint, network, vote chain, monotonic
+`generation`, canonical record-ID-sorted map, and a SHA-256 digest binding all
+of those fields. Each map entry contains the record ID, revision number,
+live-or-tombstone state, and revision digest. A revision digest is SHA-256 of
+the canonical plaintext revision, not its encryption wrapper. `zcash_voting`
+owns both encodings and digest calculations. Generation zero is the canonical
+empty map. Every committed collection change increments the generation by one;
+wraparound or a duplicate record ID fails closed.
+
+The integration keeps the head in authenticated, encrypted,
+rollback-resistant storage outside both `VotingDb` and the encrypted record
+collection. Another object or version in the same rollbackable backup is not
+independent. A collection change writes and reads back its new immutable
+revisions first, then compare-and-swap advances and reads back the complete
+head. Concurrent changes serialize through that head; revisions left by a
+losing writer are uncommitted and removed. No vote broadcast or helper POST may
+depend on the new state until both steps succeed. Once the head advances,
+superseded revisions are no longer needed for restore and may be deleted.
+
+Restore validates the independent head and loads the exact latest revision it
+names for each record. A missing revision or mismatch in record ID, revision
+number, live-or-tombstone state, revision digest, map digest, or head context
+fails closed before any restored record can cause a network effect. Extra
+unreferenced revisions are ignored and removed. An older collection snapshot
+cannot satisfy a newer head because it lacks at least one named revision.
+Adding one key while tombstoning another is one head change.
 
 Before a POST to a fresh helper, its `attempting_urls` reservation is made
 durable. An overdue duplicate-safe re-POST to a helper already in
@@ -1117,9 +1141,10 @@ rules are the ones defined by the helper submission invariants.
 All actions in an atomic batch are committed to one record together; a partial
 batch record is invalid. Helper tracking remains per action and share. Replacing
 unsubmitted ballot intent atomically creates the replacement and tombstones the
-old ID. Once all expected shares are confirmed on the vote chain, the secret
-record body is deleted and its authenticated tombstone prevents an older backup
-from restoring it. The wallet does not retain complete vote history: VAN
+old ID in one head change. Once all expected shares are confirmed on the vote
+chain, the secret record body is deleted and its head-committed tombstone
+prevents an older backup from restoring it. The wallet does not retain complete
+vote history: VAN
 transition recovery can still show that a proposal was already consumed, but
 neither it nor the tombstone recovers the earlier ballot choice.
 
@@ -1207,7 +1232,8 @@ capability format, or additional custody exchange changes in version 1.
 - the durable helper tracker defined by the helper submission invariants,
   including accepted, ambiguous, and attempting sets, target counts, and
   pre-dispatch reservations;
-- the pending-tally record and helper-journal restore rules;
+- the pending-tally record and collection-head encodings, digests, and
+  helper-journal restore rules;
 - the typed vote-chain recovery checkpoint and target-bound tree and transition
   validation;
 - the recoverable bundle policy and round-auth version 3 digest validation;
@@ -1221,8 +1247,12 @@ capability format, or additional custody exchange changes in version 1.
   attempt;
 - durably store and read back each encrypted pending-tally record before vote or
   helper network effects;
-- enumerate every record and tombstone outside `VotingDb` and pass them through
-  the canonical `zcash_voting` importer; and
+- compare-and-swap and read back the collection head in rollback-resistant
+  authenticated storage independent of both `VotingDb` and the encrypted
+  record collection;
+- load every latest revision named by the head, pass it through the canonical
+  `zcash_voting` importer, and require the resulting collection to match before
+  network effects; and
 - tombstone a record and remove its secret body only after all expected helper
   shares are confirmed.
 
