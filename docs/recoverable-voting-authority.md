@@ -265,8 +265,9 @@ The immutable, nonsecret record that binds an authority context to its root and
 bundle source tags outside `VotingDb`. A software authority stores a
 `VotingAuthoritySelectionV1`; a stored-random authority uses its
 `VotingAuthorityBackupV1`, which carries the same selection plus the secret
-root. The marker is still account-linking metadata and belongs in authenticated
-encrypted backup storage.
+root. Both records also bind `SHA-256(round_auth_payload_v3)`. The marker is
+still account-linking metadata and belongs in authenticated encrypted backup
+storage.
 
 ### Voting hotkey
 
@@ -314,7 +315,7 @@ publication of a public target. `registered-seed-v1` persists this canonical
 selection plaintext outside `VotingDb`:
 
 ```text
-{"format_version":1,"root_source":"registered-seed-v1","bundle_source":"<derived-v1 or imported-capability-v1>","authority_context":"<Base64>"}
+{"format_version":1,"root_source":"registered-seed-v1","bundle_source":"<derived-v1 or imported-capability-v1>","round_auth_payload_digest":"<Base64>","authority_context":"<Base64>"}
 ```
 
 It uses the same compact JSON, field-order, canonical padded Base64, strict
@@ -397,7 +398,8 @@ Keystone integration therefore uses `stored-random-v1`:
 
 1. Ask `zcash_voting` to generate 64 bytes with the operating system CSPRNG.
 2. Select the authority's typed bundle source.
-3. Bind the root, both sources, and canonical context in a typed backup record.
+3. Bind the root, both sources, canonical context, and authenticated round
+   payload digest in a typed backup record.
 4. Store the live copy in platform secure storage.
 5. Commit an authenticated, encrypted backup that can survive deletion or loss
    of the app's voting database.
@@ -406,33 +408,35 @@ Keystone integration therefore uses `stored-random-v1`:
 
 The canonical plaintext payload is `VotingAuthorityBackupV1`. It contains the
 format version, `stored-random-v1` root-source identifier, selected bundle
-source, complete authority context, and 64-byte root. `zcash_voting` owns this
-payload and its validation; the wallet integration owns encryption,
-authentication, storage, and restore UX. The plaintext payload must never be
-logged, placed in a transaction memo, or included in diagnostics.
+source, SHA-256 digest of the canonical authenticated round payload, complete
+authority context, and 64-byte root. `zcash_voting` owns this payload and its
+validation; the wallet integration owns encryption, authentication, storage,
+and restore UX. The plaintext payload must never be logged, placed in a
+transaction memo, or included in diagnostics.
 
 Its exact plaintext encoding is compact UTF-8 JSON with these fields in this
 order and no whitespace or trailing newline:
 
 ```text
-{"format_version":1,"root_source":"stored-random-v1","bundle_source":"<derived-v1 or imported-capability-v1>","authority_context":"<Base64>","authority_root":"<Base64>"}
+{"format_version":1,"root_source":"stored-random-v1","bundle_source":"<derived-v1 or imported-capability-v1>","round_auth_payload_digest":"<Base64>","authority_context":"<Base64>","authority_root":"<Base64>"}
 ```
 
-Both byte strings use canonical padded standard Base64. `authority_context` is
-the complete `authority_context_v1` byte encoding, and `authority_root` must
-decode to exactly 64 bytes. Parsing follows the existing capability-codec rule:
-unknown, duplicate, missing, or reordered fields; whitespace; a trailing
-newline; noncanonical Base64; an unknown source; or an invalid context is
-rejected. A parser can enforce this by validating the decoded object,
-serializing it canonically, and requiring byte-for-byte equality with the
-input.
+All three byte strings use canonical padded standard Base64.
+`round_auth_payload_digest` and `authority_root` decode to exactly 32 and 64
+bytes respectively, while `authority_context` is the complete
+`authority_context_v1` byte encoding. Parsing follows the existing
+capability-codec rule: unknown, duplicate, missing, or reordered fields;
+whitespace; a trailing newline; noncanonical Base64; an unknown source; or an
+invalid context is rejected. A parser can enforce this by validating the
+decoded object, serializing it canonically, and requiring byte-for-byte
+equality with the input.
 
-The root, both sources, and context become final when the wallet creates the
-first backup record for that authority context. It must never create another
-`VotingAuthorityBackupV1` for the same context with a different selection. A
-failed or interrupted store is retried with the same canonical plaintext.
-Additional backup copies and later re-encryption are allowed only when the
-decoded plaintext remains byte-for-byte identical.
+The root, both sources, round payload digest, and context become final when the
+wallet creates the first backup record for that authority context. It must never
+create another `VotingAuthorityBackupV1` for the same context with a different
+selection. A failed or interrupted store is retried with the same canonical
+plaintext. Additional backup copies and later re-encryption are allowed only
+when the decoded plaintext remains byte-for-byte identical.
 
 The read-back gate requires the decoded selection to equal that final
 plaintext. This single-assignment rule means any authenticated backup for the
@@ -443,19 +447,21 @@ or replace that authority.
 
 This public fixture freezes the encoding. It uses regtest, account index zero,
 fingerprint bytes `00` through `1f`, vote chain `vote-chain-1`, little-endian
-round field element 1, root bytes `00` through `3f`, and `derived-v1`:
+round field element 1, root bytes `00` through `3f`, round payload digest bytes
+`40` through `5f`, and `derived-v1`:
 
 ```text
-{"format_version":1,"root_source":"stored-random-v1","bundle_source":"derived-v1","authority_context":"AQIAAAAAAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8MAHZvdGUtY2hhaW4tMQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","authority_root":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="}
+{"format_version":1,"root_source":"stored-random-v1","bundle_source":"derived-v1","round_auth_payload_digest":"QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=","authority_context":"AQIAAAAAAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8MAHZvdGUtY2hhaW4tMQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","authority_root":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="}
 ```
 
-The SHA-256 digest of those 325 plaintext bytes is
-`1446b608217b821ecd4dd394c488a3f65ed7a0e723c4d10b28640bbdae2157ef`.
+The SHA-256 digest of those 400 plaintext bytes is
+`1ccf235dc9f606ee7cfad65ff1809e4fb2d9a78c2571ce6f7103e742a0ec43cb`.
 
 Because the complete context includes `account_fingerprint_32`, restore must
 compare the record with the currently selected Orchard full viewing key before
 making the root available. Matching network, account index, chain, and round is
-not sufficient by itself.
+not sufficient by itself. Restore also hashes the currently authenticated
+version 3 payload and requires the stored digest to match.
 
 Acceptable storage can include an integration's existing end-to-end encrypted
 wallet backup or an explicit encrypted export. A second row in the same voting
@@ -733,10 +739,12 @@ uses `stored-random-v1`. A direct delegation obtains bundle material through
 indistinguishable on the vote chain.
 
 After database loss, the wallet first restores the authenticated selection
-marker. `zcash_voting` then constructs only the selected typed candidate from
-explicit recovery inputs: the registered seed or authenticated root backup,
-plus reconstructed local bundles or the validated custody capability. It
-reconciles that candidate with the authority's durable external use.
+marker and requires its round payload digest to match the currently
+authenticated version 3 payload. `zcash_voting` then constructs only the
+selected typed candidate from explicit recovery inputs: the registered seed or
+authenticated root backup, plus reconstructed local bundles or the validated
+custody capability. It reconciles that candidate with the authority's durable
+external use.
 
 A previously published target recovered from a validated capability or the
 controller-owned durable job must match the selected root-derived hotkey and
@@ -784,20 +792,25 @@ version 3 round, but can continue to resolve other supported rounds. Activation
 must not issue a version 2 attestation for the same new round as a compatibility
 fallback; doing so would let an older wallet join under `random-v0` behavior.
 
-The reverse transition is also forbidden. A round ID that has ever been
-published with a version 1 or 2 attestation cannot later be published as version
-3, even if the older entry was removed in between. Existing voters may already
-have persisted or on-chain `random-v0` authority under that ID. Config
-production checks the published round history before signing a version 3 entry,
-and a wallet with an existing authority rejects an authenticated entry that
-selects different authority semantics for the same round ID.
+A round ID is single-assignment across every auth version. An ID ever published
+with a version 1 or 2 attestation cannot later use version 3, even if the older
+entry was removed. For an ID first published as version 3, its canonical
+`round_auth_payload_v3` bytes are permanent. The same payload may be re-signed,
+but a different height, block hash, authority scheme, bundle policy, election
+key, or PIR field requires a new round ID.
 
-Version 3 intentionally preserves the version 2 preimage fields and adds the
-snapshot height, but it does not add network or vote-chain ID. The trusted
-signing-key set and signed config namespace must therefore be scoped to exactly
-one Zcash network and one vote chain. If a deployment needs to reuse the same
-trusted keys across either boundary, it needs a later auth version that signs
-both identifiers.
+Config production records the first published payload digest in append-only
+round history and rejects a nonidentical replacement. Resolution also rejects
+two authenticated payloads for one round ID. A wallet with an authority marker
+requires the current payload digest to match the stored digest, so removal of
+the old config cannot make a different valid version 3 payload look like the
+original round.
+
+Version 3 retains the version 2 preimage fields, but it does not add network or
+vote-chain ID. The trusted signing-key set and signed config namespace must
+therefore be scoped to exactly one Zcash network and one vote chain. If a
+deployment needs to reuse the same trusted keys across either boundary, it
+needs a later auth version that signs both identifiers.
 
 ## Software-wallet flow
 
@@ -1130,7 +1143,7 @@ capability format, or additional custody exchange changes in version 1.
 - fail-closed reconciliation of typed source candidates with external authority
   use;
 - the pending-tally record and helper-journal restore rules;
-- the recoverable bundle policy and round-auth version 3 verification;
+- the recoverable bundle policy and round-auth version 3 digest validation;
 - legacy migration and bounded nullifier-to-successor VAN recovery; and
 - atomic-batch rules, public vectors, and integration fixtures.
 
@@ -1192,9 +1205,10 @@ statements.
 No consensus rule or vote-action message change is required for authority
 construction. `vote-sdk` must add the round-auth version 3 config fields,
 including the snapshot height and block hash, canonical signing preimage, signer
-and config-PR support, and verification fixtures shared with `zcash_voting`. An
-explicit on-chain scheme field may be considered later, but is not needed when
-round-auth version 3 is enforced.
+and config-PR support, append-only round-payload history that rejects
+nonidentical replacements, and verification fixtures shared with
+`zcash_voting`. An explicit on-chain scheme field may be considered later, but
+is not needed when round-auth version 3 is enforced.
 
 ### `vote-nullifier-pir`
 
