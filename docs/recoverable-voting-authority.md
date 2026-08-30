@@ -1100,11 +1100,11 @@ without preserving the original outer transaction bytes.
 The pre-broadcast revision has no helper plans or journals. After confirmation,
 each action's plan may be installed once, but only as the complete plan set
 returned for all of that action's encrypted shares. The integration writes and
-reads back the new record revision, then compare-and-swap advances and reads
-back the collection head before the first helper reservation or POST for that
-action. If a plan is still absent after restore, the wallet may plan that
-action's complete share set and pass through the same durability gate. It never
-plans only the shares whose journals are absent.
+reads back the new record revision and map nodes, then compare-and-swap advances
+and reads back the collection head before the first helper reservation or POST
+for that action. If a plan is still absent after restore, the wallet may plan
+that action's complete share set and pass through the same durability gate. It
+never plans only the shares whose journals are absent.
 
 Plan merge permits absent to become one complete value and otherwise requires
 the stored value byte for byte. Present to absent, a partial or positionally
@@ -1132,8 +1132,9 @@ validated revision chain, equal values agree, a descendant zero may replace an
 ancestor nonzero value, and zero-to-nonzero or unequal-nonzero changes fail
 closed. Restore and helper payload construction use the journaled effective
 value, not a value reconstructed from the original plan. Before another helper
-POST depends on an overdue zero, the revision carrying that zero and the updated
-collection head are committed and read back. Later revisions preserve zero.
+POST depends on an overdue zero, the revision carrying that zero, its new map
+nodes, and the updated collection head are committed and read back. Later
+revisions preserve zero.
 
 This changes the current outcome-dependent reset. Before the first overdue POST
 uses zero, the tracker prepares that durable transition. For a fresh helper it
@@ -1145,38 +1146,100 @@ If the local update then fails, no POST starts and restore conservatively import
 the already committed zero and any attempting-helper marker. Neither store may
 roll the schedule back to a delayed value.
 
-The backup is a collection of immutable revisions addressed by `record_id` and
-revision digest, not one shared slot. Each record's revisions have a monotonic
-number and prior-revision digest. A collection head selects one latest live or
-tombstone revision for every record.
+The backup stores immutable record revisions and immutable nodes of a canonical
+`PendingTallyAuthenticatedMapV1`, keyed by the 32-byte `record_id`. Record
+revisions have a monotonic `u64` number and prior-revision digest. A map leaf
+selects one latest live or tombstone revision. Its revision digest is SHA-256 of
+the canonical plaintext revision, not its encryption wrapper. A tombstone
+revision contains no ballot secret, is terminal, and cannot become live again.
 
-Every collection change also advances a `PendingTallyCollectionHeadV1`. The
-head contains the account fingerprint, network, vote chain, monotonic
-`generation`, canonical record-ID-sorted map, and a SHA-256 digest binding all
-of those fields. Each map entry contains the record ID, revision number,
-live-or-tombstone state, and revision digest. A revision digest is SHA-256 of
-the canonical plaintext revision, not its encryption wrapper. `zcash_voting`
-owns both encodings and digest calculations. Generation zero is the canonical
-empty map. Every committed collection change increments the generation by one;
-wraparound or a duplicate record ID fails closed.
+The authenticated map is a compressed 256-bit binary Patricia tree. Paths
+consume record-ID bits most-significant-bit first. A subtree with more than one
+key branches at the first bit where its keys differ; branch indexes strictly
+increase toward the leaves, both children are nonempty, and unary branches are
+collapsed. These rules produce one tree independent of insertion order, with
+one leaf per entry and at most one fewer branch than leaves. Every immutable
+node is stored and addressed by its 32-byte plaintext node hash.
+
+`zcash_voting` owns the canonical node encoding and these SHA-256 calculations:
+
+```text
+empty_root = SHA-256(
+    "zcash-shielded-vote:pending-tally-map-empty:v1"
+)
+
+leaf_hash = SHA-256(
+    "zcash-shielded-vote:pending-tally-map-leaf:v1"
+    || record_id_32
+    || revision_u64_le
+    || state_u8
+    || revision_digest_32
+)
+
+branch_hash = SHA-256(
+    "zcash-shielded-vote:pending-tally-map-branch:v1"
+    || bit_index_u16_le
+    || left_hash_32
+    || right_hash_32
+)
+```
+
+`state_u8` is `0x00` for live and `0x01` for tombstone; other values fail
+closed. `bit_index_u16_le` is in `0..=255`. Duplicate leaves or any
+noncanonical shape fail closed.
+
+`PendingTallyCollectionHeadV1` has constant size with respect to the record
+count. It contains the account fingerprint, network, vote chain, monotonic
+`generation`, live-plus-tombstone `entry_count_u64`, and authenticated-map root.
+Its prefix-free canonical fields and final digest are:
+
+```text
+canonical_head_fields_without_digest =
+    0x01
+    || account_fingerprint_32
+    || network_tag_u8
+    || vote_chain_id_length_u16_le
+    || vote_chain_id_utf8
+    || generation_u64_le
+    || entry_count_u64_le
+    || authenticated_map_root_32
+
+head_digest = SHA-256(
+    "zcash-shielded-vote:pending-tally-head:v1"
+    || canonical_head_fields_without_digest
+)
+```
+
+Generation zero has count zero and `empty_root`. Every committed change
+increments the generation; wraparound, a leaf-count mismatch, or an invalid
+head digest fails closed.
 
 The integration keeps the head in authenticated, encrypted,
-rollback-resistant storage outside both `VotingDb` and the encrypted record
-collection. Another object or version in the same rollbackable backup is not
-independent. A collection change writes and reads back its new immutable
-revisions first, then compare-and-swap advances and reads back the complete
-head. Concurrent changes serialize through that head; revisions left by a
-losing writer are uncommitted and removed. No vote broadcast or helper POST may
-depend on the new state until both steps succeed. Once the head advances,
-superseded revisions are no longer needed for restore and may be deleted.
+rollback-resistant storage outside both `VotingDb` and the encrypted record and
+node collection. Another object or version in the same rollbackable backup is
+not independent. A collection change writes and reads back each new record
+revision and immutable map node needed for the next root. It then
+compare-and-swap replaces the exact prior head and reads back the new head.
+Concurrent changes serialize through that constant-size head. Objects left by a
+losing writer are uncommitted and may be removed. No vote broadcast or helper
+POST may depend on the change until both steps succeed. Once the head advances,
+superseded revisions and nodes no longer reachable from its root may be deleted.
 
-Restore validates the independent head and loads the exact latest revision it
-names for each record. A missing revision or mismatch in record ID, revision
-number, live-or-tombstone state, revision digest, map digest, or head context
-fails closed before any restored record can cause a network effect. Extra
-unreferenced revisions are ignored and removed. An older collection snapshot
-cannot satisfy a newer head because it lacks at least one named revision.
-Adding one key while tombstoning another is one head change.
+Restore starts from the independent head and traverses every nonempty node
+reachable from its root. It verifies every node hash and Patricia-tree rule,
+requires the distinct leaf count to equal `entry_count_u64`, and loads the exact
+revision named by each leaf. A missing object or mismatch in path, record ID,
+revision number, state, revision digest, root, head digest, or head context fails
+closed before any restored record can cause a network effect. Unreachable
+objects are ignored and may be removed. An older collection snapshot cannot
+satisfy a newer head because it cannot reproduce the committed root.
+
+Replacing unsubmitted ballot intent writes the replacement live leaf and the
+old record's terminal tombstone under one new root and one head
+compare-and-swap. Completion likewise replaces a live leaf with its terminal
+tombstone before the old secret revisions are removed. Tombstone leaves remain
+in the map to prevent resurrection, while a one-record journal update rewrites
+only its leaf and at most 256 branch nodes rather than the complete collection.
 
 Before a POST to a fresh helper, its `attempting_urls` reservation is made
 durable. A duplicate-safe re-POST to an already journaled helper preserves its
@@ -1196,14 +1259,12 @@ identity, schedule, batch, or tree-position data fails closed. Its ordering and
 retry rules are the ones defined by the helper submission invariants.
 
 All actions in an atomic batch are committed to one record together; a partial
-batch record is invalid. Helper tracking remains per action and share. Replacing
-unsubmitted ballot intent atomically creates the replacement and tombstones the
-old ID in one head change. Once all expected shares are confirmed on the vote
-chain, the secret record body is deleted and its head-committed tombstone
-prevents an older backup from restoring it. The wallet does not retain complete
-vote history: VAN
-transition recovery can still show that a proposal was already consumed, but
-neither it nor the tombstone recovers the earlier ballot choice.
+batch record is invalid. Helper tracking remains per action and share. Once all
+expected shares are confirmed on the vote chain, the terminal tombstone permits
+deletion of the secret record revisions. The wallet does not retain complete
+vote history: VAN transition recovery can still show that a proposal was
+already consumed, but neither it nor the tombstone recovers the earlier ballot
+choice.
 
 ## Legacy migration
 
@@ -1289,8 +1350,9 @@ capability format, or additional custody exchange changes in version 1.
 - the durable helper tracker defined by the helper submission invariants,
   including accepted, ambiguous, and attempting sets, target counts, and
   pre-dispatch reservations and monotonic overdue schedule resets;
-- the pending-tally record and collection-head encodings, digests, and
-  original-plan and helper-journal restore rules;
+- the pending-tally record, original-plan and helper-journal merge rules,
+  authenticated-map nodes, collection-head encodings, hash domains, terminal
+  tombstones, and canonical restore rules;
 - the typed vote-chain recovery checkpoint and target-bound tree and transition
   validation;
 - the recoverable bundle policy and round-auth version 3 digest validation;
@@ -1302,17 +1364,20 @@ capability format, or additional custody exchange changes in version 1.
 - obtain a new vote-chain recovery checkpoint from an independently
   authenticated current view of finalized chain state for each recovery
   attempt;
-- durably store and read back each encrypted pending-tally revision before vote
-  or helper network effects, including an overdue revision that changes the
-  effective `submit_at` to zero;
+- durably store and read back each encrypted pending-tally revision and every
+  authenticated-map node needed for its next root before vote or helper network
+  effects, including an overdue revision that changes the effective `submit_at`
+  to zero;
 - retain and reuse each complete original helper plan, and never replan only
   shares whose journals are absent;
-- compare-and-swap and read back the collection head in rollback-resistant
-  authenticated storage independent of both `VotingDb` and the encrypted
-  record collection;
-- load every latest revision named by the head, pass it through the canonical
-  `zcash_voting` importer, and require the resulting collection to match before
-  network effects; and
+- compare-and-swap and read back the constant-size collection head in
+  rollback-resistant authenticated storage independent of `VotingDb` and the
+  encrypted record and node collection;
+- traverse every node and leaf reachable from the head root, load each exact
+  named revision through the canonical `zcash_voting` importer, and require the
+  resulting collection to match before network effects;
+- remove unreferenced revisions and nodes only after the new head is committed
+  and read back; and
 - tombstone a record and remove its secret body only after all expected helper
   shares are confirmed.
 
