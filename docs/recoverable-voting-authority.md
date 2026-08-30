@@ -106,7 +106,9 @@ the wallet's normal encrypted backup. In that case the Keystone device is not
 needed. For direct delegation, the authority backup by itself can re-derive the
 hotkey but cannot reconstruct bundle IDs or weights without the original
 account's snapshot notes. A custody voter uses the capability package instead
-of the funds controller's snapshot notes.
+of the funds controller's snapshot notes. For a `stored-random-v1` custody
+authority, the authenticated root backup plus the exact capability is
+sufficient; the voter does not also need its original account viewing key.
 
 ## Motivating failure
 
@@ -229,7 +231,8 @@ authority_context_v1 =
 `network_tag_u8` is the protocol byte `0` for mainnet, `1` for testnet, and `2` for
 regtest. Implementations map by network name, not an internal enum discriminant.
 `account_fingerprint_32` must match the account selected by
-`account_index_u32_le`; a provider rejects a mismatch before returning a root.
+`account_index_u32_le` when the authority is created. Restore follows the
+source-specific account-binding rules below.
 `vote_chain_id` must first pass the crate's canonical chain-ID validation.
 `vote_round_id_32` is the canonical little-endian 32-byte Pallas base-field
 encoding used by the round. The ZIP-32 account index must be below `2^31`.
@@ -304,11 +307,22 @@ VAN-blinding derivation. A public-target import selects
 source of bundle weights and blindings. Integrations must not invent another
 untagged source.
 
-Before returning a root, the provider validates that the context's account
+When an authority is created, the provider validates that the context's account
 fingerprint matches the Orchard full viewing key for the selected network and
-account index. This prevents a backup or randomly generated root belonging to
-another seed's account at the same index from being accepted as the current
-authority.
+account index. A `registered-seed-v1` restore repeats this check while deriving
+the root from the seed. A `stored-random-v1` restore also repeats it when the
+viewing key is available.
+
+The one exception is a `stored-random-v1` authority using
+`imported-capability-v1` when the voter's viewing key is unavailable. In that
+case `zcash_voting` keeps the restored root as a sealed candidate until its
+derived hotkey matches the exact capability target and the capability's
+network, chain, and round match the authenticated context. It makes the
+authority usable only after those checks pass. This exception does not apply to
+`derived-v1`, which still needs the original account's viewing state to rebuild
+its bundles. These rules prevent a backup belonging to another account from
+being silently accepted as the current authority without making the voter
+account an unnecessary recovery dependency for funds in custody.
 
 The provider and bundle sources are selected before direct delegation or
 publication of a public target. `registered-seed-v1` persists this canonical
@@ -441,9 +455,9 @@ when the decoded plaintext remains byte-for-byte identical.
 The read-back gate requires the decoded selection to equal that final
 plaintext. This single-assignment rule means any authenticated backup for the
 context restores the same authority, without relying on the deleted voting
-database to identify a newer copy. Restore still checks the account fingerprint
-below. If the final root is lost before the gate succeeds, version 1 cannot use
-or replace that authority.
+database to identify a newer copy. Restore validates the account binding under
+the rules below. If the final root is lost before the gate succeeds, version 1
+cannot use or replace that authority.
 
 This public fixture freezes the encoding. It uses regtest, account index zero,
 fingerprint bytes `00` through `1f`, vote chain `vote-chain-1`, little-endian
@@ -457,11 +471,11 @@ round field element 1, root bytes `00` through `3f`, round payload digest bytes
 The SHA-256 digest of those 400 plaintext bytes is
 `1ccf235dc9f606ee7cfad65ff1809e4fb2d9a78c2571ce6f7103e742a0ec43cb`.
 
-Because the complete context includes `account_fingerprint_32`, restore must
-compare the record with the currently selected Orchard full viewing key before
-making the root available. Matching network, account index, chain, and round is
-not sufficient by itself. Restore also hashes the currently authenticated
-version 3 payload and requires the stored digest to match.
+Restore hashes the currently authenticated version 3 payload and requires the
+stored digest to match. It validates `account_fingerprint_32` against the
+currently selected Orchard full viewing key except for the sealed
+`stored-random-v1` custody recovery described above. Matching network, account
+index, chain, and round alone is not sufficient.
 
 Acceptable storage can include an integration's existing end-to-end encrypted
 wallet backup or an explicit encrypted export. A second row in the same voting
@@ -943,14 +957,18 @@ only by the recovery endpoint cannot prove current absence.
 
 1. Build the typed source candidates above, reconcile them with durable external
    use, and validate the selected root source, bundle source, authority context,
-   account fingerprint, scheme, and bundle policy.
-2. Re-derive the hotkey from the authority root.
+   scheme, and bundle policy. Validate the account fingerprint against the
+   account viewing key, or keep the specific `stored-random-v1` plus
+   `imported-capability-v1` candidate sealed for the capability-bound check in
+   step 3.
+2. Re-derive the hotkey internally from the authority root.
 3. Restore the bundle material. For `derived-v1`, rescan the account at the
    round snapshot, rebuild the canonical bundle plan including notes spent
    since the snapshot, and re-derive each bundle ID, blinding, and weight. For
    `imported-capability-v1`, restore the exact capability package, validate its
    target and round against the recovered hotkey, and import its bundle indices,
-   weights, blindings, and transaction hashes.
+   weights, blindings, and transaction hashes. A sealed root becomes usable only
+   after this validation succeeds.
 4. Reconstruct each initial VAN from the recovered hotkey and bundle material.
 5. Validate the recovery checkpoint, then sync and root-validate the
    vote-commitment tree and complete confirmed cast-vote transition index
@@ -1013,9 +1031,15 @@ still cannot recreate a missing custody capability.
 ### Pending tally recovery
 
 Finding the current VAN does not recover a confirmed vote whose helper shares
-are still incomplete. Version 1 therefore adds a library-owned
-`PendingTallyRecoveryV1` record for the interval between committing a vote and
-confirming all of its expected helper shares. It contains:
+are still incomplete. The durable tracker defined by the
+[helper submission invariants](helper_submission_invariants.md) is therefore a
+version 1 prerequisite. Pending-tally recovery is enabled only after that
+tracker is live; the recovery record does not introduce a second delivery
+state machine.
+
+Version 1 adds a library-owned `PendingTallyRecoveryV1` record for the interval
+between committing a vote and confirming all of its expected helper shares. It
+contains:
 
 - the exact serialized `VoteRecoveryBundle` for each action, including its
   secret share material and, for an atomic batch, the common digest and complete
@@ -1073,10 +1097,10 @@ Definite acceptance may move the helper to `sent_to_urls`, while any other
 re-POST outcome leaves its prior state unchanged. Fresh helper results and
 confirmation are recorded before another helper is contacted. Restore keeps
 accepted, ambiguous, and attempting evidence, never reduces the target count
-or changes the original schedule, and resumes the existing helper tracker
+or changes the original schedule, and resumes the prerequisite helper tracker
 against the current validated helper configuration. Conflicting identity,
-schedule, batch, or tree-position data fails closed. These are the same
-ordering and retry rules used by the live tracker, not a second delivery policy.
+schedule, batch, or tree-position data fails closed. Its ordering and retry
+rules are the ones defined by the helper submission invariants.
 
 All actions in an atomic batch are committed to one record together; a partial
 batch record is invalid. Helper tracking remains per action and share. Replacing
@@ -1144,6 +1168,12 @@ The root and capability have separate recovery jobs:
 - the root recreates the voting hotkey; and
 - the exact capability recreates the custody bundle material.
 
+For a `stored-random-v1` authority, an authenticated root backup and the exact
+capability are sufficient even when the voter's Orchard viewing key is no
+longer available. `zcash_voting` keeps the restored root sealed until the
+derived hotkey and capability context match as described above. This exception
+does not allow the root to reconstruct or authorize a `derived-v1` bundle plan.
+
 The voter must retain the imported package durably, while the funds controller
 keeps the existing redeliverable outbox copy. Either copy can restore the
 bundle material. If both copies are lost, the root still recovers the hotkey but
@@ -1162,6 +1192,9 @@ capability format, or additional custody exchange changes in version 1.
 - canonical validation and recovery of imported custody capabilities;
 - fail-closed reconciliation of typed source candidates with external authority
   use;
+- the durable helper tracker defined by the helper submission invariants,
+  including accepted, ambiguous, and attempting sets, target counts, and
+  pre-dispatch reservations;
 - the pending-tally record and helper-journal restore rules;
 - the typed vote-chain recovery checkpoint and target-bound tree and transition
   validation;
