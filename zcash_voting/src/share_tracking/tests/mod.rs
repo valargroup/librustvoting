@@ -380,7 +380,14 @@ fn db_with_recoverable_vote() -> VotingDb {
     db
 }
 
-fn seed_recoverable_vote(db: &VotingDb) {
+fn db_with_round_and_bundle() -> VotingDb {
+    let db = VotingDb::open_in_memory().unwrap();
+    db.set_wallet_id(WALLET_ID);
+    seed_round_and_bundle(&db);
+    db
+}
+
+fn seed_round_and_bundle(db: &VotingDb) {
     db.create_round(
         crate::Network::Testnet,
         &RoundParams {
@@ -394,6 +401,10 @@ fn seed_recoverable_vote(db: &VotingDb) {
     )
     .unwrap();
     db.ensure_bundles(ROUND_ID, &[note(0)]).unwrap();
+}
+
+fn seed_recoverable_vote(db: &VotingDb) {
+    seed_round_and_bundle(db);
     queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 1, 2, &[0xCA; 32]).unwrap();
     let json = serialize_recovery(&recovery_bundle_fixture()).unwrap();
     db.conn()

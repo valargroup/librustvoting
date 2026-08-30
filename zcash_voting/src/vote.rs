@@ -354,8 +354,9 @@ impl CommittedVote {
     ///
     /// Returns [`VotingError::InvalidInput`] before storage or network side
     /// effects when the fleet is empty, invalid, or duplicated; the plan does
-    /// not match that fleet; or the share index is absent. Storage and payload
-    /// reconstruction failures are returned unchanged.
+    /// not match that fleet; the share index is absent; or this handle has been
+    /// replaced by a newer committed vote. Storage and payload reconstruction
+    /// failures are returned unchanged.
     pub async fn submit_share_to_helpers(
         &self,
         db: &VotingDb,
@@ -369,6 +370,7 @@ impl CommittedVote {
             &self.round_id,
             self.bundle_index,
             self.commit.proposal_id,
+            &self.commit.vote_commitment,
             &self.commit.share_payloads,
             request,
             cancel,

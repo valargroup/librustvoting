@@ -290,6 +290,7 @@ pub(crate) async fn submit_committed_share_to_helpers(
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
+    expected_vote_commitment: &[u8; 32],
     payloads: &[SharePayload],
     request: ShareSubmissionRequest<'_>,
     cancel: &(dyn Fn() -> bool + Send + Sync),
@@ -331,7 +332,19 @@ pub(crate) async fn submit_committed_share_to_helpers(
     }
     let vc_tree_position =
         match vote_recovery::helper_recovery_material(db, round_id, bundle_index, proposal_id)? {
-            vote_recovery::HelperRecoveryMaterial::Ready(bundle) => bundle.vc_tree_position,
+            vote_recovery::HelperRecoveryMaterial::Ready(bundle) => {
+                let recovery = crate::vote::parse_recovery(&bundle.commitment_bundle_json)?;
+                if recovery.vote_commitment != *expected_vote_commitment {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "committed vote changed before helper share submission for \
+                             round={round_id}, bundle={bundle_index}, proposal={proposal_id}; \
+                             recover the current committed vote"
+                        ),
+                    });
+                }
+                bundle.vc_tree_position
+            }
             vote_recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
                 return Err(VotingError::InvalidInput {
                     message: "committed vote must be confirmed before submitting helper shares"

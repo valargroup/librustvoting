@@ -492,6 +492,66 @@ async fn committed_vote_submission_keeps_degraded_planned_target_before_healthy_
 }
 
 #[tokio::test(start_paused = true)]
+async fn stale_committed_vote_submission_is_rejected_before_side_effects() {
+    let db = db_with_round_and_bundle();
+    let original_recovery = recovery_bundle_fixture();
+    crate::vote::insert_recovery_fixture(&db, &original_recovery).unwrap();
+    let original_handle = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let stale_handle = original_handle.clone();
+
+    let mut replacement_recovery = original_recovery;
+    replacement_recovery.vote_commitment = [0x42; 32];
+    crate::vote::insert_recovery_fixture(&db, &replacement_recovery).unwrap();
+    let current_handle = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    current_handle.record_vc_position(&db, 789).unwrap();
+
+    let configured = helpers(1);
+    let plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 4_321,
+        target_count: 1,
+        target_servers: configured.clone(),
+    };
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&post_url, json_status("queued"));
+    let client = client_with(transport.clone());
+
+    let error = stale_handle
+        .submit_share_to_helpers(
+            &db,
+            &client,
+            ShareSubmissionRequest {
+                share_index: 0,
+                plan: &plan,
+                configured_server_urls: &configured,
+                now_seconds: SUBMIT_AT,
+            },
+            &never_cancel(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("committed vote changed before helper share submission"),
+        "{error}"
+    );
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+    assert!(transport.calls().is_empty());
+    let persisted = crate::vote::recovery_bundle(&db, ROUND_ID, 0, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.vote_commitment,
+        replacement_recovery.vote_commitment
+    );
+    assert_eq!(persisted.vc_tree_position, 789);
+}
+
+#[tokio::test(start_paused = true)]
 async fn repeated_committed_submission_preserves_the_original_schedule() {
     let db = db_with_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
