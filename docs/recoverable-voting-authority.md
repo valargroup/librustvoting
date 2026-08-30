@@ -19,7 +19,7 @@ also derives each bundle's VAN blinding from the root and canonical bundle
 plan. For funds in custody, it instead restores bundle blindings and weights
 from the existing capability package retained by the voter and funds
 controller. The signed round configuration selects this common version 1
-framework and authenticates the snapshot height used to reconstruct its bundle
+framework and authenticates the snapshot block used to reconstruct its bundle
 plan. After data loss, the restored root and bundle material let the
 wallet find its latest VANs in the validated vote tree and continue after
 partial delegation or singleton and atomic votes. While helper-share delivery
@@ -681,6 +681,7 @@ entry:
 ```text
 auth_version = 3
 snapshot_height = <unsigned 64-bit Zcash block height>
+snapshot_block_hash = <32-byte Zcash consensus block hash>
 voting_authority_scheme = "recoverable-authority-v1"
 bundle_policy = "recoverable-v1"
 ```
@@ -697,6 +698,7 @@ round_auth_payload_v3 =
     || tier1_layers_u32_le
     || poly_len_u32_le
     || snapshot_height_u64_le
+    || snapshot_block_hash_32
     || voting_authority_scheme_length_u16_le
     || voting_authority_scheme_ascii
     || bundle_policy_length_u16_le
@@ -704,17 +706,23 @@ round_auth_payload_v3 =
 ```
 
 The version 2 round and PIR fields retain their encodings and relative order.
-The snapshot height binds the note set from which the canonical bundle plan is
-reconstructed. The two length-prefixed ASCII identifiers bind the authority
-framework and note-selection policy. `vote-sdk` owns production of the exact
-version 3 payload and signatures; `zcash_voting` owns byte-for-byte verification
-and selection of the corresponding behavior.
+The height selects the snapshot point, while the block hash identifies its
+exact Zcash fork. Config JSON uses the canonical lowercase 64-hex-character
+block ID returned by `z_gettreestate`; the signing preimage hex-decodes it
+left-to-right into 32 bytes without reversing them. The two length-prefixed
+ASCII identifiers bind the authority framework and note-selection policy.
+`vote-sdk` owns production of the exact version 3 payload and signatures;
+`zcash_voting` owns byte-for-byte verification and selection of the
+corresponding behavior.
 
 The authenticated round returned by `zcash_voting` carries the signed snapshot
-height. Construction and recovery obtain `VotingRoundParams::snapshot_height`
-from that value. If vote-server metadata also supplies a height, it must match
-the authenticated value; an implementation must not substitute the unsigned
-copy.
+height and block hash. Construction and recovery require the same pair from the
+wallet's scanned chain, the lightwalletd `TreeState`, and PIR snapshot metadata.
+If vote-server metadata also supplies either value, it must match the
+authenticated value; an implementation must not substitute the unsigned copy.
+After a reorg, a different block at the signed height stops new construction.
+Recovery of an existing delegation may use verified archival data for the
+signed block, but it must not rebuild bundles from the replacement fork.
 
 The round configuration selects the common authority framework and bundle
 policy. It does not select either local recovery source. A software wallet can
@@ -1158,7 +1166,13 @@ statements.
 
 No consensus rule or vote-action message change is required for authority
 construction. `vote-sdk` must add the round-auth version 3 config fields,
-including the snapshot height, canonical signing preimage, signer and config-PR
-support, and verification fixtures shared with `zcash_voting`. An explicit
-on-chain scheme field may be considered later, but is not needed when
+including the snapshot height and block hash, canonical signing preimage, signer
+and config-PR support, and verification fixtures shared with `zcash_voting`. An
+explicit on-chain scheme field may be considered later, but is not needed when
 round-auth version 3 is enforced.
+
+### `vote-nullifier-pir`
+
+Snapshot publishers expose the canonical Zcash block hash with the height and
+build the dataset from that exact block. Clients reject an endpoint whose
+reported hash does not match the authenticated round.
