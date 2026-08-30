@@ -1614,23 +1614,31 @@ impl VotingDb {
         proposal_id: u32,
         tx_hash: &str,
     ) -> Result<(), VotingError> {
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin vote submission transaction failed: {e}"),
+            })?;
         crate::vote::ensure_singleton_vote_update_with_conn(
-            &conn,
+            &tx,
             &wallet_id,
             round_id,
             bundle_index,
             proposal_id,
         )?;
         queries::record_vote_submission(
-            &conn,
+            &tx,
             round_id,
             &wallet_id,
             bundle_index,
             proposal_id,
             tx_hash,
-        )
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit vote submission transaction failed: {e}"),
+        })
     }
 
     /// Atomically records a delegation transaction hash with idempotency checks.
@@ -2275,6 +2283,7 @@ fn check_text_conflict(
 mod tests {
     use super::*;
     use crate::types::{RoundBoundVotingHotkeyTarget, VotingHotkey};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // 64 hex chars = 32 bytes when decoded. Required because build_governance_pczt
     // hex-decodes vote_round_id and validates it as exactly 32 bytes (a Pallas field element).
@@ -2283,6 +2292,13 @@ mod tests {
     const TESTNET_NU6_SNAPSHOT_HEIGHT: u64 = 3_536_500;
     const TESTNET_NU6_BRANCH_ID: u32 = 0x4DEC_4DF0;
     const REGTEST_NU6_3_SNAPSHOT_HEIGHT: u64 = crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT as u64;
+    static SQLITE_BUSY_OBSERVED: AtomicBool = AtomicBool::new(false);
+
+    fn signal_sqlite_busy(_attempt: i32) -> bool {
+        SQLITE_BUSY_OBSERVED.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        true
+    }
 
     fn test_db() -> VotingDb {
         let db = VotingDb::open(":memory:").unwrap();
@@ -5195,7 +5211,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_vote_submitted_waits_instead_of_writing_through_a_stale_snapshot() {
+    fn public_vote_submission_waits_instead_of_writing_through_a_stale_snapshot() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5249,9 +5265,12 @@ mod tests {
         }
 
         // The production operation reserves the writer before its first read.
-        // If another writer already owns it, busy_timeout makes this call wait
-        // until that writer commits, after which the read and update both succeed.
+        // If another writer already owns it, SQLite's busy handling makes this
+        // call wait until that writer commits, after which the read and update
+        // both succeed.
         {
+            SQLITE_BUSY_OBSERVED.store(false, Ordering::SeqCst);
+            db_a.conn().busy_handler(Some(signal_sqlite_busy)).unwrap();
             let mut writer_conn = db_b.conn();
             let writer_tx = writer_conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -5263,28 +5282,34 @@ mod tests {
                 )
                 .unwrap();
 
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
             let (result_tx, result_rx) = std::sync::mpsc::channel();
             std::thread::scope(|scope| {
                 scope.spawn(|| {
-                    started_tx.send(()).unwrap();
-                    let started = std::time::Instant::now();
-                    let result = db_a.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx");
-                    result_tx.send((started.elapsed(), result)).unwrap();
+                    let result = crate::vote::record_submission(&db_a, ROUND_ID, 0, 1, "vote-tx");
+                    result_tx.send(result).unwrap();
                 });
 
-                started_rx.recv().unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                let contention_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !SQLITE_BUSY_OBSERVED.load(Ordering::SeqCst) {
+                    if let Ok(result) = result_rx.try_recv() {
+                        panic!("vote submission completed before SQLite contention: {result:?}");
+                    }
+                    assert!(
+                        std::time::Instant::now() < contention_deadline,
+                        "vote submission never reached SQLite contention"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 assert!(matches!(
                     result_rx.try_recv(),
                     Err(std::sync::mpsc::TryRecvError::Empty)
                 ));
 
                 writer_tx.commit().unwrap();
-                let (elapsed, result) = result_rx
+                let result = result_rx
                     .recv_timeout(std::time::Duration::from_secs(2))
                     .unwrap();
-                assert!(elapsed >= std::time::Duration::from_millis(150));
                 result.unwrap();
             });
         }

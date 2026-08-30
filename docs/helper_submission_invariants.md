@@ -1118,6 +1118,8 @@ Regression coverage: `test_share_delegation_lifecycle` in
 `interrupted_retry_does_not_resolve_a_replaced_share_generation` in
 `share_tracking/tests`,
 `mark_vote_submitted_waits_instead_of_writing_through_a_stale_snapshot` in
+`storage/operations.rs`,
+`public_vote_submission_waits_instead_of_writing_through_a_stale_snapshot` in
 `storage/operations.rs`, and `changed_choice_ignores_stale_share_confirmations`
 and `skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
 
