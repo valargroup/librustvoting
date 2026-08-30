@@ -11,6 +11,8 @@ use crate::types::{Network, NoteInfo, VotingError, VotingRoundParams, WitnessDat
 
 mod share_delegations;
 
+#[cfg(test)]
+pub(crate) use share_delegations::record_share_delegation_with_after_read;
 pub use share_delegations::{
     add_ambiguous_servers, add_attempting_server, add_sent_servers_preserving_schedule,
     clear_stale_share_delegations_for_intent, get_share_delegations, get_unconfirmed_delegations,

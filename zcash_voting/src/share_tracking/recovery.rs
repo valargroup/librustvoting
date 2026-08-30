@@ -209,6 +209,8 @@ pub(super) async fn resubmit_to_next_helper(
         let retries_outcome_unknown_helper = outcome_unknown_helpers.contains(server_url.as_str());
         let retries_definitely_accepted_helper =
             definitely_accepted_helpers.contains(server_url.as_str());
+        let journals_fresh_attempt =
+            !retries_outcome_unknown_helper && !retries_definitely_accepted_helper;
         let attempt = share::ShareDeliveryAttemptParams {
             round_id: params.round_id,
             bundle_index: share.bundle_index,
@@ -222,10 +224,10 @@ pub(super) async fn resubmit_to_next_helper(
         // journaled, so the journal-before-dispatch invariant holds without a
         // new attempting marker (which the guard would refuse). Re-read
         // confirmation immediately before either last-resort re-POST.
-        let may_dispatch = if retries_outcome_unknown_helper || retries_definitely_accepted_helper {
-            !share::is_confirmed(db, &attempt)?
-        } else {
+        let may_dispatch = if journals_fresh_attempt {
             share::begin_existing_delivery_attempt(db, &attempt)?
+        } else {
+            !share::is_confirmed(db, &attempt)?
         };
         if !may_dispatch {
             continue;
@@ -252,6 +254,14 @@ pub(super) async fn resubmit_to_next_helper(
                 });
             }
             Err(HelperError::Cancelled) => {
+                if journals_fresh_attempt {
+                    share::resolve_delivery_attempt(
+                        db,
+                        &attempt,
+                        share::ShareDeliveryAttemptOutcome::DefiniteFailure,
+                        request.schedule.reset_submit_at(),
+                    )?;
+                }
                 return Ok(ResubmitReport {
                     outcome: ResubmitOutcome::Cancelled,
                     outcome_unknown_urls: newly_outcome_unknown_urls,

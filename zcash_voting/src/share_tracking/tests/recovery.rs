@@ -1391,6 +1391,140 @@ async fn unconfigured_helpers_are_not_polled() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn fresh_recovery_cancelled_before_dispatch_clears_marker_and_remains_retryable() {
+    let configured = helpers(2);
+    let db = db_with_delivery(&[helper(1)], &[], 2);
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+    let cancel_after_journal = || only_share(&db).attempting_urls.contains(&helper(2));
+
+    let cancelled = track_pending_shares(
+        &db,
+        &params(&configured, SUBMIT_AT, &random),
+        &client,
+        &cancel_after_journal,
+    )
+    .await
+    .unwrap();
+
+    assert!(cancelled.cancelled);
+    assert!(transport.calls().is_empty());
+    let stored = only_share(&db);
+    assert_eq!(stored.sent_to_urls, vec![helper(1)]);
+    assert!(stored.ambiguous_urls.is_empty());
+    assert!(stored.attempting_urls.is_empty());
+    assert_eq!(stored.submit_at, SUBMIT_AT);
+
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(2)),
+        json_status("queued"),
+    );
+    let retried = track_pending_shares(
+        &db,
+        &params(&configured, SUBMIT_AT, &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert!(!retried.cancelled);
+    assert_eq!(retried.resubmitted[0].server_url, helper(2));
+    assert_eq!(transport.call_count("/shares"), 1);
+    let stored = only_share(&db);
+    assert_eq!(stored.sent_to_urls, vec![helper(1), helper(2)]);
+    assert!(stored.attempting_urls.is_empty());
+    assert_eq!(stored.submit_at, SUBMIT_AT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_outcome_unknown_retry_preserves_ambiguous_state() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let configured = helpers(1);
+    let db = db_with_delivery(&[], &[helper(1)], 1);
+    let stored = only_share(&db);
+    let outcome_unknown_urls = vec![helper(1)];
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+    let tracking_params = params(&configured, overdue(), &random);
+    let cancel_checks = AtomicUsize::new(0);
+    let cancel_before_dispatch = || cancel_checks.fetch_add(1, Ordering::Relaxed) > 0;
+    let mut attempted_urls = Vec::new();
+
+    let report = resubmit_to_next_helper(
+        &db,
+        &tracking_params,
+        &client,
+        &ResubmitRequest {
+            share: &stored,
+            configured_urls: &configured,
+            definite_acceptance_urls: &[],
+            outcome_unknown_urls: &outcome_unknown_urls,
+            schedule: ResubmissionSchedule::Immediate,
+        },
+        &mut attempted_urls,
+        &cancel_before_dispatch,
+        &|| 0,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(report.outcome, ResubmitOutcome::Cancelled));
+    assert!(transport.calls().is_empty());
+    let stored = only_share(&db);
+    assert!(stored.sent_to_urls.is_empty());
+    assert_eq!(stored.ambiguous_urls, vec![helper(1)]);
+    assert!(stored.attempting_urls.is_empty());
+    assert_eq!(stored.submit_at, SUBMIT_AT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_accepted_fallback_preserves_acceptance() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let configured = helpers(1);
+    let db = db_with_delivery(&[helper(1)], &[], 1);
+    let stored = only_share(&db);
+    let definite_acceptance_urls = vec![helper(1)];
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+    let tracking_params = params(&configured, overdue(), &random);
+    let cancel_checks = AtomicUsize::new(0);
+    let cancel_before_dispatch = || cancel_checks.fetch_add(1, Ordering::Relaxed) > 0;
+    let mut attempted_urls = Vec::new();
+
+    let report = resubmit_to_next_helper(
+        &db,
+        &tracking_params,
+        &client,
+        &ResubmitRequest {
+            share: &stored,
+            configured_urls: &configured,
+            definite_acceptance_urls: &definite_acceptance_urls,
+            outcome_unknown_urls: &[],
+            schedule: ResubmissionSchedule::Immediate,
+        },
+        &mut attempted_urls,
+        &cancel_before_dispatch,
+        &|| 0,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(report.outcome, ResubmitOutcome::Cancelled));
+    assert!(transport.calls().is_empty());
+    let stored = only_share(&db);
+    assert_eq!(stored.sent_to_urls, vec![helper(1)]);
+    assert!(stored.ambiguous_urls.is_empty());
+    assert!(stored.attempting_urls.is_empty());
+    assert_eq!(stored.submit_at, SUBMIT_AT);
+}
+
+#[tokio::test(start_paused = true)]
 async fn cancelled_pass_reports_cancellation_and_keeps_durable_effects() {
     let configured = helpers(2);
     let db = db_with_share(&configured);

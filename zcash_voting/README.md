@@ -49,10 +49,16 @@ precompute → delegate → vote → share lifecycle:
    canonical `batch_json` once, persist the shared hash with
    `vote::record_batch_submission`, and confirm with
    `confirm_vote_batch_submission`. After confirmation, call
-   `vote::recover_commit` again, plan the recovered `CommittedVote`'s helper
-   shares, and call `CommittedVote::submit_share_to_helpers`. The crate
-   reconstructs each wire payload with the durable confirmed VC position and
-   journals every delivery attempt before dispatch. `track_pending_shares`
+   `vote::CommittedVote::recover` for each vote, create its full plan set with
+   `share::policy::plan_share_submissions`, and persist those `SharePlan`s
+   before submitting any share. Pass each share's stored plan to
+   `CommittedVote::submit_share_to_helpers`. The crate does not yet persist
+   planner output: after restart, reuse the original full plan set for that
+   vote rather than replanning only missing shares. Replanning a subset loses
+   commitment-wide balancing and quota context and can exceed the initial
+   per-helper quota. The crate reconstructs each wire payload with the durable
+   confirmed VC position and journals every delivery attempt before dispatch.
+   `track_pending_shares`
    polls the complete current fleet and requires two distinct confirmations
    when at least two helpers are configured; a one-helper fleet uses its only
    available confirmation. The result is persisted internally.

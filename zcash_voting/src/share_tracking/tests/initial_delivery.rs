@@ -1121,6 +1121,317 @@ fn concurrent_attempt_reservations_preserve_both_markers() {
 }
 
 #[test]
+fn concurrent_acceptances_preserve_both_results() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "zcash-voting-concurrent-acceptances-{}-{unique}.sqlite",
+        std::process::id()
+    ));
+    let path_string = path.to_string_lossy().into_owned();
+    let first_db = VotingDb::open(&path_string).unwrap();
+    first_db.set_wallet_id(WALLET_ID);
+    seed_recoverable_vote(&first_db);
+    let initial = ShareSubmissionReport {
+        target_count: 2,
+        ..ShareSubmissionReport::default()
+    };
+    share::record_delivery(
+        &first_db,
+        &share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            submission: &initial,
+            submit_at: SUBMIT_AT,
+        },
+    )
+    .unwrap();
+    first_db
+        .conn()
+        .execute(
+            "UPDATE share_delegations SET attempting_urls = :attempting_urls
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+            rusqlite::named_params! {
+                ":attempting_urls": serde_json::to_string(&[helper(1), helper(2)]).unwrap(),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+
+    let second_db = VotingDb::open(&path_string).unwrap();
+    second_db.set_wallet_id(WALLET_ID);
+    let writer = second_db.conn();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer
+        .execute(
+            "UPDATE share_delegations
+             SET sent_to_urls = :sent_to_urls, attempting_urls = :attempting_urls
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+            rusqlite::named_params! {
+                ":sent_to_urls": serde_json::to_string(&[helper(2)]).unwrap(),
+                ":attempting_urls": serde_json::to_string(&[helper(1)]).unwrap(),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let resolution = std::thread::spawn(move || {
+        let first_helper = helper(1);
+        let attempt = share::ShareDeliveryAttemptParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            server_url: &first_helper,
+            target_count: 2,
+            submit_at: SUBMIT_AT,
+        };
+        started_tx.send(()).unwrap();
+        share::resolve_delivery_attempt(
+            &first_db,
+            &attempt,
+            share::ShareDeliveryAttemptOutcome::Accepted,
+            false,
+        )
+        .unwrap();
+        first_db
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    writer.execute_batch("COMMIT").unwrap();
+    drop(writer);
+
+    let first_db = resolution.join().unwrap();
+    let stored = only_share(&second_db);
+    assert_eq!(stored.sent_to_urls, vec![helper(2), helper(1)]);
+    assert!(stored.ambiguous_urls.is_empty());
+    assert!(stored.attempting_urls.is_empty());
+
+    drop(first_db);
+    drop(second_db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path_string}-shm"));
+    let _ = std::fs::remove_file(format!("{path_string}-wal"));
+}
+
+#[test]
+fn concurrent_delivery_record_preserves_stronger_state() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "zcash-voting-concurrent-delivery-record-{}-{unique}.sqlite",
+        std::process::id()
+    ));
+    let path_string = path.to_string_lossy().into_owned();
+    let first_db = VotingDb::open(&path_string).unwrap();
+    first_db.set_wallet_id(WALLET_ID);
+    seed_recoverable_vote(&first_db);
+    let initial = ShareSubmissionReport {
+        target_count: 2,
+        ..ShareSubmissionReport::default()
+    };
+    share::record_delivery(
+        &first_db,
+        &share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            submission: &initial,
+            submit_at: SUBMIT_AT,
+        },
+    )
+    .unwrap();
+    first_db
+        .conn()
+        .execute(
+            "UPDATE share_delegations SET attempting_urls = :attempting_urls
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+            rusqlite::named_params! {
+                ":attempting_urls": serde_json::to_string(&[helper(3)]).unwrap(),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+
+    let second_db = VotingDb::open(&path_string).unwrap();
+    second_db.set_wallet_id(WALLET_ID);
+    let mut injected_concurrent_update = false;
+    let mut after_read = || {
+        if injected_concurrent_update {
+            return;
+        }
+        injected_concurrent_update = true;
+        second_db
+            .conn()
+            .execute(
+                "UPDATE share_delegations
+                 SET sent_to_urls = :sent_to_urls,
+                     attempting_urls = :attempting_urls,
+                     target_count = 3
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+                rusqlite::named_params! {
+                    ":sent_to_urls": serde_json::to_string(&[helper(2)]).unwrap(),
+                    ":attempting_urls": serde_json::to_string(&[helper(3)]).unwrap(),
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": WALLET_ID,
+                },
+            )
+            .unwrap();
+    };
+    let nullifier = only_share(&first_db).nullifier;
+    let conn = first_db.conn();
+    let durable_submit_at = queries::record_share_delegation_with_after_read(
+        &conn,
+        ROUND_ID,
+        WALLET_ID,
+        0,
+        1,
+        0,
+        &[helper(1)],
+        &[],
+        2,
+        &nullifier,
+        SUBMIT_AT + 100,
+        &mut after_read,
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(injected_concurrent_update);
+    assert_eq!(durable_submit_at, SUBMIT_AT);
+    let stored = only_share(&second_db);
+    assert_eq!(stored.sent_to_urls, vec![helper(2), helper(1)]);
+    assert!(stored.ambiguous_urls.is_empty());
+    assert_eq!(stored.attempting_urls, vec![helper(3)]);
+    assert_eq!(stored.target_count, 3);
+    assert_eq!(stored.submit_at, SUBMIT_AT);
+
+    drop(first_db);
+    drop(second_db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path_string}-shm"));
+    let _ = std::fs::remove_file(format!("{path_string}-wal"));
+}
+
+#[test]
+fn concurrent_definite_failure_does_not_restore_an_accepted_attempt() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "zcash-voting-concurrent-failure-{}-{unique}.sqlite",
+        std::process::id()
+    ));
+    let path_string = path.to_string_lossy().into_owned();
+    let first_db = VotingDb::open(&path_string).unwrap();
+    first_db.set_wallet_id(WALLET_ID);
+    seed_recoverable_vote(&first_db);
+    let initial = ShareSubmissionReport {
+        target_count: 2,
+        ..ShareSubmissionReport::default()
+    };
+    share::record_delivery(
+        &first_db,
+        &share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            submission: &initial,
+            submit_at: SUBMIT_AT,
+        },
+    )
+    .unwrap();
+    first_db
+        .conn()
+        .execute(
+            "UPDATE share_delegations SET attempting_urls = :attempting_urls
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+            rusqlite::named_params! {
+                ":attempting_urls": serde_json::to_string(&[helper(1), helper(2)]).unwrap(),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+
+    let second_db = VotingDb::open(&path_string).unwrap();
+    second_db.set_wallet_id(WALLET_ID);
+    let writer = second_db.conn();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer
+        .execute(
+            "UPDATE share_delegations
+             SET sent_to_urls = :sent_to_urls, attempting_urls = :attempting_urls
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+            rusqlite::named_params! {
+                ":sent_to_urls": serde_json::to_string(&[helper(2)]).unwrap(),
+                ":attempting_urls": serde_json::to_string(&[helper(1)]).unwrap(),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let resolution = std::thread::spawn(move || {
+        let first_helper = helper(1);
+        let attempt = share::ShareDeliveryAttemptParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            server_url: &first_helper,
+            target_count: 2,
+            submit_at: SUBMIT_AT,
+        };
+        started_tx.send(()).unwrap();
+        share::resolve_delivery_attempt(
+            &first_db,
+            &attempt,
+            share::ShareDeliveryAttemptOutcome::DefiniteFailure,
+            false,
+        )
+        .unwrap();
+        first_db
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    writer.execute_batch("COMMIT").unwrap();
+    drop(writer);
+
+    let first_db = resolution.join().unwrap();
+    let stored = only_share(&second_db);
+    assert_eq!(stored.sent_to_urls, vec![helper(2)]);
+    assert!(stored.ambiguous_urls.is_empty());
+    assert!(stored.attempting_urls.is_empty());
+
+    drop(first_db);
+    drop(second_db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path_string}-shm"));
+    let _ = std::fs::remove_file(format!("{path_string}-wal"));
+}
+
+#[test]
 fn attempting_updates_preserve_noncanonical_legacy_history() {
     let db = db_with_delivery(&[], &[], 1);
     db.conn()

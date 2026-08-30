@@ -231,55 +231,70 @@ pub fn remove_attempting_server(
     server_url: &str,
 ) -> Result<(), VotingError> {
     ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    let attempting_json: String = conn
-        .query_row(
-            "SELECT attempting_urls FROM share_delegations
+    loop {
+        let (sent_json, ambiguous_json, attempting_json): (String, String, String) = conn
+            .query_row(
+                "SELECT sent_to_urls, ambiguous_urls, attempting_urls FROM share_delegations
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id
                AND share_index = :share_index",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": bundle_index,
-                ":proposal_id": proposal_id,
-                ":share_index": share_index,
-            },
-            |row| row.get(0),
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to read attempting_urls: {e}"),
-        })?;
-    let stored_in_flight_urls: Vec<String> =
-        serde_json::from_str(&attempting_json).map_err(|e| VotingError::Internal {
-            message: format!("failed to deserialize attempting_urls: {e}"),
-        })?;
-    let (in_flight_urls, preserved_legacy_in_flight_urls) =
-        partition_stored_helper_urls(&stored_in_flight_urls);
-    let mut state = ShareDeliveryState::from_url_lists(&[], &[], &in_flight_urls)?;
-    state.mark_definite_failure(server_url)?;
-    let attempting_json = serialize_url_list(
-        state.in_flight_urls(),
-        &preserved_legacy_in_flight_urls,
-        "attempting_urls",
-    )?;
-    conn.execute(
-        "UPDATE share_delegations SET attempting_urls = :attempting_urls
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index,
+                    ":proposal_id": proposal_id,
+                    ":share_index": share_index,
+                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!(
+                    "failed to read helper delivery state before clearing attempt: {e}"
+                ),
+            })?;
+        let stored_in_flight_urls: Vec<String> =
+            serde_json::from_str(&attempting_json).map_err(|e| VotingError::Internal {
+                message: format!("failed to deserialize attempting_urls: {e}"),
+            })?;
+        let (in_flight_urls, preserved_legacy_in_flight_urls) =
+            partition_stored_helper_urls(&stored_in_flight_urls);
+        let mut state = ShareDeliveryState::from_url_lists(&[], &[], &in_flight_urls)?;
+        state.mark_definite_failure(server_url)?;
+        let updated_attempting_json = serialize_url_list(
+            state.in_flight_urls(),
+            &preserved_legacy_in_flight_urls,
+            "attempting_urls",
+        )?;
+        let updated = conn
+            .execute(
+                "UPDATE share_delegations SET attempting_urls = :updated_attempting_urls
          WHERE round_id = :round_id AND wallet_id = :wallet_id
            AND bundle_index = :bundle_index AND proposal_id = :proposal_id
-           AND share_index = :share_index",
-        named_params! {
-            ":attempting_urls": attempting_json,
-            ":round_id": round_id,
-            ":wallet_id": wallet_id,
-            ":bundle_index": bundle_index,
-            ":proposal_id": proposal_id,
-            ":share_index": share_index,
-        },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear helper attempt: {e}"),
-    })?;
-    Ok(())
+           AND share_index = :share_index
+           AND sent_to_urls = :observed_sent_to_urls
+           AND ambiguous_urls = :observed_ambiguous_urls
+           AND attempting_urls = :observed_attempting_urls",
+                named_params! {
+                    ":updated_attempting_urls": updated_attempting_json,
+                    ":observed_sent_to_urls": sent_json,
+                    ":observed_ambiguous_urls": ambiguous_json,
+                    ":observed_attempting_urls": attempting_json,
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index,
+                    ":proposal_id": proposal_id,
+                    ":share_index": share_index,
+                },
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to clear helper attempt: {e}"),
+            })?;
+        if updated == 1 {
+            return Ok(());
+        }
+        // A separate connection changed the delivery state after our read.
+        // Retry against that stronger state instead of restoring stale lists.
+    }
 }
 
 /// Creates or strengthens durable delivery evidence for one committed share.
@@ -306,49 +321,148 @@ pub(crate) fn record_share_delegation(
     nullifier: &[u8],
     submit_at: u64,
 ) -> Result<u64, VotingError> {
+    record_share_delegation_inner(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        sent_to_urls,
+        ambiguous_urls,
+        target_count,
+        nullifier,
+        submit_at,
+        &mut || {},
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_share_delegation_with_after_read(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    sent_to_urls: &[String],
+    ambiguous_urls: &[String],
+    target_count: u32,
+    nullifier: &[u8],
+    submit_at: u64,
+    after_read: &mut dyn FnMut(),
+) -> Result<u64, VotingError> {
+    record_share_delegation_inner(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        sent_to_urls,
+        ambiguous_urls,
+        target_count,
+        nullifier,
+        submit_at,
+        after_read,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_share_delegation_inner(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    sent_to_urls: &[String],
+    ambiguous_urls: &[String],
+    target_count: u32,
+    nullifier: &[u8],
+    submit_at: u64,
+    after_read: &mut dyn FnMut(),
+) -> Result<u64, VotingError> {
     ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    let existing: Option<(String, String, String, u32, Vec<u8>)> = conn
-        .query_row(
-            "SELECT sent_to_urls, ambiguous_urls, attempting_urls, target_count, nullifier
+    loop {
+        let existing: Option<(String, String, String, u32, Vec<u8>)> = conn
+            .query_row(
+                "SELECT sent_to_urls, ambiguous_urls, attempting_urls, target_count, nullifier
              FROM share_delegations
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id
                AND share_index = :share_index",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": bundle_index,
-                ":proposal_id": proposal_id,
-                ":share_index": share_index,
-            },
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to read existing share delivery: {e}"),
-        })?;
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index,
+                    ":proposal_id": proposal_id,
+                    ":share_index": share_index,
+                },
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to read existing share delivery: {e}"),
+            })?;
+        after_read();
 
-    let (
-        stored_definite_acceptance_urls,
-        stored_outcome_unknown_urls,
-        stored_in_flight_urls,
-        effective_target,
-    ) = if let Some((
-        sent_json,
-        ambiguous_json,
-        attempting_json,
-        existing_target,
-        existing_nullifier,
-    )) = existing
-    {
+        let Some((sent_json, ambiguous_json, attempting_json, existing_target, existing_nullifier)) =
+            existing
+        else {
+            let state = ShareDeliveryState::from_url_lists(sent_to_urls, ambiguous_urls, &[])?;
+            let definite_acceptance_json =
+                serialize_url_list(state.accepted_urls(), &[], "sent_to_urls")?;
+            let ambiguous_json =
+                serialize_url_list(state.outcome_unknown_urls(), &[], "ambiguous_urls")?;
+            let attempting_json = serialize_url_list(&[], &[], "attempting_urls")?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let inserted_submit_at = conn
+                .query_row(
+                    "INSERT INTO share_delegations \
+                     (round_id, wallet_id, bundle_index, proposal_id, share_index, sent_to_urls, ambiguous_urls, attempting_urls, target_count, nullifier, confirmed, submit_at, created_at) \
+                     VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :sent_to_urls, :ambiguous_urls, :attempting_urls, :target_count, :nullifier, 0, :submit_at, :created_at) \
+                     ON CONFLICT (round_id, wallet_id, bundle_index, proposal_id, share_index) DO NOTHING \
+                     RETURNING submit_at",
+                    named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": wallet_id,
+                        ":bundle_index": bundle_index,
+                        ":proposal_id": proposal_id,
+                        ":share_index": share_index,
+                        ":sent_to_urls": definite_acceptance_json,
+                        ":ambiguous_urls": ambiguous_json,
+                        ":attempting_urls": attempting_json,
+                        ":target_count": target_count,
+                        ":nullifier": nullifier,
+                        ":submit_at": submit_at,
+                        ":created_at": now,
+                    },
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| VotingError::Internal {
+                    message: format!("failed to record share delegation: {e}"),
+                })?;
+            if let Some(inserted_submit_at) = inserted_submit_at {
+                return Ok(inserted_submit_at);
+            }
+            // Another connection inserted the row after our read. Reload it
+            // and apply the normal merge and nullifier checks.
+            continue;
+        };
         if existing_nullifier != nullifier {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -356,90 +470,83 @@ pub(crate) fn record_share_delegation(
                 ),
             });
         }
-        (
-            parse_url_list(&sent_json, "sent_to_urls")?,
-            parse_url_list(&ambiguous_json, "ambiguous_urls")?,
-            parse_url_list(&attempting_json, "attempting_urls")?,
-            existing_target.max(target_count),
-        )
-    } else {
-        (Vec::new(), Vec::new(), Vec::new(), target_count)
-    };
-    let (definite_acceptance_urls, preserved_legacy_definite_acceptance_urls) =
-        partition_stored_helper_urls(&stored_definite_acceptance_urls);
-    let (outcome_unknown_urls, mut preserved_legacy_outcome_unknown_urls) =
-        partition_stored_helper_urls(&stored_outcome_unknown_urls);
-    let (in_flight_urls, mut preserved_legacy_in_flight_urls) =
-        partition_stored_helper_urls(&stored_in_flight_urls);
-    let mut state = ShareDeliveryState::from_url_lists(
-        &definite_acceptance_urls,
-        &outcome_unknown_urls,
-        &in_flight_urls,
-    )?;
-    state.merge_persisted_report(sent_to_urls, ambiguous_urls)?;
-    preserved_legacy_outcome_unknown_urls
-        .retain(|url| !preserved_legacy_definite_acceptance_urls.contains(url));
-    preserved_legacy_in_flight_urls.retain(|url| {
-        !preserved_legacy_definite_acceptance_urls.contains(url)
-            && !preserved_legacy_outcome_unknown_urls.contains(url)
-    });
+        let (definite_acceptance_urls, preserved_legacy_definite_acceptance_urls) =
+            partition_stored_helper_urls(&parse_url_list(&sent_json, "sent_to_urls")?);
+        let (outcome_unknown_urls, mut preserved_legacy_outcome_unknown_urls) =
+            partition_stored_helper_urls(&parse_url_list(&ambiguous_json, "ambiguous_urls")?);
+        let (in_flight_urls, mut preserved_legacy_in_flight_urls) =
+            partition_stored_helper_urls(&parse_url_list(&attempting_json, "attempting_urls")?);
+        let mut state = ShareDeliveryState::from_url_lists(
+            &definite_acceptance_urls,
+            &outcome_unknown_urls,
+            &in_flight_urls,
+        )?;
+        state.merge_persisted_report(sent_to_urls, ambiguous_urls)?;
+        preserved_legacy_outcome_unknown_urls
+            .retain(|url| !preserved_legacy_definite_acceptance_urls.contains(url));
+        preserved_legacy_in_flight_urls.retain(|url| {
+            !preserved_legacy_definite_acceptance_urls.contains(url)
+                && !preserved_legacy_outcome_unknown_urls.contains(url)
+        });
 
-    let definite_acceptance_json = serialize_url_list(
-        state.accepted_urls(),
-        &preserved_legacy_definite_acceptance_urls,
-        "sent_to_urls",
-    )?;
-    let ambiguous_json = serialize_url_list(
-        state.outcome_unknown_urls(),
-        &preserved_legacy_outcome_unknown_urls,
-        "ambiguous_urls",
-    )?;
-    let attempting_json = serialize_url_list(
-        state.in_flight_urls(),
-        &preserved_legacy_in_flight_urls,
-        "attempting_urls",
-    )?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let effective_submit_at = conn
-        .query_row(
-        "INSERT INTO share_delegations \
-         (round_id, wallet_id, bundle_index, proposal_id, share_index, sent_to_urls, ambiguous_urls, attempting_urls, target_count, nullifier, confirmed, submit_at, created_at) \
-         VALUES (:round_id, :wallet_id, :bundle_index, :proposal_id, :share_index, :sent_to_urls, :ambiguous_urls, :attempting_urls, :target_count, :nullifier, 0, :submit_at, :created_at) \
-         ON CONFLICT (round_id, wallet_id, bundle_index, proposal_id, share_index) DO UPDATE SET \
-         sent_to_urls = excluded.sent_to_urls, \
-         ambiguous_urls = excluded.ambiguous_urls, \
-         attempting_urls = excluded.attempting_urls, \
-         target_count = excluded.target_count \
-         WHERE share_delegations.nullifier = excluded.nullifier \
-         RETURNING submit_at",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": bundle_index,
-                ":proposal_id": proposal_id,
-                ":share_index": share_index,
-                ":sent_to_urls": definite_acceptance_json,
-                ":ambiguous_urls": ambiguous_json,
-                ":attempting_urls": attempting_json,
-                ":target_count": effective_target,
-                ":nullifier": nullifier,
-                ":submit_at": submit_at,
-                ":created_at": now,
-            },
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to record share delegation: {e}"),
-        })?;
-    effective_submit_at.ok_or_else(|| VotingError::InvalidInput {
-        message: format!(
-            "share nullifier conflict for round={round_id}, wallet={wallet_id}, bundle={bundle_index}, proposal={proposal_id}, share={share_index}"
-        ),
-    })
+        let updated_sent = serialize_url_list(
+            state.accepted_urls(),
+            &preserved_legacy_definite_acceptance_urls,
+            "sent_to_urls",
+        )?;
+        let updated_ambiguous = serialize_url_list(
+            state.outcome_unknown_urls(),
+            &preserved_legacy_outcome_unknown_urls,
+            "ambiguous_urls",
+        )?;
+        let updated_attempting = serialize_url_list(
+            state.in_flight_urls(),
+            &preserved_legacy_in_flight_urls,
+            "attempting_urls",
+        )?;
+        let effective_target = existing_target.max(target_count);
+        let effective_submit_at = conn
+            .query_row(
+                "UPDATE share_delegations \
+                 SET sent_to_urls = :sent_to_urls, ambiguous_urls = :ambiguous_urls, \
+                     attempting_urls = :attempting_urls, target_count = :target_count \
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id \
+                   AND bundle_index = :bundle_index AND proposal_id = :proposal_id \
+                   AND share_index = :share_index \
+                   AND nullifier = :observed_nullifier \
+                   AND sent_to_urls = :observed_sent_to_urls \
+                   AND ambiguous_urls = :observed_ambiguous_urls \
+                   AND attempting_urls = :observed_attempting_urls \
+                   AND target_count = :observed_target_count \
+                 RETURNING submit_at",
+                named_params! {
+                    ":sent_to_urls": updated_sent,
+                    ":ambiguous_urls": updated_ambiguous,
+                    ":attempting_urls": updated_attempting,
+                    ":target_count": effective_target,
+                    ":observed_nullifier": existing_nullifier,
+                    ":observed_sent_to_urls": sent_json,
+                    ":observed_ambiguous_urls": ambiguous_json,
+                    ":observed_attempting_urls": attempting_json,
+                    ":observed_target_count": existing_target,
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index,
+                    ":proposal_id": proposal_id,
+                    ":share_index": share_index,
+                },
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to record share delegation: {e}"),
+            })?;
+        if let Some(effective_submit_at) = effective_submit_at {
+            return Ok(effective_submit_at);
+        }
+        // A separate connection strengthened the row after our read. Reload
+        // and merge that evidence instead of overwriting it.
+    }
 }
 
 /// Load all share delegations for a round.
@@ -786,76 +893,89 @@ fn merge_share_delegation_urls(
     reset_submit_at: bool,
 ) -> Result<(), VotingError> {
     ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    let (sent_json, ambiguous_json, attempting_json): (String, String, String) = conn
-        .query_row(
-            "SELECT sent_to_urls, ambiguous_urls, attempting_urls FROM share_delegations \
+    loop {
+        let (sent_json, ambiguous_json, attempting_json): (String, String, String) = conn
+            .query_row(
+                "SELECT sent_to_urls, ambiguous_urls, attempting_urls FROM share_delegations \
              WHERE round_id = :round_id AND wallet_id = :wallet_id \
              AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": bundle_index,
-                ":proposal_id": proposal_id,
-                ":share_index": share_index,
-            },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to read helper delivery state for update: {e}"),
-        })?;
-    let (definite_acceptance_urls, preserved_legacy_definite_acceptance_urls) =
-        partition_stored_helper_urls(&parse_url_list(&sent_json, "sent_to_urls")?);
-    let (outcome_unknown_urls, preserved_legacy_outcome_unknown_urls) =
-        partition_stored_helper_urls(&parse_url_list(&ambiguous_json, "ambiguous_urls")?);
-    let (in_flight_urls, preserved_legacy_in_flight_urls) =
-        partition_stored_helper_urls(&parse_url_list(&attempting_json, "attempting_urls")?);
-    let mut state = ShareDeliveryState::from_url_lists(
-        &definite_acceptance_urls,
-        &outcome_unknown_urls,
-        &in_flight_urls,
-    )?;
-    for url in new_urls {
-        match merge {
-            HelperUrlMerge::DefiniteAcceptance => state.mark_accepted(url)?,
-            HelperUrlMerge::OutcomeUnknown => state.mark_outcome_unknown(url)?,
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index,
+                    ":proposal_id": proposal_id,
+                    ":share_index": share_index,
+                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to read helper delivery state for update: {e}"),
+            })?;
+        let (definite_acceptance_urls, preserved_legacy_definite_acceptance_urls) =
+            partition_stored_helper_urls(&parse_url_list(&sent_json, "sent_to_urls")?);
+        let (outcome_unknown_urls, preserved_legacy_outcome_unknown_urls) =
+            partition_stored_helper_urls(&parse_url_list(&ambiguous_json, "ambiguous_urls")?);
+        let (in_flight_urls, preserved_legacy_in_flight_urls) =
+            partition_stored_helper_urls(&parse_url_list(&attempting_json, "attempting_urls")?);
+        let mut state = ShareDeliveryState::from_url_lists(
+            &definite_acceptance_urls,
+            &outcome_unknown_urls,
+            &in_flight_urls,
+        )?;
+        for url in new_urls {
+            match merge {
+                HelperUrlMerge::DefiniteAcceptance => state.mark_accepted(url)?,
+                HelperUrlMerge::OutcomeUnknown => state.mark_outcome_unknown(url)?,
+            }
         }
-    }
-    let updated_sent = serialize_url_list(
-        state.accepted_urls(),
-        &preserved_legacy_definite_acceptance_urls,
-        "sent_to_urls",
-    )?;
-    let updated_ambiguous = serialize_url_list(
-        state.outcome_unknown_urls(),
-        &preserved_legacy_outcome_unknown_urls,
-        "ambiguous_urls",
-    )?;
-    let updated_attempting = serialize_url_list(
-        state.in_flight_urls(),
-        &preserved_legacy_in_flight_urls,
-        "attempting_urls",
-    )?;
-    conn.execute(
-        "UPDATE share_delegations SET sent_to_urls = :sent_to_urls, ambiguous_urls = :ambiguous_urls, \
+        let updated_sent = serialize_url_list(
+            state.accepted_urls(),
+            &preserved_legacy_definite_acceptance_urls,
+            "sent_to_urls",
+        )?;
+        let updated_ambiguous = serialize_url_list(
+            state.outcome_unknown_urls(),
+            &preserved_legacy_outcome_unknown_urls,
+            "ambiguous_urls",
+        )?;
+        let updated_attempting = serialize_url_list(
+            state.in_flight_urls(),
+            &preserved_legacy_in_flight_urls,
+            "attempting_urls",
+        )?;
+        let updated = conn
+            .execute(
+                "UPDATE share_delegations SET sent_to_urls = :sent_to_urls, ambiguous_urls = :ambiguous_urls, \
          attempting_urls = :attempting_urls, submit_at = iif(:reset_submit_at, 0, submit_at) \
          WHERE round_id = :round_id AND wallet_id = :wallet_id \
-         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
-        named_params! {
-            ":sent_to_urls": updated_sent,
-            ":ambiguous_urls": updated_ambiguous,
-            ":attempting_urls": updated_attempting,
-            ":reset_submit_at": reset_submit_at,
-            ":round_id": round_id,
-            ":wallet_id": wallet_id,
-            ":bundle_index": bundle_index,
-            ":proposal_id": proposal_id,
-            ":share_index": share_index,
-        },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to update helper delivery state: {e}"),
-    })?;
-    Ok(())
+         AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index \
+         AND sent_to_urls = :observed_sent_to_urls \
+         AND ambiguous_urls = :observed_ambiguous_urls \
+         AND attempting_urls = :observed_attempting_urls",
+                named_params! {
+                    ":sent_to_urls": updated_sent,
+                    ":ambiguous_urls": updated_ambiguous,
+                    ":attempting_urls": updated_attempting,
+                    ":reset_submit_at": reset_submit_at,
+                    ":observed_sent_to_urls": sent_json,
+                    ":observed_ambiguous_urls": ambiguous_json,
+                    ":observed_attempting_urls": attempting_json,
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index,
+                    ":proposal_id": proposal_id,
+                    ":share_index": share_index,
+                },
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to update helper delivery state: {e}"),
+            })?;
+        if updated == 1 {
+            return Ok(());
+        }
+        // A separate connection changed the delivery state after our read.
+        // Reload and merge it instead of overwriting stronger evidence.
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

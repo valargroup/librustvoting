@@ -241,9 +241,13 @@ pub enum NextStep {
     /// This covers the crash boundary after the cast-vote transaction confirms
     /// and before every helper-share row has been durably recorded. The
     /// `share_index` identifies the missing helper share to submit. Wallets
-    /// should recover the `CommittedVote`, recompute its planner output, and
-    /// call `CommittedVote::submit_share_to_helpers`; that method journals
-    /// every attempt and outcome.
+    /// should recover the `CommittedVote` and reuse the original full-batch
+    /// planner output when calling `CommittedVote::submit_share_to_helpers`;
+    /// recomputing plans independently for missing shares can violate the
+    /// planner's batch-wide per-helper quota. This crate does not yet persist
+    /// that planner output, so the wallet must persist it before submitting
+    /// the first share. The submission method journals every attempt and
+    /// outcome, but not the batch plan itself.
     SubmitShares {
         bundle_index: u32,
         proposal_id: u32,

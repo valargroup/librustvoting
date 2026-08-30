@@ -161,9 +161,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   string conversion without losing HTTP retry or ambiguity classification.
 - Initial delivery keeps planned and fallback helpers in separate health-ranked
   groups, so a healthy fallback cannot bypass a degraded planned assignment.
-- Cancellation observed after a failed final or non-retryable helper request
-  is returned as cancellation and is not scored as a helper failure, including
-  single-attempt recovery POSTs.
+- Cancellation before a pending retry or single-attempt recovery POST returns
+  cancellation without scoring a helper failure. Once a request completes,
+  its final or non-retryable result is preserved despite late cancellation.
 - In fleets with at least two helpers, one confirmation claim can no longer
   suppress durable recovery; two distinct currently configured helpers must
   agree before the crate persists confirmation.
