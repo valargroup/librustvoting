@@ -118,11 +118,13 @@ random, versioned voting-master generation for each account, network, and vote
 chain, stores it in platform secure storage, and maintains an authenticated
 encrypted account authority backup independent of both platform secure storage
 and `VotingDb`.
-The backup durably preserves active and retired master generations and each
-immutable round-to-generation, root, and source binding. Generation activation
-and each round binding are committed and read back before use. `zcash_voting`
-derives each round's authority root from the selected generation and complete
-authority context. The wallet retains that root in encrypted authority state.
+The backup durably preserves active and retired master generations and, for
+each round, the current binding of its generation, root, authority source, and
+bundle source.
+Generation activation and every binding update are committed and read back
+before use. `zcash_voting` derives each round's authority root from the selected
+generation and complete authority context. The wallet retains that root in
+encrypted authority state.
 
 Each round records its selected generation before publishing a target or
 allowing delegation. A failed or interrupted write is retried with the same
@@ -130,10 +132,11 @@ generation, root, and selection. Once an authority may have been used, the
 round cannot switch generations. Rotation creates and backs up a new default
 generation only for rounds whose authority has not been used. It neither
 reassigns nor revokes the generation selected for a used round.
-Generation creation, retirement, and the retained generation set are
-rollback-protected. Restore rejects stale generation state and uses a retired
-generation only for rounds already assigned to it. Older generations remain
-available for recovery of those rounds.
+Generation creation, retirement, the retained generation set, and every round
+binding form one rollback-protected account-authority state. Restore rejects a
+stale snapshot of any of that state and uses a retired generation only for
+rounds already assigned to it. Older generations remain available for recovery
+of those rounds.
 
 A master generation by itself cannot delegate funds or complete a vote.
 Delegation additionally requires the funds owner's Zcash account signature.
@@ -372,8 +375,8 @@ after their authorities and delegation bundles have already been constructed.
 | Component | Responsibility |
 | --- | --- |
 | `zcash_voting` | Versioned context and source types; master-to-round-root, hotkey, and self-custody bundle derivation; custody capability validation; round selection; VAN recovery; pending-vote export/import; shared vectors and fixtures |
-| Wallet integration | Seed or master provider; master creation and rotation; authenticated round-to-generation storage; retained per-round roots; encrypted backups; snapshot rescan; independently authenticated recovery checkpoint; recovery UX |
-| Current Keystone integration | Master-backup gate, account binding, immutable generation selection, and existing PCZT or PCZT-batch signing |
+| Wallet integration | Seed or master provider; master creation and rotation; rollback-protected round and source bindings; retained per-round roots; encrypted backups; snapshot rescan; independently authenticated recovery checkpoint; recovery UX |
+| Current Keystone integration | Master-backup gate, account binding, rollback-protected generation selection, and existing PCZT or PCZT-batch signing |
 | Keystone firmware | No version 1 change; a future root provider may use the same boundary |
 | `vote-sdk` | New authenticated round fields and signing support; complete block-bound transition data for recovery |
 | `vote-nullifier-pir` | Publish snapshot height and block hash for the exact dataset |
@@ -396,8 +399,8 @@ Reviewers are being asked to approve these directions:
 6. recovery by validated VAN transition traversal rather than saved transaction
    history;
 7. reuse of the existing helper tracker for votes awaiting helper completion;
-8. future-only master rotation with immutable generation selection for used
-   rounds; and
+8. master rotation that can change only unused authorities, with every round and
+   source binding rollback-protected and immutable once use is possible; and
 9. no circuit, vote-chain, batching, or Keystone firmware change in version 1.
 
 Once these decisions are approved, implementation work can define and review
