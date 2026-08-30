@@ -35,21 +35,141 @@ pub(crate) struct ShareDeliveryRecordParams<'a> {
 /// Identity and policy needed to durably journal a helper POST.
 #[derive(Clone, Copy, Debug)]
 pub struct ShareDeliveryAttemptParams<'a> {
+    /// Round that owns the share.
     pub round_id: &'a str,
+    /// Index of the committed vote bundle that owns the share.
     pub bundle_index: u32,
+    /// Proposal whose vote commitment contains the share.
     pub proposal_id: u32,
+    /// Position of the share within that proposal's commitment.
     pub share_index: u32,
+    /// Canonical base URL of the helper receiving the POST.
     pub server_url: &'a str,
+    /// Desired number of definite helper placements.
     pub target_count: usize,
+    /// Unix seconds when the helper should submit, or zero for immediate.
     pub submit_at: u64,
 }
 
 /// Definite state transition for a previously journaled helper POST.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShareDeliveryAttemptOutcome {
+    /// The helper definitely acknowledged acceptance.
     Accepted,
+    /// The request may have reached the helper, but no acknowledgement arrived.
     Ambiguous,
+    /// The request definitely did not reach an accepted state.
     DefiniteFailure,
+}
+
+/// Canonical per-helper delivery state for one share.
+///
+/// A helper has exactly one state. Stronger evidence always wins:
+/// accepted > outcome unknown > in flight. Each list retains the order in
+/// which helpers first entered that state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ShareDeliveryState {
+    accepted_urls: Vec<String>,
+    outcome_unknown_urls: Vec<String>,
+    in_flight_urls: Vec<String>,
+}
+
+impl ShareDeliveryState {
+    pub(crate) fn from_url_lists(
+        accepted_urls: &[String],
+        outcome_unknown_urls: &[String],
+        in_flight_urls: &[String],
+    ) -> Result<Self, VotingError> {
+        let mut state = Self::default();
+        state.merge_persisted_report(accepted_urls, outcome_unknown_urls)?;
+        for url in crate::helper::url::canonical_helper_url_list(in_flight_urls)? {
+            if !state.contains(&url) {
+                state.in_flight_urls.push(url);
+            }
+        }
+        Ok(state)
+    }
+
+    /// Merges a persisted report without allowing weaker evidence to replace
+    /// stronger evidence already held by the state.
+    pub(crate) fn merge_persisted_report(
+        &mut self,
+        accepted_urls: &[String],
+        outcome_unknown_urls: &[String],
+    ) -> Result<(), VotingError> {
+        for url in crate::helper::url::canonical_helper_url_list(accepted_urls)? {
+            self.mark_accepted_canonical(url);
+        }
+        for url in crate::helper::url::canonical_helper_url_list(outcome_unknown_urls)? {
+            self.mark_outcome_unknown_canonical(url);
+        }
+        Ok(())
+    }
+
+    /// Starts a new attempt unless this helper already has any delivery state.
+    pub(crate) fn begin(&mut self, url: &str) -> Result<bool, VotingError> {
+        let url = crate::helper::url::canonicalize_helper_base_url(url)?;
+        if self.contains(&url) {
+            return Ok(false);
+        }
+        self.in_flight_urls.push(url);
+        Ok(true)
+    }
+
+    pub(crate) fn mark_accepted(&mut self, url: &str) -> Result<(), VotingError> {
+        let url = crate::helper::url::canonicalize_helper_base_url(url)?;
+        self.mark_accepted_canonical(url);
+        Ok(())
+    }
+
+    pub(crate) fn mark_outcome_unknown(&mut self, url: &str) -> Result<(), VotingError> {
+        let url = crate::helper::url::canonicalize_helper_base_url(url)?;
+        self.mark_outcome_unknown_canonical(url);
+        Ok(())
+    }
+
+    pub(crate) fn mark_definite_failure(&mut self, url: &str) -> Result<(), VotingError> {
+        let url = crate::helper::url::canonicalize_helper_base_url(url)?;
+        self.in_flight_urls.retain(|candidate| candidate != &url);
+        Ok(())
+    }
+
+    pub(crate) fn accepted_urls(&self) -> &[String] {
+        &self.accepted_urls
+    }
+
+    pub(crate) fn outcome_unknown_urls(&self) -> &[String] {
+        &self.outcome_unknown_urls
+    }
+
+    pub(crate) fn in_flight_urls(&self) -> &[String] {
+        &self.in_flight_urls
+    }
+
+    fn contains(&self, url: &str) -> bool {
+        self.accepted_urls.iter().any(|candidate| candidate == url)
+            || self
+                .outcome_unknown_urls
+                .iter()
+                .any(|candidate| candidate == url)
+            || self.in_flight_urls.iter().any(|candidate| candidate == url)
+    }
+
+    fn mark_accepted_canonical(&mut self, url: String) {
+        self.outcome_unknown_urls
+            .retain(|candidate| candidate != &url);
+        self.in_flight_urls.retain(|candidate| candidate != &url);
+        if !self.accepted_urls.contains(&url) {
+            self.accepted_urls.push(url);
+        }
+    }
+
+    fn mark_outcome_unknown_canonical(&mut self, url: String) {
+        self.in_flight_urls.retain(|candidate| candidate != &url);
+        if !self.accepted_urls.contains(&url) && !self.outcome_unknown_urls.contains(&url) {
+            self.outcome_unknown_urls.push(url);
+        }
+    }
 }
 use pasta_curves::group::ff::PrimeField;
 use pasta_curves::pallas;
@@ -187,9 +307,10 @@ pub fn record(
 /// Records definite and outcome-unknown helper submissions for later tracking.
 ///
 /// `params.submission.target_count` is the number of definite placements the
-/// tracker should maintain. Ambiguous helpers are polled for global on-chain
-/// confirmation but never count toward that target: `pending` does not prove
-/// that one helper possesses the share.
+/// tracker should maintain. Outcome-unknown helpers never count toward that
+/// target because `pending` does not prove possession. Tracking excludes them
+/// during early replenishment but may retry them during overdue duplicate-safe
+/// recovery.
 ///
 /// # Errors
 ///
@@ -276,7 +397,9 @@ pub fn record_delivery_fixture(
 
 /// Writes an `attempting` marker before a helper POST may be dispatched.
 ///
-/// Returns `false` if the helper is already accepted, ambiguous, or in flight.
+/// Returns `false` if the helper already has definite acceptance,
+/// outcome-unknown, or in-flight state. The marker is persisted before this
+/// function returns `true`, so dispatch can safely occur only afterward.
 pub(crate) fn begin_delivery_attempt(
     db: &VotingDb,
     params: &ShareDeliveryAttemptParams<'_>,
@@ -326,8 +449,10 @@ pub(crate) fn begin_existing_delivery_attempt(
     )
 }
 
-/// Resolves a journaled helper POST without ever making an unknown outcome
-/// eligible for another POST to the same helper.
+/// Persists the observed result of a journaled helper POST.
+///
+/// Outcome-unknown state remains excluded from ordinary delivery. Overdue
+/// recovery may explicitly retry it through the duplicate-safe helper path.
 pub(crate) fn resolve_delivery_attempt(
     db: &VotingDb,
     params: &ShareDeliveryAttemptParams<'_>,
@@ -783,6 +908,62 @@ mod tests {
 
         confirm(&db, ROUND_ID, 0, 1, 1).unwrap();
         assert!(pending_rounds(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delivery_state_preserves_order_and_strongest_evidence() {
+        let accepted = vec![
+            "https://accepted-1.example".to_string(),
+            "HTTPS://ACCEPTED-1.EXAMPLE:443/".to_string(),
+        ];
+        let outcome_unknown = vec![
+            "https://unknown-1.example".to_string(),
+            "https://accepted-1.example".to_string(),
+        ];
+        let in_flight = vec![
+            "https://flight-1.example".to_string(),
+            "https://unknown-1.example".to_string(),
+            "https://accepted-1.example".to_string(),
+        ];
+        let mut state =
+            ShareDeliveryState::from_url_lists(&accepted, &outcome_unknown, &in_flight).unwrap();
+
+        assert_eq!(state.accepted_urls(), &["https://accepted-1.example"]);
+        assert_eq!(state.outcome_unknown_urls(), &["https://unknown-1.example"]);
+        assert_eq!(state.in_flight_urls(), &["https://flight-1.example"]);
+        assert!(!state.begin("https://unknown-1.example/").unwrap());
+        assert!(state.begin("https://flight-2.example").unwrap());
+
+        state
+            .mark_outcome_unknown("https://flight-2.example")
+            .unwrap();
+        state.mark_accepted("https://unknown-1.example").unwrap();
+        state
+            .mark_definite_failure("https://flight-1.example")
+            .unwrap();
+        state
+            .merge_persisted_report(
+                &["https://accepted-2.example".to_string()],
+                &[
+                    "https://accepted-1.example".to_string(),
+                    "https://unknown-2.example".to_string(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.accepted_urls(),
+            &[
+                "https://accepted-1.example",
+                "https://unknown-1.example",
+                "https://accepted-2.example",
+            ]
+        );
+        assert_eq!(
+            state.outcome_unknown_urls(),
+            &["https://flight-2.example", "https://unknown-2.example",]
+        );
+        assert!(state.in_flight_urls().is_empty());
     }
 
     #[test]

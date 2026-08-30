@@ -1,0 +1,912 @@
+use super::*;
+use crate::share_policy::SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS;
+
+// ---- Initial fan-out -------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn fan_out_stops_at_the_target_count() {
+    let transport = Arc::new(MockTransport::default());
+    for index in 1..=5 {
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(index)),
+            json_status("queued"),
+        );
+    }
+
+    let client = client_with(transport.clone());
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &helpers(5),
+        3,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert_eq!(report.accepted_urls, vec![helper(1), helper(2), helper(3)]);
+    assert!(report.ambiguous_urls.is_empty());
+    assert_eq!(report.target_count, 3);
+    assert_eq!(transport.calls().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fan_out_moves_past_a_refusing_helper() {
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        http_status(400),
+    );
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(2)),
+        json_status("queued"),
+    );
+
+    let client = client_with(transport.clone());
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &helpers(3),
+        1,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert_eq!(report.accepted_urls, vec![helper(2)]);
+    assert_eq!(client.health().failure_count(&helper(1)), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fan_out_never_retries_the_same_helper() {
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        http_status(400),
+    );
+
+    let client = client_with(transport.clone());
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &[helper(1)],
+        3,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert!(report.accepted_urls.is_empty());
+    // One attempt, then the candidate pool is exhausted — no spinning.
+    assert_eq!(transport.call_count(&helper(1)), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fan_out_returns_partial_acceptance_rather_than_failing() {
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        json_status("queued"),
+    );
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(2)),
+        http_status(400),
+    );
+
+    let client = client_with(transport.clone());
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &helpers(2),
+        2,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    // Under-placed, not lost: tracking spreads it further later.
+    assert_eq!(report.accepted_urls, vec![helper(1)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fan_out_retains_ambiguous_attempts_separately() {
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        Err(HelperTransportError::Ambiguous(
+            "connection closed before headers".to_string(),
+        )),
+    );
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(2)),
+        json_status("queued"),
+    );
+
+    let client = client_with(transport.clone());
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &helpers(2),
+        1,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert_eq!(report.accepted_urls, vec![helper(2)]);
+    assert_eq!(report.ambiguous_urls, vec![helper(1)]);
+    assert_eq!(transport.call_count(&helper(1)), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fan_out_retains_unusable_successful_response_as_ambiguous() {
+    let transport = Arc::new(MockTransport::default());
+    let first_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    transport.queue_post(&first_url, Ok(HelperResponse::json(200, br#"{}"#.to_vec())));
+    transport.queue_post(&first_url, json_status("queued"));
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(2)),
+        json_status("queued"),
+    );
+
+    let client = client_with(transport.clone());
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &helpers(2),
+        1,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert_eq!(report.accepted_urls, vec![helper(2)]);
+    assert_eq!(report.ambiguous_urls, vec![helper(1)]);
+    assert_eq!(transport.call_count(&first_url), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fan_out_retains_server_error_as_ambiguous_without_retrying() {
+    let transport = Arc::new(MockTransport::default());
+    let first_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    transport.queue_post(&first_url, http_status(503));
+    transport.queue_post(&first_url, json_status("queued"));
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(2)),
+        json_status("queued"),
+    );
+
+    let client = client_with(transport.clone());
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &helpers(2),
+        1,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert_eq!(report.accepted_urls, vec![helper(2)]);
+    assert_eq!(report.ambiguous_urls, vec![helper(1)]);
+    assert_eq!(transport.call_count(&first_url), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fan_out_stops_at_the_overall_deadline_and_clamps_the_last_request() {
+    let transport = Arc::new(MockTransport::default());
+    let first_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    let second_url = format!("{}/shielded-vote/v1/shares", helper(2));
+    transport.queue_post_after(&first_url, Duration::from_secs(50), json_status("queued"));
+    transport.queue_post_after(&second_url, Duration::from_secs(20), json_status("queued"));
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(3)),
+        json_status("queued"),
+    );
+    let config = HelperClientConfig::default()
+        .with_post_timeout(Duration::from_secs(90))
+        .unwrap()
+        .without_retries();
+    let client = HelperClient::with_config(transport.clone(), HelperHealth::default(), config);
+    let started = tokio::time::Instant::now();
+
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &helpers(3),
+        3,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS)
+    );
+    assert_eq!(report.accepted_urls, vec![helper(1)]);
+    assert_eq!(report.ambiguous_urls, vec![helper(2)]);
+    assert_eq!(transport.timeout_for(&first_url), Duration::from_secs(60));
+    assert_eq!(transport.timeout_for(&second_url), Duration::from_secs(10));
+    assert_eq!(transport.call_count(&helper(3)), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn definite_failure_in_backoff_is_not_marked_ambiguous() {
+    let transport = Arc::new(MockTransport::default());
+    let first_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    // The attempt definitely fails 100 ms before the overall deadline, so
+    // the 200 ms retry backoff would cross it. The held definite error
+    // must surface instead of the deadline converting it into an unknown
+    // outcome mid-sleep.
+    transport.queue_post_after(
+        &first_url,
+        Duration::from_millis(59_900),
+        Err(HelperTransportError::Transport(
+            "connect refused".to_string(),
+        )),
+    );
+    let config = HelperClientConfig::default()
+        .with_post_timeout(Duration::from_secs(90))
+        .unwrap();
+    let client = HelperClient::with_config(transport.clone(), HelperHealth::default(), config);
+
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &helpers(2),
+        2,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert!(report.accepted_urls.is_empty());
+    assert!(
+        report.ambiguous_urls.is_empty(),
+        "a definite pre-response failure must stay definite: {:?}",
+        report.ambiguous_urls
+    );
+    assert_eq!(transport.call_count(&helper(2)), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn definite_failure_at_backoff_deadline_clears_durable_attempt_and_retries_later() {
+    let db = db_with_delivery(&[], &[], 1);
+    let transport = Arc::new(MockTransport::default());
+    let first_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    transport.queue_post_after(
+        &first_url,
+        Duration::from_millis(59_900),
+        Err(HelperTransportError::Transport(
+            "connect refused".to_string(),
+        )),
+    );
+    transport.queue_post(&first_url, json_status("queued"));
+    let config = HelperClientConfig::default()
+        .with_post_timeout(Duration::from_secs(90))
+        .unwrap();
+    let client = HelperClient::with_config(transport.clone(), HelperHealth::default(), config);
+    let servers = helpers(2);
+
+    let first =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+            .await
+            .unwrap();
+    assert!(first.accepted_urls.is_empty());
+    assert!(first.ambiguous_urls.is_empty());
+    assert!(only_share(&db).attempting_urls.is_empty());
+
+    let second =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+            .await
+            .unwrap();
+    assert_eq!(second.accepted_urls, vec![helper(1)]);
+    assert!(only_share(&db).attempting_urls.is_empty());
+    assert_eq!(transport.call_count(&first_url), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_attempt_starts_under_minimum_budget() {
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post_after(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        Duration::from_millis(59_500),
+        json_status("queued"),
+    );
+    let config = HelperClientConfig::default()
+        .with_post_timeout(Duration::from_secs(90))
+        .unwrap()
+        .without_retries();
+    let client = HelperClient::with_config(transport.clone(), HelperHealth::default(), config);
+
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &helpers(2),
+        2,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert_eq!(report.accepted_urls, vec![helper(1)]);
+    assert!(report.ambiguous_urls.is_empty());
+    // 500 ms of budget is below the minimum, so the second helper is
+    // never contacted rather than burned into ambiguity.
+    assert_eq!(transport.call_count(&helper(2)), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fan_out_canonicalizes_candidates_without_shrinking_the_target() {
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        json_status("queued"),
+    );
+
+    let client = client_with(transport.clone());
+    let report = submit_initial_share_to_candidates(
+        &client,
+        valid_share_json(),
+        &[helper(1), format!("{}/", helper(1))],
+        3,
+        10,
+        &never_cancel(),
+    )
+    .await;
+
+    assert_eq!(report.accepted_urls, vec![helper(1)]);
+    assert_eq!(report.target_count, 3);
+    assert_eq!(transport.call_count(&helper(1)), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_post_is_journaled_before_transport_dispatch() {
+    let db = Arc::new(db_with_delivery(&[], &[], 1));
+    let transport = Arc::new(MockTransport::default());
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    transport.queue_post(&post_url, json_status("queued"));
+    let observed_db = db.clone();
+    transport.observe_posts(move |_| {
+        let stored = only_share(&observed_db);
+        assert_eq!(stored.attempting_urls, vec![helper(1)]);
+        assert!(stored.sent_to_urls.is_empty());
+    });
+    let client = client_with(transport);
+    let servers = vec![helper(1)];
+
+    let report =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+            .await
+            .unwrap();
+
+    assert_eq!(report.accepted_urls, vec![helper(1)]);
+    let stored = only_share(&db);
+    assert_eq!(stored.sent_to_urls, vec![helper(1)]);
+    assert!(stored.attempting_urls.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn submit_rejects_invalid_candidate_url_before_any_network_io() {
+    let db = db_with_delivery(&[], &[], 1);
+    let before = only_share(&db);
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let servers = vec![helper(1), "helper.example:443".to_string()];
+
+    let error =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+            .await
+            .unwrap_err();
+
+    assert!(
+        matches!(error, VotingError::InvalidInput { .. }),
+        "unexpected error: {error}"
+    );
+    assert_eq!(transport.call_count(&helper(1)), 0);
+    let after = only_share(&db);
+    assert_eq!(after.sent_to_urls, before.sent_to_urls);
+    assert_eq!(after.ambiguous_urls, before.ambiguous_urls);
+    assert_eq!(after.attempting_urls, before.attempting_urls);
+    assert_eq!(after.target_count, before.target_count);
+    assert_eq!(after.submit_at, before.submit_at);
+}
+
+#[tokio::test(start_paused = true)]
+async fn invalid_candidate_url_does_not_create_a_share_record() {
+    let db = db_with_recoverable_vote();
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let servers = vec![helper(1), "helper.example:443".to_string()];
+
+    let error =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+            .await
+            .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_vote_submission_keeps_degraded_planned_target_before_healthy_fallback() {
+    let db = db_with_recoverable_vote();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE votes SET vc_tree_position = 789
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+    let configured = helpers(2);
+    let plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 4_321,
+        target_count: 1,
+        target_servers: vec![helper(2)],
+    };
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(2));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&post_url, json_status("queued"));
+    let health = HelperHealth::default();
+    for _ in 0..HELPER_FAILURE_THRESHOLD {
+        health.record_failure(&helper(2), SUBMIT_AT);
+    }
+    let client = HelperClient::new(transport.clone(), health);
+
+    let report = committed
+        .submit_share_to_helpers(
+            &db,
+            &client,
+            ShareSubmissionRequest {
+                share_index: 0,
+                plan: &plan,
+                configured_server_urls: &configured,
+                now_seconds: SUBMIT_AT,
+            },
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.accepted_urls, vec![helper(2)]);
+    let body = transport.posted_json(&post_url);
+    assert_eq!(body["vote_round_id"], ROUND_ID);
+    assert_eq!(body["proposal_id"], 1);
+    assert_eq!(body["share_index"], 0);
+    assert_eq!(body["tree_position"], 789);
+    assert_eq!(body["submit_at"], 4_321);
+    let stored = only_share(&db);
+    assert_eq!(stored.bundle_index, 0);
+    assert_eq!(stored.proposal_id, 1);
+    assert_eq!(stored.share_index, 0);
+    assert_eq!(stored.sent_to_urls, vec![helper(2)]);
+    assert_eq!(transport.call_count(&helper(1)), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_committed_submission_preserves_the_original_schedule() {
+    let db = db_with_recoverable_vote();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(2);
+    let first_plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 4_321,
+        target_count: 1,
+        target_servers: vec![helper(1)],
+    };
+    let second_plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 9_876,
+        target_count: 1,
+        target_servers: vec![helper(2)],
+    };
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        json_status("queued"),
+    );
+    let client = client_with(transport.clone());
+
+    for plan in [&first_plan, &second_plan] {
+        committed
+            .submit_share_to_helpers(
+                &db,
+                &client,
+                ShareSubmissionRequest {
+                    share_index: 0,
+                    plan,
+                    configured_server_urls: &configured,
+                    now_seconds: SUBMIT_AT,
+                },
+                &never_cancel(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let stored = only_share(&db);
+    assert_eq!(stored.submit_at, first_plan.submit_at);
+    assert_eq!(stored.sent_to_urls, vec![helper(1)]);
+    assert_eq!(transport.call_count(&helper(1)), 1);
+    assert_eq!(transport.call_count(&helper(2)), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_vote_submission_rejects_mismatched_plan_before_side_effects() {
+    let db = db_with_recoverable_vote();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(2);
+    let plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 4_321,
+        target_count: 1,
+        target_servers: vec![helper(3)],
+    };
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+
+    let error = committed
+        .submit_share_to_helpers(
+            &db,
+            &client,
+            ShareSubmissionRequest {
+                share_index: 0,
+                plan: &plan,
+                configured_server_urls: &configured,
+                now_seconds: SUBMIT_AT,
+            },
+            &never_cancel(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_submission_rejects_duplicate_spelling_fleet_before_effects() {
+    let db = db_with_recoverable_vote();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = vec![helper(1), format!("HTTPS://HELPER-1.EXAMPLE:443/")];
+    let plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 4_321,
+        target_count: 1,
+        target_servers: vec![helper(1)],
+    };
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+
+    let error = committed
+        .submit_share_to_helpers(
+            &db,
+            &client,
+            ShareSubmissionRequest {
+                share_index: 0,
+                plan: &plan,
+                configured_server_urls: &configured,
+                now_seconds: SUBMIT_AT,
+            },
+            &never_cancel(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_vote_submission_rejects_uncapped_large_fleet_target() {
+    let db = db_with_recoverable_vote();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(33);
+    let plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 4_321,
+        target_count: 11,
+        target_servers: configured[..11].to_vec(),
+    };
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+
+    let error = committed
+        .submit_share_to_helpers(
+            &db,
+            &client,
+            ShareSubmissionRequest {
+                share_index: 0,
+                plan: &plan,
+                configured_server_urls: &configured,
+                now_seconds: SUBMIT_AT,
+            },
+            &never_cancel(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn tracking_rejects_invalid_configured_url() {
+    let configured = vec![
+        helper(1),
+        "https://helper.example/vote?tenant=1".to_string(),
+    ];
+    let db = db_with_share(&[helper(1)]);
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+
+    let error = track_pending_shares(
+        &db,
+        &params(&configured, ready_not_overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(error, VotingError::InvalidInput { .. }),
+        "unexpected error: {error}"
+    );
+    assert_eq!(transport.call_count(&helper(1)), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn tracking_rejects_duplicate_spelling_fleet_before_effects() {
+    let configured = vec![helper(1), "HTTPS://HELPER-1.EXAMPLE:443/".to_string()];
+    let db = db_with_share(&[helper(1)]);
+    let before = only_share(&db);
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+
+    let error = track_pending_shares(
+        &db,
+        &params(&configured, ready_not_overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    let after = only_share(&db);
+    assert_eq!(after.sent_to_urls, before.sent_to_urls);
+    assert_eq!(after.ambiguous_urls, before.ambiguous_urls);
+    assert_eq!(after.attempting_urls, before.attempting_urls);
+    assert_eq!(after.confirmed, before.confirmed);
+    assert_eq!(after.submit_at, before.submit_at);
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn tracking_rejects_empty_fleet_before_effects() {
+    let db = db_with_share(&[helper(1)]);
+    let before = only_share(&db);
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+
+    let error = track_pending_shares(
+        &db,
+        &params(&[], ready_not_overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    let after = only_share(&db);
+    assert_eq!(after.sent_to_urls, before.sent_to_urls);
+    assert_eq!(after.ambiguous_urls, before.ambiguous_urls);
+    assert_eq!(after.attempting_urls, before.attempting_urls);
+    assert_eq!(after.confirmed, before.confirmed);
+    assert_eq!(after.submit_at, before.submit_at);
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn definite_initial_failure_clears_attempt_and_remains_retryable() {
+    let db = db_with_delivery(&[], &[], 1);
+    let transport = Arc::new(MockTransport::default());
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    transport.queue_post(
+        &post_url,
+        Err(HelperTransportError::Transport(
+            "connect failed".to_string(),
+        )),
+    );
+    transport.queue_post(&post_url, json_status("queued"));
+    let client = HelperClient::with_config(
+        transport.clone(),
+        HelperHealth::default(),
+        HelperClientConfig::default().without_retries(),
+    );
+    let servers = vec![helper(1)];
+
+    let first =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+            .await
+            .unwrap();
+    assert!(first.accepted_urls.is_empty());
+    assert!(only_share(&db).attempting_urls.is_empty());
+
+    let second =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+            .await
+            .unwrap();
+    assert_eq!(second.accepted_urls, vec![helper(1)]);
+    assert_eq!(transport.call_count(&post_url), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguous_initial_failure_is_not_replayed_by_initial_delivery() {
+    let db = db_with_delivery(&[], &[], 1);
+    let transport = Arc::new(MockTransport::default());
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    transport.queue_post(
+        &post_url,
+        Err(HelperTransportError::Ambiguous(
+            "request timeout".to_string(),
+        )),
+    );
+    transport.queue_post(&post_url, json_status("queued"));
+    let client = client_with(transport.clone());
+    let servers = vec![helper(1)];
+
+    submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+        .await
+        .unwrap();
+    let stored = only_share(&db);
+    assert_eq!(stored.ambiguous_urls, vec![helper(1)]);
+    assert!(stored.attempting_urls.is_empty());
+
+    submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+        .await
+        .unwrap();
+    assert_eq!(transport.call_count(&post_url), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_outcome_write_leaves_attempting_marker() {
+    let db = Arc::new(db_with_delivery(&[], &[], 1));
+    let transport = Arc::new(MockTransport::default());
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    transport.queue_post(&post_url, json_status("queued"));
+    let trigger_db = db.clone();
+    transport.observe_posts(move |_| {
+        trigger_db
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_delivery_promotion
+                 BEFORE UPDATE OF sent_to_urls ON share_delegations
+                 BEGIN SELECT RAISE(FAIL, 'injected promotion failure'); END;",
+            )
+            .unwrap();
+    });
+    let client = client_with(transport.clone());
+    let servers = vec![helper(1)];
+
+    let result =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel()).await;
+
+    assert!(result.is_err());
+    let stored = only_share(&db);
+    assert_eq!(stored.attempting_urls, vec![helper(1)]);
+    assert!(stored.sent_to_urls.is_empty());
+
+    db.conn()
+        .execute_batch("DROP TRIGGER fail_delivery_promotion")
+        .unwrap();
+    transport.queue_post(&post_url, json_status("queued"));
+    submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel())
+        .await
+        .unwrap();
+    assert_eq!(transport.call_count(&post_url), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_attempt_write_prevents_network_dispatch() {
+    let db = db_with_delivery(&[], &[], 1);
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_attempt_write
+             BEFORE UPDATE OF attempting_urls ON share_delegations
+             BEGIN SELECT RAISE(FAIL, 'injected attempt failure'); END;",
+        )
+        .unwrap();
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let servers = vec![helper(1)];
+
+    let result =
+        submit_share_to_helpers(&db, &client, &initial_submission(&servers), &never_cancel()).await;
+
+    assert!(result.is_err());
+    assert!(transport.calls().is_empty());
+}
+
+#[test]
+fn attempting_updates_preserve_noncanonical_legacy_history() {
+    let db = db_with_delivery(&[], &[], 1);
+    db.conn()
+        .execute(
+            "UPDATE share_delegations SET attempting_urls = :urls
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            rusqlite::named_params! {
+                ":urls": r#"["legacy helper without a URL"]"#,
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+    let attempt = share::ShareDeliveryAttemptParams {
+        round_id: ROUND_ID,
+        bundle_index: 0,
+        proposal_id: 1,
+        share_index: 0,
+        server_url: &helper(1),
+        target_count: 1,
+        submit_at: SUBMIT_AT,
+    };
+
+    assert!(share::begin_existing_delivery_attempt(&db, &attempt).unwrap());
+    let after_add: String = db
+        .conn()
+        .query_row(
+            "SELECT attempting_urls FROM share_delegations
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&after_add).unwrap(),
+        vec!["https://helper-1.example", "legacy helper without a URL"]
+    );
+
+    share::resolve_delivery_attempt(
+        &db,
+        &attempt,
+        share::ShareDeliveryAttemptOutcome::DefiniteFailure,
+        false,
+    )
+    .unwrap();
+    let after_remove: String = db
+        .conn()
+        .query_row(
+            "SELECT attempting_urls FROM share_delegations
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            rusqlite::named_params! {
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&after_remove).unwrap(),
+        vec!["legacy helper without a URL"]
+    );
+}
