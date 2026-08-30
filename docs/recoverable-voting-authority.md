@@ -306,8 +306,17 @@ derivation scheme.
 ### 2. Derive software-wallet roots from the wallet seed
 
 A software wallet uses the [ZIP 32 registered-key construction][zip32-registered]
-under the application-owned context `ZcashShieldedVoting` and a fixed numeric
-namespace constant, `VOTING_KDF_ID_V1`, defined by `zcash_voting`.
+under the exact ASCII context `ZcashShieldedVoting` and this fixed numeric
+namespace:
+
+```text
+VOTING_KDF_ID_V1 = 0x564F5445 = 1,448,039,493
+```
+
+The hexadecimal value spells `VOTE` in big-endian byte order and is below
+`2^31`. It is passed as the `ZipNumber` argument to `RegKD`, whose registered
+subtree step therefore uses hardened child index
+`VOTING_KDF_ID_V1 + 2^31 = 0xD64F5445`.
 
 Neither the context nor the numeric namespace requires external assignment or
 a standalone ZIP before deployment. `zcash_voting` defines both as version 1
@@ -340,6 +349,10 @@ The wallet-facing library API does not accept a mnemonic, root seed, account
 spending key, or registered subtree key. A narrow software seed-provider helper
 may live outside the ordinary API so integrations do not duplicate the path.
 
+The software provider should derive the authority root when needed. If it
+caches the root or derived hotkey, the cache belongs in platform secure storage,
+not `VotingDb`. The wallet seed remains the independent recovery source.
+
 The registered cryptovalue is not passed into any ZIP-32 KDF. The next section
 defines a direct Orchard-key expansion instead.
 
@@ -362,6 +375,33 @@ source, complete authority context, and 64-byte root. `zcash_voting` owns this
 payload and its validation; the wallet integration owns encryption,
 authentication, storage, and restore UX. The plaintext payload must never be
 logged, placed in a transaction memo, or included in diagnostics.
+
+Its exact plaintext encoding is compact UTF-8 JSON with these fields in this
+order and no whitespace or trailing newline:
+
+```text
+{"format_version":1,"root_source":"stored-random-v1","bundle_source":"<derived-v1 or imported-capability-v1>","authority_context":"<Base64>","authority_root":"<Base64>"}
+```
+
+Both byte strings use canonical padded standard Base64. `authority_context` is
+the complete `authority_context_v1` byte encoding, and `authority_root` must
+decode to exactly 64 bytes. Parsing follows the existing capability-codec rule:
+unknown, duplicate, missing, or reordered fields; whitespace; a trailing
+newline; noncanonical Base64; an unknown source; or an invalid context is
+rejected. A parser can enforce this by validating the decoded object,
+serializing it canonically, and requiring byte-for-byte equality with the
+input.
+
+This public fixture freezes the encoding. It uses regtest, account index zero,
+fingerprint bytes `00` through `1f`, vote chain `vote-chain-1`, little-endian
+round field element 1, root bytes `00` through `3f`, and `derived-v1`:
+
+```text
+{"format_version":1,"root_source":"stored-random-v1","bundle_source":"derived-v1","authority_context":"AQIAAAAAAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8MAHZvdGUtY2hhaW4tMQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","authority_root":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw=="}
+```
+
+The SHA-256 digest of those 325 plaintext bytes is
+`1446b608217b821ecd4dd394c488a3f65ed7a0e723c4d10b28640bbdae2157ef`.
 
 Because the complete context includes `account_fingerprint_32`, restore must
 compare the record with the currently selected Orchard full viewing key before
@@ -406,8 +446,8 @@ result is valid. The expected number of iterations is one; the counter makes
 the function interoperable for a rare invalid candidate. Return a derivation
 error rather than wrapping if the `u32` counter is exhausted.
 
-The hotkey uses external Orchard address index zero. Its persisted authority is
-a typed root, not an untagged byte string whose meaning is guessed from length:
+The hotkey uses external Orchard address index zero. Its in-memory authority is
+typed, not an untagged byte string whose meaning is guessed from length:
 
 ```text
 VotingAuthoritySecret::RandomV0(64-byte legacy hotkey seed)
@@ -419,9 +459,10 @@ VotingAuthoritySecret::RootV1 {
 }
 ```
 
-Implementations may cache the derived 32-byte Orchard spending key, but the
-root remains the recovery source. Both root and derived key are zeroized after
-use.
+Implementations may cache the derived 32-byte Orchard spending key only in the
+same platform secure-storage boundary as the root; neither secret belongs in
+`VotingDb`. The root remains the recovery source. In-memory copies of both
+secrets are zeroized after use.
 
 This direct expansion deliberately differs from today's
 `VotingHotkey::from_stored_secret`, which treats a random 64-byte value as a
@@ -520,29 +561,56 @@ The authenticated round configuration identifies:
 - `voting_authority_scheme = "recoverable-authority-v1"`; and
 - `bundle_policy = "recoverable-v1"`.
 
-`recoverable-v1` selects the account's canonical eligible note set at the
-round snapshot. Before planning, candidate notes are ordered by commitment-tree
-position with note commitment as a tiebreaker, then duplicate nullifiers are
-collapsed by retaining the first note in that order. It applies these frozen
-planning values:
+`recoverable-v1` requires the wallet to be scanned through the round snapshot
+and selects notes from the originally selected account that meet all of these
+conditions at that height:
+
+- the account has an Orchard full viewing key, and the note belongs to either
+  its external or internal scope;
+- the note uses the shielded-voting pool, protocol, and note version active at
+  the snapshot;
+- the note was mined at or before the snapshot and was unspent at the snapshot,
+  including a note that was spent later; and
+- its commitment-tree position, canonical 32-byte commitment, nullifier, and
+  value can be reconstructed.
+
+Notes from another account, pool, or note version, notes mined after the
+snapshot, and notes already spent at the snapshot are excluded. Before
+planning, candidate notes are ordered by commitment-tree position with note
+commitment as a tiebreaker. Duplicate nullifiers are then collapsed by keeping
+the first note in that order.
+
+The policy applies these frozen planning values:
 
 | Property | `recoverable-v1` value |
 | --- | --- |
-| Real notes per bundle | `BUNDLE_NOTE_SLOTS` (currently 5) |
+| Real notes per bundle | 5 |
 | Bundle-addition value threshold | Disabled |
 | Zero-ballot bundle rule | Drop totals below `BALLOT_DIVISOR` (12,500,000 zatoshi) |
 | Packing order | Value descending, then position ascending |
 | Notes within a surviving bundle | Position ascending |
 | Surviving bundle order | Total value descending, then minimum position ascending |
 | Privacy bundle target | 2 |
-| Privacy drop budget | 1% of selected note value |
+| Privacy drop budget | Floor of 1% of selected note value |
 | Absolute privacy drop ceiling | 100,000,000,000 zatoshi (1,000 ZEC) |
 
-The privacy trim greedily removes the lowest-value trailing bundle while both
-the bundle target and drop budget permit, preserving at least one eligible
-bundle. These rules intentionally match the current default policy except for
-making the initial note order and duplicate choice explicit. Later changes
-require a new policy identifier. They do not silently change version 1.
+Let `selected_value` be the sum of the deduplicated candidate-note values before
+zero-ballot bundles or privacy bundles are dropped. Using wide integer
+arithmetic, the exact budget is:
+
+```text
+percentage_budget = floor(selected_value * 100 / 10_000)
+effective_budget = min(percentage_budget, 100_000_000_000)
+```
+
+After zero-ballot bundles are removed and the surviving bundles are put in the
+table's order, privacy trimming repeatedly removes the trailing bundle while
+more than two bundles remain and
+`already_dropped + trailing_bundle_value <= effective_budget`. These rules
+match the current default policy except that version 1 also freezes the initial
+note order and duplicate choice. Any change to the candidate predicate,
+ordering, arithmetic, comparison, or constant requires a new policy identifier;
+it must not silently change `recoverable-v1`.
 
 Wallets may continue to support manual note subsets or custom policies, but
 those flows must either carry their own recoverable selection descriptor or
@@ -561,9 +629,11 @@ submitted.
 
 ### 7. Select the framework through authenticated round configuration
 
-Rounds created before activation use round-auth version 1 or 2, do not contain
-an authenticated scheme, and remain `random-v0`. A recoverable round uses
-round-auth version 3 and carries these fields in its signed round entry:
+Existing persisted authorities and authenticated round-auth version 2 rounds do
+not contain a signed authority scheme and remain `random-v0`. Round-auth version
+1 entries already fail current authentication and are skipped. A recoverable
+round uses round-auth version 3 and carries these fields in its signed round
+entry:
 
 ```text
 auth_version = 3
@@ -602,27 +672,38 @@ uses `stored-random-v1`. A direct delegation obtains bundle material through
 `imported-capability-v1`. Both root sources and both bundle sources are
 indistinguishable on the vote chain.
 
-The root source and root are persisted before direct delegation or publication
-of a public target. The typed construction or import persists the bundle source
-with its bundle IDs or capability digest. A wallet must not silently replace a
-missing root, re-derive imported blindings, or reinterpret a capability bundle
-as `derived-v1`.
+The root source and context are persisted before direct delegation or
+publication of a public target. The root is re-derived from the software seed or
+held in the stored-random secure-storage and backup boundary. The typed
+construction or import persists the bundle source with its bundle IDs or
+capability digest. A wallet must not silently replace a missing root, re-derive
+imported blindings, or reinterpret a capability bundle as `derived-v1`.
 
-The crate fails closed on an unknown auth version, scheme, root source, bundle
-source, or policy. It rejects authority fields attached to a version 1 or 2
-entry because those versions do not sign the fields. A wallet must not decide
-between legacy and version 1 behavior from an application version, date, secret
-length, or whether local rows happen to exist.
+Failure is scoped to the object that could not be authenticated or interpreted.
+An entry with an unknown auth version, authority scheme, or bundle policy is
+excluded from the resolved round set and its round ID is reported, while other
+authenticated rounds remain usable. An unknown persisted root source, bundle
+source, or authority version rejects operations and recovery for that authority.
+Authority fields on a version 1 or 2 entry are rejected because those versions
+do not sign them. A wallet must not decide between legacy and version 1 behavior
+from an application version, date, secret length, or whether local rows happen
+to exist.
 
 The vote chain does not need the scheme to verify proofs or signatures. A
 future vote-action field may make scheme negotiation more visible, but it is
 not required for the first implementation because round-auth version 3 binds
 the value before the wallet constructs any delegation.
 
-An older wallet that supports only auth versions 1 and 2 rejects version 3
-rather than ignoring an unsigned extension. Activation must not issue a
-version 1 or 2 attestation for the same new round as a compatibility fallback;
-doing so would let an older wallet join under `random-v0` behavior.
+An older wallet that supports only version 2 does not authenticate or join a
+version 3 round, but can continue to resolve other supported rounds. Activation
+must not issue a version 2 attestation for the same new round as a compatibility
+fallback; doing so would let an older wallet join under `random-v0` behavior.
+
+Version 3 intentionally preserves the version 2 preimage fields and does not
+add network or vote-chain ID. The trusted signing-key set and signed config
+namespace must therefore be scoped to exactly one Zcash network and one vote
+chain. If a deployment needs to reuse the same trusted keys across either
+boundary, it needs a later auth version that signs both identifiers.
 
 ## Software-wallet flow
 
@@ -634,9 +715,9 @@ doing so would let an older wallet join under `random-v0` behavior.
 3. Ask the software seed provider for the version 1 authority root.
 4. Select `derived-v1` and construct the hotkey, every bundle ID, and every
    blinding factor in `zcash_voting`.
-5. Persist the root source, `derived-v1` bundle source, context, root, bundle
-   IDs, blindings, and plan for normal operation. The seed remains the
-   independent recovery source.
+5. Persist the root source, `derived-v1` bundle source, context, bundle IDs,
+   blindings, and plan metadata for normal operation. Derive the root from the
+   seed when needed, or cache it only in platform secure storage.
 6. Build proofs, sign, submit, and confirm delegation through the existing
    lifecycle.
 
@@ -750,7 +831,8 @@ atomically, but it does not merge their identities or create a batch-wide
    target and round against the recovered hotkey, and import its bundle indices,
    weights, blindings, and transaction hashes.
 4. Reconstruct each initial VAN from the recovered hotkey and bundle material.
-5. Sync and root-validate the vote-commitment tree.
+5. Sync and root-validate the vote-commitment tree against authenticated current
+   vote-chain state.
 6. Derive the VAN for every mask obtainable by clearing a subset of the
    round's proposal bits and locate matching commitments in the tree.
 7. Require each later tree match's set bits to be a strict subset of the
@@ -779,6 +861,11 @@ using submission as a probe. If a future circuit expands the authority mask
 enough to make enumeration impractical, a targeted nullifier-to-successor query
 can replace the search without changing authority derivation.
 
+Root validation proves the integrity of the tree at the selected chain state,
+not that a data source supplied the current state. A stale or withholding source
+therefore stops recovery instead of making absence evidence that a VAN is
+unused.
+
 Version 1 does not reconstruct an earlier choice, helper-delivery state, atomic
 batch order, or exact unconfirmed transaction after the voting database is
 lost. It also cannot recreate a missing custody capability. Those are separate
@@ -802,9 +889,10 @@ bundle blinding factor. That legacy package is distinct from
 `VotingAuthorityBackupV1`.
 
 Persisted state adds explicit authority scheme, root source, bundle source,
-authority context, and either bundle-ID or capability-digest metadata. Migration
-assigns `random-v0` to all existing rows. It never infers a scheme from secret
-length or recomputes a value merely because a column is empty.
+authority context, and either bundle-ID or capability-digest metadata. It does
+not add the version 1 root or a cached Orchard spending key to `VotingDb`.
+Migration assigns `random-v0` to all existing rows. It never infers a scheme
+from secret length or recomputes a value merely because a column is empty.
 
 Changing the root, provider, or bundle source is allowed only before any
 delegation may have been submitted. After that point, the original authority
@@ -816,7 +904,9 @@ The existing public-target flow remains part of
 `recoverable-authority-v1`. The voter obtains an authority root from either
 version 1 root source, derives the hotkey, and sends the existing round-bound
 public target. The authority context is bound to the voter's selected account;
-it does not claim that the voter owns the funds controller's account.
+it does not claim that the voter owns the funds controller's account. The
+selected voter account must be Orchard-capable but need not contain the funds
+being delegated by the controller.
 
 The funds controller applies `recoverable-v1` to its own snapshot notes,
 samples each VAN blinding as it does today, constructs ZKP #1, and exports the
