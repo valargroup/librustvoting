@@ -1048,8 +1048,12 @@ contains:
   share material;
 - `confirmed_vc_tree_position: Option<u64>` for each action;
 - the common digest and complete action order for an atomic batch;
-- the helper-delivery journal for each share, including its identity, original
-  `created_at`, `submit_at`, target count, accepted (`sent_to_urls`),
+- an optional original helper plan for each action, containing the canonical
+  planning-time helper fleet and one positionally aligned plan per encrypted
+  share with `immediate`, `submit_at`, `target_count`, and canonical distinct
+  `target_servers`;
+- the optional helper-delivery journal for each share, including its identity,
+  original `created_at`, `submit_at`, target count, accepted (`sent_to_urls`),
   `ambiguous_urls`, and `attempting_urls` helper sets, and confirmation state;
   and
 - a stable record ID, monotonic revision, and prior-revision digest.
@@ -1092,6 +1096,34 @@ action. No helper network effect is allowed until either path supplies it. An
 action not found there remains subject to ordinary transaction
 reconciliation; its recovered message or complete batch can be resubmitted
 without preserving the original outer transaction bytes.
+
+The pre-broadcast revision has no helper plans or journals. After confirmation,
+each action's plan may be installed once, but only as the complete plan set
+returned for all of that action's encrypted shares. The integration writes and
+reads back the new record revision, then compare-and-swap advances and reads
+back the collection head before the first helper reservation or POST for that
+action. If a plan is still absent after restore, the wallet may plan that
+action's complete share set and pass through the same durability gate. It never
+plans only the shares whose journals are absent.
+
+Plan merge permits absent to become one complete value and otherwise requires
+the stored value byte for byte. Present to absent, a partial or positionally
+misaligned share set, or a different planning-time fleet, `immediate` marker,
+schedule, target count, or target list fails closed. Before initial fan-out, the
+stored plan is validated against the complete current helper fleet under the
+existing wallet-plan rules. A removed planned target, target-count drift,
+noncanonical or duplicate helper, or commitment-wide quota violation stops
+before a network effect; it does not authorize replanning. Once delivery has
+begun, the journal and current validated fleet drive recovery under the helper
+tracker rules. The original target lists remain initial-placement context and
+do not cap recovery.
+
+A missing journal entry is distinct from a present entry whose accepted,
+ambiguous, and attempting sets are all empty. The latter can remain after a
+definite failed POST and is restored as delivery history. A journal without its
+action's complete stored plan is invalid. A share with a stored plan but no
+journal resumes through typed initial delivery with that exact plan; a present
+journal is imported before the helper tracker resumes.
 
 The backup is a collection of immutable revisions addressed by `record_id` and
 revision digest, not one shared slot. Each record's revisions have a monotonic
@@ -1238,7 +1270,7 @@ capability format, or additional custody exchange changes in version 1.
   including accepted, ambiguous, and attempting sets, target counts, and
   pre-dispatch reservations;
 - the pending-tally record and collection-head encodings, digests, and
-  helper-journal restore rules;
+  original-plan and helper-journal restore rules;
 - the typed vote-chain recovery checkpoint and target-bound tree and transition
   validation;
 - the recoverable bundle policy and round-auth version 3 digest validation;
@@ -1252,6 +1284,8 @@ capability format, or additional custody exchange changes in version 1.
   attempt;
 - durably store and read back each encrypted pending-tally record before vote or
   helper network effects;
+- retain and reuse each complete original helper plan, and never replan only
+  shares whose journals are absent;
 - compare-and-swap and read back the collection head in rollback-resistant
   authenticated storage independent of both `VotingDb` and the encrypted
   record collection;
