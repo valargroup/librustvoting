@@ -998,6 +998,23 @@ confirming all of its expected helper shares. It contains:
   and
 - a stable record ID, monotonic revision, and prior-revision digest.
 
+The record ID is stable across confirmation and helper-journal updates:
+
+```text
+record_id = SHA-256(
+    "zcash-shielded-vote:pending-tally:v1"
+    || authority_context_v1
+    || bundle_index_u32_le
+    || record_identity
+)
+
+singleton record_identity = 0x00 || proposal_id_u32_le || vote_commitment_32
+atomic-batch record_identity = 0x01 || batch_digest_32
+```
+
+The batch digest already binds its complete ordered action list. Restore
+recomputes the ID from the record body and rejects a mismatched storage key.
+
 `zcash_voting` owns the versioned record, validation, and conservative merge
 rules. The integration stores it in authenticated encrypted storage that
 survives loss of `VotingDb`; it is not sent to the vote chain or helpers. The
@@ -1009,10 +1026,15 @@ An action not found there remains subject to ordinary transaction
 reconciliation; its recovered message or complete batch can be resubmitted
 without preserving the original outer transaction bytes.
 
-The backup slot must atomically retain and return its latest committed revision;
-an older but otherwise valid snapshot is not sufficient. Updates use
-compare-and-swap or an append-only equivalent, and restore rejects a broken
-revision chain or two different records at the same revision.
+The backup is an enumerable collection keyed by `record_id`, not one shared
+slot. Each key has its own compare-and-swap revision chain, and creating,
+updating, or deleting one key cannot replace another pending vote. Restore
+lists every key, loads every latest live revision and tombstone, and rejects a
+broken revision chain or two different records at the same revision. The store
+must atomically retain and return those latest revisions; an older but otherwise
+valid collection snapshot is not sufficient. Adding one key while tombstoning
+another is one collection transaction. An append-only implementation is also
+valid if it provides the same enumeration and freshness guarantees.
 
 Before each helper POST, the corresponding attempting state is made durable.
 The accepted, ambiguous, definite-failure, or confirmed transition is then
@@ -1023,12 +1045,14 @@ current validated helper configuration. Conflicting identity, schedule, batch,
 or tree-position data fails closed. These are the same ordering and retry rules
 used by the live tracker, not a second delivery policy.
 
-All actions in an atomic batch are committed to this backup together; a partial
-batch record is invalid. Helper tracking remains per action and share. Once all
-expected shares are confirmed on the vote chain, the record is deleted. The
-wallet does not retain complete vote history: after deletion, VAN transition
-recovery can still show that a proposal was already consumed, but it does not
-recover the earlier ballot choice.
+All actions in an atomic batch are committed to one record together; a partial
+batch record is invalid. Helper tracking remains per action and share. Replacing
+unsubmitted ballot intent atomically creates the replacement and tombstones the
+old ID. Once all expected shares are confirmed on the vote chain, the secret
+record body is deleted and its authenticated tombstone prevents an older backup
+from restoring it. The wallet does not retain complete vote history: VAN
+transition recovery can still show that a proposal was already consumed, but
+neither it nor the tombstone recovers the earlier ballot choice.
 
 ## Legacy migration
 
@@ -1112,11 +1136,12 @@ capability format, or additional custody exchange changes in version 1.
 
 ### All wallet integrations
 
-- durably store and read back the encrypted pending-tally record before vote or
+- durably store and read back each encrypted pending-tally record before vote or
   helper network effects;
-- restore it outside `VotingDb` and pass it back through the canonical
-  `zcash_voting` importer; and
-- delete it only after all expected helper shares are confirmed.
+- enumerate every record and tombstone outside `VotingDb` and pass them through
+  the canonical `zcash_voting` importer; and
+- tombstone a record and remove its secret body only after all expected helper
+  shares are confirmed.
 
 ### Software-wallet integrations
 
