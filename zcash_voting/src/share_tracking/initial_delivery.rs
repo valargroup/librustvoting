@@ -9,7 +9,7 @@ use crate::{
         share_submission_target_count, SHARE_DELIVERY_MIN_ATTEMPT_BUDGET_MILLISECONDS,
         SHARE_INITIAL_DELIVERY_TIMEOUT_MILLISECONDS,
     },
-    types::{SharePayload, VotingError},
+    types::{ShareDelegationRecord, SharePayload, VotingError},
 };
 
 use super::{
@@ -70,6 +70,7 @@ pub(crate) async fn submit_share_to_helpers(
 
 /// Executes a fan-out after the caller has established canonical, disjoint
 /// candidate groups.
+#[cfg(test)]
 async fn submit_share_to_canonical_helpers(
     db: &VotingDb,
     client: &HelperClient,
@@ -78,13 +79,30 @@ async fn submit_share_to_canonical_helpers(
     fallback: &[String],
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
-    let planned_set: HashSet<&str> = planned.iter().map(String::as_str).collect();
-    let candidates = planned.iter().chain(fallback).cloned().collect::<Vec<_>>();
+    let (_, persisted_delivery) = prepare_share_delivery(db, params)?;
+    dispatch_share_to_canonical_helpers(
+        db,
+        client,
+        params,
+        planned,
+        fallback,
+        persisted_delivery,
+        cancel,
+    )
+    .await
+}
+
+/// Creates or merges the durable record before dispatch and returns the
+/// write-once schedule together with the merged delivery state.
+fn prepare_share_delivery(
+    db: &VotingDb,
+    params: &InitialShareSubmissionParams<'_>,
+) -> Result<(u64, ShareDelegationRecord), VotingError> {
     let initial_persisted_report = ShareSubmissionReport {
         target_count: params.target_count,
         ..ShareSubmissionReport::default()
     };
-    share::record_delivery(
+    let durable_submit_at = share::record_delivery(
         db,
         &share::ShareDeliveryRecordParams {
             round_id: params.round_id,
@@ -105,6 +123,21 @@ async fn submit_share_to_canonical_helpers(
         .ok_or_else(|| VotingError::Internal {
             message: "newly journaled helper share was not found".to_string(),
         })?;
+    Ok((durable_submit_at, persisted_delivery))
+}
+
+/// Continues fan-out from an already-prepared durable delivery record.
+async fn dispatch_share_to_canonical_helpers(
+    db: &VotingDb,
+    client: &HelperClient,
+    params: &InitialShareSubmissionParams<'_>,
+    planned: &[String],
+    fallback: &[String],
+    persisted_delivery: ShareDelegationRecord,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<ShareSubmissionReport, VotingError> {
+    let planned_set: HashSet<&str> = planned.iter().map(String::as_str).collect();
+    let candidates = planned.iter().chain(fallback).cloned().collect::<Vec<_>>();
     let definite_acceptance_urls = persisted_delivery
         .sent_to_urls
         .into_iter()
@@ -312,7 +345,11 @@ pub(crate) async fn submit_committed_share_to_helpers(
                 });
             }
         };
-    let share_wire_json = payload.to_wire_json(Some(vc_tree_position), request.plan.submit_at)?;
+    // Validate the complete typed payload before the durable row is created.
+    // A continuation may replace this requested schedule with the write-once
+    // value returned by persistence.
+    let requested_share_wire_json =
+        payload.to_wire_json(Some(vc_tree_position), request.plan.submit_at)?;
     let mut candidates = planned;
     let fallback = configured
         .urls()
@@ -321,25 +358,34 @@ pub(crate) async fn submit_committed_share_to_helpers(
         .cloned()
         .collect::<Vec<_>>();
     candidates.extend(fallback);
-    submit_share_to_canonical_helpers(
+    let requested_params = InitialShareSubmissionParams {
+        round_id,
+        bundle_index,
+        proposal_id,
+        share_index: request.share_index,
+        share_wire_json: &requested_share_wire_json,
+        #[cfg(test)]
+        planned_servers: &candidates[..planned_target],
+        #[cfg(test)]
+        fallback_servers: &candidates[planned_target..],
+        target_count: planned_target,
+        submit_at: request.plan.submit_at,
+        now_seconds: request.now_seconds,
+    };
+    let (durable_submit_at, persisted_delivery) = prepare_share_delivery(db, &requested_params)?;
+    let share_wire_json = payload.to_wire_json(Some(vc_tree_position), durable_submit_at)?;
+    let durable_params = InitialShareSubmissionParams {
+        share_wire_json: &share_wire_json,
+        submit_at: durable_submit_at,
+        ..requested_params
+    };
+    dispatch_share_to_canonical_helpers(
         db,
         client,
-        &InitialShareSubmissionParams {
-            round_id,
-            bundle_index,
-            proposal_id,
-            share_index: request.share_index,
-            share_wire_json: &share_wire_json,
-            #[cfg(test)]
-            planned_servers: &candidates[..planned_target],
-            #[cfg(test)]
-            fallback_servers: &candidates[planned_target..],
-            target_count: planned_target,
-            submit_at: request.plan.submit_at,
-            now_seconds: request.now_seconds,
-        },
+        &durable_params,
         &candidates[..planned_target],
         &candidates[planned_target..],
+        persisted_delivery,
         cancel,
     )
     .await

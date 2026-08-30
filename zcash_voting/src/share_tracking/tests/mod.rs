@@ -376,6 +376,11 @@ fn db_with_delivery(
 fn db_with_recoverable_vote() -> VotingDb {
     let db = VotingDb::open_in_memory().unwrap();
     db.set_wallet_id(WALLET_ID);
+    seed_recoverable_vote(&db);
+    db
+}
+
+fn seed_recoverable_vote(db: &VotingDb) {
     db.create_round(
         crate::Network::Testnet,
         &RoundParams {
@@ -404,7 +409,6 @@ fn db_with_recoverable_vote() -> VotingDb {
             },
         )
         .unwrap();
-    db
 }
 
 fn only_share(db: &VotingDb) -> ShareDelegationRecord {

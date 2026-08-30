@@ -540,6 +540,139 @@ async fn repeated_committed_submission_preserves_the_original_schedule() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn repeated_partial_committed_submission_sends_original_schedule_to_new_helper() {
+    let db = db_with_recoverable_vote();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(3);
+    let first_plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 4_321,
+        target_count: 2,
+        target_servers: vec![helper(1), helper(2)],
+    };
+    let second_plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 9_876,
+        target_count: 2,
+        target_servers: vec![helper(3), helper(2)],
+    };
+    let first_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    let second_url = format!("{}/shielded-vote/v1/shares", helper(2));
+    let new_url = format!("{}/shielded-vote/v1/shares", helper(3));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post_after(&first_url, Duration::from_secs(50), json_status("queued"));
+    transport.queue_post_after(&second_url, Duration::from_secs(20), json_status("queued"));
+    transport.queue_post(&new_url, json_status("queued"));
+    let config = HelperClientConfig::default()
+        .with_post_timeout(Duration::from_secs(90))
+        .unwrap()
+        .without_retries();
+    let client = HelperClient::with_config(transport.clone(), HelperHealth::default(), config);
+
+    let first = committed
+        .submit_share_to_helpers(
+            &db,
+            &client,
+            ShareSubmissionRequest {
+                share_index: 0,
+                plan: &first_plan,
+                configured_server_urls: &configured,
+                now_seconds: SUBMIT_AT,
+            },
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.accepted_urls, vec![helper(1)]);
+    assert_eq!(first.ambiguous_urls, vec![helper(2)]);
+    assert_eq!(first.target_count, 2);
+    assert_eq!(transport.call_count(&helper(3)), 0);
+
+    let second = committed
+        .submit_share_to_helpers(
+            &db,
+            &client,
+            ShareSubmissionRequest {
+                share_index: 0,
+                plan: &second_plan,
+                configured_server_urls: &configured,
+                now_seconds: SUBMIT_AT,
+            },
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(second.accepted_urls, vec![helper(1), helper(3)]);
+    assert_eq!(second.ambiguous_urls, vec![helper(2)]);
+    assert_eq!(second.target_count, 2);
+    assert_eq!(transport.posted_submit_at(&new_url), first_plan.submit_at);
+    assert_eq!(transport.call_count(&helper(1)), 1);
+    assert_eq!(transport.call_count(&helper(2)), 1);
+    assert_eq!(transport.call_count(&helper(3)), 1);
+    let stored = only_share(&db);
+    assert_eq!(stored.submit_at, first_plan.submit_at);
+    assert_eq!(stored.sent_to_urls, vec![helper(1), helper(3)]);
+    assert_eq!(stored.ambiguous_urls, vec![helper(2)]);
+    assert!(stored.attempting_urls.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_committed_submission_does_not_resurrect_zero_schedule() {
+    let db = db_with_recoverable_vote();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(3);
+    let initial = ShareSubmissionReport {
+        accepted_urls: vec![helper(1)],
+        target_count: 2,
+        ..ShareSubmissionReport::default()
+    };
+    share::record_delivery(
+        &db,
+        &share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            submission: &initial,
+            submit_at: 0,
+        },
+    )
+    .unwrap();
+    let plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 9_876,
+        target_count: 2,
+        target_servers: vec![helper(2), helper(3)],
+    };
+    let new_url = format!("{}/shielded-vote/v1/shares", helper(2));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&new_url, json_status("queued"));
+    let client = client_with(transport.clone());
+
+    let report = committed
+        .submit_share_to_helpers(
+            &db,
+            &client,
+            ShareSubmissionRequest {
+                share_index: 0,
+                plan: &plan,
+                configured_server_urls: &configured,
+                now_seconds: SUBMIT_AT,
+            },
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.accepted_urls, vec![helper(1), helper(2)]);
+    assert_eq!(transport.posted_submit_at(&new_url), 0);
+    assert_eq!(transport.call_count(&helper(3)), 0);
+    assert_eq!(only_share(&db).submit_at, 0);
+}
+
+#[tokio::test(start_paused = true)]
 async fn committed_vote_submission_rejects_mismatched_plan_before_side_effects() {
     let db = db_with_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
@@ -842,6 +975,89 @@ async fn failed_attempt_write_prevents_network_dispatch() {
 
     assert!(result.is_err());
     assert!(transport.calls().is_empty());
+}
+
+#[test]
+fn concurrent_attempt_reservations_preserve_both_markers() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "zcash-voting-concurrent-attempts-{}-{unique}.sqlite",
+        std::process::id()
+    ));
+    let path_string = path.to_string_lossy().into_owned();
+    let first_db = VotingDb::open(&path_string).unwrap();
+    first_db.set_wallet_id(WALLET_ID);
+    seed_recoverable_vote(&first_db);
+    let initial = ShareSubmissionReport {
+        target_count: 2,
+        ..ShareSubmissionReport::default()
+    };
+    share::record_delivery(
+        &first_db,
+        &share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            submission: &initial,
+            submit_at: SUBMIT_AT,
+        },
+    )
+    .unwrap();
+
+    let second_db = VotingDb::open(&path_string).unwrap();
+    second_db.set_wallet_id(WALLET_ID);
+    let writer = second_db.conn();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer
+        .execute(
+            "UPDATE share_delegations SET attempting_urls = :attempting_urls
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+            rusqlite::named_params! {
+                ":attempting_urls": serde_json::to_string(&[helper(2)]).unwrap(),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let reservation = std::thread::spawn(move || {
+        let first_helper = helper(1);
+        let attempt = share::ShareDeliveryAttemptParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            server_url: &first_helper,
+            target_count: 2,
+            submit_at: SUBMIT_AT,
+        };
+        started_tx.send(()).unwrap();
+        let added = share::begin_existing_delivery_attempt(&first_db, &attempt).unwrap();
+        (first_db, added)
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    writer.execute_batch("COMMIT").unwrap();
+    drop(writer);
+
+    let (first_db, added) = reservation.join().unwrap();
+    assert!(added);
+    assert_eq!(
+        only_share(&second_db).attempting_urls,
+        vec![helper(2), helper(1)]
+    );
+
+    drop(first_db);
+    drop(second_db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path_string}-shm"));
+    let _ = std::fs::remove_file(format!("{path_string}-wal"));
 }
 
 #[test]

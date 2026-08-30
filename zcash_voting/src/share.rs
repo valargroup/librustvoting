@@ -312,6 +312,8 @@ pub fn record(
 /// during early replenishment but may retry them during overdue duplicate-safe
 /// recovery.
 ///
+/// Returns the effective durable `submit_at`, preserving an existing schedule.
+///
 /// # Errors
 ///
 /// Returns [`VotingError::InvalidInput`] when the target does not fit the
@@ -323,7 +325,7 @@ pub fn record(
 fn record_delivery_impl(
     db: &VotingDb,
     params: &ShareDeliveryRecordParams<'_>,
-) -> Result<(), VotingError> {
+) -> Result<u64, VotingError> {
     let target_count =
         u32::try_from(params.submission.target_count).map_err(|_| VotingError::InvalidInput {
             message: format!(
@@ -354,7 +356,7 @@ fn record_delivery_impl(
 pub(crate) fn record_delivery(
     db: &VotingDb,
     params: &ShareDeliveryRecordParams<'_>,
-) -> Result<(), VotingError> {
+) -> Result<u64, VotingError> {
     record_delivery_impl(db, params)
 }
 
@@ -393,6 +395,7 @@ pub fn record_delivery_fixture(
             submit_at,
         },
     )
+    .map(|_| ())
 }
 
 /// Writes an `attempting` marker before a helper POST may be dispatched.

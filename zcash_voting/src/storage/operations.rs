@@ -1806,9 +1806,10 @@ impl VotingDb {
             nullifier,
             submit_at,
         )
+        .map(|_| ())
     }
 
-    /// Record definite and outcome-unknown helper deliveries with their target.
+    /// Record helper deliveries and return the effective write-once schedule.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_share_delivery(
         &self,
@@ -1821,7 +1822,7 @@ impl VotingDb {
         target_count: u32,
         nullifier: &[u8],
         submit_at: u64,
-    ) -> Result<(), VotingError> {
+    ) -> Result<u64, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::record_share_delegation(
@@ -5442,8 +5443,10 @@ mod tests {
         db.record_share_delegation(ROUND_ID, 0, 0, 0, &urls_a, &nf, 1000)
             .unwrap();
         let urls_c = vec!["https://helper-c.example".to_string()];
-        db.record_share_delivery(ROUND_ID, 0, 0, 1, &urls_b, &urls_c, 2, &nf, 2000)
+        let initial_submit_at = db
+            .record_share_delivery(ROUND_ID, 0, 0, 1, &urls_b, &urls_c, 2, &nf, 2000)
             .unwrap();
+        assert_eq!(initial_submit_at, 2000);
 
         // Query all — should return both
         let all = db.get_share_delegations(ROUND_ID).unwrap();
@@ -5464,8 +5467,10 @@ mod tests {
         // A resumed fan-out merges history: prior accepted URLs survive, a
         // newly accepted URL outranks its old ambiguous state, and the desired
         // placement cannot shrink.
-        db.record_share_delivery(ROUND_ID, 0, 0, 1, &urls_c, &urls_d, 1, &nf, 2500)
+        let resumed_submit_at = db
+            .record_share_delivery(ROUND_ID, 0, 0, 1, &urls_c, &urls_d, 1, &nf, 2500)
             .unwrap();
+        assert_eq!(resumed_submit_at, 2000);
         let rerecorded = db
             .get_share_delegations(ROUND_ID)
             .unwrap()
