@@ -1884,6 +1884,38 @@ impl VotingDb {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_share_delivery_for_vote_generation(
+        &self,
+        wallet_id: &str,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+        sent_to_urls: &[String],
+        ambiguous_urls: &[String],
+        target_count: u32,
+        nullifier: &[u8],
+        submit_at: u64,
+        expected_commitment_bundle_json: &str,
+    ) -> Result<u64, VotingError> {
+        let mut conn = self.conn();
+        queries::record_share_delegation_for_vote_generation(
+            &mut conn,
+            round_id,
+            wallet_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+            sent_to_urls,
+            ambiguous_urls,
+            target_count,
+            nullifier,
+            submit_at,
+            expected_commitment_bundle_json,
+        )
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_attempting_server(

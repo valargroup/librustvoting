@@ -97,6 +97,7 @@ async fn submit_share_to_canonical_helpers(
 
 /// Creates or merges the durable record before dispatch and returns the
 /// write-once schedule together with the merged delivery state.
+#[cfg(test)]
 fn prepare_share_delivery(
     db: &VotingDb,
     scope: &share::ShareOperationScope,
@@ -118,13 +119,51 @@ fn prepare_share_delivery(
             submit_at: params.submit_at,
         },
     )?;
+    load_prepared_share_delivery(db, scope, params, durable_submit_at, &expected_nullifier)
+}
+
+fn prepare_committed_share_delivery(
+    db: &VotingDb,
+    scope: &share::ShareOperationScope,
+    params: &InitialShareSubmissionParams<'_>,
+    expected_commitment_bundle_json: &str,
+    expected_nullifier: &[u8; 32],
+) -> Result<(u64, ShareDelegationRecord), VotingError> {
+    let initial_persisted_report = ShareSubmissionReport {
+        target_count: params.target_count,
+        ..ShareSubmissionReport::default()
+    };
+    let (durable_submit_at, expected_nullifier) = share::record_delivery_for_committed_vote(
+        db,
+        scope,
+        &share::ShareDeliveryRecordParams {
+            round_id: params.round_id,
+            bundle_index: params.bundle_index,
+            proposal_id: params.proposal_id,
+            share_index: params.share_index,
+            submission: &initial_persisted_report,
+            submit_at: params.submit_at,
+        },
+        expected_commitment_bundle_json,
+        expected_nullifier,
+    )?;
+    load_prepared_share_delivery(db, scope, params, durable_submit_at, &expected_nullifier)
+}
+
+fn load_prepared_share_delivery(
+    db: &VotingDb,
+    scope: &share::ShareOperationScope,
+    params: &InitialShareSubmissionParams<'_>,
+    durable_submit_at: u64,
+    expected_nullifier: &[u8; 32],
+) -> Result<(u64, ShareDelegationRecord), VotingError> {
     let persisted_delivery = share::list_for_scope(db, scope, params.round_id)?
         .into_iter()
         .find(|share| {
             share.bundle_index == params.bundle_index
                 && share.proposal_id == params.proposal_id
                 && share.share_index == params.share_index
-                && share.nullifier == expected_nullifier
+                && share.nullifier == expected_nullifier.as_slice()
         })
         .ok_or_else(|| VotingError::Internal {
             message: "newly journaled helper share was not found".to_string(),
@@ -374,38 +413,49 @@ pub(crate) async fn submit_committed_share_to_helpers(
             message: "committed share payload identity does not match its vote handle".to_string(),
         });
     }
-    let vc_tree_position = match vote_recovery::helper_recovery_material_for_wallet(
-        db,
-        scope.wallet_id(),
-        round_id,
-        bundle_index,
-        proposal_id,
-    )? {
-        vote_recovery::HelperRecoveryMaterial::Ready(bundle) => {
-            let recovery = crate::vote::parse_recovery(&bundle.commitment_bundle_json)?;
-            if recovery.vote_commitment != *expected_vote_commitment {
-                return Err(VotingError::InvalidInput {
-                    message: format!(
-                        "committed vote changed before helper share submission for \
+    let (vc_tree_position, expected_nullifier, expected_commitment_bundle_json) =
+        match vote_recovery::helper_recovery_material_for_wallet(
+            db,
+            scope.wallet_id(),
+            round_id,
+            bundle_index,
+            proposal_id,
+        )? {
+            vote_recovery::HelperRecoveryMaterial::Ready(bundle) => {
+                let recovery = crate::vote::parse_recovery(&bundle.commitment_bundle_json)?;
+                if recovery.vote_commitment != *expected_vote_commitment {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "committed vote changed before helper share submission for \
                              round={round_id}, bundle={bundle_index}, proposal={proposal_id}; \
                              recover the current committed vote"
-                    ),
+                        ),
+                    });
+                }
+                let expected_nullifier = share::nullifier_from_recovery_json(
+                    &bundle.commitment_bundle_json,
+                    proposal_id,
+                    request.share_index,
+                )?;
+                (
+                    bundle.vc_tree_position,
+                    expected_nullifier,
+                    bundle.commitment_bundle_json,
+                )
+            }
+            vote_recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
+                return Err(VotingError::InvalidInput {
+                    message: "committed vote must be confirmed before submitting helper shares"
+                        .to_string(),
                 });
             }
-            bundle.vc_tree_position
-        }
-        vote_recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
-            return Err(VotingError::InvalidInput {
-                message: "committed vote must be confirmed before submitting helper shares"
-                    .to_string(),
-            });
-        }
-        vote_recovery::HelperRecoveryMaterial::Missing => {
-            return Err(VotingError::Internal {
-                message: "committed vote is missing durable helper recovery material".to_string(),
-            });
-        }
-    };
+            vote_recovery::HelperRecoveryMaterial::Missing => {
+                return Err(VotingError::Internal {
+                    message: "committed vote is missing durable helper recovery material"
+                        .to_string(),
+                });
+            }
+        };
     // Validate the complete typed payload before the durable row is created.
     // A continuation may replace this requested schedule with the write-once
     // value returned by persistence.
@@ -433,8 +483,13 @@ pub(crate) async fn submit_committed_share_to_helpers(
         submit_at: request.plan.submit_at,
         now_seconds: request.now_seconds,
     };
-    let (durable_submit_at, persisted_delivery) =
-        prepare_share_delivery(db, &scope, &requested_params)?;
+    let (durable_submit_at, persisted_delivery) = prepare_committed_share_delivery(
+        db,
+        &scope,
+        &requested_params,
+        &expected_commitment_bundle_json,
+        &expected_nullifier,
+    )?;
     let share_wire_json = payload.to_wire_json(Some(vc_tree_position), durable_submit_at)?;
     let durable_params = InitialShareSubmissionParams {
         share_wire_json: &share_wire_json,

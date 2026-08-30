@@ -375,13 +375,7 @@ pub(crate) fn record_delivery_for_scope(
     scope: &ShareOperationScope,
     params: &ShareDeliveryRecordParams<'_>,
 ) -> Result<(u64, [u8; 32]), VotingError> {
-    let target_count =
-        u32::try_from(params.submission.target_count).map_err(|_| VotingError::InvalidInput {
-            message: format!(
-                "target_count {} does not fit u32",
-                params.submission.target_count
-            ),
-        })?;
+    let target_count = persisted_delivery_target_count(params)?;
     let nullifier = delivery_nullifier_for_scope(
         db,
         scope,
@@ -403,6 +397,43 @@ pub(crate) fn record_delivery_for_scope(
         params.submit_at,
     )?;
     Ok((submit_at, nullifier))
+}
+
+/// Records delivery while atomically requiring the recovery generation that
+/// was validated before the share payload was built.
+pub(crate) fn record_delivery_for_committed_vote(
+    db: &VotingDb,
+    scope: &ShareOperationScope,
+    params: &ShareDeliveryRecordParams<'_>,
+    expected_commitment_bundle_json: &str,
+    expected_nullifier: &[u8; 32],
+) -> Result<(u64, [u8; 32]), VotingError> {
+    let target_count = persisted_delivery_target_count(params)?;
+    let submit_at = db.record_share_delivery_for_vote_generation(
+        scope.wallet_id(),
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+        &params.submission.accepted_urls,
+        &params.submission.ambiguous_urls,
+        target_count,
+        expected_nullifier,
+        params.submit_at,
+        expected_commitment_bundle_json,
+    )?;
+    Ok((submit_at, *expected_nullifier))
+}
+
+fn persisted_delivery_target_count(
+    params: &ShareDeliveryRecordParams<'_>,
+) -> Result<u32, VotingError> {
+    u32::try_from(params.submission.target_count).map_err(|_| VotingError::InvalidInput {
+        message: format!(
+            "target_count {} does not fit u32",
+            params.submission.target_count
+        ),
+    })
 }
 
 #[cfg(test)]

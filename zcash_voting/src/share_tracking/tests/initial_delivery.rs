@@ -551,6 +551,58 @@ async fn stale_committed_vote_submission_is_rejected_before_side_effects() {
     assert_eq!(persisted.vc_tree_position, 789);
 }
 
+#[test]
+fn generation_bound_preparation_rejects_replacement_after_validation() {
+    let db = db_with_round_and_bundle();
+    let original_recovery = recovery_bundle_fixture();
+    crate::vote::insert_recovery_fixture(&db, &original_recovery).unwrap();
+    let expected_commitment_bundle_json =
+        crate::vote::serialize_recovery(&original_recovery).unwrap();
+    let expected_nullifier = share::nullifier_from_recovery_json(
+        &expected_commitment_bundle_json,
+        original_recovery.proposal_id,
+        0,
+    )
+    .unwrap();
+    let scope = share::ShareOperationScope::capture(&db);
+    let submission = ShareSubmissionReport {
+        target_count: 1,
+        ..ShareSubmissionReport::default()
+    };
+    let params = share::ShareDeliveryRecordParams {
+        round_id: ROUND_ID,
+        bundle_index: 0,
+        proposal_id: 1,
+        share_index: 0,
+        submission: &submission,
+        submit_at: 4_321,
+    };
+
+    // This replacement models the interval after the committed-handle check
+    // and before preparation journals the first helper attempt.
+    let mut replacement_recovery = original_recovery;
+    replacement_recovery.vote_commitment = [0x42; 32];
+    crate::vote::insert_recovery_fixture(&db, &replacement_recovery).unwrap();
+
+    let error = share::record_delivery_for_committed_vote(
+        &db,
+        &scope,
+        &params,
+        &expected_commitment_bundle_json,
+        &expected_nullifier,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("committed vote changed before helper share delivery"),
+        "{error}"
+    );
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn repeated_committed_submission_preserves_the_original_schedule() {
     let db = db_with_recoverable_vote();

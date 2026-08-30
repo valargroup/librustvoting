@@ -674,6 +674,13 @@ The `test-fixtures` feature exposes hidden `share::record` and
 They do not exist in production builds and MUST NOT be used to model wallet
 submission behavior.
 
+Durable preparation is bound atomically to the commitment-bundle generation
+validated for the `CommittedVote` handle. The storage write locks and compares
+that exact recovery snapshot before creating or merging the share row. A
+replacement that lands after the earlier recovery read therefore fails
+preparation before any helper POST instead of combining the old payload with
+the replacement's nullifier.
+
 After validation it creates or merges the durable share record. Persistence
 returns the effective write-once `submit_at`; resumed fan-out rebuilds the wire
 payload with that durable schedule before contacting any newly selected
@@ -718,6 +725,7 @@ covered by `initial_post_is_journaled_before_transport_dispatch`,
 provided by
 `committed_vote_submission_keeps_degraded_planned_target_before_healthy_fallback`,
 `stale_committed_vote_submission_is_rejected_before_side_effects`,
+`generation_bound_preparation_rejects_replacement_after_validation`,
 `repeated_committed_submission_preserves_the_original_schedule`,
 `repeated_partial_committed_submission_sends_original_schedule_to_new_helper`,
 `repeated_committed_submission_does_not_resurrect_zero_schedule`,

@@ -1,4 +1,4 @@
-use rusqlite::{named_params, Connection, OptionalExtension};
+use rusqlite::{named_params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{load_ballot_intent, load_vote_choice_for_intent_check};
 use crate::helper::url::canonicalize_helper_base_url;
@@ -429,6 +429,77 @@ pub(crate) fn record_share_delegation(
         submit_at,
         &mut || {},
     )
+}
+
+/// Records delivery only while the owning vote still has the expected
+/// commitment-bundle generation.
+///
+/// An immediate transaction acquires SQLite's write lock before the generation
+/// is read. That lock is held through the share write, so another connection
+/// cannot replace the vote between validation and delivery-row persistence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_share_delegation_for_vote_generation(
+    conn: &mut Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    sent_to_urls: &[String],
+    ambiguous_urls: &[String],
+    target_count: u32,
+    nullifier: &[u8],
+    submit_at: u64,
+    expected_commitment_bundle_json: &str,
+) -> Result<u64, VotingError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to lock committed vote for helper delivery: {e}"),
+        })?;
+    let current_commitment_bundle_json: Option<String> = tx
+        .query_row(
+            "SELECT commitment_bundle_json FROM votes
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index,
+                ":proposal_id": proposal_id,
+            },
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read committed vote for helper delivery: {e}"),
+        })?;
+    if current_commitment_bundle_json.as_deref() != Some(expected_commitment_bundle_json) {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "committed vote changed before helper share delivery for round={round_id}, wallet={wallet_id}, bundle={bundle_index}, proposal={proposal_id}"
+            ),
+        });
+    }
+
+    let submit_at = record_share_delegation_inner(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        sent_to_urls,
+        ambiguous_urls,
+        target_count,
+        nullifier,
+        submit_at,
+        &mut || {},
+    )?;
+    tx.commit().map_err(|e| VotingError::Internal {
+        message: format!("failed to commit helper-share generation transaction: {e}"),
+    })?;
+    Ok(submit_at)
 }
 
 #[cfg(test)]

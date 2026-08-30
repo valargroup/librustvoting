@@ -116,6 +116,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Initial helper delivery now atomically binds durable share preparation to the
+  commitment-bundle generation validated for the `CommittedVote`, so a
+  concurrent vote replacement cannot pair an old in-memory payload with the
+  replacement's nullifier before dispatch.
 - Initial helper submission now journals each target before dispatch and
   resolves it atomically to accepted, ambiguous, or definitely failed. A
   process interruption or failed outcome write leaves a distinct crash marker,
