@@ -90,7 +90,7 @@ find its matching VANs in the validated vote tree and continue voting.
 
 | Recovery case | Recovery material | Result |
 | --- | --- | --- |
-| Software seed provider | Original wallet seed or mnemonic plus a rescan of the original account | Re-derive the same authority root and canonical bundle plan |
+| Software seed provider | Original wallet seed or mnemonic, authority-selection marker or uniquely matching external use, and a rescan of the original account | Re-derive the same authority root and canonical bundle plan |
 | Current Keystone integration with a confirmed delegation | Encrypted voting-authority backup plus the original account's Orchard viewing capability or equivalent restored snapshot-note state | Restore the root and canonical bundle plan, then vote without a Keystone signature or device operation |
 | Current Keystone integration with remaining delegation transactions | Encrypted voting-authority backup plus access to the original Zcash account, normally through Keystone | Restore the root, then sign the remaining delegation PCZTs |
 | Public-target custody with retained capability | Voter's seed or encrypted authority-root backup plus the exact custody capability package | Re-derive the hotkey, import the original bundle weights and blindings, then recover matching VANs |
@@ -254,6 +254,15 @@ version 1 does not mix locally constructed and imported bundles for the same
 account and round. The source is persisted recovery metadata and does not
 appear on-chain.
 
+### Authority selection marker
+
+The immutable, nonsecret record that binds an authority context to its root and
+bundle source tags outside `VotingDb`. A software authority stores a
+`VotingAuthoritySelectionV1`; a stored-random authority uses its
+`VotingAuthorityBackupV1`, which carries the same selection plus the secret
+root. The marker is still account-linking metadata and belongs in authenticated
+encrypted backup storage.
+
 ### Voting hotkey
 
 An Orchard `SpendingKey` used only by the shielded-voting protocol. Its address
@@ -278,6 +287,7 @@ VotingAuthorityContextV1
 VotingAuthorityRootV1(64 bytes)
 AuthorityRootSourceV1
 BundleMaterialSourceV1
+VotingAuthoritySelectionV1
 ```
 
 A root provider accepts the canonical context and returns exactly one 64-byte
@@ -295,10 +305,26 @@ another seed's account at the same index from being accepted as the current
 authority.
 
 The provider and bundle sources are selected before direct delegation or
-publication of a public target and are persisted explicitly. They must not be
-inferred from application version, secret length, device type, or local rows.
-Once a public target is published or any direct delegation may have been
-submitted, both sources, the context, and the root are immutable.
+publication of a public target. `registered-seed-v1` persists this canonical
+selection plaintext outside `VotingDb`:
+
+```text
+{"format_version":1,"root_source":"registered-seed-v1","bundle_source":"<derived-v1 or imported-capability-v1>","authority_context":"<Base64>"}
+```
+
+It uses the same compact JSON, field-order, canonical padded Base64, strict
+parsing, and context validation rules as `VotingAuthorityBackupV1` below. The
+integration commits and reads back the authenticated encrypted record before
+publishing a public target or allowing direct delegation submission. A
+`stored-random-v1` backup is the corresponding source marker for that path, so
+it does not need a second record.
+
+The first marker for an authority context is final. Copies and re-encryption
+must preserve its canonical plaintext, and a restore path without the marker
+must not infer the selection from application version, secret length, device
+type, or whichever recovery input is available. Once a public target is
+published or any direct delegation may have been submitted, both sources, the
+context, and the root are immutable.
 
 The root source is intentionally not included in the expansion. If two
 conforming providers return the same root for the same context, they produce
@@ -693,9 +719,34 @@ uses `stored-random-v1`. A direct delegation obtains bundle material through
 `imported-capability-v1`. Both root sources and both bundle sources are
 indistinguishable on the vote chain.
 
-The root source and context are persisted before direct delegation or
-publication of a public target. The root is re-derived from the software seed or
-held in the stored-random secure-storage and backup boundary. The typed
+After database loss, the wallet first restores the authenticated selection
+marker. `zcash_voting` then constructs only the selected typed candidate from
+explicit recovery inputs: the registered seed or authenticated root backup,
+plus reconstructed local bundles or the validated custody capability. It
+reconciles that candidate with the authority's durable external use.
+
+A previously published target recovered from a validated capability or the
+controller-owned durable job must match the selected root-derived hotkey and
+`imported-capability-v1` flow; the exact capability is still required to restore
+its bundles. A pending or confirmed direct delegation must match the selected
+candidate's initial VANs in the transaction or validated vote tree. A mismatch
+reports the missing or wrong recovery material instead of substituting another
+source.
+
+If the marker itself was lost, complete external evidence may reconstruct it
+only when exactly one typed candidate matches: a public target identifies the
+imported flow, while a pending or confirmed direct delegation identifies the
+derived flow. The recovered selection is made durable again before use.
+No match, multiple nonidentical matches, conflicting target and delegation
+evidence, or incomplete target, transaction, or chain evidence fails closed.
+Lack of evidence is not proof that no selection existed. These rules keep a
+software-created authority recoverable from its seed without letting a software
+wallet replace a Keystone-created authority merely because it can now access
+the same account seed.
+
+The selection marker is persisted outside `VotingDb` before direct delegation
+or publication of a public target. The root is re-derived from the software seed
+or held in the stored-random secure-storage and backup boundary. The typed
 construction or import persists the bundle source with its bundle IDs or
 capability digest. A wallet must not silently replace a missing root, re-derive
 imported blindings, or reinterpret a capability bundle as `derived-v1`.
@@ -745,17 +796,20 @@ both identifiers.
 3. Ask the software seed provider for the version 1 authority root.
 4. Select `derived-v1` and construct the hotkey, every bundle ID, and every
    blinding factor in `zcash_voting`.
-5. Persist the root source, `derived-v1` bundle source, context, bundle IDs,
-   blindings, and plan metadata for normal operation. Derive the root from the
-   seed when needed, or cache it only in platform secure storage.
+5. Commit and read back the `registered-seed-v1` selection marker outside
+   `VotingDb`. Persist bundle IDs, blindings, and plan metadata in `VotingDb`
+   only for normal operation. Derive the root from the seed when needed, or
+   cache it only in platform secure storage.
 6. Build proofs, sign, submit, and confirm delegation through the existing
    lifecycle.
 
 ### Recovery
 
-After a fresh install, the same seed provider and authority context produce the
-same root. The wallet can reconstruct the plan and recover on-chain VANs without
-a separate voting-secret backup.
+After a fresh install, the selection marker chooses the same seed provider and
+bundle source, and the same authority context produces the same root. The
+wallet can reconstruct the plan and recover on-chain VANs without a separate
+voting-secret backup. If the marker was also lost, the complete external-use
+reconciliation above must uniquely reconstruct it before recovery continues.
 
 A watch-only wallet or imported UFVK cannot derive the root. Recovery requires
 the original wallet seed or the exact authority root through an authenticated,
@@ -852,8 +906,9 @@ atomically, but it does not merge their identities or create a batch-wide
 
 `zcash_voting` recovers one bundle as follows:
 
-1. Validate the root source, bundle source, authority context, account
-   fingerprint, scheme, and bundle policy.
+1. Build the typed source candidates above, reconcile them with durable external
+   use, and validate the selected root source, bundle source, authority context,
+   account fingerprint, scheme, and bundle policy.
 2. Re-derive the hotkey from the authority root.
 3. Restore the bundle material. For `derived-v1`, rescan the account at the
    round snapshot, rebuild the canonical bundle plan including notes spent
@@ -985,10 +1040,12 @@ capability format, or additional custody exchange changes in version 1.
 
 ### `zcash_voting`
 
-- account fingerprint, authority context, root source, bundle source, and backup
+- account fingerprint, authority context, source-selection, and root-backup
   types;
 - hotkey, local bundle-ID, and VAN-blinding derivation;
 - canonical validation and recovery of imported custody capabilities;
+- fail-closed reconciliation of typed source candidates with external authority
+  use;
 - the recoverable bundle policy and round-auth version 3 verification;
 - legacy migration and bounded nullifier-to-successor VAN recovery; and
 - atomic-batch rules, public vectors, and integration fixtures.
@@ -996,14 +1053,16 @@ capability format, or additional custody exchange changes in version 1.
 ### Software-wallet integrations
 
 - root-seed provider implementation;
+- durable authenticated storage of the software selection marker;
 - secure root handling and backup where applicable;
-- snapshot rescan and recovery UX; and
+- snapshot rescan, external-use reconciliation, and recovery UX; and
 - fail-closed handling for unsupported schemes or custom non-recoverable note
   selection.
 
 ### Public-target integrations
 
 - creating the public target from a version 1 root-derived hotkey;
+- returning the previously published target during recovery;
 - preserving the existing controller-side blinding generation, ZKP #1, and
   capability export;
 - durable voter retention and controller redelivery of the exact capability;
