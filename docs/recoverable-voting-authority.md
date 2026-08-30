@@ -7,9 +7,7 @@ implemented today.
 
 The review goal is to approve the authority model, derivation boundaries,
 backup contract, recovery behavior, batching compatibility, and migration
-boundary before code is written. Approval fixes the version 1 decisions below.
-Implementation must freeze the byte encodings and public test vectors in
-`zcash_voting` before production activation.
+boundary before code is written.
 
 Deterministic Keystone hotkey derivation is explicitly outside this version.
 The version 1 Keystone path uses the firmware and transaction-signing flow that
