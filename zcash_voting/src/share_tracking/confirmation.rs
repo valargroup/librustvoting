@@ -59,6 +59,27 @@ pub(super) async fn poll_share_helpers(
     now_seconds: u64,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> ShareStatusOutcome {
+    poll_share_helpers_with_budget(
+        client,
+        round_id,
+        share_id,
+        server_urls,
+        now_seconds,
+        cancel,
+        SHARE_STATUS_POLL_BUDGET_MILLISECONDS,
+    )
+    .await
+}
+
+pub(super) async fn poll_share_helpers_with_budget(
+    client: &HelperClient,
+    round_id: &str,
+    share_id: &str,
+    server_urls: &[String],
+    now_seconds: u64,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    poll_budget_milliseconds: u64,
+) -> ShareStatusOutcome {
     const REQUIRED_CONFIRMATIONS: usize = 2;
     let required_confirmations = REQUIRED_CONFIRMATIONS.min(server_urls.len());
     if required_confirmations == 0 {
@@ -69,8 +90,7 @@ pub(super) async fn poll_share_helpers(
     let mut polls = JoinSet::new();
     let mut in_flight = HashSet::new();
     let task_cancelled = Arc::new(AtomicBool::new(false));
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_millis(SHARE_STATUS_POLL_BUDGET_MILLISECONDS);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(poll_budget_milliseconds);
     let mut confirmations = 0usize;
 
     loop {
@@ -97,6 +117,17 @@ pub(super) async fn poll_share_helpers(
             return ShareStatusOutcome::Cancelled;
         }
 
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            task_cancelled.store(true, Ordering::Relaxed);
+            polls.abort_all();
+            let failure_time = now_seconds.saturating_add(poll_budget_milliseconds.div_ceil(1_000));
+            for server_url in in_flight {
+                client.health().record_failure(&server_url, failure_time);
+            }
+            return ShareStatusOutcome::ConfiguredHelperQuorumNotObserved;
+        }
+
         while polls.len() < SHARE_STATUS_MAX_CONCURRENT_POLLS {
             let Some(server_url) = remaining.pop_front() else {
                 break;
@@ -120,17 +151,6 @@ pub(super) async fn poll_share_helpers(
             return ShareStatusOutcome::ConfiguredHelperQuorumNotObserved;
         }
 
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            task_cancelled.store(true, Ordering::Relaxed);
-            polls.abort_all();
-            let failure_time =
-                now_seconds.saturating_add(SHARE_STATUS_POLL_BUDGET_MILLISECONDS.div_ceil(1_000));
-            for server_url in in_flight {
-                client.health().record_failure(&server_url, failure_time);
-            }
-            return ShareStatusOutcome::ConfiguredHelperQuorumNotObserved;
-        }
         let cancel_check = now + Duration::from_millis(SHARE_STATUS_CANCEL_CHECK_MILLISECONDS);
         let wait_deadline = deadline.min(cancel_check);
         let joined = tokio::select! {

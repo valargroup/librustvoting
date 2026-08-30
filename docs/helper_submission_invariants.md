@@ -769,6 +769,7 @@ The status endpoint recognizes exactly `pending` and `confirmed`.
 
 Regression tests: `two_distinct_confirmations_stop_status_checks`,
 `stalled_status_poll_does_not_starve_a_later_share`,
+`expired_status_budget_does_not_start_or_penalize_helpers`,
 `cancellation_aborts_bounded_in_flight_status_polls`,
 `late_cancellation_does_not_replace_final_confirmation`,
 `one_confirmation_is_not_enough`,

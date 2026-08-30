@@ -231,6 +231,8 @@ mod initial_delivery;
 mod recovery;
 
 use configured_fleet::ConfiguredHelperFleet;
+#[cfg(test)]
+use confirmation::poll_share_helpers_with_budget;
 use confirmation::{poll_share_helpers, ShareStatusOutcome};
 pub(crate) use initial_delivery::submit_committed_share_to_helpers;
 #[cfg(test)]

@@ -137,6 +137,35 @@ async fn every_helper_pending_reports_not_confirmed() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn expired_status_budget_does_not_start_or_penalize_helpers() {
+    let round_id = field_hex(1);
+    let share_id = "cd".repeat(32);
+    let configured = helpers(SHARE_STATUS_MAX_CONCURRENT_POLLS + 1);
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+
+    let outcome = poll_share_helpers_with_budget(
+        &client,
+        &round_id,
+        &share_id,
+        &configured,
+        1_000,
+        &never_cancel(),
+        0,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        ShareStatusOutcome::ConfiguredHelperQuorumNotObserved
+    );
+    assert!(transport.calls().is_empty());
+    for server_url in configured {
+        assert_eq!(client.health().failure_count(&server_url), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn cancellation_aborts_bounded_in_flight_status_polls() {
     let round_id = field_hex(1);
     let share_id = "cd".repeat(32);
