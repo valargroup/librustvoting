@@ -305,10 +305,11 @@ accepted, ambiguous, and interrupted evidence, and it permits no helper POST
 without a real confirmed tree position. Helper behavior continues to follow
 the [helper submission invariants](helper_submission_invariants.md).
 
-The backup can be retired when the existing recovery API deliberately clears
-it, when an unsubmitted intent is validly replaced, or when the tracker marks
-every expected share confirmed. Retirement must not allow an older backup to
-reappear as live state. Complete confirmed vote history is not retained.
+The backup remains available until an unsubmitted intent is validly replaced
+or the tracker marks every expected share confirmed. Ordinary recovery cleanup
+must not remove the last restorable copy while helper completion is pending.
+Retirement must not allow an older backup to reappear as live state. Complete
+confirmed vote history is not retained.
 
 ## Batching
 
