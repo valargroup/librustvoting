@@ -7,22 +7,24 @@ model and repository boundaries before implementation. Exact byte encodings,
 test vectors, storage layouts, and API shapes belong in the implementation
 work.
 
-Deterministic Keystone hotkey derivation is outside this version. The current
-Keystone path requires no firmware change.
+On-device derivation from the Keystone mnemonic remains outside this version.
+The current Keystone path requires no firmware change.
 
 ## TL;DR
 
-Each account and voting round gets one voting-authority root. Software wallets
-derive it from their seed. Current Keystone integrations generate it randomly
-and back it up before delegation. The root always recreates the voting hotkey.
-For self-custodied funds, `zcash_voting` also recreates each bundle's VAN
-blinding from the root and the canonical snapshot bundle plan. For funds in
-custody, the existing capability package remains the source of bundle weights
-and blindings. An authenticated round configuration selects this framework and
-the snapshot used to reconstruct bundles. After data loss, the wallet can
-recreate its authority, find its latest VANs in validated vote-chain data, and
-continue after partial delegation or later votes. Existing rounds, circuits,
-vote-chain messages, atomic batching, and Keystone signing remain unchanged.
+Each Zcash account gets a separate voting-authority root for each network, vote
+chain, and round. Software wallets derive it from their seed. Current Keystone
+hosts instead back up a random, versioned master generation scoped to one
+account, network, and vote chain; `zcash_voting` derives and the wallet retains a
+distinct root for each round. The root always recreates the voting hotkey. For
+self-custodied funds, `zcash_voting` also recreates each bundle's VAN blinding
+from the root and the canonical snapshot bundle plan. For funds in custody, the
+existing capability package remains the source of bundle weights and blindings.
+An authenticated round configuration selects this framework and the snapshot
+used to reconstruct bundles. After data loss, the wallet can recreate its
+authority, find its latest VANs in validated vote-chain data, and continue after
+partial delegation or later votes. Existing rounds, circuits, vote-chain
+messages, atomic batching, Keystone signing, and firmware remain unchanged.
 
 ## Problem
 
@@ -49,39 +51,45 @@ choices:
 
 | Choice | Version 1 options |
 | --- | --- |
-| Authority-root source | Derive from a software wallet seed, or restore a previously backed-up random root |
+| Authority-root source | Derive the round root from a software wallet seed, or from a selected backed-up Keystone host master generation |
 | Bundle-material source | Derive blindings for self-custodied funds, or import the existing capability for funds in custody |
 
-Both choices are recorded before the authority is used. For a random-root
-authority, its first backup fixes the root and both choices. Otherwise they
-become immutable once a public target is published or a delegation may have
-been submitted. They are local recovery metadata and do not appear on either
-chain.
+Both choices and, for a master-backed authority, the selected master generation
+are recorded before the authority is used. They become immutable once a public
+target is published or a delegation may have been submitted. They are local
+recovery metadata and do not appear on either chain.
 
 The framework has one stable boundary:
 
 ```text
-software seed -----------+
-                         |
-backed-up random root ----+--> voting-authority root --> voting hotkey
-                                      |
-                                      +--> self-custody bundle blindings
+software seed -----------------------------+
+                                           |
+backed-up Keystone master + round context --+--> voting-authority root
+                                                        |
+                                                        +--> voting hotkey
+                                                        |
+                                                        +--> self-custody bundle blindings
 
-custody capability ------------------------------------> custody bundle material
+custody capability ------------------------------------------> custody bundle material
 ```
 
-Every integration supplies a root and a typed bundle source to
-`zcash_voting`. From that point onward, the library owns authority construction
-and recovery. Integrations must not create their own parallel derivation.
+Every integration supplies a typed authority source and bundle source.
+`zcash_voting` owns the canonical master-to-round derivation and, from the
+per-round root onward, authority construction and recovery. Integrations must
+not create their own parallel derivation.
 
 ### Authority context
 
-The root and all of its outputs are bound to:
+Every per-round root and all of its outputs are bound to:
 
 - the Zcash network;
 - the ZIP-32 account index and a fingerprint of the actual Orchard account;
 - the vote-chain ID; and
 - the vote-round ID.
+
+A Keystone host master generation is scoped to the first three items; deriving
+a round root adds the vote-round ID. A generation is not shared across accounts,
+networks, or vote chains.
 
 The account fingerprint prevents the same account index from accidentally
 selecting an authority belonging to another seed. It is derived from the
@@ -105,24 +113,39 @@ cannot derive the private authority.
 
 ### Current Keystone integrations
 
-Current Keystone firmware cannot derive this root. The host wallet therefore:
+Current Keystone firmware does not derive voting authority. The host creates a
+random, versioned voting-master generation for each account, network, and vote
+chain, stores it in platform secure storage, and maintains an authenticated
+encrypted account authority backup independent of both platform secure storage
+and `VotingDb`.
+The backup durably preserves active and retired master generations and each
+immutable round-to-generation, root, and source binding. Generation activation
+and each round binding are committed and read back before use. `zcash_voting`
+derives each round's authority root from the selected generation and complete
+authority context. The wallet retains that root in encrypted authority state.
 
-1. generates a random 64-byte root;
-2. binds it to the authority context and bundle source;
-3. stores it in platform secure storage;
-4. commits an authenticated encrypted backup that survives loss of the app or
-   device and is independent of both platform secure storage and the voting
-   database; and
-5. reads that backup back successfully before publishing a public target or
-   allowing delegation submission.
+Each round records its selected generation before publishing a target or
+allowing delegation. A failed or interrupted write is retried with the same
+generation, root, and selection. Once an authority may have been used, the
+round cannot switch generations. Rotation creates and backs up a new default
+generation only for rounds whose authority has not been used. It neither
+reassigns nor revokes the generation selected for a used round.
+Generation creation, retirement, and the retained generation set are
+rollback-protected. Restore rejects stale generation state and uses a retired
+generation only for rounds already assigned to it. Older generations remain
+available for recovery of those rounds.
 
-Creating the first backup record permanently fixes the root, both source
-choices, and authenticated round selection. A failed or interrupted store is
-retried with that same record; it does not permit a replacement authority.
+A master generation by itself cannot delegate funds or complete a vote.
+Delegation additionally requires the funds owner's Zcash account signature.
+Completing a vote additionally requires either the self-custody viewing or
+snapshot-note state needed to reconstruct the bundle, or the exact custody
+capability. An attacker who obtains both the generation and that additional
+material after delegation can derive the hotkey and vote. The master cannot
+spend the Zcash account's funds.
 
-The backup is the recovery source. Restoring only the Keystone mnemonic does
-not recreate the root, and a missing root must not be replaced with a newly
-generated one.
+The account authority backup is the recovery source. Restoring only the Keystone
+mnemonic does not recreate it, and a missing generation must not be replaced for
+a round already assigned to it. Stale or incomplete restored state fails closed.
 
 Keystone continues to sign delegation PCZTs through its existing signing flow.
 After a delegation is confirmed, the restored host-side authority signs votes;
@@ -131,23 +154,24 @@ Zcash account signature. Reconstructing self-custody bundles also requires the
 original account's viewing data or equivalent restored snapshot-note state.
 
 The provider boundary leaves room for a future firmware feature that returns
-the same kind of root. Such a feature would affect root custody only. It would
-not change the hotkey expansion, bundle derivation, recovery flow, circuits, or
-vote-chain messages, and it could not retroactively recreate an older random
-root.
+the same kind of per-round root. Such a feature would affect root custody only.
+It would not change the hotkey expansion, bundle derivation, recovery flow,
+circuits, or vote-chain messages, and it could not recreate an older
+host-generated master.
 
 ### Source selection and backup
 
-The selected root source and bundle source are stored in authenticated
-encrypted state outside `VotingDb`. For a random root, the root backup itself
-also serves as this selection record. A software authority stores the same
-selection without the root.
+The account authority backup stores the selected authority source and bundle
+source in authenticated encrypted state outside `VotingDb`. A master-backed
+round also stores its generation identifier and retained per-round root. The
+master secret alone does not replace this per-round selection record. A software
+authority stores the same selection without a master generation.
 
-This record prevents a restored software wallet from silently deriving a new
-seed-based authority when the original authority was created from a random
-Keystone-era root. If the record is lost, recovery may reconstruct the choice
-only when authenticated external evidence identifies exactly one matching
-authority. Ambiguous or conflicting evidence fails closed.
+This record prevents a restored wallet from silently switching between a seed
+and a Keystone master, or between master generations. If the record is lost,
+recovery may reconstruct the choice only when authenticated external evidence
+identifies exactly one matching authority. Ambiguous or conflicting evidence
+fails closed.
 
 ## Canonical authority construction
 
@@ -158,12 +182,12 @@ authority root and context using a versioned, domain-separated expansion. The
 result is a voting-only key. It cannot spend the Zcash account that supplied
 the delegation weight.
 
-The expansion is identical for software-derived and backed-up random roots.
-The root source therefore remains a custody concern rather than a second
+The expansion is identical for software-derived and master-derived per-round
+roots. The root source therefore remains a custody concern rather than a second
 protocol implementation.
 
-The version 1 root has a new typed meaning. Existing random 64-byte hotkey
-secrets retain their current interpretation and are never inferred by length.
+Master generations, version 1 per-round roots, and existing random 64-byte
+hotkey secrets have distinct typed meanings and are never inferred by length.
 
 ### Self-custodied bundle material
 
@@ -213,10 +237,10 @@ retains an encrypted copy and the funds controller keeps its existing
 redeliverable copy. If both are lost, the hotkey remains recoverable but the
 custody bundle material is not.
 
-For a backed-up random root, a matching capability is enough to bind the
-restored authority even if the voter's original Orchard viewing key is no
-longer available. This does not allow the same root to reconstruct
-self-custodied bundles.
+For a master-derived root, a matching capability is enough to bind the restored
+authority even if the voter's original Orchard viewing key is no longer
+available. This does not allow the same root to reconstruct self-custodied
+bundles.
 
 No new custody exchange, circuit input, or vote-chain field is required.
 
@@ -254,8 +278,8 @@ This is a client-configuration change, not a consensus or vote-action change.
 
 After restoring the authority selection, the wallet:
 
-1. obtains the same root from the software seed or encrypted random-root
-   backup;
+1. obtains the same root from the software seed or the master generation
+   selected for that round, and verifies any retained root matches;
 2. reconstructs self-custody bundles from the authenticated snapshot or
    restores custody bundles from the exact capability;
 3. recreates each initial VAN;
@@ -335,8 +359,8 @@ after their authorities and delegation bundles have already been constructed.
   is required.
 - No Keystone firmware, key export, QR type, or on-device vote operation is
   required.
-- A future deterministic Keystone provider remains possible through the common
-  root boundary.
+- A future firmware-derived Keystone provider remains possible through the
+  common per-round-root boundary.
 - A UFVK or watch-only wallet is not sufficient to recover private authority.
 - Funds in custody remain dependent on the retained or redelivered capability.
 - Custom note selection remains outside the recoverable path unless it carries
@@ -346,9 +370,9 @@ after their authorities and delegation bundles have already been constructed.
 
 | Component | Responsibility |
 | --- | --- |
-| `zcash_voting` | Versioned context and source types; hotkey and self-custody bundle derivation; custody capability validation; round selection; VAN recovery; pending-vote export/import; shared vectors and fixtures |
-| Wallet integration | Seed or random-root provider; authenticated selection storage; encrypted backups; snapshot rescan; independently authenticated recovery checkpoint; recovery UX |
-| Current Keystone integration | Random-root backup gate, account binding, and existing PCZT or PCZT-batch signing |
+| `zcash_voting` | Versioned context and source types; master-to-round-root, hotkey, and self-custody bundle derivation; custody capability validation; round selection; VAN recovery; pending-vote export/import; shared vectors and fixtures |
+| Wallet integration | Seed or master provider; master creation and rotation; authenticated round-to-generation storage; retained per-round roots; encrypted backups; snapshot rescan; independently authenticated recovery checkpoint; recovery UX |
+| Current Keystone integration | Master-backup gate, account binding, immutable generation selection, and existing PCZT or PCZT-batch signing |
 | Keystone firmware | No version 1 change; a future root provider may use the same boundary |
 | `vote-sdk` | New authenticated round fields and signing support; complete block-bound transition data for recovery |
 | `vote-nullifier-pir` | Publish snapshot height and block hash for the exact dataset |
@@ -358,9 +382,11 @@ after their authorities and delegation bundles have already been constructed.
 
 Reviewers are being asked to approve these directions:
 
-1. one versioned authority-root boundary owned by `zcash_voting`;
-2. deterministic software roots and backed-up random roots for current
-   Keystone integrations;
+1. one versioned per-round authority-root boundary and canonical master-to-round
+   derivation owned by `zcash_voting`;
+2. deterministic software roots and backed-up host master generations scoped
+   to one account, Zcash network, and vote chain, with retained per-round roots
+   for current Keystone integrations;
 3. root-derived bundle blindings for self-custodied funds while preserving the
    existing capability flow for funds in custody;
 4. a canonical, versioned snapshot bundle policy;
@@ -368,8 +394,9 @@ Reviewers are being asked to approve these directions:
 6. recovery by validated VAN transition traversal rather than saved transaction
    history;
 7. reuse of the existing helper tracker for votes awaiting helper completion;
-   and
-8. no circuit, vote-chain, batching, or Keystone firmware change in version 1.
+8. future-only master rotation with immutable generation selection for used
+   rounds; and
+9. no circuit, vote-chain, batching, or Keystone firmware change in version 1.
 
 Once these decisions are approved, implementation work can define and review
 the exact encodings, APIs, storage adapters, and cross-repository test vectors.
