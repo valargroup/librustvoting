@@ -329,6 +329,7 @@ fn record_impl(
                     "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
                 ),
             })?;
+    ensure_recovery_proposal(&bundle, proposal_id)?;
     let payload = recover_payload(&bundle, share_index)?;
     let primary_blind = array32("primary_blind", payload.primary_blind.clone())?;
     let nullifier = compute_nullifier(&bundle.vote_commitment, share_index, &primary_blind)?;
@@ -705,6 +706,16 @@ pub(crate) fn nullifier_from_recovery_json(
     share_index: u32,
 ) -> Result<[u8; 32], VotingError> {
     let bundle = crate::vote::parse_recovery(commitment_bundle_json)?;
+    ensure_recovery_proposal(&bundle, proposal_id)?;
+    let payload = recover_payload(&bundle, share_index)?;
+    let primary_blind = array32("primary_blind", payload.primary_blind.clone())?;
+    compute_nullifier(&bundle.vote_commitment, share_index, &primary_blind)
+}
+
+fn ensure_recovery_proposal(
+    bundle: &VoteRecoveryBundle,
+    proposal_id: u32,
+) -> Result<(), VotingError> {
     if bundle.proposal_id != proposal_id {
         return Err(VotingError::InvalidInput {
             message: format!(
@@ -713,9 +724,7 @@ pub(crate) fn nullifier_from_recovery_json(
             ),
         });
     }
-    let payload = recover_payload(&bundle, share_index)?;
-    let primary_blind = array32("primary_blind", payload.primary_blind.clone())?;
-    compute_nullifier(&bundle.vote_commitment, share_index, &primary_blind)
+    Ok(())
 }
 
 /// Lists all helper-share records for a round.
@@ -916,14 +925,7 @@ pub fn recover_wire_json(
     submit_at: u64,
 ) -> Result<String, VotingError> {
     let bundle = crate::vote::parse_recovery(commitment_bundle_json)?;
-    if bundle.proposal_id != proposal_id {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "recovery proposal_id {} does not match requested {proposal_id}",
-                bundle.proposal_id
-            ),
-        });
-    }
+    ensure_recovery_proposal(&bundle, proposal_id)?;
     let payload = recover_payload(&bundle, share_index)?;
     payload.to_wire_json(Some(vc_tree_position), submit_at)
 }
@@ -1153,6 +1155,44 @@ mod tests {
         confirm(&db, ROUND_ID, 0, 1, 1).unwrap();
         assert!(unconfirmed(&db, ROUND_ID).unwrap().is_empty());
         assert_eq!(list(&db, ROUND_ID).unwrap()[0].confirmed, true);
+    }
+
+    #[test]
+    fn record_rejects_recovery_for_a_different_proposal() {
+        let db = db_with_vote_recovery();
+        let mut mismatched = recovery_bundle_fixture();
+        mismatched.proposal_id = 2;
+        db.conn()
+            .execute(
+                "UPDATE votes SET commitment_bundle_json = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3
+                   AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::params![
+                    serialize_recovery(&mismatched).unwrap(),
+                    ROUND_ID,
+                    WALLET_ID
+                ],
+            )
+            .unwrap();
+
+        let error = record(
+            &db,
+            ROUND_ID,
+            0,
+            1,
+            0,
+            &["https://helper.example".to_string()],
+            99,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("recovery proposal_id 2 does not match requested 1"),
+            "unexpected error: {error}"
+        );
+        assert!(list(&db, ROUND_ID).unwrap().is_empty());
     }
 
     #[test]
