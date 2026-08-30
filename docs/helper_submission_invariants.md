@@ -2,17 +2,19 @@
 
 ## Status and scope
 
-This document records the helper-share submission invariants implemented by
-`zcash_voting`. It is an audit map for wallet integrators and reviewers. It
-covers planning, initial delivery, transport outcomes, persistence,
-confirmation polling, and recovery.
+This document specifies the richer helper-share tracker required by the
+recoverable voting design. At the time of that proposal, schema version 15 on
+`main` persists the accepted helper set as `sent_to_urls`, but not target
+counts, `ambiguous_urls`, or `attempting_urls`. It also does not provide the
+tracker APIs described below. Until that work lands, this document is a target
+contract rather than a description of current behavior.
 
-The implementation is authoritative. A change to an invariant below SHOULD
-update this document and the named regression tests in the same pull request.
-Values exposed as policy metadata but not enforced by a particular API are
-called out explicitly.
+Once the tracker lands, its implementation is authoritative. A change to an
+invariant below SHOULD update this document and the named regression tests in
+the same pull request. Values exposed as policy metadata but not enforced by a
+particular API are called out explicitly.
 
-The main implementation surfaces are:
+The planned implementation surfaces are:
 
 - [`share_policy`](../zcash_voting/src/share_policy/), whose
   [`mod.rs`](../zcash_voting/src/share_policy/mod.rs) facade exposes helper

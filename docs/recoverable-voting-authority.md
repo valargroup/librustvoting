@@ -1031,20 +1031,23 @@ still cannot recreate a missing custody capability.
 ### Pending tally recovery
 
 Finding the current VAN does not recover a confirmed vote whose helper shares
-are still incomplete. The durable tracker defined by the
-[helper submission invariants](helper_submission_invariants.md) is therefore a
-version 1 prerequisite. Pending-tally recovery is enabled only after that
-tracker is live; the recovery record does not introduce a second delivery
-state machine.
+are still incomplete. The richer tracker defined by the
+[helper submission invariants](helper_submission_invariants.md) is a version 1
+prerequisite. At design approval, `main` persists the accepted helper set as
+`sent_to_urls`, but not a target count, `ambiguous_urls`, or `attempting_urls`,
+and does not provide the richer tracker APIs. Pending-tally recovery is enabled
+only after those pieces are implemented. Its recovery record reuses that
+tracker rather than introducing a second delivery state machine.
 
 Version 1 adds a library-owned `PendingTallyRecoveryV1` record for the interval
 between committing a vote and confirming all of its expected helper shares. It
 contains:
 
-- the exact serialized `VoteRecoveryBundle` for each action, including its
-  secret share material and, for an atomic batch, the common digest and complete
-  action order;
-- each real confirmed vote-commitment tree position once known;
+- one `PendingVoteActionRecoveryV1` per action, containing every current
+  `VoteRecoveryBundle` field except `vc_tree_position`, including its secret
+  share material;
+- `confirmed_vc_tree_position: Option<u64>` for each action;
+- the common digest and complete action order for an atomic batch;
 - the helper-delivery journal for each share, including its identity, original
   `created_at`, `submit_at`, target count, accepted (`sent_to_urls`),
   `ambiguous_urls`, and `attempting_urls` helper sets, and confirmation state;
@@ -1068,14 +1071,23 @@ atomic-batch record_identity = 0x01 || batch_digest_32
 The batch digest already binds its complete ordered action list. Restore
 recomputes the ID from the record body and rejects a mismatched storage key.
 
+For each action, `confirmed_vc_tree_position` is the pending record's only
+authoritative tree position. `None` means that confirmation has not supplied
+one; `Some(position)` is assigned exactly once, and zero is a valid position.
+A full `VoteRecoveryBundle` is materialized for the existing recovery APIs
+only after the field is present. When records are merged, `Some` may fill
+`None`, equal `Some` values agree, and different `Some` values fail closed.
+Zero is never treated as an unknown-value sentinel.
+
 `zcash_voting` owns the versioned record, validation, and conservative merge
 rules. The integration stores it in authenticated encrypted storage that
 survives loss of `VotingDb`; it is not sent to the vote chain or helpers. The
-record is written and read back before the first vote broadcast. Confirmation
-adds the authenticated tree position before helper delivery starts. If the
-database was lost first, the position may instead be recovered from the exact
-matching action in validated chain data. A placeholder position is never used.
-An action not found there remains subject to ordinary transaction
+record is written and read back with every confirmed position set to `None`
+before the first vote broadcast. Confirmation assigns the authenticated
+position before helper delivery starts. If the database was lost first,
+validated chain data may instead supply the position from the exact matching
+action. No helper network effect is allowed until either path supplies it. An
+action not found there remains subject to ordinary transaction
 reconciliation; its recovered message or complete batch can be resubmitted
 without preserving the original outer transaction bytes.
 
