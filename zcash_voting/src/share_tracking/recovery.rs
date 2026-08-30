@@ -22,6 +22,8 @@ pub(super) enum ResubmitOutcome {
     Unrecoverable,
     /// Recovery exists but confirmation has not recorded the real VC position.
     AwaitingVcPosition,
+    /// The loaded share was deleted or replaced while recovery was in flight.
+    StaleGeneration,
     /// The vote-end recovery window closed during this tracking pass.
     CutoffReached,
     Cancelled,
@@ -37,9 +39,10 @@ pub(super) struct ResubmitRequest<'a> {
     /// The configured helper fleet, already canonicalized by the caller.
     pub(super) configured_urls: &'a [String],
     pub(super) definite_acceptance_urls: &'a [String],
-    /// Helpers whose earlier POST has no known outcome, including persisted
-    /// ambiguity and attempts interrupted before their outcome was recorded.
-    pub(super) outcome_unknown_urls: &'a [String],
+    /// Helpers whose completed POST has no known outcome.
+    pub(super) ambiguous_urls: &'a [String],
+    /// Helpers left in flight by an interrupted process.
+    pub(super) interrupted_attempt_urls: &'a [String],
     pub(super) schedule: ResubmissionSchedule,
 }
 
@@ -64,24 +67,22 @@ impl ResubmissionSchedule {
 
 /// Walks the randomized resubmission order until one helper accepts.
 ///
-/// Untried helpers come first. Early replenishment uses only untried helpers
-/// because another POST to an accepted helper cannot add a placement, and it
-/// excludes outcome-unknown helpers. This includes attempts interrupted before
-/// their outcome could be recorded. Genuinely overdue recovery is
-/// liveness-critical, so after exhausting untried helpers it may re-POST each
-/// outcome-unknown helper once — its earlier POST may never have arrived, and
-/// helper-side duplicate detection makes the re-POST converge instead of
-/// double-counting — and only then falls back to definitely accepted helpers.
+/// Untried helpers come first. An interrupted attempt follows them even during
+/// early recovery so a crash marker cannot strand a share when vote-end timing
+/// is unavailable. Completed ambiguous attempts and accepted fallbacks remain
+/// overdue-only. Helper-side duplicate detection makes every replay converge
+/// instead of double-counting.
 ///
 /// Randomization is preserved within the untried and previously attempted
-/// groups; the outcome-unknown retry group is a deterministic last resort
-/// ranked only by health, since its membership is already persisted. Degraded
-/// helpers move behind healthy peers in their group. Every POST is journaled
-/// before dispatch (an outcome-unknown helper is already durably journaled),
-/// and every accepted or ambiguous outcome is persisted before returning or
-/// advancing to another helper.
+/// groups; interrupted and ambiguous retry groups are deterministic last
+/// resorts ranked only by health, since their membership is already persisted.
+/// Degraded helpers move behind healthy peers in their group. Every POST is
+/// journaled before dispatch, and every accepted or ambiguous outcome is
+/// persisted before returning or advancing to another helper.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn resubmit_to_next_helper(
     db: &VotingDb,
+    scope: &share::ShareOperationScope,
     params: &ShareTrackingParams<'_>,
     client: &HelperClient,
     request: &ResubmitRequest<'_>,
@@ -90,8 +91,10 @@ pub(super) async fn resubmit_to_next_helper(
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
 ) -> Result<ResubmitReport, VotingError> {
     let share = request.share;
-    let bundle = match vote_recovery::helper_recovery_material(
+    let generation = share::ShareGeneration::new(scope, &share.nullifier);
+    let bundle = match vote_recovery::helper_recovery_material_for_wallet(
         db,
+        scope.wallet_id(),
         params.round_id,
         share.bundle_index,
         share.proposal_id,
@@ -127,9 +130,30 @@ pub(super) async fn resubmit_to_next_helper(
             });
         }
     };
+    let recovered_nullifier = match share::nullifier_from_recovery_json(
+        &bundle.commitment_bundle_json,
+        share.proposal_id,
+        share.share_index,
+    ) {
+        Ok(nullifier) => nullifier,
+        Err(_) => {
+            return Ok(ResubmitReport {
+                outcome: ResubmitOutcome::Unrecoverable,
+                outcome_unknown_urls: Vec::new(),
+            });
+        }
+    };
+    if recovered_nullifier.as_slice() != share.nullifier {
+        return Ok(ResubmitReport {
+            outcome: ResubmitOutcome::StaleGeneration,
+            outcome_unknown_urls: Vec::new(),
+        });
+    }
 
-    let outcome_unknown_helpers: HashSet<&str> = request
-        .outcome_unknown_urls
+    let ambiguous_helpers: HashSet<&str> =
+        request.ambiguous_urls.iter().map(String::as_str).collect();
+    let interrupted_helpers: HashSet<&str> = request
+        .interrupted_attempt_urls
         .iter()
         .map(String::as_str)
         .collect();
@@ -144,7 +168,8 @@ pub(super) async fn resubmit_to_next_helper(
             request
                 .configured_urls
                 .iter()
-                .filter(|url| !outcome_unknown_helpers.contains(url.as_str()))
+                .filter(|url| !ambiguous_helpers.contains(url.as_str()))
+                .filter(|url| !interrupted_helpers.contains(url.as_str()))
                 .filter(|url| !attempted.contains(url.as_str()))
                 .filter(|url| {
                     request.schedule.reset_submit_at()
@@ -169,9 +194,21 @@ pub(super) async fn resubmit_to_next_helper(
     let (untried, previously_attempted) = randomized.split_at(untried_count);
     let ordering_time = params.now_seconds.saturating_add(elapsed_seconds());
     let mut order = client.health().candidate_servers(untried, ordering_time);
+    let interrupted_retry_urls = request
+        .interrupted_attempt_urls
+        .iter()
+        .filter(|url| !attempted_urls.contains(url))
+        .filter(|url| !definitely_accepted_helpers.contains(url.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    order.extend(
+        client
+            .health()
+            .candidate_servers(&interrupted_retry_urls, ordering_time),
+    );
     if request.schedule.reset_submit_at() {
-        let outcome_unknown_retry_urls: Vec<String> = request
-            .outcome_unknown_urls
+        let ambiguous_retry_urls: Vec<String> = request
+            .ambiguous_urls
             .iter()
             .filter(|url| !attempted_urls.contains(url))
             .filter(|url| !definitely_accepted_helpers.contains(url.as_str()))
@@ -180,7 +217,7 @@ pub(super) async fn resubmit_to_next_helper(
         order.extend(
             client
                 .health()
-                .candidate_servers(&outcome_unknown_retry_urls, ordering_time),
+                .candidate_servers(&ambiguous_retry_urls, ordering_time),
         );
         order.extend(
             client
@@ -206,7 +243,9 @@ pub(super) async fn resubmit_to_next_helper(
             });
         }
         attempted_urls.push(server_url.clone());
-        let retries_outcome_unknown_helper = outcome_unknown_helpers.contains(server_url.as_str());
+        let retries_ambiguous_helper = ambiguous_helpers.contains(server_url.as_str());
+        let retries_interrupted_helper = interrupted_helpers.contains(server_url.as_str());
+        let retries_outcome_unknown_helper = retries_ambiguous_helper || retries_interrupted_helper;
         let retries_definitely_accepted_helper =
             definitely_accepted_helpers.contains(server_url.as_str());
         let journals_fresh_attempt =
@@ -225,9 +264,26 @@ pub(super) async fn resubmit_to_next_helper(
         // new attempting marker (which the guard would refuse). Re-read
         // confirmation immediately before either last-resort re-POST.
         let may_dispatch = if journals_fresh_attempt {
-            share::begin_existing_delivery_attempt(db, &attempt)?
+            match share::begin_existing_delivery_attempt_for_generation(db, &attempt, generation)? {
+                crate::storage::queries::ShareAttemptReservation::Started => true,
+                crate::storage::queries::ShareAttemptReservation::AlreadyRecorded => false,
+                crate::storage::queries::ShareAttemptReservation::StaleGeneration => {
+                    return Ok(ResubmitReport {
+                        outcome: ResubmitOutcome::StaleGeneration,
+                        outcome_unknown_urls: newly_outcome_unknown_urls,
+                    });
+                }
+            }
         } else {
-            !share::is_confirmed(db, &attempt)?
+            match share::is_confirmed_for_generation(db, &attempt, generation)? {
+                Some(confirmed) => !confirmed,
+                None => {
+                    return Ok(ResubmitReport {
+                        outcome: ResubmitOutcome::StaleGeneration,
+                        outcome_unknown_urls: newly_outcome_unknown_urls,
+                    });
+                }
+            }
         };
         if !may_dispatch {
             continue;
@@ -242,25 +298,37 @@ pub(super) async fn resubmit_to_next_helper(
             .await
         {
             Ok(_) => {
-                share::resolve_delivery_attempt(
+                if !share::resolve_delivery_attempt_for_generation(
                     db,
                     &attempt,
+                    generation,
                     share::ShareDeliveryAttemptOutcome::Accepted,
                     request.schedule.reset_submit_at(),
-                )?;
+                )? {
+                    return Ok(ResubmitReport {
+                        outcome: ResubmitOutcome::StaleGeneration,
+                        outcome_unknown_urls: newly_outcome_unknown_urls,
+                    });
+                }
                 return Ok(ResubmitReport {
                     outcome: ResubmitOutcome::DefinitelyAcceptedByHelper(server_url),
                     outcome_unknown_urls: newly_outcome_unknown_urls,
                 });
             }
             Err(HelperError::Cancelled) => {
-                if journals_fresh_attempt {
-                    share::resolve_delivery_attempt(
+                if journals_fresh_attempt
+                    && !share::resolve_delivery_attempt_for_generation(
                         db,
                         &attempt,
+                        generation,
                         share::ShareDeliveryAttemptOutcome::DefiniteFailure,
                         request.schedule.reset_submit_at(),
-                    )?;
+                    )?
+                {
+                    return Ok(ResubmitReport {
+                        outcome: ResubmitOutcome::StaleGeneration,
+                        outcome_unknown_urls: newly_outcome_unknown_urls,
+                    });
                 }
                 return Ok(ResubmitReport {
                     outcome: ResubmitOutcome::Cancelled,
@@ -271,25 +339,54 @@ pub(super) async fn resubmit_to_next_helper(
             // durable acceptance established by the original request.
             Err(error) if error.is_ambiguous() && retries_definitely_accepted_helper => {}
             Err(error) if error.is_ambiguous() => {
-                share::resolve_delivery_attempt(
+                if !share::resolve_delivery_attempt_for_generation(
                     db,
                     &attempt,
+                    generation,
                     share::ShareDeliveryAttemptOutcome::Ambiguous,
                     request.schedule.reset_submit_at(),
-                )?;
-                if !retries_outcome_unknown_helper {
+                )? {
+                    return Ok(ResubmitReport {
+                        outcome: ResubmitOutcome::StaleGeneration,
+                        outcome_unknown_urls: newly_outcome_unknown_urls,
+                    });
+                }
+                if !retries_ambiguous_helper {
                     newly_outcome_unknown_urls.push(server_url);
                 }
+            }
+            Err(_) if retries_interrupted_helper => {
+                if !share::resolve_delivery_attempt_for_generation(
+                    db,
+                    &attempt,
+                    generation,
+                    share::ShareDeliveryAttemptOutcome::Ambiguous,
+                    request.schedule.reset_submit_at(),
+                )? {
+                    return Ok(ResubmitReport {
+                        outcome: ResubmitOutcome::StaleGeneration,
+                        outcome_unknown_urls: newly_outcome_unknown_urls,
+                    });
+                }
+                newly_outcome_unknown_urls.push(server_url);
             }
             // A definite failure of a re-POST says nothing about the original
             // outcome-unknown POST, so that persisted state is kept.
             Err(_) if retries_outcome_unknown_helper => {}
-            Err(_) => share::resolve_delivery_attempt(
-                db,
-                &attempt,
-                share::ShareDeliveryAttemptOutcome::DefiniteFailure,
-                request.schedule.reset_submit_at(),
-            )?,
+            Err(_) => {
+                if !share::resolve_delivery_attempt_for_generation(
+                    db,
+                    &attempt,
+                    generation,
+                    share::ShareDeliveryAttemptOutcome::DefiniteFailure,
+                    request.schedule.reset_submit_at(),
+                )? {
+                    return Ok(ResubmitReport {
+                        outcome: ResubmitOutcome::StaleGeneration,
+                        outcome_unknown_urls: newly_outcome_unknown_urls,
+                    });
+                }
+            }
         }
     }
     Ok(ResubmitReport {

@@ -19,7 +19,10 @@ pub use share_delegations::{
     pending_share_rounds, remove_attempting_server, share_is_confirmed,
 };
 pub(crate) use share_delegations::{
-    add_sent_servers, mark_share_confirmed, record_share_delegation,
+    add_ambiguous_servers_for_generation, add_attempting_server_for_generation,
+    add_sent_servers_for_generation, add_sent_servers_preserving_schedule_for_generation,
+    mark_share_confirmed, record_share_delegation, remove_attempting_server_for_generation,
+    share_is_confirmed_for_generation, ShareAttemptReservation,
 };
 
 const NOTE_IDENTITY_HASH_BYTES: usize = 32;

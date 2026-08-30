@@ -28,8 +28,8 @@ use super::{
 /// dispatched. Definite acknowledgements and unknown outcomes are promoted to
 /// their final state, while definite pre-dispatch failures clear the marker.
 /// A process death or failed outcome write therefore leaves an outcome-unknown
-/// marker. Early replenishment will not replay it; overdue recovery may retry
-/// it only through the helper's duplicate-safe endpoint.
+/// marker. Recovery retries that interrupted helper after untried helpers,
+/// preserving the original schedule unless the share is genuinely overdue.
 ///
 /// # Errors
 ///
@@ -47,6 +47,7 @@ pub(crate) async fn submit_share_to_helpers(
     params: &InitialShareSubmissionParams<'_>,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
+    let scope = share::ShareOperationScope::capture(db);
     serde_json::from_str::<serde_json::Value>(params.share_wire_json).map_err(|e| {
         VotingError::InvalidInput {
             message: format!("invalid helper share JSON: {e}"),
@@ -65,7 +66,7 @@ pub(crate) async fn submit_share_to_helpers(
                 .to_string(),
         });
     }
-    submit_share_to_canonical_helpers(db, client, params, &planned, &fallback, cancel).await
+    submit_share_to_canonical_helpers(db, &scope, client, params, &planned, &fallback, cancel).await
 }
 
 /// Executes a fan-out after the caller has established canonical, disjoint
@@ -73,15 +74,17 @@ pub(crate) async fn submit_share_to_helpers(
 #[cfg(test)]
 async fn submit_share_to_canonical_helpers(
     db: &VotingDb,
+    scope: &share::ShareOperationScope,
     client: &HelperClient,
     params: &InitialShareSubmissionParams<'_>,
     planned: &[String],
     fallback: &[String],
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
-    let (_, persisted_delivery) = prepare_share_delivery(db, params)?;
+    let (_, persisted_delivery) = prepare_share_delivery(db, scope, params)?;
     dispatch_share_to_canonical_helpers(
         db,
+        scope,
         client,
         params,
         planned,
@@ -96,14 +99,16 @@ async fn submit_share_to_canonical_helpers(
 /// write-once schedule together with the merged delivery state.
 fn prepare_share_delivery(
     db: &VotingDb,
+    scope: &share::ShareOperationScope,
     params: &InitialShareSubmissionParams<'_>,
 ) -> Result<(u64, ShareDelegationRecord), VotingError> {
     let initial_persisted_report = ShareSubmissionReport {
         target_count: params.target_count,
         ..ShareSubmissionReport::default()
     };
-    let durable_submit_at = share::record_delivery(
+    let (durable_submit_at, expected_nullifier) = share::record_delivery_for_scope(
         db,
+        scope,
         &share::ShareDeliveryRecordParams {
             round_id: params.round_id,
             bundle_index: params.bundle_index,
@@ -113,12 +118,13 @@ fn prepare_share_delivery(
             submit_at: params.submit_at,
         },
     )?;
-    let persisted_delivery = share::list(db, params.round_id)?
+    let persisted_delivery = share::list_for_scope(db, scope, params.round_id)?
         .into_iter()
         .find(|share| {
             share.bundle_index == params.bundle_index
                 && share.proposal_id == params.proposal_id
                 && share.share_index == params.share_index
+                && share.nullifier == expected_nullifier
         })
         .ok_or_else(|| VotingError::Internal {
             message: "newly journaled helper share was not found".to_string(),
@@ -127,8 +133,10 @@ fn prepare_share_delivery(
 }
 
 /// Continues fan-out from an already-prepared durable delivery record.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_share_to_canonical_helpers(
     db: &VotingDb,
+    scope: &share::ShareOperationScope,
     client: &HelperClient,
     params: &InitialShareSubmissionParams<'_>,
     planned: &[String],
@@ -136,6 +144,8 @@ async fn dispatch_share_to_canonical_helpers(
     persisted_delivery: ShareDelegationRecord,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
+    let expected_nullifier = persisted_delivery.nullifier.clone();
+    let generation = share::ShareGeneration::new(scope, &expected_nullifier);
     let planned_set: HashSet<&str> = planned.iter().map(String::as_str).collect();
     let candidates = planned.iter().chain(fallback).cloned().collect::<Vec<_>>();
     let definite_acceptance_urls = persisted_delivery
@@ -214,8 +224,12 @@ async fn dispatch_share_to_canonical_helpers(
             target_count: params.target_count,
             submit_at: params.submit_at,
         };
-        if !share::begin_delivery_attempt(db, &attempt)? {
-            continue;
+        match share::begin_delivery_attempt_for_generation(db, &attempt, generation)? {
+            crate::storage::queries::ShareAttemptReservation::Started => {}
+            crate::storage::queries::ShareAttemptReservation::AlreadyRecorded => continue,
+            crate::storage::queries::ShareAttemptReservation::StaleGeneration => {
+                return Err(stale_delivery_error(params));
+            }
         }
 
         let helper_post_outcome = tokio::time::timeout_at(
@@ -237,39 +251,53 @@ async fn dispatch_share_to_canonical_helpers(
                 // here can only cancel an in-flight HTTP attempt, whose
                 // transport outcome is genuinely unknown; retain it for
                 // polling.
-                share::resolve_delivery_attempt(
+                if !share::resolve_delivery_attempt_for_generation(
                     db,
                     &attempt,
+                    generation,
                     share::ShareDeliveryAttemptOutcome::Ambiguous,
                     false,
-                )?;
+                )? {
+                    return Err(stale_delivery_error(params));
+                }
                 delivery_state.mark_outcome_unknown(&server_url)?;
                 break;
             }
             Ok(Ok(_)) => {
-                share::resolve_delivery_attempt(
+                if !share::resolve_delivery_attempt_for_generation(
                     db,
                     &attempt,
+                    generation,
                     share::ShareDeliveryAttemptOutcome::Accepted,
                     false,
-                )?;
+                )? {
+                    return Err(stale_delivery_error(params));
+                }
                 delivery_state.mark_accepted(&server_url)?;
             }
             Ok(Err(error)) if error.is_ambiguous() => {
-                share::resolve_delivery_attempt(
+                if !share::resolve_delivery_attempt_for_generation(
                     db,
                     &attempt,
+                    generation,
                     share::ShareDeliveryAttemptOutcome::Ambiguous,
                     false,
-                )?;
+                )? {
+                    return Err(stale_delivery_error(params));
+                }
                 delivery_state.mark_outcome_unknown(&server_url)?;
             }
-            Ok(Err(_)) => share::resolve_delivery_attempt(
-                db,
-                &attempt,
-                share::ShareDeliveryAttemptOutcome::DefiniteFailure,
-                false,
-            )?,
+            Ok(Err(_)) => {
+                if !share::resolve_delivery_attempt_for_generation(
+                    db,
+                    &attempt,
+                    generation,
+                    share::ShareDeliveryAttemptOutcome::DefiniteFailure,
+                    false,
+                )? {
+                    return Err(stale_delivery_error(params));
+                }
+            }
         }
     }
     Ok(ShareSubmissionReport {
@@ -282,6 +310,16 @@ async fn dispatch_share_to_canonical_helpers(
             .collect(),
         target_count: params.target_count,
     })
+}
+
+fn stale_delivery_error(params: &InitialShareSubmissionParams<'_>) -> VotingError {
+    VotingError::InvalidInput {
+        message: format!(
+            "committed share changed while helper delivery was in flight for \
+             round={}, bundle={}, proposal={}, share={}",
+            params.round_id, params.bundle_index, params.proposal_id, params.share_index
+        ),
+    }
 }
 
 /// Validates and submits one payload owned by a committed vote.
@@ -300,6 +338,7 @@ pub(crate) async fn submit_committed_share_to_helpers(
     request: ShareSubmissionRequest<'_>,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
+    let scope = share::ShareOperationScope::capture(db);
     let configured = ConfiguredHelperFleet::new(request.configured_server_urls)?;
     let planned = canonical_helper_url_list(&request.plan.target_servers)?;
     if planned.len() != request.plan.target_servers.len() {
@@ -335,34 +374,38 @@ pub(crate) async fn submit_committed_share_to_helpers(
             message: "committed share payload identity does not match its vote handle".to_string(),
         });
     }
-    let vc_tree_position =
-        match vote_recovery::helper_recovery_material(db, round_id, bundle_index, proposal_id)? {
-            vote_recovery::HelperRecoveryMaterial::Ready(bundle) => {
-                let recovery = crate::vote::parse_recovery(&bundle.commitment_bundle_json)?;
-                if recovery.vote_commitment != *expected_vote_commitment {
-                    return Err(VotingError::InvalidInput {
-                        message: format!(
-                            "committed vote changed before helper share submission for \
+    let vc_tree_position = match vote_recovery::helper_recovery_material_for_wallet(
+        db,
+        scope.wallet_id(),
+        round_id,
+        bundle_index,
+        proposal_id,
+    )? {
+        vote_recovery::HelperRecoveryMaterial::Ready(bundle) => {
+            let recovery = crate::vote::parse_recovery(&bundle.commitment_bundle_json)?;
+            if recovery.vote_commitment != *expected_vote_commitment {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "committed vote changed before helper share submission for \
                              round={round_id}, bundle={bundle_index}, proposal={proposal_id}; \
                              recover the current committed vote"
-                        ),
-                    });
-                }
-                bundle.vc_tree_position
-            }
-            vote_recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
-                return Err(VotingError::InvalidInput {
-                    message: "committed vote must be confirmed before submitting helper shares"
-                        .to_string(),
+                    ),
                 });
             }
-            vote_recovery::HelperRecoveryMaterial::Missing => {
-                return Err(VotingError::Internal {
-                    message: "committed vote is missing durable helper recovery material"
-                        .to_string(),
-                });
-            }
-        };
+            bundle.vc_tree_position
+        }
+        vote_recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
+            return Err(VotingError::InvalidInput {
+                message: "committed vote must be confirmed before submitting helper shares"
+                    .to_string(),
+            });
+        }
+        vote_recovery::HelperRecoveryMaterial::Missing => {
+            return Err(VotingError::Internal {
+                message: "committed vote is missing durable helper recovery material".to_string(),
+            });
+        }
+    };
     // Validate the complete typed payload before the durable row is created.
     // A continuation may replace this requested schedule with the write-once
     // value returned by persistence.
@@ -390,7 +433,8 @@ pub(crate) async fn submit_committed_share_to_helpers(
         submit_at: request.plan.submit_at,
         now_seconds: request.now_seconds,
     };
-    let (durable_submit_at, persisted_delivery) = prepare_share_delivery(db, &requested_params)?;
+    let (durable_submit_at, persisted_delivery) =
+        prepare_share_delivery(db, &scope, &requested_params)?;
     let share_wire_json = payload.to_wire_json(Some(vc_tree_position), durable_submit_at)?;
     let durable_params = InitialShareSubmissionParams {
         share_wire_json: &share_wire_json,
@@ -399,6 +443,7 @@ pub(crate) async fn submit_committed_share_to_helpers(
     };
     dispatch_share_to_canonical_helpers(
         db,
+        &scope,
         client,
         &durable_params,
         &candidates[..planned_target],

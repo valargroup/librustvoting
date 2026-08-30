@@ -70,6 +70,117 @@ async fn invalid_status_scores_a_failure_without_blocking_confirmation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn confirmation_stays_bound_to_the_wallet_that_started_tracking() {
+    const OTHER_WALLET: &str = "other-share-wallet";
+
+    let configured = helpers(2);
+    let db = db_with_delivery(&configured, &[], configured.len());
+    db.set_wallet_id(OTHER_WALLET);
+    seed_recoverable_vote_for_wallet(&db, OTHER_WALLET);
+    let submission = ShareSubmissionReport {
+        accepted_urls: configured.clone(),
+        ambiguous_urls: Vec::new(),
+        target_count: configured.len(),
+    };
+    share::record_delivery(
+        &db,
+        &share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            submission: &submission,
+            submit_at: SUBMIT_AT,
+        },
+    )
+    .unwrap();
+    db.set_wallet_id(WALLET_ID);
+    let share_id = share_id_of(&db);
+    let db = Arc::new(db);
+
+    let transport = Arc::new(MockTransport::default());
+    for index in 1..=2 {
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(index)
+            ),
+            json_status("confirmed"),
+        );
+    }
+    let switched_db = Arc::clone(&db);
+    transport.observe_gets(move |_| switched_db.set_wallet_id(OTHER_WALLET));
+    let client = client_with(transport);
+    let random = zero_bytes;
+
+    let report = track_pending_shares(
+        &db,
+        &params(&configured, ready_not_overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(db.wallet_id(), OTHER_WALLET);
+    assert!(!only_share(&db).confirmed);
+    db.set_wallet_id(WALLET_ID);
+    assert!(only_share(&db).confirmed);
+    assert_eq!(report.confirmed.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn confirmation_does_not_apply_to_a_replaced_share_generation() {
+    let configured = helpers(2);
+    let db = Arc::new(db_with_delivery(&configured, &[], configured.len()));
+    let share_id = share_id_of(&db);
+    let replacement_nullifier = vec![0xF1; 32];
+    let transport = Arc::new(MockTransport::default());
+    for index in 1..=2 {
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(index)
+            ),
+            json_status("confirmed"),
+        );
+    }
+    let replacing_db = Arc::clone(&db);
+    let replacement_for_observer = replacement_nullifier.clone();
+    transport.observe_gets(move |_| {
+        replacing_db
+            .conn()
+            .execute(
+                "UPDATE share_delegations SET nullifier = :nullifier
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+                rusqlite::named_params! {
+                    ":nullifier": replacement_for_observer,
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": WALLET_ID,
+                },
+            )
+            .unwrap();
+    });
+    let client = client_with(transport);
+    let random = zero_bytes;
+
+    let report = track_pending_shares(
+        &db,
+        &params(&configured, ready_not_overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    let stored = only_share(&db);
+    assert_eq!(stored.nullifier, replacement_nullifier);
+    assert!(!stored.confirmed);
+    assert!(report.confirmed.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
 async fn two_helper_fleet_polls_beyond_its_single_placement() {
     let configured = helpers(2);
     let db = db_with_delivery(&[helper(1)], &[], 1);
@@ -1116,7 +1227,7 @@ async fn small_fleet_all_ambiguous_still_recovers() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn early_replenishment_skips_an_interrupted_attempt() {
+async fn early_replenishment_prefers_untried_before_an_interrupted_attempt() {
     let configured = helpers(3);
     let db = db_with_delivery(&[helper(1)], &[], 2);
     mark_interrupted_attempt(&db, &helper(2));
@@ -1189,7 +1300,7 @@ async fn overdue_recovery_retries_an_interrupted_attempt_after_untried_helpers()
 }
 
 #[tokio::test(start_paused = true)]
-async fn failed_interrupted_attempt_retry_preserves_the_unknown_outcome() {
+async fn failed_interrupted_attempt_retry_becomes_explicitly_ambiguous() {
     let configured = helpers(1);
     let db = db_with_delivery(&[], &[], 1);
     mark_interrupted_attempt(&db, &helper(1));
@@ -1219,12 +1330,138 @@ async fn failed_interrupted_attempt_retry_preserves_the_unknown_outcome() {
     .unwrap();
 
     assert!(report.resubmitted.is_empty());
-    assert!(report.ambiguous.is_empty());
+    assert_eq!(report.ambiguous[0].server_url, helper(1));
     assert_eq!(transport.call_count("/shares"), 1);
     let stored = only_share(&db);
     assert!(stored.sent_to_urls.is_empty());
+    assert_eq!(stored.ambiguous_urls, vec![helper(1)]);
+    assert!(stored.attempting_urls.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupted_one_helper_share_recovers_without_vote_end_time() {
+    let configured = helpers(1);
+    let db = db_with_delivery(&[], &[], 1);
+    mark_interrupted_attempt(&db, &helper(1));
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&post_url, json_status("duplicate"));
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+    let mut tracking_params = params(&configured, SUBMIT_AT - 1, &random);
+    tracking_params.vote_end_time_seconds = None;
+
+    let report = track_pending_shares(&db, &tracking_params, &client, &never_cancel())
+        .await
+        .unwrap();
+
+    assert_eq!(report.resubmitted[0].server_url, helper(1));
+    assert_eq!(transport.call_count("/shares"), 1);
+    assert_eq!(transport.posted_submit_at(&post_url), SUBMIT_AT);
+    let stored = only_share(&db);
+    assert_eq!(stored.sent_to_urls, vec![helper(1)]);
+    assert!(stored.ambiguous_urls.is_empty());
+    assert!(stored.attempting_urls.is_empty());
+    assert_eq!(stored.submit_at, SUBMIT_AT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupted_retry_does_not_resolve_a_replaced_share_generation() {
+    let configured = helpers(1);
+    let db = Arc::new(db_with_delivery(&[], &[], 1));
+    mark_interrupted_attempt(&db, &helper(1));
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&post_url, json_status("duplicate"));
+    let replacing_db = Arc::clone(&db);
+    transport.observe_posts(move |_| {
+        replacing_db
+            .conn()
+            .execute(
+                "UPDATE share_delegations SET nullifier = :nullifier
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+                rusqlite::named_params! {
+                    ":nullifier": vec![0xF3_u8; 32],
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": WALLET_ID,
+                },
+            )
+            .unwrap();
+    });
+    let client = client_with(transport);
+    let random = zero_bytes;
+    let mut tracking_params = params(&configured, SUBMIT_AT - 1, &random);
+    tracking_params.vote_end_time_seconds = None;
+
+    let report = track_pending_shares(&db, &tracking_params, &client, &never_cancel())
+        .await
+        .unwrap();
+
+    assert!(report.resubmitted.is_empty());
+    assert!(report.ambiguous.is_empty());
+    let stored = only_share(&db);
+    assert_eq!(stored.nullifier, vec![0xF3; 32]);
+    assert!(stored.sent_to_urls.is_empty());
     assert!(stored.ambiguous_urls.is_empty());
     assert_eq!(stored.attempting_urls, vec![helper(1)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_early_interrupted_retry_is_not_repeated_without_vote_end_time() {
+    let configured = helpers(1);
+    let db = db_with_delivery(&[], &[], 1);
+    mark_interrupted_attempt(&db, &helper(1));
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&post_url, http_status(400));
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+    let mut tracking_params = params(&configured, SUBMIT_AT - 1, &random);
+    tracking_params.vote_end_time_seconds = None;
+
+    let first = track_pending_shares(&db, &tracking_params, &client, &never_cancel())
+        .await
+        .unwrap();
+    let second = track_pending_shares(&db, &tracking_params, &client, &never_cancel())
+        .await
+        .unwrap();
+
+    assert_eq!(first.ambiguous[0].server_url, helper(1));
+    assert!(second.resubmitted.is_empty());
+    assert!(second.ambiguous.is_empty());
+    assert_eq!(transport.call_count("/shares"), 1);
+    let stored = only_share(&db);
+    assert_eq!(stored.ambiguous_urls, vec![helper(1)]);
+    assert!(stored.attempting_urls.is_empty());
+    assert_eq!(stored.submit_at, SUBMIT_AT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_before_interrupted_retry_keeps_the_crash_marker() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let configured = helpers(1);
+    let db = db_with_delivery(&[], &[], 1);
+    mark_interrupted_attempt(&db, &helper(1));
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+    let mut tracking_params = params(&configured, SUBMIT_AT - 1, &random);
+    tracking_params.vote_end_time_seconds = None;
+    let checks = AtomicUsize::new(0);
+    let cancel_before_dispatch = || checks.fetch_add(1, Ordering::Relaxed) > 0;
+
+    let report = track_pending_shares(&db, &tracking_params, &client, &cancel_before_dispatch)
+        .await
+        .unwrap();
+
+    assert!(report.cancelled);
+    assert!(transport.calls().is_empty());
+    let stored = only_share(&db);
+    assert_eq!(stored.attempting_urls, vec![helper(1)]);
+    assert!(stored.ambiguous_urls.is_empty());
+    assert_eq!(stored.submit_at, SUBMIT_AT);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1453,16 +1690,19 @@ async fn cancelled_outcome_unknown_retry_preserves_ambiguous_state() {
     let cancel_checks = AtomicUsize::new(0);
     let cancel_before_dispatch = || cancel_checks.fetch_add(1, Ordering::Relaxed) > 0;
     let mut attempted_urls = Vec::new();
+    let scope = share::ShareOperationScope::capture(&db);
 
     let report = resubmit_to_next_helper(
         &db,
+        &scope,
         &tracking_params,
         &client,
         &ResubmitRequest {
             share: &stored,
             configured_urls: &configured,
             definite_acceptance_urls: &[],
-            outcome_unknown_urls: &outcome_unknown_urls,
+            ambiguous_urls: &outcome_unknown_urls,
+            interrupted_attempt_urls: &[],
             schedule: ResubmissionSchedule::Immediate,
         },
         &mut attempted_urls,
@@ -1496,16 +1736,19 @@ async fn cancelled_accepted_fallback_preserves_acceptance() {
     let cancel_checks = AtomicUsize::new(0);
     let cancel_before_dispatch = || cancel_checks.fetch_add(1, Ordering::Relaxed) > 0;
     let mut attempted_urls = Vec::new();
+    let scope = share::ShareOperationScope::capture(&db);
 
     let report = resubmit_to_next_helper(
         &db,
+        &scope,
         &tracking_params,
         &client,
         &ResubmitRequest {
             share: &stored,
             configured_urls: &configured,
             definite_acceptance_urls: &definite_acceptance_urls,
-            outcome_unknown_urls: &[],
+            ambiguous_urls: &[],
+            interrupted_attempt_urls: &[],
             schedule: ResubmissionSchedule::Immediate,
         },
         &mut attempted_urls,

@@ -90,6 +90,7 @@ struct MockTransport {
     post_bodies: Mutex<Vec<(String, Vec<u8>)>>,
     get_delays: Mutex<HashMap<String, VecDeque<Duration>>>,
     post_delays: Mutex<HashMap<String, VecDeque<Duration>>>,
+    get_observer: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
     post_observer: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
 
@@ -134,6 +135,10 @@ impl MockTransport {
 
     fn observe_posts(&self, observer: impl Fn(&str) + Send + Sync + 'static) {
         *self.post_observer.lock().unwrap() = Some(Arc::new(observer));
+    }
+
+    fn observe_gets(&self, observer: impl Fn(&str) + Send + Sync + 'static) {
+        *self.get_observer.lock().unwrap() = Some(Arc::new(observer));
     }
 
     fn calls(&self) -> Vec<String> {
@@ -196,6 +201,9 @@ impl HelperTransport for MockTransport {
             .lock()
             .unwrap()
             .push((url.to_string(), timeout));
+        if let Some(observer) = self.get_observer.lock().unwrap().as_ref() {
+            observer(url);
+        }
         let delay = self
             .get_delays
             .lock()
@@ -404,8 +412,12 @@ fn seed_round_and_bundle(db: &VotingDb) {
 }
 
 fn seed_recoverable_vote(db: &VotingDb) {
+    seed_recoverable_vote_for_wallet(db, WALLET_ID);
+}
+
+fn seed_recoverable_vote_for_wallet(db: &VotingDb, wallet_id: &str) {
     seed_round_and_bundle(db);
-    queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 1, 2, &[0xCA; 32]).unwrap();
+    queries::store_vote(&db.conn(), ROUND_ID, wallet_id, 0, 1, 2, &[0xCA; 32]).unwrap();
     let json = serialize_recovery(&recovery_bundle_fixture()).unwrap();
     db.conn()
         .execute(
@@ -416,7 +428,7 @@ fn seed_recoverable_vote(db: &VotingDb) {
                 ":json": json,
                 ":pos": 456i64,
                 ":round_id": ROUND_ID,
-                ":wallet_id": WALLET_ID,
+                ":wallet_id": wallet_id,
             },
         )
         .unwrap();

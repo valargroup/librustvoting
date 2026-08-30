@@ -1506,3 +1506,182 @@ fn attempting_updates_preserve_noncanonical_legacy_history() {
         vec!["legacy helper without a URL"]
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn initial_delivery_stays_bound_to_its_starting_wallet() {
+    const OTHER_WALLET: &str = "other-initial-wallet";
+
+    let configured = helpers(1);
+    let db = db_with_recoverable_vote();
+    db.set_wallet_id(OTHER_WALLET);
+    seed_recoverable_vote_for_wallet(&db, OTHER_WALLET);
+    let empty = ShareSubmissionReport {
+        target_count: 1,
+        ..ShareSubmissionReport::default()
+    };
+    share::record_delivery(
+        &db,
+        &share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            submission: &empty,
+            submit_at: SUBMIT_AT,
+        },
+    )
+    .unwrap();
+    db.set_wallet_id(WALLET_ID);
+    let db = Arc::new(db);
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&post_url, json_status("queued"));
+    let switched_db = Arc::clone(&db);
+    transport.observe_posts(move |_| switched_db.set_wallet_id(OTHER_WALLET));
+    let client = client_with(transport);
+    let request = initial_submission(&configured);
+
+    let report = submit_share_to_helpers(&db, &client, &request, &never_cancel())
+        .await
+        .unwrap();
+
+    assert_eq!(report.accepted_urls, vec![helper(1)]);
+    assert_eq!(db.wallet_id(), OTHER_WALLET);
+    assert!(only_share(&db).sent_to_urls.is_empty());
+    db.set_wallet_id(WALLET_ID);
+    assert_eq!(only_share(&db).sent_to_urls, vec![helper(1)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_delivery_rejects_a_replaced_share_generation() {
+    let configured = helpers(1);
+    let db = Arc::new(db_with_recoverable_vote());
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&post_url, json_status("queued"));
+    let replacing_db = Arc::clone(&db);
+    transport.observe_posts(move |_| {
+        replacing_db
+            .conn()
+            .execute(
+                "UPDATE share_delegations SET nullifier = :nullifier
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+                rusqlite::named_params! {
+                    ":nullifier": vec![0xF2_u8; 32],
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": WALLET_ID,
+                },
+            )
+            .unwrap();
+    });
+    let client = client_with(transport);
+    let request = initial_submission(&configured);
+
+    let error = submit_share_to_helpers(&db, &client, &request, &never_cancel())
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("committed share changed while helper delivery was in flight"));
+    let stored = only_share(&db);
+    assert_eq!(stored.nullifier, vec![0xF2; 32]);
+    assert!(stored.sent_to_urls.is_empty());
+    assert_eq!(stored.attempting_urls, vec![helper(1)]);
+}
+
+#[test]
+fn wrong_nullifier_generation_cannot_apply_any_delivery_transition() {
+    let db = db_with_delivery(&[], &[], 1);
+    let stored = only_share(&db);
+    let attempt = share::ShareDeliveryAttemptParams {
+        round_id: ROUND_ID,
+        bundle_index: 0,
+        proposal_id: 1,
+        share_index: 0,
+        server_url: &helper(1),
+        target_count: 1,
+        submit_at: SUBMIT_AT,
+    };
+    assert!(share::begin_existing_delivery_attempt(&db, &attempt).unwrap());
+    let scope = share::ShareOperationScope::capture(&db);
+    let wrong_nullifier = vec![0xF4; 32];
+    let wrong_generation = share::ShareGeneration::new(&scope, &wrong_nullifier);
+
+    assert!(matches!(
+        share::begin_existing_delivery_attempt_for_generation(&db, &attempt, wrong_generation)
+            .unwrap(),
+        crate::storage::queries::ShareAttemptReservation::StaleGeneration
+    ));
+    assert_eq!(
+        share::is_confirmed_for_generation(&db, &attempt, wrong_generation).unwrap(),
+        None
+    );
+    assert!(!share::confirm_for_generation(&db, ROUND_ID, 0, 1, 0, wrong_generation).unwrap());
+    for outcome in [
+        share::ShareDeliveryAttemptOutcome::Accepted,
+        share::ShareDeliveryAttemptOutcome::Ambiguous,
+        share::ShareDeliveryAttemptOutcome::DefiniteFailure,
+    ] {
+        assert!(!share::resolve_delivery_attempt_for_generation(
+            &db,
+            &attempt,
+            wrong_generation,
+            outcome,
+            false,
+        )
+        .unwrap());
+    }
+
+    let unchanged = only_share(&db);
+    assert_eq!(unchanged.nullifier, stored.nullifier);
+    assert!(unchanged.sent_to_urls.is_empty());
+    assert!(unchanged.ambiguous_urls.is_empty());
+    assert_eq!(unchanged.attempting_urls, vec![helper(1)]);
+    assert!(!unchanged.confirmed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_delivery_does_not_recreate_share_after_recovery_cleanup() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let configured = helpers(2);
+    let db = db_with_recoverable_vote();
+    let transport = Arc::new(MockTransport::default());
+    for server_url in &configured {
+        transport.queue_post(
+            &format!("{server_url}/shielded-vote/v1/shares"),
+            json_status("queued"),
+        );
+    }
+    let client = client_with(transport.clone());
+    let cleared = AtomicBool::new(false);
+    let clear_after_first_acceptance = || {
+        if !cleared.load(Ordering::Relaxed)
+            && share::list(&db, ROUND_ID)
+                .unwrap()
+                .first()
+                .is_some_and(|record| !record.sent_to_urls.is_empty())
+        {
+            db.clear_recovery_state(ROUND_ID).unwrap();
+            cleared.store(true, Ordering::Relaxed);
+        }
+        false
+    };
+    let request = InitialShareSubmissionParams {
+        target_count: 2,
+        ..initial_submission(&configured)
+    };
+
+    let error = submit_share_to_helpers(&db, &client, &request, &clear_after_first_acceptance)
+        .await
+        .unwrap_err();
+
+    assert!(cleared.load(Ordering::Relaxed));
+    assert!(error
+        .to_string()
+        .contains("committed share changed while helper delivery was in flight"));
+    assert_eq!(transport.call_count("/shares"), 1);
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+}

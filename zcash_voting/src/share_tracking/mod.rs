@@ -119,9 +119,9 @@ pub struct ResubmittedShare {
 /// [`submit_share_to_helpers`] journals every attempt and outcome before this
 /// report is returned, so callers must not treat it as pending persistence.
 /// Outcome-unknown attempts do not count toward `target_count` because the
-/// current status endpoint reports confirmation evidence, not possession.
-/// Tracking excludes them from early replenishment but may retry them once
-/// during overdue duplicate-safe recovery.
+/// current status endpoint reports confirmation evidence, not possession. A
+/// completed ambiguous attempt remains overdue-only; a process-interrupted
+/// attempt may be retried once per pass through the duplicate-safe endpoint.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShareSubmissionReport {
     /// Helpers that definitively accepted the share.
@@ -251,10 +251,10 @@ use recovery::{resubmit_to_next_helper, ResubmissionSchedule, ResubmitOutcome, R
 /// 4. Before the vote-end cutoff, when overdue or below the desired placement,
 ///    walk a health-aware randomized resubmission order and durably retain each
 ///    attempt before contacting another helper. Early replenishment preserves
-///    the persisted `submit_at` and excludes outcome-unknown helpers; overdue
-///    recovery uses zero so helpers act immediately, and after untried helpers
-///    it may re-POST outcome-unknown helpers once, converging via helper-side
-///    duplicate detection.
+///    the persisted `submit_at`, preferring untried helpers before interrupted
+///    attempts. Explicit ambiguity remains overdue-only. Overdue recovery uses
+///    zero so helpers act immediately and may also retry ambiguous or accepted
+///    helpers, converging through helper-side duplicate detection.
 ///
 /// `cancel` is polled between every helper and every share. When it fires the
 /// pass returns what it has already durably recorded with
@@ -289,13 +289,14 @@ async fn track_pending_shares_with_elapsed(
     cancel: &(dyn Fn() -> bool + Send + Sync),
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
 ) -> Result<ShareTrackingReport, VotingError> {
+    let scope = share::ShareOperationScope::capture(db);
     // Validate the complete trust boundary before reading or mutating storage
     // and before dispatching any helper request.
     let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
     let configured_urls = configured_fleet.urls();
     let mut report = ShareTrackingReport::default();
 
-    for share in share::unconfirmed(db, params.round_id)? {
+    for share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
         if cancel() {
             report.cancelled = true;
             break;
@@ -309,8 +310,8 @@ async fn track_pending_shares_with_elapsed(
             .cloned()
             .collect::<Vec<_>>();
         // An `attempting` marker left by an interrupted process is an unknown
-        // POST outcome. Treat it like explicit ambiguity: exclude it from
-        // early replenishment, but allow overdue duplicate-safe recovery.
+        // POST outcome. Keep it separate from explicit ambiguity so recovery
+        // can reconcile the crash marker even without vote-end timing.
         let configured_outcome_unknown_urls = share
             .ambiguous_urls
             .iter()
@@ -323,17 +324,6 @@ async fn track_pending_shares_with_elapsed(
             .filter(|url| configured_fleet.contains(url))
             .cloned()
             .collect::<Vec<_>>();
-        // Once a process has stopped, both explicit ambiguity and a leftover
-        // attempting marker mean the POST outcome is unknown. Keep their
-        // persisted states distinct, but give overdue duplicate-safe recovery
-        // one combined view so interrupted attempts are not mistaken for
-        // helpers that have never been tried.
-        let configured_recovery_outcome_unknown_urls = dedupe_preserving_order(
-            configured_outcome_unknown_urls
-                .iter()
-                .chain(&configured_interrupted_attempt_urls)
-                .cloned(),
-        );
         let mut delivery_state = share::ShareDeliveryState::from_url_lists(
             &configured_definite_acceptance_urls,
             &configured_outcome_unknown_urls,
@@ -374,13 +364,17 @@ async fn track_pending_shares_with_elapsed(
                     break;
                 }
                 ShareStatusOutcome::ConfiguredHelperQuorumObserved => {
-                    share::confirm(
+                    let generation = share::ShareGeneration::new(&scope, &share.nullifier);
+                    if !share::confirm_for_generation(
                         db,
                         params.round_id,
                         share.bundle_index,
                         share.proposal_id,
                         share.share_index,
-                    )?;
+                        generation,
+                    )? {
+                        continue;
+                    }
                     report.confirmed.push(ShareKey::of(&share));
                     continue;
                 }
@@ -412,13 +406,15 @@ async fn track_pending_shares_with_elapsed(
             loop {
                 let resubmission = resubmit_to_next_helper(
                     db,
+                    &scope,
                     params,
                     client,
                     &ResubmitRequest {
                         share: &share,
                         configured_urls,
                         definite_acceptance_urls: delivery_state.accepted_urls(),
-                        outcome_unknown_urls: &configured_recovery_outcome_unknown_urls,
+                        ambiguous_urls: &configured_outcome_unknown_urls,
+                        interrupted_attempt_urls: &configured_interrupted_attempt_urls,
                         schedule,
                     },
                     &mut attempted_urls_this_pass,
@@ -426,6 +422,9 @@ async fn track_pending_shares_with_elapsed(
                     elapsed_seconds,
                 )
                 .await?;
+                if matches!(resubmission.outcome, ResubmitOutcome::StaleGeneration) {
+                    break;
+                }
                 for server_url in resubmission.outcome_unknown_urls {
                     let newly_outcome_unknown =
                         !delivery_state.outcome_unknown_urls().contains(&server_url);
@@ -459,6 +458,7 @@ async fn track_pending_shares_with_elapsed(
                         break;
                     }
                     ResubmitOutcome::AwaitingVcPosition
+                    | ResubmitOutcome::StaleGeneration
                     | ResubmitOutcome::NoDefiniteAcceptanceObserved
                     | ResubmitOutcome::CutoffReached => break,
                     ResubmitOutcome::Cancelled => {
@@ -477,7 +477,7 @@ async fn track_pending_shares_with_elapsed(
     // during this pass do not remain in the next-delay calculation.
     let current_time = params.now_seconds.saturating_add(elapsed_seconds());
     report.next_delay_seconds = next_tracking_delay_seconds(
-        &share::unconfirmed(db, params.round_id)?,
+        &share::unconfirmed_for_scope(db, &scope, params.round_id)?,
         current_time,
         params.policy,
     );

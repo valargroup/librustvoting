@@ -54,23 +54,6 @@ fallback, replenishment, overdue recovery, fleet changes, incomplete or
 independently planned batches, and single-share mode fall outside it. The
 statement also makes no claim about the combined view of colluding helpers.
 
-## Confidentiality statement
-
-The primary confidentiality adversary considered by the helper-distribution
-policy is collusion by the MPC validator committee. Decrypting an encrypted
-share requires control of at least the protocol's two-thirds validator
-threshold. For a complete normal commitment planned as one batch with at least
-two configured helpers, an adversary controlling that threshold together with
-one helper can obtain at most 12 of the 16 plaintext shares from that helper's
-returned initial target assignments.
-
-This is a 75-percent share-count bound, not necessarily a bound on the
-percentage of voting balance revealed. It is an initial-planning statement,
-not a lifetime possession bound: ambiguous delivery, initial-delivery
-fallback, replenishment, overdue recovery, fleet changes, incomplete or
-independently planned batches, and single-share mode fall outside it. The
-statement also makes no claim about the combined view of colluding helpers.
-
 ## Terminology and state model
 
 A **configured helper** is a canonical HTTP or HTTPS helper endpoint in the
@@ -90,7 +73,16 @@ placements.
 An **attempting helper** is an initial-submission or recovery target durably
 reserved in `attempting_urls` before its POST is dispatched. A process
 interruption can leave that reservation without a classified response; on
-restart it is treated as outcome-unknown and remains poll-only.
+restart it is treated as outcome-unknown and receives one duplicate-safe
+reconciliation attempt per pass after untried helpers.
+
+An **interrupted helper** is an attempting helper whose durable reservation is
+loaded by a later tracking operation with no corresponding live request in
+that operation. The earlier process may have stopped before dispatch, during
+transport, or before persisting the response, so interruption proves neither
+acceptance nor non-acceptance. It remains in `attempting_urls` until a
+duplicate-safe reconciliation classifies it as accepted or explicitly
+ambiguous.
 
 The durable **placement target** is the desired number of definite helper
 acceptances for one share. Tracking caps its effective value to both the
@@ -117,9 +109,13 @@ under-placed or overdue --> attempting_urls --> recovery POST
                                                |-- definite --> sent_to_urls
                                                \-- unknown --> ambiguous_urls
 
-overdue only: ambiguous_urls or attempting_urls --> duplicate-safe re-POST
-                                                   |-- accepted --> sent_to_urls
-                                                   \-- otherwise --> unchanged
+early or overdue: attempting_urls --> duplicate-safe re-POST
+                                      |-- accepted --> sent_to_urls
+                                      \-- otherwise --> ambiguous_urls
+
+overdue only: ambiguous_urls --> duplicate-safe re-POST
+                                |-- accepted --> sent_to_urls
+                                \-- otherwise --> unchanged
 
 sent_to_urls, ambiguous_urls, or attempting_urls
     -- confirmed status from the configured quorum --> confirmed
@@ -136,14 +132,13 @@ for storage updates in
 `delivery_state_preserves_order_and_strongest_evidence` exercises this
 precedence directly.
 
-A helper in either outcome-unknown set is poll-only for early replenishment.
-Overdue recovery, which is liveness-critical, MAY re-POST an outcome-unknown
-helper — after every untried helper and at most once per tracking pass —
-because helper-side duplicate detection (`duplicate` is a definite acceptance)
-makes the re-POST converge instead of double-counting. A definite acceptance
-of the re-POST moves the helper to `sent_to_urls`; a definite failure of the
-re-POST says nothing about the original POST and leaves the outcome-unknown
-state in place.
+An explicitly ambiguous helper is poll-only for early replenishment. An
+interrupted helper is retried after every untried helper, even without vote-end
+timing, and at most once per tracking pass. Helper-side duplicate detection
+(`duplicate` is a definite acceptance) makes the re-POST converge instead of
+double-counting. Acceptance moves it to `sent_to_urls`; any completed
+non-acceptance moves the crash marker to explicit `ambiguous_urls`, preventing
+unbounded early replay while preserving the original unknown outcome.
 
 ## Planning invariants
 
@@ -693,7 +688,10 @@ helper it writes
 
 Ambiguous attempts do not satisfy the target. The returned report summarizes
 state that has already been journaled; the tracker is responsible for
-repairing any remaining deficit.
+repairing any remaining deficit. `ShareSubmissionReport` has no separate
+in-flight field, so its `ambiguous_urls` projection includes both durable
+`ambiguous_urls` and process-interrupted `attempting_urls`. Storage and tracker
+logic continue to keep those states distinct.
 
 Regression tests in
 [`share_tracking/tests/initial_delivery.rs`](../zcash_voting/src/share_tracking/tests/initial_delivery.rs):
@@ -705,13 +703,14 @@ Regression tests in
 covered by `initial_post_is_journaled_before_transport_dispatch`,
 `definite_initial_failure_clears_attempt_and_remains_retryable`,
 `ambiguous_initial_failure_is_not_replayed_by_initial_delivery`,
-`failed_outcome_write_leaves_attempting_marker`, and
+`failed_outcome_write_is_reported_as_ambiguous_on_resume`, and
 `failed_attempt_write_prevents_network_dispatch`. Typed-boundary coverage is
 provided by
 `committed_vote_submission_keeps_degraded_planned_target_before_healthy_fallback`,
 `repeated_committed_submission_preserves_the_original_schedule`,
 `committed_vote_submission_rejects_mismatched_plan_before_side_effects`, and
-`invalid_candidate_url_does_not_create_a_share_record`.
+`invalid_candidate_url_does_not_create_a_share_record`. Cleanup concurrency is
+covered by `initial_delivery_does_not_recreate_share_after_recovery_cleanup`.
 
 ## Confirmation and health invariants
 
@@ -815,26 +814,30 @@ configured helper set.
 
 1. Under-placement starts replenishment immediately; it does not wait for the
    share to become status-checkable or overdue.
-2. Early replenishment preserves the durable `submit_at` and considers only
-   helpers that have not definitely accepted the share.
+2. Early replenishment preserves the durable `submit_at`. It tries untried
+   helpers first, then process-interrupted helpers. Explicitly ambiguous and
+   accepted helpers remain excluded.
 3. Overdue recovery rebuilds the payload with `submit_at = 0`. It tries
-   untried helpers first, then outcome-unknown helpers, then previously
-   accepted helpers. Outcome-unknown and accepted retries rely on their
-   existing durable history instead of trying to add a fresh attempt marker.
+   untried helpers first, then interrupted helpers, explicitly ambiguous
+   helpers, and finally previously accepted helpers. Already-journaled retries
+   rely on their durable history instead of adding a fresh attempt marker.
 4. The untried and previously accepted groups are independently randomized
-   from host-supplied CSPRNG bytes. The outcome-unknown retry group is a
-   deterministic last resort whose membership is already persisted; health
+   from host-supplied CSPRNG bytes. Interrupted and ambiguous retry groups are
+   deterministic last resorts whose membership is already persisted; health
    ordering is applied within every group.
 5. An ambiguous helper stays poll-only for early replenishment. Overdue
    recovery re-POSTs it at most once per pass; a definite acceptance
    (including `duplicate`) moves it to `sent_to_urls`, while a definite
    failure of the re-POST leaves the outcome-unknown state untouched because
    it says nothing about the original POST.
-6. A definite failure is attempted at most once in one tracking pass. It can
+6. An interrupted helper is retried at most once per pass. Acceptance makes it
+   definite; an ambiguous or definite failure moves it to explicit ambiguity,
+   consuming the early-retry crash marker without discarding uncertainty.
+7. A definite failure is attempted at most once in one tracking pass. It can
    become eligible again in a later pass.
-7. One pass continues until it fills the complete definite-placement deficit
+8. One pass continues until it fills the complete definite-placement deficit
    or has no eligible helper that accepts.
-8. Recovery may use any configured helper for liveness; initial balancing is
+9. Recovery may use any configured helper for liveness; initial balancing is
    not a recovery cap.
 
 Regression tests: `under_placed_share_preserves_delayed_submit_at`,
@@ -844,6 +847,8 @@ Regression tests: `under_placed_share_preserves_delayed_submit_at`,
 `one_tracking_pass_does_not_repeat_a_definite_failure`,
 `a_definite_failure_is_eligible_again_on_a_later_pass`,
 `early_replenishment_excludes_ambiguous_helpers`,
+`interrupted_one_helper_share_recovers_without_vote_end_time`,
+`failed_early_interrupted_retry_is_not_repeated_without_vote_end_time`,
 `overdue_recovery_retries_ambiguous_helper_after_untried`,
 `overdue_recovery_reposts_to_accepted_helper_after_untried_helpers_fail`,
 `ambiguous_accepted_helper_retry_preserves_the_stronger_delivery_state`,
@@ -855,8 +860,8 @@ Regression tests: `under_placed_share_preserves_delayed_submit_at`,
 
 Before dispatching any initial or recovery POST, the helper MUST be durably
 journaled: a fresh target is added to `attempting_urls`, while an overdue
-re-POST to an outcome-unknown or accepted helper relies on its already-
-persisted delivery history. A definite acceptance moves the helper to
+re-POST to an ambiguous or accepted helper and any interrupted re-POST rely on
+already-persisted delivery history. A definite acceptance moves the helper to
 `sent_to_urls`; an ambiguous result moves a fresh helper to `ambiguous_urls`;
 and a definite failure of a fresh attempt removes the reservation so the
 helper can be retried in a later pass. A definite failure of an overdue
@@ -866,10 +871,11 @@ transition is persisted before the workflow contacts another helper.
 
 A process interruption during an in-flight initial or recovery request leaves
 the helper in `attempting_urls`. On restart, that state is exposed as
-outcome-unknown: poll-only for early replenishment, with any further POST
-deferred to the deliberate, duplicate-safe overdue retry above. A failed
-outcome write has the same conservative behavior: the attempting marker
-remains rather than making the helper eligible for a fresh reservation.
+outcome-unknown and receives a deliberate, duplicate-safe reconciliation after
+untried helpers, even when vote-end timing is unavailable. A completed
+non-acceptance promotes it to explicit ambiguity; a second early pass therefore
+does not replay it again. A failed outcome write has the same conservative
+behavior as process interruption.
 
 Immediately before every recovery POST, the durable confirmation bit is
 re-read. A fresh helper gets this check while its `attempting_urls` reservation
@@ -888,6 +894,7 @@ suppresses overdue recovery.
 
 Regression tests: `ambiguous_attempt_is_durable_before_recovery_advances`,
 `ambiguous_resubmission_is_recorded_while_recovery_continues`,
+`cancellation_before_interrupted_retry_keeps_the_crash_marker`,
 `concurrent_confirmation_stops_outcome_unknown_retry`,
 `under_placement_stops_at_the_resubmission_cutoff`,
 `resubmission_rechecks_the_cutoff_before_every_post`, and
@@ -967,6 +974,11 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
    Changing or skipping that intent clears stale share rows.
 11. Pending rounds are wallet-scoped and remain discoverable until every share
     is confirmed.
+12. An asynchronous submission or tracking pass captures its wallet scope
+    before storage or network work. Every post-await transition is conditional
+    on that wallet and the exact persisted share nullifier. A deleted or
+    replacement generation is left untouched, and its stale helper result is
+    omitted from reports.
 
 Enforcement:
 [`share.rs`](../zcash_voting/src/share.rs),
@@ -976,7 +988,13 @@ Enforcement:
 Regression coverage: `test_share_delegation_lifecycle` in
 `storage/operations.rs`,
 `pending_rounds_return_session_context_until_all_shares_confirm` in
-`share.rs`, and `changed_choice_ignores_stale_share_confirmations` and
+`share.rs`, `confirmation_stays_bound_to_the_wallet_that_started_tracking`,
+`confirmation_does_not_apply_to_a_replaced_share_generation`,
+`initial_delivery_stays_bound_to_its_starting_wallet`,
+`initial_delivery_rejects_a_replaced_share_generation`, and
+`initial_delivery_does_not_recreate_share_after_recovery_cleanup`,
+`interrupted_retry_does_not_resolve_a_replaced_share_generation` in
+`share_tracking/tests`, and `changed_choice_ignores_stale_share_confirmations` and
 `skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
 
 ### Configuration and migration
@@ -1039,7 +1057,9 @@ Enforcement:
 
 Regression tests:
 `clear_preserves_recorded_positions_and_resets_unconfirmed_votes` and
-`test_clear_recovery_state_resets_vote_recovery`.
+`test_clear_recovery_state_resets_vote_recovery`, plus
+`initial_delivery_does_not_recreate_share_after_recovery_cleanup` for cleanup
+racing active helper delivery.
 
 ## Helper identity and payload invariants
 

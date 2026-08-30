@@ -5,6 +5,13 @@ use crate::helper::url::canonicalize_helper_base_url;
 use crate::share::ShareDeliveryState;
 use crate::types::{ShareDelegationRecord, VotingError};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShareAttemptReservation {
+    Started,
+    AlreadyRecorded,
+    StaleGeneration,
+}
+
 pub(super) fn delete_for_replaced_vote(
     conn: &Connection,
     round_id: &str,
@@ -141,16 +148,42 @@ pub fn add_attempting_server(
     share_index: u32,
     server_url: &str,
 ) -> Result<bool, VotingError> {
-    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
+    match add_attempting_server_for_generation(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        server_url,
+        None,
+    )? {
+        ShareAttemptReservation::Started => Ok(true),
+        ShareAttemptReservation::AlreadyRecorded => Ok(false),
+        ShareAttemptReservation::StaleGeneration => Err(missing_share_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_attempting_server_for_generation(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    server_url: &str,
+    expected_nullifier: Option<&[u8]>,
+) -> Result<ShareAttemptReservation, VotingError> {
     loop {
-        let (sent_json, ambiguous_json, attempting_json, confirmed): (
-            String,
-            String,
-            String,
-            bool,
-        ) = conn
+        let current: Option<(String, String, String, bool, Vec<u8>)> = conn
             .query_row(
-                "SELECT sent_to_urls, ambiguous_urls, attempting_urls, confirmed
+                "SELECT sent_to_urls, ambiguous_urls, attempting_urls, confirmed, nullifier
              FROM share_delegations
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id
@@ -162,11 +195,28 @@ pub fn add_attempting_server(
                     ":proposal_id": proposal_id,
                     ":share_index": share_index,
                 },
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
+            .optional()
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to read helper attempt state: {e}"),
             })?;
+        let Some((sent_json, ambiguous_json, attempting_json, confirmed, nullifier)) = current
+        else {
+            return Ok(ShareAttemptReservation::StaleGeneration);
+        };
+        if expected_nullifier.is_some_and(|expected| expected != nullifier) {
+            return Ok(ShareAttemptReservation::StaleGeneration);
+        }
+        ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
         let (definitely_accepted_urls, _) =
             partition_stored_helper_urls(&parse_url_list(&sent_json, "sent_to_urls")?);
         let (outcome_unknown_urls, _) =
@@ -179,7 +229,7 @@ pub fn add_attempting_server(
             &in_flight_urls,
         )?;
         if confirmed || !state.begin(server_url)? {
-            return Ok(false);
+            return Ok(ShareAttemptReservation::AlreadyRecorded);
         }
         let updated_attempting_json = serialize_url_list(
             state.in_flight_urls(),
@@ -193,11 +243,13 @@ pub fn add_attempting_server(
                    AND bundle_index = :bundle_index AND proposal_id = :proposal_id
                    AND share_index = :share_index
                    AND confirmed = 0
+                   AND nullifier = :observed_nullifier
                    AND sent_to_urls = :observed_sent_to_urls
                    AND ambiguous_urls = :observed_ambiguous_urls
                    AND attempting_urls = :observed_attempting_urls",
                 named_params! {
                     ":updated_attempting_urls": updated_attempting_json,
+                    ":observed_nullifier": nullifier,
                     ":observed_sent_to_urls": sent_json,
                     ":observed_ambiguous_urls": ambiguous_json,
                     ":observed_attempting_urls": attempting_json,
@@ -212,7 +264,7 @@ pub fn add_attempting_server(
                 message: format!("failed to record helper attempt: {e}"),
             })?;
         if updated == 1 {
-            return Ok(true);
+            return Ok(ShareAttemptReservation::Started);
         }
         // A separate connection changed the delivery state after our read.
         // Reload and merge its stronger evidence instead of overwriting it.
@@ -230,11 +282,43 @@ pub fn remove_attempting_server(
     share_index: u32,
     server_url: &str,
 ) -> Result<(), VotingError> {
-    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
+    if remove_attempting_server_for_generation(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        server_url,
+        None,
+    )? {
+        Ok(())
+    } else {
+        Err(missing_share_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remove_attempting_server_for_generation(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    server_url: &str,
+    expected_nullifier: Option<&[u8]>,
+) -> Result<bool, VotingError> {
     loop {
-        let (sent_json, ambiguous_json, attempting_json): (String, String, String) = conn
+        let current: Option<(String, String, String, Vec<u8>)> = conn
             .query_row(
-                "SELECT sent_to_urls, ambiguous_urls, attempting_urls FROM share_delegations
+                "SELECT sent_to_urls, ambiguous_urls, attempting_urls, nullifier
+             FROM share_delegations
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id
                AND share_index = :share_index",
@@ -245,13 +329,21 @@ pub fn remove_attempting_server(
                     ":proposal_id": proposal_id,
                     ":share_index": share_index,
                 },
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
+            .optional()
             .map_err(|e| VotingError::Internal {
                 message: format!(
                     "failed to read helper delivery state before clearing attempt: {e}"
                 ),
             })?;
+        let Some((sent_json, ambiguous_json, attempting_json, nullifier)) = current else {
+            return Ok(false);
+        };
+        if expected_nullifier.is_some_and(|expected| expected != nullifier) {
+            return Ok(false);
+        }
+        ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
         let stored_in_flight_urls: Vec<String> =
             serde_json::from_str(&attempting_json).map_err(|e| VotingError::Internal {
                 message: format!("failed to deserialize attempting_urls: {e}"),
@@ -271,11 +363,13 @@ pub fn remove_attempting_server(
          WHERE round_id = :round_id AND wallet_id = :wallet_id
            AND bundle_index = :bundle_index AND proposal_id = :proposal_id
            AND share_index = :share_index
+           AND nullifier = :observed_nullifier
            AND sent_to_urls = :observed_sent_to_urls
            AND ambiguous_urls = :observed_ambiguous_urls
            AND attempting_urls = :observed_attempting_urls",
                 named_params! {
                     ":updated_attempting_urls": updated_attempting_json,
+                    ":observed_nullifier": nullifier,
                     ":observed_sent_to_urls": sent_json,
                     ":observed_ambiguous_urls": ambiguous_json,
                     ":observed_attempting_urls": attempting_json,
@@ -290,7 +384,7 @@ pub fn remove_attempting_server(
                 message: format!("failed to clear helper attempt: {e}"),
             })?;
         if updated == 1 {
-            return Ok(());
+            return Ok(true);
         }
         // A separate connection changed the delivery state after our read.
         // Retry against that stronger state instead of restoring stale lists.
@@ -720,24 +814,55 @@ pub fn share_is_confirmed(
     proposal_id: u32,
     share_index: u32,
 ) -> Result<bool, VotingError> {
-    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    conn.query_row(
-        "SELECT confirmed FROM share_delegations
+    share_is_confirmed_for_generation(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        None,
+    )?
+    .ok_or_else(|| missing_share_error(round_id, bundle_index, proposal_id, share_index))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn share_is_confirmed_for_generation(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    expected_nullifier: Option<&[u8]>,
+) -> Result<Option<bool>, VotingError> {
+    let current: Option<(bool, Vec<u8>)> = conn
+        .query_row(
+            "SELECT confirmed, nullifier FROM share_delegations
          WHERE round_id = :round_id AND wallet_id = :wallet_id
            AND bundle_index = :bundle_index AND proposal_id = :proposal_id
            AND share_index = :share_index",
-        named_params! {
-            ":round_id": round_id,
-            ":wallet_id": wallet_id,
-            ":bundle_index": bundle_index,
-            ":proposal_id": proposal_id,
-            ":share_index": share_index,
-        },
-        |row| row.get(0),
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to read helper-share confirmation: {e}"),
-    })
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index,
+                ":proposal_id": proposal_id,
+                ":share_index": share_index,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read helper-share confirmation: {e}"),
+        })?;
+    let Some((confirmed, nullifier)) = current else {
+        return Ok(None);
+    };
+    if expected_nullifier.is_some_and(|expected| expected != nullifier) {
+        return Ok(None);
+    }
+    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
+    Ok(Some(confirmed))
 }
 
 /// Mark a share delegation as confirmed on-chain.
@@ -748,13 +873,14 @@ pub(crate) fn mark_share_confirmed(
     bundle_index: u32,
     proposal_id: u32,
     share_index: u32,
-) -> Result<(), VotingError> {
-    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
-    let updated = conn
-        .execute(
-            "UPDATE share_delegations SET confirmed = 1 \
-             WHERE round_id = :round_id AND wallet_id = :wallet_id \
-             AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
+    expected_nullifier: Option<&[u8]>,
+) -> Result<bool, VotingError> {
+    let current: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT nullifier FROM share_delegations
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index AND proposal_id = :proposal_id
+               AND share_index = :share_index",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
@@ -762,19 +888,38 @@ pub(crate) fn mark_share_confirmed(
                 ":proposal_id": proposal_id,
                 ":share_index": share_index,
             },
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read helper-share generation: {e}"),
+        })?;
+    let Some(nullifier) = current else {
+        return Ok(false);
+    };
+    if expected_nullifier.is_some_and(|expected| expected != nullifier) {
+        return Ok(false);
+    }
+    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
+    let updated = conn
+        .execute(
+            "UPDATE share_delegations SET confirmed = 1 \
+             WHERE round_id = :round_id AND wallet_id = :wallet_id \
+             AND bundle_index = :bundle_index AND proposal_id = :proposal_id \
+             AND share_index = :share_index AND nullifier = :expected_nullifier",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index,
+                ":proposal_id": proposal_id,
+                ":share_index": share_index,
+                ":expected_nullifier": nullifier,
+            },
         )
         .map_err(|e| VotingError::Internal {
             message: format!("failed to mark share confirmed: {}", e),
         })?;
-    if updated == 0 {
-        return Err(VotingError::Internal {
-            message: format!(
-                "no share delegation found: round={}, bundle={}, proposal={}, share={}",
-                round_id, bundle_index, proposal_id, share_index
-            ),
-        });
-    }
-    Ok(())
+    Ok(updated == 1)
 }
 
 fn ensure_share_matches_ballot_intent(
@@ -825,7 +970,8 @@ fn ensure_share_matches_ballot_intent(
 
 /// Appends definite delivery evidence, supersedes weaker evidence for those
 /// helpers, and makes the share immediately actionable.
-pub(crate) fn add_sent_servers(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_sent_servers_for_generation(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -833,7 +979,8 @@ pub(crate) fn add_sent_servers(
     proposal_id: u32,
     share_index: u32,
     new_urls: &[String],
-) -> Result<(), VotingError> {
+    expected_nullifier: Option<&[u8]>,
+) -> Result<bool, VotingError> {
     update_sent_servers(
         conn,
         round_id,
@@ -843,6 +990,7 @@ pub(crate) fn add_sent_servers(
         share_index,
         new_urls,
         true,
+        expected_nullifier,
     )
 }
 
@@ -856,6 +1004,38 @@ pub fn add_sent_servers_preserving_schedule(
     share_index: u32,
     new_urls: &[String],
 ) -> Result<(), VotingError> {
+    if add_sent_servers_preserving_schedule_for_generation(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        new_urls,
+        None,
+    )? {
+        Ok(())
+    } else {
+        Err(missing_share_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_sent_servers_preserving_schedule_for_generation(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    new_urls: &[String],
+    expected_nullifier: Option<&[u8]>,
+) -> Result<bool, VotingError> {
     update_sent_servers(
         conn,
         round_id,
@@ -865,6 +1045,7 @@ pub fn add_sent_servers_preserving_schedule(
         share_index,
         new_urls,
         false,
+        expected_nullifier,
     )
 }
 
@@ -891,12 +1072,13 @@ fn merge_share_delegation_urls(
     new_urls: &[String],
     merge: HelperUrlMerge,
     reset_submit_at: bool,
-) -> Result<(), VotingError> {
-    ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
+    expected_nullifier: Option<&[u8]>,
+) -> Result<bool, VotingError> {
     loop {
-        let (sent_json, ambiguous_json, attempting_json): (String, String, String) = conn
+        let current: Option<(String, String, String, Vec<u8>)> = conn
             .query_row(
-                "SELECT sent_to_urls, ambiguous_urls, attempting_urls FROM share_delegations \
+                "SELECT sent_to_urls, ambiguous_urls, attempting_urls, nullifier
+             FROM share_delegations \
              WHERE round_id = :round_id AND wallet_id = :wallet_id \
              AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index",
                 named_params! {
@@ -906,11 +1088,19 @@ fn merge_share_delegation_urls(
                     ":proposal_id": proposal_id,
                     ":share_index": share_index,
                 },
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
+            .optional()
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to read helper delivery state for update: {e}"),
             })?;
+        let Some((sent_json, ambiguous_json, attempting_json, nullifier)) = current else {
+            return Ok(false);
+        };
+        if expected_nullifier.is_some_and(|expected| expected != nullifier) {
+            return Ok(false);
+        }
+        ensure_share_matches_ballot_intent(conn, round_id, wallet_id, bundle_index, proposal_id)?;
         let (definite_acceptance_urls, preserved_legacy_definite_acceptance_urls) =
             partition_stored_helper_urls(&parse_url_list(&sent_json, "sent_to_urls")?);
         let (outcome_unknown_urls, preserved_legacy_outcome_unknown_urls) =
@@ -949,6 +1139,7 @@ fn merge_share_delegation_urls(
          attempting_urls = :attempting_urls, submit_at = iif(:reset_submit_at, 0, submit_at) \
          WHERE round_id = :round_id AND wallet_id = :wallet_id \
          AND bundle_index = :bundle_index AND proposal_id = :proposal_id AND share_index = :share_index \
+         AND nullifier = :observed_nullifier \
          AND sent_to_urls = :observed_sent_to_urls \
          AND ambiguous_urls = :observed_ambiguous_urls \
          AND attempting_urls = :observed_attempting_urls",
@@ -957,6 +1148,7 @@ fn merge_share_delegation_urls(
                     ":ambiguous_urls": updated_ambiguous,
                     ":attempting_urls": updated_attempting,
                     ":reset_submit_at": reset_submit_at,
+                    ":observed_nullifier": nullifier,
                     ":observed_sent_to_urls": sent_json,
                     ":observed_ambiguous_urls": ambiguous_json,
                     ":observed_attempting_urls": attempting_json,
@@ -971,7 +1163,7 @@ fn merge_share_delegation_urls(
                 message: format!("failed to update helper delivery state: {e}"),
             })?;
         if updated == 1 {
-            return Ok(());
+            return Ok(true);
         }
         // A separate connection changed the delivery state after our read.
         // Reload and merge it instead of overwriting stronger evidence.
@@ -988,7 +1180,8 @@ fn update_sent_servers(
     share_index: u32,
     new_urls: &[String],
     reset_submit_at: bool,
-) -> Result<(), VotingError> {
+    expected_nullifier: Option<&[u8]>,
+) -> Result<bool, VotingError> {
     merge_share_delegation_urls(
         conn,
         round_id,
@@ -999,6 +1192,7 @@ fn update_sent_servers(
         new_urls,
         HelperUrlMerge::DefiniteAcceptance,
         reset_submit_at,
+        expected_nullifier,
     )
 }
 
@@ -1015,6 +1209,40 @@ pub fn add_ambiguous_servers(
     new_urls: &[String],
     reset_submit_at: bool,
 ) -> Result<(), VotingError> {
+    if add_ambiguous_servers_for_generation(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        new_urls,
+        reset_submit_at,
+        None,
+    )? {
+        Ok(())
+    } else {
+        Err(missing_share_error(
+            round_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_ambiguous_servers_for_generation(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    new_urls: &[String],
+    reset_submit_at: bool,
+    expected_nullifier: Option<&[u8]>,
+) -> Result<bool, VotingError> {
     merge_share_delegation_urls(
         conn,
         round_id,
@@ -1025,5 +1253,19 @@ pub fn add_ambiguous_servers(
         new_urls,
         HelperUrlMerge::OutcomeUnknown,
         reset_submit_at,
+        expected_nullifier,
     )
+}
+
+fn missing_share_error(
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> VotingError {
+    VotingError::Internal {
+        message: format!(
+            "no share delegation found: round={round_id}, bundle={bundle_index}, proposal={proposal_id}, share={share_index}"
+        ),
+    }
 }

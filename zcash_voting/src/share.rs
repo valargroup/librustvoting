@@ -51,6 +51,45 @@ pub struct ShareDeliveryAttemptParams<'a> {
     pub submit_at: u64,
 }
 
+/// Wallet identity captured before an asynchronous helper-share operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShareOperationScope {
+    wallet_id: String,
+}
+
+impl ShareOperationScope {
+    pub(crate) fn capture(db: &VotingDb) -> Self {
+        Self {
+            wallet_id: db.wallet_id(),
+        }
+    }
+
+    pub(crate) fn wallet_id(&self) -> &str {
+        &self.wallet_id
+    }
+}
+
+/// Exact persisted share generation that an asynchronous result may mutate.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShareGeneration<'a> {
+    scope: &'a ShareOperationScope,
+    nullifier: &'a [u8],
+}
+
+impl<'a> ShareGeneration<'a> {
+    pub(crate) fn new(scope: &'a ShareOperationScope, nullifier: &'a [u8]) -> Self {
+        Self { scope, nullifier }
+    }
+
+    pub(crate) fn scope(self) -> &'a ShareOperationScope {
+        self.scope
+    }
+
+    pub(crate) fn nullifier(self) -> &'a [u8] {
+        self.nullifier
+    }
+}
+
 /// Definite state transition for a previously journaled helper POST.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShareDeliveryAttemptOutcome {
@@ -322,10 +361,20 @@ pub fn record(
 /// [`crate::helper::url::canonicalize_helper_base_url`] — validate helper
 /// URLs before delivering over the network. Storage failures are returned
 /// unchanged.
+#[cfg(any(test, feature = "test-fixtures"))]
 fn record_delivery_impl(
     db: &VotingDb,
     params: &ShareDeliveryRecordParams<'_>,
 ) -> Result<u64, VotingError> {
+    let scope = ShareOperationScope::capture(db);
+    record_delivery_for_scope(db, &scope, params).map(|(submit_at, _)| submit_at)
+}
+
+pub(crate) fn record_delivery_for_scope(
+    db: &VotingDb,
+    scope: &ShareOperationScope,
+    params: &ShareDeliveryRecordParams<'_>,
+) -> Result<(u64, [u8; 32]), VotingError> {
     let target_count =
         u32::try_from(params.submission.target_count).map_err(|_| VotingError::InvalidInput {
             message: format!(
@@ -333,14 +382,16 @@ fn record_delivery_impl(
                 params.submission.target_count
             ),
         })?;
-    let nullifier = delivery_nullifier(
+    let nullifier = delivery_nullifier_for_scope(
         db,
+        scope,
         params.round_id,
         params.bundle_index,
         params.proposal_id,
         params.share_index,
     )?;
-    db.record_share_delivery(
+    let submit_at = db.record_share_delivery_for_wallet(
+        scope.wallet_id(),
         params.round_id,
         params.bundle_index,
         params.proposal_id,
@@ -350,9 +401,11 @@ fn record_delivery_impl(
         target_count,
         &nullifier,
         params.submit_at,
-    )
+    )?;
+    Ok((submit_at, nullifier))
 }
 
+#[cfg(test)]
 pub(crate) fn record_delivery(
     db: &VotingDb,
     params: &ShareDeliveryRecordParams<'_>,
@@ -403,42 +456,24 @@ pub fn record_delivery_fixture(
 /// Returns `false` if the helper already has definite acceptance,
 /// outcome-unknown, or in-flight state. The marker is persisted before this
 /// function returns `true`, so dispatch can safely occur only afterward.
-pub(crate) fn begin_delivery_attempt(
+pub(crate) fn begin_delivery_attempt_for_generation(
     db: &VotingDb,
     params: &ShareDeliveryAttemptParams<'_>,
-) -> Result<bool, VotingError> {
-    let target_count =
-        u32::try_from(params.target_count).map_err(|_| VotingError::InvalidInput {
-            message: format!("target_count {} does not fit u32", params.target_count),
-        })?;
-    let nullifier = delivery_nullifier(
-        db,
-        params.round_id,
-        params.bundle_index,
-        params.proposal_id,
-        params.share_index,
-    )?;
-    db.record_share_delivery(
-        params.round_id,
-        params.bundle_index,
-        params.proposal_id,
-        params.share_index,
-        &[],
-        &[],
-        target_count,
-        &nullifier,
-        params.submit_at,
-    )?;
-    db.add_attempting_server(
+    generation: ShareGeneration<'_>,
+) -> Result<crate::storage::queries::ShareAttemptReservation, VotingError> {
+    db.add_attempting_server_for_generation(
+        generation.scope().wallet_id(),
         params.round_id,
         params.bundle_index,
         params.proposal_id,
         params.share_index,
         params.server_url,
+        Some(generation.nullifier()),
     )
 }
 
 /// Journals a POST for a share record that recovery has already loaded.
+#[cfg(test)]
 pub(crate) fn begin_existing_delivery_attempt(
     db: &VotingDb,
     params: &ShareDeliveryAttemptParams<'_>,
@@ -452,50 +487,94 @@ pub(crate) fn begin_existing_delivery_attempt(
     )
 }
 
+pub(crate) fn begin_existing_delivery_attempt_for_generation(
+    db: &VotingDb,
+    params: &ShareDeliveryAttemptParams<'_>,
+    generation: ShareGeneration<'_>,
+) -> Result<crate::storage::queries::ShareAttemptReservation, VotingError> {
+    db.add_attempting_server_for_generation(
+        generation.scope().wallet_id(),
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+        params.server_url,
+        Some(generation.nullifier()),
+    )
+}
+
 /// Persists the observed result of a journaled helper POST.
 ///
 /// Outcome-unknown state remains excluded from ordinary delivery. Overdue
 /// recovery may explicitly retry it through the duplicate-safe helper path.
+#[cfg(test)]
 pub(crate) fn resolve_delivery_attempt(
     db: &VotingDb,
     params: &ShareDeliveryAttemptParams<'_>,
     outcome: ShareDeliveryAttemptOutcome,
     reset_submit_at: bool,
 ) -> Result<(), VotingError> {
+    let scope = ShareOperationScope::capture(db);
+    let nullifier = delivery_nullifier_for_scope(
+        db,
+        &scope,
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+    )?;
+    resolve_delivery_attempt_for_generation(
+        db,
+        params,
+        ShareGeneration::new(&scope, &nullifier),
+        outcome,
+        reset_submit_at,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn resolve_delivery_attempt_for_generation(
+    db: &VotingDb,
+    params: &ShareDeliveryAttemptParams<'_>,
+    generation: ShareGeneration<'_>,
+    outcome: ShareDeliveryAttemptOutcome,
+    reset_submit_at: bool,
+) -> Result<bool, VotingError> {
     let url = [params.server_url.to_string()];
     match outcome {
-        ShareDeliveryAttemptOutcome::Accepted if reset_submit_at => db.add_sent_servers(
+        ShareDeliveryAttemptOutcome::Accepted => db.add_sent_servers_for_generation(
+            generation.scope().wallet_id(),
             params.round_id,
             params.bundle_index,
             params.proposal_id,
             params.share_index,
             &url,
+            Some(generation.nullifier()),
+            reset_submit_at,
         ),
-        ShareDeliveryAttemptOutcome::Accepted => db.add_sent_servers_preserving_schedule(
-            params.round_id,
-            params.bundle_index,
-            params.proposal_id,
-            params.share_index,
-            &url,
-        ),
-        ShareDeliveryAttemptOutcome::Ambiguous => db.add_ambiguous_servers(
+        ShareDeliveryAttemptOutcome::Ambiguous => db.add_ambiguous_servers_for_generation(
+            generation.scope().wallet_id(),
             params.round_id,
             params.bundle_index,
             params.proposal_id,
             params.share_index,
             &url,
             reset_submit_at,
+            Some(generation.nullifier()),
         ),
-        ShareDeliveryAttemptOutcome::DefiniteFailure => db.remove_attempting_server(
+        ShareDeliveryAttemptOutcome::DefiniteFailure => db.remove_attempting_server_for_generation(
+            generation.scope().wallet_id(),
             params.round_id,
             params.bundle_index,
             params.proposal_id,
             params.share_index,
             params.server_url,
+            Some(generation.nullifier()),
         ),
     }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 fn delivery_nullifier(
     db: &VotingDb,
     round_id: &str,
@@ -503,12 +582,48 @@ fn delivery_nullifier(
     proposal_id: u32,
     share_index: u32,
 ) -> Result<[u8; 32], VotingError> {
-    let bundle = crate::vote::recovery_bundle(db, round_id, bundle_index, proposal_id)?
+    let scope = ShareOperationScope::capture(db);
+    delivery_nullifier_for_scope(db, &scope, round_id, bundle_index, proposal_id, share_index)
+}
+
+fn delivery_nullifier_for_scope(
+    db: &VotingDb,
+    scope: &ShareOperationScope,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<[u8; 32], VotingError> {
+    let fields = db.get_commitment_bundle_recovery_fields_for_wallet(
+        scope.wallet_id(),
+        round_id,
+        bundle_index,
+        proposal_id,
+    )?;
+    let bundle = fields
+        .and_then(|(json, _)| json)
         .ok_or_else(|| VotingError::InvalidInput {
             message: format!(
                 "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
             ),
         })?;
+    nullifier_from_recovery_json(&bundle, proposal_id, share_index)
+}
+
+pub(crate) fn nullifier_from_recovery_json(
+    commitment_bundle_json: &str,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<[u8; 32], VotingError> {
+    let bundle = crate::vote::parse_recovery(commitment_bundle_json)?;
+    if bundle.proposal_id != proposal_id {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "recovery proposal_id {} does not match requested {proposal_id}",
+                bundle.proposal_id
+            ),
+        });
+    }
     let payload = recover_payload(&bundle, share_index)?;
     let primary_blind = array32("primary_blind", payload.primary_blind.clone())?;
     compute_nullifier(&bundle.vote_commitment, share_index, &primary_blind)
@@ -519,12 +634,28 @@ pub fn list(db: &VotingDb, round_id: &str) -> Result<Vec<ShareDelegationRecord>,
     db.get_share_delegations(round_id)
 }
 
+pub(crate) fn list_for_scope(
+    db: &VotingDb,
+    scope: &ShareOperationScope,
+    round_id: &str,
+) -> Result<Vec<ShareDelegationRecord>, VotingError> {
+    db.get_share_delegations_for_wallet(round_id, scope.wallet_id())
+}
+
 /// Lists unconfirmed helper-share records for retry and polling.
 pub fn unconfirmed(
     db: &VotingDb,
     round_id: &str,
 ) -> Result<Vec<ShareDelegationRecord>, VotingError> {
     db.get_unconfirmed_delegations(round_id)
+}
+
+pub(crate) fn unconfirmed_for_scope(
+    db: &VotingDb,
+    scope: &ShareOperationScope,
+    round_id: &str,
+) -> Result<Vec<ShareDelegationRecord>, VotingError> {
+    db.get_unconfirmed_delegations_for_wallet(round_id, scope.wallet_id())
 }
 
 /// Lists rounds with at least one unconfirmed helper share.
@@ -545,19 +676,23 @@ pub fn pending_rounds(db: &VotingDb) -> Result<Vec<PendingShareRound>, VotingErr
 }
 
 /// Re-reads whether one helper-share record is durably confirmed.
-pub(crate) fn is_confirmed(
+pub(crate) fn is_confirmed_for_generation(
     db: &VotingDb,
     params: &ShareDeliveryAttemptParams<'_>,
-) -> Result<bool, VotingError> {
-    db.share_is_confirmed(
+    generation: ShareGeneration<'_>,
+) -> Result<Option<bool>, VotingError> {
+    db.share_is_confirmed_for_generation(
+        generation.scope().wallet_id(),
         params.round_id,
         params.bundle_index,
         params.proposal_id,
         params.share_index,
+        Some(generation.nullifier()),
     )
 }
 
 /// Marks one helper-share record confirmed.
+#[cfg(test)]
 pub(crate) fn confirm(
     db: &VotingDb,
     round_id: &str,
@@ -566,6 +701,24 @@ pub(crate) fn confirm(
     share_index: u32,
 ) -> Result<(), VotingError> {
     db.mark_share_confirmed(round_id, bundle_index, proposal_id, share_index)
+}
+
+pub(crate) fn confirm_for_generation(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    generation: ShareGeneration<'_>,
+) -> Result<bool, VotingError> {
+    db.mark_share_confirmed_for_generation(
+        generation.scope().wallet_id(),
+        round_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        Some(generation.nullifier()),
+    )
 }
 
 /// Adds helper URLs after immediate resubmission and clears a delayed schedule.
