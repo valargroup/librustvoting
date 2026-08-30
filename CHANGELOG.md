@@ -194,7 +194,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - SQLite operations that validate durable voting state before updating it now
   use immediate transactions, preventing concurrent WAL writers from causing
   stale-snapshot `database is locked` failures during submission and
-  confirmation recording.
+  confirmation recording, including direct VC-position writes.
 
 ## v3.1.0-rc.13
 

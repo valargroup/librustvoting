@@ -1117,11 +1117,10 @@ Regression coverage: `test_share_delegation_lifecycle` in
 `initial_delivery_does_not_recreate_share_after_recovery_cleanup`,
 `interrupted_retry_does_not_resolve_a_replaced_share_generation` in
 `share_tracking/tests`,
-`mark_vote_submitted_waits_instead_of_writing_through_a_stale_snapshot` in
-`storage/operations.rs`,
-`public_vote_submission_waits_instead_of_writing_through_a_stale_snapshot` in
-`storage/operations.rs`, and `changed_choice_ignores_stale_share_confirmations`
-and `skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
+`public_vote_writers_reserve_before_validation_and_wait_on_contention`
+in `storage/operations.rs` for public submission and VC-position writes, and
+`changed_choice_ignores_stale_share_confirmations` and
+`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
 
 ### Configuration and migration
 

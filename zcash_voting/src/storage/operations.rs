@@ -2300,6 +2300,26 @@ mod tests {
         true
     }
 
+    fn wait_for_sqlite_contention<'conn, T: std::fmt::Debug>(
+        writer_tx: rusqlite::Transaction<'conn>,
+        result_rx: &std::sync::mpsc::Receiver<T>,
+        operation: &str,
+    ) -> rusqlite::Transaction<'conn> {
+        let contention_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !SQLITE_BUSY_OBSERVED.load(Ordering::SeqCst) {
+            if let Ok(result) = result_rx.try_recv() {
+                drop(writer_tx);
+                panic!("{operation} completed before SQLite contention: {result:?}");
+            }
+            if std::time::Instant::now() >= contention_deadline {
+                drop(writer_tx);
+                panic!("{operation} never reached SQLite contention");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        writer_tx
+    }
+
     fn test_db() -> VotingDb {
         let db = VotingDb::open(":memory:").unwrap();
         db.set_wallet_id(W);
@@ -5211,7 +5231,7 @@ mod tests {
     }
 
     #[test]
-    fn public_vote_submission_waits_instead_of_writing_through_a_stale_snapshot() {
+    fn public_vote_writers_reserve_before_validation_and_wait_on_contention() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5289,18 +5309,8 @@ mod tests {
                     result_tx.send(result).unwrap();
                 });
 
-                let contention_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(2);
-                while !SQLITE_BUSY_OBSERVED.load(Ordering::SeqCst) {
-                    if let Ok(result) = result_rx.try_recv() {
-                        panic!("vote submission completed before SQLite contention: {result:?}");
-                    }
-                    assert!(
-                        std::time::Instant::now() < contention_deadline,
-                        "vote submission never reached SQLite contention"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                let writer_tx =
+                    wait_for_sqlite_contention(writer_tx, &result_rx, "vote submission");
                 assert!(matches!(
                     result_rx.try_recv(),
                     Err(std::sync::mpsc::TryRecvError::Empty)
@@ -5318,6 +5328,63 @@ mod tests {
             queries::get_vote_tx_hash(&db_a.conn(), ROUND_ID, W, 0, 1).unwrap(),
             Some("vote-tx".to_string())
         );
+
+        // The public VC-position writer must reserve the writer before checking
+        // whether a vote is a singleton. Otherwise it can validate the old row,
+        // wait behind a concurrent ballot update, and write the old confirmation
+        // onto the changed row after that update commits.
+        {
+            SQLITE_BUSY_OBSERVED.store(false, Ordering::SeqCst);
+            let mut writer_conn = db_b.conn();
+            let writer_tx = writer_conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            writer_tx
+                .execute(
+                    "UPDATE votes SET commitment_bundle_json = ?1
+                     WHERE round_id = ?2 AND wallet_id = ?3
+                       AND bundle_index = 0 AND proposal_id = 1",
+                    rusqlite::params![r#"{"batch_digest":"00"}"#, ROUND_ID, W],
+                )
+                .unwrap();
+
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let result = crate::vote::record_vc_position(&db_a, ROUND_ID, 0, 1, 789);
+                    result_tx.send(result).unwrap();
+                });
+
+                let writer_tx =
+                    wait_for_sqlite_contention(writer_tx, &result_rx, "VC-position recording");
+                assert!(matches!(
+                    result_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+
+                writer_tx.commit().unwrap();
+                let error = result_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect_err("a changed batch member must reject the singleton VC writer");
+                assert!(
+                    error.to_string().contains("complete batch lifecycle"),
+                    "{error}"
+                );
+            });
+        }
+
+        let position: Option<i64> = db_a
+            .conn()
+            .query_row(
+                "SELECT vc_tree_position FROM votes
+                 WHERE round_id = ?1 AND wallet_id = ?2
+                   AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::params![ROUND_ID, W],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(position, None);
 
         drop(db_b);
         drop(db_a);
