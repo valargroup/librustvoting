@@ -1121,7 +1121,8 @@ Regression coverage: `test_share_delegation_lifecycle` in
 in `storage/operations.rs` for public submission and VC-position writes, and
 `helper_share_writers_reserve_before_validation_and_reject_stale_intent` in
 `storage/operations.rs` for share recording, confirmation, and server updates,
-and
+`record_derives_share_identity_after_reserving_wal_writer` in `share.rs` for
+recovery-identity derivation under the same reservation, and
 `changed_choice_ignores_stale_share_confirmations` and
 `skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
 

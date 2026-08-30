@@ -2323,7 +2323,7 @@ pub fn recovery_bundle(
     recovery_bundle_with_conn(&conn, &wallet_id, round_id, bundle_index, proposal_id)
 }
 
-fn recovery_bundle_with_conn(
+pub(crate) fn recovery_bundle_with_conn(
     conn: &rusqlite::Connection,
     wallet_id: &str,
     round_id: &str,
