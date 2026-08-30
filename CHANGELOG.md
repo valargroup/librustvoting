@@ -80,6 +80,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Initial share delivery continues to target half the configured fleet, rounded
   up, while balancing a complete commitment across the ready helper pool.
   Retries may exceed the initial distribution for liveness.
+- Share confirmation polls now run at most four helper requests concurrently
+  and spend at most ten seconds on one share before advancing, preventing a
+  stalled helper set from starving later shares in the same tracking pass.
 - **Breaking:** `submit_share_to_helpers` and `track_pending_shares` now reject
   helper URLs that fail canonicalization with `VotingError::InvalidInput`
   before any network I/O, instead of silently dropping them — an

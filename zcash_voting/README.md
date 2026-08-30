@@ -331,6 +331,8 @@ that should stay consistent across SDKs:
   waiting for the half-fleet target (capped by protocol policy at 10 helpers),
   and stop at 30 seconds
 - 30-second helper POST attempts with bounded initial-delivery concurrency
+- helper confirmation polling bounded to four concurrent requests and ten
+  seconds per share so stalled helpers cannot starve later shares
 - share-count-derived batch planning with independent entropy per share, a
   minimum capacity pool, and a hard initial quota of `floor(3S / 4)` shares per
   helper (12 when `S = 16`); retries remain liveness-first and may exceed it

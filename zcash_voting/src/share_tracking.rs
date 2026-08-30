@@ -20,9 +20,15 @@
 //! on-chain state.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
+
+use tokio::task::JoinSet;
 
 use crate::{
     helper::{
@@ -42,6 +48,17 @@ use crate::{
     },
     types::{ShareDelegationRecord, SharePayload, VotingError},
 };
+
+/// Maximum helper status requests in flight for one share.
+pub const SHARE_STATUS_MAX_CONCURRENT_POLLS: usize = 4;
+/// Maximum wall-clock time one share may consume while seeking confirmation.
+pub const SHARE_STATUS_POLL_BUDGET_MILLISECONDS: u64 = 10_000;
+/// Interval for observing caller cancellation while helper tasks are pending.
+const SHARE_STATUS_CANCEL_CHECK_MILLISECONDS: u64 = 50;
+
+const _: () = assert!(SHARE_STATUS_MAX_CONCURRENT_POLLS > 0);
+const _: () = assert!(SHARE_STATUS_POLL_BUDGET_MILLISECONDS > 0);
+const _: () = assert!(SHARE_STATUS_CANCEL_CHECK_MILLISECONDS > 0);
 
 /// Identifies one helper share within a round.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -217,6 +234,13 @@ pub fn os_random_bytes(len: usize) -> Vec<u8> {
 }
 
 /// Polls helpers for the share's global on-chain confirmation state.
+///
+/// At most [`SHARE_STATUS_MAX_CONCURRENT_POLLS`] requests run concurrently and
+/// the complete quorum search is capped by
+/// [`SHARE_STATUS_POLL_BUDGET_MILLISECONDS`]. Reaching the quorum, caller
+/// cancellation, or budget expiry aborts every outstanding request. Helpers
+/// still in flight at budget expiry are degraded so later passes prefer other
+/// configured endpoints.
 async fn poll_share_helpers(
     client: &HelperClient,
     round_id: &str,
@@ -230,32 +254,96 @@ async fn poll_share_helpers(
     if required_confirmations == 0 {
         return ShareStatusOutcome::NotConfirmed;
     }
+
+    let mut remaining = VecDeque::from(client.health().candidate_servers(server_urls, now_seconds));
+    let mut polls = JoinSet::new();
+    let mut in_flight = HashSet::new();
+    let task_cancelled = Arc::new(AtomicBool::new(false));
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_millis(SHARE_STATUS_POLL_BUDGET_MILLISECONDS);
     let mut confirmations = 0usize;
-    for server_url in client.health().candidate_servers(server_urls, now_seconds) {
+
+    loop {
+        // A cancellation observed after the final completed request must not
+        // replace that request's definite result.
+        if polls.is_empty() && remaining.is_empty() {
+            return ShareStatusOutcome::NotConfirmed;
+        }
         if cancel() {
+            task_cancelled.store(true, Ordering::Relaxed);
+            polls.abort_all();
             return ShareStatusOutcome::Cancelled;
         }
-        match client
-            .share_status(&server_url, round_id, share_id, now_seconds, cancel)
-            .await
-        {
+
+        while polls.len() < SHARE_STATUS_MAX_CONCURRENT_POLLS {
+            let Some(server_url) = remaining.pop_front() else {
+                break;
+            };
+            in_flight.insert(server_url.clone());
+            let client = client.clone();
+            let round_id = round_id.to_string();
+            let share_id = share_id.to_string();
+            let task_cancelled = Arc::clone(&task_cancelled);
+            polls.spawn(async move {
+                let outcome = client
+                    .share_status(&server_url, &round_id, &share_id, now_seconds, &|| {
+                        task_cancelled.load(Ordering::Relaxed)
+                    })
+                    .await;
+                (server_url, outcome)
+            });
+        }
+
+        if polls.is_empty() {
+            return ShareStatusOutcome::NotConfirmed;
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            task_cancelled.store(true, Ordering::Relaxed);
+            polls.abort_all();
+            let failure_time =
+                now_seconds.saturating_add(SHARE_STATUS_POLL_BUDGET_MILLISECONDS.div_ceil(1_000));
+            for server_url in in_flight {
+                client.health().record_failure(&server_url, failure_time);
+            }
+            return ShareStatusOutcome::NotConfirmed;
+        }
+        let cancel_check = now + Duration::from_millis(SHARE_STATUS_CANCEL_CHECK_MILLISECONDS);
+        let wait_deadline = deadline.min(cancel_check);
+        let joined = match tokio::time::timeout_at(wait_deadline, polls.join_next()).await {
+            Ok(joined) => joined,
+            Err(_) => continue,
+        };
+        let Some(joined) = joined else {
+            continue;
+        };
+        let Ok((server_url, outcome)) = joined else {
+            continue;
+        };
+        in_flight.remove(&server_url);
+        match outcome {
             Ok(ShareStatus::Confirmed) => {
                 confirmations += 1;
                 if confirmations == required_confirmations {
+                    task_cancelled.store(true, Ordering::Relaxed);
+                    polls.abort_all();
                     return ShareStatusOutcome::Confirmed;
                 }
             }
             // The helper is alive but has not revealed yet. Keep walking.
             Ok(ShareStatus::Pending) => {}
-            Err(HelperError::Cancelled) => {
+            Err(HelperError::Cancelled) if cancel() => {
+                task_cancelled.store(true, Ordering::Relaxed);
+                polls.abort_all();
                 return ShareStatusOutcome::Cancelled;
             }
+            Err(HelperError::Cancelled) => {}
             // Any transport, HTTP, or out-of-protocol failure was already
             // scored by the client.
             Err(_) => continue,
         }
     }
-    ShareStatusOutcome::NotConfirmed
 }
 
 /// Fans one freshly built share out to helpers until enough accept it.
@@ -1220,6 +1308,7 @@ mod tests {
         calls: Mutex<Vec<String>>,
         timeouts: Mutex<Vec<(String, Duration)>>,
         post_bodies: Mutex<Vec<(String, Vec<u8>)>>,
+        get_delays: Mutex<HashMap<String, VecDeque<Duration>>>,
         post_delays: Mutex<HashMap<String, VecDeque<Duration>>>,
         post_observer: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
     }
@@ -1232,6 +1321,16 @@ mod tests {
                 .entry(url.to_string())
                 .or_default()
                 .push_back(reply);
+        }
+
+        fn queue_get_after(&self, url: &str, delay: Duration, reply: Reply) {
+            self.queue_get(url, reply);
+            self.get_delays
+                .lock()
+                .unwrap()
+                .entry(url.to_string())
+                .or_default()
+                .push_back(delay);
         }
 
         fn queue_post(&self, url: &str, reply: Reply) {
@@ -1317,8 +1416,18 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((url.to_string(), timeout));
+            let delay = self
+                .get_delays
+                .lock()
+                .unwrap()
+                .get_mut(url)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or_default();
             let reply = self.take(&self.gets, "GET", url);
-            Box::pin(async move { reply })
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                reply
+            })
         }
 
         fn post_json<'a>(
@@ -1394,27 +1503,32 @@ mod tests {
             )
         };
 
-        transport.queue_get(&status_url(1), json_status("pending"));
+        transport.queue_get(&status_url(1), json_status("confirmed"));
         transport.queue_get(&status_url(2), json_status("confirmed"));
-        transport.queue_get(&status_url(3), json_status("confirmed"));
+        for index in 3..=6 {
+            transport.queue_get_after(
+                &status_url(index),
+                Duration::from_secs(60 * 60),
+                json_status("pending"),
+            );
+        }
 
         let client = client_with(transport.clone());
         let outcome = poll_share_helpers(
             &client,
             &round_id,
             &share_id,
-            &helpers(5),
+            &helpers(6),
             1_000,
             &never_cancel(),
         )
         .await;
 
         assert_eq!(outcome, ShareStatusOutcome::Confirmed);
-        // Helpers 4-5 are never contacted once a distinct second helper agrees.
-        assert_eq!(transport.calls().len(), 3);
-        for index in 4..=5 {
-            assert_eq!(transport.call_count(&helper(index)), 0);
-        }
+        // The bounded initial group may already be in flight, and one slot may
+        // refill after the first confirmation. Observing the second aborts
+        // those requests before the final configured helper is dispatched.
+        assert_eq!(transport.call_count(&helper(6)), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1506,49 +1620,46 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancel_between_helpers_stops_without_confirming() {
+    async fn cancellation_aborts_bounded_in_flight_status_polls() {
         let round_id = field_hex(1);
         let share_id = "cd".repeat(32);
         let transport = Arc::new(MockTransport::default());
-        transport.queue_get(
+        transport.queue_get_after(
             &format!(
                 "{}/shielded-vote/v1/share-status/{round_id}/{share_id}",
                 helper(1)
             ),
+            Duration::from_secs(60 * 60),
             json_status("pending"),
         );
-        transport.queue_get(
+        transport.queue_get_after(
             &format!(
                 "{}/shielded-vote/v1/share-status/{round_id}/{share_id}",
                 helper(2)
             ),
+            Duration::from_secs(60 * 60),
             json_status("confirmed"),
         );
-
-        let calls = Arc::new(Mutex::new(0usize));
-        let cancel_after_first = {
-            let calls = calls.clone();
-            move || {
-                let mut calls = calls.lock().unwrap();
-                *calls += 1;
-                // False for the first helper's pre-check, true afterwards.
-                *calls > 2
-            }
-        };
+        let cancel_after_dispatch = || transport.calls().len() == 2;
 
         let client = client_with(transport.clone());
+        let started = tokio::time::Instant::now();
         let outcome = poll_share_helpers(
             &client,
             &round_id,
             &share_id,
             &helpers(2),
             1_000,
-            &cancel_after_first,
+            &cancel_after_dispatch,
         )
         .await;
 
         assert_eq!(outcome, ShareStatusOutcome::Cancelled);
-        assert_eq!(transport.call_count(&helper(2)), 0);
+        assert_eq!(transport.calls().len(), 2);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(SHARE_STATUS_CANCEL_CHECK_MILLISECONDS)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2614,6 +2725,15 @@ mod tests {
         hex::encode(only_share(db).nullifier)
     }
 
+    fn share_id_at(db: &VotingDb, share_index: u32) -> String {
+        let share = share::list(db, ROUND_ID)
+            .unwrap()
+            .into_iter()
+            .find(|share| share.share_index == share_index)
+            .unwrap_or_else(|| panic!("share {share_index} not found"));
+        hex::encode(share.nullifier)
+    }
+
     fn zero_bytes(len: usize) -> Vec<u8> {
         vec![0u8; len]
     }
@@ -2704,12 +2824,11 @@ mod tests {
         // The invalid answer cost helper 1 health.
         assert_eq!(client.health().failure_count(&helper(1)), 1);
 
-        // Confirmation short-circuited the remaining helpers and any repair.
+        // Confirmation short-circuited recovery. The bounded concurrent group
+        // may already include helpers beyond the two that formed the quorum.
         assert_eq!(transport.call_count("/shielded-vote/v1/shares"), 0);
         assert!(report.resubmitted.is_empty());
-        for index in 4..=5 {
-            assert_eq!(transport.call_count(&helper(index)), 0);
-        }
+        assert!(transport.calls().len() <= configured.len());
 
         // Existing definite placement history is unchanged.
         assert_eq!(only_share(&db).sent_to_urls.len(), 5);
@@ -2747,6 +2866,94 @@ mod tests {
         assert_eq!(transport.call_count(&helper(1)), 1);
         assert_eq!(transport.call_count(&helper(2)), 1);
         assert_eq!(transport.call_count("/shares"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_status_poll_does_not_starve_a_later_share() {
+        let configured = helpers(SHARE_STATUS_MAX_CONCURRENT_POLLS);
+        let db = db_with_delivery(&configured, &[], configured.len());
+        let submission = ShareSubmissionReport {
+            accepted_urls: configured.clone(),
+            ambiguous_urls: Vec::new(),
+            target_count: configured.len(),
+        };
+        share::record_delivery(
+            &db,
+            &share::ShareDeliveryRecordParams {
+                round_id: ROUND_ID,
+                bundle_index: 0,
+                proposal_id: 1,
+                share_index: 1,
+                submission: &submission,
+                submit_at: SUBMIT_AT,
+            },
+        )
+        .unwrap();
+
+        let first_share_id = share_id_at(&db, 0);
+        let second_share_id = share_id_at(&db, 1);
+        let transport = Arc::new(MockTransport::default());
+        for index in 1..=configured.len() {
+            transport.queue_get_after(
+                &format!(
+                    "{}/shielded-vote/v1/share-status/{ROUND_ID}/{first_share_id}",
+                    helper(index)
+                ),
+                Duration::from_secs(60 * 60),
+                json_status("pending"),
+            );
+            transport.queue_get(
+                &format!(
+                    "{}/shielded-vote/v1/share-status/{ROUND_ID}/{second_share_id}",
+                    helper(index)
+                ),
+                json_status(if index <= 2 { "confirmed" } else { "pending" }),
+            );
+        }
+        let config = HelperClientConfig::default()
+            .with_request_timeout(Duration::from_secs(60 * 60))
+            .unwrap()
+            .without_retries();
+        let client = HelperClient::with_config(transport, HelperHealth::default(), config);
+        let random = zero_bytes;
+        let started = tokio::time::Instant::now();
+
+        let report = track_pending_shares(
+            &db,
+            &params(&configured, ready_not_overdue(), &random),
+            &client,
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(SHARE_STATUS_POLL_BUDGET_MILLISECONDS)
+        );
+        assert_eq!(
+            report.confirmed,
+            vec![ShareKey {
+                bundle_index: 0,
+                proposal_id: 1,
+                share_index: 1,
+            }]
+        );
+        let shares = share::list(&db, ROUND_ID).unwrap();
+        assert!(
+            !shares
+                .iter()
+                .find(|share| share.share_index == 0)
+                .unwrap()
+                .confirmed
+        );
+        assert!(
+            shares
+                .iter()
+                .find(|share| share.share_index == 1)
+                .unwrap()
+                .confirmed
+        );
     }
 
     #[tokio::test(start_paused = true)]
