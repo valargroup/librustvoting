@@ -100,8 +100,8 @@ Orchard full viewing key and stays in local encrypted state.
 A software wallet derives a 64-byte authority root from its wallet seed using
 the ZIP-32 registered-key construction. The derivation is hardened, bound to
 the complete authority context, and separated from the wallet's spending-key
-paths. The namespace is owned by this application and does not require a ZIP
-number or ZIP publication before deployment.
+paths. The namespace is owned by this application and does not require an
+assigned ZIP number or ZIP publication before deployment.
 
 The wallet-facing `zcash_voting` API does not accept the seed or an account
 spending key. A narrow wallet-owned provider derives the root, verifies the
@@ -298,10 +298,11 @@ because recovery uses absence of a transition as evidence that the current VAN
 is still unspent.
 
 Every transition is recomputed from the recovered authority and checked against
-the validated tree. The current 16-proposal mask bounds recovery to at most 15
-successor transitions per bundle. Missing, conflicting, incomplete, or
-ambiguous data fails closed instead of probing the chain by attempting another
-vote.
+complete, authenticated, ordered transition data. Each singleton successor and
+the final successor of an atomic batch are also checked against the validated
+tree. The current 16-proposal mask bounds recovery to at most 15 successor
+transitions per bundle. Missing, conflicting, incomplete, or ambiguous data
+fails closed instead of probing the chain by attempting another vote.
 
 This recovery needs complete public transition data, but not the wallet's
 previous transaction database, confirmed vote history, or prior ballot choices.
