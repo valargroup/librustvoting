@@ -14,11 +14,11 @@ Keystone path uses the firmware and transaction-signing flow that exist today.
 For each account and voting round, the voter creates one voting-authority root:
 software wallets derive it from their seed, while current Keystone wallets
 generate and securely back it up without requiring firmware changes. The root
-always recreates the voting hotkey. For locally controlled funds,
-`zcash_voting` also derives each bundle's VAN blinding from the root and
-canonical bundle plan; public-target custody instead restores bundle blindings
-and weights from the existing capability package retained by the voter and
-funds controller. The signed round configuration selects this common version 1
+always recreates the voting hotkey. For self-custodied funds, `zcash_voting`
+also derives each bundle's VAN blinding from the root and canonical bundle
+plan. For funds in custody, it instead restores bundle blindings and weights
+from the existing capability package retained by the voter and funds
+controller. The signed round configuration selects this common version 1
 framework. After data loss, the restored root and bundle material let the
 wallet find its latest VANs in the validated vote tree and continue after
 partial delegation or singleton and atomic votes. Existing rounds remain
