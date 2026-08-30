@@ -305,24 +305,24 @@ derivation scheme.
 
 ### 2. Derive software-wallet roots from the wallet seed
 
-A software wallet uses the [ZIP 32 registered-key construction][zip32-registered]
-under the exact ASCII context `ZcashShieldedVoting` and this fixed numeric
-namespace:
+A software wallet uses `zip32::registered::cryptovalue_from_subpath`, the
+hardened primitive from the [ZIP 32 registered-key construction][zip32-registered],
+under the ASCII context `ZcashShieldedVoting` and this fixed numeric namespace:
 
 ```text
-VOTING_KDF_ID_V1 = 0x564F5445 = 1,448,039,493
+VOTING_KDF_ID_V1: u16 = 0x5654 = 22,100
 ```
 
-The hexadecimal value spells `VOTE` in big-endian byte order and is below
-`2^31`. It is passed as the `ZipNumber` argument to `RegKD`, whose registered
-subtree step therefore uses hardened child index
-`VOTING_KDF_ID_V1 + 2^31 = 0xD64F5445`.
+The hexadecimal value spells `VT` in big-endian byte order and fits the
+canonical API's `u16 zip_number` argument. It is passed as that argument to
+`RegKD`, whose subtree step therefore uses hardened child index
+`VOTING_KDF_ID_V1 + 2^31 = 0x80005654`.
 
-Neither the context nor the numeric namespace requires external assignment or
-a standalone ZIP before deployment. `zcash_voting` defines both as version 1
-protocol constants. Changing either produces different roots and therefore a
-new root-source version. A later ZIP may document the deployed values without
-renumbering version 1.
+Neither value requires external assignment or a standalone ZIP before
+deployment. `zcash_voting` defines them as version 1 protocol constants. This is
+an application-defined use of the primitive, not a claim that ZIP 22100 exists.
+Changing either value requires a new root-source version; a later ZIP may
+document the deployed values without renumbering version 1.
 
 Conceptually, the tree is:
 
