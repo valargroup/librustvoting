@@ -930,6 +930,15 @@ atomically, but it does not merge their identities or create a batch-wide
 
 ## Recovery state machine
 
+Recovery takes a library-owned `VoteChainRecoveryCheckpointV1` containing the
+canonical vote-chain ID, unsigned 64-bit committed block height, and 32-byte
+block hash. The wallet obtains a new checkpoint at the start of the attempt
+from an authenticated current view of finalized chain state that is independent
+of the tree and transition index endpoint. For a CometBFT deployment, this can
+be a light-client-verified committed header under the wallet's configured trust
+state and maximum-age policy. A cached checkpoint or a height and hash reported
+only by the recovery endpoint cannot prove current absence.
+
 `zcash_voting` recovers one bundle as follows:
 
 1. Build the typed source candidates above, reconcile them with durable external
@@ -943,8 +952,9 @@ atomically, but it does not merge their identities or create a batch-wide
    target and round against the recovered hotkey, and import its bundle indices,
    weights, blindings, and transaction hashes.
 4. Reconstruct each initial VAN from the recovered hotkey and bundle material.
-5. Sync and root-validate the vote-commitment tree and the complete confirmed
-   cast-vote transition index through the same authenticated chain height.
+5. Validate the recovery checkpoint, then sync and root-validate the
+   vote-commitment tree and complete confirmed cast-vote transition index
+   through its exact height and block hash.
 6. Locate the unique initial VAN in the validated tree and record its leaf
    position.
 7. Starting from that VAN and its initial mask, derive its spend nullifier and
@@ -957,11 +967,15 @@ atomically, but it does not merge their identities or create a batch-wide
 The transition index is built from every confirmed `cast_vote` and
 `cast_vote_batch` action for the round. It may come from a complete verified
 block scan or an index that proves both inclusion and absence against
-authenticated chain state. A best-effort transaction search is not sufficient:
-absence is used only when completeness through the selected height is known.
-Each record exposes the consumed VAN nullifier, ordered proposal IDs, action
-nullifiers and successor commitments, each vote commitment and its confirmed
-vote-commitment tree position, and the final VAN leaf position.
+authenticated chain state. Both the index and tree sync report coverage through
+the recovery checkpoint as a height and block-hash pair, which must exactly
+match the trusted pair; the latest actual tree checkpoint may be older only when
+the sync verifies that no leaves were appended in the intervening blocks. A
+best-effort transaction search is not sufficient: absence is used only when
+completeness through the trusted checkpoint is known. Each record exposes the
+consumed VAN nullifier, ordered proposal IDs, action nullifiers and successor
+commitments, each vote commitment and its confirmed vote-commitment tree
+position, and the final VAN leaf position.
 
 Validation recomputes every native authority transition from the recovered
 hotkey, bundle material, and current mask. It requires the first nullifier to
@@ -988,10 +1002,12 @@ existing signed-transaction reconciliation and redelivery flow; the voter does
 not rebuild the controller's delegation.
 
 This requires complete public round transition data, not the wallet's prior
-transaction database or ballot choices. A stale vote built from an earlier VAN
-is rejected by the chain as a spent nullifier; recovery finds the current VAN
-instead of using submission as a probe. A stale or withholding chain source
-stops recovery rather than making absence evidence that a VAN is unused. It
+transaction database or ballot choices. Recovery finds the current VAN as of
+the trusted checkpoint instead of using submission as a probe. The recovery
+endpoint cannot lower that target to its own internally consistent tip; if
+either data source cannot reach the requested height and block hash, recovery
+stops rather than treating absence as evidence that a VAN is unused. A later
+concurrent transition follows ordinary stale-transaction reconciliation. This
 still cannot recreate a missing custody capability.
 
 ### Pending tally recovery
@@ -1147,12 +1163,17 @@ capability format, or additional custody exchange changes in version 1.
 - fail-closed reconciliation of typed source candidates with external authority
   use;
 - the pending-tally record and helper-journal restore rules;
+- the typed vote-chain recovery checkpoint and target-bound tree and transition
+  validation;
 - the recoverable bundle policy and round-auth version 3 digest validation;
 - legacy migration and bounded nullifier-to-successor VAN recovery; and
 - atomic-batch rules, public vectors, and integration fixtures.
 
 ### All wallet integrations
 
+- obtain a new vote-chain recovery checkpoint from an independently
+  authenticated current view of finalized chain state for each recovery
+  attempt;
 - durably store and read back each encrypted pending-tally record before vote or
   helper network effects;
 - enumerate every record and tombstone outside `VotingDb` and pass them through
@@ -1210,9 +1231,10 @@ No consensus rule or vote-action message change is required for authority
 construction. `vote-sdk` must add the round-auth version 3 config fields,
 including the snapshot height and block hash, canonical signing preimage, signer
 and config-PR support, append-only round-payload history that rejects
-nonidentical replacements, and verification fixtures shared with
-`zcash_voting`. An explicit on-chain scheme field may be considered later, but
-is not needed when round-auth version 3 is enforced.
+nonidentical replacements, block-bound coverage for tree and transition data
+through a caller-supplied recovery checkpoint, and verification fixtures shared
+with `zcash_voting`. An explicit on-chain scheme field may be considered later,
+but is not needed when round-auth version 3 is enforced.
 
 ### `vote-nullifier-pir`
 
