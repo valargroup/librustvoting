@@ -720,6 +720,14 @@ version 3 round, but can continue to resolve other supported rounds. Activation
 must not issue a version 2 attestation for the same new round as a compatibility
 fallback; doing so would let an older wallet join under `random-v0` behavior.
 
+The reverse transition is also forbidden. A round ID that has ever been
+published with a version 1 or 2 attestation cannot later be published as version
+3, even if the older entry was removed in between. Existing voters may already
+have persisted or on-chain `random-v0` authority under that ID. Config
+production checks the published round history before signing a version 3 entry,
+and a wallet with an existing authority rejects an authenticated entry that
+selects different authority semantics for the same round ID.
+
 Version 3 intentionally preserves the version 2 preimage fields and adds the
 snapshot height, but it does not add network or vote-chain ID. The trusted
 signing-key set and signed config namespace must therefore be scoped to exactly
