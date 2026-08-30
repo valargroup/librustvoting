@@ -19,7 +19,8 @@ also derives each bundle's VAN blinding from the root and canonical bundle
 plan. For funds in custody, it instead restores bundle blindings and weights
 from the existing capability package retained by the voter and funds
 controller. The signed round configuration selects this common version 1
-framework. After data loss, the restored root and bundle material let the
+framework and authenticates the snapshot height used to reconstruct its bundle
+plan. After data loss, the restored root and bundle material let the
 wallet find its latest VANs in the validated vote tree and continue after
 partial delegation or singleton and atomic votes. Existing rounds remain
 unchanged.
@@ -638,6 +639,7 @@ entry:
 
 ```text
 auth_version = 3
+snapshot_height = <unsigned 64-bit Zcash block height>
 voting_authority_scheme = "recoverable-authority-v1"
 bundle_policy = "recoverable-v1"
 ```
@@ -653,17 +655,25 @@ round_auth_payload_v3 =
     || tier0_layers_u32_le
     || tier1_layers_u32_le
     || poly_len_u32_le
+    || snapshot_height_u64_le
     || voting_authority_scheme_length_u16_le
     || voting_authority_scheme_ascii
     || bundle_policy_length_u16_le
     || bundle_policy_ascii
 ```
 
-The first seven fields preserve the version 2 round and PIR bindings. The two
-length-prefixed ASCII identifiers additionally bind the authority framework
-and note-selection policy. `vote-sdk` owns production of the exact version 3
-payload and signatures; `zcash_voting` owns byte-for-byte verification and
-selection of the corresponding behavior.
+The version 2 round and PIR fields retain their encodings and relative order.
+The snapshot height binds the note set from which the canonical bundle plan is
+reconstructed. The two length-prefixed ASCII identifiers bind the authority
+framework and note-selection policy. `vote-sdk` owns production of the exact
+version 3 payload and signatures; `zcash_voting` owns byte-for-byte verification
+and selection of the corresponding behavior.
+
+The authenticated round returned by `zcash_voting` carries the signed snapshot
+height. Construction and recovery obtain `VotingRoundParams::snapshot_height`
+from that value. If vote-server metadata also supplies a height, it must match
+the authenticated value; an implementation must not substitute the unsigned
+copy.
 
 The round configuration selects the common authority framework and bundle
 policy. It does not select either local recovery source. A software wallet can
@@ -700,11 +710,12 @@ version 3 round, but can continue to resolve other supported rounds. Activation
 must not issue a version 2 attestation for the same new round as a compatibility
 fallback; doing so would let an older wallet join under `random-v0` behavior.
 
-Version 3 intentionally preserves the version 2 preimage fields and does not
-add network or vote-chain ID. The trusted signing-key set and signed config
-namespace must therefore be scoped to exactly one Zcash network and one vote
-chain. If a deployment needs to reuse the same trusted keys across either
-boundary, it needs a later auth version that signs both identifiers.
+Version 3 intentionally preserves the version 2 preimage fields and adds the
+snapshot height, but it does not add network or vote-chain ID. The trusted
+signing-key set and signed config namespace must therefore be scoped to exactly
+one Zcash network and one vote chain. If a deployment needs to reuse the same
+trusted keys across either boundary, it needs a later auth version that signs
+both identifiers.
 
 ## Software-wallet flow
 
@@ -995,6 +1006,7 @@ statements.
 
 No consensus rule or vote-action message change is required for authority
 construction. `vote-sdk` must add the round-auth version 3 config fields,
-canonical signing preimage, signer and config-PR support, and verification
-fixtures shared with `zcash_voting`. An explicit on-chain scheme field may be
-considered later, but is not needed when round-auth version 3 is enforced.
+including the snapshot height, canonical signing preimage, signer and config-PR
+support, and verification fixtures shared with `zcash_voting`. An explicit
+on-chain scheme field may be considered later, but is not needed when
+round-auth version 3 is enforced.
