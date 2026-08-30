@@ -86,8 +86,8 @@ stage-oriented API:
   `batch_json` once, persist the shared tx hash with
   `vote::record_batch_submission`, and record its ordered event with
   `confirmation::confirm_vote_batch_submission`. After confirmation, call
-  `vote::recover_commit` again, plan the recovered `CommittedVote`'s helper
-  shares, and call its typed `submit_share_to_helpers` method. The crate rebuilds
+  `vote::CommittedVote::recover`, plan the recovered vote's helper shares, and
+  call its typed `submit_share_to_helpers` method. The crate rebuilds
   each payload with the confirmed VC position and journals delivery before
   dispatch. Re-run the planner because later work may depend on on-chain
   confirmations. `open_proposals` contains only proposals with no
