@@ -1885,9 +1885,14 @@ impl VotingDb {
         nullifier: &[u8],
         submit_at: u64,
     ) -> Result<u64, VotingError> {
-        let conn = self.conn();
-        queries::record_share_delegation(
-            &conn,
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin share delegation transaction failed: {e}"),
+            })?;
+        let effective_submit_at = queries::record_share_delegation(
+            &tx,
             round_id,
             wallet_id,
             bundle_index,
@@ -1898,7 +1903,11 @@ impl VotingDb {
             target_count,
             nullifier,
             submit_at,
-        )
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit share delegation transaction failed: {e}"),
+        })?;
+        Ok(effective_submit_at)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1977,9 +1986,14 @@ impl VotingDb {
         capacity_policy: crate::share::ShareAttemptCapacityPolicy,
         expected_nullifier: Option<&[u8]>,
     ) -> Result<queries::ShareAttemptReservation, VotingError> {
-        let conn = self.conn();
-        queries::add_attempting_server_for_generation(
-            &conn,
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin share attempt transaction failed: {e}"),
+            })?;
+        let reservation = queries::add_attempting_server_for_generation(
+            &tx,
             round_id,
             wallet_id,
             bundle_index,
@@ -1990,7 +2004,11 @@ impl VotingDb {
             target_count,
             capacity_policy,
             expected_nullifier,
-        )
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit share attempt transaction failed: {e}"),
+        })?;
+        Ok(reservation)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2004,9 +2022,14 @@ impl VotingDb {
         server_url: &str,
         expected_nullifier: Option<&[u8]>,
     ) -> Result<bool, VotingError> {
-        let conn = self.conn();
-        queries::remove_attempting_server_for_generation(
-            &conn,
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin share attempt transaction failed: {e}"),
+            })?;
+        let removed = queries::remove_attempting_server_for_generation(
+            &tx,
             round_id,
             wallet_id,
             bundle_index,
@@ -2014,7 +2037,11 @@ impl VotingDb {
             share_index,
             server_url,
             expected_nullifier,
-        )
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit share attempt transaction failed: {e}"),
+        })?;
+        Ok(removed)
     }
 
     /// Load all share delegations for a round.
@@ -2122,16 +2149,25 @@ impl VotingDb {
         share_index: u32,
         expected_nullifier: Option<&[u8]>,
     ) -> Result<bool, VotingError> {
-        let conn = self.conn();
-        queries::mark_share_confirmed(
-            &conn,
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin share confirmation transaction failed: {e}"),
+            })?;
+        let confirmed = queries::mark_share_confirmed(
+            &tx,
             round_id,
             wallet_id,
             bundle_index,
             proposal_id,
             share_index,
             expected_nullifier,
-        )
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit share confirmation transaction failed: {e}"),
+        })?;
+        Ok(confirmed)
     }
 
     #[cfg(test)]
@@ -2177,10 +2213,15 @@ impl VotingDb {
         expected_nullifier: Option<&[u8]>,
         reset_submit_at: bool,
     ) -> Result<bool, VotingError> {
-        let conn = self.conn();
-        if reset_submit_at {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin sent-server update transaction failed: {e}"),
+            })?;
+        let updated = if reset_submit_at {
             queries::add_sent_servers_for_generation(
-                &conn,
+                &tx,
                 round_id,
                 wallet_id,
                 bundle_index,
@@ -2191,7 +2232,7 @@ impl VotingDb {
             )
         } else {
             queries::add_sent_servers_preserving_schedule_for_generation(
-                &conn,
+                &tx,
                 round_id,
                 wallet_id,
                 bundle_index,
@@ -2200,7 +2241,11 @@ impl VotingDb {
                 new_urls,
                 expected_nullifier,
             )
-        }
+        }?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit sent-server update transaction failed: {e}"),
+        })?;
+        Ok(updated)
     }
 
     /// Append outcome-unknown helper attempts to a share delegation.
@@ -2248,9 +2293,14 @@ impl VotingDb {
         reset_submit_at: bool,
         expected_nullifier: Option<&[u8]>,
     ) -> Result<bool, VotingError> {
-        let conn = self.conn();
-        queries::add_ambiguous_servers_for_generation(
-            &conn,
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin ambiguous-server update transaction failed: {e}"),
+            })?;
+        let updated = queries::add_ambiguous_servers_for_generation(
+            &tx,
             round_id,
             wallet_id,
             bundle_index,
@@ -2259,7 +2309,11 @@ impl VotingDb {
             new_urls,
             reset_submit_at,
             expected_nullifier,
-        )
+        )?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit ambiguous-server update transaction failed: {e}"),
+        })?;
+        Ok(updated)
     }
 }
 
@@ -2293,6 +2347,7 @@ mod tests {
     const TESTNET_NU6_BRANCH_ID: u32 = 0x4DEC_4DF0;
     const REGTEST_NU6_3_SNAPSHOT_HEIGHT: u64 = crate::types::REGTEST_NU6_3_ACTIVATION_HEIGHT as u64;
     static SQLITE_BUSY_OBSERVED: AtomicBool = AtomicBool::new(false);
+    static SQLITE_CONTENTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn signal_sqlite_busy(_attempt: i32) -> bool {
         SQLITE_BUSY_OBSERVED.store(true, Ordering::SeqCst);
@@ -5232,6 +5287,7 @@ mod tests {
 
     #[test]
     fn public_vote_writers_reserve_before_validation_and_wait_on_contention() {
+        let _contention_test_guard = SQLITE_CONTENTION_TEST_LOCK.lock().unwrap();
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5385,6 +5441,233 @@ mod tests {
             )
             .unwrap();
         assert_eq!(position, None);
+
+        drop(db_b);
+        drop(db_a);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
+    }
+
+    #[test]
+    fn helper_share_writers_reserve_before_validation_and_reject_stale_intent() {
+        let _contention_test_guard = SQLITE_CONTENTION_TEST_LOCK.lock().unwrap();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zcash-voting-immediate-helper-share-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let db_a = VotingDb::open(&path_string).unwrap();
+        db_a.set_wallet_id(W);
+        db_a.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db_a.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db_a.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        db_a.set_ballot_intent(ROUND_ID, 1, crate::session::Decision::Choice(0), 2)
+            .unwrap();
+
+        let db_b = VotingDb::open(&path_string).unwrap();
+        db_b.set_wallet_id(W);
+        db_a.conn().busy_handler(Some(signal_sqlite_busy)).unwrap();
+
+        // A concurrent intent change owns the writer while share recording
+        // starts. Recording must wait, observe the new skipped intent, and
+        // avoid recreating the row cleared by that intent change.
+        {
+            SQLITE_BUSY_OBSERVED.store(false, Ordering::SeqCst);
+            let mut writer_conn = db_b.conn();
+            let writer_tx = writer_conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            writer_tx
+                .execute(
+                    "UPDATE ballot_intent SET skipped = 1, choice = NULL
+                     WHERE round_id = ?1 AND wallet_id = ?2 AND proposal_id = 1",
+                    rusqlite::params![ROUND_ID, W],
+                )
+                .unwrap();
+            writer_tx
+                .execute(
+                    "DELETE FROM share_delegations
+                     WHERE round_id = ?1 AND wallet_id = ?2 AND proposal_id = 1",
+                    rusqlite::params![ROUND_ID, W],
+                )
+                .unwrap();
+
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let result = db_a.record_share_delegation(
+                        ROUND_ID,
+                        0,
+                        1,
+                        0,
+                        &["https://stale.example".to_string()],
+                        &[0x11; 32],
+                        123,
+                    );
+                    result_tx.send(result).unwrap();
+                });
+
+                let writer_tx =
+                    wait_for_sqlite_contention(writer_tx, &result_rx, "share recording");
+                writer_tx.commit().unwrap();
+                let error = result_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect_err("recording must reject the newly skipped intent");
+                assert!(matches!(error, VotingError::InvalidInput { .. }));
+            });
+        }
+        assert!(db_a.get_share_delegations(ROUND_ID).unwrap().is_empty());
+
+        db_a.conn()
+            .execute(
+                "UPDATE ballot_intent SET skipped = 0, choice = 0
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND proposal_id = 1",
+                rusqlite::params![ROUND_ID, W],
+            )
+            .unwrap();
+        db_a.record_share_delegation(
+            ROUND_ID,
+            0,
+            1,
+            0,
+            &["https://original.example".to_string()],
+            &[0x22; 32],
+            456,
+        )
+        .unwrap();
+
+        // Confirmation must not apply to a replacement row committed by the
+        // concurrent intent writer.
+        {
+            SQLITE_BUSY_OBSERVED.store(false, Ordering::SeqCst);
+            let mut writer_conn = db_b.conn();
+            let writer_tx = writer_conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            writer_tx
+                .execute(
+                    "UPDATE ballot_intent SET skipped = 1, choice = NULL
+                     WHERE round_id = ?1 AND wallet_id = ?2 AND proposal_id = 1",
+                    rusqlite::params![ROUND_ID, W],
+                )
+                .unwrap();
+            writer_tx
+                .execute(
+                    "UPDATE share_delegations
+                     SET nullifier = ?1, sent_to_urls = ?2, confirmed = 0, submit_at = 789
+                     WHERE round_id = ?3 AND wallet_id = ?4
+                       AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+                    rusqlite::params![
+                        vec![0x33u8; 32],
+                        r#"["https://replacement.example"]"#,
+                        ROUND_ID,
+                        W
+                    ],
+                )
+                .unwrap();
+
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    result_tx
+                        .send(db_a.mark_share_confirmed(ROUND_ID, 0, 1, 0))
+                        .unwrap();
+                });
+
+                let writer_tx =
+                    wait_for_sqlite_contention(writer_tx, &result_rx, "share confirmation");
+                writer_tx.commit().unwrap();
+                let error = result_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect_err("confirmation must reject the newly skipped intent");
+                assert!(matches!(error, VotingError::InvalidInput { .. }));
+            });
+        }
+        let replacement = db_a.get_share_delegations(ROUND_ID).unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert!(!replacement[0].confirmed);
+        assert_eq!(replacement[0].nullifier, vec![0x33; 32]);
+
+        db_a.conn()
+            .execute(
+                "UPDATE ballot_intent SET skipped = 0, choice = 0
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND proposal_id = 1",
+                rusqlite::params![ROUND_ID, W],
+            )
+            .unwrap();
+
+        // Sent-server updates likewise wait and leave the concurrently
+        // replaced row's delivery state unchanged.
+        {
+            SQLITE_BUSY_OBSERVED.store(false, Ordering::SeqCst);
+            let mut writer_conn = db_b.conn();
+            let writer_tx = writer_conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            writer_tx
+                .execute(
+                    "UPDATE ballot_intent SET skipped = 1, choice = NULL
+                     WHERE round_id = ?1 AND wallet_id = ?2 AND proposal_id = 1",
+                    rusqlite::params![ROUND_ID, W],
+                )
+                .unwrap();
+            writer_tx
+                .execute(
+                    "UPDATE share_delegations
+                     SET nullifier = ?1, sent_to_urls = ?2, confirmed = 0, submit_at = 987
+                     WHERE round_id = ?3 AND wallet_id = ?4
+                       AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+                    rusqlite::params![
+                        vec![0x44u8; 32],
+                        r#"["https://latest.example"]"#,
+                        ROUND_ID,
+                        W
+                    ],
+                )
+                .unwrap();
+
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    result_tx
+                        .send(db_a.add_sent_servers(
+                            ROUND_ID,
+                            0,
+                            1,
+                            0,
+                            &["https://stale-addition.example".to_string()],
+                        ))
+                        .unwrap();
+                });
+
+                let writer_tx =
+                    wait_for_sqlite_contention(writer_tx, &result_rx, "sent-server update");
+                writer_tx.commit().unwrap();
+                let error = result_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect_err("sent-server update must reject the newly skipped intent");
+                assert!(matches!(error, VotingError::InvalidInput { .. }));
+            });
+        }
+        let replacement = db_a.get_share_delegations(ROUND_ID).unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].nullifier, vec![0x44; 32]);
+        assert_eq!(
+            replacement[0].sent_to_urls,
+            vec!["https://latest.example".to_string()]
+        );
+        assert_eq!(replacement[0].submit_at, 987);
 
         drop(db_b);
         drop(db_a);
