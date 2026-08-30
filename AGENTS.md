@@ -6,9 +6,8 @@ Before changing helper-share planning, submission, transport, persistence,
 polling, or recovery, read and follow
 [`docs/helper_submission_invariants.md`](docs/helper_submission_invariants.md).
 
-The document is the review specification for the richer tracker required by
-the recoverable voting design. Its status section distinguishes current
-behavior from planned invariants. In particular:
+The document is the review specification for the invariants currently enforced
+by this repository. In particular:
 
 - do not weaken or bypass an invariant silently;
 - preserve durable state transitions, timeout and retry boundaries, helper

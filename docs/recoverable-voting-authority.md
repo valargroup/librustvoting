@@ -1032,13 +1032,11 @@ still cannot recreate a missing custody capability.
 ### Pending tally recovery
 
 Finding the current VAN does not recover a confirmed vote whose helper shares
-are still incomplete. The richer tracker defined by the
-[helper submission invariants](helper_submission_invariants.md) is a version 1
-prerequisite. At design approval, `main` persists the accepted helper set as
-`sent_to_urls`, but not a target count, `ambiguous_urls`, or `attempting_urls`,
-and does not provide the richer tracker APIs. Pending-tally recovery is enabled
-only after those pieces are implemented. Its recovery record reuses that
-tracker rather than introducing a second delivery state machine.
+are still incomplete. Pending-tally recovery builds on the implemented tracker
+defined by the [helper submission invariants](helper_submission_invariants.md),
+including its durable target, accepted, ambiguous, and attempting states. Its
+recovery record reuses that tracker rather than introducing a second delivery
+state machine.
 
 Version 1 adds a library-owned `PendingTallyRecoveryV1` record for the interval
 between committing a vote and confirming all of its expected helper shares. It
@@ -1126,14 +1124,18 @@ cannot satisfy a newer head because it lacks at least one named revision.
 Adding one key while tombstoning another is one head change.
 
 Before a POST to a fresh helper, its `attempting_urls` reservation is made
-durable. An overdue duplicate-safe re-POST to a helper already in
-`sent_to_urls`, `ambiguous_urls`, or `attempting_urls` preserves that state
-before dispatch; it does not downgrade stronger evidence to `attempting_urls`.
-Definite acceptance may move the helper to `sent_to_urls`, while any other
-re-POST outcome leaves its prior state unchanged. Fresh helper results and
-confirmation are recorded before another helper is contacted. Restore keeps
-accepted, ambiguous, and attempting evidence, never reduces the target count
-or changes the original schedule, and resumes the prerequisite helper tracker
+durable. A duplicate-safe re-POST to an already journaled helper preserves its
+state before dispatch; it does not replace that state with a fresh reservation.
+An interrupted helper in `attempting_urls` may be retried after untried helpers
+either early or overdue. Acceptance moves it to `sent_to_urls`; a completed
+ambiguous or definite failure moves it to `ambiguous_urls`, while cancellation
+leaves the interrupted marker unchanged. An explicitly ambiguous helper is
+retried only when overdue; acceptance moves it to `sent_to_urls`, while other
+outcomes preserve `ambiguous_urls`. An accepted helper is a last-resort overdue
+target, and a weaker outcome cannot downgrade its acceptance. Fresh helper
+results and confirmation are recorded before another helper is contacted.
+Restore keeps accepted, ambiguous, and attempting evidence, never reduces the
+target count or changes the original schedule, and resumes the helper tracker
 against the current validated helper configuration. Conflicting identity,
 schedule, batch, or tree-position data fails closed. Its ordering and retry
 rules are the ones defined by the helper submission invariants.
