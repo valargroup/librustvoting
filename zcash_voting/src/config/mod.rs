@@ -79,6 +79,7 @@ const ALG_ED25519: &str = "ed25519";
 const CHECKSUM_QUERY_NAME: &str = "checksum";
 const SHA256_CHECKSUM_PREFIX: &str = "sha256:";
 const VERSION_V0: &str = "v0";
+const VOTE_PROTOCOL_VERSION_V1: &str = "v1";
 const VOTE_SERVER_VERSION_V1: &str = "v1";
 const ROUND_PARAM_BYTE_LEN: usize = 32;
 
@@ -95,7 +96,7 @@ impl Default for WalletCapabilities {
     fn default() -> Self {
         Self {
             vote_server: vec![VOTE_SERVER_VERSION_V1.to_string()],
-            vote_protocol: vec![VERSION_V0.to_string()],
+            vote_protocol: vec![VOTE_PROTOCOL_VERSION_V1.to_string()],
             tally: vec![VERSION_V0.to_string()],
             pir: vec![VERSION_V0.to_string()],
         }
@@ -1319,7 +1320,7 @@ mod tests {
             },
             "supported_versions": {
                 "pir": ["v0"],
-                "vote_protocol": "v0",
+                "vote_protocol": "v1",
                 "tally": "v0",
                 "vote_server": "v1"
             },
@@ -2033,6 +2034,31 @@ mod tests {
                 round_id: ROUND_ID.to_string(),
                 ea_pk: vec![7u8; 32],
             }]
+        );
+    }
+
+    #[test]
+    fn resolve_dynamic_voting_config_rejects_legacy_vote_protocol() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let mut dynamic: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
+        dynamic["supported_versions"]["vote_protocol"] = serde_json::json!("v0");
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+
+        let error = resolve_dynamic_voting_config(
+            resolved_static,
+            &dynamic.to_string().into_bytes(),
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            VotingConfigError::UnsupportedVersion {
+                component: "vote_protocol".to_string(),
+                advertised: "v0".to_string(),
+            }
         );
     }
 

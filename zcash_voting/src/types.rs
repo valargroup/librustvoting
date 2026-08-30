@@ -24,7 +24,7 @@ pub use crate::wire::VotingRoundParams;
 pub const MIN_PROPOSAL_ID: u32 = 1;
 
 /// Highest valid on-chain proposal identifier supported by the vote circuit.
-pub const MAX_PROPOSAL_ID: u32 = 15;
+pub const MAX_PROPOSAL_ID: u32 = 50;
 
 /// Minimum number of options a proposal can declare.
 pub const MIN_VOTE_OPTIONS: u32 = 2;
@@ -1146,6 +1146,17 @@ mod tests {
             orchard_tree: String::new(),
             ironwood_tree: String::new(),
         }
+    }
+
+    #[test]
+    fn proposal_bounds_match_circuit_authority() {
+        assert!(validate_proposal_id(MIN_PROPOSAL_ID).is_ok());
+        assert!(validate_proposal_id(MAX_PROPOSAL_ID).is_ok());
+        assert!(validate_proposal_id(MAX_PROPOSAL_ID + 1).is_err());
+        assert_eq!(
+            voting_circuits::MAX_PROPOSAL_AUTHORITY,
+            (1u64 << (MAX_PROPOSAL_ID + 1)) - 1
+        );
     }
 
     #[test]

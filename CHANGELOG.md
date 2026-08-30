@@ -41,6 +41,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   intentionally reveal that their included proposal actions came from one
   transaction.
 
+### Changed
+- Expanded the supported proposal-ID range from 1–15 to 1–50 while retaining
+  the independent 15-action atomic vote-batch limit and 16 encrypted shares
+  per vote commitment. This consumes the corresponding breaking circuit and
+  verification-key change.
+
 ## v3.1.0-rc.13
 
 ### Changed

@@ -5257,9 +5257,15 @@ mod tests {
         // Verify proposal_authority reflects per-bundle submission state
         let conn = db.conn();
         let zkp2_0 = queries::load_zkp2_inputs(&conn, ROUND_ID, W, 0).unwrap();
-        assert_eq!(zkp2_0.proposal_authority, 0xFFFF & !(1u64 << 0)); // bit 0 cleared
+        assert_eq!(
+            zkp2_0.proposal_authority,
+            voting_circuits::MAX_PROPOSAL_AUTHORITY & !(1u64 << 0)
+        );
         let zkp2_1 = queries::load_zkp2_inputs(&conn, ROUND_ID, W, 1).unwrap();
-        assert_eq!(zkp2_1.proposal_authority, 0xFFFF); // no bits cleared
+        assert_eq!(
+            zkp2_1.proposal_authority,
+            voting_circuits::MAX_PROPOSAL_AUTHORITY
+        );
         drop(conn);
 
         // Verify cascade: clearing the round removes everything
