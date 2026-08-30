@@ -218,10 +218,10 @@ authority_context_v1 =
     || vote_round_id_32
 ```
 
-`network_tag_u8` is the single byte `0` for mainnet, `1` for testnet, and `2`
-for regtest. `account_fingerprint_32` must match the account selected by
-`account_index_u32_le`; a provider rejects a mismatch before returning or
-restoring a root.
+`network_tag_u8` is the protocol byte `0` for mainnet, `1` for testnet, and `2` for
+regtest. Implementations map by network name, not an internal enum discriminant.
+`account_fingerprint_32` must match the account selected by
+`account_index_u32_le`; a provider rejects a mismatch before returning a root.
 `vote_chain_id` must first pass the crate's canonical chain-ID validation.
 `vote_round_id_32` is the canonical little-endian 32-byte Pallas base-field
 encoding used by the round. The ZIP-32 account index must be below `2^31`.
@@ -362,11 +362,12 @@ Today's Keystone firmware cannot supply the registered seed-derived root. A
 Keystone integration therefore uses `stored-random-v1`:
 
 1. Ask `zcash_voting` to generate 64 bytes with the operating system CSPRNG.
-2. Bind the root to the canonical authority context in a typed backup record.
-3. Store the live copy in platform secure storage.
-4. Commit an authenticated, encrypted backup that can survive deletion or loss
+2. Select the authority's typed bundle source.
+3. Bind the root, both sources, and canonical context in a typed backup record.
+4. Store the live copy in platform secure storage.
+5. Commit an authenticated, encrypted backup that can survive deletion or loss
    of the app's voting database.
-5. Read back and validate the backup before publishing a public target or
+6. Read back and validate the backup before publishing a public target or
    allowing any direct delegation submission.
 
 The canonical plaintext payload is `VotingAuthorityBackupV1`. It contains the
@@ -391,6 +392,12 @@ newline; noncanonical Base64; an unknown source; or an invalid context is
 rejected. A parser can enforce this by validating the decoded object,
 serializing it canonically, and requiring byte-for-byte equality with the
 input.
+
+The read-back gate requires the decoded root, both sources, and context to equal
+the live authority selection byte-for-byte. Any pre-submission change to one of
+those values invalidates the backup and repeats the complete gate. After data
+loss, restore uses the record's typed selection and still checks the account
+fingerprint below.
 
 This public fixture freezes the encoding. It uses regtest, account index zero,
 fingerprint bytes `00` through `1f`, vote chain `vote-chain-1`, little-endian
@@ -446,18 +453,9 @@ result is valid. The expected number of iterations is one; the counter makes
 the function interoperable for a rare invalid candidate. Return a derivation
 error rather than wrapping if the `u32` counter is exhausted.
 
-The hotkey uses external Orchard address index zero. Its in-memory authority is
-typed, not an untagged byte string whose meaning is guessed from length:
-
-```text
-VotingAuthoritySecret::RandomV0(64-byte legacy hotkey seed)
-VotingAuthoritySecret::RootV1 {
-    root_source,
-    bundle_source,
-    context,
-    authority_root_64,
-}
-```
+The hotkey uses external Orchard address index zero. APIs represent the legacy
+hotkey seed and version 1 root as distinct typed variants; they never infer an
+untagged secret's meaning from its length.
 
 Implementations may cache the derived 32-byte Orchard spending key only in the
 same platform secure-storage boundary as the root; neither secret belongs in
@@ -505,6 +503,9 @@ field and zero-padded on the right. The note commitment must be its canonical
 snapshot-selection and bundle-planning policy. Padding notes are excluded
 because their randomness is not recoverable and they do not define real voting
 weight.
+
+`bundle_index` is the zero-based index in the surviving bundle order after the
+zero-ballot and privacy drops.
 
 The blinding factor is then:
 
@@ -739,12 +740,13 @@ The host wallet uses `stored-random-v1` and the existing hardware interaction:
 1. Resolve and authenticate the round configuration.
 2. Extract the Orchard full viewing key from the paired account UFVK, compute
    the account fingerprint, and bind it into the authority context.
-3. Generate the authority root and complete the durable encrypted backup gate.
-4. Select `derived-v1` and let `zcash_voting` derive the hotkey, bundle IDs, VAN
+3. Generate the authority root and select `derived-v1`.
+4. Complete the durable encrypted backup gate for that exact selection.
+5. Let `zcash_voting` derive the hotkey, bundle IDs, VAN
    blindings, and delegation proof inputs.
-5. Build the delegation PCZT or PCZT batch.
-6. Ask Keystone to sign it through the existing Zcash signing flow.
-7. Submit and confirm delegation through the existing lifecycle.
+6. Build the delegation PCZT or PCZT batch.
+7. Ask Keystone to sign it through the existing Zcash signing flow.
+8. Submit and confirm delegation through the existing lifecycle.
 
 Multiple delegation PCZTs can continue to use the existing Keystone batch
 signing path. A batch contains already-constructed transactions, so grouping
@@ -835,9 +837,9 @@ atomically, but it does not merge their identities or create a batch-wide
    vote-chain state.
 6. Derive the VAN for every mask obtainable by clearing a subset of the
    round's proposal bits and locate matching commitments in the tree.
-7. Require each later tree match's set bits to be a strict subset of the
-   previous match's set bits, then select the unique match with the most
-   consumed proposal bits.
+7. In increasing leaf-position order, require each match's set bits to be a
+   strict subset of the previous match's set bits, then select the unique match
+   with the most consumed proposal bits.
 
 The current circuit has 15 usable proposal bits, so this search has at most
 `2^15` candidates per bundle. The initial mask is `0xFFFF`. Bit 0 remains set;
@@ -894,9 +896,11 @@ not add the version 1 root or a cached Orchard spending key to `VotingDb`.
 Migration assigns `random-v0` to all existing rows. It never infers a scheme
 from secret length or recomputes a value merely because a column is empty.
 
-Changing the root, provider, or bundle source is allowed only before any
-delegation may have been submitted. After that point, the original authority
-remains mandatory.
+Changing the root, root source, bundle source, or context is allowed only before
+a public target is published or any direct delegation may have been submitted.
+For `stored-random-v1`, a change invalidates the old backup and must pass the
+replacement gate before either action. After either point, the original
+authority remains mandatory.
 
 ## Public-target custody
 
