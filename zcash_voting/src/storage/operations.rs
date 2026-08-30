@@ -1925,6 +1925,8 @@ impl VotingDb {
         proposal_id: u32,
         share_index: u32,
         server_url: &str,
+        placement_server_urls: &[String],
+        target_count: usize,
     ) -> Result<bool, VotingError> {
         let wallet_id = self.wallet_id();
         Ok(matches!(
@@ -1935,6 +1937,9 @@ impl VotingDb {
                 proposal_id,
                 share_index,
                 server_url,
+                placement_server_urls,
+                target_count,
+                crate::share::ShareAttemptCapacityPolicy::EnforcePlacementTarget,
                 None,
             )?,
             queries::ShareAttemptReservation::Started
@@ -1950,6 +1955,9 @@ impl VotingDb {
         proposal_id: u32,
         share_index: u32,
         server_url: &str,
+        placement_server_urls: &[String],
+        target_count: usize,
+        capacity_policy: crate::share::ShareAttemptCapacityPolicy,
         expected_nullifier: Option<&[u8]>,
     ) -> Result<queries::ShareAttemptReservation, VotingError> {
         let conn = self.conn();
@@ -1961,6 +1969,9 @@ impl VotingDb {
             proposal_id,
             share_index,
             server_url,
+            placement_server_urls,
+            target_count,
+            capacity_policy,
             expected_nullifier,
         )
     }

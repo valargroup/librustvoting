@@ -51,6 +51,15 @@ pub struct ShareDeliveryAttemptParams<'a> {
     pub submit_at: u64,
 }
 
+/// Whether a fresh durable helper reservation must respect the placement target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShareAttemptCapacityPolicy {
+    /// Refuse a fresh reservation once accepted plus in-flight placements reach the target.
+    EnforcePlacementTarget,
+    /// Permit recovery to exceed the target when retry ordering or liveness requires it.
+    AllowRecoveryBeyondPlacementTarget,
+}
+
 /// Wallet identity captured before an asynchronous helper-share operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShareOperationScope {
@@ -484,13 +493,17 @@ pub fn record_delivery_fixture(
 
 /// Writes an `attempting` marker before a helper POST may be dispatched.
 ///
-/// Returns `false` if the helper already has definite acceptance,
-/// outcome-unknown, or in-flight state. The marker is persisted before this
-/// function returns `true`, so dispatch can safely occur only afterward.
+/// The helper must belong to `placement_server_urls`. A reservation starts
+/// only while the number of accepted plus in-flight configured helpers is
+/// below `params.target_count`; an existing helper state, a satisfied capacity,
+/// or a stale generation is reported without writing a marker. The marker is
+/// persisted before `Started` is returned, so dispatch can safely occur only
+/// afterward.
 pub(crate) fn begin_delivery_attempt_for_generation(
     db: &VotingDb,
     params: &ShareDeliveryAttemptParams<'_>,
     generation: ShareGeneration<'_>,
+    placement_server_urls: &[String],
 ) -> Result<crate::storage::queries::ShareAttemptReservation, VotingError> {
     db.add_attempting_server_for_generation(
         generation.scope().wallet_id(),
@@ -499,15 +512,22 @@ pub(crate) fn begin_delivery_attempt_for_generation(
         params.proposal_id,
         params.share_index,
         params.server_url,
+        placement_server_urls,
+        params.target_count,
+        ShareAttemptCapacityPolicy::EnforcePlacementTarget,
         Some(generation.nullifier()),
     )
 }
 
 /// Journals a POST for a share record that recovery has already loaded.
+///
+/// Returns `false` if the helper already has delivery state or the configured
+/// placement capacity is already satisfied.
 #[cfg(test)]
 pub(crate) fn begin_existing_delivery_attempt(
     db: &VotingDb,
     params: &ShareDeliveryAttemptParams<'_>,
+    placement_server_urls: &[String],
 ) -> Result<bool, VotingError> {
     db.add_attempting_server(
         params.round_id,
@@ -515,13 +535,21 @@ pub(crate) fn begin_existing_delivery_attempt(
         params.proposal_id,
         params.share_index,
         params.server_url,
+        placement_server_urls,
+        params.target_count,
     )
 }
 
+/// Journals a recovery POST under the caller-selected placement-capacity policy.
+///
+/// The durable target remains `params.target_count` even when overdue or
+/// interrupted recovery is explicitly allowed to reserve beyond it.
 pub(crate) fn begin_existing_delivery_attempt_for_generation(
     db: &VotingDb,
     params: &ShareDeliveryAttemptParams<'_>,
     generation: ShareGeneration<'_>,
+    placement_server_urls: &[String],
+    capacity_policy: ShareAttemptCapacityPolicy,
 ) -> Result<crate::storage::queries::ShareAttemptReservation, VotingError> {
     db.add_attempting_server_for_generation(
         generation.scope().wallet_id(),
@@ -530,6 +558,9 @@ pub(crate) fn begin_existing_delivery_attempt_for_generation(
         params.proposal_id,
         params.share_index,
         params.server_url,
+        placement_server_urls,
+        params.target_count,
+        capacity_policy,
         Some(generation.nullifier()),
     )
 }
@@ -720,6 +751,26 @@ pub(crate) fn is_confirmed_for_generation(
         params.share_index,
         Some(generation.nullifier()),
     )
+}
+
+/// Re-reads whether the exact helper-share generation still owns its durable key.
+pub(crate) fn is_current_generation(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    generation: ShareGeneration<'_>,
+) -> Result<bool, VotingError> {
+    db.share_is_confirmed_for_generation(
+        generation.scope().wallet_id(),
+        round_id,
+        bundle_index,
+        proposal_id,
+        share_index,
+        Some(generation.nullifier()),
+    )
+    .map(|confirmed| confirmed.is_some())
 }
 
 /// Marks one helper-share record confirmed.

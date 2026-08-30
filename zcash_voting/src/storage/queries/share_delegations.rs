@@ -1,14 +1,15 @@
 use rusqlite::{named_params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::{load_ballot_intent, load_vote_choice_for_intent_check};
-use crate::helper::url::canonicalize_helper_base_url;
-use crate::share::ShareDeliveryState;
+use crate::helper::url::{canonical_helper_url_list, canonicalize_helper_base_url};
+use crate::share::{ShareAttemptCapacityPolicy, ShareDeliveryState};
 use crate::types::{ShareDelegationRecord, VotingError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShareAttemptReservation {
     Started,
     AlreadyRecorded,
+    PlacementCapacityReached,
     StaleGeneration,
 }
 
@@ -135,10 +136,12 @@ fn serialize_url_list(
 
 /// Durably marks a helper POST as in flight before the request is dispatched.
 ///
-/// The helper URL must canonicalize. Ballot intent and existing share state
-/// are validated before the row is updated; callers may dispatch only after
-/// this returns `true`.
-/// Returns `false` when this helper already has any recorded outcome.
+/// The helper URL must canonicalize and belong to `placement_server_urls`.
+/// Ballot intent and existing share state are validated before the row is
+/// updated; callers may dispatch only after this returns `true`. Returns
+/// `false` when this helper already has delivery state or accepted plus
+/// in-flight configured helpers already reach `target_count`.
+#[allow(clippy::too_many_arguments)]
 pub fn add_attempting_server(
     conn: &Connection,
     round_id: &str,
@@ -147,6 +150,8 @@ pub fn add_attempting_server(
     proposal_id: u32,
     share_index: u32,
     server_url: &str,
+    placement_server_urls: &[String],
+    target_count: usize,
 ) -> Result<bool, VotingError> {
     match add_attempting_server_for_generation(
         conn,
@@ -156,10 +161,14 @@ pub fn add_attempting_server(
         proposal_id,
         share_index,
         server_url,
+        placement_server_urls,
+        target_count,
+        ShareAttemptCapacityPolicy::EnforcePlacementTarget,
         None,
     )? {
         ShareAttemptReservation::Started => Ok(true),
-        ShareAttemptReservation::AlreadyRecorded => Ok(false),
+        ShareAttemptReservation::AlreadyRecorded
+        | ShareAttemptReservation::PlacementCapacityReached => Ok(false),
         ShareAttemptReservation::StaleGeneration => Err(missing_share_error(
             round_id,
             bundle_index,
@@ -178,8 +187,18 @@ pub(crate) fn add_attempting_server_for_generation(
     proposal_id: u32,
     share_index: u32,
     server_url: &str,
+    placement_server_urls: &[String],
+    target_count: usize,
+    capacity_policy: ShareAttemptCapacityPolicy,
     expected_nullifier: Option<&[u8]>,
 ) -> Result<ShareAttemptReservation, VotingError> {
+    let placement_server_urls = canonical_helper_url_list(placement_server_urls)?;
+    let server_url = canonicalize_helper_base_url(server_url)?;
+    if !placement_server_urls.contains(&server_url) {
+        return Err(VotingError::InvalidInput {
+            message: "attempted helper must belong to the placement fleet".to_string(),
+        });
+    }
     loop {
         let current: Option<(String, String, String, bool, Vec<u8>)> = conn
             .query_row(
@@ -228,9 +247,29 @@ pub(crate) fn add_attempting_server_for_generation(
             &outcome_unknown_urls,
             &in_flight_urls,
         )?;
-        if confirmed || !state.begin(server_url)? {
+        if confirmed
+            || state.accepted_urls().contains(&server_url)
+            || state.outcome_unknown_urls().contains(&server_url)
+            || state.in_flight_urls().contains(&server_url)
+        {
             return Ok(ShareAttemptReservation::AlreadyRecorded);
         }
+        let reserved_placements = state
+            .accepted_urls()
+            .iter()
+            .chain(state.in_flight_urls())
+            .filter(|url| placement_server_urls.contains(url))
+            .count();
+        let placement_capacity_reached = match capacity_policy {
+            ShareAttemptCapacityPolicy::EnforcePlacementTarget => {
+                reserved_placements >= target_count
+            }
+            ShareAttemptCapacityPolicy::AllowRecoveryBeyondPlacementTarget => false,
+        };
+        if placement_capacity_reached {
+            return Ok(ShareAttemptReservation::PlacementCapacityReached);
+        }
+        debug_assert!(state.begin(&server_url)?);
         let updated_attempting_json = serialize_url_list(
             state.in_flight_urls(),
             &preserved_legacy_in_flight_urls,

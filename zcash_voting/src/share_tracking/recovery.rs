@@ -43,7 +43,15 @@ pub(super) struct ResubmitRequest<'a> {
     pub(super) ambiguous_urls: &'a [String],
     /// Helpers left in flight by an interrupted process.
     pub(super) interrupted_attempt_urls: &'a [String],
+    pub(super) target_count: usize,
     pub(super) schedule: ResubmissionSchedule,
+    pub(super) candidates: ResubmissionCandidates,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResubmissionCandidates {
+    FullRecoveryOrder,
+    InterruptedOnly,
 }
 
 #[derive(Clone, Copy)]
@@ -145,7 +153,18 @@ pub(super) async fn resubmit_to_next_helper(
     };
     if recovered_nullifier.as_slice() != share.nullifier {
         return Ok(ResubmitReport {
-            outcome: ResubmitOutcome::StaleGeneration,
+            outcome: if share::is_current_generation(
+                db,
+                params.round_id,
+                share.bundle_index,
+                share.proposal_id,
+                share.share_index,
+                generation,
+            )? {
+                ResubmitOutcome::Unrecoverable
+            } else {
+                ResubmitOutcome::StaleGeneration
+            },
             outcome_unknown_urls: Vec::new(),
         });
     }
@@ -162,22 +181,25 @@ pub(super) async fn resubmit_to_next_helper(
         .iter()
         .map(String::as_str)
         .collect();
-    let eligible_servers: Vec<String> = {
-        let attempted: HashSet<&str> = attempted_urls.iter().map(String::as_str).collect();
-        dedupe_preserving_order(
-            request
-                .configured_urls
-                .iter()
-                .filter(|url| !ambiguous_helpers.contains(url.as_str()))
-                .filter(|url| !interrupted_helpers.contains(url.as_str()))
-                .filter(|url| !attempted.contains(url.as_str()))
-                .filter(|url| {
-                    request.schedule.reset_submit_at()
-                        || !definitely_accepted_helpers.contains(url.as_str())
-                })
-                .cloned(),
-        )
-    };
+    let eligible_servers: Vec<String> =
+        if request.candidates == ResubmissionCandidates::FullRecoveryOrder {
+            let attempted: HashSet<&str> = attempted_urls.iter().map(String::as_str).collect();
+            dedupe_preserving_order(
+                request
+                    .configured_urls
+                    .iter()
+                    .filter(|url| !ambiguous_helpers.contains(url.as_str()))
+                    .filter(|url| !interrupted_helpers.contains(url.as_str()))
+                    .filter(|url| !attempted.contains(url.as_str()))
+                    .filter(|url| {
+                        request.schedule.reset_submit_at()
+                            || !definitely_accepted_helpers.contains(url.as_str())
+                    })
+                    .cloned(),
+            )
+        } else {
+            Vec::new()
+        };
     let needed = resubmission_server_order_random_bytes_required(
         &eligible_servers,
         request.definite_acceptance_urls,
@@ -206,7 +228,9 @@ pub(super) async fn resubmit_to_next_helper(
             .health()
             .candidate_servers(&interrupted_retry_urls, ordering_time),
     );
-    if request.schedule.reset_submit_at() {
+    if request.schedule.reset_submit_at()
+        && request.candidates == ResubmissionCandidates::FullRecoveryOrder
+    {
         let ambiguous_retry_urls: Vec<String> = request
             .ambiguous_urls
             .iter()
@@ -226,6 +250,7 @@ pub(super) async fn resubmit_to_next_helper(
         );
     }
     let mut newly_outcome_unknown_urls = Vec::new();
+    let mut fresh_placement_capacity_reached = false;
     for server_url in order {
         if cancel() {
             return Ok(ResubmitReport {
@@ -250,13 +275,19 @@ pub(super) async fn resubmit_to_next_helper(
             definitely_accepted_helpers.contains(server_url.as_str());
         let journals_fresh_attempt =
             !retries_outcome_unknown_helper && !retries_definitely_accepted_helper;
+        let capacity_policy =
+            if request.schedule.reset_submit_at() || !request.interrupted_attempt_urls.is_empty() {
+                share::ShareAttemptCapacityPolicy::AllowRecoveryBeyondPlacementTarget
+            } else {
+                share::ShareAttemptCapacityPolicy::EnforcePlacementTarget
+            };
         let attempt = share::ShareDeliveryAttemptParams {
             round_id: params.round_id,
             bundle_index: share.bundle_index,
             proposal_id: share.proposal_id,
             share_index: share.share_index,
             server_url: &server_url,
-            target_count: usize::try_from(share.target_count).unwrap_or(usize::MAX),
+            target_count: request.target_count,
             submit_at: request.schedule.submit_at(),
         };
         // Outcome-unknown and previously accepted helpers are already durably
@@ -264,9 +295,22 @@ pub(super) async fn resubmit_to_next_helper(
         // new attempting marker (which the guard would refuse). Re-read
         // confirmation immediately before either last-resort re-POST.
         let may_dispatch = if journals_fresh_attempt {
-            match share::begin_existing_delivery_attempt_for_generation(db, &attempt, generation)? {
+            if fresh_placement_capacity_reached {
+                continue;
+            }
+            match share::begin_existing_delivery_attempt_for_generation(
+                db,
+                &attempt,
+                generation,
+                request.configured_urls,
+                capacity_policy,
+            )? {
                 crate::storage::queries::ShareAttemptReservation::Started => true,
                 crate::storage::queries::ShareAttemptReservation::AlreadyRecorded => false,
+                crate::storage::queries::ShareAttemptReservation::PlacementCapacityReached => {
+                    fresh_placement_capacity_reached = true;
+                    false
+                }
                 crate::storage::queries::ShareAttemptReservation::StaleGeneration => {
                     return Ok(ResubmitReport {
                         outcome: ResubmitOutcome::StaleGeneration,

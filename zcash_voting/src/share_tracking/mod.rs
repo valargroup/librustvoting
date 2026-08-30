@@ -19,7 +19,11 @@
 //! fleet is therefore the trusted quorum for the share nullifier's global
 //! on-chain state.
 
-use std::{collections::HashSet, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, LazyLock, Mutex, Weak},
+    time::{Duration, Instant},
+};
 
 use crate::{
     helper::client::HelperClient,
@@ -39,10 +43,83 @@ pub const SHARE_STATUS_MAX_CONCURRENT_POLLS: usize = 4;
 pub const SHARE_STATUS_POLL_BUDGET_MILLISECONDS: u64 = 10_000;
 /// Interval for observing caller cancellation while helper tasks are pending.
 const SHARE_STATUS_CANCEL_CHECK_MILLISECONDS: u64 = 50;
+/// Interval for observing caller cancellation while waiting for a share lock.
+const SHARE_OPERATION_LOCK_CANCEL_CHECK_MILLISECONDS: u64 = 50;
 
 const _: () = assert!(SHARE_STATUS_MAX_CONCURRENT_POLLS > 0);
 const _: () = assert!(SHARE_STATUS_POLL_BUDGET_MILLISECONDS > 0);
 const _: () = assert!(SHARE_STATUS_CANCEL_CHECK_MILLISECONDS > 0);
+const _: () = assert!(SHARE_OPERATION_LOCK_CANCEL_CHECK_MILLISECONDS > 0);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShareOperationLockKey {
+    wallet_id: String,
+    round_id: String,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+}
+
+static SHARE_OPERATION_LOCKS: LazyLock<
+    Mutex<HashMap<ShareOperationLockKey, Weak<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+async fn lock_share_operation(
+    scope: &share::ShareOperationScope,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, VotingError> {
+    let key = ShareOperationLockKey {
+        wallet_id: scope.wallet_id().to_string(),
+        round_id: round_id.to_string(),
+        bundle_index,
+        proposal_id,
+        share_index,
+    };
+    let lock = {
+        let mut locks = SHARE_OPERATION_LOCKS
+            .lock()
+            .map_err(|e| VotingError::Internal {
+                message: format!("helper-share operation lock registry poisoned: {e}"),
+            })?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    };
+    Ok(lock.lock_owned().await)
+}
+
+async fn lock_share_operation_or_cancel(
+    scope: &share::ShareOperationScope,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, VotingError> {
+    let lock = lock_share_operation(scope, round_id, bundle_index, proposal_id, share_index);
+    tokio::pin!(lock);
+
+    loop {
+        if cancel() {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            result = &mut lock => return result.map(Some),
+            _ = tokio::time::sleep(Duration::from_millis(
+                SHARE_OPERATION_LOCK_CANCEL_CHECK_MILLISECONDS,
+            )) => {}
+        }
+    }
+}
 
 /// Identifies one helper share within a round.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -232,12 +309,15 @@ mod recovery;
 
 use configured_fleet::ConfiguredHelperFleet;
 #[cfg(test)]
-use confirmation::poll_share_helpers_with_budget;
+use confirmation::{finish_expired_polls, poll_share_helpers_with_budget};
 use confirmation::{poll_share_helpers, ShareStatusOutcome};
 pub(crate) use initial_delivery::submit_committed_share_to_helpers;
 #[cfg(test)]
 use initial_delivery::submit_share_to_helpers;
-use recovery::{resubmit_to_next_helper, ResubmissionSchedule, ResubmitOutcome, ResubmitRequest};
+use recovery::{
+    resubmit_to_next_helper, ResubmissionCandidates, ResubmissionSchedule, ResubmitOutcome,
+    ResubmitRequest,
+};
 
 /// Runs one confirm-or-retry pass over a round's unconfirmed shares.
 ///
@@ -298,11 +378,35 @@ async fn track_pending_shares_with_elapsed(
     let configured_urls = configured_fleet.urls();
     let mut report = ShareTrackingReport::default();
 
-    for share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
+    for loaded_share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
         if cancel() {
             report.cancelled = true;
             break;
         }
+        let Some(_operation_guard) = lock_share_operation_or_cancel(
+            &scope,
+            params.round_id,
+            loaded_share.bundle_index,
+            loaded_share.proposal_id,
+            loaded_share.share_index,
+            cancel,
+        )
+        .await?
+        else {
+            report.cancelled = true;
+            break;
+        };
+        let Some(share) = share::unconfirmed_for_scope(db, &scope, params.round_id)?
+            .into_iter()
+            .find(|share| {
+                share.bundle_index == loaded_share.bundle_index
+                    && share.proposal_id == loaded_share.proposal_id
+                    && share.share_index == loaded_share.share_index
+                    && share.nullifier == loaded_share.nullifier
+            })
+        else {
+            continue;
+        };
 
         // Only configured helpers count toward current placement or polling.
         let configured_definite_acceptance_urls = share
@@ -345,7 +449,10 @@ async fn track_pending_shares_with_elapsed(
             params.vote_end_time_seconds,
             params.policy,
         );
-        if flags.is_idle() && delivery_state.accepted_urls().len() >= target_count {
+        if flags.is_idle()
+            && delivery_state.accepted_urls().len() >= target_count
+            && configured_interrupted_attempt_urls.is_empty()
+        {
             continue;
         }
 
@@ -397,8 +504,14 @@ async fn track_pending_shares_with_elapsed(
         let resubmission_window_open = params.vote_end_time_seconds.is_none_or(|vote_end| {
             is_share_resubmission_window_open(current_time, vote_end, params.policy)
         });
+        let under_placed = delivery_state.accepted_urls().len() < target_count;
+        let reconcile_interrupted_only = !flags.overdue_for_retry
+            && !under_placed
+            && !configured_interrupted_attempt_urls.is_empty();
         if resubmission_window_open
-            && (flags.overdue_for_retry || delivery_state.accepted_urls().len() < target_count)
+            && (flags.overdue_for_retry
+                || under_placed
+                || !configured_interrupted_attempt_urls.is_empty())
         {
             let schedule = if flags.overdue_for_retry {
                 ResubmissionSchedule::Immediate
@@ -417,7 +530,13 @@ async fn track_pending_shares_with_elapsed(
                         definite_acceptance_urls: delivery_state.accepted_urls(),
                         ambiguous_urls: &configured_outcome_unknown_urls,
                         interrupted_attempt_urls: &configured_interrupted_attempt_urls,
+                        target_count,
                         schedule,
+                        candidates: if reconcile_interrupted_only {
+                            ResubmissionCandidates::InterruptedOnly
+                        } else {
+                            ResubmissionCandidates::FullRecoveryOrder
+                        },
                     },
                     &mut attempted_urls_this_pass,
                     cancel,
@@ -449,8 +568,9 @@ async fn track_pending_shares_with_elapsed(
                             share: ShareKey::of(&share),
                             server_url,
                         });
-                        if delivery_state.accepted_urls().len() >= target_count
-                            || !newly_definite_placement
+                        if !reconcile_interrupted_only
+                            && (delivery_state.accepted_urls().len() >= target_count
+                                || !newly_definite_placement)
                         {
                             break;
                         }

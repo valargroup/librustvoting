@@ -184,30 +184,26 @@ async fn dispatch_share_to_canonical_helpers(
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
     let expected_nullifier = persisted_delivery.nullifier.clone();
+    let candidates = planned.iter().chain(fallback).cloned().collect::<Vec<_>>();
+    let Some(_operation_guard) = super::lock_share_operation_or_cancel(
+        scope,
+        params.round_id,
+        params.bundle_index,
+        params.proposal_id,
+        params.share_index,
+        cancel,
+    )
+    .await?
+    else {
+        let delivery_state =
+            load_current_delivery_state(db, scope, params, &expected_nullifier, &candidates)?;
+        return Ok(delivery_report(&delivery_state, params.target_count));
+    };
     let generation = share::ShareGeneration::new(scope, &expected_nullifier);
     let planned_set: HashSet<&str> = planned.iter().map(String::as_str).collect();
-    let candidates = planned.iter().chain(fallback).cloned().collect::<Vec<_>>();
-    let definite_acceptance_urls = persisted_delivery
-        .sent_to_urls
-        .into_iter()
-        .filter(|url| candidates.contains(url))
-        .collect::<Vec<_>>();
-    let outcome_unknown_urls = persisted_delivery
-        .ambiguous_urls
-        .into_iter()
-        .filter(|url| candidates.contains(url))
-        .collect::<Vec<_>>();
-    let interrupted_attempt_urls = persisted_delivery
-        .attempting_urls
-        .into_iter()
-        .filter(|url| candidates.contains(url))
-        .collect::<Vec<_>>();
-    let mut delivery_state = share::ShareDeliveryState::from_url_lists(
-        &definite_acceptance_urls,
-        &outcome_unknown_urls,
-        &interrupted_attempt_urls,
-    )?;
-    let mut remaining = candidates;
+    let mut delivery_state =
+        load_current_delivery_state(db, scope, params, &expected_nullifier, &candidates)?;
+    let mut remaining = candidates.clone();
     remaining.retain(|url| {
         !delivery_state.accepted_urls().contains(url)
             && !delivery_state.outcome_unknown_urls().contains(url)
@@ -260,12 +256,13 @@ async fn dispatch_share_to_canonical_helpers(
             proposal_id: params.proposal_id,
             share_index: params.share_index,
             server_url: &server_url,
-            target_count: params.target_count,
+            target_count: definite_acceptance_target,
             submit_at: params.submit_at,
         };
-        match share::begin_delivery_attempt_for_generation(db, &attempt, generation)? {
+        match share::begin_delivery_attempt_for_generation(db, &attempt, generation, &candidates)? {
             crate::storage::queries::ShareAttemptReservation::Started => {}
             crate::storage::queries::ShareAttemptReservation::AlreadyRecorded => continue,
+            crate::storage::queries::ShareAttemptReservation::PlacementCapacityReached => break,
             crate::storage::queries::ShareAttemptReservation::StaleGeneration => {
                 return Err(stale_delivery_error(params));
             }
@@ -339,7 +336,54 @@ async fn dispatch_share_to_canonical_helpers(
             }
         }
     }
-    Ok(ShareSubmissionReport {
+    delivery_state =
+        load_current_delivery_state(db, scope, params, &expected_nullifier, &candidates)?;
+    Ok(delivery_report(&delivery_state, params.target_count))
+}
+
+fn load_current_delivery_state(
+    db: &VotingDb,
+    scope: &share::ShareOperationScope,
+    params: &InitialShareSubmissionParams<'_>,
+    expected_nullifier: &[u8],
+    candidates: &[String],
+) -> Result<share::ShareDeliveryState, VotingError> {
+    let current_delivery = share::list_for_scope(db, scope, params.round_id)?
+        .into_iter()
+        .find(|share| {
+            share.bundle_index == params.bundle_index
+                && share.proposal_id == params.proposal_id
+                && share.share_index == params.share_index
+                && share.nullifier == expected_nullifier
+        })
+        .ok_or_else(|| stale_delivery_error(params))?;
+    let definite_acceptance_urls = current_delivery
+        .sent_to_urls
+        .into_iter()
+        .filter(|url| candidates.contains(url))
+        .collect::<Vec<_>>();
+    let outcome_unknown_urls = current_delivery
+        .ambiguous_urls
+        .into_iter()
+        .filter(|url| candidates.contains(url))
+        .collect::<Vec<_>>();
+    let interrupted_attempt_urls = current_delivery
+        .attempting_urls
+        .into_iter()
+        .filter(|url| candidates.contains(url))
+        .collect::<Vec<_>>();
+    share::ShareDeliveryState::from_url_lists(
+        &definite_acceptance_urls,
+        &outcome_unknown_urls,
+        &interrupted_attempt_urls,
+    )
+}
+
+fn delivery_report(
+    delivery_state: &share::ShareDeliveryState,
+    target_count: usize,
+) -> ShareSubmissionReport {
+    ShareSubmissionReport {
         accepted_urls: delivery_state.accepted_urls().to_vec(),
         ambiguous_urls: delivery_state
             .outcome_unknown_urls()
@@ -347,8 +391,8 @@ async fn dispatch_share_to_canonical_helpers(
             .chain(delivery_state.in_flight_urls())
             .cloned()
             .collect(),
-        target_count: params.target_count,
-    })
+        target_count,
+    }
 }
 
 fn stale_delivery_error(params: &InitialShareSubmissionParams<'_>) -> VotingError {

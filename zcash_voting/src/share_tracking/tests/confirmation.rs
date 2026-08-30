@@ -165,6 +165,126 @@ async fn expired_status_budget_does_not_start_or_penalize_helpers() {
     }
 }
 
+#[tokio::test]
+async fn budget_expiry_scores_only_polls_that_are_still_running() {
+    let round_id = field_hex(1);
+    let share_id = "cd".repeat(32);
+    let completed_url = helper(1);
+    let stalled_url = helper(2);
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_get(
+        &format!("{completed_url}/shielded-vote/v1/share-status/{round_id}/{share_id}"),
+        json_status("pending"),
+    );
+    let client = client_with(transport.clone());
+    client.health().record_failure(&completed_url, 900);
+    client.health().record_failure(&completed_url, 901);
+
+    let mut polls = tokio::task::JoinSet::new();
+    let completed_client = client.clone();
+    let completed_round = round_id.clone();
+    let completed_share = share_id.clone();
+    let completed_server = completed_url.clone();
+    polls.spawn(async move {
+        let outcome = completed_client
+            .share_status(
+                &completed_server,
+                &completed_round,
+                &completed_share,
+                1_000,
+                &never_cancel(),
+            )
+            .await;
+        (completed_server, outcome)
+    });
+    let stalled_server = stalled_url.clone();
+    polls.spawn(async move {
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        (
+            stalled_server,
+            Err(crate::helper::client::HelperError::Cancelled),
+        )
+    });
+
+    while transport.call_count(&completed_url) == 0
+        || client.health().failure_count(&completed_url) != 0
+    {
+        tokio::task::yield_now().await;
+    }
+
+    let mut in_flight = HashSet::from([completed_url.clone(), stalled_url.clone()]);
+    let mut confirmations = 0;
+    let quorum = finish_expired_polls(
+        &mut polls,
+        &mut in_flight,
+        &mut confirmations,
+        2,
+        &client,
+        1_001,
+    )
+    .await;
+
+    assert!(!quorum);
+    assert_eq!(client.health().failure_count(&completed_url), 0);
+    assert_eq!(client.health().failure_count(&stalled_url), 1);
+}
+
+#[tokio::test]
+async fn budget_expiry_preserves_boundary_quorum_without_penalizing_abort() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let confirmed_urls = [helper(1), helper(2)];
+    let stalled_url = helper(3);
+    let client = client_with(Arc::new(MockTransport::default()));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut polls = tokio::task::JoinSet::new();
+    for server_url in confirmed_urls.clone() {
+        let completed = Arc::clone(&completed);
+        polls.spawn(async move {
+            completed.fetch_add(1, Ordering::Release);
+            (
+                server_url,
+                Ok(crate::helper::client::ShareStatus::Confirmed),
+            )
+        });
+    }
+    let stalled_server = stalled_url.clone();
+    polls.spawn(async move {
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        (
+            stalled_server,
+            Err(crate::helper::client::HelperError::Cancelled),
+        )
+    });
+    while completed.load(Ordering::Acquire) != confirmed_urls.len() {
+        tokio::task::yield_now().await;
+    }
+    tokio::task::yield_now().await;
+
+    let mut in_flight = HashSet::from([
+        confirmed_urls[0].clone(),
+        confirmed_urls[1].clone(),
+        stalled_url.clone(),
+    ]);
+    let mut confirmations = 0;
+    let quorum = finish_expired_polls(
+        &mut polls,
+        &mut in_flight,
+        &mut confirmations,
+        confirmed_urls.len(),
+        &client,
+        1_001,
+    )
+    .await;
+
+    assert!(quorum);
+    assert_eq!(confirmations, confirmed_urls.len());
+    assert_eq!(in_flight, HashSet::from([stalled_url.clone()]));
+    assert_eq!(client.health().failure_count(&stalled_url), 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn cancellation_aborts_bounded_in_flight_status_polls() {
     let round_id = field_hex(1);

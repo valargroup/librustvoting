@@ -31,6 +31,124 @@ async fn fan_out_stops_at_the_target_count() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn overlapping_initial_fan_outs_share_one_target() {
+    let db = db_with_recoverable_vote();
+    let servers = helpers(4);
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post_after(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        Duration::from_secs(1),
+        json_status("queued"),
+    );
+    for index in 2..=4 {
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(index)),
+            json_status("queued"),
+        );
+    }
+    let client = client_with(transport.clone());
+    let params = InitialShareSubmissionParams {
+        target_count: 2,
+        ..initial_submission(&servers)
+    };
+
+    let first_cancel = never_cancel();
+    let second_cancel = never_cancel();
+    let (first, second) = tokio::join!(
+        submit_share_to_helpers(&db, &client, &params, &first_cancel),
+        submit_share_to_helpers(&db, &client, &params, &second_cancel),
+    );
+
+    assert_eq!(first.unwrap().accepted_urls.len(), 2);
+    assert_eq!(second.unwrap().accepted_urls.len(), 2);
+    assert_eq!(transport.call_count("/shares"), 2);
+    assert_eq!(only_share(&db).sent_to_urls.len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_aborts_initial_wait_for_live_share_operation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let db = VotingDb::open_in_memory().unwrap();
+    db.set_wallet_id("initial-cancellation-lock-wait");
+    seed_recoverable_vote_for_wallet(&db, "initial-cancellation-lock-wait");
+    let scope = share::ShareOperationScope::capture(&db);
+    let _operation_guard = lock_share_operation(&scope, ROUND_ID, 0, 1, 0)
+        .await
+        .unwrap();
+    let servers = helpers(2);
+    let transport = Arc::new(MockTransport::default());
+    let client = client_with(transport.clone());
+    let submission = InitialShareSubmissionParams {
+        target_count: 1,
+        ..initial_submission(&servers)
+    };
+    let cancelled = AtomicBool::new(false);
+    let cancel = || cancelled.load(Ordering::Relaxed);
+
+    let trigger_cancellation = async {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        cancelled.store(true, Ordering::Relaxed);
+    };
+    let (report, ()) = tokio::join!(
+        submit_share_to_helpers(&db, &client, &submission, &cancel),
+        trigger_cancellation,
+    );
+    let report = report.unwrap();
+
+    assert!(report.accepted_urls.is_empty());
+    assert!(report.ambiguous_urls.is_empty());
+    assert!(transport.calls().is_empty());
+    assert!(only_share(&db).attempting_urls.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn tracking_waits_for_live_initial_fan_out_before_replenishing() {
+    let db = Arc::new(db_with_recoverable_vote());
+    let servers = helpers(3);
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post_after(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        Duration::from_secs(1),
+        json_status("queued"),
+    );
+    for index in 2..=3 {
+        transport.queue_post(
+            &format!("{}/shielded-vote/v1/shares", helper(index)),
+            json_status("queued"),
+        );
+    }
+    let client = client_with(transport.clone());
+    let initial_db = Arc::clone(&db);
+    let initial_client = client.clone();
+    let initial_servers = servers.clone();
+    let initial = tokio::spawn(async move {
+        let params = InitialShareSubmissionParams {
+            target_count: 2,
+            ..initial_submission(&initial_servers)
+        };
+        submit_share_to_helpers(&initial_db, &initial_client, &params, &never_cancel())
+            .await
+            .unwrap();
+    });
+    while transport.call_count(&helper(1)) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let random = zero_bytes;
+    let mut tracking_params = params(&servers, SUBMIT_AT - 1, &random);
+    tracking_params.vote_end_time_seconds = None;
+
+    let report = track_pending_shares(&db, &tracking_params, &client, &never_cancel())
+        .await
+        .unwrap();
+    initial.await.unwrap();
+
+    assert!(report.resubmitted.is_empty());
+    assert_eq!(transport.call_count("/shares"), 2);
+    assert_eq!(only_share(&db).sent_to_urls.len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn fan_out_moves_past_a_refusing_helper() {
     let transport = Arc::new(MockTransport::default());
     transport.queue_post(
@@ -1159,7 +1277,9 @@ fn concurrent_attempt_reservations_preserve_both_markers() {
             submit_at: SUBMIT_AT,
         };
         started_tx.send(()).unwrap();
-        let added = share::begin_existing_delivery_attempt(&first_db, &attempt).unwrap();
+        let placement_servers = helpers(2);
+        let added = share::begin_existing_delivery_attempt(&first_db, &attempt, &placement_servers)
+            .unwrap();
         (first_db, added)
     });
     started_rx.recv().unwrap();
@@ -1173,6 +1293,87 @@ fn concurrent_attempt_reservations_preserve_both_markers() {
         only_share(&second_db).attempting_urls,
         vec![helper(2), helper(1)]
     );
+
+    drop(first_db);
+    drop(second_db);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path_string}-shm"));
+    let _ = std::fs::remove_file(format!("{path_string}-wal"));
+}
+
+#[test]
+fn concurrent_attempt_reservations_share_one_placement_capacity() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "zcash-voting-concurrent-attempt-capacity-{}-{unique}.sqlite",
+        std::process::id()
+    ));
+    let path_string = path.to_string_lossy().into_owned();
+    let first_db = VotingDb::open(&path_string).unwrap();
+    first_db.set_wallet_id(WALLET_ID);
+    seed_recoverable_vote(&first_db);
+    share::record_delivery(
+        &first_db,
+        &share::ShareDeliveryRecordParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            submission: &ShareSubmissionReport {
+                target_count: 1,
+                ..ShareSubmissionReport::default()
+            },
+            submit_at: SUBMIT_AT,
+        },
+    )
+    .unwrap();
+
+    let second_db = VotingDb::open(&path_string).unwrap();
+    second_db.set_wallet_id(WALLET_ID);
+    let writer = second_db.conn();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer
+        .execute(
+            "UPDATE share_delegations SET attempting_urls = :attempting_urls
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = 0 AND proposal_id = 1 AND share_index = 0",
+            rusqlite::named_params! {
+                ":attempting_urls": serde_json::to_string(&[helper(2)]).unwrap(),
+                ":round_id": ROUND_ID,
+                ":wallet_id": WALLET_ID,
+            },
+        )
+        .unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let reservation = std::thread::spawn(move || {
+        let first_helper = helper(1);
+        let placement_servers = helpers(2);
+        let attempt = share::ShareDeliveryAttemptParams {
+            round_id: ROUND_ID,
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+            server_url: &first_helper,
+            target_count: 1,
+            submit_at: SUBMIT_AT,
+        };
+        started_tx.send(()).unwrap();
+        let added = share::begin_existing_delivery_attempt(&first_db, &attempt, &placement_servers)
+            .unwrap();
+        (first_db, added)
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    writer.execute_batch("COMMIT").unwrap();
+    drop(writer);
+
+    let (first_db, added) = reservation.join().unwrap();
+    assert!(!added);
+    assert_eq!(only_share(&second_db).attempting_urls, vec![helper(2)]);
 
     drop(first_db);
     drop(second_db);
@@ -1516,7 +1717,7 @@ fn attempting_updates_preserve_noncanonical_legacy_history() {
         submit_at: SUBMIT_AT,
     };
 
-    assert!(share::begin_existing_delivery_attempt(&db, &attempt).unwrap());
+    assert!(share::begin_existing_delivery_attempt(&db, &attempt, &[helper(1)]).unwrap());
     let after_add: String = db
         .conn()
         .query_row(
@@ -1656,14 +1857,20 @@ fn wrong_nullifier_generation_cannot_apply_any_delivery_transition() {
         target_count: 1,
         submit_at: SUBMIT_AT,
     };
-    assert!(share::begin_existing_delivery_attempt(&db, &attempt).unwrap());
+    assert!(share::begin_existing_delivery_attempt(&db, &attempt, &[helper(1)]).unwrap());
     let scope = share::ShareOperationScope::capture(&db);
     let wrong_nullifier = vec![0xF4; 32];
     let wrong_generation = share::ShareGeneration::new(&scope, &wrong_nullifier);
 
     assert!(matches!(
-        share::begin_existing_delivery_attempt_for_generation(&db, &attempt, wrong_generation)
-            .unwrap(),
+        share::begin_existing_delivery_attempt_for_generation(
+            &db,
+            &attempt,
+            wrong_generation,
+            &[helper(1)],
+            share::ShareAttemptCapacityPolicy::EnforcePlacementTarget,
+        )
+        .unwrap(),
         crate::storage::queries::ShareAttemptReservation::StaleGeneration
     ));
     assert_eq!(

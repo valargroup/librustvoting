@@ -67,10 +67,14 @@ pub struct WalletHelperSharePlan {
 
 /// Inputs for planning all helper shares in one committed vote.
 pub struct WalletHelperSharePlanningRequest<'a> {
+    /// Complete configured fleet. Exact and canonically equivalent duplicates
+    /// are rejected rather than silently collapsed.
     pub configured_server_urls: &'a [String],
     pub now_seconds: u64,
     pub vote_end_time_seconds: u64,
     pub last_moment_buffer_seconds: Option<u64>,
+    /// Whether the committed vote contains the protocol's single share.
+    /// This is valid only when the commitment exposes exactly one payload.
     pub single_share: bool,
     /// Position in this committed vote's share payloads, not a domain share ID.
     pub immediate_share_index: Option<u32>,
@@ -246,8 +250,7 @@ pub fn plan_committed_vote_shares(
     committed: &CommittedVote,
     request: WalletHelperSharePlanningRequest<'_>,
 ) -> Result<WalletHelperSharePlan> {
-    let configured_server_urls = canonical_helper_url_list(request.configured_server_urls)
-        .context("validate helper URLs")?;
+    let configured_server_urls = canonical_distinct_helper_urls(request.configured_server_urls)?;
     let share_count = committed.share_payloads().len();
     let required = share_submission_random_bytes_required(
         share_count,
@@ -276,6 +279,15 @@ pub fn plan_committed_vote_shares(
         configured_server_urls,
         share_plans,
     })
+}
+
+fn canonical_distinct_helper_urls(configured_server_urls: &[String]) -> Result<Vec<String>> {
+    let canonical =
+        canonical_helper_url_list(configured_server_urls).context("validate helper URLs")?;
+    if canonical.len() != configured_server_urls.len() {
+        bail!("configured helper URLs must contain distinct canonical helpers");
+    }
+    Ok(canonical)
 }
 
 /// Submits every committed helper share through crate-owned durable journaling.
@@ -369,4 +381,41 @@ pub fn record_committed_vote_execution(
         .context("record vote commitment tree position")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_distinct_helper_urls;
+
+    #[test]
+    fn helper_planning_rejects_exact_and_canonical_duplicates() {
+        for configured in [
+            vec![
+                "https://helper.example".to_string(),
+                "https://helper.example".to_string(),
+            ],
+            vec![
+                "https://helper.example:443/".to_string(),
+                "https://HELPER.example".to_string(),
+            ],
+        ] {
+            assert!(canonical_distinct_helper_urls(&configured).is_err());
+        }
+    }
+
+    #[test]
+    fn helper_planning_retains_a_unique_canonical_fleet() {
+        let configured = vec![
+            "https://ONE.example:443/".to_string(),
+            "https://two.example/base/".to_string(),
+        ];
+
+        assert_eq!(
+            canonical_distinct_helper_urls(&configured).unwrap(),
+            vec![
+                "https://one.example".to_string(),
+                "https://two.example/base".to_string(),
+            ]
+        );
+    }
 }

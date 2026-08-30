@@ -126,6 +126,8 @@ pub fn plan_share_submission(
 /// domain share index. The caller maps the round's [`ImmediateShareKey`] to its
 /// batch position. The designated plan remains positionally aligned with the
 /// input batch, is marked `immediate`, and receives `submit_at = 0`.
+/// `single_share` is valid only when `share_count == 1`; it cannot be used to
+/// exempt a complete commitment from commitment-wide placement protections.
 pub fn plan_share_submissions(
     share_count: usize,
     server_urls: &[String],
@@ -176,6 +178,13 @@ pub fn plan_share_submissions_with_preferred_servers(
     submit_at_random_bytes: &[u8],
     server_random_bytes: &[u8],
 ) -> Result<Vec<ShareSubmissionPlan>, VotingError> {
+    if single_share && share_count != 1 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "single_share planning requires exactly one share payload, got {share_count}"
+            ),
+        });
+    }
     if immediate_share_index.is_some_and(|index| index as usize >= share_count) {
         return Err(VotingError::InvalidInput {
             message: format!("immediate_share_index must be less than share_count {share_count}"),

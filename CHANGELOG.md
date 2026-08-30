@@ -116,6 +116,24 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Single-share helper planning now rejects any batch whose payload count is not
+  exactly one, and the wallet planning example rejects exact or canonically
+  equivalent duplicate configured helpers instead of silently shrinking the
+  fleet before placement targets are computed.
+- Initial delivery and tracking are serialized per durable share identity and
+  validate the exact generation after acquiring the lock. Waiting callers
+  continue to observe cancellation. Initial attempt reservations atomically
+  account for accepted plus live placements, so overlapping fan-outs can no
+  longer advance through disjoint fallback helpers and exceed the target.
+- Tracking now reconciles configured interrupted attempts even after definite
+  placement is satisfied, without contacting additional untried helpers or
+  requiring vote-end timing.
+- Recovery now reports a parseable but persistently nullifier-inconsistent
+  commitment bundle as unrecoverable while continuing to treat a concurrently
+  replaced share row as stale.
+- Status-budget expiry now drains tasks that completed at the boundary before
+  degrading genuinely aborted requests, preventing one poll result from being
+  scored twice.
 - Initial helper delivery now atomically binds durable share preparation to the
   commitment-bundle generation validated for the `CommittedVote`, so a
   concurrent vote replacement cannot pair an old in-memory payload with the

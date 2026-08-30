@@ -20,6 +20,7 @@ fn share_record(confirmed: bool, submit_at: u64) -> ShareDelegationRecord {
 // ---- Mock transport -------------------------------------------------
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -360,7 +361,18 @@ fn db_with_delivery(
     ambiguous_urls: &[String],
     target_count: usize,
 ) -> VotingDb {
-    let db = db_with_recoverable_vote();
+    db_with_delivery_for_wallet(WALLET_ID, sent_to_urls, ambiguous_urls, target_count)
+}
+
+fn db_with_delivery_for_wallet(
+    wallet_id: &str,
+    sent_to_urls: &[String],
+    ambiguous_urls: &[String],
+    target_count: usize,
+) -> VotingDb {
+    let db = VotingDb::open_in_memory().unwrap();
+    db.set_wallet_id(wallet_id);
+    seed_recoverable_vote_for_wallet(&db, wallet_id);
     let submission = ShareSubmissionReport {
         accepted_urls: sent_to_urls.to_vec(),
         ambiguous_urls: ambiguous_urls.to_vec(),
@@ -385,6 +397,19 @@ fn db_with_recoverable_vote() -> VotingDb {
     let db = VotingDb::open_in_memory().unwrap();
     db.set_wallet_id(WALLET_ID);
     seed_recoverable_vote(&db);
+    db
+}
+
+fn db_with_unique_recoverable_vote() -> VotingDb {
+    static NEXT_WALLET_ID: AtomicU64 = AtomicU64::new(1);
+
+    let wallet_id = format!(
+        "share-tracking-test-{}",
+        NEXT_WALLET_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let db = VotingDb::open_in_memory().unwrap();
+    db.set_wallet_id(&wallet_id);
+    seed_recoverable_vote_for_wallet(&db, &wallet_id);
     db
 }
 
@@ -523,7 +548,10 @@ async fn submit_initial_share_to_candidates(
     now_seconds: u64,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> ShareSubmissionReport {
-    let db = db_with_recoverable_vote();
+    // These helpers are invoked by tests that run concurrently. Give each
+    // short-lived database a distinct wallet so the production per-share lock
+    // does not serialize otherwise unrelated test cases.
+    let db = db_with_unique_recoverable_vote();
     let candidates = canonical_helper_url_list(candidate_servers)
         .expect("test candidate URLs must canonicalize");
     submit_share_to_helpers(

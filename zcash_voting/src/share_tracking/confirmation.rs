@@ -43,6 +43,28 @@ fn record_completed_poll(
     *confirmations == required_confirmations
 }
 
+pub(super) async fn finish_expired_polls(
+    polls: &mut JoinSet<(String, Result<ShareStatus, HelperError>)>,
+    in_flight: &mut HashSet<String>,
+    confirmations: &mut usize,
+    required_confirmations: usize,
+    client: &HelperClient,
+    failure_time: u64,
+) -> bool {
+    polls.abort_all();
+    let mut quorum_observed = false;
+    while let Some(joined) = polls.join_next().await {
+        quorum_observed |=
+            record_completed_poll(joined, in_flight, confirmations, required_confirmations);
+    }
+    if !quorum_observed {
+        for server_url in in_flight.drain() {
+            client.health().record_failure(&server_url, failure_time);
+        }
+    }
+    quorum_observed
+}
+
 /// Polls helpers for the share's global on-chain confirmation state.
 ///
 /// At most [`SHARE_STATUS_MAX_CONCURRENT_POLLS`] requests run concurrently and
@@ -119,11 +141,21 @@ pub(super) async fn poll_share_helpers_with_budget(
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            task_cancelled.store(true, Ordering::Relaxed);
-            polls.abort_all();
+            // Abort first, then drain the set. Tasks that completed before the
+            // abort retain their own status and health result; only tasks that
+            // actually abort remain in `in_flight` for manual degradation.
             let failure_time = now_seconds.saturating_add(poll_budget_milliseconds.div_ceil(1_000));
-            for server_url in in_flight {
-                client.health().record_failure(&server_url, failure_time);
+            if finish_expired_polls(
+                &mut polls,
+                &mut in_flight,
+                &mut confirmations,
+                required_confirmations,
+                client,
+                failure_time,
+            )
+            .await
+            {
+                return ShareStatusOutcome::ConfiguredHelperQuorumObserved;
             }
             return ShareStatusOutcome::ConfiguredHelperQuorumNotObserved;
         }

@@ -586,6 +586,28 @@ fn single_share_mode_is_exempt_from_complete_batch_usage_cap() {
 }
 
 #[test]
+fn single_share_mode_rejects_non_singleton_batches() {
+    let servers = vec!["https://only.example.com".to_string()];
+
+    for share_count in [0, 2, VOTE_COMMITMENT_SHARE_COUNT] {
+        assert!(matches!(
+            plan_share_submissions(
+                share_count,
+                &servers,
+                1_000,
+                2_000,
+                None,
+                true,
+                None,
+                &[],
+                &vec![0; share_count * share_server_order_random_bytes_required(servers.len())],
+            ),
+            Err(VotingError::InvalidInput { .. })
+        ));
+    }
+}
+
+#[test]
 fn share_submission_batch_plan_rejects_missing_entropy() {
     let servers = vec![
         "https://one.example.com".to_string(),
