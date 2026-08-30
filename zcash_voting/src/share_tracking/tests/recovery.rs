@@ -1,5 +1,19 @@
 use super::*;
 
+fn mark_interrupted_attempt(db: &VotingDb, server_url: &str) {
+    let stored = only_share(db);
+    let attempt = share::ShareDeliveryAttemptParams {
+        round_id: ROUND_ID,
+        bundle_index: stored.bundle_index,
+        proposal_id: stored.proposal_id,
+        share_index: stored.share_index,
+        server_url,
+        target_count: usize::try_from(stored.target_count).unwrap(),
+        submit_at: stored.submit_at,
+    };
+    assert!(share::begin_existing_delivery_attempt(db, &attempt).unwrap());
+}
+
 #[tokio::test(start_paused = true)]
 async fn invalid_status_scores_a_failure_without_blocking_confirmation() {
     let configured = helpers(5);
@@ -1099,6 +1113,118 @@ async fn small_fleet_all_ambiguous_still_recovers() {
     assert_eq!(stored.ambiguous_urls, vec![helper(2)]);
     assert_eq!(stored.submit_at, 0);
     assert_eq!(transport.call_count(&helper(2)), 1, "status poll only");
+}
+
+#[tokio::test(start_paused = true)]
+async fn early_replenishment_skips_an_interrupted_attempt() {
+    let configured = helpers(3);
+    let db = db_with_delivery(&[helper(1)], &[], 2);
+    mark_interrupted_attempt(&db, &helper(2));
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(3));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&post_url, json_status("queued"));
+
+    let client = client_with(transport.clone());
+    let random = preserve_server_order;
+    let report = track_pending_shares(
+        &db,
+        &params(&configured, SUBMIT_AT - 1, &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.resubmitted[0].server_url, helper(3));
+    assert_eq!(transport.call_count(&helper(2)), 0);
+    let stored = only_share(&db);
+    assert_eq!(stored.sent_to_urls, vec![helper(1), helper(3)]);
+    assert_eq!(stored.attempting_urls, vec![helper(2)]);
+    assert_eq!(stored.submit_at, SUBMIT_AT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn overdue_recovery_retries_an_interrupted_attempt_after_untried_helpers() {
+    let configured = helpers(2);
+    let db = db_with_delivery(&[], &[], 1);
+    mark_interrupted_attempt(&db, &helper(2));
+    let share_id = share_id_of(&db);
+    let transport = Arc::new(MockTransport::default());
+    for index in 1..=2 {
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+                helper(index)
+            ),
+            json_status("pending"),
+        );
+    }
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        http_status(400),
+    );
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(2)),
+        json_status("duplicate"),
+    );
+
+    let client = client_with(transport.clone());
+    let random = preserve_server_order;
+    let report = track_pending_shares(
+        &db,
+        &params(&configured, overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.resubmitted[0].server_url, helper(2));
+    assert_eq!(transport.call_count("/shares"), 2);
+    let stored = only_share(&db);
+    assert_eq!(stored.sent_to_urls, vec![helper(2)]);
+    assert!(stored.ambiguous_urls.is_empty());
+    assert!(stored.attempting_urls.is_empty());
+    assert_eq!(stored.submit_at, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_interrupted_attempt_retry_preserves_the_unknown_outcome() {
+    let configured = helpers(1);
+    let db = db_with_delivery(&[], &[], 1);
+    mark_interrupted_attempt(&db, &helper(1));
+    let share_id = share_id_of(&db);
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_get(
+        &format!(
+            "{}/shielded-vote/v1/share-status/{ROUND_ID}/{share_id}",
+            helper(1)
+        ),
+        json_status("pending"),
+    );
+    transport.queue_post(
+        &format!("{}/shielded-vote/v1/shares", helper(1)),
+        http_status(400),
+    );
+
+    let client = client_with(transport.clone());
+    let random = zero_bytes;
+    let report = track_pending_shares(
+        &db,
+        &params(&configured, overdue(), &random),
+        &client,
+        &never_cancel(),
+    )
+    .await
+    .unwrap();
+
+    assert!(report.resubmitted.is_empty());
+    assert!(report.ambiguous.is_empty());
+    assert_eq!(transport.call_count("/shares"), 1);
+    let stored = only_share(&db);
+    assert!(stored.sent_to_urls.is_empty());
+    assert!(stored.ambiguous_urls.is_empty());
+    assert_eq!(stored.attempting_urls, vec![helper(1)]);
 }
 
 #[tokio::test(start_paused = true)]

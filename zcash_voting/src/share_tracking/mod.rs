@@ -322,6 +322,17 @@ async fn track_pending_shares_with_elapsed(
             .filter(|url| configured_fleet.contains(url))
             .cloned()
             .collect::<Vec<_>>();
+        // Once a process has stopped, both explicit ambiguity and a leftover
+        // attempting marker mean the POST outcome is unknown. Keep their
+        // persisted states distinct, but give overdue duplicate-safe recovery
+        // one combined view so interrupted attempts are not mistaken for
+        // helpers that have never been tried.
+        let configured_recovery_outcome_unknown_urls = dedupe_preserving_order(
+            configured_outcome_unknown_urls
+                .iter()
+                .chain(&configured_interrupted_attempt_urls)
+                .cloned(),
+        );
         let mut delivery_state = share::ShareDeliveryState::from_url_lists(
             &configured_definite_acceptance_urls,
             &configured_outcome_unknown_urls,
@@ -406,7 +417,7 @@ async fn track_pending_shares_with_elapsed(
                         share: &share,
                         configured_urls,
                         definite_acceptance_urls: delivery_state.accepted_urls(),
-                        outcome_unknown_urls: delivery_state.outcome_unknown_urls(),
+                        outcome_unknown_urls: &configured_recovery_outcome_unknown_urls,
                         schedule,
                     },
                     &mut attempted_urls_this_pass,

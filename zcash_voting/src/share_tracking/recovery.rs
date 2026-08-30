@@ -37,6 +37,8 @@ pub(super) struct ResubmitRequest<'a> {
     /// The configured helper fleet, already canonicalized by the caller.
     pub(super) configured_urls: &'a [String],
     pub(super) definite_acceptance_urls: &'a [String],
+    /// Helpers whose earlier POST has no known outcome, including persisted
+    /// ambiguity and attempts interrupted before their outcome was recorded.
     pub(super) outcome_unknown_urls: &'a [String],
     pub(super) schedule: ResubmissionSchedule,
 }
@@ -64,7 +66,8 @@ impl ResubmissionSchedule {
 ///
 /// Untried helpers come first. Early replenishment uses only untried helpers
 /// because another POST to an accepted helper cannot add a placement, and it
-/// excludes outcome-unknown helpers. Genuinely overdue recovery is
+/// excludes outcome-unknown helpers. This includes attempts interrupted before
+/// their outcome could be recorded. Genuinely overdue recovery is
 /// liveness-critical, so after exhausting untried helpers it may re-POST each
 /// outcome-unknown helper once — its earlier POST may never have arrived, and
 /// helper-side duplicate detection makes the re-POST converge instead of
