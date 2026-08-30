@@ -255,22 +255,23 @@ cannot be recovered consistently.
 A new authenticated round-config version binds:
 
 - `recoverable-authority-v1` as the authority scheme;
-- `recoverable-v1` as the bundle policy; and
+- `recoverable-v1` as the bundle policy;
+- the canonical Zcash network and exact vote-chain ID; and
 - the Zcash snapshot height and block hash.
 
 The height tells wallets which snapshot to use. The hash ensures they use the
 same fork at that height. Construction and recovery require the wallet scan,
 tree state, and PIR snapshot metadata to match that authenticated pair.
 
-One round ID has one immutable authenticated payload. Changing the snapshot,
-scheme, policy, election key, or PIR parameters requires a new round ID.
+One round ID has one immutable authenticated payload. Changing the network,
+vote chain, snapshot, scheme, policy, election key, or PIR parameters requires
+a new round ID.
 Existing authenticated rounds remain legacy `random-v0`; an older wallet that
 does not understand the new config simply does not join the new round.
 
-Because this round-config version does not sign the Zcash network or vote-chain
-ID, its trusted signing keys and configuration namespace are scoped to exactly
-one network and one vote chain. Reusing those keys across either boundary
-requires a later version that signs both identifiers.
+The wallet accepts the signed network and vote-chain identifiers only when they
+exactly match its independently selected connection context. Separate signing
+keys and configuration namespaces remain defense in depth.
 
 This is a client-configuration change, not a consensus or vote-action change.
 
@@ -390,7 +391,8 @@ Reviewers are being asked to approve these directions:
 3. root-derived bundle blindings for self-custodied funds while preserving the
    existing capability flow for funds in custody;
 4. a canonical, versioned snapshot bundle policy;
-5. authenticated round selection including the snapshot height and block hash;
+5. authenticated round selection including the Zcash network, vote-chain ID,
+   snapshot height, and block hash;
 6. recovery by validated VAN transition traversal rather than saved transaction
    history;
 7. reuse of the existing helper tracker for votes awaiting helper completion;
