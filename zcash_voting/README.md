@@ -56,8 +56,12 @@ precompute → delegate → vote → share lifecycle:
    planner output: after restart, reuse the original full plan set for that
    vote rather than replanning only missing shares. Replanning a subset loses
    commitment-wide balancing and quota context and can exceed the initial
-   per-helper quota. The crate reconstructs each wire payload with the durable
-   confirmed VC position and journals every delivery attempt before dispatch.
+   per-helper quota. Pass the complete current helper fleet when submitting;
+   reject the stored plan before any POST if a planned target was removed or
+   the fleet now requires a different target count. Compatible fleet changes
+   may continue without replanning. The crate reconstructs each wire payload
+   with the durable confirmed VC position and journals every delivery attempt
+   before dispatch.
    `track_pending_shares`
    polls the complete current fleet and requires two distinct confirmations
    when at least two helpers are configured; a one-helper fleet uses its only

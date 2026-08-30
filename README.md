@@ -86,12 +86,14 @@ stage-oriented API:
   `batch_json` once, persist the shared tx hash with
   `vote::record_batch_submission`, and record its ordered event with
   `confirmation::confirm_vote_batch_submission`. After confirmation, call
-  `vote::CommittedVote::recover`, plan the recovered vote's helper shares, and
-  call its typed `submit_share_to_helpers` method. The crate rebuilds
-  each payload with the confirmed VC position and journals delivery before
-  dispatch. Re-run the planner because later work may depend on on-chain
-  confirmations. `open_proposals` contains only proposals with no
-  terminal decision yet.
+  `vote::CommittedVote::recover`. Create and persist its complete helper-share
+  plan set if none exists, then call its typed `submit_share_to_helpers` method
+  with each stored plan and the complete current helper fleet. The crate
+  rebuilds each payload with the confirmed VC position and journals delivery
+  before dispatch. After restart, reuse the original complete helper plan;
+  never replan only the missing shares. Re-run `resume_plan` after each durable
+  action because later work may depend on on-chain confirmations.
+  `open_proposals` contains only proposals with no terminal decision yet.
 
 The Zcash-format transaction signed during delegation is specified separately
 in [Delegation signing transaction (TX1)](docs/delegation-signing-transaction.md).

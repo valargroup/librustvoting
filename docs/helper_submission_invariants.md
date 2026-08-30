@@ -683,15 +683,18 @@ the ambiguous, non-transient 501 boundary.
 ## Initial fan-out invariants
 
 `CommittedVote::submit_share_to_helpers` accepts only a committed share index,
-a planner-produced `ShareSubmissionPlan`, the complete configured fleet, and
-the current health-ordering time. It derives the round, bundle, proposal,
-payload, confirmed VC-tree position, target, and schedule from the committed
-vote and durable confirmation state. It rejects an empty, duplicated, or
-noncanonical fleet, a plan that does not exactly match that fleet, a missing
-confirmed VC position, or a committed handle whose vote commitment no longer
-matches the current durable recovery bundle before touching storage or the
-network. The raw journaled submission routine is crate-private, and there is
-no public post-hoc delivery mutator.
+a planner-produced `ShareSubmissionPlan`, the complete current configured
+fleet, and the current health-ordering time. It derives the round, bundle,
+proposal, payload, confirmed VC-tree position, target, and schedule from the
+committed vote and durable confirmation state. It rejects an empty, duplicated,
+or noncanonical fleet, a plan whose target count or targets are not valid for
+that current fleet, a missing confirmed VC position, or a committed handle
+whose vote commitment no longer matches the current durable recovery bundle
+before touching storage or the network. At the wallet host boundary, a
+planning-time fleet change is compatible only while every stored plan remains
+valid against the current fleet; removed planned targets and target-count drift
+are rejected rather than remapped or replanned. The raw journaled submission
+routine is crate-private, and there is no public post-hoc delivery mutator.
 
 The `test-fixtures` feature exposes hidden `share::record` and
 `share::record_delivery_fixture` seed helpers for external integration tests.
@@ -773,6 +776,12 @@ provided by
 `committed_vote_submission_rejects_mismatched_plan_before_side_effects`, and
 `invalid_candidate_url_does_not_create_a_share_record`. Cleanup concurrency is
 covered by `initial_delivery_does_not_recreate_share_after_recovery_cleanup`.
+The wallet example validates the complete stored plan set before entering its
+submission loop; `helper_submission_allows_compatible_current_fleet_churn`,
+`helper_submission_rejects_a_removed_planned_target`,
+`helper_submission_rejects_current_fleet_target_drift`, and
+`helper_submission_validates_every_plan_before_delivery` cover its current-
+fleet boundary.
 
 ## Confirmation and health invariants
 
@@ -1206,10 +1215,13 @@ host wallet:
    timing and ordering input. `os_random_bytes` is provided for Rust hosts.
 4. **Lifecycle.** The host owns the timer, app-lock and round-expiry behavior,
    invokes `track_pending_shares`, and supplies cancellation.
-5. **Initial identity.** The host MUST retain the `CommittedVote`, pass the
-   exact planner-produced plan and complete configured fleet, and call its
-   typed `submit_share_to_helpers` method. The crate derives the durable
-   identity and wire payload and journals every POST before dispatch.
+5. **Initial identity.** The host MUST retain the `CommittedVote`, persist the
+   complete original plan set before the first helper POST, pass each exact
+   planner-produced plan with the complete current configured fleet, and call
+   its typed `submit_share_to_helpers` method. The host MUST reject a stored
+   plan whose target count or target membership is no longer valid for the
+   current fleet rather than replanning missing shares. The crate derives the
+   durable identity and wire payload and journals every POST before dispatch.
 6. **Helper-operator trust.** The protocol assumes that the authority supplying
    the wallet's helper configuration is trusted to choose independent operators
    and govern changes. URLs are endpoint identities, not authenticated operator

@@ -3,12 +3,14 @@ use serde::{Deserialize, Serialize};
 use zcash_voting::prelude::{
     canonical_helper_url_list, commit_atomic_vote_batch, commit_batch, os_random_bytes,
     sync_vote_tree, track_pending_shares, van_witness, CommittedVote, DraftVote, HelperClient,
-    NoopProgressReporter, SharePayload, SharePlan, ShareSubmissionReport, ShareSubmissionRequest,
+    NoopProgressReporter, SharePlan, ShareSubmissionReport, ShareSubmissionRequest,
     ShareTimingPolicy, ShareTrackingParams, ShareTrackingReport, SignedVoteBatch,
     SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteSigner, VoteSubmission, VotingDb,
     VotingHotkey,
 };
-use zcash_voting::share::policy::{plan_share_submissions, share_submission_random_bytes_required};
+use zcash_voting::share::policy::{
+    plan_share_submissions, share_submission_random_bytes_required, share_submission_target_count,
+};
 
 /// Inputs for deriving a Merkle witness for one confirmed delegation bundle.
 ///
@@ -61,6 +63,8 @@ pub struct WalletAtomicVoteBatchRequest<'a> {
 /// same commitment-wide balancing and quota context.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletHelperSharePlan {
+    /// Canonical planning-time fleet retained as historical plan context.
+    /// Submission separately validates the wallet's current configured fleet.
     pub configured_server_urls: Vec<String>,
     pub share_plans: Vec<SharePlan>,
 }
@@ -78,6 +82,17 @@ pub struct WalletHelperSharePlanningRequest<'a> {
     pub single_share: bool,
     /// Position in this committed vote's share payloads, not a domain share ID.
     pub immediate_share_index: Option<u32>,
+}
+
+/// Inputs for submitting a persisted complete helper-share plan.
+pub struct WalletHelperShareSubmissionRequest<'a> {
+    /// The original complete plan set persisted before the first helper POST.
+    pub persisted_plan: &'a WalletHelperSharePlan,
+    /// Complete current helper fleet. It may differ from the planning fleet,
+    /// but every stored plan must remain valid against it.
+    pub configured_server_urls: &'a [String],
+    /// Current Unix time used only for process-local helper health ordering.
+    pub now_seconds: u64,
 }
 
 /// One durably journaled initial helper-share delivery result.
@@ -100,12 +115,6 @@ pub struct WalletShareTrackingRequest<'a> {
 pub struct WalletVoteExecutionRequest<'a> {
     pub vote_tx_hash: &'a str,
     pub vc_tree_position: u64,
-}
-
-/// Chain and helper-server payloads derived from a committed vote.
-pub struct WalletVoteExecutionPayload<'a> {
-    pub submission: VoteSubmission,
-    pub share_payloads: &'a [SharePayload],
 }
 
 /// Derives the VAN witness needed to commit votes for one bundle.
@@ -210,27 +219,25 @@ pub fn commit_atomic_vote_bundle_batch(
     .context("commit atomic cast-vote batch")
 }
 
-/// Returns the payloads the caller should submit to external services.
+/// Returns the cast-vote payload the caller should submit to the vote chain.
 ///
-/// Submit `submission` to the vote chain and each `share_payloads` item to the
-/// selected helper server(s). Network requests remain caller-owned; the wallet
-/// library only reconstructs the persisted payload fields.
-pub fn committed_vote_payloads<'a>(
+/// Helper shares must be planned with [`plan_committed_vote_shares`] and sent
+/// through [`submit_committed_vote_shares`] so every attempt is journaled
+/// before dispatch.
+pub fn committed_vote_submission(
     voting_db: &VotingDb,
-    committed: &'a CommittedVote,
-) -> Result<WalletVoteExecutionPayload<'a>> {
-    Ok(WalletVoteExecutionPayload {
-        submission: committed
-            .submission(voting_db)
-            .context("build vote submission")?,
-        share_payloads: committed.share_payloads(),
-    })
+    committed: &CommittedVote,
+) -> Result<VoteSubmission> {
+    committed
+        .submission(voting_db)
+        .context("build vote submission")
 }
 
 /// Returns a single wallet-facing aggregate for external API boundaries.
 ///
-/// This includes chain submission fields, helper-share payloads, and the stored
-/// recovery JSON in one typed object.
+/// This includes chain fields, helper-share data, and stored recovery JSON in
+/// one typed object. Do not POST its raw helper payloads; use
+/// [`submit_committed_vote_shares`] for durable delivery.
 pub fn committed_vote_signed_commitment(
     voting_db: &VotingDb,
     committed: &CommittedVote,
@@ -282,6 +289,9 @@ pub fn plan_committed_vote_shares(
 }
 
 fn canonical_distinct_helper_urls(configured_server_urls: &[String]) -> Result<Vec<String>> {
+    if configured_server_urls.is_empty() {
+        bail!("configured helper URLs must not be empty");
+    }
     let canonical =
         canonical_helper_url_list(configured_server_urls).context("validate helper URLs")?;
     if canonical.len() != configured_server_urls.len() {
@@ -295,24 +305,24 @@ fn canonical_distinct_helper_urls(configured_server_urls: &[String]) -> Result<V
 /// `client` is caller-owned so a wallet can enforce its Tor or proxy route.
 /// Each returned report describes state already persisted by
 /// `CommittedVote::submit_share_to_helpers`; do not record it a second time.
+/// The complete plan set is validated against the current fleet before any
+/// share is journaled or sent.
 pub async fn submit_committed_vote_shares(
     voting_db: &VotingDb,
     committed: &CommittedVote,
     client: &HelperClient,
-    persisted_plan: &WalletHelperSharePlan,
-    now_seconds: u64,
+    request: WalletHelperShareSubmissionRequest<'_>,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<Vec<WalletShareDelivery>> {
     let share_count = committed.share_payloads().len();
-    if persisted_plan.share_plans.len() != share_count {
-        bail!(
-            "persisted helper-share plan count {} does not match committed share count {share_count}",
-            persisted_plan.share_plans.len()
-        );
-    }
+    let configured_server_urls = validate_helper_submission_plan(
+        request.persisted_plan,
+        request.configured_server_urls,
+        share_count,
+    )?;
 
     let mut deliveries = Vec::with_capacity(share_count);
-    for (share_index, plan) in persisted_plan.share_plans.iter().enumerate() {
+    for (share_index, plan) in request.persisted_plan.share_plans.iter().enumerate() {
         if cancel() {
             break;
         }
@@ -324,8 +334,8 @@ pub async fn submit_committed_vote_shares(
                 ShareSubmissionRequest {
                     share_index,
                     plan,
-                    configured_server_urls: &persisted_plan.configured_server_urls,
-                    now_seconds,
+                    configured_server_urls: &configured_server_urls,
+                    now_seconds: request.now_seconds,
                 },
                 cancel,
             )
@@ -338,6 +348,46 @@ pub async fn submit_committed_vote_shares(
     }
 
     Ok(deliveries)
+}
+
+fn validate_helper_submission_plan(
+    persisted_plan: &WalletHelperSharePlan,
+    configured_server_urls: &[String],
+    share_count: usize,
+) -> Result<Vec<String>> {
+    if persisted_plan.share_plans.len() != share_count {
+        bail!(
+            "persisted helper-share plan count {} does not match committed share count {share_count}",
+            persisted_plan.share_plans.len()
+        );
+    }
+
+    let configured_server_urls = canonical_distinct_helper_urls(configured_server_urls)?;
+    let expected_target = share_submission_target_count(configured_server_urls.len());
+    for (share_index, plan) in persisted_plan.share_plans.iter().enumerate() {
+        let planned = canonical_helper_url_list(&plan.target_servers)
+            .with_context(|| format!("validate helper-share plan {share_index}"))?;
+        if planned.len() != plan.target_servers.len() {
+            bail!("helper-share plan {share_index} contains duplicate canonical targets");
+        }
+        let planned_target = usize::try_from(plan.target_count)
+            .context("helper-share plan target count exceeds usize")?;
+        if planned_target != expected_target || planned.len() != planned_target {
+            bail!(
+                "helper-share plan {share_index} target count and target list must match current fleet target {expected_target}"
+            );
+        }
+        if let Some(server_url) = planned
+            .iter()
+            .find(|server_url| !configured_server_urls.contains(server_url))
+        {
+            bail!(
+                "helper-share plan {share_index} targets helper removed from current configuration: {server_url}"
+            );
+        }
+    }
+
+    Ok(configured_server_urls)
 }
 
 /// Runs one crate-owned confirmation and recovery pass.
@@ -385,7 +435,26 @@ pub fn record_committed_vote_execution(
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_distinct_helper_urls;
+    use super::{
+        canonical_distinct_helper_urls, validate_helper_submission_plan, WalletHelperSharePlan,
+    };
+    use zcash_voting::prelude::SharePlan;
+
+    fn helper(index: u32) -> String {
+        format!("https://helper-{index}.example")
+    }
+
+    fn persisted_plan(target_servers: &[u32], target_count: u32) -> WalletHelperSharePlan {
+        WalletHelperSharePlan {
+            configured_server_urls: (1..=3).map(helper).collect(),
+            share_plans: vec![SharePlan {
+                immediate: false,
+                submit_at: 1_000,
+                target_count,
+                target_servers: target_servers.iter().copied().map(helper).collect(),
+            }],
+        }
+    }
 
     #[test]
     fn helper_planning_rejects_exact_and_canonical_duplicates() {
@@ -417,5 +486,83 @@ mod tests {
                 "https://two.example/base".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn helper_submission_allows_compatible_current_fleet_churn() {
+        let plan = persisted_plan(&[1, 2], 2);
+
+        for current in [
+            vec![helper(1), helper(2), helper(3)],
+            vec![helper(1), helper(2), helper(3), helper(4)],
+        ] {
+            assert_eq!(
+                validate_helper_submission_plan(&plan, &current, 1).unwrap(),
+                current
+            );
+        }
+    }
+
+    #[test]
+    fn helper_submission_canonicalizes_the_current_fleet() {
+        let plan = persisted_plan(&[1, 2], 2);
+        let current = vec![
+            "HTTPS://HELPER-1.EXAMPLE:443/".to_string(),
+            helper(2),
+            helper(3),
+        ];
+
+        assert_eq!(
+            validate_helper_submission_plan(&plan, &current, 1).unwrap(),
+            vec![helper(1), helper(2), helper(3)]
+        );
+    }
+
+    #[test]
+    fn helper_submission_rejects_a_removed_planned_target() {
+        let plan = persisted_plan(&[1, 3], 2);
+        let current = vec![helper(1), helper(2), helper(4)];
+
+        assert!(validate_helper_submission_plan(&plan, &current, 1).is_err());
+    }
+
+    #[test]
+    fn helper_submission_rejects_current_fleet_target_drift() {
+        let plan = persisted_plan(&[1, 2], 2);
+        let current = (1..=5).map(helper).collect::<Vec<_>>();
+
+        assert!(validate_helper_submission_plan(&plan, &current, 1).is_err());
+    }
+
+    #[test]
+    fn helper_submission_rejects_invalid_current_fleets() {
+        let plan = persisted_plan(&[1, 2], 2);
+
+        for current in [
+            vec![],
+            vec![helper(1), helper(1)],
+            vec!["not a helper URL".to_string()],
+            vec![
+                "https://helper.example:443/".to_string(),
+                "https://HELPER.example".to_string(),
+            ],
+        ] {
+            assert!(validate_helper_submission_plan(&plan, &current, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn helper_submission_validates_every_plan_before_delivery() {
+        let mut plan = persisted_plan(&[1, 2], 2);
+        plan.share_plans.push(SharePlan {
+            immediate: false,
+            submit_at: 2_000,
+            target_count: 2,
+            target_servers: vec![helper(1), helper(4)],
+        });
+        let current = vec![helper(1), helper(2), helper(3)];
+
+        assert!(validate_helper_submission_plan(&plan, &current, 2).is_err());
+        assert!(validate_helper_submission_plan(&plan, &current, 1).is_err());
     }
 }

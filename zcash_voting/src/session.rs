@@ -204,9 +204,11 @@ pub enum NextStep {
     /// fields to the vote chain, persist the cast-vote tx hash with
     /// `vote::record_submission` while polling, then call
     /// `confirmation::confirm_vote_submission` after the transaction confirms.
-    /// Call `vote::recover_commit` again after confirmation before submitting
-    /// helper-share payloads, so they carry the confirmed vote commitment tree
-    /// position.
+    /// After confirmation, recover the `CommittedVote`, create and persist its
+    /// complete helper-share plan if none exists, and submit through
+    /// `CommittedVote::submit_share_to_helpers` with the current helper fleet.
+    /// The typed method rebuilds payloads with the confirmed commitment-tree
+    /// position and journals each POST before dispatch.
     SubmitVote {
         bundle_index: u32,
         proposal_id: u32,

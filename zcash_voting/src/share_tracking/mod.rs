@@ -222,10 +222,13 @@ pub struct ShareSubmissionRequest<'a> {
     pub share_index: u32,
     /// Plan returned by the helper-share planner for this payload.
     pub plan: &'a ShareSubmissionPlan,
-    /// Complete helper fleet used to create `plan`.
+    /// Complete current helper fleet at delivery time.
     ///
     /// The fleet must be nonempty, canonicalizable, and canonically distinct;
-    /// every planned target must belong to it.
+    /// every planned target must belong to it and the plan's target count must
+    /// match the policy target derived from its size. It may differ from the
+    /// planning-time fleet only when the stored plan remains valid under those
+    /// rules.
     pub configured_server_urls: &'a [String],
     /// Current Unix time used only for process-local helper health ordering.
     pub now_seconds: u64,
