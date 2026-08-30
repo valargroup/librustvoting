@@ -3,15 +3,24 @@
 ## Status
 
 This document is a proposal for review. It does not describe behavior that is
-implemented today.
+implemented today. The review goal is to approve the authority model,
+derivation boundaries, backup contract, recovery behavior, batching
+compatibility, and migration boundary before code is written. Deterministic
+Keystone hotkey derivation is explicitly outside this version. The version 1
+Keystone path uses the firmware and transaction-signing flow that exist today.
 
-The review goal is to approve the authority model, derivation boundaries,
-backup contract, recovery behavior, batching compatibility, and migration
-boundary before code is written.
+## TL;DR
 
-Deterministic Keystone hotkey derivation is explicitly outside this version.
-The version 1 Keystone path uses the firmware and transaction-signing flow that
-exist today.
+For each account and voting round, the wallet creates one voting-authority
+root: software wallets derive it from their seed, while current Keystone
+wallets generate and securely back it up without requiring firmware changes.
+`zcash_voting` then uses one standardized recipe to derive the voting hotkey
+and a separate VAN blinding for every canonical delegation bundle. The signed
+round configuration tells wallets when to use this recoverable scheme. After
+data loss, the wallet restores the root, rebuilds the same bundles, derives the
+possible VAN states, and finds the latest one in the validated vote tree,
+allowing voting to continue after partial delegation or singleton and atomic
+votes. Existing rounds retain their current random-secret behavior unchanged.
 
 ## Executive summary
 
