@@ -149,7 +149,7 @@ requiring the controller's bundle secrets to become root-derived.
 - Recover confirmed partial delegation from VAN commitments rather than exact
   transaction bytes.
 - Recover the latest confirmed VAN state after singleton or atomic voting
-  without requiring transaction history.
+  without requiring the wallet's prior transaction history.
 - Work unchanged with atomic vote batches and Keystone PCZT batch signing.
 - Version every persisted derivation artifact so legacy random rounds continue
   to work without reinterpretation.
@@ -862,40 +862,54 @@ atomically, but it does not merge their identities or create a batch-wide
    target and round against the recovered hotkey, and import its bundle indices,
    weights, blindings, and transaction hashes.
 4. Reconstruct each initial VAN from the recovered hotkey and bundle material.
-5. Sync and root-validate the vote-commitment tree against authenticated current
-   vote-chain state.
-6. Derive the VAN for every mask obtainable by clearing a subset of the
-   round's proposal bits and locate matching commitments in the tree.
-7. In increasing leaf-position order, require each match's set bits to be a
-   strict subset of the previous match's set bits, then select the unique match
-   with the most consumed proposal bits.
+5. Sync and root-validate the vote-commitment tree and the complete confirmed
+   cast-vote transition index through the same authenticated chain height.
+6. Locate the unique initial VAN in the validated tree and record its leaf
+   position.
+7. Starting from that VAN and its initial mask, derive its spend nullifier and
+   look it up in the transition index.
+8. If no confirmed transition consumes the nullifier, the current VAN and
+   position have been found. Otherwise validate the singleton or ordered atomic
+   batch, derive its successor mask and VAN, require the final commitment at the
+   reported leaf position in the validated tree, and repeat.
 
-The current circuit has 15 usable proposal bits, so this search has at most
-`2^15` candidates per bundle. The initial mask is `0xFFFF`. Bit 0 remains set;
-bits 1 through 15 identify unused proposals. A singleton appends each successor
-VAN. An atomic batch appends only its final VAN, but that commitment still
-contains the final mask, which is all recovery needs to continue voting.
+The transition index is built from every confirmed `cast_vote` and
+`cast_vote_batch` action for the round. It may come from a complete verified
+block scan or an index that proves both inclusion and absence against
+authenticated chain state. A best-effort transaction search is not sufficient:
+absence is used only when completeness through the selected height is known.
+Each record exposes the consumed VAN nullifier, ordered proposal IDs, action
+nullifiers and successor commitments, and final VAN leaf position.
 
-The selected match provides the current VAN position and proposal-authority
-mask. For a bundle known to have a confirmed delegation, no match, incomparable
-matches, multiple terminal matches, or any tree mismatch fail closed. A bundle
-with no matches may continue direct delegation only after ordinary transaction
+Validation recomputes every native authority transition from the recovered
+hotkey, bundle material, and current mask. It requires the first nullifier to
+consume the current VAN, every proposal bit to be available and used once, all
+ordered action nullifiers and successor commitments to match, and the final VAN
+to occupy the reported tree leaf. A duplicate consumer, malformed batch,
+unexpected proposal transition, missing final leaf, or index/tree height
+mismatch fails closed. An atomic batch contributes several transitions but only
+one final tree leaf.
+
+The initial mask is `0xFFFF`. Bit 0 remains set, while bits 1 through 15 identify
+unused proposals. Recovery therefore performs at most 15 native transitions and
+index lookups per bundle instead of enumerating `2^15` masks. At the existing
+4,096-bundle capability limit, the aggregate bound is 61,440 transitions. The
+index can be loaded once and shared across all bundles.
+
+The final record provides the current VAN position and proposal-authority mask.
+For a bundle known to have a confirmed delegation, a missing initial VAN,
+ambiguous transition, or validation failure stops recovery. A bundle with no
+initial VAN may continue direct delegation only after ordinary transaction
 reconciliation establishes that it was never confirmed and its source notes
 remain usable. An imported custody bundle remains under the controller's
 existing signed-transaction reconciliation and redelivery flow; the voter does
 not rebuild the controller's delegation.
 
-Transaction history can improve status and diagnostics, but it is not a
-recovery requirement. A stale vote built from an earlier VAN is rejected by the
-chain as a spent nullifier; recovery should find the current VAN instead of
-using submission as a probe. If a future circuit expands the authority mask
-enough to make enumeration impractical, a targeted nullifier-to-successor query
-can replace the search without changing authority derivation.
-
-Root validation proves the integrity of the tree at the selected chain state,
-not that a data source supplied the current state. A stale or withholding source
-therefore stops recovery instead of making absence evidence that a VAN is
-unused.
+This requires complete public round transition data, not the wallet's prior
+transaction database or ballot choices. A stale vote built from an earlier VAN
+is rejected by the chain as a spent nullifier; recovery finds the current VAN
+instead of using submission as a probe. A stale or withholding chain source
+stops recovery rather than making absence evidence that a VAN is unused.
 
 Version 1 does not reconstruct an earlier choice, helper-delivery state, atomic
 batch order, or exact unconfirmed transaction after the voting database is
@@ -976,7 +990,7 @@ capability format, or additional custody exchange changes in version 1.
 - hotkey, local bundle-ID, and VAN-blinding derivation;
 - canonical validation and recovery of imported custody capabilities;
 - the recoverable bundle policy and round-auth version 3 verification;
-- legacy migration and current-VAN tree recovery; and
+- legacy migration and bounded nullifier-to-successor VAN recovery; and
 - atomic-batch rules, public vectors, and integration fixtures.
 
 ### Software-wallet integrations
