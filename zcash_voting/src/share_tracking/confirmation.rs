@@ -27,6 +27,22 @@ pub(super) enum ShareStatusOutcome {
     Cancelled,
 }
 
+fn record_completed_poll(
+    joined: Result<(String, Result<ShareStatus, HelperError>), tokio::task::JoinError>,
+    in_flight: &mut HashSet<String>,
+    confirmations: &mut usize,
+    required_confirmations: usize,
+) -> bool {
+    let Ok((server_url, outcome)) = joined else {
+        return false;
+    };
+    in_flight.remove(&server_url);
+    if matches!(outcome, Ok(ShareStatus::Confirmed)) {
+        *confirmations += 1;
+    }
+    *confirmations == required_confirmations
+}
+
 /// Polls helpers for the share's global on-chain confirmation state.
 ///
 /// At most [`SHARE_STATUS_MAX_CONCURRENT_POLLS`] requests run concurrently and
@@ -58,8 +74,20 @@ pub(super) async fn poll_share_helpers(
     let mut confirmations = 0usize;
 
     loop {
-        // A cancellation observed after the final completed request must not
-        // replace that request's definite result.
+        // Drain already-completed work before observing cancellation so a late
+        // cancellation cannot replace definite confirmation evidence.
+        while let Some(joined) = polls.try_join_next() {
+            if record_completed_poll(
+                joined,
+                &mut in_flight,
+                &mut confirmations,
+                required_confirmations,
+            ) {
+                task_cancelled.store(true, Ordering::Relaxed);
+                polls.abort_all();
+                return ShareStatusOutcome::ConfiguredHelperQuorumObserved;
+            }
+        }
         if polls.is_empty() && remaining.is_empty() {
             return ShareStatusOutcome::ConfiguredHelperQuorumNotObserved;
         }
@@ -105,37 +133,23 @@ pub(super) async fn poll_share_helpers(
         }
         let cancel_check = now + Duration::from_millis(SHARE_STATUS_CANCEL_CHECK_MILLISECONDS);
         let wait_deadline = deadline.min(cancel_check);
-        let joined = match tokio::time::timeout_at(wait_deadline, polls.join_next()).await {
-            Ok(joined) => joined,
-            Err(_) => continue,
+        let joined = tokio::select! {
+            biased;
+            joined = polls.join_next() => joined,
+            _ = tokio::time::sleep_until(wait_deadline) => continue,
         };
         let Some(joined) = joined else {
             continue;
         };
-        let Ok((server_url, outcome)) = joined else {
-            continue;
-        };
-        in_flight.remove(&server_url);
-        match outcome {
-            Ok(ShareStatus::Confirmed) => {
-                confirmations += 1;
-                if confirmations == required_confirmations {
-                    task_cancelled.store(true, Ordering::Relaxed);
-                    polls.abort_all();
-                    return ShareStatusOutcome::ConfiguredHelperQuorumObserved;
-                }
-            }
-            // The helper is alive but has not revealed yet. Keep walking.
-            Ok(ShareStatus::Pending) => {}
-            Err(HelperError::Cancelled) if cancel() => {
-                task_cancelled.store(true, Ordering::Relaxed);
-                polls.abort_all();
-                return ShareStatusOutcome::Cancelled;
-            }
-            Err(HelperError::Cancelled) => {}
-            // Any transport, HTTP, or out-of-protocol failure was already
-            // scored by the client.
-            Err(_) => continue,
+        if record_completed_poll(
+            joined,
+            &mut in_flight,
+            &mut confirmations,
+            required_confirmations,
+        ) {
+            task_cancelled.store(true, Ordering::Relaxed);
+            polls.abort_all();
+            return ShareStatusOutcome::ConfiguredHelperQuorumObserved;
         }
     }
 }

@@ -180,6 +180,39 @@ async fn cancellation_aborts_bounded_in_flight_status_polls() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn late_cancellation_does_not_replace_final_confirmation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let round_id = field_hex(1);
+    let share_id = "cd".repeat(32);
+    let transport = Arc::new(MockTransport::default());
+    for index in 1..=2 {
+        transport.queue_get(
+            &format!(
+                "{}/shielded-vote/v1/share-status/{round_id}/{share_id}",
+                helper(index)
+            ),
+            json_status("confirmed"),
+        );
+    }
+    let cancel_checks = AtomicUsize::new(0);
+    let cancel_after_first_join = || cancel_checks.fetch_add(1, Ordering::Relaxed) > 0;
+
+    let client = client_with(transport);
+    let outcome = poll_share_helpers(
+        &client,
+        &round_id,
+        &share_id,
+        &helpers(2),
+        1_000,
+        &cancel_after_first_join,
+    )
+    .await;
+
+    assert_eq!(outcome, ShareStatusOutcome::ConfiguredHelperQuorumObserved);
+}
+
+#[tokio::test(start_paused = true)]
 async fn late_cancellation_does_not_replace_final_failed_poll() {
     let round_id = field_hex(1);
     let share_id = "cd".repeat(32);
