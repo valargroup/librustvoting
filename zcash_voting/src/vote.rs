@@ -373,6 +373,9 @@ impl CommittedVote {
     /// The complete plan and every helper payload are validated before the
     /// first POST. A process-wide semaphore enforces the SDK's exported helper
     /// concurrency policy across simultaneous wallets and committed votes.
+    /// This handle must match the exact durable recovery snapshot; recover a
+    /// fresh `CommittedVote` after confirmation synchronizes a pre-confirmation
+    /// plan to its confirmed VC tree position.
     pub async fn submit_prepared_shares(
         &self,
         db: &VotingDb,

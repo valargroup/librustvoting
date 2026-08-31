@@ -58,13 +58,14 @@ precompute → delegate → vote → share lifecycle:
    aggregate quota, and atomically persists the complete generation-bound plan
    before any POST. Planning may occur before confirmation; the confirmation transaction
    advances an exactly matching plan snapshot when it fills the VC tree
-   position. The same call after restart returns that stored plan. Once the vote
-   is confirmed, call `CommittedVote::submit_prepared_shares` with the complete
-   current configured fleet. The SDK validates the plan and every payload
-   before network I/O, enforces the process-wide 16-POST ceiling, reconstructs
-   each wire payload with the durable confirmed VC position, and journals every
-   attempt before dispatch. Removed targets and target-count drift fail instead
-   of being remapped or replanned.
+   position. The same call after restart returns that stored plan. Once the
+   vote is confirmed, recover a fresh `CommittedVote`, then call
+   `CommittedVote::submit_prepared_shares` with the complete current configured
+   fleet. The SDK validates the plan and every payload before network I/O,
+   enforces the process-wide 16-POST ceiling, reconstructs each wire payload
+   with the durable confirmed VC position, and journals every attempt before
+   dispatch. Removed targets and target-count drift fail instead of being
+   remapped or replanned.
    `track_pending_shares`
    polls the complete current fleet and requires two distinct confirmations
    when at least two helpers are configured; a one-helper fleet uses its only

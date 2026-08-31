@@ -55,6 +55,7 @@ fn reset_vote_to_preconfirmation(db: &VotingDb) {
 
 fn set_recovery_share_count(db: &VotingDb, share_count: usize) {
     let mut recovery = recovery_bundle_fixture();
+    recovery.single_share = share_count == 1;
     recovery.encrypted_shares = (0..share_count)
         .map(|index| EncryptedShare {
             c1: point_bytes(index as u64 * 2 + 1),
@@ -67,7 +68,7 @@ fn set_recovery_share_count(db: &VotingDb, share_count: usize) {
     recovery.share_blinds = (0..share_count)
         .map(|index| field_bytes(index as u8 + 1))
         .collect();
-    recovery.share_comms = (0..share_count)
+    recovery.share_comms = (0..crate::share_policy::VOTE_COMMITMENT_SHARE_COUNT)
         .map(|index| field_bytes(index as u8 + 20))
         .collect();
     let json = serialize_recovery(&recovery).unwrap();
@@ -186,7 +187,7 @@ fn seed_recoverable_vote_for_proposal(db: &VotingDb, proposal_id: u32, choice: u
 
 #[test]
 fn complete_plan_is_persisted_and_reused() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = helpers(3);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured[..2]).unwrap();
@@ -220,7 +221,7 @@ fn complete_plan_is_persisted_and_reused() {
 
 #[test]
 fn complete_roster_derives_exactly_one_round_immediate_share() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     seed_recoverable_vote_for_proposal(&db, 2, 1);
     let configured = helpers(3);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -274,7 +275,7 @@ fn skipped_lower_proposal_does_not_take_the_immediate_designation() {
 
 #[test]
 fn planning_rejects_incomplete_duplicate_and_omitting_rosters_before_persistence() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = helpers(3);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -365,7 +366,7 @@ fn preexisting_delivery_is_marked_legacy_best_effort() {
 
 #[test]
 fn changing_vote_generation_invalidates_the_plan() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = helpers(3);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -377,7 +378,7 @@ fn changing_vote_generation_invalidates_the_plan() {
         .execute(
             "UPDATE votes SET commitment_bundle_json = NULL
              WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0 AND proposal_id = 1",
-            rusqlite::params![ROUND_ID, WALLET_ID],
+            rusqlite::params![ROUND_ID, db.wallet_id()],
         )
         .unwrap();
 
@@ -392,7 +393,7 @@ fn changing_vote_generation_invalidates_the_plan() {
 
 #[test]
 fn stale_handle_cannot_prepare_same_commitment_replacement() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = helpers(3);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -415,7 +416,7 @@ fn stale_handle_cannot_prepare_same_commitment_replacement() {
 
 #[tokio::test]
 async fn stale_handle_cannot_submit_same_commitment_replacement_plan() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let stale_handle = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = helpers(3);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -449,7 +450,7 @@ async fn stale_handle_cannot_submit_same_commitment_replacement_plan() {
 async fn same_commitment_replacement_after_plan_load_stops_every_post() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = vec![helper(1)];
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -483,7 +484,7 @@ async fn same_commitment_replacement_after_plan_load_stops_every_post() {
 
 #[tokio::test]
 async fn delayed_immediate_plan_is_rejected_before_network() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = vec![helper(1)];
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -521,7 +522,8 @@ async fn prepared_batch_stays_bound_to_its_starting_wallet() {
 
     const OTHER_WALLET: &str = "other-prepared-batch-wallet";
 
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
+    let starting_wallet = db.wallet_id();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = vec![helper(1)];
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -530,7 +532,7 @@ async fn prepared_batch_stays_bound_to_its_starting_wallet() {
         .unwrap();
     db.set_wallet_id(OTHER_WALLET);
     seed_recoverable_vote_for_wallet(&db, OTHER_WALLET);
-    db.set_wallet_id(WALLET_ID);
+    db.set_wallet_id(&starting_wallet);
 
     let transport = Arc::new(MockTransport::default());
     queue_successes(&transport, &configured, 2);
@@ -555,7 +557,7 @@ async fn prepared_batch_stays_bound_to_its_starting_wallet() {
     assert_eq!(report.deliveries.len(), 2);
     assert_eq!(db.wallet_id(), OTHER_WALLET);
     assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
-    db.set_wallet_id(WALLET_ID);
+    db.set_wallet_id(&starting_wallet);
     assert_eq!(share::list(&db, ROUND_ID).unwrap().len(), 2);
     assert!(share::list(&db, ROUND_ID)
         .unwrap()
@@ -565,7 +567,7 @@ async fn prepared_batch_stays_bound_to_its_starting_wallet() {
 
 #[tokio::test]
 async fn preconfirmation_plan_survives_confirmation_restart_and_submission() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     reset_vote_to_preconfirmation(&db);
     let configured = helpers(3);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured[..2]).unwrap();
@@ -614,21 +616,20 @@ async fn preconfirmation_plan_survives_confirmation_restart_and_submission() {
 }
 
 #[tokio::test]
-async fn preconfirmation_handle_survives_verified_confirmation_transition() {
-    let db = db_with_recoverable_vote();
+async fn preconfirmation_handle_is_stale_after_confirmation_transition() {
+    let db = db_with_unique_recoverable_vote();
     reset_vote_to_preconfirmation(&db);
     let configured = vec![helper(1)];
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
     let committed_before = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
-    let prepared = committed_before
+    committed_before
         .prepare_share_delivery(&db, planning_params(&fleet))
         .unwrap();
 
     crate::vote::record_vc_position(&db, ROUND_ID, 0, 1, 456).unwrap();
 
     let transport = Arc::new(MockTransport::default());
-    queue_successes(&transport, &configured, prepared.share_plans.len());
-    let report = committed_before
+    let error = committed_before
         .submit_prepared_shares(
             &db,
             &client_with(transport.clone()),
@@ -636,20 +637,92 @@ async fn preconfirmation_handle_survives_verified_confirmation_transition() {
             &never_cancel(),
         )
         .await
+        .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(error
+        .to_string()
+        .contains("recover the current committed vote"));
+    assert!(transport.calls().is_empty());
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn untargeted_helper_replacement_invalidates_persisted_fleet_before_network() {
+    let db = db_with_unique_recoverable_vote();
+    set_recovery_share_count(&db, 1);
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let plan = committed
+        .prepare_share_delivery(&db, planning_params(&fleet))
+        .unwrap();
+    let untargeted = configured
+        .iter()
+        .find(|url| !plan.share_plans[0].target_servers.contains(url))
+        .unwrap();
+    let drifted = configured
+        .iter()
+        .map(|url| {
+            if url == untargeted {
+                helper(4)
+            } else {
+                url.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let transport = Arc::new(MockTransport::default());
+
+    let error = committed
+        .submit_prepared_shares(
+            &db,
+            &client_with(transport.clone()),
+            submission_params(&drifted),
+            &never_cancel(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(error.to_string().contains("persisted helper-share plan"));
+    assert!(transport.calls().is_empty());
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn fleet_reordering_preserves_persisted_fleet_identity() {
+    let db = db_with_unique_recoverable_vote();
+    set_recovery_share_count(&db, 1);
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let plan = committed
+        .prepare_share_delivery(&db, planning_params(&fleet))
+        .unwrap();
+    let reordered = configured.iter().rev().cloned().collect::<Vec<_>>();
+    let transport = Arc::new(MockTransport::default());
+    queue_successes(&transport, &configured, plan.share_plans.len());
+
+    let report = committed
+        .submit_prepared_shares(
+            &db,
+            &client_with(transport.clone()),
+            submission_params(&reordered),
+            &never_cancel(),
+        )
+        .await
         .unwrap();
 
-    assert_eq!(report.deliveries.len(), prepared.share_plans.len());
-    assert!(report.pending_share_indices.is_empty());
+    assert_eq!(report.deliveries.len(), 1);
     assert_eq!(
-        transport.posted_json(&format!("{}/shielded-vote/v1/shares", helper(1)))["tree_position"],
-        456
+        report.deliveries[0].submission.accepted_urls.len(),
+        plan.share_plans[0].target_count as usize
     );
-    assert_eq!(share::list(&db, ROUND_ID).unwrap().len(), 2);
 }
 
 #[tokio::test]
 async fn fleet_churn_and_target_drift_fail_before_network() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = helpers(3);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -689,7 +762,7 @@ async fn fleet_churn_and_target_drift_fail_before_network() {
 
 #[tokio::test]
 async fn one_helper_fleet_is_planned_and_submitted_by_the_sdk() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = vec![helper(1)];
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -722,7 +795,7 @@ async fn one_helper_fleet_is_planned_and_submitted_by_the_sdk() {
 
 #[tokio::test]
 async fn every_payload_is_validated_before_the_first_post() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let mut committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
     let configured = vec![helper(1)];
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
@@ -750,7 +823,7 @@ async fn every_payload_is_validated_before_the_first_post() {
 
 #[tokio::test]
 async fn restart_reuses_the_plan_and_resumes_definite_delivery_deficits() {
-    let db = db_with_recoverable_vote();
+    let db = db_with_unique_recoverable_vote();
     let configured = vec![helper(1)];
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
     let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
@@ -810,7 +883,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
     let configured = helpers(2);
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
 
-    let strict_db = db_with_recoverable_vote();
+    let strict_db = db_with_unique_recoverable_vote();
     set_recovery_share_count(&strict_db, 16);
     let strict = crate::vote::CommittedVote::recover(&strict_db, ROUND_ID, 0, 1).unwrap();
     let strict_plan = strict
@@ -840,7 +913,7 @@ async fn quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagate
     assert!(error.to_string().contains("initial maximum"));
     assert!(strict_transport.calls().is_empty());
 
-    let legacy_db = db_with_recoverable_vote();
+    let legacy_db = db_with_unique_recoverable_vote();
     set_recovery_share_count(&legacy_db, 16);
     share::record_delivery(
         &legacy_db,
@@ -904,10 +977,10 @@ async fn global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_share
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let _global_limit_guard = GLOBAL_BATCH_LIMIT_TEST_LOCK.lock().await;
-    let saturating_db = db_with_recoverable_vote();
+    let saturating_db = db_with_unique_recoverable_vote();
     set_recovery_share_count(&saturating_db, 16);
     let saturating = crate::vote::CommittedVote::recover(&saturating_db, ROUND_ID, 0, 1).unwrap();
-    let queued_db = db_with_recoverable_vote();
+    let queued_db = db_with_unique_recoverable_vote();
     let queued = crate::vote::CommittedVote::recover(&queued_db, ROUND_ID, 0, 1).unwrap();
     let configured = vec![helper(1)];
     let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();

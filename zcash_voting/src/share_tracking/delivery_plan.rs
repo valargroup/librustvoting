@@ -446,9 +446,9 @@ pub(crate) fn load_share_delivery_plan(
     payloads: &[SharePayload],
 ) -> Result<(ShareDeliveryPlan, String), VotingError> {
     let conn = db.conn();
-    let stored_vote: Option<(Option<String>, Option<i64>)> = conn
+    let commitment_bundle_json: String = conn
         .query_row(
-            "SELECT commitment_bundle_json, vc_tree_position FROM votes
+            "SELECT commitment_bundle_json FROM votes
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
             named_params! {
@@ -457,22 +457,17 @@ pub(crate) fn load_share_delivery_plan(
                 ":bundle_index": bundle_index as i64,
                 ":proposal_id": proposal_id as i64,
             },
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()
         .map_err(|e| VotingError::Internal {
             message: format!("load committed vote for helper-share submission failed: {e}"),
-        })?;
-    let (commitment_bundle_json, vc_tree_position) = stored_vote
-        .and_then(|(json, position)| json.map(|json| (json, position)))
+        })?
+        .flatten()
         .ok_or_else(|| VotingError::InvalidInput {
             message: "committed vote is missing durable helper recovery material".to_string(),
         })?;
-    validate_handle_generation(
-        handle_commitment_bundle_json,
-        &commitment_bundle_json,
-        vc_tree_position,
-    )?;
+    validate_handle_generation(handle_commitment_bundle_json, &commitment_bundle_json)?;
     let plan = load_plan_with_conn(
         &conn,
         round_id,
@@ -511,24 +506,11 @@ pub(crate) fn load_share_delivery_plan(
 fn validate_handle_generation(
     handle_commitment_bundle_json: &str,
     current_commitment_bundle_json: &str,
-    current_vc_tree_position: Option<i64>,
 ) -> Result<(), VotingError> {
     if handle_commitment_bundle_json == current_commitment_bundle_json {
         return Ok(());
     }
-
-    let confirmation_position = current_vc_tree_position
-        .and_then(|position| u64::try_from(position).ok())
-        .ok_or_else(stale_handle_error)?;
-    let mut handle_recovery = crate::vote::parse_recovery(handle_commitment_bundle_json)?;
-    if handle_recovery.vc_tree_position != 0 {
-        return Err(stale_handle_error());
-    }
-    handle_recovery.vc_tree_position = confirmation_position;
-    if crate::vote::serialize_recovery(&handle_recovery)? != current_commitment_bundle_json {
-        return Err(stale_handle_error());
-    }
-    Ok(())
+    Err(stale_handle_error())
 }
 
 fn stale_handle_error() -> VotingError {
@@ -627,6 +609,15 @@ pub(crate) fn validate_share_delivery_plan(
     if configured.is_empty() || configured.len() != configured_server_urls.len() {
         return Err(VotingError::InvalidInput {
             message: "configured helper fleet must be nonempty and canonically distinct"
+                .to_string(),
+        });
+    }
+    let planned_fleet = canonical_helper_url_list(&plan.configured_server_urls)?;
+    let same_fleet =
+        BTreeSet::from_iter(planned_fleet.iter()) == BTreeSet::from_iter(configured.iter());
+    if planned_fleet.len() != plan.configured_server_urls.len() || !same_fleet {
+        return Err(VotingError::InvalidInput {
+            message: "current helper fleet does not match the persisted helper-share plan"
                 .to_string(),
         });
     }

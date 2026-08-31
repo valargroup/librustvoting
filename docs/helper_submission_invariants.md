@@ -732,11 +732,11 @@ create a second or conflicting immediate designation.
 `CommittedVote::submit_prepared_shares` is the delivery boundary. It loads that
 plan, requires the plan's exact current committed-vote generation, binds the
 submitting handle to that generation, and requires a compatible complete
-current fleet. A handle must contain either the exact current recovery snapshot
-or its exact pre-confirmation predecessor, verified by replacing only the
-placeholder VC position with the durable confirmed position. It reconstructs
-and validates every payload before the first POST, then executes all incomplete
-shares. Removed targets, target-count drift, malformed payloads,
+current fleet. A handle must contain the exact current recovery snapshot, and
+callers must recover a fresh handle after confirmation changes that snapshot.
+It reconstructs and validates every payload before the first POST, then
+executes all incomplete shares. Configured-fleet drift, removed targets,
+target-count drift, malformed payloads,
 aggregate-quota violations, a nonzero schedule on the designated immediate
 share, or a missing confirmed VC position fail before network I/O. The raw
 per-share executor is
@@ -765,12 +765,13 @@ NOT be used to model wallet submission behavior.
 
 Complete-plan persistence and per-share preparation are both bound atomically
 to the exact commitment-bundle generation validated for the `CommittedVote`
-handle. Plan loading also validates the handle's stored generation, with only
-the verified confirmation-only VC-position transition accepted. A replacement
-that lands after an earlier recovery read, including one that preserves the
-vote commitment, invalidates the handle or plan and fails before any helper
-POST instead of combining old payload or placement data with the replacement
-generation.
+handle. Plan loading requires the handle's exact stored generation. The schema
+trigger advances the persisted plan through the confirmation-only VC-position
+transition, so a caller must recover a fresh `CommittedVote` before submitting.
+A replacement that lands after an earlier recovery read, including one that
+preserves the vote commitment, invalidates the handle or plan and fails before
+any helper POST instead of combining old payload or placement data with the
+replacement generation.
 
 After validation it creates or merges the durable share record. Persistence
 returns the effective write-once `submit_at`; resumed fan-out rebuilds the wire
@@ -847,8 +848,11 @@ are `stale_handle_cannot_prepare_same_commitment_replacement`,
 `prepared_batch_stays_bound_to_its_starting_wallet`,
 `complete_plan_is_persisted_and_reused`,
 `preconfirmation_plan_survives_confirmation_restart_and_submission`,
+`preconfirmation_handle_is_stale_after_confirmation_transition`,
 `restart_reuses_the_plan_and_resumes_definite_delivery_deficits`,
 `fleet_churn_and_target_drift_fail_before_network`,
+`untargeted_helper_replacement_invalidates_persisted_fleet_before_network`,
+`fleet_reordering_preserves_persisted_fleet_identity`,
 `one_helper_fleet_is_planned_and_submitted_by_the_sdk`,
 `every_payload_is_validated_before_the_first_post`,
 `quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagates`,
@@ -1251,10 +1255,10 @@ a plan only when it is bound to the exact OLD JSON and replacing only the
 JSON's `vc_tree_position` yields the exact NEW JSON. It then deletes any plan
 whose snapshot still differs. Singleton and atomic-batch confirmation perform
 this transition inside their existing transaction. Runtime loading requires
-the plan to match that exact new snapshot and accepts an older handle only when
-its stored JSON is the exact pre-confirmation predecessor verified against the
-durable VC position. Every other handle snapshot is stale, including a
-same-commitment recovery replacement.
+the plan and submitting handle to match that exact new snapshot. The
+pre-confirmation handle becomes stale and must be recovered again. Every other
+handle snapshot is also stale, including a same-commitment recovery
+replacement.
 
 The internal record keeps `attempting_urls` distinct. The compatibility wire
 view has no separate attempting field, so it merges those helpers into
@@ -1354,14 +1358,15 @@ host wallet:
    helper ordering. Hosts do not supply randomness to the planning lifecycle.
 4. **Lifecycle.** The host owns the timer, app-lock and round-expiry behavior,
    invokes `track_pending_shares`, and supplies cancellation.
-5. **Initial delivery invocation.** The host recovers or retains the
-   `CommittedVote`, obtains `HelperFleetPreflight` from the SDK, calls
+5. **Initial delivery invocation.** The host obtains `HelperFleetPreflight`
+   from the SDK, calls
    `prepare_share_delivery` with the complete proposal roster from the
-   authenticated round configuration, waits for chain confirmation when
-   necessary, then calls `submit_prepared_shares`. It supplies the complete
-   current configured fleet and cancellation signal. It does not select the
-   immediate share, serialize plans, select helpers, derive targets, expose
-   share payloads, filter missing shares, or replan after restart.
+   authenticated round configuration, and waits for chain confirmation when
+   necessary. It then recovers a fresh `CommittedVote` and calls
+   `submit_prepared_shares`. It supplies the complete current configured fleet
+   and cancellation signal. It does not select the immediate share, serialize
+   plans, select helpers, derive targets, expose share payloads, filter missing
+   shares, or replan after restart.
 6. **Helper-operator trust.** The protocol assumes that the authority supplying
    the wallet's helper configuration is trusted to choose independent operators
    and govern changes. URLs are endpoint identities, not authenticated operator

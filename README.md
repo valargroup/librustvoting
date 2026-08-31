@@ -92,7 +92,8 @@ stage-oriented API:
   `CommittedVote::prepare_share_delivery` with the complete proposal id roster
   from the authenticated round configuration. The SDK requires matching
   terminal ballot intents and derives the round's single immediate share while
-  atomically creating or reloading the complete plan. After vote confirmation, call
+  atomically creating or reloading the complete plan. After vote confirmation,
+  recover a fresh `CommittedVote`, then call
   `CommittedVote::submit_prepared_shares` with the complete current fleet. The
   crate validates every payload, rebuilds it with the confirmed VC position,
   and journals delivery before dispatch. After restart, prepare again to load

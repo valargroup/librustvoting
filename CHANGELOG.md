@@ -171,9 +171,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the exact old `commitment_bundle_json` snapshot to the exact confirmed
   snapshot. Vote replacement, recovery clearing, and unrelated recovery-data
   mutations continue to delete the plan. Runtime loading requires the plan's
-  exact current generation and accepts a submitting handle's older snapshot
-  only when the durable VC position verifies it as the exact pre-confirmation
-  predecessor.
+  exact current generation; callers recover a fresh `CommittedVote` after the
+  confirmation transition before submitting the synchronized plan.
+- Prepared-batch submission now binds persisted plans to the complete helper
+  fleet identity, rejecting even an untargeted helper replacement before
+  network I/O while accepting harmless reordering of the same canonical fleet.
 - Prepared-batch submission now validates the whole plan and every helper
   payload before the first network request, durably reserves each attempt
   before POST, preserves deterministic report ordering, reports queued shares

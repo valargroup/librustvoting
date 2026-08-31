@@ -254,7 +254,9 @@ pub fn prepare_committed_vote_shares(
 ///
 /// `client` is caller-owned so a wallet can enforce its Tor or proxy route.
 /// The SDK loads the original plan, validates all payloads before any POST, and
-/// enforces its process-wide helper concurrency limit.
+/// enforces its process-wide helper concurrency limit. If planning happened
+/// before confirmation, `committed` must be recovered again afterward so its
+/// generation exactly matches the confirmation-synchronized plan snapshot.
 pub async fn submit_committed_vote_shares(
     voting_db: &VotingDb,
     committed: &CommittedVote,
