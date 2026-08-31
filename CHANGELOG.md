@@ -200,10 +200,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   replacement share generation.
 
 ### Changed
-- Expanded the supported proposal-ID range from 1–15 to 1–50 while retaining
-  the independent 15-action atomic vote-batch limit and 16 encrypted shares
-  per vote commitment. This consumes the corresponding breaking circuit and
-  verification-key change.
+- Expanded the supported proposal-ID and atomic vote-batch ranges from 1–15 to
+  1–50 while retaining 16 encrypted shares per vote commitment. This consumes
+  the corresponding breaking circuit and verification-key change.
 
 ## v3.1.0-rc.13
 

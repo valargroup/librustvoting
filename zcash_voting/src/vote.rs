@@ -23,7 +23,7 @@ use crate::{
     types::{
         validate_proposal_id, validate_vote_decision, validate_vote_round_id_hex,
         CastVoteSignature, EncryptedShare, Network, ProgressReporter, SharePayload,
-        VoteCommitmentBundle, VotingError, VotingHotkey, WireEncryptedShare,
+        VoteCommitmentBundle, VotingError, VotingHotkey, WireEncryptedShare, MAX_PROPOSAL_ID,
     },
 };
 
@@ -34,7 +34,11 @@ pub const VAN_AUTH_PATH_LEN: usize = 24;
 pub const DEFAULT_BATCH_PROOF_CONCURRENCY: usize = 3;
 
 /// Protocol maximum for the number of actions in one atomic vote batch.
-pub const MAX_VOTE_BATCH_ACTIONS: usize = 15;
+pub const MAX_VOTE_BATCH_ACTIONS: usize = MAX_PROPOSAL_ID as usize;
+
+// Preserve the pre-50-action resource ceiling independently of the protocol
+// action limit. The default remains DEFAULT_BATCH_PROOF_CONCURRENCY.
+const MAX_BATCH_PROOF_CONCURRENCY: usize = 15;
 
 const VOTE_RECOVERY_FORMAT: &str = "zcash_voting_vote_recovery_v1";
 const VOTE_BATCH_RECOVERY_FORMAT: &str = "zcash_voting_vote_batch_recovery_v1";
@@ -796,7 +800,7 @@ pub fn prepare_atomic_vote_batch(
         batch.witness.anchor_height,
         &round_id_bytes,
         batch.stages,
-        batch.max_proof_concurrency.min(MAX_VOTE_BATCH_ACTIONS),
+        batch.max_proof_concurrency.min(MAX_BATCH_PROOF_CONCURRENCY),
         &proof_plans,
     )?;
 
@@ -3650,7 +3654,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         let error = validate_atomic_vote_batch(&drafts).unwrap_err();
-        assert!(error.to_string().contains("at most 15 actions"));
+        assert_eq!(MAX_VOTE_BATCH_ACTIONS, MAX_PROPOSAL_ID as usize);
+        assert!(error
+            .to_string()
+            .contains(&format!("at most {MAX_VOTE_BATCH_ACTIONS} actions")));
     }
 
     #[test]
