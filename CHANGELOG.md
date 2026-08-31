@@ -82,6 +82,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   POSTs across wallets and votes.
 
 ### Changed
+- Local voting-hotkey delegation now derives each bundle's VAN blinding from
+  the stored hotkey secret and exact round and bundle identity. Restoring that
+  secret and using `recoverable_bundle_policy_v1()` reconstructs the same VAN
+  after voting database loss without new authority-root or recovery tables.
 - Share confirmation polls now run at most four helper requests concurrently
   and spend at most ten seconds on one share before advancing, preventing a
   stalled helper set from starving later shares in the same tracking pass.

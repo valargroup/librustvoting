@@ -284,6 +284,29 @@ impl Default for BundlePolicy {
     }
 }
 
+// These values are independent of the mutable wallet defaults. Changing them
+// would alter bundle identities reconstructed after voting database loss.
+const RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE: usize = 5;
+const RECOVERABLE_V1_MAX_PRIVACY_BUNDLES: usize = 2;
+const RECOVERABLE_V1_PRIVACY_DROP_BPS: u32 = 100;
+const RECOVERABLE_V1_MAX_PRIVACY_DROP_ZATOSHI: u64 = 100_000_000_000;
+
+/// Exact bundle policy for reconstructing version 1 deterministic VANs.
+///
+/// Wallets that need delegation recovery after voting database loss should use
+/// this policy both when first preparing the round and when rebuilding it.
+pub fn recoverable_bundle_policy_v1() -> BundlePolicy {
+    BundlePolicy {
+        max_real_notes_per_bundle: RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE,
+        bundle_addition_threshold_zatoshi: None,
+        privacy_trim: Some(PrivacyTrimPolicy {
+            max_bundles: RECOVERABLE_V1_MAX_PRIVACY_BUNDLES,
+            drop_bps: RECOVERABLE_V1_PRIVACY_DROP_BPS,
+            max_drop_zatoshi: Some(RECOVERABLE_V1_MAX_PRIVACY_DROP_ZATOSHI),
+        }),
+    }
+}
+
 /// What the privacy trim removed from a bundle plan.
 ///
 /// Reported separately from the sub-ballot drop because the two mean different
@@ -659,6 +682,31 @@ mod tests {
             scope: 0,
             ufvk_str: String::new(),
         }
+    }
+
+    #[test]
+    fn recoverable_bundle_policy_v1_is_frozen() {
+        let policy = recoverable_bundle_policy_v1();
+
+        assert_eq!(policy.max_real_notes_per_bundle(), 5);
+        assert_eq!(policy.bundle_addition_threshold(), None);
+        assert_eq!(policy.max_privacy_bundles(), Some(2));
+        assert_eq!(policy.privacy_drop_bps(), 100);
+        assert_eq!(policy.max_privacy_drop_zatoshi(), Some(100_000_000_000));
+
+        let large_note_value = 990 * BALLOT_DIVISOR;
+        let tail_note_value = 20 * BALLOT_DIVISOR;
+        let notes = (0..10)
+            .map(|position| make_note(large_note_value, position))
+            .chain((10..15).map(|position| make_note(tail_note_value, position)))
+            .collect::<Vec<_>>();
+        let plan = canonical_note_bundle_plan_for_notes(&notes, policy).unwrap();
+
+        assert_eq!(plan.bundles.len(), 2);
+        assert_eq!(plan.eligible_weight, 9_900 * BALLOT_DIVISOR);
+        assert_eq!(plan.privacy_trim.dropped_bundles, 1);
+        assert_eq!(plan.privacy_trim.dropped_notes, 5);
+        assert_eq!(plan.privacy_trim.dropped_value, 100 * BALLOT_DIVISOR);
     }
 
     #[test]
