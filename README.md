@@ -50,6 +50,24 @@ stage-oriented API:
   delegation submissions, bounded by the smaller of 1% of selected note value
   and 1,000 ZEC by default. `PrivacyTrim` reports the raw note value excluded,
   not bundle-quantized voting weight.
+- `recoverable_authority::*` is the opt-in authority path for round-auth v3
+  rounds. It accepts a seed-free registered-key result or a backed-up Keystone
+  host master generation, binds the result to the exact account, network, vote
+  chain, round, and signed config payload, and derives the Orchard voting key
+  plus canonical self-custody bundle material. Wallets retain the authority
+  selection and secrets in authenticated, encrypted, rollback-protected state
+  outside `VotingDb`. Software integrations must freeze and retain their
+  allocated ZIP-32 registered application identifier; this crate does not
+  invent one. Recoverable v3 callers must keep the opaque verified-round token
+  returned by v3 config resolution. Its PIR path also requires exact endpoint
+  metadata containing the signed snapshot height, block hash, and layout. The
+  current height-only PIR `/root` metadata is insufficient; legacy round-auth
+  v2 PIR APIs are unchanged. Finalized-chain reconciliation verifies the
+  initial VAN and its native nullifier, then classifies each bundle as unspent,
+  terminally spent by one atomic ballot, or spent in an unsupported way. It
+  requires a caller integration that independently authenticates the finalized
+  checkpoint and proves the nullifier lookup complete through it. It does not
+  reconstruct a successor VAN or remaining proposal-authority mask.
 - `precompute::*` prepares shielded note witnesses, delegation PIR inputs, and VAN
   witnesses for vote proofs. `precompute_pir_proofs` warms PIR nullifier proofs in
   the background before any round or bundle exists (no hotkey needed), keyed by
@@ -67,6 +85,18 @@ stage-oriented API:
   hashes and tree positions atomically.
 - `vote::*` builds ZKP #2, signs cast-vote payloads, persists the canonical
   `VoteRecoveryBundle`, and reconstructs vote-chain submissions after a crash.
+- Recoverable-v1 rounds use the narrower
+  `recoverable_authority::commit_recoverable_complete_ballot_v1` path. The
+  signed proposal count defines IDs `1..=N`; every ID must first have a durable
+  `Choice` or `Skipped` intent. Each bundle then submits every `Choice` in one
+  ascending atomic batch, even when there is only one choice. Skipped proposals
+  are omitted. An all-skipped ballot creates no transaction and therefore has
+  no cross-device on-chain completion marker. Persisting the first bundle's
+  signed batch freezes the round's intents before the payload is returned;
+  later bundles must commit the identical complete ballot while that database
+  survives. After total local-state loss, the chain cannot reveal hidden choice
+  values, so the wallet must restore or reconfirm the original intents before
+  submitting an unspent bundle.
 - `share::*` recovers helper-share payloads, computes share nullifiers, and
   applies share scheduling policy. `CommittedVote::submit_share_to_helpers`
   owns journaled initial delivery, while `track_pending_shares` requires two
@@ -93,7 +123,9 @@ stage-oriented API:
   before dispatch. After restart, reuse the original complete helper plan;
   never replan only the missing shares. Re-run `resume_plan` after each durable
   action because later work may depend on on-chain confirmations.
-  `open_proposals` contains only proposals with no terminal decision yet.
+  `open_proposals` contains only proposals with no terminal decision yet. The
+  generic `CastVote` planner remains for legacy hotkeys; recoverable-v1 callers
+  must wait for the complete-ballot API instead of executing singleton steps.
 
 The Zcash-format transaction signed during delegation is specified separately
 in [Delegation signing transaction (TX1)](docs/delegation-signing-transaction.md).

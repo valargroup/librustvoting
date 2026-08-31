@@ -17,6 +17,14 @@ precompute → delegate → vote → share lifecycle:
    count. Wallets that need fewer real notes per bundle can call the
    `*_with_policy` variants with `BundlePolicy::new(...)`; proof construction
    still pads each bundle to the same fixed circuit slot count.
+   For a round-auth v3 integration, use `recoverable_authority` to bind the
+   authenticated round, network, vote chain, account, and Orchard full viewing
+   key to a seed-free authority root, then freeze the canonical self-custody
+   bundle before delegation. The wallet must retain the authority selection,
+   root secret, and allocated ZIP-32 registered application identifier in its
+   own authenticated, encrypted, rollback-protected storage. Use the opaque
+   verified-round token returned by the v3 config resolver rather than
+   rebuilding authority context from the public signing payload.
 3. Build the governance PCZT with `setup_delegation`.
 4. Precompute delegation inputs with `note_witnesses` and `delegation_pir`.
 5. After `delegate::setup`, load `delegation_signing_request` and sign it in
@@ -26,6 +34,20 @@ precompute → delegate → vote → share lifecycle:
    plus `confirm_delegation_submission` after confirmation.
 6. Record each terminal ballot decision with `set_ballot_intent`, passing the
    proposal's declared option count so choices are validated before persistence.
+   For recoverable-v1, wait until every ID in the signed proposal count has a
+   `Choice` or `Skipped` intent, then call
+   `recoverable_authority::commit_recoverable_complete_ballot_v1` once per
+   bundle. It submits every `Choice` in ascending proposal order through one
+   atomic batch, even when only one proposal was answered. Skipped proposals
+   are omitted. Do not use the singleton or generic arbitrary-batch APIs with a
+   recoverable authority. Persisting the first bundle's signed batch durably
+   freezes the round's complete intent set before the payload is returned;
+   later bundles must use that identical ballot. If every proposal is skipped,
+   there is no transaction and no on-chain completion marker after total
+   local-state loss. The identical-choice freeze is also local database state:
+   after total loss, chain reconciliation cannot recover hidden choices, so a
+   wallet must restore or reconfirm the original intents before submitting an
+   unspent bundle.
    For multiple answered proposals in one bundle, call
    `vote::commit_atomic_vote_batch` once with their canonical order and submit
    the returned `SignedVoteBatch::batch_json` to the chain's
@@ -91,6 +113,7 @@ precompute → delegate → vote → share lifecycle:
 | `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `config` | Static and dynamic voting config validation, signature checks, and switch decisions. |
+| `recoverable_authority` | Opt-in round-bound authority derivation, canonical self-custody bundles, one-shot complete ballots, and finalized-chain reconciliation. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
 | `hotkey` | Voting hotkey reconstruction from stored app-owned secret material plus random app-owned hotkeys. |
 | `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |
@@ -144,6 +167,24 @@ config/server layout and YPIR-degree handshake and fail closed before any
 private query (`VotingError::InvalidInput` on mismatch); they do not re-check
 advertised-endpoint membership. Do not pass a compiled-client layout constant
 in place of `resolved.pir_layout`.
+
+Recoverable round-auth v3 uses the stricter
+`recoverable_authority::select_recoverable_pir_snapshot_v1` and
+`connect_recoverable_pir_blocking_v1` path. It accepts only exact external
+snapshot metadata matching the verified round's configured endpoint, signed
+height, block hash, and PIR layout. The current PIR `RootInfo` reports height
+but not block hash, so it cannot produce this opaque binding. Integrations must
+wait for or supply an independently verified exact metadata source before
+recoverable delegation precompute or proving; legacy v2/config/PIR APIs remain
+available as before.
+
+Confirmed authority reconciliation also has an explicit integration boundary.
+The crate verifies the initial VCT path and native VAN nullifier, then reports
+the bundle as unspent, terminally consumed by one canonical atomic batch, or
+spent in an unsupported way. The caller-supplied evidence verifier must
+independently authenticate the finalized checkpoint block hash and VCT root and
+prove the initial-nullifier lookup complete through that checkpoint. The result
+never exposes a successor VAN or remaining authority mask.
 
 ```rust
 use std::sync::Arc;

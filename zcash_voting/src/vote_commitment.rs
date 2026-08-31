@@ -115,6 +115,36 @@ pub(crate) fn sign_cast_vote(
     sign_cast_vote_digest(hotkey_seed, network, &sighash, alpha_v)
 }
 
+/// Signs a cast vote with an already-derived recoverable Orchard key.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sign_cast_vote_with_spending_key(
+    spending_key: &orchard::keys::SpendingKey,
+    vote_round_id_hex: &str,
+    r_vpk_bytes: &[u8],
+    van_nullifier: &[u8],
+    vote_authority_note_new: &[u8],
+    vote_commitment: &[u8],
+    proposal_id: u32,
+    anchor_height: u32,
+    alpha_v: &[u8],
+) -> Result<CastVoteSignature, VotingError> {
+    if r_vpk_bytes.len() != 32 {
+        return Err(VotingError::Internal {
+            message: format!("r_vpk must be 32 bytes, got {}", r_vpk_bytes.len()),
+        });
+    }
+    let sighash = cast_vote_sighash(
+        vote_round_id_hex,
+        r_vpk_bytes,
+        van_nullifier,
+        vote_authority_note_new,
+        vote_commitment,
+        proposal_id,
+        anchor_height,
+    )?;
+    sign_cast_vote_digest_with_spending_key(spending_key, &sighash, alpha_v)
+}
+
 /// Signs a precomputed singleton or batch cast-vote digest with the randomized
 /// voting key selected by `alpha_v`.
 pub(crate) fn sign_cast_vote_digest(
@@ -123,15 +153,24 @@ pub(crate) fn sign_cast_vote_digest(
     digest: &[u8; 32],
     alpha_v: &[u8],
 ) -> Result<CastVoteSignature, VotingError> {
-    use pasta_curves::group::ff::PrimeField;
-
     // Derive the voting hotkey SpendingKey from seed.
     let sk = crate::hotkey::spending_key_from_hotkey_seed(
         hotkey_seed,
         network,
         crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX,
     )?;
-    let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
+    sign_cast_vote_digest_with_spending_key(&sk, digest, alpha_v)
+}
+
+/// Signs a precomputed digest with an already-derived recoverable Orchard key.
+pub(crate) fn sign_cast_vote_digest_with_spending_key(
+    spending_key: &orchard::keys::SpendingKey,
+    digest: &[u8; 32],
+    alpha_v: &[u8],
+) -> Result<CastVoteSignature, VotingError> {
+    use pasta_curves::group::ff::PrimeField;
+
+    let ask = orchard::keys::SpendAuthorizingKey::from(spending_key);
 
     // Deserialize alpha_v
     let alpha_v_arr: [u8; 32] = alpha_v.try_into().map_err(|_| VotingError::Internal {

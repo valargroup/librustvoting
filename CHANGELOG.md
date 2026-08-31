@@ -7,6 +7,22 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Added
+- Added the opt-in `recoverable-authority-v1` wallet flow. It derives a
+  round-bound Orchard voting key and deterministic self-custody bundle
+  material from a seed-free authority root, authenticates the selected
+  network, vote chain, and snapshot with opaque round-auth v3 verification
+  tokens, requires exact endpoint, height, block-hash, and layout binding for
+  recoverable PIR, signs the authenticated proposal count, and requires every
+  proposal to be terminal before each bundle submits all chosen proposals in
+  one atomic batch. Finalized reconciliation verifies the initial VCT leaf and
+  native nullifier, then reports the bundle as unspent, terminally consumed by
+  that batch, or spent in an unsupported way; it does not restore a successor
+  VAN or remaining authority mask. All-skipped ballots intentionally create no
+  transaction and have no cross-device on-chain completion marker. Persisting
+  the first bundle's signed batch freezes the complete ballot before returning
+  it, and later bundles must commit that identical ballot.
+  Existing random hotkeys, round-auth v2 rounds, custody capability bytes,
+  circuits, helper delivery, and vote-chain messages remain unchanged.
 - `HyperTransport::with_connector` and `with_http_connector` now let wallets
   inject fully configured or Rustls-wrapped Hyper connectors for proxies,
   custom DNS, and route-lifecycle enforcement while retaining the SDK's pooled

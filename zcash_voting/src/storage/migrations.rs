@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-pub(super) const CURRENT_VERSION: u32 = 16;
+pub(super) const CURRENT_VERSION: u32 = 17;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -55,9 +55,22 @@ DROP TABLE imt_proofs;",
 ALTER TABLE share_delegations ADD COLUMN attempting_urls TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE share_delegations ADD COLUMN target_count INTEGER NOT NULL DEFAULT 0;",
     ),
+    (
+        16,
+        "CREATE TABLE recoverable_ballot_lock (
+    round_id           TEXT NOT NULL,
+    wallet_id          TEXT NOT NULL DEFAULT '',
+    proposal_count     INTEGER NOT NULL CHECK (proposal_count BETWEEN 1 AND 15),
+    ballot_fingerprint BLOB NOT NULL CHECK (length(ballot_fingerprint) = 32),
+    created_at         INTEGER NOT NULL,
+    PRIMARY KEY (round_id, wallet_id),
+    FOREIGN KEY (round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE
+);",
+    ),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
+DROP TABLE IF EXISTS recoverable_ballot_lock;
 DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
 DROP TABLE IF EXISTS share_delegations;
@@ -172,6 +185,19 @@ mod tests {
             .replace("    target_count    INTEGER NOT NULL DEFAULT 0,\n", "")
     }
 
+    /// Strips the complete-ballot lock table added at version 17.
+    fn without_recoverable_ballot_lock(schema: &str) -> String {
+        let start = schema
+            .find("CREATE TABLE recoverable_ballot_lock")
+            .expect("schema must contain the table added at version 17");
+        let end = start
+            + schema[start..]
+                .find(");")
+                .expect("recoverable_ballot_lock DDL must be terminated")
+            + ");".len();
+        format!("{}{}", &schema[..start], &schema[end..])
+    }
+
     /// The bundle-scoped `imt_proofs` table that version 15 replaced with
     /// `pir_proof_cache`, exactly as `001_init.sql` created it through v14.
     const V14_IMT_PROOFS_SQL: &str = "CREATE TABLE imt_proofs (
@@ -190,7 +216,8 @@ mod tests {
 
     /// The version-14 schema: no `pir_proof_cache` yet, `imt_proofs` still present.
     fn v14_schema() -> String {
-        let schema = without_durable_ambiguous_deliveries(include_str!("migrations/001_init.sql"));
+        let schema = without_recoverable_ballot_lock(include_str!("migrations/001_init.sql"));
+        let schema = without_durable_ambiguous_deliveries(&schema);
         format!(
             "{}\n{}\n",
             without_pir_proof_cache(&schema),
@@ -369,6 +396,7 @@ mod tests {
             "bundles",
             "votes",
             "share_delegations",
+            "recoverable_ballot_lock",
             "pir_proof_cache",
         ] {
             assert_eq!(
@@ -516,6 +544,7 @@ mod tests {
         assert!(tables.contains(&"share_delegations".to_string()));
         assert!(tables.contains(&"keystone_signatures".to_string()));
         assert!(tables.contains(&"ballot_intent".to_string()));
+        assert!(tables.contains(&"recoverable_ballot_lock".to_string()));
         assert!(tables.contains(&"pir_proof_cache".to_string()));
 
         let round_columns = table_columns(&conn, "rounds");

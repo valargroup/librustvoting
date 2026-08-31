@@ -5,7 +5,7 @@
 //! APIs in `crate::phases`. The wallet executes each step with its own
 //! network/proof/sign plumbing.
 
-use rusqlite::{named_params, TransactionBehavior};
+use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,6 +73,27 @@ impl VotingDb {
             })?;
         let skipped_bool = skipped != 0;
         let choice_u32 = choice.map(|c| c as u32);
+        let existing = tx
+            .query_row(
+                "SELECT skipped, choice FROM ballot_intent
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND proposal_id = :proposal_id",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":proposal_id": proposal_id as i64,
+                },
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| VotingError::Internal {
+                message: format!("read current ballot intent failed: {e}"),
+            })?;
+        if existing == Some((skipped_bool, choice)) {
+            return Ok(());
+        }
+        queries::ensure_recoverable_ballot_intents_mutable(&tx, round_id, &wallet_id)?;
         queries::ensure_no_submitted_vote_conflict_for_intent(
             &tx,
             round_id,
@@ -1490,11 +1511,24 @@ mod tests {
             share_blinds: vec![[0x41; 32], [0x42; 32]],
             share_comms: vec![[0x51; 32], [0x52; 32]],
             batch: None,
+            recoverable_ballot_proposal_count: None,
         }
     }
 
     fn store_two_action_batch_recovery_fixture(db: &VotingDb) -> [u8; 32] {
         store_two_action_batch_recovery_fixture_for(db, (1, 0), (2, 1))
+    }
+
+    fn store_recoverable_ballot_fixture(db: &VotingDb) -> [u8; 32] {
+        let digest = store_two_action_batch_recovery_fixture(db);
+        for proposal_id in [1, 2] {
+            let mut recovery = crate::vote::recovery_bundle(db, ROUND, 0, proposal_id)
+                .unwrap()
+                .unwrap();
+            recovery.recoverable_ballot_proposal_count = Some(3);
+            store_recovery_bundle_fixture(db, &recovery, None);
+        }
+        digest
     }
 
     fn store_two_action_batch_recovery_fixture_for(
@@ -1616,6 +1650,85 @@ mod tests {
             intents,
             vec![(1, Decision::Choice(3)), (2, Decision::Skipped)]
         );
+    }
+
+    #[test]
+    fn recoverable_ballot_intents_remain_mutable_before_durable_commit() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
+
+        db.set_ballot_intent(ROUND, 3, Decision::Choice(2), 3)
+            .unwrap();
+        assert_eq!(
+            db.ballot_intents(ROUND).unwrap(),
+            vec![
+                (1, Decision::Choice(0)),
+                (2, Decision::Choice(1)),
+                (3, Decision::Choice(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn durable_recoverable_ballot_commit_freezes_the_whole_ballot() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
+        store_recoverable_ballot_fixture(&db);
+        queries::lock_recoverable_ballot(&db.conn(), ROUND, W, 3, [0xAB; 32]).unwrap();
+
+        let error = db
+            .set_ballot_intent(ROUND, 3, Decision::Choice(2), 3)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("durably committed recoverable ballot"));
+        assert_eq!(
+            db.ballot_intents(ROUND).unwrap(),
+            vec![
+                (1, Decision::Choice(0)),
+                (2, Decision::Choice(1)),
+                (3, Decision::Skipped),
+            ]
+        );
+
+        // Rewriting the same intent remains idempotent after durable commit.
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
+    }
+
+    #[test]
+    fn clearing_recovery_state_does_not_unlock_a_recoverable_ballot() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 3, Decision::Skipped, 3)
+            .unwrap();
+        store_recoverable_ballot_fixture(&db);
+        queries::lock_recoverable_ballot(&db.conn(), ROUND, W, 3, [0xAB; 32]).unwrap();
+
+        db.clear_recovery_state(ROUND).unwrap();
+        assert!(crate::vote::recovery_bundle(&db, ROUND, 0, 1)
+            .unwrap()
+            .is_none());
+
+        let error = db
+            .set_ballot_intent(ROUND, 3, Decision::Choice(2), 3)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("durably committed recoverable ballot"));
     }
 
     #[test]

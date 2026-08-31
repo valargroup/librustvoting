@@ -6,10 +6,17 @@
 //! sources produce the same typed per-round root and therefore share hotkey and
 //! self-custody bundle derivation.
 
+mod ballot;
 mod bundle;
+mod chain_recovery;
 mod derivation;
 mod pir;
 
+pub use ballot::{
+    commit_recoverable_complete_ballot_v1, prepare_recoverable_complete_ballot_v1,
+    record_recoverable_complete_ballot_submission_v1, recoverable_complete_ballot_readiness_v1,
+    RecoverableBallotReadinessV1, RecoverableCompleteBallotV1,
+};
 pub(crate) use bundle::canonical_recoverable_notes;
 pub use bundle::{
     plan_recoverable_self_custody_bundles_v1, recoverable_bundle_policy_v1,
@@ -17,6 +24,7 @@ pub use bundle::{
     RecoverableBundleUseV1, RecoverableSelfCustodyBundlePlanV1, RecoverableSelfCustodyBundleV1,
     RecoverableVanBlindingV1,
 };
+pub use chain_recovery::*;
 pub use derivation::{
     orchard_fvk_fingerprint_v1, BundleMaterialSourceV1, KeystoneMasterGenerationV1,
     RecoverableVotingHotkeyV1, RegisteredKeyApplicationV1, SoftwareRegisteredKeyRequestV1,

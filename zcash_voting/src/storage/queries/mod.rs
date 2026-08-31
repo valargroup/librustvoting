@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::note_bundling::BundlePolicy;
 use crate::storage::{KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord};
-use crate::types::{Network, NoteInfo, VotingError, VotingRoundParams, WitnessData};
+use crate::types::{
+    Network, NoteInfo, VotingError, VotingRoundParams, WitnessData, MAX_PROPOSAL_ID,
+    MIN_PROPOSAL_ID,
+};
 
 mod share_delegations;
 
@@ -3266,6 +3269,149 @@ pub fn clear_unsigned_delegation_setup_fields(
     .map_err(|e| VotingError::Internal {
         message: format!("failed to clear unsigned delegation setup fields: {e}"),
     })?;
+    Ok(())
+}
+
+// --- Recoverable complete-ballot lock ---
+
+fn load_recoverable_ballot_lock(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<Option<(u32, [u8; 32])>, VotingError> {
+    let stored = conn
+        .query_row(
+            "SELECT proposal_count, ballot_fingerprint
+             FROM recoverable_ballot_lock
+             WHERE round_id = :round_id AND wallet_id = :wallet_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+            },
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load recoverable ballot lock: {e}"),
+        })?;
+
+    stored
+        .map(|(proposal_count, fingerprint)| {
+            let proposal_count = u32::try_from(proposal_count).map_err(|_| {
+                VotingError::Internal {
+                    message: format!(
+                        "stored recoverable ballot proposal_count must be non-negative, got {proposal_count}"
+                    ),
+                }
+            })?;
+            if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_count) {
+                return Err(VotingError::Internal {
+                    message: format!(
+                        "stored recoverable ballot proposal_count is invalid: {proposal_count}"
+                    ),
+                });
+            }
+            let fingerprint: [u8; 32] = fingerprint.try_into().map_err(|fingerprint: Vec<u8>| {
+                VotingError::Internal {
+                    message: format!(
+                        "stored recoverable ballot fingerprint must be 32 bytes, got {}",
+                        fingerprint.len()
+                    ),
+                }
+            })?;
+            Ok((proposal_count, fingerprint))
+        })
+        .transpose()
+}
+
+/// Freezes a recoverable round to one terminal ballot at durable commit time.
+///
+/// Repeating the same lock is idempotent so each delegation bundle can commit
+/// the identical ballot. A different lock is rejected before signed material
+/// can escape the persistence transaction.
+pub(crate) fn lock_recoverable_ballot(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    proposal_count: u32,
+    ballot_fingerprint: [u8; 32],
+) -> Result<(), VotingError> {
+    if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_count) {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "recoverable ballot proposal_count must be between {MIN_PROPOSAL_ID} and {MAX_PROPOSAL_ID}, got {proposal_count}"
+            ),
+        });
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    conn.execute(
+        "INSERT OR IGNORE INTO recoverable_ballot_lock
+            (round_id, wallet_id, proposal_count, ballot_fingerprint, created_at)
+         VALUES (:round_id, :wallet_id, :proposal_count, :ballot_fingerprint, :created_at)",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":proposal_count": proposal_count as i64,
+            ":ballot_fingerprint": ballot_fingerprint.as_slice(),
+            ":created_at": now,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to store recoverable ballot lock: {e}"),
+    })?;
+
+    let stored = load_recoverable_ballot_lock(conn, round_id, wallet_id)?.ok_or_else(|| {
+        VotingError::Internal {
+            message: "recoverable ballot lock disappeared after insertion".to_string(),
+        }
+    })?;
+    if stored != (proposal_count, ballot_fingerprint) {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} already has a different durably committed recoverable ballot"
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn require_recoverable_ballot_lock(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    proposal_count: u32,
+    ballot_fingerprint: [u8; 32],
+) -> Result<(), VotingError> {
+    match load_recoverable_ballot_lock(conn, round_id, wallet_id)? {
+        Some(stored) if stored == (proposal_count, ballot_fingerprint) => Ok(()),
+        Some(_) => Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} has a different durably committed recoverable ballot"
+            ),
+        }),
+        None => Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} has no durable recoverable ballot lock; rebuild the complete ballot"
+            ),
+        }),
+    }
+}
+
+pub(crate) fn ensure_recoverable_ballot_intents_mutable(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<(), VotingError> {
+    if load_recoverable_ballot_lock(conn, round_id, wallet_id)?.is_some() {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} has a durably committed recoverable ballot; its intents cannot change"
+            ),
+        });
+    }
     Ok(())
 }
 
