@@ -167,6 +167,9 @@ mod tests {
                 assert_eq!(signer_hotkey.stored_secret(), hotkey.stored_secret());
                 assert_eq!(signer_hotkey.network(), hotkey.network());
             }
+            crate::vote::VoteSigner::RecoverableAuthority { .. } => {
+                panic!("legacy constructor returned recoverable signer")
+            }
         }
     }
 

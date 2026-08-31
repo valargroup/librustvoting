@@ -137,6 +137,29 @@ CREATE TABLE ballot_intent (
     CHECK ((skipped = 1 AND choice IS NULL) OR (skipped = 0 AND choice IS NOT NULL))
 );
 
+CREATE TABLE pending_vote_backup_heads (
+    wallet_id      TEXT NOT NULL PRIMARY KEY,
+    revision       INTEGER NOT NULL CHECK (revision > 0),
+    digest         BLOB NOT NULL CHECK (length(digest) = 32)
+);
+
+CREATE TABLE pending_vote_backup_protection (
+    wallet_id       TEXT NOT NULL DEFAULT '',
+    record_id       BLOB NOT NULL CHECK (length(record_id) = 32),
+    round_id        TEXT NOT NULL,
+    bundle_index    INTEGER NOT NULL,
+    proposal_id     INTEGER NOT NULL,
+    retired         INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
+    ledger_revision INTEGER NOT NULL CHECK (ledger_revision > 0),
+    ledger_digest   BLOB NOT NULL CHECK (length(ledger_digest) = 32),
+    PRIMARY KEY (wallet_id, record_id, proposal_id),
+    FOREIGN KEY (round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE
+);
+
+CREATE INDEX pending_vote_backup_live_action
+    ON pending_vote_backup_protection
+       (round_id, wallet_id, bundle_index, proposal_id, retired);
+
 CREATE TABLE pir_proof_cache (
     wallet_id   TEXT NOT NULL DEFAULT '',
     network     TEXT NOT NULL CHECK (network IN ('mainnet','testnet','regtest')),

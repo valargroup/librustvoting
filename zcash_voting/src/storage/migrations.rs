@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 16;
+const CURRENT_VERSION: u32 = 17;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -55,9 +55,34 @@ DROP TABLE imt_proofs;",
 ALTER TABLE share_delegations ADD COLUMN attempting_urls TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE share_delegations ADD COLUMN target_count INTEGER NOT NULL DEFAULT 0;",
     ),
+    (
+        16,
+        "CREATE TABLE pending_vote_backup_heads (
+    wallet_id      TEXT NOT NULL PRIMARY KEY,
+    revision       INTEGER NOT NULL CHECK (revision > 0),
+    digest         BLOB NOT NULL CHECK (length(digest) = 32)
+);
+CREATE TABLE pending_vote_backup_protection (
+    wallet_id       TEXT NOT NULL DEFAULT '',
+    record_id       BLOB NOT NULL CHECK (length(record_id) = 32),
+    round_id        TEXT NOT NULL,
+    bundle_index    INTEGER NOT NULL,
+    proposal_id     INTEGER NOT NULL,
+    retired         INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
+    ledger_revision INTEGER NOT NULL CHECK (ledger_revision > 0),
+    ledger_digest   BLOB NOT NULL CHECK (length(ledger_digest) = 32),
+    PRIMARY KEY (wallet_id, record_id, proposal_id),
+    FOREIGN KEY (round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE
+);
+CREATE INDEX pending_vote_backup_live_action
+    ON pending_vote_backup_protection
+       (round_id, wallet_id, bundle_index, proposal_id, retired);",
+    ),
 ];
 
-const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
+const RESET_SQL: &str = "DROP TABLE IF EXISTS pending_vote_backup_protection;
+DROP TABLE IF EXISTS pending_vote_backup_heads;
+DROP TABLE IF EXISTS pir_proof_cache;
 DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
 DROP TABLE IF EXISTS share_delegations;
@@ -172,6 +197,17 @@ mod tests {
             .replace("    target_count    INTEGER NOT NULL DEFAULT 0,\n", "")
     }
 
+    /// Strips the rollback head, action protection, and index added at v17.
+    fn without_pending_vote_backup_tables(schema: &str) -> String {
+        let start = schema
+            .find("CREATE TABLE pending_vote_backup_heads")
+            .expect("schema must contain pending backup tables");
+        let end = schema
+            .find("CREATE TABLE pir_proof_cache")
+            .expect("pending backup tables must precede pir proof cache");
+        format!("{}{}", &schema[..start], &schema[end..])
+    }
+
     /// The bundle-scoped `imt_proofs` table that version 15 replaced with
     /// `pir_proof_cache`, exactly as `001_init.sql` created it through v14.
     const V14_IMT_PROOFS_SQL: &str = "CREATE TABLE imt_proofs (
@@ -190,7 +226,8 @@ mod tests {
 
     /// The version-14 schema: no `pir_proof_cache` yet, `imt_proofs` still present.
     fn v14_schema() -> String {
-        let schema = without_durable_ambiguous_deliveries(include_str!("migrations/001_init.sql"));
+        let schema = without_pending_vote_backup_tables(include_str!("migrations/001_init.sql"));
+        let schema = without_durable_ambiguous_deliveries(&schema);
         format!(
             "{}\n{}\n",
             without_pir_proof_cache(&schema),
@@ -370,6 +407,8 @@ mod tests {
             "votes",
             "share_delegations",
             "pir_proof_cache",
+            "pending_vote_backup_heads",
+            "pending_vote_backup_protection",
         ] {
             assert_eq!(
                 table_columns(&migrated, table),
@@ -517,6 +556,8 @@ mod tests {
         assert!(tables.contains(&"keystone_signatures".to_string()));
         assert!(tables.contains(&"ballot_intent".to_string()));
         assert!(tables.contains(&"pir_proof_cache".to_string()));
+        assert!(tables.contains(&"pending_vote_backup_heads".to_string()));
+        assert!(tables.contains(&"pending_vote_backup_protection".to_string()));
 
         let round_columns = table_columns(&conn, "rounds");
         assert!(round_columns.contains(&"network".to_string()));

@@ -91,6 +91,7 @@ async fn submit_share_to_canonical_helpers(
         fallback,
         persisted_delivery,
         cancel,
+        None,
     )
     .await
 }
@@ -182,6 +183,7 @@ async fn dispatch_share_to_canonical_helpers(
     fallback: &[String],
     persisted_delivery: ShareDelegationRecord,
     cancel: &(dyn Fn() -> bool + Send + Sync),
+    mut checkpoint: Option<&mut crate::recoverable_authority::PendingVoteBackupCheckpointV1<'_>>,
 ) -> Result<ShareSubmissionReport, VotingError> {
     let expected_nullifier = persisted_delivery.nullifier.clone();
     let candidates = planned.iter().chain(fallback).cloned().collect::<Vec<_>>();
@@ -267,6 +269,9 @@ async fn dispatch_share_to_canonical_helpers(
                 return Err(stale_delivery_error(params));
             }
         }
+        if let Some(checkpoint) = checkpoint.as_deref_mut() {
+            checkpoint.checkpoint(db)?;
+        }
 
         let helper_post_outcome = tokio::time::timeout_at(
             deadline,
@@ -297,6 +302,9 @@ async fn dispatch_share_to_canonical_helpers(
                     return Err(stale_delivery_error(params));
                 }
                 delivery_state.mark_outcome_unknown(&server_url)?;
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
+                }
                 break;
             }
             Ok(Ok(_)) => {
@@ -310,6 +318,9 @@ async fn dispatch_share_to_canonical_helpers(
                     return Err(stale_delivery_error(params));
                 }
                 delivery_state.mark_accepted(&server_url)?;
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
+                }
             }
             Ok(Err(error)) if error.is_ambiguous() => {
                 if !share::resolve_delivery_attempt_for_generation(
@@ -322,6 +333,9 @@ async fn dispatch_share_to_canonical_helpers(
                     return Err(stale_delivery_error(params));
                 }
                 delivery_state.mark_outcome_unknown(&server_url)?;
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
+                }
             }
             Ok(Err(_)) => {
                 if !share::resolve_delivery_attempt_for_generation(
@@ -332,6 +346,9 @@ async fn dispatch_share_to_canonical_helpers(
                     false,
                 )? {
                     return Err(stale_delivery_error(params));
+                }
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
                 }
             }
         }
@@ -421,6 +438,61 @@ pub(crate) async fn submit_committed_share_to_helpers(
     request: ShareSubmissionRequest<'_>,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
+    submit_committed_share_to_helpers_inner(
+        db,
+        client,
+        round_id,
+        bundle_index,
+        proposal_id,
+        expected_vote_commitment,
+        payloads,
+        request,
+        cancel,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn submit_committed_share_to_helpers_with_pending_backup(
+    db: &VotingDb,
+    client: &HelperClient,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    expected_vote_commitment: &[u8; 32],
+    payloads: &[SharePayload],
+    request: ShareSubmissionRequest<'_>,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    checkpoint: &mut crate::recoverable_authority::PendingVoteBackupCheckpointV1<'_>,
+) -> Result<ShareSubmissionReport, VotingError> {
+    submit_committed_share_to_helpers_inner(
+        db,
+        client,
+        round_id,
+        bundle_index,
+        proposal_id,
+        expected_vote_commitment,
+        payloads,
+        request,
+        cancel,
+        Some(checkpoint),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_committed_share_to_helpers_inner(
+    db: &VotingDb,
+    client: &HelperClient,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    expected_vote_commitment: &[u8; 32],
+    payloads: &[SharePayload],
+    request: ShareSubmissionRequest<'_>,
+    cancel: &(dyn Fn() -> bool + Send + Sync),
+    mut checkpoint: Option<&mut crate::recoverable_authority::PendingVoteBackupCheckpointV1<'_>>,
+) -> Result<ShareSubmissionReport, VotingError> {
     let scope = share::ShareOperationScope::capture(db);
     let configured = ConfiguredHelperFleet::new(request.configured_server_urls)?;
     let planned = canonical_helper_url_list(&request.plan.target_servers)?;
@@ -442,6 +514,16 @@ pub(crate) async fn submit_committed_share_to_helpers(
         return Err(VotingError::InvalidInput {
             message: format!("planned helper is not in configured_server_urls: {server_url}"),
         });
+    }
+    if let Some(checkpoint) = checkpoint.as_deref_mut() {
+        checkpoint.validate_share_request(
+            round_id,
+            bundle_index,
+            proposal_id,
+            request.share_index,
+            request.plan,
+            request.configured_server_urls,
+        )?;
     }
     let payload = payloads
         .iter()
@@ -527,6 +609,9 @@ pub(crate) async fn submit_committed_share_to_helpers(
         submit_at: request.plan.submit_at,
         now_seconds: request.now_seconds,
     };
+    if let Some(checkpoint) = checkpoint.as_deref_mut() {
+        checkpoint.activate(db)?;
+    }
     let (durable_submit_at, persisted_delivery) = prepare_committed_share_delivery(
         db,
         &scope,
@@ -549,6 +634,7 @@ pub(crate) async fn submit_committed_share_to_helpers(
         &candidates[planned_target..],
         persisted_delivery,
         cancel,
+        checkpoint,
     )
     .await
 }

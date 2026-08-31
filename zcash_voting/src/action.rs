@@ -296,6 +296,70 @@ pub(crate) fn build_governance_pczt(
     round_name: &str,
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<GovernancePczt, VotingError> {
+    build_governance_pczt_inner(
+        notes,
+        params,
+        network,
+        fvk_bytes,
+        hotkey_raw_address,
+        consensus_branch_id,
+        coin_type,
+        seed_fingerprint,
+        account_index,
+        round_name,
+        padded_note_secrets,
+        None,
+    )
+}
+
+/// Builds the same governance PCZT with a caller-supplied typed recoverable
+/// VAN blinding instead of sampling legacy randomness.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_governance_pczt_with_van_blinding(
+    notes: &[NoteInfo],
+    params: &VotingRoundParams,
+    network: VotingNetwork,
+    fvk_bytes: &[u8],
+    hotkey_raw_address: &[u8],
+    consensus_branch_id: u32,
+    coin_type: u32,
+    seed_fingerprint: &[u8; 32],
+    account_index: u32,
+    round_name: &str,
+    padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
+    van_blinding: &crate::recoverable_authority::RecoverableVanBlindingV1,
+) -> Result<GovernancePczt, VotingError> {
+    build_governance_pczt_inner(
+        notes,
+        params,
+        network,
+        fvk_bytes,
+        hotkey_raw_address,
+        consensus_branch_id,
+        coin_type,
+        seed_fingerprint,
+        account_index,
+        round_name,
+        padded_note_secrets,
+        Some(van_blinding.as_bytes()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_governance_pczt_inner(
+    notes: &[NoteInfo],
+    params: &VotingRoundParams,
+    network: VotingNetwork,
+    fvk_bytes: &[u8],
+    hotkey_raw_address: &[u8],
+    consensus_branch_id: u32,
+    coin_type: u32,
+    seed_fingerprint: &[u8; 32],
+    account_index: u32,
+    round_name: &str,
+    padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
+    recoverable_van_blinding: Option<&[u8; 32]>,
+) -> Result<GovernancePczt, VotingError> {
     validate_notes(notes)?;
     validate_round_params(params)?;
     let branch_id =
@@ -428,8 +492,17 @@ pub(crate) fn build_governance_pczt(
             message: "total note weight overflows u64".to_string(),
         })?;
 
-    // Sample van_comm_rand
-    let van_comm_rand_fp = pallas::Base::random(&mut crypto_rng);
+    // Legacy rounds sample this value. Recoverable rounds pass the canonical
+    // field encoding derived from their typed root and bundle identity.
+    let van_comm_rand_fp =
+        match recoverable_van_blinding {
+            Some(bytes) => Option::<pallas::Base>::from(pallas::Base::from_repr(*bytes))
+                .ok_or_else(|| VotingError::Internal {
+                    message: "recoverable VAN blinding is not a canonical Pallas field element"
+                        .to_string(),
+                })?,
+            None => pallas::Base::random(&mut crypto_rng),
+        };
     let van_comm_rand: [u8; 32] = van_comm_rand_fp.to_repr();
 
     // Compute VAN
@@ -1002,6 +1075,47 @@ mod tests {
             output.user_address().as_deref(),
             Some(expected_user_address.as_str())
         );
+    }
+
+    #[test]
+    fn recoverable_pczt_uses_exact_derived_van_blinding() {
+        let notes = [mock_note()];
+        let context = crate::recoverable_authority::VotingAuthorityContextV1::from_orchard_fvk(
+            VotingNetwork::Regtest,
+            MOCK_ACCOUNT,
+            &mock_fvk_bytes(),
+            "vote-chain-test",
+            [0x01; 32],
+        )
+        .unwrap();
+        let request = crate::recoverable_authority::SoftwareRegisteredKeyRequestV1::new(
+            crate::recoverable_authority::RegisteredKeyApplicationV1::new(0xA11C),
+            context,
+        );
+        let root = crate::recoverable_authority::VotingAuthorityRootV1::from_registered_key_output(
+            &request, [0x55; 64],
+        );
+        let plan =
+            crate::recoverable_authority::plan_recoverable_self_custody_bundles_v1(&notes).unwrap();
+        let blinding = plan.bundle(0).unwrap().derive_van_blinding(&root);
+
+        let result = build_governance_pczt_with_van_blinding(
+            &notes,
+            &mock_nu6_3_params(),
+            VotingNetwork::Regtest,
+            &mock_fvk_bytes(),
+            &mock_hotkey_address(),
+            u32::from(BranchId::Nu6_3),
+            VotingNetwork::Regtest.network_type().coin_type(),
+            &MOCK_SEED_FP,
+            MOCK_ACCOUNT,
+            "Test Round",
+            &sample_padded_note_secrets(notes.len()).unwrap(),
+            &blinding,
+        )
+        .unwrap();
+
+        assert_eq!(result.van_comm_rand, blinding.as_bytes());
     }
 
     #[test]

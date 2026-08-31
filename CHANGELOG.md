@@ -7,6 +7,16 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Added
+- Added the opt-in `recoverable-authority-v1` wallet flow. It derives a
+  round-bound Orchard voting key and deterministic self-custody bundle
+  material from a seed-free authority root, authenticates the selected
+  network, vote chain, and snapshot with opaque round-auth v3 verification
+  tokens, requires exact endpoint, height, block-hash, and layout binding for
+  recoverable PIR, restores confirmed VAN chains after local VCT and native
+  transition verification plus an external finalized-completeness check, and
+  exports rollback-aware pending vote and helper-delivery backups. Existing
+  random hotkeys, round-auth v2 rounds, custody capability bytes, circuits, and
+  vote-chain messages remain unchanged.
 - Added a typed `HelperClient` for readiness checks, share submission, and
   status polling. It validates canonical round IDs, protocol fields,
   ciphertext points, complete 16-share reveal inputs, and JSON responses;

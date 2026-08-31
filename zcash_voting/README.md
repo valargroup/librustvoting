@@ -17,6 +17,14 @@ precompute → delegate → vote → share lifecycle:
    count. Wallets that need fewer real notes per bundle can call the
    `*_with_policy` variants with `BundlePolicy::new(...)`; proof construction
    still pads each bundle to the same fixed circuit slot count.
+   For a round-auth v3 integration, use `recoverable_authority` to bind the
+   authenticated round, network, vote chain, account, and Orchard full viewing
+   key to a seed-free authority root, then freeze the canonical self-custody
+   bundle before delegation. The wallet must retain the authority selection,
+   root secret, and allocated ZIP-32 registered application identifier in its
+   own authenticated, encrypted, rollback-protected storage. Use the opaque
+   verified-round token returned by the v3 config resolver rather than
+   rebuilding authority context from the public signing payload.
 3. Build the governance PCZT with `setup_delegation`.
 4. Precompute delegation inputs with `note_witnesses` and `delegation_pir`.
 5. After `delegate::setup`, load `delegation_signing_request` and sign it in
@@ -66,6 +74,11 @@ precompute → delegate → vote → share lifecycle:
    polls the complete current fleet and requires two distinct confirmations
    when at least two helpers are configured; a one-helper fleet uses its only
    available confirmation. The result is persisted internally.
+   Recoverable integrations use the pending-backup variants to checkpoint the
+   complete vote, original helper plans, and tracker evidence before a
+   dependent POST and after each classified outcome. The wallet encrypts and
+   atomically persists the returned rollback-aware ledger and its independent
+   revision head.
    `Decision::Skipped` is terminal, so `open_proposals`
    contains only proposals that have no recorded decision.
 
@@ -91,6 +104,7 @@ precompute → delegate → vote → share lifecycle:
 | `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `config` | Static and dynamic voting config validation, signature checks, and switch decisions. |
+| `recoverable_authority` | Opt-in round-bound authority derivation, canonical self-custody bundles, finalized-chain recovery, and pending-vote backup state. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
 | `hotkey` | Voting hotkey reconstruction from stored app-owned secret material plus random app-owned hotkeys. |
 | `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |
@@ -144,6 +158,22 @@ config/server layout and YPIR-degree handshake and fail closed before any
 private query (`VotingError::InvalidInput` on mismatch); they do not re-check
 advertised-endpoint membership. Do not pass a compiled-client layout constant
 in place of `resolved.pir_layout`.
+
+Recoverable round-auth v3 uses the stricter
+`recoverable_authority::select_recoverable_pir_snapshot_v1` and
+`connect_recoverable_pir_blocking_v1` path. It accepts only exact external
+snapshot metadata matching the verified round's configured endpoint, signed
+height, block hash, and PIR layout. The current PIR `RootInfo` reports height
+but not block hash, so it cannot produce this opaque binding. Integrations must
+wait for or supply an independently verified exact metadata source before
+recoverable delegation precompute or proving; legacy v2/config/PIR APIs remain
+available as before.
+
+Confirmed authority-chain recovery also has an explicit integration boundary.
+The crate locally verifies each VCT path, native VAN nullifier, and authority
+transition, but the caller-supplied recovery evidence verifier must independently
+authenticate the finalized checkpoint block hash and VCT root and prove that no
+confirmed authority consumer is omitted through that checkpoint.
 
 ```rust
 use std::sync::Arc;

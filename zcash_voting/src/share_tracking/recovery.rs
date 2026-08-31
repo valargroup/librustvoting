@@ -97,6 +97,7 @@ pub(super) async fn resubmit_to_next_helper(
     attempted_urls: &mut Vec<String>,
     cancel: &(dyn Fn() -> bool + Send + Sync),
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
+    mut checkpoint: Option<&mut crate::recoverable_authority::PendingVoteBackupCheckpointV1<'_>>,
 ) -> Result<ResubmitReport, VotingError> {
     let share = request.share;
     let generation = share::ShareGeneration::new(scope, &share.nullifier);
@@ -332,6 +333,9 @@ pub(super) async fn resubmit_to_next_helper(
         if !may_dispatch {
             continue;
         }
+        if let Some(checkpoint) = checkpoint.as_deref_mut() {
+            checkpoint.checkpoint(db)?;
+        }
         match client
             .resubmit_share(
                 &server_url,
@@ -354,6 +358,9 @@ pub(super) async fn resubmit_to_next_helper(
                         outcome_unknown_urls: newly_outcome_unknown_urls,
                     });
                 }
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
+                }
                 return Ok(ResubmitReport {
                     outcome: ResubmitOutcome::DefinitelyAcceptedByHelper(server_url),
                     outcome_unknown_urls: newly_outcome_unknown_urls,
@@ -374,6 +381,9 @@ pub(super) async fn resubmit_to_next_helper(
                         outcome_unknown_urls: newly_outcome_unknown_urls,
                     });
                 }
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
+                }
                 return Ok(ResubmitReport {
                     outcome: ResubmitOutcome::Cancelled,
                     outcome_unknown_urls: newly_outcome_unknown_urls,
@@ -381,7 +391,11 @@ pub(super) async fn resubmit_to_next_helper(
             }
             // A weaker outcome from a recovery re-POST cannot downgrade the
             // durable acceptance established by the original request.
-            Err(error) if error.is_ambiguous() && retries_definitely_accepted_helper => {}
+            Err(error) if error.is_ambiguous() && retries_definitely_accepted_helper => {
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
+                }
+            }
             Err(error) if error.is_ambiguous() => {
                 if !share::resolve_delivery_attempt_for_generation(
                     db,
@@ -398,6 +412,9 @@ pub(super) async fn resubmit_to_next_helper(
                 if !retries_ambiguous_helper {
                     newly_outcome_unknown_urls.push(server_url);
                 }
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
+                }
             }
             Err(_) if retries_interrupted_helper => {
                 if !share::resolve_delivery_attempt_for_generation(
@@ -413,10 +430,17 @@ pub(super) async fn resubmit_to_next_helper(
                     });
                 }
                 newly_outcome_unknown_urls.push(server_url);
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
+                }
             }
             // A definite failure of a re-POST says nothing about the original
             // outcome-unknown POST, so that persisted state is kept.
-            Err(_) if retries_outcome_unknown_helper => {}
+            Err(_) if retries_outcome_unknown_helper => {
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
+                }
+            }
             Err(_) => {
                 if !share::resolve_delivery_attempt_for_generation(
                     db,
@@ -429,6 +453,9 @@ pub(super) async fn resubmit_to_next_helper(
                         outcome: ResubmitOutcome::StaleGeneration,
                         outcome_unknown_urls: newly_outcome_unknown_urls,
                     });
+                }
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint.checkpoint(db)?;
                 }
             }
         }

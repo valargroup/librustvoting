@@ -378,6 +378,38 @@ impl CommittedVote {
         .await
     }
 
+    /// Submits one committed helper share while externally checkpointing every
+    /// durable reservation and classified outcome before network work advances.
+    ///
+    /// This is the opt-in recoverable-authority variant of
+    /// [`Self::submit_share_to_helpers`]. The caller owns encrypted storage and
+    /// supplies a checkpoint bound to this vote's complete original helper
+    /// fleet and placement plans. A checkpoint failure returns immediately;
+    /// when it follows a reservation no POST has occurred, and when it follows
+    /// an outcome the stronger local evidence remains durable.
+    pub async fn submit_share_to_helpers_with_pending_backup(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        request: crate::share_tracking::ShareSubmissionRequest<'_>,
+        checkpoint: &mut crate::recoverable_authority::PendingVoteBackupCheckpointV1<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<crate::share_tracking::ShareSubmissionReport, VotingError> {
+        crate::share_tracking::submit_committed_share_to_helpers_with_pending_backup(
+            db,
+            client,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            &self.commit.vote_commitment,
+            &self.commit.share_payloads,
+            request,
+            cancel,
+            checkpoint,
+        )
+        .await
+    }
+
     /// Reconstructs chain-ready cast-vote fields from persisted recovery state.
     pub fn submission(&self, db: &VotingDb) -> Result<VoteSubmission, VotingError> {
         submission(
@@ -640,8 +672,8 @@ pub fn prepare_atomic_vote_batch(
     validate_atomic_vote_batch(batch.drafts)?;
     let bundle_count = db.get_bundle_count(batch.round_id)?;
     crate::round::validate_bundle_index(bundle_count, batch.bundle_index, "voting")?;
-    let (secret, network) = signer_secret_and_network(signer);
-    db.require_round_network(batch.round_id, network, "vote signer")?;
+    let resolved_signer = resolve_vote_signer(signer)?;
+    let network = resolved_signer.network();
     let wallet_id = db.wallet_id();
 
     // Capture every proposal row under one read transaction. The proofs run
@@ -652,6 +684,13 @@ pub fn prepare_atomic_vote_batch(
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("failed to begin vote batch preparation transaction: {e}"),
         })?;
+        validate_vote_signer_context_with_conn(
+            &tx,
+            &wallet_id,
+            batch.round_id,
+            batch.bundle_index,
+            resolved_signer,
+        )?;
         let mut recoveries = Vec::with_capacity(batch.drafts.len());
         for draft in batch.drafts {
             recoveries.push(recovery_bundle_with_conn(
@@ -761,16 +800,31 @@ pub fn prepare_atomic_vote_batch(
     let mut authority = first_state.zkp2.proposal_authority;
     let mut proof_plans = Vec::with_capacity(batch.drafts.len());
     for (index, (draft, state)) in batch.drafts.iter().zip(captured.iter()).enumerate() {
-        let transition = crate::zkp2::plan_vote_authority_transition(
-            secret,
-            network,
-            state.zkp2.address_index,
-            state.zkp2.total_note_value,
-            &state.zkp2.gov_comm_rand,
-            &round_id_bytes,
-            draft.proposal_id,
-            authority,
-        )?;
+        let transition = match resolved_signer {
+            ResolvedVoteSigner::Legacy { secret, network } => {
+                crate::zkp2::plan_vote_authority_transition(
+                    secret,
+                    network,
+                    state.zkp2.address_index,
+                    state.zkp2.total_note_value,
+                    &state.zkp2.gov_comm_rand,
+                    &round_id_bytes,
+                    draft.proposal_id,
+                    authority,
+                )?
+            }
+            ResolvedVoteSigner::Recoverable { spending_key, .. } => {
+                crate::zkp2::plan_vote_authority_transition_from_spending_key(
+                    &spending_key,
+                    state.zkp2.address_index,
+                    state.zkp2.total_note_value,
+                    &state.zkp2.gov_comm_rand,
+                    &round_id_bytes,
+                    draft.proposal_id,
+                    authority,
+                )?
+            }
+        };
         authority = transition.proposal_authority_new;
         let (auth_path, position) = if index == 0 {
             (batch.witness.auth_path_fixed()?, batch.witness.position)
@@ -791,7 +845,7 @@ pub fn prepare_atomic_vote_batch(
     }
 
     let bundles = build_batch_proofs(
-        secret,
+        resolved_signer,
         batch.bundle_index,
         batch.witness.anchor_height,
         &round_id_bytes,
@@ -846,12 +900,23 @@ pub fn prepare_atomic_vote_batch(
             proposal_id: plan.draft.proposal_id,
             bundle_index: batch.bundle_index,
         });
-        let signature = crate::vote_commitment::sign_cast_vote_digest(
-            secret,
-            network,
-            &batch_digest,
-            &bundle.alpha_v,
-        )?;
+        let signature = match resolved_signer {
+            ResolvedVoteSigner::Legacy { secret, network } => {
+                crate::vote_commitment::sign_cast_vote_digest(
+                    secret,
+                    network,
+                    &batch_digest,
+                    &bundle.alpha_v,
+                )?
+            }
+            ResolvedVoteSigner::Recoverable { spending_key, .. } => {
+                crate::vote_commitment::sign_cast_vote_digest_with_spending_key(
+                    &spending_key,
+                    &batch_digest,
+                    &bundle.alpha_v,
+                )?
+            }
+        };
         let vote_auth_sig = array64("vote_auth_sig", signature.vote_auth_sig)?;
         let mut recovery =
             VoteRecoveryBundle::from_parts(batch.bundle_index, &plan.draft, bundle, vote_auth_sig)?;
@@ -1095,7 +1160,7 @@ fn single_leaf_auth_path(
 
 #[allow(clippy::too_many_arguments)]
 fn build_batch_proofs(
-    hotkey_seed: &[u8],
+    resolved_signer: ResolvedVoteSigner<'_>,
     bundle_index: u32,
     anchor_height: u32,
     round_id_bytes: &[u8],
@@ -1128,24 +1193,50 @@ fn build_batch_proofs(
                         bundle_index,
                         stages,
                     };
-                    let result = crate::zkp2::build_vote_commitment(
-                        hotkey_seed,
-                        plan.state.network,
-                        plan.state.zkp2.address_index,
-                        plan.state.zkp2.total_note_value,
-                        &plan.state.zkp2.gov_comm_rand,
-                        round_id_bytes,
-                        &plan.state.zkp2.ea_pk,
-                        plan.draft.proposal_id,
-                        plan.draft.choice,
-                        plan.draft.num_options,
-                        &plan.auth_path,
-                        plan.position,
-                        anchor_height,
-                        plan.proposal_authority,
-                        plan.draft.single_share,
-                        &progress,
-                    )
+                    let build = |spending_key: &orchard::keys::SpendingKey| {
+                        crate::zkp2::build_vote_commitment_from_spending_key(
+                            spending_key,
+                            plan.state.zkp2.address_index,
+                            plan.state.zkp2.total_note_value,
+                            &plan.state.zkp2.gov_comm_rand,
+                            round_id_bytes,
+                            &plan.state.zkp2.ea_pk,
+                            plan.draft.proposal_id,
+                            plan.draft.choice,
+                            plan.draft.num_options,
+                            &plan.auth_path,
+                            plan.position,
+                            anchor_height,
+                            plan.proposal_authority,
+                            plan.draft.single_share,
+                            &progress,
+                        )
+                    };
+                    let result = match resolved_signer {
+                        ResolvedVoteSigner::Legacy { secret, network } => {
+                            crate::zkp2::build_vote_commitment(
+                                secret,
+                                network,
+                                plan.state.zkp2.address_index,
+                                plan.state.zkp2.total_note_value,
+                                &plan.state.zkp2.gov_comm_rand,
+                                round_id_bytes,
+                                &plan.state.zkp2.ea_pk,
+                                plan.draft.proposal_id,
+                                plan.draft.choice,
+                                plan.draft.num_options,
+                                &plan.auth_path,
+                                plan.position,
+                                anchor_height,
+                                plan.proposal_authority,
+                                plan.draft.single_share,
+                                &progress,
+                            )
+                        }
+                        ResolvedVoteSigner::Recoverable { spending_key, .. } => {
+                            build(&spending_key)
+                        }
+                    }
                     .and_then(|bundle| {
                         if bundle.vote_authority_note_new != plan.expected_new_van {
                             return Err(VotingError::Internal {
@@ -1322,6 +1413,10 @@ pub enum VoteCommitStage {
 pub enum VoteSigner<'a> {
     /// Crate-owned voting hotkey material.
     Hotkey { hotkey: &'a VotingHotkey },
+    /// Version 1 recoverable voting authority.
+    RecoverableAuthority {
+        authority: crate::recoverable_authority::RecoverableBundleUseV1<'a>,
+    },
 }
 
 impl<'a> VoteSigner<'a> {
@@ -1329,6 +1424,68 @@ impl<'a> VoteSigner<'a> {
     pub fn hotkey(hotkey: &'a VotingHotkey) -> Self {
         Self::Hotkey { hotkey }
     }
+
+    /// Builds a signer from a root whose immutable selection matches the
+    /// currently authenticated round payload and exact bundle material.
+    pub fn recoverable_authority(
+        authority: crate::recoverable_authority::RecoverableBundleUseV1<'a>,
+    ) -> Self {
+        Self::RecoverableAuthority { authority }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResolvedVoteSigner<'a> {
+    Legacy {
+        secret: &'a [u8],
+        network: Network,
+    },
+    Recoverable {
+        spending_key: orchard::keys::SpendingKey,
+        context: &'a crate::recoverable_authority::VotingAuthorityContextV1,
+        authority: crate::recoverable_authority::RecoverableBundleUseV1<'a>,
+    },
+}
+
+impl ResolvedVoteSigner<'_> {
+    fn network(self) -> Network {
+        match self {
+            Self::Legacy { network, .. } => network,
+            Self::Recoverable { context, .. } => context.network(),
+        }
+    }
+}
+
+fn validate_vote_signer_context_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    signer: ResolvedVoteSigner<'_>,
+) -> Result<(), VotingError> {
+    match signer {
+        ResolvedVoteSigner::Legacy { network, .. } => {
+            let stored_network =
+                crate::storage::queries::load_round_network(conn, round_id, wallet_id)?;
+            crate::storage::operations::validate_network_matches_round(
+                stored_network,
+                network,
+                "vote signer",
+            )?;
+        }
+        ResolvedVoteSigner::Recoverable {
+            context, authority, ..
+        } => {
+            let authority_round_id = hex::encode(context.vote_round_id());
+            if authority_round_id != round_id {
+                return Err(VotingError::InvalidInput {
+                    message: "recoverable vote signer is bound to a different round".to_string(),
+                });
+            }
+            authority.validate_persisted_with_conn(conn, wallet_id, round_id, bundle_index)?;
+        }
+    }
+    Ok(())
 }
 
 struct CastVoteSigningFields<'a> {
@@ -1342,9 +1499,25 @@ struct CastVoteSigningFields<'a> {
     alpha_v: &'a [u8],
 }
 
-fn signer_secret_and_network<'a>(signer: VoteSigner<'a>) -> (&'a [u8], Network) {
+fn resolve_vote_signer(signer: VoteSigner<'_>) -> Result<ResolvedVoteSigner<'_>, VotingError> {
     match signer {
-        VoteSigner::Hotkey { hotkey } => (hotkey.stored_secret(), hotkey.network()),
+        VoteSigner::Hotkey { hotkey } => Ok(ResolvedVoteSigner::Legacy {
+            secret: hotkey.stored_secret(),
+            network: hotkey.network(),
+        }),
+        VoteSigner::RecoverableAuthority { authority } => {
+            let root = authority.authority_root();
+            root.validate_current_selection(
+                authority.authority_selection(),
+                authority.current_round(),
+            )?;
+            let hotkey = root.voting_hotkey()?;
+            Ok(ResolvedVoteSigner::Recoverable {
+                spending_key: hotkey.orchard_spending_key(),
+                context: root.context(),
+                authority,
+            })
+        }
     }
 }
 
@@ -1352,19 +1525,33 @@ fn sign_cast_vote_with_signer(
     signer: VoteSigner<'_>,
     fields: CastVoteSigningFields<'_>,
 ) -> Result<CastVoteSignature, VotingError> {
-    let (secret, network) = signer_secret_and_network(signer);
-    crate::vote_commitment::sign_cast_vote(
-        secret,
-        network,
-        fields.vote_round_id,
-        fields.r_vpk_bytes,
-        fields.van_nullifier,
-        fields.vote_authority_note_new,
-        fields.vote_commitment,
-        fields.proposal_id,
-        fields.anchor_height,
-        fields.alpha_v,
-    )
+    match resolve_vote_signer(signer)? {
+        ResolvedVoteSigner::Legacy { secret, network } => crate::vote_commitment::sign_cast_vote(
+            secret,
+            network,
+            fields.vote_round_id,
+            fields.r_vpk_bytes,
+            fields.van_nullifier,
+            fields.vote_authority_note_new,
+            fields.vote_commitment,
+            fields.proposal_id,
+            fields.anchor_height,
+            fields.alpha_v,
+        ),
+        ResolvedVoteSigner::Recoverable { spending_key, .. } => {
+            crate::vote_commitment::sign_cast_vote_with_spending_key(
+                &spending_key,
+                fields.vote_round_id,
+                fields.r_vpk_bytes,
+                fields.van_nullifier,
+                fields.vote_authority_note_new,
+                fields.vote_commitment,
+                fields.proposal_id,
+                fields.anchor_height,
+                fields.alpha_v,
+            )
+        }
+    }
 }
 
 /// Chain-ready cast-vote submission fields for the vote chain.
@@ -1489,8 +1676,7 @@ pub fn prepare_commit(
 ) -> Result<PreparedVoteCommit, VotingError> {
     validate_draft_vote(draft)?;
 
-    let (secret, network) = signer_secret_and_network(signer);
-    db.require_round_network(round_id, network, "vote signer")?;
+    let resolved_signer = resolve_vote_signer(signer)?;
 
     let wallet_id = db.wallet_id();
     let recovered = {
@@ -1498,6 +1684,13 @@ pub fn prepare_commit(
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("failed to begin recovered vote preparation transaction: {e}"),
         })?;
+        validate_vote_signer_context_with_conn(
+            &tx,
+            &wallet_id,
+            round_id,
+            bundle_index,
+            resolved_signer,
+        )?;
         let recovered =
             recovery_bundle_with_conn(&tx, &wallet_id, round_id, bundle_index, draft.proposal_id)?;
         if let Some(recovered) = recovered.as_ref() {
@@ -1555,20 +1748,41 @@ pub fn prepare_commit(
         stages,
     };
     let auth_path = witness.auth_path_fixed()?;
-    let prepared_proof = db.prepare_vote_commitment(
-        round_id,
-        bundle_index,
-        secret,
-        network,
-        draft.proposal_id,
-        draft.choice,
-        draft.num_options,
-        &auth_path,
-        witness.position,
-        witness.anchor_height,
-        draft.single_share,
-        &progress,
-    )?;
+    let prepared_proof = match resolved_signer {
+        ResolvedVoteSigner::Legacy { secret, network } => db.prepare_vote_commitment(
+            round_id,
+            bundle_index,
+            secret,
+            network,
+            draft.proposal_id,
+            draft.choice,
+            draft.num_options,
+            &auth_path,
+            witness.position,
+            witness.anchor_height,
+            draft.single_share,
+            &progress,
+        )?,
+        ResolvedVoteSigner::Recoverable {
+            spending_key,
+            context,
+            authority,
+        } => db.prepare_vote_commitment_with_spending_key(
+            round_id,
+            bundle_index,
+            &spending_key,
+            context.network(),
+            Some(authority),
+            draft.proposal_id,
+            draft.choice,
+            draft.num_options,
+            &auth_path,
+            witness.position,
+            witness.anchor_height,
+            draft.single_share,
+            &progress,
+        )?,
+    };
     let bundle = prepared_proof.bundle;
     let wire_shares = bundle
         .enc_shares
@@ -3436,6 +3650,241 @@ mod tests {
         }
     }
 
+    fn recoverable_authority(
+        network: Network,
+        round_id: [u8; 32],
+    ) -> (
+        crate::recoverable_authority::VotingAuthorityRootV1,
+        crate::recoverable_authority::VotingAuthoritySelectionV1,
+        crate::config::VerifiedRoundAuthV3,
+        crate::recoverable_authority::RecoverableSelfCustodyBundlePlanV1,
+    ) {
+        let context = crate::recoverable_authority::VotingAuthorityContextV1::from_fingerprint(
+            network,
+            0,
+            [0x22; 32],
+            "vote-chain-test",
+            round_id,
+        )
+        .unwrap();
+        let request = crate::recoverable_authority::SoftwareRegisteredKeyRequestV1::new(
+            crate::recoverable_authority::RegisteredKeyApplicationV1::new(0xA11C),
+            context,
+        );
+        let root = crate::recoverable_authority::VotingAuthorityRootV1::from_registered_key_output(
+            &request, [0x55; 64],
+        );
+        let round_auth = crate::recoverable_authority::test_verified_round_auth_v3(root.context());
+        let selection = crate::recoverable_authority::VotingAuthoritySelectionV1::bind(
+            &root,
+            crate::recoverable_authority::BundleMaterialSourceV1::RecoverableSelfCustody,
+            &round_auth,
+        )
+        .unwrap();
+        let bundles =
+            crate::recoverable_authority::plan_recoverable_self_custody_bundles_v1(&[note(0)])
+                .unwrap();
+        (root, selection, round_auth, bundles)
+    }
+
+    fn persist_recoverable_self_custody_bundle(
+        db: &VotingDb,
+        root: &crate::recoverable_authority::VotingAuthorityRootV1,
+        bundle: &crate::recoverable_authority::RecoverableSelfCustodyBundleV1,
+    ) {
+        let blinding = bundle.derive_van_blinding(root);
+        let hotkey = root.voting_hotkey().unwrap();
+        let (g_d_x, pk_d_x) =
+            crate::action::derive_hotkey_x_coords_from_raw_address(hotkey.raw_orchard_address())
+                .unwrap();
+        let total_note_value = bundle.notes().iter().map(|note| note.value).sum::<u64>();
+        let van = crate::governance::construct_van(
+            &g_d_x,
+            &pk_d_x,
+            total_note_value,
+            root.context().vote_round_id(),
+            blinding.as_bytes(),
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE bundles
+                 SET van_comm_rand = ?1, gov_comm = ?2, total_note_value = ?3,
+                     address_index = 0
+                 WHERE round_id = ?4 AND wallet_id = ?5 AND bundle_index = ?6",
+                rusqlite::params![
+                    blinding.as_bytes().as_slice(),
+                    van,
+                    total_note_value,
+                    ROUND_ID,
+                    WALLET_ID,
+                    bundle.identity().bundle_index(),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn recoverable_signer_accepts_exact_self_custody_material_and_rejects_mismatch() {
+        let db = db_with_vote();
+        let round_id: [u8; 32] = hex::decode(ROUND_ID).unwrap().try_into().unwrap();
+        let (root, selection, round_auth, bundles) =
+            recoverable_authority(Network::Testnet, round_id);
+        let bundle = bundles.bundle(0).unwrap();
+        persist_recoverable_self_custody_bundle(&db, &root, bundle);
+        let authority = crate::recoverable_authority::RecoverableBundleUseV1::new(
+            &root,
+            &selection,
+            &round_auth,
+            crate::recoverable_authority::RecoverableBundleMaterialV1::RecoverableSelfCustody(
+                bundle.identity(),
+            ),
+        );
+        let signer = resolve_vote_signer(VoteSigner::recoverable_authority(authority)).unwrap();
+
+        {
+            let conn = db.conn();
+            validate_vote_signer_context_with_conn(&conn, WALLET_ID, ROUND_ID, 0, signer).unwrap();
+        }
+
+        db.conn()
+            .execute(
+                "UPDATE bundles SET total_note_value = total_note_value + 1
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                rusqlite::params![ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+        let error = prepare_commit(
+            &db,
+            ROUND_ID,
+            0,
+            &DraftVote {
+                proposal_id: 1,
+                choice: 2,
+                num_options: 3,
+                single_share: false,
+                vc_tree_position: 456,
+            },
+            &VanWitness {
+                auth_path: Vec::new(),
+                position: 0,
+                anchor_height: 0,
+            },
+            VoteSigner::recoverable_authority(authority),
+            &NoopProgressReporter,
+        )
+        .err()
+        .expect("mismatched persisted bundle material must fail before signing");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the selected recoverable source"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recoverable_signer_preflight_rejects_wrong_round_network_and_payload() {
+        let db = db_with_vote();
+        let draft = DraftVote {
+            proposal_id: 1,
+            choice: 2,
+            num_options: 3,
+            single_share: false,
+            vc_tree_position: 456,
+        };
+        let witness = VanWitness {
+            auth_path: Vec::new(),
+            position: 0,
+            anchor_height: 0,
+        };
+
+        let (wrong_round_root, wrong_round_selection, wrong_round_auth, wrong_round_bundles) =
+            recoverable_authority(Network::Testnet, [0x02; 32]);
+        let error = match prepare_commit(
+            &db,
+            ROUND_ID,
+            0,
+            &draft,
+            &witness,
+            VoteSigner::recoverable_authority(
+                crate::recoverable_authority::RecoverableBundleUseV1::new(
+                &wrong_round_root,
+                &wrong_round_selection,
+                &wrong_round_auth,
+                    crate::recoverable_authority::RecoverableBundleMaterialV1::RecoverableSelfCustody(
+                        wrong_round_bundles.bundle(0).unwrap().identity(),
+                    ),
+                ),
+            ),
+            &NoopProgressReporter,
+        ) {
+            Ok(_) => panic!("wrong-round recoverable signer must fail before proving"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("bound to a different round"));
+
+        let matching_round: [u8; 32] = hex::decode(ROUND_ID).unwrap().try_into().unwrap();
+        let (
+            wrong_network_root,
+            wrong_network_selection,
+            wrong_network_auth,
+            wrong_network_bundles,
+        ) = recoverable_authority(Network::Regtest, matching_round);
+        let drafts = [draft.clone()];
+        let batch = AtomicVoteBatch::new(ROUND_ID, 0, &drafts, &witness, &NoopProgressReporter);
+        let error = match prepare_atomic_vote_batch(
+            &db,
+            VoteSigner::recoverable_authority(
+                crate::recoverable_authority::RecoverableBundleUseV1::new(
+                    &wrong_network_root,
+                    &wrong_network_selection,
+                    &wrong_network_auth,
+                    crate::recoverable_authority::RecoverableBundleMaterialV1::RecoverableSelfCustody(
+                        wrong_network_bundles.bundle(0).unwrap().identity(),
+                    ),
+                ),
+            ),
+            batch,
+        ) {
+            Ok(_) => panic!("wrong-network recoverable signer must fail before proving"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("network"), "{error}");
+
+        let (root, selection, _, bundles) = recoverable_authority(Network::Testnet, matching_round);
+        let mut stale_round_id = [0u8; 32];
+        stale_round_id[0] = 3;
+        let (_, _, stale_round_auth, _) = recoverable_authority(Network::Testnet, stale_round_id);
+        let error = match prepare_commit(
+            &db,
+            ROUND_ID,
+            0,
+            &draft,
+            &witness,
+            VoteSigner::recoverable_authority(
+                crate::recoverable_authority::RecoverableBundleUseV1::new(
+                    &root,
+                    &selection,
+                    &stale_round_auth,
+                    crate::recoverable_authority::RecoverableBundleMaterialV1::RecoverableSelfCustody(
+                        bundles.bundle(0).unwrap().identity(),
+                    ),
+                ),
+            ),
+            &NoopProgressReporter,
+        ) {
+            Ok(_) => panic!("stale round payload must fail before proving"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("current authenticated round payload"),
+            "{error}"
+        );
+    }
+
     fn recovery_bundle_fixture() -> VoteRecoveryBundle {
         VoteRecoveryBundle {
             vote_round_id: ROUND_ID.to_string(),
@@ -4185,6 +4634,90 @@ mod tests {
             .unwrap();
 
         assert_ne!(Network::Regtest, Network::Testnet);
+    }
+
+    #[test]
+    fn recoverable_signer_uses_direct_orchard_key() {
+        use orchard::{
+            keys::SpendAuthorizingKey,
+            primitives::redpallas::{Signature, SpendAuth, VerificationKey},
+        };
+        use pasta_curves::group::ff::PrimeField;
+
+        let round_id: [u8; 32] = hex::decode(ROUND_ID).unwrap().try_into().unwrap();
+        let context = crate::recoverable_authority::VotingAuthorityContextV1::from_fingerprint(
+            Network::Regtest,
+            0,
+            [0x22; 32],
+            "vote-chain-test",
+            round_id,
+        )
+        .unwrap();
+        let request = crate::recoverable_authority::SoftwareRegisteredKeyRequestV1::new(
+            crate::recoverable_authority::RegisteredKeyApplicationV1::new(0xA11C),
+            context,
+        );
+        let root = crate::recoverable_authority::VotingAuthorityRootV1::from_registered_key_output(
+            &request, [0x55; 64],
+        );
+        let hotkey = root.voting_hotkey().unwrap();
+        let round_auth = crate::recoverable_authority::test_verified_round_auth_v3(root.context());
+        let selection = crate::recoverable_authority::VotingAuthoritySelectionV1::bind(
+            &root,
+            crate::recoverable_authority::BundleMaterialSourceV1::RecoverableSelfCustody,
+            &round_auth,
+        )
+        .unwrap();
+        let bundles =
+            crate::recoverable_authority::plan_recoverable_self_custody_bundles_v1(&[note(0)])
+                .unwrap();
+        let r_vpk = [0x10; 32];
+        let van_nullifier = [0x11; 32];
+        let vote_authority_note_new = [0x12; 32];
+        let vote_commitment = [0x13; 32];
+        let mut alpha_v = [0u8; 32];
+        alpha_v[0] = 7;
+
+        let signature = sign_cast_vote_with_signer(
+            VoteSigner::recoverable_authority(
+                crate::recoverable_authority::RecoverableBundleUseV1::new(
+                    &root,
+                    &selection,
+                    &round_auth,
+                    crate::recoverable_authority::RecoverableBundleMaterialV1::RecoverableSelfCustody(
+                        bundles.bundle(0).unwrap().identity(),
+                    ),
+                ),
+            ),
+            CastVoteSigningFields {
+                vote_round_id: ROUND_ID,
+                r_vpk_bytes: &r_vpk,
+                van_nullifier: &van_nullifier,
+                vote_authority_note_new: &vote_authority_note_new,
+                vote_commitment: &vote_commitment,
+                proposal_id: 1,
+                anchor_height: 123,
+                alpha_v: &alpha_v,
+            },
+        )
+        .unwrap();
+        let sighash = crate::vote_commitment::cast_vote_sighash(
+            ROUND_ID,
+            &r_vpk,
+            &van_nullifier,
+            &vote_authority_note_new,
+            &vote_commitment,
+            1,
+            123,
+        )
+        .unwrap();
+        let alpha = pasta_curves::pallas::Scalar::from_repr(alpha_v).unwrap();
+        let ask = SpendAuthorizingKey::from(&hotkey.orchard_spending_key());
+        let verification_key = VerificationKey::from(&ask.randomize(&alpha));
+        let signature: [u8; 64] = signature.vote_auth_sig.try_into().unwrap();
+        verification_key
+            .verify(&sighash, &Signature::<SpendAuth>::from(signature))
+            .unwrap();
     }
 
     #[test]

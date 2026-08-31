@@ -11,6 +11,8 @@ use crate::types::{Network, NoteInfo, VotingError, VotingRoundParams, WitnessDat
 
 mod share_delegations;
 
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) use share_delegations::record_share_delegation;
 #[cfg(test)]
 pub(crate) use share_delegations::record_share_delegation_with_after_read;
 pub use share_delegations::{
@@ -21,7 +23,7 @@ pub use share_delegations::{
 pub(crate) use share_delegations::{
     add_ambiguous_servers_for_generation, add_attempting_server_for_generation,
     add_sent_servers_for_generation, add_sent_servers_preserving_schedule_for_generation,
-    mark_share_confirmed, record_share_delegation, record_share_delegation_for_vote_generation,
+    mark_share_confirmed, record_share_delegation_for_vote_generation,
     remove_attempting_server_for_generation, share_is_confirmed_for_generation,
     ShareAttemptReservation,
 };
@@ -1518,6 +1520,62 @@ pub struct Zkp2DelegationData {
     /// cleared and acts as a structural invariant — it corresponds to the circuit's
     /// sentinel value rejected by the non-zero gate.
     pub proposal_authority: u64,
+}
+
+/// Exact persisted bundle fields that distinguish recoverable bundle sources.
+pub(crate) struct PersistedRecoverableBundleMaterial {
+    pub van_comm_rand: Vec<u8>,
+    pub gov_comm: Vec<u8>,
+    pub total_note_value: u64,
+    pub address_index: u32,
+    pub delegation_tx_hash: Option<String>,
+}
+
+/// Loads the immutable delegation material checked before recoverable authority use.
+pub(crate) fn load_persisted_recoverable_bundle_material(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<PersistedRecoverableBundleMaterial, VotingError> {
+    let (van_comm_rand, gov_comm, total_note_value, address_index, delegation_tx_hash) = conn
+        .query_row(
+            "SELECT van_comm_rand, gov_comm, total_note_value, address_index, delegation_tx_hash
+             FROM bundles
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": i64::from(bundle_index),
+            },
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .map_err(|error| VotingError::InvalidInput {
+            message: format!(
+                "recoverable bundle material is unavailable for round={round_id}, bundle={bundle_index} ({error})"
+            ),
+        })?;
+
+    Ok(PersistedRecoverableBundleMaterial {
+        van_comm_rand,
+        gov_comm,
+        total_note_value: u64::try_from(total_note_value).map_err(|_| VotingError::Internal {
+            message: "stored recoverable bundle weight is negative".to_string(),
+        })?,
+        address_index: u32::try_from(address_index).map_err(|_| VotingError::Internal {
+            message: "stored recoverable bundle address index is invalid".to_string(),
+        })?,
+        delegation_tx_hash,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3223,7 +3281,16 @@ pub fn clear_recovery_state(
     wallet_id: &str,
 ) -> Result<(), VotingError> {
     conn.execute(
-        "DELETE FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        "DELETE FROM share_delegations
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+           AND NOT EXISTS (
+               SELECT 1 FROM pending_vote_backup_protection AS protection
+               WHERE protection.round_id = share_delegations.round_id
+                 AND protection.wallet_id = share_delegations.wallet_id
+                 AND protection.bundle_index = share_delegations.bundle_index
+                 AND protection.proposal_id = share_delegations.proposal_id
+                 AND protection.retired = 0
+           )",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {
@@ -3251,7 +3318,15 @@ pub fn clear_recovery_state(
         "UPDATE votes SET tx_hash = NULL, commitment_bundle_json = NULL
          WHERE round_id = :round_id
            AND wallet_id = :wallet_id
-           AND vc_tree_position IS NULL",
+           AND vc_tree_position IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM pending_vote_backup_protection AS protection
+               WHERE protection.round_id = votes.round_id
+                 AND protection.wallet_id = votes.wallet_id
+                 AND protection.bundle_index = votes.bundle_index
+                 AND protection.proposal_id = votes.proposal_id
+                 AND protection.retired = 0
+           )",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {

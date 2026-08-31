@@ -50,6 +50,22 @@ stage-oriented API:
   delegation submissions, bounded by the smaller of 1% of selected note value
   and 1,000 ZEC by default. `PrivacyTrim` reports the raw note value excluded,
   not bundle-quantized voting weight.
+- `recoverable_authority::*` is the opt-in authority path for round-auth v3
+  rounds. It accepts a seed-free registered-key result or a backed-up Keystone
+  host master generation, binds the result to the exact account, network, vote
+  chain, round, and signed config payload, and derives the Orchard voting key
+  plus canonical self-custody bundle material. Wallets retain the authority
+  selection and secrets in authenticated, encrypted, rollback-protected state
+  outside `VotingDb`. Software integrations must freeze and retain their
+  allocated ZIP-32 registered application identifier; this crate does not
+  invent one. Recoverable v3 callers must keep the opaque verified-round token
+  returned by v3 config resolution. Its PIR path also requires exact endpoint
+  metadata containing the signed snapshot height, block hash, and layout. The
+  current height-only PIR `/root` metadata is insufficient; legacy round-auth
+  v2 PIR APIs are unchanged. Authority-chain recovery locally verifies VCT
+  paths, native VAN nullifiers, and transitions, and also requires a caller
+  integration that independently authenticates the finalized checkpoint and
+  proves the supplied transition stream complete through it.
 - `precompute::*` prepares shielded note witnesses, delegation PIR inputs, and VAN
   witnesses for vote proofs. `precompute_pir_proofs` warms PIR nullifier proofs in
   the background before any round or bundle exists (no hotkey needed), keyed by
@@ -71,6 +87,10 @@ stage-oriented API:
   applies share scheduling policy. `CommittedVote::submit_share_to_helpers`
   owns journaled initial delivery, while `track_pending_shares` requires two
   distinct configured helpers to agree before persisting confirmation.
+  Recoverable rounds use the pending-backup variants to checkpoint the complete
+  vote, original helper plans, and tracker evidence before each dependent POST
+  and after each classified outcome. The wallet encrypts and atomically stores
+  that rollback-aware ledger.
 - `session::*` records durable ballot intent and returns a round-level
   `RoundPlan` with ordered `NextStep`s for restart recovery. Wallets should
   write `Decision::Choice` with the proposal's declared option count before

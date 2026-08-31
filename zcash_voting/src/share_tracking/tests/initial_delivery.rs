@@ -610,6 +610,174 @@ async fn committed_vote_submission_keeps_degraded_planned_target_before_healthy_
 }
 
 #[tokio::test(start_paused = true)]
+async fn pending_backup_rejects_material_mismatch_and_checkpoint_failure_dispatches_no_post() {
+    use crate::recoverable_authority::{
+        capture_pending_vote_backup_record_v1, BundleMaterialSourceV1, PendingHelperSharePlanV1,
+        PendingVoteBackupCheckpointV1, PendingVoteBackupKindV1, PendingVoteBackupLedgerV1,
+        RecoverableBundleMaterialV1, RecoverableBundleUseV1, RecoverableSelfCustodyBundleV1,
+        RegisteredKeyApplicationV1, SoftwareRegisteredKeyRequestV1, VotingAuthorityContextV1,
+        VotingAuthorityRootV1, VotingAuthoritySelectionV1,
+    };
+
+    let db = db_with_recoverable_vote();
+    let committed = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    committed.record_submission(&db, "vote-tx").unwrap();
+    let configured = helpers(1);
+    let plan = ShareSubmissionPlan {
+        immediate: false,
+        submit_at: 4_321,
+        target_count: 1,
+        target_servers: configured.clone(),
+    };
+    let context = VotingAuthorityContextV1::from_fingerprint(
+        crate::Network::Testnet,
+        0,
+        [0x55; 32],
+        "vote-chain-test",
+        [0x01; 32],
+    )
+    .unwrap();
+    let request = SoftwareRegisteredKeyRequestV1::new(RegisteredKeyApplicationV1::new(7), context);
+    let root = VotingAuthorityRootV1::from_registered_key_output(&request, [0x66; 64]);
+    let round_auth = crate::recoverable_authority::test_verified_round_auth_v3(root.context());
+    let selection = VotingAuthoritySelectionV1::bind(
+        &root,
+        BundleMaterialSourceV1::RecoverableSelfCustody,
+        &round_auth,
+    )
+    .unwrap();
+    let bundle = RecoverableSelfCustodyBundleV1::from_canonical_bundle(
+        0,
+        vec![crate::types::NoteInfo {
+            commitment: vec![0x91; 32],
+            nullifier: vec![0x92; 32],
+            value: crate::governance::BALLOT_DIVISOR,
+            position: 0,
+            diversifier: vec![0; 11],
+            rho: vec![0; 32],
+            rseed: vec![0; 32],
+            scope: 0,
+            ufvk_str: String::new(),
+        }],
+    )
+    .unwrap();
+    let authority = RecoverableBundleUseV1::new(
+        &root,
+        &selection,
+        &round_auth,
+        RecoverableBundleMaterialV1::RecoverableSelfCustody(bundle.identity()),
+    );
+    let helper_plans = (0..crate::share_policy::VOTE_COMMITMENT_SHARE_COUNT)
+        .map(|share_index| PendingHelperSharePlanV1 {
+            proposal_id: 1,
+            share_index: share_index as u32,
+            plan: plan.clone(),
+        })
+        .collect::<Vec<_>>();
+    db.conn()
+        .execute(
+            "UPDATE bundles
+             SET van_comm_rand = ?1, gov_comm = ?2, total_note_value = ?3,
+                 address_index = 0
+             WHERE round_id = ?4 AND wallet_id = ?5 AND bundle_index = 0",
+            rusqlite::params![
+                [0xA1u8; 32].as_slice(),
+                [0xA2u8; 32].as_slice(),
+                crate::governance::BALLOT_DIVISOR,
+                ROUND_ID,
+                db.wallet_id(),
+            ],
+        )
+        .unwrap();
+    let error = capture_pending_vote_backup_record_v1(
+        &db,
+        authority,
+        PendingVoteBackupKindV1::Singleton { proposal_id: 1 },
+        configured.clone(),
+        helper_plans.clone(),
+    )
+    .err()
+    .expect("mismatched persisted material must fail before pending export");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the selected recoverable source"),
+        "{error}"
+    );
+
+    let blinding = bundle.derive_van_blinding(&root);
+    let hotkey = root.voting_hotkey().unwrap();
+    let (g_d_x, pk_d_x) =
+        crate::action::derive_hotkey_x_coords_from_raw_address(hotkey.raw_orchard_address())
+            .unwrap();
+    let van = crate::governance::construct_van(
+        &g_d_x,
+        &pk_d_x,
+        crate::governance::BALLOT_DIVISOR,
+        root.context().vote_round_id(),
+        blinding.as_bytes(),
+    )
+    .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE bundles
+             SET van_comm_rand = ?1, gov_comm = ?2, total_note_value = ?3, address_index = 0
+             WHERE round_id = ?4 AND wallet_id = ?5 AND bundle_index = 0",
+            rusqlite::params![
+                blinding.as_bytes().as_slice(),
+                van,
+                crate::governance::BALLOT_DIVISOR,
+                ROUND_ID,
+                db.wallet_id(),
+            ],
+        )
+        .unwrap();
+    let record = capture_pending_vote_backup_record_v1(
+        &db,
+        authority,
+        PendingVoteBackupKindV1::Singleton { proposal_id: 1 },
+        configured.clone(),
+        helper_plans,
+    )
+    .unwrap();
+    let record_id = record.record_id();
+    let mut ledger = PendingVoteBackupLedgerV1::new(record).unwrap();
+    let mut persist = |_: &PendingVoteBackupLedgerV1| {
+        Err(VotingError::Internal {
+            message: "injected pending backup failure".to_string(),
+        })
+    };
+    let mut checkpoint =
+        PendingVoteBackupCheckpointV1::new(&mut ledger, record_id, &mut persist).unwrap();
+    let post_url = format!("{}/shielded-vote/v1/shares", helper(1));
+    let transport = Arc::new(MockTransport::default());
+    transport.queue_post(&post_url, json_status("queued"));
+    let client = client_with(transport.clone());
+
+    let error = committed
+        .submit_share_to_helpers_with_pending_backup(
+            &db,
+            &client,
+            ShareSubmissionRequest {
+                share_index: 0,
+                plan: &plan,
+                configured_server_urls: &configured,
+                now_seconds: SUBMIT_AT,
+            },
+            &mut checkpoint,
+            &never_cancel(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("injected pending backup failure"));
+    assert!(transport.calls().is_empty());
+    assert_eq!(only_share(&db).attempting_urls, configured);
+}
+
+#[tokio::test(start_paused = true)]
 async fn stale_committed_vote_submission_is_rejected_before_side_effects() {
     let db = db_with_round_and_bundle();
     let original_recovery = recovery_bundle_fixture();

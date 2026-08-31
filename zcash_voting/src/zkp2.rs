@@ -1,5 +1,7 @@
 #[allow(unused_imports)]
-pub(crate) use crate::backend::{orchard, pasta_curves};
+pub(crate) use crate::backend::{halo2_gadgets, orchard, pasta_curves};
+use halo2_gadgets::poseidon::primitives::{self as poseidon, ConstantLength, P128Pow5T3};
+use orchard::keys::FullViewingKey;
 use pasta_curves::group::{
     ff::{Field, PrimeField},
     Curve, Group, GroupEncoding,
@@ -48,10 +50,35 @@ pub(crate) fn plan_vote_authority_transition(
         network,
         VOTING_HOTKEY_ACCOUNT_INDEX,
     )?;
+    plan_vote_authority_transition_from_spending_key(
+        &sk,
+        address_index,
+        total_note_value,
+        gov_comm_rand,
+        voting_round_id,
+        proposal_id,
+        proposal_authority_old,
+    )
+}
+
+/// Derives one authority transition from an already-derived Orchard voting key.
+///
+/// Recoverable authority calls this path so its direct Orchard key is never
+/// reinterpreted as a legacy UnifiedSpendingKey seed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_vote_authority_transition_from_spending_key(
+    sk: &orchard::keys::SpendingKey,
+    address_index: u32,
+    total_note_value: u64,
+    gov_comm_rand: &[u8],
+    voting_round_id: &[u8],
+    proposal_id: u32,
+    proposal_authority_old: u64,
+) -> Result<VoteAuthorityTransitionPlan, VotingError> {
     let gov_comm_rand = parse_base("gov_comm_rand", gov_comm_rand)?;
     let voting_round_id = parse_base("voting_round_id", voting_round_id)?;
     let transition = derive_vote_authority_transition(
-        &sk,
+        sk,
         address_index,
         total_note_value,
         gov_comm_rand,
@@ -69,6 +96,38 @@ pub(crate) fn plan_vote_authority_transition(
         proposal_authority_old: transition.proposal_authority_old,
         proposal_authority_new: transition.proposal_authority_new,
     })
+}
+
+/// Derives the chain-visible nullifier for one native VAN spend.
+///
+/// `voting-circuits` currently keeps this out-of-circuit helper private. Keep
+/// this formula and its frozen vector in lockstep with vote-proof condition 5.
+pub(crate) fn derive_van_nullifier_from_spending_key(
+    sk: &orchard::keys::SpendingKey,
+    voting_round_id: &[u8],
+    vote_authority_note_old: &[u8],
+) -> Result<[u8; 32], VotingError> {
+    let voting_round_id = parse_base("voting_round_id", voting_round_id)?;
+    let vote_authority_note_old = parse_base("vote_authority_note_old", vote_authority_note_old)?;
+    let fvk = FullViewingKey::from(sk);
+    Ok(van_nullifier_hash(fvk.nk().inner(), voting_round_id, vote_authority_note_old).to_repr())
+}
+
+fn van_nullifier_hash(
+    nullifier_deriving_key: pallas::Base,
+    voting_round_id: pallas::Base,
+    vote_authority_note_old: pallas::Base,
+) -> pallas::Base {
+    let mut domain_bytes = [0u8; 32];
+    domain_bytes[..b"vote authority spend".len()].copy_from_slice(b"vote authority spend");
+    let domain = pallas::Base::from_repr(domain_bytes)
+        .expect("the frozen short ASCII VAN-nullifier domain is canonical");
+    poseidon::Hash::<_, P128Pow5T3, ConstantLength<4>, 3, 2>::init().hash([
+        nullifier_deriving_key,
+        domain,
+        voting_round_id,
+        vote_authority_note_old,
+    ])
 }
 
 fn parse_base(name: &str, bytes: &[u8]) -> Result<pallas::Base, VotingError> {
@@ -129,6 +188,49 @@ pub(crate) fn build_vote_commitment(
     single_share: bool,
     progress: &dyn ProgressReporter,
 ) -> Result<VoteCommitmentBundle, VotingError> {
+    let sk = crate::hotkey::spending_key_from_hotkey_seed(
+        hotkey_seed,
+        network,
+        VOTING_HOTKEY_ACCOUNT_INDEX,
+    )?;
+    build_vote_commitment_from_spending_key(
+        &sk,
+        address_index,
+        total_note_value,
+        gov_comm_rand,
+        voting_round_id,
+        ea_pk,
+        proposal_id,
+        choice,
+        num_options,
+        van_auth_path,
+        van_position,
+        anchor_height,
+        proposal_authority,
+        single_share,
+        progress,
+    )
+}
+
+/// Builds ZKP #2 from an already-derived Orchard voting key.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_vote_commitment_from_spending_key(
+    sk: &orchard::keys::SpendingKey,
+    address_index: u32,
+    total_note_value: u64,
+    gov_comm_rand: &[u8],
+    voting_round_id: &[u8],
+    ea_pk: &[u8],
+    proposal_id: u32,
+    choice: u32,
+    num_options: u32,
+    van_auth_path: &[[u8; 32]],
+    van_position: u32,
+    anchor_height: u32,
+    proposal_authority: u64,
+    single_share: bool,
+    progress: &dyn ProgressReporter,
+) -> Result<VoteCommitmentBundle, VotingError> {
     validate_vote_decision(choice, num_options)?;
     if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_id) {
         return Err(VotingError::InvalidInput {
@@ -148,13 +250,7 @@ pub(crate) fn build_vote_commitment(
         });
     }
 
-    // Derive the Orchard SpendingKey from the hotkey seed via ZIP-32.
     progress.on_progress(0.05);
-    let sk = crate::hotkey::spending_key_from_hotkey_seed(
-        hotkey_seed,
-        network,
-        VOTING_HOTKEY_ACCOUNT_INDEX,
-    )?;
 
     // Parse gov_comm_rand → pallas::Base
     let gcr = parse_base("gov_comm_rand", gov_comm_rand)?;
@@ -194,7 +290,7 @@ pub(crate) fn build_vote_commitment(
     // Generate spend-auth randomizer for the voting key.
     // The caller will need alpha_v to sign the TX2 sighash with rsk_v = ask_v.randomize(&alpha_v).
     let alpha_v = pallas::Scalar::random(&mut voting_crypto_deps::rand::rngs::OsRng);
-    let sk_for_proof = sk.clone();
+    let sk_for_proof = *sk;
     let vote_bundle = std::thread::Builder::new()
         .name("vote-proof-build".to_string())
         .stack_size(VOTE_PROOF_STACK_BYTES)
@@ -286,6 +382,22 @@ mod tests {
     }
 
     #[test]
+    fn van_nullifier_formula_matches_the_voting_circuit_vector() {
+        assert_eq!(
+            van_nullifier_hash(
+                pallas::Base::from(1u64),
+                pallas::Base::from(42u64),
+                pallas::Base::from(100u64),
+            )
+            .to_repr(),
+            [
+                114, 56, 62, 208, 155, 244, 76, 209, 125, 210, 149, 109, 176, 88, 34, 116, 123, 56,
+                62, 216, 108, 204, 55, 120, 28, 155, 217, 186, 29, 159, 128, 2,
+            ]
+        );
+    }
+
+    #[test]
     fn hotkey_spending_key_helper_uses_zip32_account_index() {
         let seed = [0x42; 64];
 
@@ -308,6 +420,34 @@ mod tests {
             orchard::keys::FullViewingKey::from(&account_0).to_bytes(),
             orchard::keys::FullViewingKey::from(&account_1).to_bytes()
         );
+    }
+
+    #[test]
+    fn legacy_transition_wrapper_matches_direct_spending_key_path() {
+        let seed = [0x42; 64];
+        let network = Network::Mainnet;
+        let spending_key = crate::hotkey::spending_key_from_hotkey_seed(
+            &seed,
+            network,
+            VOTING_HOTKEY_ACCOUNT_INDEX,
+        )
+        .unwrap();
+        let legacy = plan_vote_authority_transition(
+            &seed, network, 0, 12_500_000, &[0; 32], &[1; 32], 1, 0xFFFF,
+        )
+        .unwrap();
+        let direct = plan_vote_authority_transition_from_spending_key(
+            &spending_key,
+            0,
+            12_500_000,
+            &[0; 32],
+            &[1; 32],
+            1,
+            0xFFFF,
+        )
+        .unwrap();
+
+        assert_eq!(legacy, direct);
     }
 
     #[test]
