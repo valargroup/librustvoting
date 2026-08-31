@@ -24,6 +24,44 @@ pub enum Decision {
     Skipped,
 }
 
+/// Durable ballot-intent classification shared by resume and helper planning.
+pub(crate) struct BallotIntentClassification {
+    pub(crate) roster: BTreeSet<u32>,
+    pub(crate) choice_proposals: Vec<u32>,
+    pub(crate) open_proposals: Vec<u32>,
+}
+
+pub(crate) fn classify_ballot_intents(
+    proposal_ids: &[u32],
+    intents: &BTreeMap<u32, Decision>,
+) -> Result<BallotIntentClassification, VotingError> {
+    let mut roster = BTreeSet::new();
+    for &proposal_id in proposal_ids {
+        validate_proposal_id(proposal_id)?;
+        if !roster.insert(proposal_id) {
+            return Err(VotingError::InvalidInput {
+                message: format!("proposal roster contains duplicate id {proposal_id}"),
+            });
+        }
+    }
+
+    let mut choice_proposals = Vec::new();
+    let mut open_proposals = Vec::new();
+    for &proposal_id in &roster {
+        match intents.get(&proposal_id) {
+            Some(Decision::Choice(_)) => choice_proposals.push(proposal_id),
+            Some(Decision::Skipped) => {}
+            None => open_proposals.push(proposal_id),
+        }
+    }
+
+    Ok(BallotIntentClassification {
+        roster,
+        choice_proposals,
+        open_proposals,
+    })
+}
+
 impl VotingDb {
     /// Record (insert or replace) the voter's decision for one proposal.
     ///
@@ -206,10 +244,11 @@ pub enum NextStep {
     /// fields to the vote chain, persist the cast-vote tx hash with
     /// `vote::record_submission` while polling, then call
     /// `confirmation::confirm_vote_submission` after the transaction confirms.
-    /// After confirmation, recover the `CommittedVote`, create and persist its
-    /// complete helper-share plan if none exists, and submit through
-    /// `CommittedVote::submit_share_to_helpers` with the current helper fleet.
-    /// The typed method rebuilds payloads with the confirmed commitment-tree
+    /// Recover the `CommittedVote`, preflight the complete helper fleet, and
+    /// call `CommittedVote::prepare_share_delivery` to create or reload its
+    /// complete persisted plan. After confirmation, submit through
+    /// `CommittedVote::submit_prepared_shares` with the current fleet. The
+    /// typed method rebuilds payloads with the confirmed commitment-tree
     /// position and journals each POST before dispatch.
     SubmitVote {
         bundle_index: u32,
@@ -240,18 +279,17 @@ pub enum NextStep {
         bundle_index: u32,
         proposal_id: u32,
     },
-    /// Submit helper shares for an already-confirmed vote.
+    /// Resume helper-share submission for a committed vote.
     ///
     /// This covers the crash boundary after the cast-vote transaction confirms
     /// and before every helper-share row has been durably recorded. The
-    /// `share_index` identifies the missing helper share to submit. Wallets
-    /// should recover the `CommittedVote` and reuse the original full-batch
-    /// planner output when calling `CommittedVote::submit_share_to_helpers`;
-    /// recomputing plans independently for missing shares can violate the
-    /// planner's batch-wide per-helper quota. This crate does not yet persist
-    /// that planner output, so the wallet must persist it before submitting
-    /// the first share. The submission method journals every attempt and
-    /// outcome, but not the batch plan itself.
+    /// `share_index` identifies one missing share for stable recovery UI and
+    /// FFI routing. The host should recover the `CommittedVote`, call
+    /// `CommittedVote::prepare_share_delivery` to load or create the
+    /// SDK-persisted complete plan, and then call
+    /// `CommittedVote::submit_prepared_shares`. Submission validates the whole
+    /// batch before network I/O, journals every attempt and outcome, and
+    /// resumes only the remaining definite-delivery deficits.
     SubmitShares {
         bundle_index: u32,
         proposal_id: u32,
@@ -957,10 +995,6 @@ pub fn resume_plan(
     round_id: &str,
     proposal_ids: &[u32],
 ) -> Result<RoundPlan, VotingError> {
-    for &proposal_id in proposal_ids {
-        validate_proposal_id(proposal_id)?;
-    }
-
     let delegation: BTreeMap<u32, DelegationPhase> =
         db.delegation_phases(round_id)?.into_iter().collect();
     let votes: BTreeMap<(u32, u32), VotePhase> = db
@@ -985,20 +1019,11 @@ pub fn resume_plan(
         },
     );
     let intents: BTreeMap<u32, Decision> = db.ballot_intents(round_id)?.into_iter().collect();
+    let intent_classification = classify_ballot_intents(proposal_ids, &intents)?;
 
     let bundles: Vec<u32> = delegation.keys().copied().collect();
-
-    let mut choice_proposals: Vec<u32> = Vec::new();
-    let mut open_proposals: Vec<u32> = Vec::new();
-    for &pid in proposal_ids {
-        match intents.get(&pid) {
-            Some(Decision::Choice(_)) => choice_proposals.push(pid),
-            Some(Decision::Skipped) => {}
-            None => open_proposals.push(pid),
-        }
-    }
-    choice_proposals.sort_unstable();
-    open_proposals.sort_unstable();
+    let choice_proposals = intent_classification.choice_proposals;
+    let open_proposals = intent_classification.open_proposals;
 
     if !choice_proposals.is_empty() && bundles.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -1687,6 +1712,7 @@ mod tests {
 
         assert!(resume_plan(&db, ROUND, &[1, 0]).is_err());
         assert!(resume_plan(&db, ROUND, &[1, 16]).is_err());
+        assert!(resume_plan(&db, ROUND, &[1, 1]).is_err());
     }
 
     #[test]

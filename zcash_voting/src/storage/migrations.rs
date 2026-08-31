@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 16;
+const CURRENT_VERSION: u32 = 17;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -55,11 +55,55 @@ DROP TABLE imt_proofs;",
 ALTER TABLE share_delegations ADD COLUMN attempting_urls TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE share_delegations ADD COLUMN target_count INTEGER NOT NULL DEFAULT 0;",
     ),
+    (
+        16,
+        "CREATE TABLE helper_share_plans (
+    round_id                    TEXT NOT NULL,
+    wallet_id                   TEXT NOT NULL DEFAULT '',
+    bundle_index                INTEGER NOT NULL,
+    proposal_id                 INTEGER NOT NULL,
+    commitment_bundle_json      TEXT NOT NULL,
+    configured_server_urls_json TEXT NOT NULL,
+    share_plans_json            TEXT NOT NULL,
+    format_version              INTEGER NOT NULL CHECK (format_version = 1),
+    placement_guarantee         TEXT NOT NULL CHECK (placement_guarantee IN ('strict','legacy_best_effort')),
+    created_at                  INTEGER NOT NULL,
+    PRIMARY KEY (round_id, wallet_id, bundle_index, proposal_id),
+    FOREIGN KEY (round_id, wallet_id, bundle_index, proposal_id)
+        REFERENCES votes(round_id, wallet_id, bundle_index, proposal_id) ON DELETE CASCADE
+);
+CREATE TRIGGER clear_helper_share_plan_on_vote_generation_change
+AFTER UPDATE OF commitment_bundle_json ON votes
+WHEN OLD.commitment_bundle_json IS NOT NEW.commitment_bundle_json
+BEGIN
+    -- Confirmation is the one non-generational recovery update: it fills the
+    -- VC tree position in both the vote column and the otherwise-identical
+    -- recovery JSON. Advance only a plan bound to the exact OLD snapshot and
+    -- only when replacing that one JSON field produces the exact NEW bytes.
+    UPDATE helper_share_plans
+       SET commitment_bundle_json = NEW.commitment_bundle_json
+     WHERE round_id = NEW.round_id AND wallet_id = NEW.wallet_id
+       AND bundle_index = NEW.bundle_index AND proposal_id = NEW.proposal_id
+       AND commitment_bundle_json = OLD.commitment_bundle_json
+       AND OLD.vc_tree_position IS NULL
+       AND NEW.vc_tree_position IS NOT NULL
+       AND json_set(
+               OLD.commitment_bundle_json,
+               '$.vc_tree_position',
+               NEW.vc_tree_position
+           ) = NEW.commitment_bundle_json;
+    DELETE FROM helper_share_plans
+     WHERE round_id = NEW.round_id AND wallet_id = NEW.wallet_id
+       AND bundle_index = NEW.bundle_index AND proposal_id = NEW.proposal_id
+       AND commitment_bundle_json IS NOT NEW.commitment_bundle_json;
+END;",
+    ),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
 DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
+DROP TABLE IF EXISTS helper_share_plans;
 DROP TABLE IF EXISTS share_delegations;
 DROP TABLE IF EXISTS keystone_signatures;
 DROP TABLE IF EXISTS votes;
@@ -146,6 +190,7 @@ mod tests {
     use super::*;
     use crate::storage::queries;
     use crate::VotingRoundParams;
+    use rusqlite::OptionalExtension;
 
     fn pre_v8_schema() -> String {
         include_str!("migrations/001_init.sql").replace("    note_identity_hashes_blob BLOB,\n", "")
@@ -172,6 +217,21 @@ mod tests {
             .replace("    target_count    INTEGER NOT NULL DEFAULT 0,\n", "")
     }
 
+    /// Strips the helper plan table and trigger added at version 17.
+    fn without_helper_share_plans(schema: &str) -> String {
+        let start = schema
+            .find("CREATE TABLE helper_share_plans")
+            .expect("schema must contain the table added at version 17");
+        let next = schema[start..]
+            .find("CREATE TABLE share_delegations")
+            .expect("helper plan DDL must precede share delegations");
+        format!("{}{}", &schema[..start], &schema[start + next..])
+    }
+
+    fn v16_schema() -> String {
+        without_helper_share_plans(include_str!("migrations/001_init.sql"))
+    }
+
     /// The bundle-scoped `imt_proofs` table that version 15 replaced with
     /// `pir_proof_cache`, exactly as `001_init.sql` created it through v14.
     const V14_IMT_PROOFS_SQL: &str = "CREATE TABLE imt_proofs (
@@ -190,7 +250,8 @@ mod tests {
 
     /// The version-14 schema: no `pir_proof_cache` yet, `imt_proofs` still present.
     fn v14_schema() -> String {
-        let schema = without_durable_ambiguous_deliveries(include_str!("migrations/001_init.sql"));
+        let v16 = v16_schema();
+        let schema = without_durable_ambiguous_deliveries(&v16);
         format!(
             "{}\n{}\n",
             without_pir_proof_cache(&schema),
@@ -368,6 +429,7 @@ mod tests {
             "rounds",
             "bundles",
             "votes",
+            "helper_share_plans",
             "share_delegations",
             "pir_proof_cache",
         ] {
@@ -377,6 +439,43 @@ mod tests {
                 "column mismatch in {table}"
             );
         }
+        assert_eq!(
+            schema_sql(
+                &migrated,
+                "trigger",
+                "clear_helper_share_plan_on_vote_generation_change"
+            ),
+            schema_sql(
+                &fresh,
+                "trigger",
+                "clear_helper_share_plan_on_vote_generation_change"
+            ),
+            "migrated and fresh schemas must install the same plan lifecycle trigger"
+        );
+    }
+
+    #[test]
+    fn migrate_v16_to_v17_installs_plan_lifecycle_invariants() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v16_schema()).unwrap();
+        conn.pragma_update(None, "user_version", 16).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            CURRENT_VERSION
+        );
+        assert_helper_plan_lifecycle(&conn);
+    }
+
+    #[test]
+    fn fresh_schema_enforces_plan_lifecycle_invariants() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        assert_helper_plan_lifecycle(&conn);
     }
 
     #[test]
@@ -514,6 +613,7 @@ mod tests {
         // Replaced by pir_proof_cache at v15.
         assert!(!tables.contains(&"imt_proofs".to_string()));
         assert!(tables.contains(&"share_delegations".to_string()));
+        assert!(tables.contains(&"helper_share_plans".to_string()));
         assert!(tables.contains(&"keystone_signatures".to_string()));
         assert!(tables.contains(&"ballot_intent".to_string()));
         assert!(tables.contains(&"pir_proof_cache".to_string()));
@@ -586,5 +686,95 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<String>, _>>()
             .unwrap()
+    }
+
+    fn schema_sql(conn: &Connection, object_type: &str, name: &str) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            rusqlite::params![object_type, name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn assert_helper_plan_lifecycle(conn: &Connection) {
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        queries::insert_round(
+            conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        queries::insert_bundle(conn, "test-round", "wallet", 0, &[1]).unwrap();
+        queries::store_vote(conn, "test-round", "wallet", 0, 1, 0, &[0xCA; 32]).unwrap();
+        let before = r#"{"vc_tree_position":0,"marker":"same"}"#;
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json = ?1
+             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
+               AND bundle_index = 0 AND proposal_id = 1",
+            [before],
+        )
+        .unwrap();
+        insert_helper_plan(conn, before);
+
+        let confirmed = r#"{"vc_tree_position":7,"marker":"same"}"#;
+        conn.execute(
+            "UPDATE votes
+                SET commitment_bundle_json = ?1, vc_tree_position = 7
+              WHERE round_id = 'test-round' AND wallet_id = 'wallet'
+                AND bundle_index = 0 AND proposal_id = 1",
+            [confirmed],
+        )
+        .unwrap();
+        assert_eq!(stored_plan_snapshot(conn).as_deref(), Some(confirmed));
+
+        // A non-confirmation recovery-material change is a new generation,
+        // even when it retains the already-confirmed VC position.
+        let replacement = r#"{"vc_tree_position":7,"marker":"replacement"}"#;
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json = ?1
+             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
+               AND bundle_index = 0 AND proposal_id = 1",
+            [replacement],
+        )
+        .unwrap();
+        assert_eq!(stored_plan_snapshot(conn), None);
+
+        insert_helper_plan(conn, replacement);
+        conn.execute(
+            "DELETE FROM votes
+             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
+               AND bundle_index = 0 AND proposal_id = 1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(stored_plan_snapshot(conn), None);
+    }
+
+    fn insert_helper_plan(conn: &Connection, snapshot: &str) {
+        conn.execute(
+            "INSERT INTO helper_share_plans
+             (round_id, wallet_id, bundle_index, proposal_id,
+              commitment_bundle_json, configured_server_urls_json,
+              share_plans_json, format_version, placement_guarantee, created_at)
+             VALUES ('test-round', 'wallet', 0, 1, ?1, '[\"https://helper.example\"]',
+                     '[]', 1, 'strict', 1)",
+            [snapshot],
+        )
+        .unwrap();
+    }
+
+    fn stored_plan_snapshot(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT commitment_bundle_json FROM helper_share_plans
+             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
+               AND bundle_index = 0 AND proposal_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
     }
 }
