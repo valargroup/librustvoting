@@ -368,3 +368,297 @@ fn invalid_recovery(message: impl Into<String>) -> VotingError {
         message: message.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        backend::pasta_curves::{group::ff::PrimeField, pallas},
+        governance::BALLOT_DIVISOR,
+        recoverable_authority::{
+            test_validated_recoverable_voting_round_v1, RecoverableBundleMaterialV1,
+            RecoverableSelfCustodyBundleV1, RegisteredKeyApplicationV1,
+            SoftwareRegisteredKeyRequestV1, ValidatedRecoverableVotingRoundV1,
+            VotingAuthorityContextV1, VotingAuthorityRootBindingV1, VotingAuthorityRootV1,
+        },
+        types::{Network, NoteInfo},
+        wire::VotingRoundParams,
+    };
+    use vote_commitment_tree::MemoryTreeServer;
+
+    const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    const CHAIN_ID: &str = "vote-chain-test";
+    const CHECKPOINT_HEIGHT: u32 = 100;
+
+    struct Fixture {
+        root: VotingAuthorityRootV1,
+        binding: VotingAuthorityRootBindingV1,
+        round: ValidatedRecoverableVotingRoundV1,
+        bundle: RecoverableSelfCustodyBundleV1,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let context = VotingAuthorityContextV1::from_fingerprint(
+                Network::Testnet,
+                0,
+                [0x22; 32],
+                CHAIN_ID,
+                [0x01; 32],
+            )
+            .unwrap();
+            let request = SoftwareRegisteredKeyRequestV1::new(
+                RegisteredKeyApplicationV1::new(0xA11C),
+                context,
+            );
+            let root = VotingAuthorityRootV1::from_registered_key_output(&request, [0x55; 64]);
+            let binding = VotingAuthorityRootBindingV1::bind(&root);
+            let round = test_validated_recoverable_voting_round_v1(
+                Network::Testnet,
+                CHAIN_ID,
+                round_params(),
+                [0xAB; 32],
+                3,
+            );
+            let bundle =
+                RecoverableSelfCustodyBundleV1::from_canonical_bundle(0, vec![note()]).unwrap();
+            Self {
+                root,
+                binding,
+                round,
+                bundle,
+            }
+        }
+
+        fn authority(&self) -> RecoverableBundleUseV1<'_> {
+            RecoverableBundleUseV1::new(
+                &self.root,
+                &self.binding,
+                &self.round,
+                RecoverableBundleMaterialV1::RecoverableSelfCustody(self.bundle.identity()),
+            )
+            .unwrap()
+        }
+
+        fn initial_van(&self) -> [u8; 32] {
+            self.authority().expected_material().unwrap().van
+        }
+
+        fn initial_consumer_id(&self) -> [u8; 32] {
+            let spending_key = self.root.voting_hotkey().unwrap().orchard_spending_key();
+            derive_van_nullifier_from_spending_key(
+                &spending_key,
+                self.root.context().vote_round_id(),
+                &self.initial_van(),
+            )
+            .unwrap()
+        }
+
+        fn evidence(
+            &self,
+            consumer: Option<ConfirmedVotingAuthorityConsumerV1>,
+        ) -> VotingAuthorityRecoveryEvidenceV1 {
+            let initial_van = self.initial_van();
+            let leaf = Option::<pallas::Base>::from(pallas::Base::from_repr(initial_van)).unwrap();
+            let mut tree = MemoryTreeServer::empty();
+            tree.append(pallas::Base::from(9)).unwrap();
+            let position = tree.append(leaf).unwrap();
+            tree.checkpoint(CHECKPOINT_HEIGHT).unwrap();
+            let path = tree.path(position, CHECKPOINT_HEIGHT).unwrap();
+            let checkpoint = RecoveryCheckpointV1::new(
+                CHAIN_ID,
+                CHECKPOINT_HEIGHT as u64,
+                [0xBC; 32],
+                tree.root().to_repr(),
+            )
+            .unwrap();
+            VotingAuthorityRecoveryEvidenceV1::new(
+                checkpoint,
+                Some(VotingAuthorityVanWitnessV1::new(initial_van, path)),
+                consumer,
+            )
+            .unwrap()
+        }
+    }
+
+    fn round_params() -> VotingRoundParams {
+        VotingRoundParams {
+            vote_round_id: ROUND_ID.to_string(),
+            snapshot_height: 1000,
+            ea_pk: vec![0xEA; 32],
+            nc_root: vec![0xAA; 32],
+            nullifier_imt_root: vec![0xBB; 32],
+        }
+    }
+
+    fn note() -> NoteInfo {
+        NoteInfo {
+            commitment: vec![0x01; 32],
+            nullifier: vec![0x02; 32],
+            value: BALLOT_DIVISOR,
+            position: 0,
+            diversifier: vec![0x03; 11],
+            rho: vec![0x04; 32],
+            rseed: vec![0x05; 32],
+            scope: 0,
+            ufvk_str: "uview1test".to_string(),
+        }
+    }
+
+    struct AcceptingVerifier {
+        expected_consumer_id: [u8; 32],
+    }
+
+    impl VotingAuthorityRecoveryEvidenceVerifierV1 for AcceptingVerifier {
+        fn verify_finalized_complete_evidence(
+            &self,
+            _checkpoint: &RecoveryCheckpointV1,
+            initial_consumer_id: &[u8; 32],
+            _consumer: Option<&ConfirmedVotingAuthorityConsumerV1>,
+        ) -> Result<(), VotingError> {
+            assert_eq!(initial_consumer_id, &self.expected_consumer_id);
+            Ok(())
+        }
+    }
+
+    struct RejectingVerifier;
+
+    impl VotingAuthorityRecoveryEvidenceVerifierV1 for RejectingVerifier {
+        fn verify_finalized_complete_evidence(
+            &self,
+            _checkpoint: &RecoveryCheckpointV1,
+            _initial_consumer_id: &[u8; 32],
+            _consumer: Option<&ConfirmedVotingAuthorityConsumerV1>,
+        ) -> Result<(), VotingError> {
+            Err(invalid_recovery("finalized lookup is incomplete"))
+        }
+    }
+
+    #[test]
+    fn reconciliation_is_binary_for_canonical_atomic_ballots() {
+        let fixture = Fixture::new();
+        let verifier = AcceptingVerifier {
+            expected_consumer_id: fixture.initial_consumer_id(),
+        };
+
+        let unspent = reconcile_recoverable_ballot_v1(
+            fixture.authority(),
+            &fixture.evidence(None),
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(unspent.initial_leaf_position(), 1);
+        assert_eq!(unspent.status(), &RecoverableBallotChainStatusV1::Unspent);
+
+        let position = ConfirmedTransitionPositionV1::new(99, 4);
+        let consumer = ConfirmedVotingAuthorityConsumerV1::new(
+            position,
+            fixture.initial_consumer_id(),
+            ConfirmedVotingAuthorityConsumerKindV1::AtomicBatch {
+                proposal_ids: vec![1, 3],
+            },
+        );
+        let terminal = reconcile_recoverable_ballot_v1(
+            fixture.authority(),
+            &fixture.evidence(Some(consumer)),
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(
+            terminal.status(),
+            &RecoverableBallotChainStatusV1::TerminalAtomicBatch {
+                position,
+                proposal_ids: vec![1, 3],
+            }
+        );
+    }
+
+    #[test]
+    fn reconciliation_marks_noncanonical_spends_unsupported() {
+        let fixture = Fixture::new();
+        let verifier = AcceptingVerifier {
+            expected_consumer_id: fixture.initial_consumer_id(),
+        };
+        let position = ConfirmedTransitionPositionV1::new(99, 4);
+        let consumer = ConfirmedVotingAuthorityConsumerV1::new(
+            position,
+            fixture.initial_consumer_id(),
+            ConfirmedVotingAuthorityConsumerKindV1::AtomicBatch {
+                proposal_ids: vec![1, 1],
+            },
+        );
+
+        let reconciled = reconcile_recoverable_ballot_v1(
+            fixture.authority(),
+            &fixture.evidence(Some(consumer)),
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(
+            reconciled.status(),
+            &RecoverableBallotChainStatusV1::UnsupportedSpent {
+                position,
+                reason: UnsupportedRecoverableBallotSpendV1::NonCanonicalAtomicBatch,
+            }
+        );
+
+        let singleton = ConfirmedVotingAuthorityConsumerV1::new(
+            position,
+            fixture.initial_consumer_id(),
+            ConfirmedVotingAuthorityConsumerKindV1::Singleton { proposal_id: 1 },
+        );
+        let reconciled = reconcile_recoverable_ballot_v1(
+            fixture.authority(),
+            &fixture.evidence(Some(singleton)),
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(
+            reconciled.status(),
+            &RecoverableBallotChainStatusV1::UnsupportedSpent {
+                position,
+                reason: UnsupportedRecoverableBallotSpendV1::Singleton,
+            }
+        );
+    }
+
+    #[test]
+    fn reconciliation_requires_authenticated_complete_chain_evidence() {
+        let fixture = Fixture::new();
+        let evidence = fixture.evidence(None);
+        let err =
+            reconcile_recoverable_ballot_v1(fixture.authority(), &evidence, &RejectingVerifier)
+                .unwrap_err();
+        assert!(err.to_string().contains("lookup is incomplete"), "{err}");
+
+        let wrong_consumer = ConfirmedVotingAuthorityConsumerV1::new(
+            ConfirmedTransitionPositionV1::new(99, 4),
+            [0xFF; 32],
+            ConfirmedVotingAuthorityConsumerKindV1::AtomicBatch {
+                proposal_ids: vec![1, 3],
+            },
+        );
+        let err = reconcile_recoverable_ballot_v1(
+            fixture.authority(),
+            &fixture.evidence(Some(wrong_consumer)),
+            &AcceptingVerifier {
+                expected_consumer_id: fixture.initial_consumer_id(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("native initial VAN nullifier"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn recovery_evidence_rejects_a_missing_initial_witness() {
+        let checkpoint = RecoveryCheckpointV1::new(CHAIN_ID, 100, [0xBC; 32], [0xCD; 32]).unwrap();
+        let err = VotingAuthorityRecoveryEvidenceV1::new(checkpoint, None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("initial VAN witness is missing"),
+            "{err}"
+        );
+    }
+}

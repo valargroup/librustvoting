@@ -238,3 +238,280 @@ fn load_recoverable_ballot_intents(
         .collect();
     Ok((intents, missing))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        governance::BALLOT_DIVISOR,
+        recoverable_authority::{
+            recoverable_bundle_policy_v1, test_validated_recoverable_voting_round_v1,
+            RecoverableBundleMaterialV1, RecoverableSelfCustodyBundleV1,
+            RegisteredKeyApplicationV1, SoftwareRegisteredKeyRequestV1,
+            ValidatedRecoverableVotingRoundV1, VotingAuthorityContextV1,
+            VotingAuthorityRootBindingV1, VotingAuthorityRootV1,
+        },
+        types::{Network, NoopProgressReporter, NoteInfo},
+        wire::VotingRoundParams,
+    };
+
+    const ROUND_ID: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    const CHAIN_ID: &str = "vote-chain-test";
+    const WALLET_ID: &str = "wallet";
+
+    struct Fixture {
+        db: VotingDb,
+        root: VotingAuthorityRootV1,
+        binding: VotingAuthorityRootBindingV1,
+        round: ValidatedRecoverableVotingRoundV1,
+        bundle: RecoverableSelfCustodyBundleV1,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let params = round_params();
+            let context = VotingAuthorityContextV1::from_fingerprint(
+                Network::Testnet,
+                0,
+                [0x22; 32],
+                CHAIN_ID,
+                [0x01; 32],
+            )
+            .unwrap();
+            let request = SoftwareRegisteredKeyRequestV1::new(
+                RegisteredKeyApplicationV1::new(0xA11C),
+                context,
+            );
+            let root = VotingAuthorityRootV1::from_registered_key_output(&request, [0x55; 64]);
+            let binding = VotingAuthorityRootBindingV1::bind(&root);
+            let round = test_validated_recoverable_voting_round_v1(
+                Network::Testnet,
+                CHAIN_ID,
+                params.clone(),
+                [0xAB; 32],
+                3,
+            );
+            let note = note();
+            let bundle =
+                RecoverableSelfCustodyBundleV1::from_canonical_bundle(0, vec![note.clone()])
+                    .unwrap();
+
+            let db = VotingDb::open_in_memory().unwrap();
+            db.set_wallet_id(WALLET_ID);
+            db.create_round(Network::Testnet, &params, None).unwrap();
+            db.ensure_bundles_with_policy(ROUND_ID, &[note], recoverable_bundle_policy_v1())
+                .unwrap();
+
+            let authority = RecoverableBundleUseV1::new(
+                &root,
+                &binding,
+                &round,
+                RecoverableBundleMaterialV1::RecoverableSelfCustody(bundle.identity()),
+            )
+            .unwrap();
+            let expected = authority.expected_material().unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE bundles SET van_comm_rand = ?1, gov_comm = ?2,
+                        total_note_value = ?3, address_index = 0
+                     WHERE round_id = ?4 AND wallet_id = ?5 AND bundle_index = 0",
+                    rusqlite::params![
+                        expected.van_blinding.as_slice(),
+                        expected.van.as_slice(),
+                        expected.total_note_value as i64,
+                        ROUND_ID,
+                        WALLET_ID,
+                    ],
+                )
+                .unwrap();
+
+            Self {
+                db,
+                root,
+                binding,
+                round,
+                bundle,
+            }
+        }
+
+        fn authority(&self) -> RecoverableBundleUseV1<'_> {
+            RecoverableBundleUseV1::new(
+                &self.root,
+                &self.binding,
+                &self.round,
+                RecoverableBundleMaterialV1::RecoverableSelfCustody(self.bundle.identity()),
+            )
+            .unwrap()
+        }
+
+        fn set_complete_intents(&self) {
+            self.db
+                .set_ballot_intent(ROUND_ID, 1, Decision::Choice(0), 2)
+                .unwrap();
+            self.db
+                .set_ballot_intent(ROUND_ID, 2, Decision::Skipped, 2)
+                .unwrap();
+            self.db
+                .set_ballot_intent(ROUND_ID, 3, Decision::Choice(2), 3)
+                .unwrap();
+        }
+    }
+
+    fn round_params() -> VotingRoundParams {
+        VotingRoundParams {
+            vote_round_id: ROUND_ID.to_string(),
+            snapshot_height: 1000,
+            ea_pk: vec![0xEA; 32],
+            nc_root: vec![0xAA; 32],
+            nullifier_imt_root: vec![0xBB; 32],
+        }
+    }
+
+    fn note() -> NoteInfo {
+        NoteInfo {
+            commitment: vec![0x01; 32],
+            nullifier: vec![0x02; 32],
+            value: BALLOT_DIVISOR,
+            position: 0,
+            diversifier: vec![0x03; 11],
+            rho: vec![0x04; 32],
+            rseed: vec![0x05; 32],
+            scope: 0,
+            ufvk_str: "uview1test".to_string(),
+        }
+    }
+
+    fn draft(proposal_id: u32, choice: u32, num_options: u32) -> DraftVote {
+        DraftVote {
+            proposal_id,
+            choice,
+            num_options,
+            single_share: false,
+            vc_tree_position: 0,
+        }
+    }
+
+    #[test]
+    fn readiness_waits_for_every_chain_proposal() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            recoverable_complete_ballot_readiness_v1(&fixture.db, fixture.authority()).unwrap(),
+            RecoverableBallotReadinessV1::WaitingForIntents {
+                proposal_ids: vec![1, 2, 3]
+            }
+        );
+
+        fixture.set_complete_intents();
+        assert_eq!(
+            recoverable_complete_ballot_readiness_v1(&fixture.db, fixture.authority()).unwrap(),
+            RecoverableBallotReadinessV1::Ready {
+                proposal_ids: vec![1, 3]
+            }
+        );
+    }
+
+    #[test]
+    fn complete_ballot_matches_choices_and_omits_skips() {
+        let fixture = Fixture::new();
+        fixture.set_complete_intents();
+        let witness = VanWitness {
+            auth_path: Vec::new(),
+            position: 0,
+            anchor_height: 0,
+        };
+        let drafts = [draft(1, 0, 2), draft(3, 2, 3)];
+        let ballot = RecoverableCompleteBallotV1::new(
+            fixture.authority(),
+            &drafts,
+            &witness,
+            &NoopProgressReporter,
+        );
+        validate_complete_ballot(&fixture.db, ROUND_ID, &ballot).unwrap();
+
+        let missing_choice = [draft(1, 0, 2)];
+        let ballot = RecoverableCompleteBallotV1::new(
+            fixture.authority(),
+            &missing_choice,
+            &witness,
+            &NoopProgressReporter,
+        );
+        let err = validate_complete_ballot(&fixture.db, ROUND_ID, &ballot).unwrap_err();
+        assert!(
+            err.to_string().contains("Choice intent for proposal 3"),
+            "{err}"
+        );
+
+        let includes_skip = [draft(1, 0, 2), draft(2, 0, 2), draft(3, 2, 3)];
+        let ballot = RecoverableCompleteBallotV1::new(
+            fixture.authority(),
+            &includes_skip,
+            &witness,
+            &NoopProgressReporter,
+        );
+        let err = validate_complete_ballot(&fixture.db, ROUND_ID, &ballot).unwrap_err();
+        assert!(err.to_string().contains("omit skipped proposal 2"), "{err}");
+    }
+
+    #[test]
+    fn all_skipped_needs_no_transaction_and_drafts_must_be_ordered() {
+        let fixture = Fixture::new();
+        for proposal_id in 1..=3 {
+            fixture
+                .db
+                .set_ballot_intent(ROUND_ID, proposal_id, Decision::Skipped, 3)
+                .unwrap();
+        }
+        assert_eq!(
+            recoverable_complete_ballot_readiness_v1(&fixture.db, fixture.authority()).unwrap(),
+            RecoverableBallotReadinessV1::AllSkipped
+        );
+
+        fixture
+            .db
+            .set_ballot_intent(ROUND_ID, 1, Decision::Choice(0), 3)
+            .unwrap();
+        fixture
+            .db
+            .set_ballot_intent(ROUND_ID, 3, Decision::Choice(1), 3)
+            .unwrap();
+        let witness = VanWitness {
+            auth_path: Vec::new(),
+            position: 0,
+            anchor_height: 0,
+        };
+        let reversed = [draft(3, 1, 3), draft(1, 0, 3)];
+        let ballot = RecoverableCompleteBallotV1::new(
+            fixture.authority(),
+            &reversed,
+            &witness,
+            &NoopProgressReporter,
+        );
+        let err = validate_complete_ballot(&fixture.db, ROUND_ID, &ballot).unwrap_err();
+        assert!(
+            err.to_string().contains("ascending proposal order"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn readiness_rejects_mismatched_persisted_bundle_material() {
+        let fixture = Fixture::new();
+        fixture
+            .db
+            .conn()
+            .execute(
+                "UPDATE bundles SET gov_comm = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 0",
+                rusqlite::params![vec![0xFFu8; 32], ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+
+        let err =
+            recoverable_complete_ballot_readiness_v1(&fixture.db, fixture.authority()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("persisted bundle material does not match"),
+            "{err}"
+        );
+    }
+}
