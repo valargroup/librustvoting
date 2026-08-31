@@ -39,7 +39,7 @@ jobs:
               run_ci=true
               break
             fi
-          done < <(git diff --name-only -z "$base_sha" "$HEAD_SHA")
+          done < <(git diff --no-renames --name-only -z "$base_sha" "$HEAD_SHA")
           echo "run_ci=$run_ci" >> "$GITHUB_OUTPUT"
 
   test:
