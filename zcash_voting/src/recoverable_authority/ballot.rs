@@ -151,6 +151,18 @@ fn validate_complete_ballot(
     }
 
     let proposal_count = ballot.authority.current_round().proposal_count();
+    if let Some(draft) = ballot
+        .drafts
+        .iter()
+        .find(|draft| !(1..=proposal_count).contains(&draft.proposal_id))
+    {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "recoverable ballot draft proposal {} is outside the chain range 1..={proposal_count}",
+                draft.proposal_id
+            ),
+        });
+    }
     let (intents, missing) = load_recoverable_ballot_intents(db, round_id, proposal_count)?;
     if !missing.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -450,6 +462,19 @@ mod tests {
         );
         let err = validate_complete_ballot(&fixture.db, ROUND_ID, &ballot).unwrap_err();
         assert!(err.to_string().contains("omit skipped proposal 2"), "{err}");
+
+        let outside_range = [draft(1, 0, 2), draft(3, 2, 3), draft(4, 0, 2)];
+        let ballot = RecoverableCompleteBallotV1::new(
+            fixture.authority(),
+            &outside_range,
+            &witness,
+            &NoopProgressReporter,
+        );
+        let err = validate_complete_ballot(&fixture.db, ROUND_ID, &ballot).unwrap_err();
+        assert!(
+            err.to_string().contains("outside the chain range 1..=3"),
+            "{err}"
+        );
     }
 
     #[test]
