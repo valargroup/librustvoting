@@ -441,14 +441,14 @@ pub(crate) fn load_share_delivery_plan(
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
-    expected_vote_commitment: &[u8; 32],
+    handle_commitment_bundle_json: &str,
     current_fleet: &[String],
     payloads: &[SharePayload],
 ) -> Result<(ShareDeliveryPlan, String), VotingError> {
     let conn = db.conn();
-    let commitment_bundle_json: String = conn
+    let stored_vote: Option<(Option<String>, Option<i64>)> = conn
         .query_row(
-            "SELECT commitment_bundle_json FROM votes
+            "SELECT commitment_bundle_json, vc_tree_position FROM votes
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
             named_params! {
@@ -457,23 +457,22 @@ pub(crate) fn load_share_delivery_plan(
                 ":bundle_index": bundle_index as i64,
                 ":proposal_id": proposal_id as i64,
             },
-            |row| row.get::<_, Option<String>>(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|e| VotingError::Internal {
             message: format!("load committed vote for helper-share submission failed: {e}"),
-        })?
-        .flatten()
+        })?;
+    let (commitment_bundle_json, vc_tree_position) = stored_vote
+        .and_then(|(json, position)| json.map(|json| (json, position)))
         .ok_or_else(|| VotingError::InvalidInput {
             message: "committed vote is missing durable helper recovery material".to_string(),
         })?;
-    let recovery = crate::vote::parse_recovery(&commitment_bundle_json)?;
-    if recovery.vote_commitment != *expected_vote_commitment {
-        return Err(VotingError::InvalidInput {
-            message: "committed vote changed before helper-share submission; recover the current committed vote"
-                .to_string(),
-        });
-    }
+    validate_handle_generation(
+        handle_commitment_bundle_json,
+        &commitment_bundle_json,
+        vc_tree_position,
+    )?;
     let plan = load_plan_with_conn(
         &conn,
         round_id,
@@ -507,6 +506,36 @@ pub(crate) fn load_share_delivery_plan(
         immediate_position_for_commitment(immediate_key, bundle_index, proposal_id, payloads)?;
     validate_immediate_plan(&plan, immediate_position)?;
     Ok((plan, commitment_bundle_json))
+}
+
+fn validate_handle_generation(
+    handle_commitment_bundle_json: &str,
+    current_commitment_bundle_json: &str,
+    current_vc_tree_position: Option<i64>,
+) -> Result<(), VotingError> {
+    if handle_commitment_bundle_json == current_commitment_bundle_json {
+        return Ok(());
+    }
+
+    let confirmation_position = current_vc_tree_position
+        .and_then(|position| u64::try_from(position).ok())
+        .ok_or_else(stale_handle_error)?;
+    let mut handle_recovery = crate::vote::parse_recovery(handle_commitment_bundle_json)?;
+    if handle_recovery.vc_tree_position != 0 {
+        return Err(stale_handle_error());
+    }
+    handle_recovery.vc_tree_position = confirmation_position;
+    if crate::vote::serialize_recovery(&handle_recovery)? != current_commitment_bundle_json {
+        return Err(stale_handle_error());
+    }
+    Ok(())
+}
+
+fn stale_handle_error() -> VotingError {
+    VotingError::InvalidInput {
+        message: "committed vote changed before helper-share submission; recover the current committed vote"
+            .to_string(),
+    }
 }
 
 fn load_plan_with_conn(

@@ -796,6 +796,7 @@ impl TryFrom<session::RoundPlan> for RoundPlanView {
                 .collect(),
             open_proposals: plan.open_proposals,
             immediate_share_key: plan.immediate_share_key,
+            immediate_share_confirmed: plan.immediate_share_confirmed,
             all_decided: plan.all_decided,
         })
     }
@@ -1775,6 +1776,7 @@ mod tests {
                 proposal_id: 11,
                 share_index: 0,
             }),
+            immediate_share_confirmed: false,
             all_decided: false,
         };
 

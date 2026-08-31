@@ -414,6 +414,38 @@ fn stale_handle_cannot_prepare_same_commitment_replacement() {
 }
 
 #[tokio::test]
+async fn stale_handle_cannot_submit_same_commitment_replacement_plan() {
+    let db = db_with_recoverable_vote();
+    let stale_handle = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let configured = helpers(3);
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+
+    replace_recovery_preserving_vote_commitment(&db);
+    let current_handle = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    current_handle
+        .prepare_share_delivery(&db, planning_params(&fleet))
+        .unwrap();
+    let transport = Arc::new(MockTransport::default());
+
+    let error = stale_handle
+        .submit_prepared_shares(
+            &db,
+            &client_with(transport.clone()),
+            submission_params(&configured),
+            &never_cancel(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }));
+    assert!(error
+        .to_string()
+        .contains("committed vote changed before helper-share submission"));
+    assert!(transport.calls().is_empty());
+    assert!(share::list(&db, ROUND_ID).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn same_commitment_replacement_after_plan_load_stops_every_post() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -578,6 +610,40 @@ async fn preconfirmation_plan_survives_confirmation_restart_and_submission() {
     );
     assert!(report.pending_share_indices.is_empty());
     assert!(!report.cancelled);
+    assert_eq!(share::list(&db, ROUND_ID).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn preconfirmation_handle_survives_verified_confirmation_transition() {
+    let db = db_with_recoverable_vote();
+    reset_vote_to_preconfirmation(&db);
+    let configured = vec![helper(1)];
+    let fleet = HelperFleetPreflight::from_readiness(&configured, &configured).unwrap();
+    let committed_before = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
+    let prepared = committed_before
+        .prepare_share_delivery(&db, planning_params(&fleet))
+        .unwrap();
+
+    crate::vote::record_vc_position(&db, ROUND_ID, 0, 1, 456).unwrap();
+
+    let transport = Arc::new(MockTransport::default());
+    queue_successes(&transport, &configured, prepared.share_plans.len());
+    let report = committed_before
+        .submit_prepared_shares(
+            &db,
+            &client_with(transport.clone()),
+            submission_params(&configured),
+            &never_cancel(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.deliveries.len(), prepared.share_plans.len());
+    assert!(report.pending_share_indices.is_empty());
+    assert_eq!(
+        transport.posted_json(&format!("{}/shielded-vote/v1/shares", helper(1)))["tree_position"],
+        456
+    );
     assert_eq!(share::list(&db, ROUND_ID).unwrap().len(), 2);
 }
 

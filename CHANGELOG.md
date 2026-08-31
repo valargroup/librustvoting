@@ -7,6 +7,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Added
+- `VotingDb::store_keystone_signatures_batch` now owns atomic, idempotent
+  Keystone signature persistence and reports signing-context conflicts through
+  a typed `VotingError` variant. `VotingDb::clear_wallet_state` atomically
+  removes both round-scoped rows and the wallet's round-independent PIR cache.
+- `RoundPlan` and `RoundPlanView` now expose `immediate_share_confirmed`, so
+  wallet orchestration does not need to reconstruct the immediate-share
+  confirmation decision from raw storage rows.
 - `HyperTransport::with_connector` and `with_http_connector` now let wallets
   inject fully configured or Rustls-wrapped Hyper connectors for proxies,
   custom DNS, and route-lifecycle enforcement while retaining the SDK's pooled
@@ -163,8 +170,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   from null to non-null, the v17 trigger atomically advances a plan bound to
   the exact old `commitment_bundle_json` snapshot to the exact confirmed
   snapshot. Vote replacement, recovery clearing, and unrelated recovery-data
-  mutations continue to delete the plan, and runtime loading retains the exact
-  generation check.
+  mutations continue to delete the plan. Runtime loading requires the plan's
+  exact current generation and accepts a submitting handle's older snapshot
+  only when the durable VC position verifies it as the exact pre-confirmation
+  predecessor.
 - Prepared-batch submission now validates the whole plan and every helper
   payload before the first network request, durably reserves each attempt
   before POST, preserves deterministic report ordering, reports queued shares
@@ -189,11 +198,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   degrading genuinely aborted requests, preventing one poll result from being
   scored twice.
 - Initial helper planning now binds the `CommittedVote` handle to its exact
-  recovery snapshot, and prepared-batch submission carries the plan's exact
-  generation through every concurrent share task. A same-commitment recovery
-  replacement before planning or after plan loading therefore fails before any
-  helper POST instead of pairing an old payload with replacement recovery
-  material.
+  recovery snapshot, prepared-plan loading revalidates that handle snapshot,
+  and prepared-batch submission carries the plan's exact generation through
+  every concurrent share task. Apart from the verified confirmation-only VC
+  position transition, a same-commitment recovery replacement before planning,
+  before plan loading, or after plan loading therefore fails before any helper
+  POST instead of pairing an old payload with replacement recovery material.
 - Prepared-batch submission now captures one wallet scope before loading its
   plan and carries that scope through every concurrent share task, so a wallet
   switch cannot redirect queued delivery effects into another wallet.

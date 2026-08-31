@@ -422,5 +422,6 @@ pub struct RoundPlanView {
     pub open_proposals: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
     pub immediate_share_key: Option<ImmediateShareKey>,
+    pub immediate_share_confirmed: bool,
     pub all_decided: bool,
 }

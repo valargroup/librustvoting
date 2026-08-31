@@ -462,6 +462,8 @@ pub struct RoundPlan {
     pub open_proposals: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
     pub immediate_share_key: Option<ImmediateShareKey>,
+    /// True when the designated immediate share has durable helper-quorum confirmation.
+    pub immediate_share_confirmed: bool,
     /// Informational: every proposal is either a confirmed Choice or Skipped.
     pub all_decided: bool,
     /// Durable delegation status for every eligible bundle in the round.
@@ -1303,15 +1305,24 @@ pub fn resume_plan(
         &steps,
     )?;
 
+    let immediate_share_key =
+        round_immediate_share_key(bundles.iter().copied().max(), &choice_proposals);
+    let immediate_share_confirmed = immediate_share_key.as_ref().is_some_and(|key| {
+        share_delegations.iter().any(|share| {
+            share.bundle_index == key.bundle_index
+                && share.proposal_id == key.proposal_id
+                && share.share_index == key.share_index
+                && share.confirmed
+        })
+    });
+
     Ok(RoundPlan {
         round_id: round_id.to_string(),
         pending_recovery,
         next_steps: steps,
         open_proposals,
-        immediate_share_key: round_immediate_share_key(
-            bundles.iter().copied().max(),
-            &choice_proposals,
-        ),
+        immediate_share_key,
+        immediate_share_confirmed,
         all_decided,
         delegation_statuses,
         blocking_recovery,
@@ -2346,6 +2357,27 @@ mod tests {
                 .unwrap()
                 .immediate_share_key,
             None
+        );
+    }
+
+    #[test]
+    fn round_plan_reports_immediate_share_confirmation() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
+        assert!(
+            !resume_plan(&db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .immediate_share_confirmed
+        );
+
+        confirm_vote_fixture(&db, 0, 2, 0);
+        record_confirmed_share_fixture(&db, 0, 2, 0);
+
+        assert!(
+            resume_plan(&db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .immediate_share_confirmed
         );
     }
 

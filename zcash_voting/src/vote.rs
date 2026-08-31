@@ -397,7 +397,7 @@ impl CommittedVote {
             &self.round_id,
             self.bundle_index,
             self.commit.proposal_id,
-            &self.commit.vote_commitment,
+            &self.commitment_bundle_json,
             params.configured_server_urls,
             &self.commit.share_payloads,
         )?;

@@ -730,12 +730,16 @@ drawing a replacement. Existing round plans are checked so roster drift cannot
 create a second or conflicting immediate designation.
 
 `CommittedVote::submit_prepared_shares` is the delivery boundary. It loads that
-plan, requires the exact current committed-vote generation and a compatible
-complete current fleet, reconstructs and validates every payload before the
-first POST, then executes all incomplete shares. Removed targets, target-count
-drift, malformed payloads, aggregate-quota violations, a nonzero schedule on
-the designated immediate share, or a missing confirmed VC position fail before
-network I/O. The raw per-share executor is
+plan, requires the plan's exact current committed-vote generation, binds the
+submitting handle to that generation, and requires a compatible complete
+current fleet. A handle must contain either the exact current recovery snapshot
+or its exact pre-confirmation predecessor, verified by replacing only the
+placeholder VC position with the durable confirmed position. It reconstructs
+and validates every payload before the first POST, then executes all incomplete
+shares. Removed targets, target-count drift, malformed payloads,
+aggregate-quota violations, a nonzero schedule on the designated immediate
+share, or a missing confirmed VC position fail before network I/O. The raw
+per-share executor is
 crate-private, and there is no public post-hoc delivery mutator.
 
 Up to 16 share tasks across all wallets and committed votes in the process may
@@ -761,9 +765,12 @@ NOT be used to model wallet submission behavior.
 
 Complete-plan persistence and per-share preparation are both bound atomically
 to the exact commitment-bundle generation validated for the `CommittedVote`
-handle. A replacement that lands after an earlier recovery read invalidates
-the plan and fails before any helper POST instead of combining old payload or
-placement data with the replacement generation.
+handle. Plan loading also validates the handle's stored generation, with only
+the verified confirmation-only VC-position transition accepted. A replacement
+that lands after an earlier recovery read, including one that preserves the
+vote commitment, invalidates the handle or plan and fails before any helper
+POST instead of combining old payload or placement data with the replacement
+generation.
 
 After validation it creates or merges the durable share record. Persistence
 returns the effective write-once `submit_at`; resumed fan-out rebuilds the wire
@@ -1243,9 +1250,11 @@ first `vc_tree_position: NULL -> non-NULL` vote update, the v17 trigger updates
 a plan only when it is bound to the exact OLD JSON and replacing only the
 JSON's `vc_tree_position` yields the exact NEW JSON. It then deletes any plan
 whose snapshot still differs. Singleton and atomic-batch confirmation perform
-this transition inside their existing transaction. The exact-generation check
-in `delivery_plan.rs` remains unchanged; after confirmation both the vote and
-plan point at the same new snapshot.
+this transition inside their existing transaction. Runtime loading requires
+the plan to match that exact new snapshot and accepts an older handle only when
+its stored JSON is the exact pre-confirmation predecessor verified against the
+durable VC position. Every other handle snapshot is stale, including a
+same-commitment recovery replacement.
 
 The internal record keeps `attempting_urls` distinct. The compatibility wire
 view has no separate attempting field, so it merges those helpers into
