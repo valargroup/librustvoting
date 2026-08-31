@@ -98,7 +98,7 @@ pub async fn connect_pir(
         .map_err(map_pir_connect_error)
 }
 
-fn normalize_endpoint_url(url: &str) -> String {
+pub(crate) fn normalize_endpoint_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 

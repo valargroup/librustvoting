@@ -68,8 +68,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    round_auth::{RoundAuthPayloadV2, ROUND_AUTH_VERSION_V2},
-    types::validate_vote_round_id_hex,
+    round_auth::{
+        RoundAuthContextV3, RoundAuthDigestV3, RoundAuthPayloadV2, RoundAuthPayloadV3,
+        RECOVERABLE_AUTHORITY_SCHEME_V1, RECOVERABLE_BUNDLE_POLICY_V1, ROUND_AUTH_VERSION_V2,
+        ROUND_AUTH_VERSION_V3,
+    },
+    types::{validate_vote_chain_id, validate_vote_round_id_hex, Network},
 };
 
 const STATIC_CONFIG_VERSION_V1: u32 = 1;
@@ -106,6 +110,32 @@ impl Default for WalletCapabilities {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolveVotingConfigOptions {
     pub capabilities: WalletCapabilities,
+}
+
+/// Independent wallet context used to authenticate version 3 round entries.
+///
+/// The dynamic config is not allowed to choose either value. Callers must
+/// construct this from the wallet's selected Zcash network and vote chain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundAuthExpectationV3 {
+    #[serde(with = "network_serde")]
+    pub network: Network,
+    pub vote_chain_id: String,
+}
+
+impl RoundAuthExpectationV3 {
+    /// Constructs and validates independently selected v3 context.
+    pub fn new(
+        network: Network,
+        vote_chain_id: impl Into<String>,
+    ) -> Result<Self, VotingConfigError> {
+        let vote_chain_id = vote_chain_id.into();
+        validate_expected_vote_chain_id(&vote_chain_id)?;
+        Ok(Self {
+            network,
+            vote_chain_id,
+        })
+    }
 }
 
 /// Parsed static-config source chosen by the embedding wallet.
@@ -233,6 +263,189 @@ pub struct AuthenticatedRound {
     pub ea_pk: Vec<u8>,
 }
 
+/// One round-auth v3 payload whose trusted-key signature was verified.
+///
+/// The private fields and constructor preserve verification provenance. A
+/// public [`RoundAuthPayloadV3`] is useful to config producers as signing
+/// input, but it cannot be converted into this token by a wallet caller.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VerifiedRoundAuthV3 {
+    payload: RoundAuthPayloadV3,
+    configured_pir_endpoints: Vec<String>,
+}
+
+impl VerifiedRoundAuthV3 {
+    fn from_verified_signature(
+        payload: RoundAuthPayloadV3,
+        configured_pir_endpoints: &[ServiceEndpoint],
+    ) -> Self {
+        Self {
+            payload,
+            configured_pir_endpoints: configured_pir_endpoints
+                .iter()
+                .map(|endpoint| crate::pir::normalize_endpoint_url(&endpoint.url))
+                .collect(),
+        }
+    }
+
+    pub fn round_id(&self) -> &[u8; 32] {
+        self.payload.round_id()
+    }
+
+    pub fn ea_pk(&self) -> &[u8; 32] {
+        self.payload.ea_pk()
+    }
+
+    pub fn pir_layout(&self) -> PirLayout {
+        self.payload.pir_layout()
+    }
+
+    pub fn context(&self) -> &RoundAuthContextV3 {
+        self.payload.context()
+    }
+
+    pub fn digest(&self) -> RoundAuthDigestV3 {
+        self.payload.digest()
+    }
+
+    pub(crate) fn permits_pir_endpoint(&self, endpoint: &str) -> bool {
+        let endpoint = crate::pir::normalize_endpoint_url(endpoint);
+        self.configured_pir_endpoints
+            .iter()
+            .any(|configured| configured == &endpoint)
+    }
+
+    pub(crate) fn canonical_payload_bytes(&self) -> Vec<u8> {
+        self.payload.to_bytes()
+    }
+}
+
+/// Exact vote-chain round parameters checked against a verified v3 payload.
+///
+/// This token retains both trusted-key provenance and the server roots for the
+/// authenticated snapshot. Its fields cannot be assembled independently.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VerifiedVotingRoundV3 {
+    round_auth: VerifiedRoundAuthV3,
+    round_params: crate::wire::VotingRoundParams,
+}
+
+impl VerifiedVotingRoundV3 {
+    pub fn round_auth(&self) -> &VerifiedRoundAuthV3 {
+        &self.round_auth
+    }
+
+    pub fn round_params(&self) -> &crate::wire::VotingRoundParams {
+        &self.round_params
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_verified_round_auth_v3(payload: RoundAuthPayloadV3) -> VerifiedRoundAuthV3 {
+    VerifiedRoundAuthV3::from_verified_signature(
+        payload,
+        &[ServiceEndpoint {
+            url: "https://pir.example.com".to_string(),
+            label: "test PIR".to_string(),
+        }],
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_verified_voting_round_v3(
+    round_auth: &VerifiedRoundAuthV3,
+    round_params: crate::wire::VotingRoundParams,
+) -> VerifiedVotingRoundV3 {
+    assert_eq!(
+        round_params.vote_round_id,
+        hex::encode(round_auth.round_id())
+    );
+    assert_eq!(
+        round_params.snapshot_height,
+        round_auth.context().snapshot_height()
+    );
+    assert_eq!(round_params.ea_pk.as_slice(), round_auth.ea_pk());
+    VerifiedVotingRoundV3 {
+        round_auth: round_auth.clone(),
+        round_params,
+    }
+}
+
+/// Dynamic config plus non-forgeable tokens for its verified v3 rounds.
+///
+/// This wrapper is deliberately not serializable. A wallet must authenticate
+/// dynamic config again after restart instead of restoring verification state
+/// from caller-constructible JSON.
+#[derive(Clone)]
+pub struct VerifiedVotingConfigV3 {
+    resolved: ResolvedVotingConfig,
+    verified_rounds: Vec<VerifiedRoundAuthV3>,
+}
+
+impl VerifiedVotingConfigV3 {
+    /// Public resolved config data used by existing display and service logic.
+    pub fn resolved_config(&self) -> &ResolvedVotingConfig {
+        &self.resolved
+    }
+
+    /// Returns the v3 token produced by trusted-key verification for `round_id`.
+    pub fn verified_round_auth_v3(
+        &self,
+        round_id: &str,
+    ) -> Result<&VerifiedRoundAuthV3, VotingConfigError> {
+        self.verified_rounds
+            .iter()
+            .find(|round| hex::encode(round.round_id()) == round_id)
+            .ok_or_else(|| VotingConfigError::RemoteAuthenticationFailed {
+                message: format!(
+                    "round {round_id} has no verified round-auth v3 token in resolved voting config"
+                ),
+            })
+    }
+
+    /// Builds typed round parameters after matching exact server snapshot
+    /// metadata to the trusted-key-verified v3 payload.
+    pub fn trusted_voting_round_params_for_snapshot(
+        &self,
+        round_id: String,
+        snapshot_height: u64,
+        snapshot_block_hash: Vec<u8>,
+        nc_root: Vec<u8>,
+        nullifier_imt_root: Vec<u8>,
+    ) -> Result<VerifiedVotingRoundV3, VotingConfigError> {
+        validate_round_param_len(&nc_root, "nc_root")?;
+        validate_round_param_len(&nullifier_imt_root, "nullifier_imt_root")?;
+        let snapshot_block_hash: [u8; ROUND_PARAM_BYTE_LEN] = snapshot_block_hash
+            .try_into()
+            .map_err(|_| VotingConfigError::InvalidInput {
+                message: format!(
+                    "snapshot_block_hash must be exactly {ROUND_PARAM_BYTE_LEN} bytes"
+                ),
+            })?;
+        let round_auth = self.verified_round_auth_v3(&round_id)?;
+        if snapshot_height != round_auth.context().snapshot_height()
+            || &snapshot_block_hash != round_auth.context().snapshot_block_hash()
+        {
+            return Err(VotingConfigError::RemoteAuthenticationFailed {
+                message: format!(
+                    "server snapshot for round {round_id} does not match authenticated height and block hash"
+                ),
+            });
+        }
+
+        Ok(VerifiedVotingRoundV3 {
+            round_auth: round_auth.clone(),
+            round_params: crate::wire::VotingRoundParams {
+                vote_round_id: round_id,
+                snapshot_height,
+                ea_pk: round_auth.ea_pk().to_vec(),
+                nc_root,
+                nullifier_imt_root,
+            },
+        })
+    }
+}
+
 impl ResolvedVotingConfig {
     /// Build round params from server metadata while binding trusted `ea_pk`.
     ///
@@ -245,16 +458,8 @@ impl ResolvedVotingConfig {
         nc_root: Vec<u8>,
         nullifier_imt_root: Vec<u8>,
     ) -> Result<crate::wire::VotingRoundParams, VotingConfigError> {
-        if nc_root.len() != ROUND_PARAM_BYTE_LEN {
-            return Err(VotingConfigError::InvalidInput {
-                message: format!("nc_root must be exactly {ROUND_PARAM_BYTE_LEN} bytes"),
-            });
-        }
-        if nullifier_imt_root.len() != ROUND_PARAM_BYTE_LEN {
-            return Err(VotingConfigError::InvalidInput {
-                message: format!("nullifier_imt_root must be exactly {ROUND_PARAM_BYTE_LEN} bytes"),
-            });
-        }
+        validate_round_param_len(&nc_root, "nc_root")?;
+        validate_round_param_len(&nullifier_imt_root, "nullifier_imt_root")?;
 
         let trusted_round = self
             .authenticated_rounds
@@ -263,13 +468,13 @@ impl ResolvedVotingConfig {
             .ok_or_else(|| VotingConfigError::RemoteAuthenticationFailed {
                 message: format!("round {round_id} is not authenticated in resolved voting config"),
             })?;
-        if trusted_round.ea_pk.len() != ROUND_PARAM_BYTE_LEN {
-            return Err(VotingConfigError::InvalidInput {
+        validate_round_param_len(&trusted_round.ea_pk, "authenticated ea_pk").map_err(|_| {
+            VotingConfigError::InvalidInput {
                 message: format!(
                     "authenticated round {round_id} has invalid ea_pk length: expected {ROUND_PARAM_BYTE_LEN} bytes"
                 ),
-            });
-        }
+            }
+        })?;
 
         Ok(crate::wire::VotingRoundParams {
             vote_round_id: round_id,
@@ -279,6 +484,15 @@ impl ResolvedVotingConfig {
             nullifier_imt_root,
         })
     }
+}
+
+fn validate_round_param_len(bytes: &[u8], field: &str) -> Result<(), VotingConfigError> {
+    if bytes.len() != ROUND_PARAM_BYTE_LEN {
+        return Err(VotingConfigError::InvalidInput {
+            message: format!("{field} must be exactly {ROUND_PARAM_BYTE_LEN} bytes"),
+        });
+    }
+    Ok(())
 }
 
 /// Structured status emitted while resolving a voting config.
@@ -327,19 +541,23 @@ pub struct ResolvedVotingConfigSummary {
 
 impl From<&ResolvedVotingConfig> for ResolvedVotingConfigSummary {
     fn from(config: &ResolvedVotingConfig) -> Self {
-        let authenticated_round_ids = config
-            .authenticated_rounds
-            .iter()
-            .map(|round| round.round_id.clone())
-            .collect::<Vec<_>>();
         Self {
             trusted_key_fingerprint: config.trusted_key_fingerprint.clone(),
             vote_server_fingerprint: fingerprint_json(&config.vote_servers),
             pir_endpoint_fingerprint: fingerprint_json(&config.pir_endpoints),
             pir_layout: config.pir_layout,
-            authenticated_round_set_fingerprint: fingerprint_json(&authenticated_round_ids),
+            authenticated_round_set_fingerprint: authenticated_round_set_fingerprint(config),
             protocol_versions: config.supported_versions.clone(),
         }
+    }
+}
+
+impl From<&VerifiedVotingConfigV3> for ResolvedVotingConfigSummary {
+    fn from(config: &VerifiedVotingConfigV3) -> Self {
+        let mut summary = Self::from(config.resolved_config());
+        summary.authenticated_round_set_fingerprint =
+            verified_authenticated_round_set_fingerprint(config);
+        summary
     }
 }
 
@@ -450,21 +668,53 @@ pub fn resolve_static_voting_config(
 /// and the dynamic config bytes the wallet fetched from
 /// `resolved_static.dynamic_config_url`, this validates advertised versions and
 /// authenticates round entries against the static trusted keys.
+///
+/// This legacy entry point skips round-auth v3 entries. Use
+/// [`resolve_dynamic_voting_config_with_round_auth_v3`] with independently
+/// selected network and vote-chain context to authenticate them.
 pub fn resolve_dynamic_voting_config(
     resolved_static: ResolvedStaticVotingConfig,
     dynamic_bytes: &[u8],
     options: ResolveVotingConfigOptions,
 ) -> Result<ResolvedVotingConfig, VotingConfigError> {
+    Ok(
+        resolve_dynamic_voting_config_inner(resolved_static, dynamic_bytes, options, None)?
+            .resolved,
+    )
+}
+
+/// Resolve dynamic config while requiring v3 rounds to match independent
+/// wallet-selected network and vote-chain context.
+pub fn resolve_dynamic_voting_config_with_round_auth_v3(
+    resolved_static: ResolvedStaticVotingConfig,
+    dynamic_bytes: &[u8],
+    options: ResolveVotingConfigOptions,
+    expected: RoundAuthExpectationV3,
+) -> Result<VerifiedVotingConfigV3, VotingConfigError> {
+    resolve_dynamic_voting_config_inner(resolved_static, dynamic_bytes, options, Some(&expected))
+}
+
+fn resolve_dynamic_voting_config_inner(
+    resolved_static: ResolvedStaticVotingConfig,
+    dynamic_bytes: &[u8],
+    options: ResolveVotingConfigOptions,
+    expected_v3: Option<&RoundAuthExpectationV3>,
+) -> Result<VerifiedVotingConfigV3, VotingConfigError> {
     let dynamic_config: WireVotingServiceConfig =
         serde_json::from_slice(dynamic_bytes).map_err(|e| VotingConfigError::DecodeFailed {
             message: format!("dynamic config decode failed: {e}"),
         })?;
     validate_dynamic_config(&dynamic_config, &options.capabilities)?;
+    if let Some(expected) = expected_v3 {
+        validate_expected_vote_chain_id(&expected.vote_chain_id)?;
+    }
     let authenticated_rounds = authenticate_dynamic_rounds(
         &dynamic_config.rounds,
         &resolved_static.trusted_keys,
         dynamic_config.pir_layout,
-    );
+        &dynamic_config.pir_endpoints,
+        expected_v3,
+    )?;
 
     let authenticated_count = authenticated_rounds.authenticated_rounds.len();
     let skipped_count = authenticated_rounds.skipped_round_ids.len();
@@ -473,45 +723,48 @@ pub fn resolve_dynamic_voting_config(
     // claim a verification that never ran.
     let hash_pin_verified = resolved_static.source.sha256.is_some();
 
-    Ok(ResolvedVotingConfig {
-        source_fingerprint: resolved_static.source_fingerprint,
-        trusted_key_fingerprint: resolved_static.trusted_key_fingerprint,
-        dynamic_config_fingerprint: fingerprint_bytes(dynamic_bytes),
-        vote_servers: dynamic_config.vote_servers,
-        pir_endpoints: dynamic_config.pir_endpoints,
-        pir_layout: dynamic_config.pir_layout,
-        supported_versions: dynamic_config.supported_versions,
-        authenticated_rounds: authenticated_rounds.authenticated_rounds,
-        skipped_round_ids: authenticated_rounds.skipped_round_ids.clone(),
-        conditions: vec![
-            ConfigCondition {
-                kind: ConfigConditionKind::StaticHashPinVerified,
-                status: hash_pin_verified,
-                message: if hash_pin_verified {
-                    "static hash pin verified".to_string()
-                } else {
-                    "static config source carried no hash pin".to_string()
+    Ok(VerifiedVotingConfigV3 {
+        resolved: ResolvedVotingConfig {
+            source_fingerprint: resolved_static.source_fingerprint,
+            trusted_key_fingerprint: resolved_static.trusted_key_fingerprint,
+            dynamic_config_fingerprint: fingerprint_bytes(dynamic_bytes),
+            vote_servers: dynamic_config.vote_servers,
+            pir_endpoints: dynamic_config.pir_endpoints,
+            pir_layout: dynamic_config.pir_layout,
+            supported_versions: dynamic_config.supported_versions,
+            authenticated_rounds: authenticated_rounds.authenticated_rounds,
+            skipped_round_ids: authenticated_rounds.skipped_round_ids.clone(),
+            conditions: vec![
+                ConfigCondition {
+                    kind: ConfigConditionKind::StaticHashPinVerified,
+                    status: hash_pin_verified,
+                    message: if hash_pin_verified {
+                        "static hash pin verified".to_string()
+                    } else {
+                        "static config source carried no hash pin".to_string()
+                    },
                 },
-            },
-            ConfigCondition {
-                kind: ConfigConditionKind::DynamicConfigDecoded,
-                status: true,
-                message: "dynamic config decoded".to_string(),
-            },
-            ConfigCondition {
-                kind: ConfigConditionKind::DynamicSignaturesVerified,
-                status: true,
-                message: format!(
-                    "dynamic round signatures verified: authenticated={}, skipped={}",
-                    authenticated_count, skipped_count
-                ),
-            },
-            ConfigCondition {
-                kind: ConfigConditionKind::VersionsSupported,
-                status: true,
-                message: "advertised versions are supported".to_string(),
-            },
-        ],
+                ConfigCondition {
+                    kind: ConfigConditionKind::DynamicConfigDecoded,
+                    status: true,
+                    message: "dynamic config decoded".to_string(),
+                },
+                ConfigCondition {
+                    kind: ConfigConditionKind::DynamicSignaturesVerified,
+                    status: true,
+                    message: format!(
+                        "dynamic round signatures verified: authenticated={}, skipped={}",
+                        authenticated_count, skipped_count
+                    ),
+                },
+                ConfigCondition {
+                    kind: ConfigConditionKind::VersionsSupported,
+                    status: true,
+                    message: "advertised versions are supported".to_string(),
+                },
+            ],
+        },
+        verified_rounds: authenticated_rounds.verified_v3_rounds,
     })
 }
 
@@ -585,6 +838,37 @@ pub fn resolve_dynamic_voting_config_from_attempts(
     attempts: Vec<DynamicConfigAttempt>,
     options: ResolveVotingConfigOptions,
 ) -> Result<(ResolvedVotingConfig, Vec<DynamicConfigMirrorFailure>), VotingConfigError> {
+    let (verified, skipped) = resolve_dynamic_voting_config_from_attempts_inner(
+        resolved_static,
+        attempts,
+        options,
+        None,
+    )?;
+    Ok((verified.resolved, skipped))
+}
+
+/// Resolve ordered mirror attempts with independent v3 network and vote-chain
+/// context.
+pub fn resolve_dynamic_voting_config_from_attempts_with_round_auth_v3(
+    resolved_static: ResolvedStaticVotingConfig,
+    attempts: Vec<DynamicConfigAttempt>,
+    options: ResolveVotingConfigOptions,
+    expected: RoundAuthExpectationV3,
+) -> Result<(VerifiedVotingConfigV3, Vec<DynamicConfigMirrorFailure>), VotingConfigError> {
+    resolve_dynamic_voting_config_from_attempts_inner(
+        resolved_static,
+        attempts,
+        options,
+        Some(&expected),
+    )
+}
+
+fn resolve_dynamic_voting_config_from_attempts_inner(
+    resolved_static: ResolvedStaticVotingConfig,
+    attempts: Vec<DynamicConfigAttempt>,
+    options: ResolveVotingConfigOptions,
+    expected_v3: Option<&RoundAuthExpectationV3>,
+) -> Result<(VerifiedVotingConfigV3, Vec<DynamicConfigMirrorFailure>), VotingConfigError> {
     if attempts.is_empty() {
         return Err(VotingConfigError::InvalidInput {
             message: "dynamic config attempts must contain at least one entry".to_string(),
@@ -596,7 +880,7 @@ pub fn resolve_dynamic_voting_config_from_attempts(
     let mut last_error = None;
     // First mirror that resolved but authenticated nothing, held as a
     // last-resort result along with the skip list as it stood at that point.
-    let mut round_less: Option<(ResolvedVotingConfig, String, usize)> = None;
+    let mut round_less: Option<(VerifiedVotingConfigV3, String, usize)> = None;
 
     for attempt in attempts {
         let bytes = match attempt.result {
@@ -617,8 +901,13 @@ pub fn resolve_dynamic_voting_config_from_attempts(
             }
         };
 
-        match resolve_dynamic_voting_config(resolved_static.clone(), &bytes, options.clone()) {
-            Ok(resolved) if resolved.authenticated_rounds.is_empty() => {
+        match resolve_dynamic_voting_config_inner(
+            resolved_static.clone(),
+            &bytes,
+            options.clone(),
+            expected_v3,
+        ) {
+            Ok(resolved) if resolved.resolved.authenticated_rounds.is_empty() => {
                 if round_less.is_none() {
                     round_less = Some((resolved, attempt.url.clone(), skipped.len()));
                 }
@@ -698,8 +987,53 @@ pub async fn resolve_dynamic_voting_config_over_mirrors<F, Fut>(
     resolved_static: ResolvedStaticVotingConfig,
     timeout: Duration,
     options: ResolveVotingConfigOptions,
-    mut fetch: F,
+    fetch: F,
 ) -> Result<(ResolvedVotingConfig, Vec<DynamicConfigMirrorFailure>), VotingConfigError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, String>>,
+{
+    let (verified, skipped) = resolve_dynamic_voting_config_over_mirrors_inner(
+        resolved_static,
+        timeout,
+        options,
+        None,
+        fetch,
+    )
+    .await?;
+    Ok((verified.resolved, skipped))
+}
+
+/// Fetch and resolve mirrors with independent v3 network and vote-chain
+/// context.
+pub async fn resolve_dynamic_voting_config_over_mirrors_with_round_auth_v3<F, Fut>(
+    resolved_static: ResolvedStaticVotingConfig,
+    timeout: Duration,
+    options: ResolveVotingConfigOptions,
+    expected: RoundAuthExpectationV3,
+    fetch: F,
+) -> Result<(VerifiedVotingConfigV3, Vec<DynamicConfigMirrorFailure>), VotingConfigError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, String>>,
+{
+    resolve_dynamic_voting_config_over_mirrors_inner(
+        resolved_static,
+        timeout,
+        options,
+        Some(expected),
+        fetch,
+    )
+    .await
+}
+
+async fn resolve_dynamic_voting_config_over_mirrors_inner<F, Fut>(
+    resolved_static: ResolvedStaticVotingConfig,
+    timeout: Duration,
+    options: ResolveVotingConfigOptions,
+    expected_v3: Option<RoundAuthExpectationV3>,
+    mut fetch: F,
+) -> Result<(VerifiedVotingConfigV3, Vec<DynamicConfigMirrorFailure>), VotingConfigError>
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<Vec<u8>, String>>,
@@ -725,13 +1059,14 @@ where
         };
         attempts.push(attempt);
 
-        match resolve_dynamic_voting_config_from_attempts(
+        match resolve_dynamic_voting_config_from_attempts_inner(
             resolved_static.clone(),
             attempts.clone(),
             options.clone(),
+            expected_v3.as_ref(),
         ) {
             Ok(outcome) => {
-                let has_rounds = !outcome.0.authenticated_rounds.is_empty();
+                let has_rounds = !outcome.0.resolved.authenticated_rounds.is_empty();
                 best = Some(outcome);
                 if has_rounds {
                     break;
@@ -749,12 +1084,12 @@ where
 
 /// Attach the fallback condition when earlier mirrors were passed over.
 fn finish(
-    mut resolved: ResolvedVotingConfig,
+    mut resolved: VerifiedVotingConfigV3,
     url: String,
     skipped: Vec<DynamicConfigMirrorFailure>,
-) -> (ResolvedVotingConfig, Vec<DynamicConfigMirrorFailure>) {
+) -> (VerifiedVotingConfigV3, Vec<DynamicConfigMirrorFailure>) {
     if !skipped.is_empty() {
-        resolved.conditions.push(ConfigCondition {
+        resolved.resolved.conditions.push(ConfigCondition {
             kind: ConfigConditionKind::DynamicMirrorFallbackUsed,
             status: true,
             message: format!(
@@ -883,7 +1218,67 @@ struct RoundEntry {
     auth_version: u32,
     #[serde(with = "base64_bytes")]
     ea_pk: Vec<u8>,
+    #[serde(default, skip_serializing_if = "RoundEntryField::is_missing")]
+    authority_scheme: RoundEntryField<String>,
+    #[serde(default, skip_serializing_if = "RoundEntryField::is_missing")]
+    bundle_policy: RoundEntryField<String>,
+    #[serde(default, skip_serializing_if = "RoundEntryField::is_missing")]
+    network: RoundEntryField<String>,
+    #[serde(default, skip_serializing_if = "RoundEntryField::is_missing")]
+    vote_chain_id: RoundEntryField<String>,
+    #[serde(default, skip_serializing_if = "RoundEntryField::is_missing")]
+    snapshot_height: RoundEntryField<u64>,
+    #[serde(default, skip_serializing_if = "RoundEntryField::is_missing")]
+    snapshot_block_hash: RoundEntryField<String>,
+    #[serde(default, skip_serializing_if = "RoundEntryField::is_missing")]
+    proposal_count: RoundEntryField<u32>,
     signatures: Vec<RoundSignature>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RoundEntryField<T> {
+    Missing,
+    Value(T),
+}
+
+impl<T> RoundEntryField<T> {
+    fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    fn as_ref(&self) -> Option<&T> {
+        match self {
+            Self::Missing => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+}
+
+impl<T> Default for RoundEntryField<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<T: Serialize> Serialize for RoundEntryField<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Missing => serializer.serialize_unit(),
+            Self::Value(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for RoundEntryField<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(Self::Value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -1056,9 +1451,10 @@ pub(crate) fn validate_and_convert_pir_layout(
     Ok(negotiated)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct AuthenticatedRounds {
     authenticated_rounds: Vec<AuthenticatedRound>,
+    verified_v3_rounds: Vec<VerifiedRoundAuthV3>,
     skipped_round_ids: Vec<String>,
 }
 
@@ -1066,23 +1462,43 @@ fn authenticate_dynamic_rounds(
     rounds: &BTreeMap<String, RoundEntry>,
     trusted_keys: &[TrustedKey],
     pir_layout: PirLayout,
-) -> AuthenticatedRounds {
+    pir_endpoints: &[ServiceEndpoint],
+    expected_v3: Option<&RoundAuthExpectationV3>,
+) -> Result<AuthenticatedRounds, VotingConfigError> {
     let mut authenticated_rounds = Vec::new();
+    let mut verified_v3_rounds = Vec::new();
     let mut skipped_round_ids = Vec::new();
     for (round_id, entry) in rounds {
-        if !verify_round_entry(round_id, entry, trusted_keys, pir_layout) {
+        let Some(authenticated) = verify_round_entry(
+            round_id,
+            entry,
+            trusted_keys,
+            pir_layout,
+            pir_endpoints,
+            expected_v3,
+        ) else {
             skipped_round_ids.push(round_id.clone());
             continue;
-        }
+        };
         authenticated_rounds.push(AuthenticatedRound {
             round_id: round_id.clone(),
             ea_pk: entry.ea_pk.clone(),
         });
+        if let AuthenticatedRoundVersion::V3(verified) = authenticated {
+            verified_v3_rounds.push(verified);
+        }
     }
-    AuthenticatedRounds {
+    Ok(AuthenticatedRounds {
         authenticated_rounds,
+        verified_v3_rounds,
         skipped_round_ids,
-    }
+    })
+}
+
+#[derive(Clone)]
+enum AuthenticatedRoundVersion {
+    V2,
+    V3(VerifiedRoundAuthV3),
 }
 
 fn verify_round_entry(
@@ -1090,25 +1506,36 @@ fn verify_round_entry(
     entry: &RoundEntry,
     trusted_keys: &[TrustedKey],
     pir_layout: PirLayout,
-) -> bool {
-    if entry.auth_version != ROUND_AUTH_VERSION_V2
-        || entry.ea_pk.len() != 32
-        || entry.signatures.is_empty()
-    {
-        return false;
+    pir_endpoints: &[ServiceEndpoint],
+    expected_v3: Option<&RoundAuthExpectationV3>,
+) -> Option<AuthenticatedRoundVersion> {
+    if entry.ea_pk.len() != 32 || entry.signatures.is_empty() {
+        return None;
     }
     // Round keys are hex-validated during dynamic-config validation, but decode
     // defensively: an undecodable round id can never authenticate.
     let Ok(round_id_bytes) = hex::decode(round_id) else {
-        return false;
+        return None;
     };
     let Ok(round_id_bytes) = <[u8; 32]>::try_from(round_id_bytes.as_slice()) else {
-        return false;
+        return None;
     };
     let Ok(ea_pk) = <[u8; 32]>::try_from(entry.ea_pk.as_slice()) else {
-        return false;
+        return None;
     };
-    let payload = RoundAuthPayloadV2::new(round_id_bytes, ea_pk, pir_layout).to_bytes();
+
+    let (payload_bytes, v3_payload) = match entry.auth_version {
+        ROUND_AUTH_VERSION_V2 if !round_entry_has_v3_fields(entry) => (
+            RoundAuthPayloadV2::new(round_id_bytes, ea_pk, pir_layout).to_bytes(),
+            None,
+        ),
+        ROUND_AUTH_VERSION_V3 => {
+            let context = round_entry_v3_context(entry, expected_v3?)?;
+            let payload = RoundAuthPayloadV3::new(round_id_bytes, ea_pk, pir_layout, context);
+            (payload.to_bytes(), Some(payload))
+        }
+        _ => return None,
+    };
 
     for signature in &entry.signatures {
         let Some(key) = trusted_keys
@@ -1131,11 +1558,65 @@ fn verify_round_entry(
             continue;
         };
         let sig = Signature::from_bytes(&sig_bytes);
-        if verifying_key.verify(&payload, &sig).is_ok() {
-            return true;
+        if verifying_key.verify(&payload_bytes, &sig).is_ok() {
+            return Some(match &v3_payload {
+                Some(payload) => AuthenticatedRoundVersion::V3(
+                    VerifiedRoundAuthV3::from_verified_signature(payload.clone(), pir_endpoints),
+                ),
+                None => AuthenticatedRoundVersion::V2,
+            });
         }
     }
-    false
+    None
+}
+
+fn round_entry_has_v3_fields(entry: &RoundEntry) -> bool {
+    !entry.authority_scheme.is_missing()
+        || !entry.bundle_policy.is_missing()
+        || !entry.network.is_missing()
+        || !entry.vote_chain_id.is_missing()
+        || !entry.snapshot_height.is_missing()
+        || !entry.snapshot_block_hash.is_missing()
+        || !entry.proposal_count.is_missing()
+}
+
+fn round_entry_v3_context(
+    entry: &RoundEntry,
+    expected: &RoundAuthExpectationV3,
+) -> Option<RoundAuthContextV3> {
+    if entry.authority_scheme.as_ref()?.as_str() != RECOVERABLE_AUTHORITY_SCHEME_V1
+        || entry.bundle_policy.as_ref()?.as_str() != RECOVERABLE_BUNDLE_POLICY_V1
+    {
+        return None;
+    }
+    let network = parse_network(entry.network.as_ref()?.as_str())?;
+    let vote_chain_id = entry.vote_chain_id.as_ref()?.as_str();
+    let snapshot_height = *entry.snapshot_height.as_ref()?;
+    let snapshot_block_hash = BASE64
+        .decode(entry.snapshot_block_hash.as_ref()?.as_str())
+        .ok()?;
+    let snapshot_block_hash = <[u8; 32]>::try_from(snapshot_block_hash.as_slice()).ok()?;
+    let proposal_count = *entry.proposal_count.as_ref()?;
+    if network != expected.network || vote_chain_id != expected.vote_chain_id {
+        return None;
+    }
+    RoundAuthContextV3::new(
+        network,
+        vote_chain_id.to_string(),
+        snapshot_height,
+        snapshot_block_hash,
+        proposal_count,
+    )
+    .ok()
+}
+
+fn parse_network(value: &str) -> Option<Network> {
+    match value {
+        "mainnet" => Some(Network::Mainnet),
+        "testnet" => Some(Network::Testnet),
+        "regtest" => Some(Network::Regtest),
+        _ => None,
+    }
 }
 
 fn require_supported(
@@ -1198,8 +1679,89 @@ fn fingerprint_json<T: Serialize>(value: &T) -> String {
     fingerprint_bytes(&bytes)
 }
 
+fn authenticated_round_set_fingerprint(config: &ResolvedVotingConfig) -> String {
+    // Preserve the persisted v2 summary identity exactly. Changing this would
+    // turn the first post-upgrade load into a false round-set switch for every
+    // existing wallet.
+    let round_ids = config
+        .authenticated_rounds
+        .iter()
+        .map(|round| round.round_id.clone())
+        .collect::<Vec<_>>();
+    fingerprint_json(&round_ids)
+}
+
+fn verified_authenticated_round_set_fingerprint(config: &VerifiedVotingConfigV3) -> String {
+    if config.verified_rounds.is_empty() {
+        return authenticated_round_set_fingerprint(&config.resolved);
+    }
+
+    let canonical_payloads = config
+        .resolved
+        .authenticated_rounds
+        .iter()
+        .map(|round| {
+            if let Some(verified) = config
+                .verified_rounds
+                .iter()
+                .find(|verified| hex::encode(verified.round_id()) == round.round_id)
+            {
+                return Some(verified.canonical_payload_bytes());
+            }
+            let round_id = hex::decode(&round.round_id).ok()?;
+            let round_id = <[u8; 32]>::try_from(round_id.as_slice()).ok()?;
+            let ea_pk = <[u8; 32]>::try_from(round.ea_pk.as_slice()).ok()?;
+            Some(RoundAuthPayloadV2::new(round_id, ea_pk, config.resolved.pir_layout).to_bytes())
+        })
+        .collect::<Option<Vec<_>>>();
+
+    // Resolved output from this module always takes the canonical branch. The
+    // fallback keeps summary construction total for manually assembled public
+    // DTOs while still including all round and PIR data.
+    canonical_payloads.map_or_else(
+        || {
+            fingerprint_json(&(
+                config.resolved.pir_layout,
+                &config.resolved.authenticated_rounds,
+            ))
+        },
+        |payloads| fingerprint_json(&payloads),
+    )
+}
+
 fn fingerprint_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn validate_expected_vote_chain_id(vote_chain_id: &str) -> Result<(), VotingConfigError> {
+    validate_vote_chain_id(vote_chain_id).map_err(|error| VotingConfigError::InvalidInput {
+        message: error.to_string(),
+    })
+}
+
+mod network_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(network: &Network, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match network {
+            Network::Mainnet => "mainnet",
+            Network::Testnet => "testnet",
+            Network::Regtest => "regtest",
+        })
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Network, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_network(&value)
+            .ok_or_else(|| serde::de::Error::custom(format!("unsupported Zcash network {value}")))
+    }
 }
 
 mod base64_bytes {
@@ -1263,6 +1825,56 @@ mod tests {
             tier1_layers: 7,
             poly_len: 4096,
         }
+    }
+
+    fn round_auth_v3_context() -> RoundAuthContextV3 {
+        RoundAuthContextV3::new(
+            Network::Testnet,
+            "vote-chain-test",
+            1_234_567,
+            [0x33; 32],
+            3,
+        )
+        .unwrap()
+    }
+
+    fn round_auth_v3_expectation() -> RoundAuthExpectationV3 {
+        RoundAuthExpectationV3::new(Network::Testnet, "vote-chain-test").unwrap()
+    }
+
+    fn dynamic_bytes_v3_with_context(
+        signing_key: &SigningKey,
+        context: RoundAuthContextV3,
+    ) -> Vec<u8> {
+        let layout = test_pir_layout();
+        let ea_pk = [7u8; 32];
+        let round_id = hex::decode(ROUND_ID).unwrap().try_into().unwrap();
+        let signature = signing_key
+            .sign(&RoundAuthPayloadV3::new(round_id, ea_pk, layout, context.clone()).to_bytes())
+            .to_bytes();
+        let mut dynamic: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(signing_key)).unwrap();
+        dynamic["rounds"][ROUND_ID] = serde_json::json!({
+            "auth_version": 3,
+            "ea_pk": BASE64.encode(ea_pk),
+            "authority_scheme": RECOVERABLE_AUTHORITY_SCHEME_V1,
+            "bundle_policy": RECOVERABLE_BUNDLE_POLICY_V1,
+            "network": "testnet",
+            "vote_chain_id": "vote-chain-test",
+            "snapshot_height": context.snapshot_height(),
+            "snapshot_block_hash": BASE64.encode(context.snapshot_block_hash()),
+            "proposal_count": context.proposal_count(),
+            "signatures": [{
+                "key_id": "k1",
+                "alg": "ed25519",
+                "sig": BASE64.encode(signature)
+            }]
+        });
+        serde_json::to_vec(&dynamic).unwrap()
+    }
+
+    fn dynamic_bytes_v3(signing_key: &SigningKey) -> Vec<u8> {
+        dynamic_bytes_v3_with_context(signing_key, round_auth_v3_context())
     }
 
     fn static_bytes_v2(signing_key: &SigningKey, urls: &[&str]) -> Vec<u8> {
@@ -1402,6 +2014,17 @@ mod tests {
             }]
         );
         assert!(resolved.skipped_round_ids.is_empty());
+    }
+
+    #[test]
+    fn authenticated_round_preserves_the_legacy_two_field_literal() {
+        let round = AuthenticatedRound {
+            round_id: ROUND_ID.to_string(),
+            ea_pk: vec![7u8; 32],
+        };
+
+        assert_eq!(round.round_id, ROUND_ID);
+        assert_eq!(round.ea_pk, vec![7u8; 32]);
     }
 
     #[test]
@@ -1727,6 +2350,311 @@ mod tests {
     }
 
     #[test]
+    fn round_auth_v3_requires_explicit_context_and_authenticates_full_payload() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+        let dynamic = dynamic_bytes_v3(&trusted_key);
+
+        let legacy = resolve_dynamic_voting_config(
+            resolved_static.clone(),
+            &dynamic,
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap();
+        assert!(legacy.authenticated_rounds.is_empty());
+        assert_eq!(legacy.skipped_round_ids, vec![ROUND_ID.to_string()]);
+
+        let resolved = resolve_dynamic_voting_config_with_round_auth_v3(
+            resolved_static,
+            &dynamic,
+            ResolveVotingConfigOptions::default(),
+            round_auth_v3_expectation(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.resolved_config().authenticated_rounds,
+            vec![AuthenticatedRound {
+                round_id: ROUND_ID.to_string(),
+                ea_pk: vec![7u8; 32],
+            }]
+        );
+        assert!(resolved.resolved_config().skipped_round_ids.is_empty());
+        let round_id = hex::decode(ROUND_ID).unwrap().try_into().unwrap();
+        assert_eq!(
+            resolved.verified_round_auth_v3(ROUND_ID).unwrap().digest(),
+            RoundAuthPayloadV3::new(
+                round_id,
+                [7u8; 32],
+                test_pir_layout(),
+                round_auth_v3_context(),
+            )
+            .digest()
+        );
+    }
+
+    #[test]
+    fn public_v3_payload_cannot_forge_a_verified_round_token() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let attacker_key = SigningKey::from_bytes(&[4u8; 32]);
+        let round_id = hex::decode(ROUND_ID).unwrap().try_into().unwrap();
+        let public_payload = RoundAuthPayloadV3::new(
+            round_id,
+            [7u8; 32],
+            test_pir_layout(),
+            round_auth_v3_context(),
+        );
+        assert_eq!(public_payload.round_id(), &round_id);
+
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+        let resolved = resolve_dynamic_voting_config_with_round_auth_v3(
+            resolved_static,
+            &dynamic_bytes_v3(&attacker_key),
+            ResolveVotingConfigOptions::default(),
+            round_auth_v3_expectation(),
+        )
+        .unwrap();
+
+        assert!(resolved.resolved_config().authenticated_rounds.is_empty());
+        assert!(matches!(
+            resolved.verified_round_auth_v3(ROUND_ID),
+            Err(VotingConfigError::RemoteAuthenticationFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_resolution_authenticates_v2_in_a_mixed_v2_v3_document() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let mut mixed: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes_v3(&trusted_key)).unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&dynamic_bytes_with_round_signers(&[(
+            ROUND_ID_2,
+            &trusted_key,
+        )]))
+        .unwrap();
+        mixed["rounds"][ROUND_ID_2] = v2["rounds"][ROUND_ID_2].clone();
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+
+        let resolved = resolve_dynamic_voting_config(
+            resolved_static,
+            &serde_json::to_vec(&mixed).unwrap(),
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.authenticated_rounds,
+            vec![AuthenticatedRound {
+                round_id: ROUND_ID_2.to_string(),
+                ea_pk: vec![7u8; 32],
+            }]
+        );
+        assert_eq!(resolved.skipped_round_ids, vec![ROUND_ID.to_string()]);
+    }
+
+    #[test]
+    fn round_auth_v3_rejects_mismatched_independent_network_or_chain() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let dynamic = dynamic_bytes_v3(&trusted_key);
+        for expected in [
+            RoundAuthExpectationV3::new(Network::Mainnet, "vote-chain-test").unwrap(),
+            RoundAuthExpectationV3::new(Network::Testnet, "other-vote-chain").unwrap(),
+        ] {
+            let resolved_static =
+                resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+            let resolved = resolve_dynamic_voting_config_with_round_auth_v3(
+                resolved_static,
+                &dynamic,
+                ResolveVotingConfigOptions::default(),
+                expected,
+            )
+            .unwrap();
+            assert!(resolved.resolved_config().authenticated_rounds.is_empty());
+            assert_eq!(
+                resolved.resolved_config().skipped_round_ids,
+                vec![ROUND_ID.to_string()]
+            );
+        }
+
+        let invalid = RoundAuthExpectationV3 {
+            network: Network::Testnet,
+            vote_chain_id: "not canonical".to_string(),
+        };
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+        let error = resolve_dynamic_voting_config_with_round_auth_v3(
+            resolved_static,
+            &dynamic,
+            ResolveVotingConfigOptions::default(),
+            invalid,
+        )
+        .err()
+        .expect("invalid v3 expectation must fail");
+        assert!(matches!(error, VotingConfigError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn v2_rejects_v3_fields_and_v3_requires_every_exact_field() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let mut v2: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
+        v2["rounds"][ROUND_ID]["network"] = serde_json::json!("testnet");
+        let resolved =
+            resolve_test_dynamic(&trusted_key, &serde_json::to_vec(&v2).unwrap()).unwrap();
+        assert!(resolved.authenticated_rounds.is_empty());
+
+        let mut v2_with_null_extra: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
+        v2_with_null_extra["rounds"][ROUND_ID]["network"] = serde_json::Value::Null;
+        assert!(matches!(
+            resolve_test_dynamic(
+                &trusted_key,
+                &serde_json::to_vec(&v2_with_null_extra).unwrap()
+            ),
+            Err(VotingConfigError::DecodeFailed { .. })
+        ));
+
+        for field in [
+            "authority_scheme",
+            "bundle_policy",
+            "network",
+            "vote_chain_id",
+            "snapshot_height",
+            "snapshot_block_hash",
+            "proposal_count",
+        ] {
+            let mut v3: serde_json::Value =
+                serde_json::from_slice(&dynamic_bytes_v3(&trusted_key)).unwrap();
+            v3["rounds"][ROUND_ID]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let resolved_static =
+                resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+            let resolved = resolve_dynamic_voting_config_with_round_auth_v3(
+                resolved_static,
+                &serde_json::to_vec(&v3).unwrap(),
+                ResolveVotingConfigOptions::default(),
+                round_auth_v3_expectation(),
+            )
+            .unwrap();
+            assert!(
+                resolved.resolved_config().authenticated_rounds.is_empty(),
+                "{field}"
+            );
+            assert_eq!(
+                resolved.resolved_config().skipped_round_ids,
+                vec![ROUND_ID.to_string()]
+            );
+        }
+
+        for (field, value) in [
+            ("authority_scheme", serde_json::json!("other-authority")),
+            ("bundle_policy", serde_json::json!("other-policy")),
+            ("network", serde_json::json!("Testnet")),
+        ] {
+            let mut v3: serde_json::Value =
+                serde_json::from_slice(&dynamic_bytes_v3(&trusted_key)).unwrap();
+            v3["rounds"][ROUND_ID][field] = value;
+            let resolved_static =
+                resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+            let resolved = resolve_dynamic_voting_config_with_round_auth_v3(
+                resolved_static,
+                &serde_json::to_vec(&v3).unwrap(),
+                ResolveVotingConfigOptions::default(),
+                round_auth_v3_expectation(),
+            )
+            .unwrap();
+            assert!(
+                resolved.resolved_config().authenticated_rounds.is_empty(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn round_auth_v3_rejects_server_snapshot_mismatch() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+        let resolved = resolve_dynamic_voting_config_with_round_auth_v3(
+            resolved_static,
+            &dynamic_bytes_v3(&trusted_key),
+            ResolveVotingConfigOptions::default(),
+            round_auth_v3_expectation(),
+        )
+        .unwrap();
+
+        let params = resolved
+            .trusted_voting_round_params_for_snapshot(
+                ROUND_ID.to_string(),
+                1_234_567,
+                vec![0x33; 32],
+                vec![2u8; 32],
+                vec![3u8; 32],
+            )
+            .unwrap();
+        assert_eq!(params.round_params().snapshot_height, 1_234_567);
+
+        for (height, hash) in [(1_234_568, vec![0x33; 32]), (1_234_567, vec![0x34; 32])] {
+            let error = resolved
+                .trusted_voting_round_params_for_snapshot(
+                    ROUND_ID.to_string(),
+                    height,
+                    hash,
+                    vec![2u8; 32],
+                    vec![3u8; 32],
+                )
+                .err()
+                .expect("mismatched snapshot metadata must fail");
+            assert!(matches!(
+                error,
+                VotingConfigError::RemoteAuthenticationFailed { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn authenticated_round_fingerprint_covers_v3_snapshot_context() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+        let resolved = resolve_dynamic_voting_config_with_round_auth_v3(
+            resolved_static,
+            &dynamic_bytes_v3(&trusted_key),
+            ResolveVotingConfigOptions::default(),
+            round_auth_v3_expectation(),
+        )
+        .unwrap();
+        let changed_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+        let changed = resolve_dynamic_voting_config_with_round_auth_v3(
+            changed_static,
+            &dynamic_bytes_v3_with_context(
+                &trusted_key,
+                RoundAuthContextV3::new(
+                    Network::Testnet,
+                    "vote-chain-test",
+                    1_234_568,
+                    [0x33; 32],
+                    3,
+                )
+                .unwrap(),
+            ),
+            ResolveVotingConfigOptions::default(),
+            round_auth_v3_expectation(),
+        );
+        let changed = changed.unwrap();
+
+        assert_ne!(
+            ResolvedVotingConfigSummary::from(&resolved).authenticated_round_set_fingerprint,
+            ResolvedVotingConfigSummary::from(&changed).authenticated_round_set_fingerprint
+        );
+    }
+
+    #[test]
     fn dynamic_resolution_skips_legacy_auth_version_1_rounds() {
         let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
         let ea_pk = [7u8; 32];
@@ -1911,6 +2839,11 @@ mod tests {
         assert_eq!(
             summary_base.authenticated_round_set_fingerprint,
             summary_with_different_skips.authenticated_round_set_fingerprint
+        );
+        assert_eq!(
+            summary_base.authenticated_round_set_fingerprint,
+            fingerprint_json(&vec![ROUND_ID.to_string()]),
+            "v2 persisted summary identity must remain unchanged"
         );
     }
 
@@ -2793,6 +3726,28 @@ mod tests {
         assert!(
             matches!(&error, VotingConfigError::InvalidInput { message } if message.contains("at least one entry")),
             "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn round_auth_v3_context_is_preserved_through_mirror_attempt_resolution() {
+        let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+        let (resolved, skipped) = resolve_dynamic_voting_config_from_attempts_with_round_auth_v3(
+            resolved_static_v2(&signing_key),
+            vec![DynamicConfigAttempt::fetched(
+                MIRROR_A,
+                dynamic_bytes_v3(&signing_key),
+            )],
+            ResolveVotingConfigOptions::default(),
+            round_auth_v3_expectation(),
+        )
+        .unwrap();
+
+        assert!(skipped.is_empty());
+        assert_eq!(resolved.resolved_config().authenticated_rounds.len(), 1);
+        assert_eq!(
+            resolved.verified_round_auth_v3(ROUND_ID).unwrap().context(),
+            &round_auth_v3_context()
         );
     }
 
