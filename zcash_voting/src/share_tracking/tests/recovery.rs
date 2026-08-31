@@ -795,7 +795,6 @@ async fn resubmission_rechecks_the_cutoff_before_every_post() {
         &client,
         &never_cancel(),
         &elapsed_seconds,
-        None,
     )
     .await
     .unwrap();
@@ -1741,7 +1740,6 @@ async fn cancelled_outcome_unknown_retry_preserves_ambiguous_state() {
         &mut attempted_urls,
         &cancel_before_dispatch,
         &|| 0,
-        None,
     )
     .await
     .unwrap();
@@ -1790,7 +1788,6 @@ async fn cancelled_accepted_fallback_preserves_acceptance() {
         &mut attempted_urls,
         &cancel_before_dispatch,
         &|| 0,
-        None,
     )
     .await
     .unwrap();

@@ -997,87 +997,6 @@ Regression tests: `ambiguous_attempt_is_durable_before_recovery_advances`,
 `missing_vote_end_still_allows_early_replenishment` in
 [`share_tracking/tests/recovery.rs`](../zcash_voting/src/share_tracking/tests/recovery.rs).
 
-### Recoverable pending-vote checkpoints
-
-The recoverable-authority helper APIs are opt-in wrappers around the same
-initial fan-out and recovery tracker. They do not change helper selection,
-placement targets, retry classification, polling quorum, scheduling, or
-cutoff behavior. Legacy APIs do not require or write an external backup.
-
-Before an opt-in initial or recovery POST, the normal durable reservation or
-already-journaled retry evidence is captured into a complete versioned pending
-ledger and the caller's persistence callback MUST acknowledge that successor.
-After every accepted, ambiguous, or definite-failure classification is written
-locally, the stronger ledger successor MUST be acknowledged before the flow
-contacts another helper or returns success. If the pre-POST acknowledgement
-fails, no POST for that reservation is dispatched. If a post-outcome
-acknowledgement fails, the classified local evidence remains durable and the
-flow performs no later POST in that call.
-
-Each live ledger record contains either one complete singleton vote or every
-ordered action in an atomic batch, including canonical recovery material,
-transaction hash, optional confirmed VC position, exact timestamps, every
-original helper plan, the original fleet, a monotonic compatible-fleet history,
-and exact accepted, ambiguous, attempting, target, schedule, nullifier, and
-confirmation state. `Some(0)` is a confirmed position distinct from `None`.
-Helper evidence may name only endpoints in the recorded fleet history.
-
-Every record is bound to a typed `VotingAuthoritySelectionV1` and the exact
-self-custody bundle identity or authority-validated custody-capability bundle
-and its exact canonical package digest. A record identifier also binds the
-complete vote-recovery generation while ignoring only a later confirmed VC
-position. Regenerating an unsubmitted vote for the same proposal therefore
-creates a distinct live replacement that can be named by the old record's
-tombstone. Import requires those expected bindings, the caller's independently
-rollback-protected `(revision, digest)` head, and a complete valid record.
-Same-revision digest conflicts and lower revisions are rejected. A higher
-externally authenticated revision may skip local database revisions because
-external checkpoints can advance without an intervening import. Import is one
-immediate transaction and merges only stronger evidence: accepted outranks
-ambiguous, ambiguous outranks attempting, confirmation is monotonic, placement
-targets do not decrease, and submitted hashes or VC positions cannot change.
-
-Retirement produces a retained tombstone and is allowed only after every
-expected helper share is confirmed or when a pristine unsubmitted record is
-replaced by a live record with the same authority and bundle source. A
-replacement tombstone commits to the old record's vote kind plus the ordered
-proposal, creation-time, and normalized recovery-generation digest for every
-action. Import removes local state only when every old action and cleanup
-protection row matches that evidence and no submitted, confirmed, accepted,
-ambiguous, attempting, or helper-confirmed outcome exists. Live imported or
-activated records install cleanup protection for all actions in one transaction,
-so generic recovery cleanup cannot observe a partially protected atomic batch or
-remove protected helper rows or unconfirmed vote recovery. Full round deletion
-and authenticated tombstone import remain explicit ways to retire that
-protection. Encryption, authentication, atomic external storage, and the
-independent rollback head remain caller responsibilities.
-
-Enforcement:
-[`recoverable_authority/pending_backup.rs`](../zcash_voting/src/recoverable_authority/pending_backup.rs),
-the opt-in wrappers in
-[`share_tracking/initial_delivery.rs`](../zcash_voting/src/share_tracking/initial_delivery.rs),
-[`share_tracking/recovery.rs`](../zcash_voting/src/share_tracking/recovery.rs),
-and protected cleanup in
-[`storage/queries/mod.rs`](../zcash_voting/src/storage/queries/mod.rs).
-
-Regression tests:
-`pending_backup_failure_after_reservation_dispatches_no_post`,
-`json_roundtrip_preserves_confirmed_position_zero`,
-`same_proposal_replacement_gets_a_new_generation_id_and_tombstones_the_old_vote`,
-`import_atomically_replaces_the_exact_pristine_local_generation`,
-`replacement_import_rejects_submitted_or_confirmed_local_vote_evidence`,
-`replacement_import_rejects_every_durable_helper_outcome_class`,
-`custody_binding_accepts_only_a_bundle_from_validated_capability_material`,
-`successor_retains_multiple_records_and_rejects_evidence_downgrade`,
-`import_preserves_some_zero_and_protects_unconfirmed_recovery_from_cleanup`,
-`import_accepts_skipped_checkpoint_revisions_and_rejects_stale_head`,
-`import_rejects_a_different_typed_authority_or_bundle_binding`,
-`skipped_replacement_chain_uses_dependency_order_and_replays_idempotently`,
-`skipped_replacement_chain_rejects_an_exact_unprotected_intermediate_generation`,
-`skipped_replacement_chain_rejects_unprotected_state_outside_terminal_proposals`,
-`compatible_fleet_addition_is_checkpointed_without_changing_original_plan`, and
-`atomic_record_protection_rolls_back_if_any_action_cannot_be_protected`.
-
 ### Recovery material
 
 A recovery POST MUST use:
@@ -1264,10 +1183,9 @@ Regression tests: `migrate_from_launch_version_preserves_delegation_state`,
 
 ### Recovery cleanup
 
-Explicit recovery cleanup removes unprotected share-delivery rows and
-retryable, unconfirmed vote recovery artifacts. It preserves ballot intent,
-confirmed vote positions, imported delegation capabilities, and live pending
-records protected by the recoverable checkpoint ledger. Full round deletion is
+Explicit recovery cleanup removes share-delivery rows and retryable,
+unconfirmed vote recovery artifacts. It preserves ballot intent, confirmed
+vote positions, and imported delegation capabilities. Full round deletion is
 a separate operation.
 
 Enforcement:

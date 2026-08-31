@@ -87,10 +87,6 @@ stage-oriented API:
   applies share scheduling policy. `CommittedVote::submit_share_to_helpers`
   owns journaled initial delivery, while `track_pending_shares` requires two
   distinct configured helpers to agree before persisting confirmation.
-  Recoverable rounds use the pending-backup variants to checkpoint the complete
-  vote, original helper plans, and tracker evidence before each dependent POST
-  and after each classified outcome. The wallet encrypts and atomically stores
-  that rollback-aware ledger.
 - `session::*` records durable ballot intent and returns a round-level
   `RoundPlan` with ordered `NextStep`s for restart recovery. Wallets should
   write `Decision::Choice` with the proposal's declared option count before

@@ -314,11 +314,9 @@ use configured_fleet::ConfiguredHelperFleet;
 #[cfg(test)]
 use confirmation::{finish_expired_polls, poll_share_helpers_with_budget};
 use confirmation::{poll_share_helpers, ShareStatusOutcome};
+pub(crate) use initial_delivery::submit_committed_share_to_helpers;
 #[cfg(test)]
 use initial_delivery::submit_share_to_helpers;
-pub(crate) use initial_delivery::{
-    submit_committed_share_to_helpers, submit_committed_share_to_helpers_with_pending_backup,
-};
 use recovery::{
     resubmit_to_next_helper, ResubmissionCandidates, ResubmissionSchedule, ResubmitOutcome,
     ResubmitRequest,
@@ -363,38 +361,9 @@ pub async fn track_pending_shares(
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareTrackingReport, VotingError> {
     let started_at = Instant::now();
-    track_pending_shares_with_elapsed(
-        db,
-        params,
-        client,
-        cancel,
-        &|| started_at.elapsed().as_secs(),
-        None,
-    )
-    .await
-}
-
-/// Runs the existing helper tracker for one recoverable pending record.
-///
-/// The tracker, retry order, polling quorum, placement, and timing policy are
-/// unchanged. This opt-in wrapper only adds externally acknowledged checkpoints
-/// after durable confirmation/outcome writes and after each POST reservation.
-pub async fn track_pending_shares_with_pending_backup(
-    db: &VotingDb,
-    params: &ShareTrackingParams<'_>,
-    client: &HelperClient,
-    checkpoint: &mut crate::recoverable_authority::PendingVoteBackupCheckpointV1<'_>,
-    cancel: &(dyn Fn() -> bool + Send + Sync),
-) -> Result<ShareTrackingReport, VotingError> {
-    let started_at = Instant::now();
-    track_pending_shares_with_elapsed(
-        db,
-        params,
-        client,
-        cancel,
-        &|| started_at.elapsed().as_secs(),
-        Some(checkpoint),
-    )
+    track_pending_shares_with_elapsed(db, params, client, cancel, &|| {
+        started_at.elapsed().as_secs()
+    })
     .await
 }
 
@@ -404,29 +373,15 @@ async fn track_pending_shares_with_elapsed(
     client: &HelperClient,
     cancel: &(dyn Fn() -> bool + Send + Sync),
     elapsed_seconds: &(dyn Fn() -> u64 + Send + Sync),
-    mut checkpoint: Option<&mut crate::recoverable_authority::PendingVoteBackupCheckpointV1<'_>>,
 ) -> Result<ShareTrackingReport, VotingError> {
     let scope = share::ShareOperationScope::capture(db);
     // Validate the complete trust boundary before reading or mutating storage
     // and before dispatching any helper request.
     let configured_fleet = ConfiguredHelperFleet::new(params.configured_server_urls)?;
     let configured_urls = configured_fleet.urls();
-    if let Some(checkpoint) = checkpoint.as_deref_mut() {
-        checkpoint.validate_tracking_request(params.round_id, params.configured_server_urls)?;
-        checkpoint.activate(db)?;
-    }
     let mut report = ShareTrackingReport::default();
 
     for loaded_share in share::unconfirmed_for_scope(db, &scope, params.round_id)? {
-        if let Some(checkpoint) = checkpoint.as_deref_mut() {
-            if !checkpoint.contains_share(
-                loaded_share.bundle_index,
-                loaded_share.proposal_id,
-                loaded_share.share_index,
-            )? {
-                continue;
-            }
-        }
         if cancel() {
             report.cancelled = true;
             break;
@@ -533,9 +488,6 @@ async fn track_pending_shares_with_elapsed(
                         continue;
                     }
                     report.confirmed.push(ShareKey::of(&share));
-                    if let Some(checkpoint) = checkpoint.as_deref_mut() {
-                        checkpoint.checkpoint(db)?;
-                    }
                     continue;
                 }
                 ShareStatusOutcome::ConfiguredHelperQuorumNotObserved => {}
@@ -592,7 +544,6 @@ async fn track_pending_shares_with_elapsed(
                     &mut attempted_urls_this_pass,
                     cancel,
                     elapsed_seconds,
-                    checkpoint.as_deref_mut(),
                 )
                 .await?;
                 if matches!(resubmission.outcome, ResubmitOutcome::StaleGeneration) {

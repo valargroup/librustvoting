@@ -2014,7 +2014,7 @@ impl VotingDb {
     /// integrations should use
     /// `CommittedVote::submit_share_to_helpers`, which derives the nullifier
     /// and owns journaled delivery.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) fn record_share_delegation(
         &self,
         round_id: &str,
@@ -2043,7 +2043,7 @@ impl VotingDb {
     }
 
     /// Record helper deliveries and return the effective write-once schedule.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_share_delivery(
         &self,
@@ -2072,7 +2072,6 @@ impl VotingDb {
         )
     }
 
-    #[cfg(any(test, feature = "test-fixtures"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_share_delivery_for_wallet(
         &self,

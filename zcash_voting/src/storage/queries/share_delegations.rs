@@ -441,7 +441,6 @@ pub(crate) fn remove_attempting_server_for_generation(
 /// with definite acceptance taking precedence over outcome-unknown or
 /// in-flight state; a conflicting nullifier leaves the row unchanged.
 /// Returns the effective durable `submit_at`, which is write-once on conflict.
-#[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) fn record_share_delegation(
     conn: &Connection,
     round_id: &str,

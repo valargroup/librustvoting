@@ -9,7 +9,6 @@
 mod bundle;
 mod chain_recovery;
 mod derivation;
-mod pending_backup;
 mod pir;
 
 pub(crate) use bundle::canonical_recoverable_notes;
@@ -27,7 +26,6 @@ pub use derivation::{
     VotingAuthorityScopeV1, VotingAuthoritySelectionV1, KEYSTONE_MASTER_SECRET_LEN,
     VOTING_AUTHORITY_ROOT_LEN,
 };
-pub use pending_backup::*;
 pub use pir::{
     connect_recoverable_pir_blocking_v1, select_recoverable_pir_snapshot_v1,
     RecoverablePirClientV1, RecoverablePirSnapshotMetadataV1, VerifiedRecoverablePirSnapshotV1,

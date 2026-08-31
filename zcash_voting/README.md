@@ -74,11 +74,6 @@ precompute → delegate → vote → share lifecycle:
    polls the complete current fleet and requires two distinct confirmations
    when at least two helpers are configured; a one-helper fleet uses its only
    available confirmation. The result is persisted internally.
-   Recoverable integrations use the pending-backup variants to checkpoint the
-   complete vote, original helper plans, and tracker evidence before a
-   dependent POST and after each classified outcome. The wallet encrypts and
-   atomically persists the returned rollback-aware ledger and its independent
-   revision head.
    `Decision::Skipped` is terminal, so `open_proposals`
    contains only proposals that have no recorded decision.
 
@@ -104,7 +99,7 @@ precompute → delegate → vote → share lifecycle:
 | `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `config` | Static and dynamic voting config validation, signature checks, and switch decisions. |
-| `recoverable_authority` | Opt-in round-bound authority derivation, canonical self-custody bundles, finalized-chain recovery, and pending-vote backup state. |
+| `recoverable_authority` | Opt-in round-bound authority derivation, canonical self-custody bundles, and finalized-chain recovery. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
 | `hotkey` | Voting hotkey reconstruction from stored app-owned secret material plus random app-owned hotkeys. |
 | `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |

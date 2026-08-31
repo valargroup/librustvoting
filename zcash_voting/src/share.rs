@@ -221,7 +221,6 @@ impl ShareDeliveryState {
 }
 use pasta_curves::group::ff::PrimeField;
 use pasta_curves::pallas;
-#[cfg(any(test, feature = "test-fixtures"))]
 use rusqlite::TransactionBehavior;
 
 pub use crate::types::ShareDelegationRecord as ShareRecord;
@@ -408,7 +407,6 @@ fn record_delivery_impl(
     record_delivery_for_scope(db, &scope, params).map(|(submit_at, _)| submit_at)
 }
 
-#[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) fn record_delivery_for_scope(
     db: &VotingDb,
     scope: &ShareOperationScope,
@@ -667,6 +665,17 @@ pub(crate) fn resolve_delivery_attempt_for_generation(
 }
 
 #[cfg(any(test, feature = "test-fixtures"))]
+fn delivery_nullifier(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<[u8; 32], VotingError> {
+    let scope = ShareOperationScope::capture(db);
+    delivery_nullifier_for_scope(db, &scope, round_id, bundle_index, proposal_id, share_index)
+}
+
 fn delivery_nullifier_for_scope(
     db: &VotingDb,
     scope: &ShareOperationScope,

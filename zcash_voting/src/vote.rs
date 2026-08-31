@@ -378,38 +378,6 @@ impl CommittedVote {
         .await
     }
 
-    /// Submits one committed helper share while externally checkpointing every
-    /// durable reservation and classified outcome before network work advances.
-    ///
-    /// This is the opt-in recoverable-authority variant of
-    /// [`Self::submit_share_to_helpers`]. The caller owns encrypted storage and
-    /// supplies a checkpoint bound to this vote's complete original helper
-    /// fleet and placement plans. A checkpoint failure returns immediately;
-    /// when it follows a reservation no POST has occurred, and when it follows
-    /// an outcome the stronger local evidence remains durable.
-    pub async fn submit_share_to_helpers_with_pending_backup(
-        &self,
-        db: &VotingDb,
-        client: &crate::helper::client::HelperClient,
-        request: crate::share_tracking::ShareSubmissionRequest<'_>,
-        checkpoint: &mut crate::recoverable_authority::PendingVoteBackupCheckpointV1<'_>,
-        cancel: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<crate::share_tracking::ShareSubmissionReport, VotingError> {
-        crate::share_tracking::submit_committed_share_to_helpers_with_pending_backup(
-            db,
-            client,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-            &self.commit.vote_commitment,
-            &self.commit.share_payloads,
-            request,
-            cancel,
-            checkpoint,
-        )
-        .await
-    }
-
     /// Reconstructs chain-ready cast-vote fields from persisted recovery state.
     pub fn submission(&self, db: &VotingDb) -> Result<VoteSubmission, VotingError> {
         submission(

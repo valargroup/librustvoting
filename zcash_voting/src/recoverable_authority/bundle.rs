@@ -160,14 +160,14 @@ pub enum RecoverableBundleMaterialV1<'a> {
 }
 
 impl RecoverableBundleMaterialV1<'_> {
-    pub fn bundle_index(self) -> u32 {
+    pub(crate) fn bundle_index(self) -> u32 {
         match self {
             Self::RecoverableSelfCustody(identity) => identity.bundle_index(),
             Self::CustodyCapability { bundle_index, .. } => bundle_index,
         }
     }
 
-    pub fn source(self) -> BundleMaterialSourceV1 {
+    pub(crate) fn source(self) -> BundleMaterialSourceV1 {
         match self {
             Self::RecoverableSelfCustody(_) => BundleMaterialSourceV1::RecoverableSelfCustody,
             Self::CustodyCapability { .. } => BundleMaterialSourceV1::CustodyCapability,
@@ -177,7 +177,7 @@ impl RecoverableBundleMaterialV1<'_> {
 
 /// One immutable authority selection paired with the exact material for a bundle.
 ///
-/// Wallets should reuse this value for vote signing and pending-vote capture.
+/// Wallets should reuse this value for vote signing.
 /// Every operation revalidates the current authenticated round token and the
 /// persisted bundle fields before using secret authority material.
 #[derive(Clone, Copy)]
@@ -203,20 +203,16 @@ impl<'a> RecoverableBundleUseV1<'a> {
         }
     }
 
-    pub fn authority_root(self) -> &'a VotingAuthorityRootV1 {
+    pub(crate) fn authority_root(self) -> &'a VotingAuthorityRootV1 {
         self.authority_root
     }
 
-    pub fn authority_selection(self) -> &'a VotingAuthoritySelectionV1 {
+    pub(crate) fn authority_selection(self) -> &'a VotingAuthoritySelectionV1 {
         self.authority_selection
     }
 
-    pub fn current_round(self) -> &'a VerifiedRoundAuthV3 {
+    pub(crate) fn current_round(self) -> &'a VerifiedRoundAuthV3 {
         self.current_round
-    }
-
-    pub fn bundle_material(self) -> RecoverableBundleMaterialV1<'a> {
-        self.bundle_material
     }
 
     /// Checks the stored bundle and round within the caller's database snapshot.
