@@ -44,7 +44,10 @@ precompute → delegate → vote → share lifecycle:
    freezes the round's complete intent set before the payload is returned;
    later bundles must use that identical ballot. If every proposal is skipped,
    there is no transaction and no on-chain completion marker after total
-   local-state loss.
+   local-state loss. The identical-choice freeze is also local database state:
+   after total loss, chain reconciliation cannot recover hidden choices, so a
+   wallet must restore or reconfirm the original intents before submitting an
+   unspent bundle.
    For multiple answered proposals in one bundle, call
    `vote::commit_atomic_vote_batch` once with their canonical order and submit
    the returned `SignedVoteBatch::batch_json` to the chain's

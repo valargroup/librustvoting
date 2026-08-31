@@ -93,7 +93,10 @@ stage-oriented API:
   are omitted. An all-skipped ballot creates no transaction and therefore has
   no cross-device on-chain completion marker. Persisting the first bundle's
   signed batch freezes the round's intents before the payload is returned;
-  later bundles must commit the identical complete ballot.
+  later bundles must commit the identical complete ballot while that database
+  survives. After total local-state loss, the chain cannot reveal hidden choice
+  values, so the wallet must restore or reconfirm the original intents before
+  submitting an unspent bundle.
 - `share::*` recovers helper-share payloads, computes share nullifiers, and
   applies share scheduling policy. `CommittedVote::submit_share_to_helpers`
   owns journaled initial delivery, while `track_pending_shares` requires two

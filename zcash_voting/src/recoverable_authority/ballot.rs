@@ -159,7 +159,14 @@ pub fn record_recoverable_complete_ballot_submission_v1(
     batch_digest: &[u8],
     tx_hash: &str,
 ) -> Result<(), VotingError> {
+    authority
+        .authority_root()
+        .validate_current_selection(authority.authority_selection(), authority.current_round())?;
     let round_id = hex::encode(authority.authority_root().context().vote_round_id());
+    {
+        let conn = db.conn();
+        authority.validate_persisted_round_with_conn(&conn, &db.wallet_id(), &round_id)?;
+    }
     crate::vote::record_recoverable_ballot_submission_v1(
         db,
         &round_id,
@@ -514,5 +521,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("ascending proposal order"));
+    }
+
+    #[test]
+    fn submission_recording_revalidates_the_persisted_round() {
+        let (db, fixture) = fixture();
+        db.conn()
+            .execute(
+                "UPDATE rounds SET snapshot_height = snapshot_height + 1
+                 WHERE round_id = ?1 AND wallet_id = ?2",
+                rusqlite::params![fixture.round_id(), WALLET_ID],
+            )
+            .unwrap();
+
+        let error = record_recoverable_complete_ballot_submission_v1(
+            &db,
+            fixture.authority(),
+            &[0; 32],
+            "tx",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("persisted round parameters do not match"),
+            "{error}"
+        );
     }
 }
