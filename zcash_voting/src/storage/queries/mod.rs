@@ -3202,6 +3202,14 @@ pub fn clear_unsigned_delegation_setup_fields(
            AND note_positions_blob IS NOT NULL
            AND delegation_tx_hash IS NULL
            AND van_leaf_position IS NULL
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM chain_submission_attempts a
+                WHERE a.round_id = bundles.round_id
+                  AND a.wallet_id = bundles.wallet_id
+                  AND a.kind = 'delegation'
+                  AND a.bundle_index = bundles.bundle_index
+           )
            AND bundle_index NOT IN (
                SELECT bundle_index
                FROM keystone_signatures
@@ -3232,7 +3240,16 @@ pub fn clear_recovery_state(
         message: format!("failed to clear share delegations: {}", e),
     })?;
     conn.execute(
-        "DELETE FROM keystone_signatures WHERE round_id = :round_id AND wallet_id = :wallet_id",
+        "DELETE FROM keystone_signatures
+         WHERE round_id = :round_id AND wallet_id = :wallet_id
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM chain_submission_attempts a
+                WHERE a.round_id = keystone_signatures.round_id
+                  AND a.wallet_id = keystone_signatures.wallet_id
+                  AND a.kind = 'delegation'
+                  AND a.bundle_index = keystone_signatures.bundle_index
+           )",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {
@@ -3243,7 +3260,15 @@ pub fn clear_recovery_state(
          WHERE round_id = :round_id
            AND wallet_id = :wallet_id
            AND note_positions_blob IS NOT NULL
-           AND van_leaf_position IS NULL",
+           AND van_leaf_position IS NULL
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM chain_submission_attempts a
+                WHERE a.round_id = bundles.round_id
+                  AND a.wallet_id = bundles.wallet_id
+                  AND a.kind = 'delegation'
+                  AND a.bundle_index = bundles.bundle_index
+           )",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {
@@ -3253,7 +3278,18 @@ pub fn clear_recovery_state(
         "UPDATE votes SET tx_hash = NULL, commitment_bundle_json = NULL
          WHERE round_id = :round_id
            AND wallet_id = :wallet_id
-           AND vc_tree_position IS NULL",
+           AND vc_tree_position IS NULL
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM chain_submission_attempts a
+                WHERE a.round_id = votes.round_id
+                  AND a.wallet_id = votes.wallet_id
+                  AND a.bundle_index = votes.bundle_index
+                  AND (
+                      (a.kind = 'vote' AND a.proposal_id = votes.proposal_id) OR
+                      a.kind = 'vote_batch'
+                  )
+           )",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {

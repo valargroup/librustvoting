@@ -175,7 +175,7 @@ impl HyperTransport {
     /// anything else. Timeouts are reported distinctly from other failures so
     /// higher-level clients can tell an ambiguous submission from a refused
     /// one.
-    async fn helper_request(
+    pub(crate) async fn helper_request(
         &self,
         method: Method,
         url: &str,
@@ -350,6 +350,28 @@ impl HelperTransport for HyperTransport {
     }
 
     fn post_json<'a>(&'a self, url: &'a str, body: Vec<u8>, timeout: Duration) -> HelperFuture<'a> {
+        Box::pin(async move { self.helper_request(Method::POST, url, body, timeout).await })
+    }
+}
+
+impl crate::chain::transport::ChainTransport for HyperTransport {
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        timeout: Duration,
+    ) -> crate::chain::transport::ChainFuture<'a> {
+        Box::pin(async move {
+            self.helper_request(Method::GET, url, Vec::new(), timeout)
+                .await
+        })
+    }
+
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> crate::chain::transport::ChainFuture<'a> {
         Box::pin(async move { self.helper_request(Method::POST, url, body, timeout).await })
     }
 }

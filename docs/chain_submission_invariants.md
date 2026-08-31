@@ -47,7 +47,10 @@ An **outcome-unknown** submission may have reached the server but did not
 produce a usable response.
 
 An **accepted** submission returned CheckTx success and a validated chain
-transaction hash. Acceptance is not commitment.
+transaction hash. Acceptance is not commitment. The hash remains in the
+attempt journal; it is not copied into the delegation or vote domain row until
+the committed-success confirmation transaction also records the event-derived
+position.
 
 A **rejected** submission has definite failure evidence for that attempt. A
 rejection does not erase stronger evidence or another attempt.
@@ -117,6 +120,9 @@ for its exact attempt.
    reconciliation until explicit round or account deletion.
 8. Routine session reset and recovery cleanup do not delete chain submission
    attempts.
+9. CheckTx acceptance alone never updates the legacy delegation or vote
+   submission columns. This prevents a later DeliverTx failure from pinning a
+   domain row to a transaction that did not commit successfully.
 
 These rules mirror helper submission's reservation-before-POST and
 strongest-evidence behavior. Chain submissions deliberately differ by allowing
@@ -138,8 +144,9 @@ created by the confirmed delegation.
    randomizer.
 4. Explicit round or account deletion is the only supported operation that
    removes attempted delegation setup.
-5. The lifecycle reconciles every known chain hash before requesting another
-   signature or dispatching another payload.
+5. The lifecycle reconciles every known chain hash before another dispatch.
+   The host SHOULD invoke reconciliation before requesting fresh software
+   signing work after restart.
 
 The crash guarantee differs by signer and transaction type:
 
@@ -234,8 +241,10 @@ hosts do not parse the log.
 6. Delegation confirmation uses `confirm_delegation_submission`; singleton vote
    uses `confirm_vote_submission`; atomic batch uses
    `confirm_vote_batch_submission`.
-7. The winning hash, event-derived positions, and attempt state transition are
-   committed in one immediate transaction.
+7. The winning hash and event-derived positions are committed together by the
+   existing confirmation transaction. Attempt evidence is retained separately;
+   a crash on either side is recoverable because the attempt hash and the
+   domain record are both idempotent and neither overwrites conflicting state.
 8. Atomic-batch members advance together or not at all.
 9. Event round, bundle, proposal order, batch digest, and nullifier bindings are
    validated by the existing confirmation parser before writes.
@@ -246,8 +255,10 @@ hosts do not parse the log.
    identity. Unrelated submissions remain independent.
 2. After acquiring the lock, the lifecycle re-reads the exact durable recovery
    generation. A stale handle fails before network dispatch.
-3. Immediate SQLite transactions acquire the writer reservation before their
-   validation read.
+3. The exact generation is re-read while holding the process identity lock.
+   Attempt insertion and its round/owner validation then share one immediate
+   SQLite transaction. The host advances cancellation before destructive
+   session cleanup, so a cleanup race is observed before dispatch.
 4. Cancellation is checked before reservation, dispatch, retry, failover, and
    backoff.
 5. Cancellation observed after a request completes does not replace its result.
@@ -255,6 +266,11 @@ hosts do not parse the log.
    unsent reservation. Cancellation after dispatch retains uncertainty.
 7. A deleted or replaced generation cannot receive a delayed transport or
    confirmation result.
+
+Vizor implements host cancellation with a monotonically increasing operation
+epoch. Account/session invalidation advances the epoch synchronously; every
+SDK callback compares the captured epoch before reservation, dispatch, retry,
+and confirmation application.
 
 ## Persistence and compatibility invariants
 
@@ -311,3 +327,28 @@ state transitions.
   retry count, and failover bounded by the SDK?
 - Does a custom or Tor transport retain the host's fail-closed route policy?
 - Does each invariant name its enforcement surface and regression coverage?
+
+## Regression map
+
+- `chain::tests::retries_send_byte_identical_canonical_json` covers canonical
+  byte reuse, bounded retry, and endpoint rotation.
+- `chain::tests::endpoint_set_rejects_duplicate_canonical_identity` covers
+  endpoint identity validation.
+- `chain::tests::spent_nullifier_classifier_is_narrow_and_case_insensitive`
+  covers the compatibility classifier boundary.
+- `chain_submission::tests::check_tx_acceptance_is_journaled_without_domain_mutation`
+  covers the CheckTx/committed-domain separation.
+- `chain_submission::tests::known_pending_hash_is_reconciled_without_another_post`
+  covers reconcile-before-replay for accepted candidates.
+- `chain_submission::tests::committed_failure_rejects_without_pinning_domain_hash`
+  covers DeliverTx failure classification without a partial domain write.
+- `storage::operations::tests::attempted_delegation_cleanup_preserves_van_randomizer`
+  covers the post-attempt `van_comm_rand`, legacy hash, and Keystone-signature
+  cleanup prohibition.
+- `storage::operations::tests::attempted_vote_cleanup_preserves_exact_recovery_generation`
+  covers post-attempt vote payload recovery across generic recovery cleanup.
+- storage migration tests cover version 18 fresh and in-place schemas.
+- Vizor's `voting_providers_test.dart` covers account-switch cancellation,
+  bounded spent-nullifier reconciliation, delayed transaction indexing,
+  restart confirmation, and stale confirmation suppression through the FFI
+  adapter.

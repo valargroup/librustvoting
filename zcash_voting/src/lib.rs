@@ -3,11 +3,12 @@
 //! Wallet SDKs should import [`prelude`] and follow the lifecycle:
 //! create a round, bind eligible notes into bundles, precompute witness/PIR
 //! data, build a delegation PCZT, prove delegation, sync the vote commitment
-//! tree, cast votes with `vote::commit`, confirm chain submissions through
-//! `confirmation`, then recover helper-share payloads through `share`. New
-//! integrations should use `round`, `precompute`, `delegate`, `vote`,
-//! `confirmation`, `share`, and `session` rather than writing storage rows
-//! directly.
+//! tree, cast votes with `vote::commit`, submit and reconcile chain mutations
+//! through `chain_submission`, then recover helper-share payloads through
+//! `share`. New integrations should use `round`, `precompute`, `delegate`,
+//! `vote`, `chain_submission`, `share`, and `session` rather than writing
+//! storage rows directly. The lower-level `confirmation` module remains the
+//! parser and atomic persistence layer used by the chain lifecycle.
 
 #[cfg(all(feature = "lrz", feature = "zakura"))]
 compile_error!("features `lrz` and `zakura` cannot be enabled together");
@@ -17,6 +18,8 @@ compile_error!("enable exactly one of the `lrz` or `zakura` features");
 
 pub mod action;
 pub mod backend;
+pub mod chain;
+pub mod chain_submission;
 pub mod config;
 pub mod confirmation;
 pub mod delegate;
@@ -55,6 +58,17 @@ pub mod witness;
 pub mod zkp1;
 pub mod zkp2;
 
+pub use chain::transport::{
+    ChainFuture, ChainResponse, ChainTransport, ChainTransportError, MAX_CHAIN_RESPONSE_BYTES,
+};
+pub use chain::{
+    ChainBroadcastOutcome, ChainClient, ChainClientConfig, ChainEndpointSet, ChainError,
+    ChainTxConfirmation, ChainTxResult, ChainTxStatus,
+};
+pub use chain_submission::{
+    ChainConfirmation, ChainLifecycleError, ChainLifecycleOutcome, ChainSubmissionIdentity,
+    ChainSubmissionKind, ChainSubmissionLifecycle,
+};
 pub use helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
     ShareSubmissionStatus,

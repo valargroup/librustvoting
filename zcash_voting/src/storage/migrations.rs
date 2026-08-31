@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 17;
+const CURRENT_VERSION: u32 = 18;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -117,9 +117,38 @@ BEGIN
        AND commitment_bundle_json IS NOT NEW.commitment_bundle_json;
 END;",
     ),
+    (
+        17,
+        "CREATE TABLE chain_submission_attempts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id        TEXT NOT NULL,
+    wallet_id       TEXT NOT NULL DEFAULT '',
+    kind            TEXT NOT NULL CHECK (kind IN ('delegation','vote','vote_batch')),
+    bundle_index    INTEGER NOT NULL,
+    proposal_id     INTEGER NOT NULL DEFAULT -1,
+    batch_digest    BLOB NOT NULL DEFAULT X'',
+    payload_digest  BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    chain_tx_hash   TEXT,
+    state           TEXT NOT NULL CHECK (state IN ('attempting','outcome_unknown','accepted','rejected')),
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    FOREIGN KEY (round_id, wallet_id)
+        REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE,
+    CHECK (
+        (kind = 'delegation' AND proposal_id = -1 AND length(batch_digest) = 0) OR
+        (kind = 'vote' AND proposal_id >= 0 AND length(batch_digest) = 0) OR
+        (kind = 'vote_batch' AND proposal_id = -1 AND length(batch_digest) = 32)
+    )
+);
+CREATE INDEX chain_submission_attempts_identity
+    ON chain_submission_attempts(
+        round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest, id
+    );",
+    ),
 ];
 
-const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
+const RESET_SQL: &str = "DROP TABLE IF EXISTS chain_submission_attempts;
+DROP TABLE IF EXISTS pir_proof_cache;
 DROP TABLE IF EXISTS ballot_intent;
 DROP TABLE IF EXISTS imt_proofs;
 DROP TABLE IF EXISTS helper_share_plans;
@@ -247,8 +276,21 @@ mod tests {
         format!("{}{}", &schema[..start], &schema[start + next..])
     }
 
+    /// Strips the chain-attempt journal added at version 18.
+    fn without_chain_submission_attempts(schema: &str) -> String {
+        let start = schema
+            .find("CREATE TABLE chain_submission_attempts")
+            .expect("schema must contain the table added at version 18");
+        let next = schema[start..]
+            .find("CREATE TABLE pir_proof_cache")
+            .expect("chain attempt DDL must precede PIR cache");
+        format!("{}{}", &schema[..start], &schema[start + next..])
+    }
+
     fn v16_schema() -> String {
-        without_helper_share_plans(include_str!("migrations/001_init.sql"))
+        without_helper_share_plans(&without_chain_submission_attempts(include_str!(
+            "migrations/001_init.sql"
+        )))
     }
 
     fn v15_schema() -> String {

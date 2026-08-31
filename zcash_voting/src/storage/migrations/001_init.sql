@@ -179,6 +179,33 @@ CREATE TABLE ballot_intent (
     CHECK ((skipped = 1 AND choice IS NULL) OR (skipped = 0 AND choice IS NOT NULL))
 );
 
+CREATE TABLE chain_submission_attempts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id        TEXT NOT NULL,
+    wallet_id       TEXT NOT NULL DEFAULT '',
+    kind            TEXT NOT NULL CHECK (kind IN ('delegation','vote','vote_batch')),
+    bundle_index    INTEGER NOT NULL,
+    proposal_id     INTEGER NOT NULL DEFAULT -1,
+    batch_digest    BLOB NOT NULL DEFAULT X'',
+    payload_digest  BLOB NOT NULL CHECK (length(payload_digest) = 32),
+    chain_tx_hash   TEXT,
+    state           TEXT NOT NULL CHECK (state IN ('attempting','outcome_unknown','accepted','rejected')),
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    FOREIGN KEY (round_id, wallet_id)
+        REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE,
+    CHECK (
+        (kind = 'delegation' AND proposal_id = -1 AND length(batch_digest) = 0) OR
+        (kind = 'vote' AND proposal_id >= 0 AND length(batch_digest) = 0) OR
+        (kind = 'vote_batch' AND proposal_id = -1 AND length(batch_digest) = 32)
+    )
+);
+
+CREATE INDEX chain_submission_attempts_identity
+    ON chain_submission_attempts(
+        round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest, id
+    );
+
 CREATE TABLE pir_proof_cache (
     wallet_id   TEXT NOT NULL DEFAULT '',
     network     TEXT NOT NULL CHECK (network IN ('mainnet','testnet','regtest')),

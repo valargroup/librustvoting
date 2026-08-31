@@ -6087,6 +6087,111 @@ mod tests {
     }
 
     #[test]
+    fn attempted_delegation_cleanup_preserves_van_randomizer() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE bundles
+                SET van_comm_rand=?1, gov_comm=?2, delegation_tx_hash='legacy-hash'
+              WHERE round_id=?3 AND wallet_id=?4 AND bundle_index=0",
+            rusqlite::params![vec![0xA5_u8; 32], vec![0x5A_u8; 32], ROUND_ID, W],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO keystone_signatures
+             (round_id, wallet_id, bundle_index, sig, sighash, rk, created_at)
+             VALUES (?1, ?2, 0, ?3, ?4, ?5, 1)",
+            rusqlite::params![
+                ROUND_ID,
+                W,
+                vec![0x11_u8; 64],
+                vec![0x22_u8; 32],
+                vec![0x33_u8; 32]
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chain_submission_attempts
+             (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+              payload_digest, state, created_at, updated_at)
+             VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, 'outcome_unknown', 1, 1)",
+            rusqlite::params![ROUND_ID, W, vec![0xCC_u8; 32]],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.clear_unsigned_delegation_setup_fields(ROUND_ID).unwrap();
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        let conn = db.conn();
+        let retained: (Vec<u8>, Vec<u8>, Option<String>) = conn
+            .query_row(
+                "SELECT van_comm_rand, gov_comm, delegation_tx_hash FROM bundles
+                 WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                rusqlite::params![ROUND_ID, W],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retained.0, vec![0xA5; 32]);
+        assert_eq!(retained.1, vec![0x5A; 32]);
+        assert_eq!(retained.2.as_deref(), Some("legacy-hash"));
+        let signature_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM keystone_signatures
+                 WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                rusqlite::params![ROUND_ID, W],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(signature_count, 1);
+    }
+
+    #[test]
+    fn attempted_vote_cleanup_preserves_exact_recovery_generation() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE votes SET tx_hash='legacy-hash', commitment_bundle_json=?1
+             WHERE round_id=?2 AND wallet_id=?3 AND bundle_index=0 AND proposal_id=1",
+            rusqlite::params![r#"{"generation":"exact"}"#, ROUND_ID, W],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chain_submission_attempts
+             (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+              payload_digest, state, created_at, updated_at)
+             VALUES (?1, ?2, 'vote', 0, 1, X'', ?3, 'outcome_unknown', 1, 1)",
+            rusqlite::params![ROUND_ID, W, vec![0xDD_u8; 32]],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        let retained: (Option<String>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT tx_hash, commitment_bundle_json FROM votes
+                 WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=1",
+                rusqlite::params![ROUND_ID, W],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained.0.as_deref(), Some("legacy-hash"));
+        assert_eq!(retained.1.as_deref(), Some(r#"{"generation":"exact"}"#));
+    }
+
+    #[test]
     fn test_insert_vote_fixture() {
         let db = test_db();
         db.init_round(Network::Testnet, &test_params(), None)

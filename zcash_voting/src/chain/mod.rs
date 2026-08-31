@@ -1,0 +1,550 @@
+//! Vote-chain REST client.
+//!
+//! This module owns mutation and transaction-status protocol mapping. Durable
+//! voting-state transitions live in [`crate::chain_submission`].
+
+pub mod transport;
+
+use std::{sync::Arc, time::Duration};
+
+use serde::Deserialize;
+
+#[cfg(test)]
+use crate::wire::DelegationSubmissionWire;
+
+use crate::{
+    confirmation::TxEvent,
+    helper::{transport::HelperTransportError, url::canonicalize_server_base_url},
+    types::VotingError,
+};
+use transport::{ChainResponse, ChainTransport, MAX_CHAIN_RESPONSE_BYTES};
+
+const API_PREFIX: [&str; 2] = ["shielded-vote", "v1"];
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(4)];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainEndpointSet {
+    endpoints: Vec<String>,
+}
+
+impl ChainEndpointSet {
+    pub fn new(endpoints: &[String]) -> Result<Self, VotingError> {
+        if endpoints.is_empty() {
+            return Err(VotingError::InvalidInput {
+                message: "vote-chain endpoint set must not be empty".to_string(),
+            });
+        }
+        let mut canonical = Vec::with_capacity(endpoints.len());
+        for endpoint in endpoints {
+            let endpoint = canonicalize_server_base_url(endpoint, "vote-chain")?;
+            if canonical.contains(&endpoint) {
+                return Err(VotingError::InvalidInput {
+                    message: "vote-chain endpoint set contains duplicate canonical identities"
+                        .to_string(),
+                });
+            }
+            canonical.push(endpoint);
+        }
+        Ok(Self {
+            endpoints: canonical,
+        })
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.endpoints
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChainClientConfig {
+    request_timeout: Duration,
+    retry_delays: Vec<Duration>,
+}
+
+impl Default for ChainClientConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            retry_delays: DEFAULT_RETRY_DELAYS.to_vec(),
+        }
+    }
+}
+
+impl ChainClientConfig {
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Result<Self, VotingError> {
+        validate_duration(timeout, "request_timeout")?;
+        self.request_timeout = timeout;
+        Ok(self)
+    }
+
+    pub fn with_retry_delays(mut self, delays: Vec<Duration>) -> Result<Self, VotingError> {
+        if delays.len() > DEFAULT_RETRY_DELAYS.len() {
+            return Err(VotingError::InvalidInput {
+                message: "chain retry_delays supports at most two backoffs".to_string(),
+            });
+        }
+        for (index, delay) in delays.iter().copied().enumerate() {
+            validate_duration(delay, &format!("retry_delays[{index}]"))?;
+        }
+        self.retry_delays = delays;
+        Ok(self)
+    }
+}
+
+fn validate_duration(duration: Duration, name: &str) -> Result<(), VotingError> {
+    if duration.is_zero() {
+        return Err(VotingError::InvalidInput {
+            message: format!("{name} must be nonzero"),
+        });
+    }
+    if tokio::time::Instant::now().checked_add(duration).is_none() {
+        return Err(VotingError::InvalidInput {
+            message: format!("{name} is too large for Tokio's monotonic clock"),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainTxResult {
+    pub tx_hash: String,
+    pub code: u32,
+    pub log: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChainBroadcastOutcome {
+    Accepted(ChainTxResult),
+    Rejected(ChainTxResult),
+    OutcomeUnknown { message: String },
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainTxConfirmation {
+    pub height: u64,
+    pub code: u32,
+    pub log: String,
+    pub events: Vec<TxEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChainTxStatus {
+    Pending,
+    Committed(ChainTxConfirmation),
+}
+
+#[derive(Clone, Debug)]
+pub enum ChainError {
+    InvalidRequest(String),
+    Transport(HelperTransportError),
+    Status(u16),
+    Decode(String),
+    Cancelled,
+}
+
+impl ChainError {
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(_) | Self::Status(429 | 500 | 502 | 503 | 504) | Self::Decode(_)
+        )
+    }
+
+    pub(crate) fn is_ambiguous(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport(
+                HelperTransportError::Timeout
+                    | HelperTransportError::Ambiguous(_)
+                    | HelperTransportError::Response(_)
+            ) | Self::Status(500..=599)
+                | Self::Decode(_)
+        )
+    }
+}
+
+impl std::fmt::Display for ChainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest(message) => write!(f, "invalid chain request: {message}"),
+            Self::Transport(error) => write!(f, "chain transport failed: {error}"),
+            Self::Status(status) => write!(f, "vote chain returned HTTP {status}"),
+            Self::Decode(message) => write!(f, "vote-chain response was not usable: {message}"),
+            Self::Cancelled => write!(f, "chain request cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for ChainError {}
+
+#[derive(Clone)]
+pub struct ChainClient {
+    transport: Arc<dyn ChainTransport>,
+    endpoints: ChainEndpointSet,
+    config: ChainClientConfig,
+}
+
+impl ChainClient {
+    pub fn new(transport: Arc<dyn ChainTransport>, endpoints: ChainEndpointSet) -> Self {
+        Self::with_config(transport, endpoints, ChainClientConfig::default())
+    }
+
+    pub fn with_config(
+        transport: Arc<dyn ChainTransport>,
+        endpoints: ChainEndpointSet,
+        config: ChainClientConfig,
+    ) -> Self {
+        Self {
+            transport,
+            endpoints,
+            config,
+        }
+    }
+
+    #[cfg(test)]
+    async fn submit_delegation(
+        &self,
+        submission: &DelegationSubmissionWire,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ChainBroadcastOutcome, ChainError> {
+        let body = submission
+            .to_json()
+            .map_err(|error| ChainError::InvalidRequest(error.to_string()))?
+            .into_bytes();
+        self.broadcast("delegate-vote", body, cancel).await
+    }
+
+    pub async fn transaction_status(
+        &self,
+        tx_hash: &str,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ChainTxStatus, ChainError> {
+        let tx_hash = normalize_tx_hash(tx_hash)?;
+        let mut saw_pending = false;
+        let mut last_error = None;
+        for endpoint in self.endpoints.as_slice() {
+            if cancel() {
+                return Err(ChainError::Cancelled);
+            }
+            let url = join_url(endpoint, &["tx", &tx_hash])?;
+            match self.get(&url).await {
+                Ok(response) if response.status() == 404 => saw_pending = true,
+                Ok(response) if response.status() == 200 || response.status() == 422 => {
+                    validate_json_response(&response)?;
+                    return parse_confirmation(response).map(ChainTxStatus::Committed);
+                }
+                Ok(response) => last_error = Some(ChainError::Status(response.status())),
+                Err(error) => last_error = Some(ChainError::Transport(error)),
+            }
+        }
+        if saw_pending {
+            Ok(ChainTxStatus::Pending)
+        } else {
+            Err(last_error.unwrap_or_else(|| ChainError::Decode("no endpoint result".to_string())))
+        }
+    }
+
+    pub(crate) fn retry_delays(&self) -> &[Duration] {
+        &self.config.retry_delays
+    }
+
+    pub(crate) fn endpoint_count(&self) -> usize {
+        self.endpoints.as_slice().len()
+    }
+
+    pub(crate) async fn post_once(
+        &self,
+        endpoint_index: usize,
+        endpoint: &str,
+        body: Vec<u8>,
+    ) -> Result<ChainBroadcastOutcome, ChainError> {
+        let base = &self.endpoints.as_slice()[endpoint_index % self.endpoint_count()];
+        let url = join_url(base, &[endpoint])?;
+        self.post_json(&url, body)
+            .await
+            .and_then(parse_broadcast_response)
+    }
+
+    #[cfg(test)]
+    async fn broadcast(
+        &self,
+        endpoint: &str,
+        body: Vec<u8>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<ChainBroadcastOutcome, ChainError> {
+        let attempts = self.config.retry_delays.len() + 1;
+        let mut last_error = None;
+        for attempt in 0..attempts {
+            if cancel() {
+                return Ok(ChainBroadcastOutcome::Cancelled);
+            }
+            let base = &self.endpoints.as_slice()[attempt % self.endpoints.as_slice().len()];
+            let url = join_url(base, &[endpoint])?;
+            let result = self
+                .post_json(&url, body.clone())
+                .await
+                .and_then(parse_broadcast_response);
+            match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => {
+                    let ambiguous = error.is_ambiguous();
+                    let retryable = error.is_retryable();
+                    if attempt + 1 == attempts || !retryable {
+                        return if ambiguous {
+                            Ok(ChainBroadcastOutcome::OutcomeUnknown {
+                                message: error.to_string(),
+                            })
+                        } else {
+                            Err(error)
+                        };
+                    }
+                    last_error = Some(error);
+                    if cancel() {
+                        return Ok(ChainBroadcastOutcome::Cancelled);
+                    }
+                    tokio::time::sleep(self.config.retry_delays[attempt]).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| ChainError::Decode("retry loop exited".to_string())))
+    }
+
+    async fn get(&self, url: &str) -> Result<ChainResponse, HelperTransportError> {
+        let timeout = self.config.request_timeout;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(HelperTransportError::Timeout)?;
+        tokio::time::timeout_at(deadline, self.transport.get(url, timeout))
+            .await
+            .map_err(|_| HelperTransportError::Timeout)?
+    }
+
+    async fn post_json(&self, url: &str, body: Vec<u8>) -> Result<ChainResponse, ChainError> {
+        let timeout = self.config.request_timeout;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(ChainError::Transport(HelperTransportError::Timeout))?;
+        tokio::time::timeout_at(deadline, self.transport.post_json(url, body, timeout))
+            .await
+            .map_err(|_| ChainError::Transport(HelperTransportError::Timeout))?
+            .map_err(ChainError::Transport)
+    }
+}
+
+#[derive(Deserialize)]
+struct TxResultJson {
+    #[serde(default)]
+    tx_hash: String,
+    code: u32,
+    #[serde(default)]
+    log: String,
+}
+
+#[derive(Deserialize)]
+struct TxConfirmationJson {
+    height: u64,
+    code: u32,
+    #[serde(default)]
+    log: String,
+    #[serde(default)]
+    events: Vec<TxEvent>,
+}
+
+fn parse_broadcast_response(response: ChainResponse) -> Result<ChainBroadcastOutcome, ChainError> {
+    if response.status() != 422 && !response.is_success() {
+        return Err(ChainError::Status(response.status()));
+    }
+    validate_json_response(&response)?;
+    let parsed: TxResultJson = serde_json::from_slice(response.body())
+        .map_err(|_| ChainError::Decode("invalid transaction result JSON".to_string()))?;
+    let tx_hash = if parsed.tx_hash.is_empty() {
+        if parsed.code == 0 {
+            return Err(ChainError::Decode(
+                "accepted transaction result omitted tx_hash".to_string(),
+            ));
+        }
+        String::new()
+    } else {
+        normalize_tx_hash(&parsed.tx_hash)?
+    };
+    let result = ChainTxResult {
+        tx_hash,
+        code: parsed.code,
+        log: parsed.log,
+    };
+    if result.code == 0 {
+        Ok(ChainBroadcastOutcome::Accepted(result))
+    } else {
+        Ok(ChainBroadcastOutcome::Rejected(result))
+    }
+}
+
+fn parse_confirmation(response: ChainResponse) -> Result<ChainTxConfirmation, ChainError> {
+    let parsed: TxConfirmationJson = serde_json::from_slice(response.body())
+        .map_err(|_| ChainError::Decode("invalid transaction confirmation JSON".to_string()))?;
+    Ok(ChainTxConfirmation {
+        height: parsed.height,
+        code: parsed.code,
+        log: parsed.log,
+        events: parsed.events,
+    })
+}
+
+fn validate_json_response(response: &ChainResponse) -> Result<(), ChainError> {
+    if response.body().len() > MAX_CHAIN_RESPONSE_BYTES {
+        return Err(ChainError::Decode(format!(
+            "response exceeds {MAX_CHAIN_RESPONSE_BYTES} byte limit"
+        )));
+    }
+    let is_json = response.content_type().is_some_and(|content_type| {
+        content_type
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+    });
+    if !is_json {
+        return Err(ChainError::Decode(
+            "response Content-Type must be application/json".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn normalize_tx_hash(value: &str) -> Result<String, ChainError> {
+    let trimmed = value.trim();
+    if trimmed.len() == 64 && trimmed.chars().all(|char| char.is_ascii_hexdigit()) {
+        Ok(trimmed.to_ascii_lowercase())
+    } else {
+        Err(ChainError::InvalidRequest(
+            "transaction hash must be 64 hexadecimal characters".to_string(),
+        ))
+    }
+}
+
+fn join_url(base: &str, segments: &[&str]) -> Result<String, ChainError> {
+    let mut url = canonicalize_server_base_url(base, "vote-chain")
+        .map_err(|error| ChainError::InvalidRequest(error.to_string()))?;
+    for segment in API_PREFIX.iter().chain(segments.iter()) {
+        url.push('/');
+        url.push_str(segment);
+    }
+    Ok(url)
+}
+
+pub(crate) fn is_spent_nullifier_log(log: &str) -> bool {
+    let lower = log.to_ascii_lowercase();
+    lower.contains("nullifier already spent:")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::VecDeque, sync::Mutex};
+
+    #[derive(Default)]
+    struct MockTransport {
+        responses: Mutex<VecDeque<Result<ChainResponse, HelperTransportError>>>,
+        posts: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    impl ChainTransport for MockTransport {
+        fn get<'a>(&'a self, _url: &'a str, _timeout: Duration) -> transport::ChainFuture<'a> {
+            Box::pin(async move {
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("mock response")
+            })
+        }
+
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            body: Vec<u8>,
+            _timeout: Duration,
+        ) -> transport::ChainFuture<'a> {
+            Box::pin(async move {
+                self.posts.lock().unwrap().push((url.to_string(), body));
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("mock response")
+            })
+        }
+    }
+
+    fn response(status: u16, body: &str) -> ChainResponse {
+        ChainResponse::new(
+            status,
+            body.as_bytes().to_vec(),
+            Some("application/json".into()),
+        )
+    }
+
+    fn delegation_wire() -> DelegationSubmissionWire {
+        DelegationSubmissionWire {
+            rk: "rk".into(),
+            spend_auth_sig: "sig".into(),
+            tx1_effects: "effects".into(),
+            nf_signed: "nf".into(),
+            cmx_new: "cmx".into(),
+            gov_comm: "gov".into(),
+            gov_nullifiers: vec!["n".into()],
+            proof: "proof".into(),
+            vote_round_id: "round".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_send_byte_identical_canonical_json() {
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            Ok(response(503, r#"{"message":"busy"}"#)),
+            Ok(response(
+                200,
+                r#"{"tx_hash":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","code":0,"log":""}"#,
+            )),
+        ]);
+        let endpoints = ChainEndpointSet::new(&[
+            "https://one.example/".to_string(),
+            "https://two.example".to_string(),
+        ])
+        .unwrap();
+        let config = ChainClientConfig::default()
+            .with_retry_delays(vec![Duration::from_millis(1)])
+            .unwrap();
+        let client = ChainClient::with_config(transport.clone(), endpoints, config);
+
+        let outcome = client
+            .submit_delegation(&delegation_wire(), &|| false)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, ChainBroadcastOutcome::Accepted(_)));
+        let posts = transport.posts.lock().unwrap();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0].1, posts[1].1);
+        assert!(posts[0].0.starts_with("https://one.example/"));
+        assert!(posts[1].0.starts_with("https://two.example/"));
+    }
+
+    #[test]
+    fn endpoint_set_rejects_duplicate_canonical_identity() {
+        let error = ChainEndpointSet::new(&[
+            "https://vote.example".to_string(),
+            "https://vote.example/".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate canonical"));
+    }
+
+    #[test]
+    fn spent_nullifier_classifier_is_narrow_and_case_insensitive() {
+        assert!(is_spent_nullifier_log("Nullifier already spent: abcd"));
+        assert!(!is_spent_nullifier_log("unrelated nullifier failure"));
+    }
+}
