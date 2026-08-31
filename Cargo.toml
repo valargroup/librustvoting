@@ -15,14 +15,9 @@ default-members = [
 resolver = "2"
 
 [workspace.dependencies]
-voting-circuits = { version = "=0.11.2", default-features = false }
+voting-circuits = { version = "=0.12.0-rc.1", default-features = false }
 voting-crypto-deps = { version = "=0.2.2", default-features = false }
 zcash_protocol = { version = "0.10.4" }
-
-# Temporary until the 50-proposal voting-circuits release is tagged.
-[patch.crates-io]
-voting-circuits = { git = "https://github.com/valargroup/voting-circuits", rev = "8ab3a5f3a8b63209cc1e7c1a013dbf8875fe57f7" }
-voting-crypto-deps = { git = "https://github.com/valargroup/voting-circuits", rev = "8ab3a5f3a8b63209cc1e7c1a013dbf8875fe57f7" }
 
 [profile.test.package.imt-tree]
 opt-level = 3
