@@ -1308,6 +1308,16 @@ impl PreparedRecoverableDelegationBundleV1<'_> {
         )
     }
 
+    fn validate_persisted_round(&self, voting_db: &VotingDb) -> Result<(), VotingError> {
+        let wallet_id = voting_db.wallet_id();
+        let conn = voting_db.conn();
+        self.bundle_use().validate_persisted_round_with_conn(
+            &conn,
+            &wallet_id,
+            &self.prepared.round_id,
+        )
+    }
+
     pub fn authority_selection(&self) -> &crate::recoverable_authority::VotingAuthoritySelectionV1 {
         &self.authority_selection
     }
@@ -1365,6 +1375,7 @@ impl PreparedRecoverableDelegationBundleV1<'_> {
         voting_db: &VotingDb,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationSetup, VotingError> {
+        self.validate_persisted_round(voting_db)?;
         self.prepared.setup_with_recoverable_authority(
             voting_db,
             self.authority_root,
@@ -2412,6 +2423,40 @@ mod tests {
 
         voting_db
             .clear_unsigned_delegation_setup_fields(recoverable.round_id())
+            .unwrap();
+        voting_db
+            .conn()
+            .execute(
+                "UPDATE rounds SET snapshot_height = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3",
+                rusqlite::params![
+                    round_params.snapshot_height + 1,
+                    &round_params.vote_round_id,
+                    voting_db.wallet_id()
+                ],
+            )
+            .unwrap();
+        let setup_error = recoverable
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .err()
+            .expect("stale persisted round parameters must fail before recoverable setup");
+        assert!(
+            setup_error
+                .to_string()
+                .contains("persisted round parameters do not match"),
+            "{setup_error}"
+        );
+        voting_db
+            .conn()
+            .execute(
+                "UPDATE rounds SET snapshot_height = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3",
+                rusqlite::params![
+                    round_params.snapshot_height,
+                    &round_params.vote_round_id,
+                    voting_db.wallet_id()
+                ],
+            )
             .unwrap();
         recoverable
             .setup(&voting_db, &crate::types::NoopProgressReporter)

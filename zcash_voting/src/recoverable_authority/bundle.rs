@@ -215,6 +215,38 @@ impl<'a> RecoverableBundleUseV1<'a> {
         self.current_round
     }
 
+    /// Checks the authenticated round against its stored row within the
+    /// caller's database snapshot.
+    pub(crate) fn validate_persisted_round_with_conn(
+        self,
+        conn: &rusqlite::Connection,
+        wallet_id: &str,
+        round_id: &str,
+    ) -> Result<(), VotingError> {
+        self.authority_root
+            .validate_current_selection(self.authority_selection, self.current_round)?;
+        if hex::encode(self.authority_root.context().vote_round_id()) != round_id {
+            return Err(bundle_material_mismatch());
+        }
+        let (stored_round, stored_network) =
+            queries::load_round_params_with_network(conn, round_id, wallet_id)?;
+        crate::storage::operations::validate_network_matches_round(
+            stored_network,
+            self.authority_root.context().network(),
+            "recoverable bundle material",
+        )?;
+        if !bool::from(
+            stored_round
+                .ea_pk
+                .as_slice()
+                .ct_eq(self.current_round.ea_pk()),
+        ) || stored_round.snapshot_height != self.current_round.context().snapshot_height()
+        {
+            return Err(round_parameters_mismatch());
+        }
+        Ok(())
+    }
+
     /// Checks the stored bundle and round within the caller's database snapshot.
     pub(crate) fn validate_persisted_with_conn(
         self,
@@ -223,20 +255,12 @@ impl<'a> RecoverableBundleUseV1<'a> {
         round_id: &str,
         bundle_index: u32,
     ) -> Result<(), VotingError> {
-        self.authority_root
-            .validate_current_selection(self.authority_selection, self.current_round)?;
+        self.validate_persisted_round_with_conn(conn, wallet_id, round_id)?;
         if self.authority_selection.bundle_source() != self.bundle_material.source()
             || self.bundle_material.bundle_index() != bundle_index
-            || hex::encode(self.authority_root.context().vote_round_id()) != round_id
         {
             return Err(bundle_material_mismatch());
         }
-        let stored_network = queries::load_round_network(conn, round_id, wallet_id)?;
-        crate::storage::operations::validate_network_matches_round(
-            stored_network,
-            self.authority_root.context().network(),
-            "recoverable bundle material",
-        )?;
 
         let expected = expected_persisted_material(self.authority_root, self.bundle_material)?;
         let persisted = queries::load_persisted_recoverable_bundle_material(
@@ -331,6 +355,13 @@ fn expected_persisted_material<'a>(
 fn bundle_material_mismatch() -> VotingError {
     VotingError::InvalidInput {
         message: "persisted bundle material does not match the selected recoverable source"
+            .to_string(),
+    }
+}
+
+fn round_parameters_mismatch() -> VotingError {
+    VotingError::InvalidInput {
+        message: "persisted round parameters do not match the current authenticated round"
             .to_string(),
     }
 }

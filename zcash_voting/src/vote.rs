@@ -3642,7 +3642,14 @@ mod tests {
         let root = crate::recoverable_authority::VotingAuthorityRootV1::from_registered_key_output(
             &request, [0x55; 64],
         );
-        let round_auth = crate::recoverable_authority::test_verified_round_auth_v3(root.context());
+        let mut authenticated_params = round_params();
+        authenticated_params.vote_round_id = hex::encode(round_id);
+        let round_auth = crate::recoverable_authority::test_verified_voting_round_v3(
+            root.context(),
+            authenticated_params,
+        )
+        .round_auth()
+        .clone();
         let selection = crate::recoverable_authority::VotingAuthoritySelectionV1::bind(
             &root,
             crate::recoverable_authority::BundleMaterialSourceV1::RecoverableSelfCustody,

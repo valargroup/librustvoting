@@ -1443,6 +1443,89 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_bundle_use_rejects_persisted_round_parameter_mismatch() {
+        let (params, root, selection, hotkey, verified_round, capability_json) =
+            recoverable_capability_fixture();
+        let material = validate_recoverable_delegation_capability_v1(
+            &capability_json,
+            recoverable_validation_context(&root, &selection, &hotkey, &verified_round),
+        )
+        .unwrap();
+        let customer = test_db(":memory:");
+        import_recoverable_delegation_capability_v1(
+            &customer,
+            &capability_json,
+            ImportRecoverableDelegationCapabilityV1Params {
+                validation: recoverable_validation_context(
+                    &root,
+                    &selection,
+                    &hotkey,
+                    &verified_round,
+                ),
+                session_json: None,
+            },
+        )
+        .unwrap();
+        let authority = crate::recoverable_authority::RecoverableBundleUseV1::new(
+            &root,
+            &selection,
+            verified_round.round_auth(),
+            crate::recoverable_authority::RecoverableBundleMaterialV1::CustodyCapability {
+                capability: &material,
+                bundle_index: 0,
+            },
+        );
+
+        customer
+            .conn()
+            .execute(
+                "UPDATE rounds SET ea_pk = ?1 WHERE round_id = ?2 AND wallet_id = ?3",
+                rusqlite::params![vec![0xFF_u8; 32], &params.vote_round_id, WALLET],
+            )
+            .unwrap();
+        let key_error = {
+            let conn = customer.conn();
+            authority
+                .validate_persisted_with_conn(&conn, WALLET, &params.vote_round_id, 0)
+                .err()
+                .expect("a mismatched persisted election key must fail")
+        };
+        assert!(
+            key_error
+                .to_string()
+                .contains("persisted round parameters do not match"),
+            "{key_error}"
+        );
+
+        customer
+            .conn()
+            .execute(
+                "UPDATE rounds SET ea_pk = ?1, snapshot_height = ?2
+                 WHERE round_id = ?3 AND wallet_id = ?4",
+                rusqlite::params![
+                    &params.ea_pk,
+                    params.snapshot_height + 1,
+                    &params.vote_round_id,
+                    WALLET
+                ],
+            )
+            .unwrap();
+        let height_error = {
+            let conn = customer.conn();
+            authority
+                .validate_persisted_with_conn(&conn, WALLET, &params.vote_round_id, 0)
+                .err()
+                .expect("a mismatched persisted snapshot height must fail")
+        };
+        assert!(
+            height_error
+                .to_string()
+                .contains("persisted round parameters do not match"),
+            "{height_error}"
+        );
+    }
+
+    #[test]
     fn imported_capability_survives_recovery_and_session_reset() {
         let (_, params, hotkey, capability) = exported_fixture();
         let capability_json = capability.to_json().unwrap();
