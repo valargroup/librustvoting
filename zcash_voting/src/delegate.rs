@@ -126,28 +126,6 @@ impl DelegationKeys {
         ))
     }
 
-    /// Builds delegation keys for a version 1 recoverable voting hotkey.
-    ///
-    /// The already-derived Orchard key remains inside the typed hotkey. Only
-    /// its public delegation target is retained here.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_recoverable_voting_hotkey(
-        fvk_bytes: Vec<u8>,
-        hotkey: &crate::recoverable_authority::RecoverableVotingHotkeyV1,
-        seed_fingerprint: [u8; 32],
-        account_index: u32,
-        round_name: String,
-    ) -> Result<Self, VotingError> {
-        Ok(Self::with_voting_target(
-            fvk_bytes,
-            hotkey.delegation_target(),
-            Some(hotkey.round_bound_delegation_target()),
-            seed_fingerprint,
-            account_index,
-            round_name,
-        ))
-    }
-
     /// Builds delegation keys for a public target already bound to one vote
     /// chain, network, and round.
     ///
@@ -2365,14 +2343,14 @@ mod tests {
         )
         .unwrap();
         let hotkey = root.voting_hotkey().unwrap();
-        prepared.delegation_keys = DelegationKeys::with_recoverable_voting_hotkey(
+        prepared.delegation_keys = DelegationKeys::with_voting_target(
             prepared.delegation_keys.fvk_bytes.clone(),
-            &hotkey,
+            hotkey.delegation_target(),
+            Some(hotkey.round_bound_delegation_target()),
             prepared.delegation_keys.seed_fingerprint,
             prepared.delegation_keys.account_index,
             prepared.delegation_keys.round_name.clone(),
-        )
-        .unwrap();
+        );
         let recoverable_bundle =
             crate::recoverable_authority::RecoverableSelfCustodyBundleV1::from_canonical_bundle(
                 prepared.bundle_index,
