@@ -33,13 +33,15 @@ use std::{future::Future, pin::Pin, time::Duration};
 /// should enforce *this* value instead of choosing their own.
 pub const MAX_HELPER_RESPONSE_BYTES: usize = 256 * 1024;
 
-/// Failure of a single helper request attempt.
+/// Failure of a single routed HTTP request attempt.
 ///
-/// The split exists so callers can tell an *ambiguous* outcome from a
-/// *definite* one. Only [`HelperTransportError::Transport`] is safe to retry
-/// against the same helper for a non-idempotent request.
+/// Helper and vote-chain clients share this classification so host transports
+/// can implement one route-aware request core. The split exists so callers can
+/// tell an *ambiguous* outcome from a *definite* one. Only
+/// [`RequestTransportError::Transport`] is safe to retry against the same
+/// endpoint for a non-idempotent request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HelperTransportError {
+pub enum RequestTransportError {
     /// The deadline passed with no response.
     ///
     /// The request may still have reached the helper and been accepted. Treat
@@ -62,22 +64,25 @@ pub enum HelperTransportError {
     Transport(String),
 }
 
-impl std::fmt::Display for HelperTransportError {
+impl std::fmt::Display for RequestTransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Timeout => write!(f, "helper request timed out"),
+            Self::Timeout => write!(f, "request timed out"),
             Self::Ambiguous(message) => {
-                write!(f, "helper request outcome is unknown: {message}")
+                write!(f, "request outcome is unknown: {message}")
             }
             Self::Response(message) => {
-                write!(f, "helper response failed after headers arrived: {message}")
+                write!(f, "response failed after headers arrived: {message}")
             }
-            Self::Transport(message) => write!(f, "helper request failed: {message}"),
+            Self::Transport(message) => write!(f, "request failed before dispatch: {message}"),
         }
     }
 }
 
-impl std::error::Error for HelperTransportError {}
+impl std::error::Error for RequestTransportError {}
+
+/// Backwards-compatible helper-protocol name for the shared transport error.
+pub type HelperTransportError = RequestTransportError;
 
 /// One helper HTTP response.
 ///
