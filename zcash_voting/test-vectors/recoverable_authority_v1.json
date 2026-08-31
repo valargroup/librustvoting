@@ -41,13 +41,14 @@
       "poly_len": 4096
     },
     "snapshot_height": 1234567,
-    "snapshot_block_hash": "0303030303030303030303030303030303030303030303030303030303030303"
+    "snapshot_block_hash": "0303030303030303030303030303030303030303030303030303030303030303",
+    "proposal_count": 3
   },
   "selection": {
     "bundle_source": "recoverable-self-custody",
-    "authenticated_round_digest": "fd69e1f9c74955b32522a0df686fe8c3eb5334143fbc52ca7115a29e4a9dce91",
-    "root_verification_tag": "909609507fc2869658783b55730ce667c8d49b75e3623653c4698456d7e14b86",
-    "canonical_json": "{\"version\":1,\"zcash_network\":\"testnet\",\"account_index\":7,\"orchard_fvk_fingerprint\":\"38d1a6dd9db717785d2614d310f516721f34391d219d121c3ca484f525ffd305\",\"vote_chain_id\":\"vote-chain-test\",\"vote_round_id\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"authority_source\":{\"type\":\"keystone-master-generation\",\"generation_id\":\"e9a79acfe6d43dcb0309d7251679901907f32475a650cf7b8f7c2c6af31a11c4\"},\"bundle_source\":\"recoverable-self-custody\",\"authenticated_round_digest\":\"fd69e1f9c74955b32522a0df686fe8c3eb5334143fbc52ca7115a29e4a9dce91\",\"root_verification_tag\":\"909609507fc2869658783b55730ce667c8d49b75e3623653c4698456d7e14b86\"}"
+    "authenticated_round_digest": "ccbbd682cb67b54ae0c2845211c039a96ec63d7181df99d1d1afa60eb122001f",
+    "root_verification_tag": "6fd617ad0a31b9cef70a25d7f48d104858cea99dffa167ba5969a0c652927b0c",
+    "canonical_json": "{\"version\":1,\"zcash_network\":\"testnet\",\"account_index\":7,\"orchard_fvk_fingerprint\":\"38d1a6dd9db717785d2614d310f516721f34391d219d121c3ca484f525ffd305\",\"vote_chain_id\":\"vote-chain-test\",\"vote_round_id\":\"0101010101010101010101010101010101010101010101010101010101010101\",\"authority_source\":{\"type\":\"keystone-master-generation\",\"generation_id\":\"e9a79acfe6d43dcb0309d7251679901907f32475a650cf7b8f7c2c6af31a11c4\"},\"bundle_source\":\"recoverable-self-custody\",\"authenticated_round_digest\":\"ccbbd682cb67b54ae0c2845211c039a96ec63d7181df99d1d1afa60eb122001f\",\"root_verification_tag\":\"6fd617ad0a31b9cef70a25d7f48d104858cea99dffa167ba5969a0c652927b0c\"}"
   },
   "bundle": {
     "bundle_index": 0,

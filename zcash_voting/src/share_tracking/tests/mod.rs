@@ -348,6 +348,7 @@ fn recovery_bundle_fixture() -> VoteRecoveryBundle {
             .map(|index| field_bytes(index as u8 + 10))
             .collect(),
         batch: None,
+        recoverable_ballot_proposal_count: None,
     }
 }
 

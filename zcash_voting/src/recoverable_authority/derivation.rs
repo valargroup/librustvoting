@@ -1005,6 +1005,7 @@ mod tests {
         pir_layout: crate::wire::PirLayout,
         snapshot_height: u64,
         snapshot_block_hash: String,
+        proposal_count: u32,
     }
 
     #[derive(Deserialize)]
@@ -1147,6 +1148,7 @@ mod tests {
                     context.vote_chain_id(),
                     vector.round_auth.snapshot_height,
                     decode_hex_array(&vector.round_auth.snapshot_block_hash),
+                    vector.round_auth.proposal_count,
                 )
                 .unwrap(),
             ));

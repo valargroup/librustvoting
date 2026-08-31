@@ -915,6 +915,7 @@ mod tests {
             share_blinds: vec![[marker.wrapping_add(11); 32]],
             share_comms: vec![[marker.wrapping_add(12); 32]],
             batch: None,
+            recoverable_ballot_proposal_count: None,
         }
     }
 

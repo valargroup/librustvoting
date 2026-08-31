@@ -12,8 +12,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   material from a seed-free authority root, authenticates the selected
   network, vote chain, and snapshot with opaque round-auth v3 verification
   tokens, requires exact endpoint, height, block-hash, and layout binding for
-  recoverable PIR, restores confirmed VAN chains after local VCT and native
-  transition verification plus an external finalized-completeness check.
+  recoverable PIR, signs the authenticated proposal count, and requires every
+  proposal to be terminal before each bundle submits all chosen proposals in
+  one atomic batch. Finalized reconciliation verifies the initial VCT leaf and
+  native nullifier, then reports the bundle as unspent, terminally consumed by
+  that batch, or spent in an unsupported way; it does not restore a successor
+  VAN or remaining authority mask. All-skipped ballots intentionally create no
+  transaction and have no cross-device on-chain completion marker. Persisting
+  the first bundle's signed batch freezes the complete ballot before returning
+  it, and later bundles must commit that identical ballot.
   Existing random hotkeys, round-auth v2 rounds, custody capability bytes,
   circuits, helper delivery, and vote-chain messages remain unchanged.
 - Added a typed `HelperClient` for readiness checks, share submission, and

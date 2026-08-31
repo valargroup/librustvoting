@@ -215,6 +215,10 @@ impl<'a> RecoverableBundleUseV1<'a> {
         self.current_round
     }
 
+    pub(crate) fn bundle_index(self) -> u32 {
+        self.bundle_material.bundle_index()
+    }
+
     /// Checks the authenticated round against its stored row within the
     /// caller's database snapshot.
     pub(crate) fn validate_persisted_round_with_conn(

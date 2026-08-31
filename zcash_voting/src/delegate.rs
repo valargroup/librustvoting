@@ -2141,6 +2141,7 @@ mod tests {
                     "vote-chain-test",
                     round_params.snapshot_height,
                     snapshot_block_hash,
+                    3,
                 )
                 .unwrap(),
             ));

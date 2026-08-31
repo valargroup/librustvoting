@@ -34,6 +34,17 @@ precompute → delegate → vote → share lifecycle:
    plus `confirm_delegation_submission` after confirmation.
 6. Record each terminal ballot decision with `set_ballot_intent`, passing the
    proposal's declared option count so choices are validated before persistence.
+   For recoverable-v1, wait until every ID in the signed proposal count has a
+   `Choice` or `Skipped` intent, then call
+   `recoverable_authority::commit_recoverable_complete_ballot_v1` once per
+   bundle. It submits every `Choice` in ascending proposal order through one
+   atomic batch, even when only one proposal was answered. Skipped proposals
+   are omitted. Do not use the singleton or generic arbitrary-batch APIs with a
+   recoverable authority. Persisting the first bundle's signed batch durably
+   freezes the round's complete intent set before the payload is returned;
+   later bundles must use that identical ballot. If every proposal is skipped,
+   there is no transaction and no on-chain completion marker after total
+   local-state loss.
    For multiple answered proposals in one bundle, call
    `vote::commit_atomic_vote_batch` once with their canonical order and submit
    the returned `SignedVoteBatch::batch_json` to the chain's
@@ -99,7 +110,7 @@ precompute → delegate → vote → share lifecycle:
 | `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
 | `config` | Static and dynamic voting config validation, signature checks, and switch decisions. |
-| `recoverable_authority` | Opt-in round-bound authority derivation, canonical self-custody bundles, and finalized-chain recovery. |
+| `recoverable_authority` | Opt-in round-bound authority derivation, canonical self-custody bundles, one-shot complete ballots, and finalized-chain reconciliation. |
 | `pir` | PIR endpoint selection helpers and client re-exports. |
 | `hotkey` | Voting hotkey reconstruction from stored app-owned secret material plus random app-owned hotkeys. |
 | `governance` | Low-level governance derivations, `BALLOT_DIVISOR`, and the circuit note-slot count. |
@@ -164,11 +175,13 @@ wait for or supply an independently verified exact metadata source before
 recoverable delegation precompute or proving; legacy v2/config/PIR APIs remain
 available as before.
 
-Confirmed authority-chain recovery also has an explicit integration boundary.
-The crate locally verifies each VCT path, native VAN nullifier, and authority
-transition, but the caller-supplied recovery evidence verifier must independently
-authenticate the finalized checkpoint block hash and VCT root and prove that no
-confirmed authority consumer is omitted through that checkpoint.
+Confirmed authority reconciliation also has an explicit integration boundary.
+The crate verifies the initial VCT path and native VAN nullifier, then reports
+the bundle as unspent, terminally consumed by one canonical atomic batch, or
+spent in an unsupported way. The caller-supplied evidence verifier must
+independently authenticate the finalized checkpoint block hash and VCT root and
+prove the initial-nullifier lookup complete through that checkpoint. The result
+never exposes a successor VAN or remaining authority mask.
 
 ```rust
 use std::sync::Arc;

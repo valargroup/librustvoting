@@ -1230,6 +1230,8 @@ struct RoundEntry {
     snapshot_height: RoundEntryField<u64>,
     #[serde(default, skip_serializing_if = "RoundEntryField::is_missing")]
     snapshot_block_hash: RoundEntryField<String>,
+    #[serde(default, skip_serializing_if = "RoundEntryField::is_missing")]
+    proposal_count: RoundEntryField<u32>,
     signatures: Vec<RoundSignature>,
 }
 
@@ -1575,6 +1577,7 @@ fn round_entry_has_v3_fields(entry: &RoundEntry) -> bool {
         || !entry.vote_chain_id.is_missing()
         || !entry.snapshot_height.is_missing()
         || !entry.snapshot_block_hash.is_missing()
+        || !entry.proposal_count.is_missing()
 }
 
 fn round_entry_v3_context(
@@ -1593,6 +1596,7 @@ fn round_entry_v3_context(
         .decode(entry.snapshot_block_hash.as_ref()?.as_str())
         .ok()?;
     let snapshot_block_hash = <[u8; 32]>::try_from(snapshot_block_hash.as_slice()).ok()?;
+    let proposal_count = *entry.proposal_count.as_ref()?;
     if network != expected.network || vote_chain_id != expected.vote_chain_id {
         return None;
     }
@@ -1601,6 +1605,7 @@ fn round_entry_v3_context(
         vote_chain_id.to_string(),
         snapshot_height,
         snapshot_block_hash,
+        proposal_count,
     )
     .ok()
 }
@@ -1823,7 +1828,14 @@ mod tests {
     }
 
     fn round_auth_v3_context() -> RoundAuthContextV3 {
-        RoundAuthContextV3::new(Network::Testnet, "vote-chain-test", 1_234_567, [0x33; 32]).unwrap()
+        RoundAuthContextV3::new(
+            Network::Testnet,
+            "vote-chain-test",
+            1_234_567,
+            [0x33; 32],
+            3,
+        )
+        .unwrap()
     }
 
     fn round_auth_v3_expectation() -> RoundAuthExpectationV3 {
@@ -1851,6 +1863,7 @@ mod tests {
             "vote_chain_id": "vote-chain-test",
             "snapshot_height": context.snapshot_height(),
             "snapshot_block_hash": BASE64.encode(context.snapshot_block_hash()),
+            "proposal_count": context.proposal_count(),
             "signatures": [{
                 "key_id": "k1",
                 "alg": "ed25519",
@@ -2510,6 +2523,7 @@ mod tests {
             "vote_chain_id",
             "snapshot_height",
             "snapshot_block_hash",
+            "proposal_count",
         ] {
             let mut v3: serde_json::Value =
                 serde_json::from_slice(&dynamic_bytes_v3(&trusted_key)).unwrap();
@@ -2620,8 +2634,14 @@ mod tests {
             changed_static,
             &dynamic_bytes_v3_with_context(
                 &trusted_key,
-                RoundAuthContextV3::new(Network::Testnet, "vote-chain-test", 1_234_568, [0x33; 32])
-                    .unwrap(),
+                RoundAuthContextV3::new(
+                    Network::Testnet,
+                    "vote-chain-test",
+                    1_234_568,
+                    [0x33; 32],
+                    3,
+                )
+                .unwrap(),
             ),
             ResolveVotingConfigOptions::default(),
             round_auth_v3_expectation(),

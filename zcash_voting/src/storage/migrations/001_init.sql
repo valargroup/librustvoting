@@ -137,6 +137,16 @@ CREATE TABLE ballot_intent (
     CHECK ((skipped = 1 AND choice IS NULL) OR (skipped = 0 AND choice IS NOT NULL))
 );
 
+CREATE TABLE recoverable_ballot_lock (
+    round_id           TEXT NOT NULL,
+    wallet_id          TEXT NOT NULL DEFAULT '',
+    proposal_count     INTEGER NOT NULL CHECK (proposal_count BETWEEN 1 AND 15),
+    ballot_fingerprint BLOB NOT NULL CHECK (length(ballot_fingerprint) = 32),
+    created_at         INTEGER NOT NULL,
+    PRIMARY KEY (round_id, wallet_id),
+    FOREIGN KEY (round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE
+);
+
 CREATE TABLE pir_proof_cache (
     wallet_id   TEXT NOT NULL DEFAULT '',
     network     TEXT NOT NULL CHECK (network IN ('mainnet','testnet','regtest')),

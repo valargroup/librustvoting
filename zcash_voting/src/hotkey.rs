@@ -160,17 +160,11 @@ mod tests {
         assert_eq!(keys.address_index, hotkey.address_index());
         assert_eq!(keys.coin_type, Network::Regtest.network_type().coin_type());
 
-        match crate::vote::VoteSigner::hotkey(&hotkey) {
-            crate::vote::VoteSigner::Hotkey {
-                hotkey: signer_hotkey,
-            } => {
-                assert_eq!(signer_hotkey.stored_secret(), hotkey.stored_secret());
-                assert_eq!(signer_hotkey.network(), hotkey.network());
-            }
-            crate::vote::VoteSigner::RecoverableAuthority { .. } => {
-                panic!("legacy constructor returned recoverable signer")
-            }
-        }
+        let crate::vote::VoteSigner::Hotkey {
+            hotkey: signer_hotkey,
+        } = crate::vote::VoteSigner::hotkey(&hotkey);
+        assert_eq!(signer_hotkey.stored_secret(), hotkey.stored_secret());
+        assert_eq!(signer_hotkey.network(), hotkey.network());
     }
 
     #[test]

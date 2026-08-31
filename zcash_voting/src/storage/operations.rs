@@ -1984,9 +1984,9 @@ impl VotingDb {
     }
 
     /// Clears unconfirmed recovery artifacts while preserving ballot intent,
-    /// recorded vote confirmations, and imported delegation capabilities. Use
-    /// `clear_round`/`delete_round` to remove the whole round, including
-    /// recorded decisions.
+    /// the durable recoverable-ballot lock, recorded vote confirmations, and
+    /// imported delegation capabilities. Use `clear_round`/`delete_round` to
+    /// remove the whole round, including recorded decisions.
     pub fn clear_recovery_state(&self, round_id: &str) -> Result<(), VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();

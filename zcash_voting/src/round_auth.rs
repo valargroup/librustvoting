@@ -1,7 +1,9 @@
 //! Canonical payloads signed by dynamic-config round attestations.
 
 use crate::config::PirLayout;
-use crate::types::{validate_vote_chain_id, Network, VotingError};
+use crate::types::{
+    validate_vote_chain_id, Network, VotingError, MAX_PROPOSAL_ID, MIN_PROPOSAL_ID,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +22,7 @@ pub const RECOVERABLE_BUNDLE_POLICY_V1: &str = "recoverable-v1";
 
 const ROUND_AUTH_DOMAIN_TAG_V2: [u8; 33] = *b"zcash-shielded-vote:round-auth:v2";
 const ROUND_AUTH_DOMAIN_TAG_V3: [u8; 33] = *b"zcash-shielded-vote:round-auth:v3";
-const ROUND_AUTH_V3_FIELD_COUNT: u8 = 12;
+const ROUND_AUTH_V3_FIELD_COUNT: u8 = 13;
 
 /// Typed round-auth v2 signing payload.
 ///
@@ -78,6 +80,7 @@ pub struct RoundAuthContextV3 {
     snapshot_height: u64,
     #[serde(with = "array32_base64_serde")]
     snapshot_block_hash: [u8; 32],
+    proposal_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +91,7 @@ struct UncheckedRoundAuthContextV3 {
     snapshot_height: u64,
     #[serde(with = "array32_base64_serde")]
     snapshot_block_hash: [u8; 32],
+    proposal_count: u32,
 }
 
 impl TryFrom<UncheckedRoundAuthContextV3> for RoundAuthContextV3 {
@@ -99,6 +103,7 @@ impl TryFrom<UncheckedRoundAuthContextV3> for RoundAuthContextV3 {
             value.vote_chain_id,
             value.snapshot_height,
             value.snapshot_block_hash,
+            value.proposal_count,
         )
     }
 }
@@ -110,14 +115,23 @@ impl RoundAuthContextV3 {
         vote_chain_id: impl Into<String>,
         snapshot_height: u64,
         snapshot_block_hash: [u8; 32],
+        proposal_count: u32,
     ) -> Result<Self, VotingError> {
         let vote_chain_id = vote_chain_id.into();
         validate_vote_chain_id(&vote_chain_id)?;
+        if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_count) {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "proposal_count must be {MIN_PROPOSAL_ID}..={MAX_PROPOSAL_ID}, got {proposal_count}"
+                ),
+            });
+        }
         Ok(Self {
             network,
             vote_chain_id,
             snapshot_height,
             snapshot_block_hash,
+            proposal_count,
         })
     }
 
@@ -140,12 +154,17 @@ impl RoundAuthContextV3 {
     pub fn snapshot_block_hash(&self) -> &[u8; 32] {
         &self.snapshot_block_hash
     }
+
+    /// Returns the authenticated number of sequential proposal IDs in the round.
+    pub fn proposal_count(&self) -> u32 {
+        self.proposal_count
+    }
 }
 
 /// Typed round-auth v3 signing payload.
 ///
 /// The encoding starts with the version-specific domain followed by a field
-/// count and twelve ordered fields. Each field is encoded as
+/// count and thirteen ordered fields. Each field is encoded as
 /// `tag || byte_length_le_u32 || value`. The tags and lengths make the
 /// encoding prefix-free while retaining fixed canonical encodings for numeric
 /// values. It binds the recoverable-authority scheme and bundle policy, the
@@ -217,7 +236,7 @@ impl RoundAuthPayloadV3 {
 
     /// Returns the canonical prefix-free bytes to sign or verify.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(33 + 1 + 12 * 5 + 24 + 14 + 7 + 32 + 32 + 8 + 32 + 16);
+        let mut bytes = Vec::with_capacity(33 + 1 + 13 * 5 + 24 + 14 + 7 + 32 + 32 + 8 + 32 + 20);
         bytes.extend_from_slice(&ROUND_AUTH_DOMAIN_TAG_V3);
         bytes.push(ROUND_AUTH_V3_FIELD_COUNT);
         append_v3_field(&mut bytes, 1, RECOVERABLE_AUTHORITY_SCHEME_V1.as_bytes());
@@ -232,10 +251,11 @@ impl RoundAuthPayloadV3 {
         append_v3_field(&mut bytes, 6, &self.ea_pk);
         append_v3_field(&mut bytes, 7, &self.context.snapshot_height().to_le_bytes());
         append_v3_field(&mut bytes, 8, self.context.snapshot_block_hash());
-        append_v3_field(&mut bytes, 9, &self.pir_layout.pir_depth.to_le_bytes());
-        append_v3_field(&mut bytes, 10, &self.pir_layout.tier0_layers.to_le_bytes());
-        append_v3_field(&mut bytes, 11, &self.pir_layout.tier1_layers.to_le_bytes());
-        append_v3_field(&mut bytes, 12, &self.pir_layout.poly_len.to_le_bytes());
+        append_v3_field(&mut bytes, 9, &self.context.proposal_count().to_le_bytes());
+        append_v3_field(&mut bytes, 10, &self.pir_layout.pir_depth.to_le_bytes());
+        append_v3_field(&mut bytes, 11, &self.pir_layout.tier0_layers.to_le_bytes());
+        append_v3_field(&mut bytes, 12, &self.pir_layout.tier1_layers.to_le_bytes());
+        append_v3_field(&mut bytes, 13, &self.pir_layout.poly_len.to_le_bytes());
         bytes
     }
 
@@ -349,14 +369,14 @@ mod tests {
             poly_len: 4096,
         };
         let context =
-            RoundAuthContextV3::new(Network::Testnet, "vote-chain-1", 1_234_567, [3u8; 32])
+            RoundAuthContextV3::new(Network::Testnet, "vote-chain-1", 1_234_567, [3u8; 32], 3)
                 .unwrap();
 
         let encoded = RoundAuthPayloadV3::new(round_id, ea_pk, layout, context).to_bytes();
         assert_eq!(
             hex::encode(&encoded),
             concat!(
-                "7a636173682d736869656c6465642d766f74653a726f756e642d617574683a76330c",
+                "7a636173682d736869656c6465642d766f74653a726f756e642d617574683a76330d",
                 "01180000007265636f76657261626c652d617574686f726974792d7631",
                 "020e0000007265636f76657261626c652d7631",
                 "0307000000746573746e6574",
@@ -365,42 +385,46 @@ mod tests {
                 "06200000000202020202020202020202020202020202020202020202020202020202020202",
                 "070800000087d6120000000000",
                 "08200000000303030303030303030303030303030303030303030303030303030303030303",
-                "090400000013000000",
-                "0a040000000c000000",
-                "0b0400000007000000",
-                "0c0400000000100000"
+                "090400000003000000",
+                "0a0400000013000000",
+                "0b040000000c000000",
+                "0c0400000007000000",
+                "0d0400000000100000"
             )
         );
         assert_eq!(
             hex::encode(Sha256::digest(&encoded)),
-            "c1227644ff57e80630d99356463586363cd569c0985c0f9ea85f9a83ad0b0e5e"
+            "f155b3aa1a949dd1fa0e7ede5c1f49e15f096cd7a6f83491dd933fa449019d0a"
         );
         assert_eq!(
             RoundAuthPayloadV3::new(
                 round_id,
                 ea_pk,
                 layout,
-                RoundAuthContextV3::new(Network::Testnet, "vote-chain-1", 1_234_567, [3u8; 32],)
+                RoundAuthContextV3::new(Network::Testnet, "vote-chain-1", 1_234_567, [3u8; 32], 3,)
                     .unwrap(),
             )
             .digest()
             .to_hex(),
-            "c1227644ff57e80630d99356463586363cd569c0985c0f9ea85f9a83ad0b0e5e"
+            "f155b3aa1a949dd1fa0e7ede5c1f49e15f096cd7a6f83491dd933fa449019d0a"
         );
     }
 
     #[test]
     fn round_auth_v3_context_rejects_noncanonical_vote_chain_ids() {
         for invalid in ["", "chain id", "chain\n"] {
-            assert!(RoundAuthContextV3::new(Network::Mainnet, invalid, 1, [0; 32]).is_err());
+            assert!(RoundAuthContextV3::new(Network::Mainnet, invalid, 1, [0; 32], 1).is_err());
         }
-        assert!(RoundAuthContextV3::new(Network::Mainnet, "x".repeat(129), 1, [0; 32]).is_err());
+        assert!(RoundAuthContextV3::new(Network::Mainnet, "x".repeat(129), 1, [0; 32], 1).is_err());
+        assert!(RoundAuthContextV3::new(Network::Mainnet, "chain", 1, [0; 32], 0).is_err());
+        assert!(RoundAuthContextV3::new(Network::Mainnet, "chain", 1, [0; 32], 16).is_err());
 
         let invalid_json = serde_json::json!({
             "network": "mainnet",
             "vote_chain_id": "chain id",
             "snapshot_height": 1,
             "snapshot_block_hash": BASE64.encode([0u8; 32]),
+            "proposal_count": 1,
         });
         assert!(serde_json::from_value::<RoundAuthContextV3>(invalid_json).is_err());
     }
@@ -408,10 +432,12 @@ mod tests {
     #[test]
     fn round_auth_v3_context_serde_is_canonical_and_validated() {
         let context =
-            RoundAuthContextV3::new(Network::Regtest, "vote-chain-test", 42, [0x33; 32]).unwrap();
+            RoundAuthContextV3::new(Network::Regtest, "vote-chain-test", 42, [0x33; 32], 3)
+                .unwrap();
         let encoded = serde_json::to_value(&context).unwrap();
         assert_eq!(encoded["network"], "regtest");
         assert_eq!(encoded["snapshot_block_hash"], BASE64.encode([0x33; 32]));
+        assert_eq!(encoded["proposal_count"], 3);
         assert_eq!(
             serde_json::from_value::<RoundAuthContextV3>(encoded).unwrap(),
             context
@@ -430,14 +456,14 @@ mod tests {
             [1; 32],
             [2; 32],
             layout,
-            RoundAuthContextV3::new(Network::Regtest, "ab", 12, [3; 32]).unwrap(),
+            RoundAuthContextV3::new(Network::Regtest, "ab", 12, [3; 32], 3).unwrap(),
         )
         .to_bytes();
         let second = RoundAuthPayloadV3::new(
             [1; 32],
             [2; 32],
             layout,
-            RoundAuthContextV3::new(Network::Regtest, "a", 12, [3; 32]).unwrap(),
+            RoundAuthContextV3::new(Network::Regtest, "a", 12, [3; 32], 3).unwrap(),
         )
         .to_bytes();
 

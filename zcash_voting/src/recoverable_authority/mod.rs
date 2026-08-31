@@ -6,11 +6,17 @@
 //! sources produce the same typed per-round root and therefore share hotkey and
 //! self-custody bundle derivation.
 
+mod ballot;
 mod bundle;
 mod chain_recovery;
 mod derivation;
 mod pir;
 
+pub use ballot::{
+    commit_recoverable_complete_ballot_v1, prepare_recoverable_complete_ballot_v1,
+    record_recoverable_complete_ballot_submission_v1, recoverable_complete_ballot_readiness_v1,
+    RecoverableBallotReadinessV1, RecoverableCompleteBallotV1,
+};
 pub(crate) use bundle::canonical_recoverable_notes;
 pub use bundle::{
     plan_recoverable_self_custody_bundles_v1, recoverable_bundle_policy_v1,
@@ -49,6 +55,7 @@ pub(crate) fn test_round_auth_payload_v3(
             context.vote_chain_id(),
             1_234_567,
             [0xAB; 32],
+            3,
         )
         .expect("test authority context has a valid vote-chain identifier"),
     )
@@ -90,6 +97,7 @@ pub(crate) fn test_verified_voting_round_v3(
             context.vote_chain_id(),
             round_params.snapshot_height,
             [0xAB; 32],
+            3,
         )
         .expect("test authority context has a valid vote-chain identifier"),
     );
