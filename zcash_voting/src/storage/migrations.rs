@@ -57,7 +57,26 @@ ALTER TABLE share_delegations ADD COLUMN target_count INTEGER NOT NULL DEFAULT 0
     ),
     (
         16,
-        "CREATE TABLE helper_share_plans (
+        "-- v3.1.0-rc.13 singleton recovery JSON predates atomic-batch metadata.
+-- Normalize those released rows before plans can bind to their exact bytes so
+-- confirmation reserialization changes only the VC tree position.
+UPDATE votes
+   SET commitment_bundle_json = json_set(
+           json_set(
+               json_set(commitment_bundle_json, '$.batch_digest', NULL),
+               '$.batch_index', NULL
+           ),
+           '$.batch_size', NULL
+       )
+ WHERE CASE
+           WHEN json_valid(commitment_bundle_json) THEN
+               json_extract(commitment_bundle_json, '$.format') = 'zcash_voting_vote_recovery_v1'
+               AND json_type(commitment_bundle_json, '$.batch_digest') IS NULL
+               AND json_type(commitment_bundle_json, '$.batch_index') IS NULL
+               AND json_type(commitment_bundle_json, '$.batch_size') IS NULL
+           ELSE 0
+       END;
+CREATE TABLE helper_share_plans (
     round_id                    TEXT NOT NULL,
     wallet_id                   TEXT NOT NULL DEFAULT '',
     bundle_index                INTEGER NOT NULL,
@@ -230,6 +249,10 @@ mod tests {
 
     fn v16_schema() -> String {
         without_helper_share_plans(include_str!("migrations/001_init.sql"))
+    }
+
+    fn v15_schema() -> String {
+        without_durable_ambiguous_deliveries(&v16_schema())
     }
 
     /// The bundle-scoped `imt_proofs` table that version 15 replaced with
@@ -468,6 +491,95 @@ mod tests {
             CURRENT_VERSION
         );
         assert_helper_plan_lifecycle(&conn);
+    }
+
+    #[test]
+    fn migrate_v15_recovery_json_preserves_plan_only_through_confirmation() {
+        const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v15_schema()).unwrap();
+        let mut params = test_params();
+        params.vote_round_id = ROUND_ID.to_string();
+        queries::insert_round(&conn, "wallet", crate::Network::Testnet, &params, None).unwrap();
+        queries::insert_bundle(&conn, ROUND_ID, "wallet", 0, &[1]).unwrap();
+        queries::store_vote(&conn, ROUND_ID, "wallet", 0, 1, 2, &[0xCA; 32]).unwrap();
+        queries::store_vote(&conn, ROUND_ID, "wallet", 0, 2, 1, &[0xCB; 32]).unwrap();
+
+        let released_json = released_singleton_recovery_json(ROUND_ID);
+        assert!(!released_json.contains("\"batch_digest\""));
+        let batch_json = r#"{"format":"zcash_voting_vote_batch_recovery_v1","batch_digest":[1],"batch_index":0,"batch_size":1}"#;
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json = ?1
+             WHERE round_id = ?2 AND wallet_id = 'wallet'
+               AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::params![released_json, ROUND_ID],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json = ?1
+             WHERE round_id = ?2 AND wallet_id = 'wallet'
+               AND bundle_index = 0 AND proposal_id = 2",
+            rusqlite::params![batch_json, ROUND_ID],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 15).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let normalized =
+            crate::vote::serialize_recovery(&crate::vote::parse_recovery(&released_json).unwrap())
+                .unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT commitment_bundle_json FROM votes
+                 WHERE round_id = ?1 AND wallet_id = 'wallet'
+                   AND bundle_index = 0 AND proposal_id = 1",
+                [ROUND_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, normalized);
+        assert!(stored.contains("\"batch_digest\":null"));
+        let stored_batch: String = conn
+            .query_row(
+                "SELECT commitment_bundle_json FROM votes
+                 WHERE round_id = ?1 AND wallet_id = 'wallet'
+                   AND bundle_index = 0 AND proposal_id = 2",
+                [ROUND_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_batch, batch_json);
+        insert_helper_plan_for_round(&conn, ROUND_ID, &stored);
+
+        let mut confirmed =
+            crate::vote::parse_recovery(&stored).expect("normalized recovery must remain valid");
+        confirmed.vc_tree_position = 789;
+        let confirmed_json = crate::vote::serialize_recovery(&confirmed).unwrap();
+        conn.execute(
+            "UPDATE votes
+                SET commitment_bundle_json = ?1, vc_tree_position = 789
+              WHERE round_id = ?2 AND wallet_id = 'wallet'
+                AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::params![confirmed_json, ROUND_ID],
+        )
+        .unwrap();
+        assert_eq!(
+            stored_plan_snapshot_for_round(&conn, ROUND_ID).as_deref(),
+            Some(confirmed_json.as_str())
+        );
+
+        let replacement_json =
+            confirmed_json.replacen("\"vote_decision\":2", "\"vote_decision\":1", 1);
+        assert_ne!(replacement_json, confirmed_json);
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json = ?1
+             WHERE round_id = ?2 AND wallet_id = 'wallet'
+               AND bundle_index = 0 AND proposal_id = 1",
+            rusqlite::params![replacement_json, ROUND_ID],
+        )
+        .unwrap();
+        assert_eq!(stored_plan_snapshot_for_round(&conn, ROUND_ID), None);
     }
 
     #[test]
@@ -754,24 +866,65 @@ mod tests {
     }
 
     fn insert_helper_plan(conn: &Connection, snapshot: &str) {
+        insert_helper_plan_for_round(conn, "test-round", snapshot);
+    }
+
+    fn insert_helper_plan_for_round(conn: &Connection, round_id: &str, snapshot: &str) {
         conn.execute(
             "INSERT INTO helper_share_plans
              (round_id, wallet_id, bundle_index, proposal_id,
               commitment_bundle_json, configured_server_urls_json,
               share_plans_json, format_version, placement_guarantee, created_at)
-             VALUES ('test-round', 'wallet', 0, 1, ?1, '[\"https://helper.example\"]',
+             VALUES (?1, 'wallet', 0, 1, ?2, '[\"https://helper.example\"]',
                      '[]', 1, 'strict', 1)",
-            [snapshot],
+            rusqlite::params![round_id, snapshot],
         )
         .unwrap();
     }
 
+    fn released_singleton_recovery_json(round_id: &str) -> String {
+        let released_shape = serde_json::to_string(&serde_json::json!({
+            "format": "zcash_voting_vote_recovery_v1",
+            "vote_round_id": round_id,
+            "bundle_index": 0,
+            "proposal_id": 1,
+            "vote_decision": 2,
+            "anchor_height": 100,
+            "vc_tree_position": 0,
+            "single_share": false,
+            "num_options": 3,
+            "van_nullifier": vec![0x31_u8; 32],
+            "vote_authority_note_new": vec![0x32_u8; 32],
+            "vote_commitment": vec![0x33_u8; 32],
+            "proof": vec![0x34_u8; 8],
+            "shares_hash": vec![0x35_u8; 32],
+            "r_vpk": vec![0x36_u8; 32],
+            "alpha_v": vec![0x37_u8; 32],
+            "vote_auth_sig": vec![0x38_u8; 64],
+            "encrypted_shares": [],
+            "share_blinds": [],
+            "share_comms": [],
+        }))
+        .unwrap();
+        let canonical_with_batch_nulls =
+            crate::vote::serialize_recovery(&crate::vote::parse_recovery(&released_shape).unwrap())
+                .unwrap();
+        canonical_with_batch_nulls
+            .strip_suffix(",\"batch_digest\":null,\"batch_index\":null,\"batch_size\":null}")
+            .map(|prefix| format!("{prefix}}}"))
+            .expect("current singleton recovery must append nullable batch metadata")
+    }
+
     fn stored_plan_snapshot(conn: &Connection) -> Option<String> {
+        stored_plan_snapshot_for_round(conn, "test-round")
+    }
+
+    fn stored_plan_snapshot_for_round(conn: &Connection, round_id: &str) -> Option<String> {
         conn.query_row(
             "SELECT commitment_bundle_json FROM helper_share_plans
-             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
+             WHERE round_id = ?1 AND wallet_id = 'wallet'
                AND bundle_index = 0 AND proposal_id = 1",
-            [],
+            [round_id],
             |row| row.get(0),
         )
         .optional()

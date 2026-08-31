@@ -768,6 +768,11 @@ to the exact commitment-bundle generation validated for the `CommittedVote`
 handle. Plan loading requires the handle's exact stored generation. The schema
 trigger advances the persisted plan through the confirmation-only VC-position
 transition, so a caller must recover a fresh `CommittedVote` before submitting.
+A version-17 migration first normalizes released singleton recovery JSON that
+predates nullable atomic-batch metadata. This happens before the plan table
+exists, allowing confirmation to remain a byte-exact VC-position-only
+transition without weakening generation comparison for any other recovery
+change.
 A replacement that lands after an earlier recovery read, including one that
 preserves the vote commitment, invalidates the handle or plan and fails before
 any helper POST instead of combining old payload or placement data with the
@@ -841,6 +846,8 @@ provided by
 `committed_vote_submission_rejects_mismatched_plan_before_side_effects`, and
 `invalid_candidate_url_does_not_create_a_share_record`. Cleanup concurrency is
 covered by `initial_delivery_does_not_recreate_share_after_recovery_cleanup`.
+Released recovery-format migration and strict plan invalidation are covered by
+`migrate_v15_recovery_json_preserves_plan_only_through_confirmation`.
 The high-level boundary regressions in
 [`share_tracking/tests/delivery_plan.rs`](../zcash_voting/src/share_tracking/tests/delivery_plan.rs)
 are `stale_handle_cannot_prepare_same_commitment_replacement`,
