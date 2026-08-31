@@ -491,10 +491,10 @@ pub struct PreparedDelegationBundle {
     pub round_name: String,
 }
 
-/// Prepared recoverable bundle that cannot invoke the legacy random setup path.
+/// Prepared bundle that binds setup to recoverable authority and bundle material.
 ///
-/// The authority binding, validated chain round, and canonical bundle material
-/// are retained together. `setup` is therefore deterministic by construction.
+/// The authority root makes the VAN blinding recoverable. The PCZT itself still
+/// follows the existing one-shot signing contract and uses fresh randomness.
 pub struct PreparedRecoverableDelegationBundleV1<'a> {
     prepared: PreparedDelegationBundle,
     authority_root: &'a crate::recoverable_authority::VotingAuthorityRootV1,
@@ -1363,7 +1363,11 @@ impl PreparedRecoverableDelegationBundleV1<'_> {
             .precompute(voting_db, wallet_db, pir_client.inner())
     }
 
-    /// Builds deterministic setup; no random alternative exists on this type.
+    /// Builds one-shot setup with the bundle's recoverable VAN blinding.
+    ///
+    /// Callers must retain the returned setup through signing. To abandon an
+    /// unsigned attempt, clear it with [`crate::precompute::reset_voting_session_state`]
+    /// before building a replacement.
     pub fn setup(
         &self,
         voting_db: &VotingDb,
@@ -1435,7 +1439,7 @@ impl PreparedRecoverableDelegationBundleV1<'_> {
         })
     }
 
-    /// Builds the existing Keystone request after deterministic setup.
+    /// Builds the existing one-shot Keystone request.
     pub fn keystone_request(
         &self,
         voting_db: &VotingDb,
@@ -2318,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_delegation_accepts_only_deterministic_persisted_setup() {
+    fn recoverable_delegation_enforces_one_shot_setup() {
         let (voting_db, round_params, _, mut prepared) = prepared_wallet_delegation_fixture();
         let round_id = hex::decode(&round_params.vote_round_id)
             .unwrap()
@@ -2429,12 +2433,33 @@ mod tests {
                 ],
             )
             .unwrap();
-        recoverable
+        let first_setup = recoverable
             .setup(&voting_db, &crate::types::NoopProgressReporter)
             .unwrap();
-        recoverable
+
+        let retry_error = recoverable
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .err()
+            .expect("a new PCZT must not overwrite the retained one-shot setup");
+        assert!(
+            retry_error
+                .to_string()
+                .contains("refusing to overwrite pczt_sighash"),
+            "{retry_error}"
+        );
+        assert_eq!(
+            recoverable.signing_request(&voting_db).unwrap().sighash,
+            first_setup.pczt_sighash
+        );
+
+        crate::precompute::reset_voting_session_state(&voting_db, recoverable.round_id()).unwrap();
+        let replacement_setup = recoverable
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let signing_request = recoverable
             .signing_request(&voting_db)
-            .expect("deterministic recoverable setup must remain signable");
+            .expect("replacement recoverable setup must remain signable");
+        assert_eq!(signing_request.sighash, replacement_setup.pczt_sighash);
     }
 
     #[test]
