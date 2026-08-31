@@ -314,6 +314,7 @@ impl Default for BundlePolicy {
 // These values are independent of the mutable wallet defaults. Changing them
 // would alter bundle identities reconstructed after voting database loss.
 const RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE: usize = 5;
+const RECOVERABLE_V1_BUNDLE_ADDITION_THRESHOLD_ZATOSHI: u64 = 25_000 * 100_000_000;
 const RECOVERABLE_V1_MAX_PRIVACY_BUNDLES: usize = 2;
 const RECOVERABLE_V1_PRIVACY_DROP_BPS: u32 = 100;
 const RECOVERABLE_V1_MAX_PRIVACY_DROP_ZATOSHI: u64 = 100_000_000_000;
@@ -322,12 +323,14 @@ const RECOVERABLE_V1_MAX_PRIVACY_DROP_ZATOSHI: u64 = 100_000_000_000;
 ///
 /// Wallets that need delegation recovery after voting database loss should use
 /// this policy both when first preparing the round and when rebuilding it. It
-/// selects the frozen v1 planner as well as the v1 numeric settings.
+/// selects the frozen v1 planner as well as the v1 numeric settings, including
+/// the 25,000 ZEC boundary that keeps the canonical ZIP-318 note shape in one
+/// bundle.
 pub fn recoverable_bundle_policy_v1() -> BundlePolicy {
     BundlePolicy {
         planner_version: BundlePlannerVersion::V1,
         max_real_notes_per_bundle: RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE,
-        bundle_addition_threshold_zatoshi: None,
+        bundle_addition_threshold_zatoshi: Some(RECOVERABLE_V1_BUNDLE_ADDITION_THRESHOLD_ZATOSHI),
         privacy_trim: Some(PrivacyTrimPolicy {
             max_bundles: RECOVERABLE_V1_MAX_PRIVACY_BUNDLES,
             drop_bps: RECOVERABLE_V1_PRIVACY_DROP_BPS,
@@ -737,7 +740,10 @@ mod tests {
 
         assert_eq!(policy.planner_version(), BundlePlannerVersion::V1);
         assert_eq!(policy.max_real_notes_per_bundle(), 5);
-        assert_eq!(policy.bundle_addition_threshold(), None);
+        assert_eq!(
+            policy.bundle_addition_threshold(),
+            Some(RECOVERABLE_V1_BUNDLE_ADDITION_THRESHOLD_ZATOSHI)
+        );
         assert_eq!(policy.max_privacy_bundles(), Some(2));
         assert_eq!(policy.privacy_drop_bps(), 100);
         assert_eq!(policy.max_privacy_drop_zatoshi(), Some(100_000_000_000));
@@ -766,6 +772,28 @@ mod tests {
         assert_eq!(plan.privacy_trim.dropped_bundles, 1);
         assert_eq!(plan.privacy_trim.dropped_notes, 5);
         assert_eq!(plan.privacy_trim.dropped_value, 100 * BALLOT_DIVISOR);
+    }
+
+    #[test]
+    fn recoverable_bundle_policy_v1_keeps_zip_318_note_shape_together() {
+        const ZATOSHI_PER_ZEC: u64 = 100_000_000;
+
+        let notes = vec![
+            make_note(10_000 * ZATOSHI_PER_ZEC, 0),
+            make_note(10_000 * ZATOSHI_PER_ZEC, 1),
+            make_note(5_000 * ZATOSHI_PER_ZEC, 2),
+            make_note(ZATOSHI_PER_ZEC, 3),
+        ];
+
+        let plan =
+            canonical_note_bundle_plan_for_notes(&notes, recoverable_bundle_policy_v1()).unwrap();
+        let bundle_positions = plan
+            .bundles
+            .iter()
+            .map(|bundle| bundle.iter().map(|note| note.position).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        assert_eq!(bundle_positions, vec![vec![0, 1, 2], vec![3]]);
     }
 
     #[test]
