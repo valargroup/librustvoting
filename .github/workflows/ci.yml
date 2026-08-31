@@ -3,14 +3,48 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - '**.md'
   pull_request:
-    paths-ignore:
-      - '**.md'
 
 jobs:
+  changes:
+    name: CI scope
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: ${{ steps.scope.outputs.run_ci }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        name: Detect non-Markdown changes
+        env:
+          HEAD_SHA: ${{ github.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          base_sha="$PUSH_BASE_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base_sha="$PR_BASE_SHA"
+          fi
+
+          if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]] || \
+             ! git cat-file -e "$base_sha^{commit}"; then
+            echo "run_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          run_ci=false
+          while IFS= read -r -d '' changed_path; do
+            if [[ "$changed_path" != *.md ]]; then
+              run_ci=true
+              break
+            fi
+          done < <(git diff --name-only -z "$base_sha" "$HEAD_SHA")
+          echo "run_ci=$run_ci" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -19,10 +53,17 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      RUN_CI: ${{ needs.changes.result != 'success' || needs.changes.outputs.run_ci == 'true' }}
     steps:
+      - name: Report Markdown-only skip
+        if: env.RUN_CI != 'true'
+        run: echo "Skipping tests because all changed files are Markdown"
       - uses: actions/checkout@v4
+        if: env.RUN_CI == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: env.RUN_CI == 'true'
       - name: Restore tracked source mtimes
+        if: env.RUN_CI == 'true'
         run: |
           python3 - <<'PY'
           import os
@@ -43,9 +84,11 @@ jobs:
               os.utime(path, (timestamp, timestamp))
           PY
       - uses: Swatinem/rust-cache@v2
+        if: env.RUN_CI == 'true'
         with:
           cache-targets: false
       - name: Cache test build artifacts
+        if: env.RUN_CI == 'true'
         uses: actions/cache@v4
         with:
           path: target
@@ -53,16 +96,18 @@ jobs:
           restore-keys: |
             test-target-v3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*', '.cargo/config.toml') }}-
       - uses: taiki-e/install-action@v2
+        if: env.RUN_CI == 'true'
         with:
           tool: cargo-nextest@0.9.138
       - name: Test default Zakura stack with fixtures
+        if: env.RUN_CI == 'true'
         run: |
           cargo nextest run -p zcash_voting -p zcash-voting-wallet-example \
             --features test-fixtures \
             --partition count:${{ matrix.partition }}/2 \
             --locked
       - name: Test documentation
-        if: matrix.partition == 1
+        if: env.RUN_CI == 'true' && matrix.partition == 1
         run: |
           cargo test -p zcash_voting -p zcash-voting-wallet-example --doc \
             --features test-fixtures \
@@ -70,21 +115,34 @@ jobs:
 
   proofs:
     name: Halo2 proof tests
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
+    env:
+      RUN_CI: ${{ needs.changes.result != 'success' || needs.changes.outputs.run_ci == 'true' }}
     steps:
+      - name: Report Markdown-only skip
+        if: env.RUN_CI != 'true'
+        run: echo "Skipping tests because all changed files are Markdown"
       - uses: actions/checkout@v4
+        if: env.RUN_CI == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: env.RUN_CI == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: env.RUN_CI == 'true'
       - uses: taiki-e/install-action@v2
+        if: env.RUN_CI == 'true'
         with:
           tool: cargo-nextest@0.9.138
       # The end-to-end delegation proof runs keygen plus proving, so it is
       # marked #[ignore] for the default suite and run here under --release.
       - name: Run ignored Zakura proof tests
+        if: env.RUN_CI == 'true'
         run: |
           cargo nextest run --release -p zcash_voting \
             --locked --run-ignored ignored-only
       - name: Run ignored LRZ proof tests
+        if: env.RUN_CI == 'true'
         run: |
           cargo nextest run --release -p zcash_voting \
             --no-default-features --features lrz \
@@ -92,26 +150,40 @@ jobs:
 
   vct-backends:
     name: VCT backends
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
+    env:
+      RUN_CI: ${{ needs.changes.result != 'success' || needs.changes.outputs.run_ci == 'true' }}
     steps:
+      - name: Report Markdown-only skip
+        if: env.RUN_CI != 'true'
+        run: echo "Skipping tests because all changed files are Markdown"
       - uses: actions/checkout@v4
+        if: env.RUN_CI == 'true'
       - uses: dtolnay/rust-toolchain@1.91.0
+        if: env.RUN_CI == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: env.RUN_CI == 'true'
       - uses: taiki-e/install-action@v2
+        if: env.RUN_CI == 'true'
         with:
           tool: cargo-nextest@0.9.138
       - name: Test LRZ VCT crates
+        if: env.RUN_CI == 'true'
         run: |
           cargo nextest run -p vote-commitment-tree -p vote-commitment-tree-client \
             --all-targets --no-default-features \
             --features vote-commitment-tree/lrz,vote-commitment-tree-client/lrz,vote-commitment-tree-client/cli \
             --locked
       - name: Test Zakura VCT crates
+        if: env.RUN_CI == 'true'
         run: |
           cargo nextest run -p vote-commitment-tree -p vote-commitment-tree-client \
             --all-targets --features vote-commitment-tree-client/cli \
             --locked
       - name: Check backend contracts
+        if: env.RUN_CI == 'true'
         run: |
           if cargo tree -p vote-commitment-tree -p vote-commitment-tree-client \
             -e all --prefix none --locked \
@@ -141,15 +213,27 @@ jobs:
 
   lrz-wallet:
     name: LRZ wallet backend
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
+    env:
+      RUN_CI: ${{ needs.changes.result != 'success' || needs.changes.outputs.run_ci == 'true' }}
     steps:
+      - name: Report Markdown-only skip
+        if: env.RUN_CI != 'true'
+        run: echo "Skipping tests because all changed files are Markdown"
       - uses: actions/checkout@v4
+        if: env.RUN_CI == 'true'
       - uses: dtolnay/rust-toolchain@1.91.0
+        if: env.RUN_CI == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: env.RUN_CI == 'true'
       - uses: taiki-e/install-action@v2
+        if: env.RUN_CI == 'true'
         with:
           tool: cargo-nextest@0.9.138
       - name: Test LRZ wallet stack
+        if: env.RUN_CI == 'true'
         # The wallet example verifies direct `zcash_voting/lrz` selection.
         run: |
           cargo nextest run -p zcash_voting -p zcash-voting-wallet-example \
@@ -157,6 +241,7 @@ jobs:
             --features lrz \
             --locked
       - name: Check wallet backend contracts
+        if: env.RUN_CI == 'true'
         run: |
           if cargo tree -p zcash_voting -e all --prefix none \
             --no-default-features --features lrz --locked \
@@ -181,6 +266,7 @@ jobs:
             exit 1
           fi
       - name: Check external git consumers
+        if: env.RUN_CI == 'true'
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target/git-consumer
         run: |
@@ -264,6 +350,7 @@ jobs:
           cargo check --manifest-path "$CONSUMER_DIR/gemini/Cargo.toml"
           cargo check --manifest-path "$CONSUMER_DIR/vizor/Cargo.toml"
       - name: Package voting crates
+        if: env.RUN_CI == 'true'
         run: |
           cargo package -p vote-commitment-tree --locked
           # The client and primary crate depend on the new VCT versions.
@@ -273,12 +360,23 @@ jobs:
 
   msrv:
     name: Rust 1.91
+    needs: changes
+    if: ${{ always() }}
     runs-on: ubuntu-latest
+    env:
+      RUN_CI: ${{ needs.changes.result != 'success' || needs.changes.outputs.run_ci == 'true' }}
     steps:
+      - name: Report Markdown-only skip
+        if: env.RUN_CI != 'true'
+        run: echo "Skipping tests because all changed files are Markdown"
       - uses: actions/checkout@v4
+        if: env.RUN_CI == 'true'
       - uses: dtolnay/rust-toolchain@1.91.0
+        if: env.RUN_CI == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: env.RUN_CI == 'true'
       - name: Check packages at MSRV
+        if: env.RUN_CI == 'true'
         run: |
           cargo check -p zcash_voting -p zcash-voting-wallet-example \
             --all-targets --features test-fixtures \
