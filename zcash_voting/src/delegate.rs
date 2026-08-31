@@ -745,6 +745,9 @@ where
 
     // Ensure the round is present in the voting database.
     voting_db.ensure_round(network, &round_params, None)?;
+    if params.recoverable_v1 {
+        require_recoverable_bundle_policy_v1(voting_db, &round_id)?;
+    }
     let (layout, bundle_note_infos) = ensure_delegation_bundle_selection(
         voting_db,
         &round_id,
@@ -792,6 +795,21 @@ fn ensure_delegation_bundle_selection(
         round_id,
     )?;
     Ok((layout, bundle_note_infos))
+}
+
+fn require_recoverable_bundle_policy_v1(
+    voting_db: &VotingDb,
+    round_id: &str,
+) -> Result<(), VotingError> {
+    let required = crate::recoverable_authority::recoverable_bundle_policy_v1();
+    let effective = voting_db.effective_bundle_policy(round_id, required)?;
+    if effective != required {
+        return Err(VotingError::InvalidInput {
+            message: "existing delegation bundles were not planned under recoverable-v1"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Inputs gathered from lightwalletd and the wallet before voting-DB work.
@@ -2469,6 +2487,39 @@ mod tests {
 
         assert_eq!(resumed.bundle_count, 6);
         assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn recoverable_delegation_rejects_a_persisted_non_v1_bundle_policy() {
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("recoverable-policy-mismatch");
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "04".repeat(32),
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        voting_db
+            .ensure_round(Network::Regtest, &round_params, None)
+            .unwrap();
+        voting_db
+            .ensure_bundles_with_policy(
+                &round_params.vote_round_id,
+                &[note_info(0, crate::governance::BALLOT_DIVISOR)],
+                BundlePolicy::new(1).unwrap(),
+            )
+            .unwrap();
+
+        let error = require_recoverable_bundle_policy_v1(&voting_db, &round_params.vote_round_id)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("were not planned under recoverable-v1"),
+            "{error}"
+        );
     }
 
     #[test]
