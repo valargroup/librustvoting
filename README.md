@@ -67,6 +67,13 @@ stage-oriented API:
   hashes and tree positions atomically.
 - `vote::*` builds ZKP #2, signs cast-vote payloads, persists the canonical
   `VoteRecoveryBundle`, and reconstructs vote-chain submissions after a crash.
+- `recoverable_authority::*` is an opt-in path for future rounds. It validates
+  selected on-chain round data against the existing dynamic config, derives
+  deterministic per-round authority and bundle material, requires a complete
+  terminal ballot, and submits each bundle's selected choices in one atomic
+  transaction. Chain recovery checks only whether the deterministic initial
+  VAN remains unspent or was terminally consumed; it has no proposal cursor or
+  mask and does not change helper delivery.
 - `share::*` recovers helper-share payloads, computes share nullifiers, and
   applies share scheduling policy. `CommittedVote::submit_share_to_helpers`
   owns journaled initial delivery, while `track_pending_shares` requires two

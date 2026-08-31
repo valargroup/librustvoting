@@ -7,6 +7,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ## Unreleased
 
 ### Added
+- Added an opt-in recoverable voting path for future rounds. Software
+  registered-key output and retained Keystone generations derive the same
+  bound per-round authority; selected on-chain round data is checked against
+  the existing dynamic config version 2 before deterministic bundle material
+  is used. A recoverable bundle requires terminal intent for every chain
+  proposal and submits all selected choices in one atomic batch. Finalized
+  chain recovery then classifies the bundle's deterministic initial VAN as
+  unspent, terminally consumed by a canonical batch, or unsupported. Existing
+  config schemas, legacy voting, and helper delivery are unchanged.
 - `HyperTransport::with_connector` and `with_http_connector` now let wallets
   inject fully configured or Rustls-wrapped Hyper connectors for proxies,
   custom DNS, and route-lifecycle enforcement while retaining the SDK's pooled

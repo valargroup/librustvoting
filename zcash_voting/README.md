@@ -87,6 +87,7 @@ precompute → delegate → vote → share lifecycle:
 | `delegate` | PCZT setup, proof generation, submission assembly, and chain recovery writes. |
 | `confirmation` | Chain tx event parsing plus atomic delegation, singleton-vote, and vote-batch confirmation recording. |
 | `vote` | ZKP2 construction, bounded parallel batch proving, cast-vote signing, and atomic recovery-bundle persistence. |
+| `recoverable_authority` | Bound per-round authority derivation, chain-round validation, deterministic bundles, complete ballots, and finalized-chain reconciliation. |
 | `share` | Helper-share payload recovery, nullifier computation, and share confirmation state. |
 | `session` | Durable ballot intent plus the round-level resume planner. |
 | `phases` | Per-bundle `DelegationPhase` derived from persisted artifacts. |
@@ -100,6 +101,34 @@ storage rows directly. An atomic batch preserves the original proof's
 privacy for choices, notes, amounts, and voting keys. Its deliberate metadata
 tradeoff is transaction-level linkage: observers can see that the ordered
 proposal actions in the batch were submitted together.
+
+## Recoverable voting authority
+
+`recoverable_authority` is an opt-in path for future rounds. It does not add a
+config schema. The wallet selects a round from the vote chain, constructs
+`ChainVotingRoundV1`, and validates it with
+`validate_recoverable_voting_round_v1` against the round ID and election key
+already authenticated by `ResolvedVotingConfig` version 2.
+
+The wallet retains one bound per-round authority root derived from either its
+registered-key provider or a backed-up Keystone master generation. The crate
+uses that root to reproduce the voting-only Orchard key and deterministic
+self-custody bundle material. Custody callers instead validate an imported
+capability for the same root and chain round.
+
+Before committing a bundle, record `Choice` or `Skipped` for every proposal in
+the chain round. `commit_recoverable_complete_ballot_v1` omits skipped
+proposals and places every selected choice in one atomic transaction. The
+first durably persisted bundle locks the round-wide intent set, so later
+bundles cannot commit a different ballot.
+
+After local state loss, `reconcile_recoverable_ballot_v1` authenticates the
+deterministic initial VAN at a finalized VCT checkpoint and checks its native
+nullifier through a caller-supplied complete chain verifier. Recovery is
+binary: the bundle is still unspent, was terminally consumed by a canonical
+atomic batch, or was spent in an unsupported form. There is no per-proposal
+cursor or mask. Confirmed vote shares continue through the existing helper
+delivery APIs.
 
 ## Config resolution
 
