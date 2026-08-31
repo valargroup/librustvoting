@@ -24,9 +24,9 @@ use voting_crypto_deps::pasta_curves::pallas::Base as Fp;
 use zcash_voting::config::{
     resolve_dynamic_voting_config, resolve_static_voting_config, PinnedConfigSource, PirLayout,
 };
-use zcash_voting::round_auth::RoundAuthPayloadV2;
+use zcash_voting::round_auth::RoundAuthPayloadV3;
 use zcash_voting::wire::ResolveVotingConfigOptions;
-use zcash_voting::{connect_pir, HyperTransport};
+use zcash_voting::{connect_pir, HyperTransport, VoteProtocol};
 
 type RequestBody = Full<Bytes>;
 type HyperClient = Client<HttpsConnector<HttpConnector>, RequestBody>;
@@ -108,7 +108,7 @@ fn prepare(args: Vec<String>) -> Result<()> {
         .expect("round id hex")
         .try_into()
         .expect("32-byte round id");
-    let payload = RoundAuthPayloadV2::new(round_id, ea_pk, pir_layout).to_bytes();
+    let payload = RoundAuthPayloadV3::new(round_id, ea_pk, pir_layout, VoteProtocol::V1).to_bytes();
     let sig = signing_key.sign(&payload).to_bytes();
 
     let static_json = serde_json::json!({
@@ -145,7 +145,8 @@ fn prepare(args: Vec<String>) -> Result<()> {
         },
         "rounds": {
             ROUND_ID: {
-                "auth_version": 2,
+                "auth_version": 3,
+                "circuit_version": "v1",
                 "ea_pk": BASE64.encode(ea_pk),
                 "signatures": [{
                     "key_id": TRUSTED_KEY_ID,

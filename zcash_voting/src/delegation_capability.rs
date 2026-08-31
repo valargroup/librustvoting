@@ -15,7 +15,7 @@ use zcash_protocol::value::MAX_MONEY;
 
 use crate::{
     action::derive_hotkey_x_coords_from_raw_address,
-    governance::{construct_van, BALLOT_DIVISOR},
+    governance::{construct_van_for_protocol, BALLOT_DIVISOR},
     storage::{queries, RoundPhase, VotingDb},
     types::{
         validate_round_params, validate_vote_chain_id, Network, RoundBoundVotingHotkeyTarget,
@@ -143,12 +143,16 @@ impl DelegationCapabilityV1 {
     ///
     /// Whitespace, reordered fields, unknown or duplicate fields, and
     /// noncanonical scalar encodings are rejected so both parties hash the
-    /// same bytes.
+    /// same bytes. VAN commitments are deliberately not reconstructed here
+    /// because the package does not contain a trusted vote protocol. Import
+    /// binds them to independently authenticated round parameters.
     pub fn from_json(json: &[u8]) -> Result<Self, VotingError> {
         Self::from_json_with_validation(json).map(|(capability, _)| capability)
     }
 
-    fn from_json_with_validation(json: &[u8]) -> Result<(Self, ValidatedCapability), VotingError> {
+    fn from_json_with_validation(
+        json: &[u8],
+    ) -> Result<(Self, StructurallyValidatedCapability), VotingError> {
         if json.len() > MAX_DELEGATION_CAPABILITY_JSON_BYTES {
             return Err(invalid(format!(
                 "delegation capability JSON exceeds {MAX_DELEGATION_CAPABILITY_JSON_BYTES} bytes"
@@ -171,7 +175,7 @@ impl DelegationCapabilityV1 {
         serde_json::to_vec(self).map_err(internal_serialize)
     }
 
-    fn validate(&self) -> Result<ValidatedCapability, VotingError> {
+    fn validate(&self) -> Result<StructurallyValidatedCapability, VotingError> {
         if self.format_version != CAPABILITY_FORMAT_VERSION {
             return Err(invalid(format!(
                 "format_version must be {CAPABILITY_FORMAT_VERSION}, got {}",
@@ -186,17 +190,15 @@ impl DelegationCapabilityV1 {
             address_index: self.address_index,
             raw_orchard_address: self.raw_orchard_address.clone(),
         };
-        let (target, round_id) = target_wire.validated_parts()?;
+        let (target, vote_round_id) = target_wire.validated_parts()?;
         if self.bundles.is_empty() || self.bundles.len() > MAX_DELEGATION_CAPABILITY_BUNDLES {
             return Err(invalid(format!(
                 "delegation capability must contain 1..={MAX_DELEGATION_CAPABILITY_BUNDLES} bundles"
             )));
         }
 
-        let (g_d_x, pk_d_x) =
-            derive_hotkey_x_coords_from_raw_address(target.raw_orchard_address())?;
         let mut tx_hashes = HashSet::with_capacity(self.bundles.len());
-        let mut van_commitments = HashSet::with_capacity(self.bundles.len());
+        let mut van_inputs = HashSet::with_capacity(self.bundles.len());
         let mut bundles = Vec::with_capacity(self.bundles.len());
         let mut batch_total = 0u64;
         for (expected_index, bundle) in self.bundles.iter().enumerate() {
@@ -216,22 +218,21 @@ impl DelegationCapabilityV1 {
             if !tx_hashes.insert(tx_hash) {
                 return Err(invalid("delegation transaction hashes must be unique"));
             }
-            let van_comm: [u8; 32] =
-                construct_van(&g_d_x, &pk_d_x, total_note_value, &round_id, &van_comm_rand)?
-                    .try_into()
-                    .expect("construct_van returns 32 bytes");
-            if !van_commitments.insert(van_comm) {
+            if !van_inputs.insert((total_note_value, van_comm_rand)) {
                 return Err(invalid("delegation VAN commitments must be unique"));
             }
-            bundles.push(ValidatedBundle {
+            bundles.push(StructurallyValidatedBundle {
                 index: bundle.bundle_index,
                 total_note_value,
                 rand: van_comm_rand,
-                van: van_comm,
                 tx_hash: bundle.delegation_tx_hash.clone(),
             });
         }
-        Ok(ValidatedCapability { target, bundles })
+        Ok(StructurallyValidatedCapability {
+            target,
+            vote_round_id,
+            bundles,
+        })
     }
 }
 
@@ -249,17 +250,67 @@ pub struct ImportDelegationCapabilityParams<'a> {
     pub session_json: Option<&'a str>,
 }
 
-struct ValidatedCapability {
+struct StructurallyValidatedCapability {
     target: VotingHotkeyTarget,
-    bundles: Vec<ValidatedBundle>,
+    vote_round_id: [u8; 32],
+    bundles: Vec<StructurallyValidatedBundle>,
 }
 
-struct ValidatedBundle {
+struct StructurallyValidatedBundle {
+    index: u32,
+    total_note_value: u64,
+    rand: [u8; 32],
+    tx_hash: String,
+}
+
+struct RoundBoundCapabilityBundle {
     index: u32,
     total_note_value: u64,
     rand: [u8; 32],
     van: [u8; 32],
     tx_hash: String,
+}
+
+impl StructurallyValidatedCapability {
+    fn bind_to_round(
+        &self,
+        round_params: &VotingRoundParams,
+    ) -> Result<Vec<RoundBoundCapabilityBundle>, VotingError> {
+        if hex::encode(self.vote_round_id) != round_params.vote_round_id {
+            return Err(invalid(
+                "delegation capability does not match the trusted voting round",
+            ));
+        }
+
+        let (g_d_x, pk_d_x) =
+            derive_hotkey_x_coords_from_raw_address(self.target.raw_orchard_address())?;
+        let mut vans = HashSet::with_capacity(self.bundles.len());
+        self.bundles
+            .iter()
+            .map(|bundle| {
+                let van: [u8; 32] = construct_van_for_protocol(
+                    round_params.vote_protocol,
+                    &g_d_x,
+                    &pk_d_x,
+                    bundle.total_note_value,
+                    &self.vote_round_id,
+                    &bundle.rand,
+                )?
+                .try_into()
+                .expect("construct_van_for_protocol returns 32 bytes");
+                if !vans.insert(van) {
+                    return Err(invalid("delegation VAN commitments must be unique"));
+                }
+                Ok(RoundBoundCapabilityBundle {
+                    index: bundle.index,
+                    total_note_value: bundle.total_note_value,
+                    rand: bundle.rand,
+                    van,
+                    tx_hash: bundle.tx_hash.clone(),
+                })
+            })
+            .collect()
+    }
 }
 
 /// Exports a capability from completed funds controller delegation state.
@@ -270,7 +321,7 @@ struct ValidatedBundle {
 /// close. It may deliver the package while broadcasting; the voter's matching
 /// digest is a delivery receipt rather than a broadcast prerequisite. Supplying
 /// the wrong target after a restart fails because it cannot reproduce the
-/// persisted VAN commitments.
+/// persisted VAN commitments under the round's persisted vote protocol.
 pub fn export_delegation_capability(
     db: &VotingDb,
     voting_target: &RoundBoundVotingHotkeyTarget,
@@ -328,7 +379,8 @@ pub fn export_delegation_capability(
             .ok_or_else(|| internal("stored delegation batch weight exceeds MAX_MONEY"))?;
         let num_ballots = total / BALLOT_DIVISOR;
         let canonical_total = canonical_total(num_ballots)?;
-        let expected_van: [u8; 32] = construct_van(
+        let expected_van: [u8; 32] = construct_van_for_protocol(
+            params.vote_protocol,
             &g_d_x,
             &pk_d_x,
             canonical_total,
@@ -336,10 +388,10 @@ pub fn export_delegation_capability(
             &rand,
         )?
         .try_into()
-        .expect("construct_van returns 32 bytes");
+        .expect("construct_van_for_protocol returns 32 bytes");
         if expected_van != stored_van || !vans.insert(expected_van) {
             return Err(invalid(
-                "voting target does not match the persisted delegation commitment",
+                "voting target or vote protocol does not match the persisted delegation commitment",
             ));
         }
         let tx_hash = hex::encode(Sha256::digest(raw_tx));
@@ -374,7 +426,9 @@ pub fn export_delegation_capability(
 /// including after confirmation advances VAN positions. Any partial,
 /// locally-constructed, or conflicting bundle state is rejected. `capability_json`
 /// must use the exact canonical encoding, and the returned lowercase digest
-/// acknowledges those delivered bytes to the funds controller.
+/// acknowledges those delivered bytes to the funds controller. VAN commitments
+/// are derived using the vote protocol in `expected_round_params`; an existing
+/// round with another protocol is rejected.
 pub fn import_delegation_capability(
     db: &VotingDb,
     capability_json: &[u8],
@@ -396,6 +450,7 @@ pub fn import_delegation_capability(
             "delegation capability does not match the trusted voter context",
         ));
     }
+    let round_bound_bundles = validated.bind_to_round(context.expected_round_params)?;
 
     let digest = DelegationCapabilityDigest::from_package_bytes(capability_json);
     let wallet_id = db.wallet_id();
@@ -408,6 +463,11 @@ pub fn import_delegation_capability(
     if queries::has_round(&tx, &capability.vote_round_id, &wallet_id)? {
         let (stored, network) =
             queries::load_round_params_with_network(&tx, &capability.vote_round_id, &wallet_id)?;
+        if stored.vote_protocol != context.expected_round_params.vote_protocol {
+            return Err(invalid(
+                "stored round vote protocol conflicts with the trusted voter context",
+            ));
+        }
         if stored != *context.expected_round_params || network != context.expected_network {
             return Err(invalid(
                 "stored round context conflicts with the capability",
@@ -425,11 +485,11 @@ pub fn import_delegation_capability(
 
     let stored_count = queries::get_bundle_count(&tx, &capability.vote_round_id, &wallet_id)?;
     if stored_count == 0 {
-        for bundle in &validated.bundles {
+        for bundle in &round_bound_bundles {
             insert_bundle(&tx, &capability.vote_round_id, &wallet_id, bundle)?;
         }
-    } else if stored_count == validated.bundles.len() as u32 {
-        for bundle in &validated.bundles {
+    } else if stored_count == round_bound_bundles.len() as u32 {
+        for bundle in &round_bound_bundles {
             if !bundle_matches(&tx, &capability.vote_round_id, &wallet_id, bundle)? {
                 return Err(invalid("stored bundle state conflicts with the capability"));
             }
@@ -534,7 +594,7 @@ fn insert_bundle(
     conn: &rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
-    bundle: &ValidatedBundle,
+    bundle: &RoundBoundCapabilityBundle,
 ) -> Result<(), VotingError> {
     conn.execute(
         "INSERT INTO bundles (
@@ -560,7 +620,7 @@ fn bundle_matches(
     conn: &rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
-    bundle: &ValidatedBundle,
+    bundle: &RoundBoundCapabilityBundle,
 ) -> Result<bool, VotingError> {
     conn.query_row(
         "SELECT COALESCE(b.note_positions_blob IS NULL
@@ -675,12 +735,17 @@ mod tests {
     const CHAIN_ID: &str = "vote-chain-1";
 
     fn round_params() -> VotingRoundParams {
+        round_params_for_protocol(crate::VoteProtocol::V1)
+    }
+
+    fn round_params_for_protocol(vote_protocol: crate::VoteProtocol) -> VotingRoundParams {
         VotingRoundParams {
             vote_round_id: hex::encode(pallas::Base::from(7).to_repr()),
             snapshot_height: 100,
             ea_pk: pallas::Point::generator().to_bytes().to_vec(),
             nc_root: vec![0xAA; 32],
             nullifier_imt_root: vec![0xBB; 32],
+            vote_protocol,
         }
     }
 
@@ -731,7 +796,15 @@ mod tests {
                 derive_hotkey_x_coords_from_raw_address(target.target().raw_orchard_address())
                     .unwrap();
             let total = (index as u64 + 2) * BALLOT_DIVISOR + 7;
-            let van = construct_van(&g_d_x, &pk_d_x, total, target.vote_round_id(), &rand).unwrap();
+            let van = construct_van_for_protocol(
+                params.vote_protocol,
+                &g_d_x,
+                &pk_d_x,
+                total,
+                target.vote_round_id(),
+                &rand,
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE bundles SET van_comm_rand=?1, gov_comm=?2,
                  total_note_value=?3, address_index=0
@@ -757,7 +830,18 @@ mod tests {
         VotingHotkey,
         DelegationCapabilityV1,
     ) {
-        let params = round_params();
+        exported_fixture_for_protocol(crate::VoteProtocol::V1)
+    }
+
+    fn exported_fixture_for_protocol(
+        vote_protocol: crate::VoteProtocol,
+    ) -> (
+        VotingDb,
+        VotingRoundParams,
+        VotingHotkey,
+        DelegationCapabilityV1,
+    ) {
+        let params = round_params_for_protocol(vote_protocol);
         let hotkey = hotkey(0x21);
         let target = bound_target(&hotkey, &params);
         let db = test_db(":memory:");
@@ -845,7 +929,8 @@ mod tests {
         let (g_d_x, pk_d_x) =
             derive_hotkey_x_coords_from_raw_address(target_b.target().raw_orchard_address())
                 .unwrap();
-        let mixed_van = construct_van(
+        let mixed_van = construct_van_for_protocol(
+            params.vote_protocol,
             &g_d_x,
             &pk_d_x,
             3 * BALLOT_DIVISOR,
@@ -923,6 +1008,50 @@ mod tests {
     }
 
     #[test]
+    fn capability_wire_stays_stable_while_import_binds_vans_to_the_round_protocol() {
+        let (_, v0_params, hotkey, v0_capability) =
+            exported_fixture_for_protocol(crate::VoteProtocol::V0);
+        let (_, v1_params, _, v1_capability) =
+            exported_fixture_for_protocol(crate::VoteProtocol::V1);
+
+        let v0_json = v0_capability.to_json().unwrap();
+        let v1_json = v1_capability.to_json().unwrap();
+        assert_eq!(v0_json, v1_json, "the version 1 wire format is unchanged");
+
+        let mut protocol_vans = Vec::new();
+        for (params, capability) in [(&v0_params, &v0_capability), (&v1_params, &v1_capability)] {
+            let customer = test_db(":memory:");
+            import_capability(&customer, capability, import_context(&hotkey, params)).unwrap();
+            let van: Vec<u8> = customer
+                .conn()
+                .query_row(
+                    "SELECT gov_comm FROM bundles
+                     WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                    params![params.vote_round_id, WALLET],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            protocol_vans.push(van);
+        }
+        assert_ne!(protocol_vans[0], protocol_vans[1]);
+
+        let customer = test_db(":memory:");
+        customer
+            .init_round(Network::Regtest, &v0_params, None)
+            .unwrap();
+        assert!(import_capability(
+            &customer,
+            &v1_capability,
+            import_context(&hotkey, &v1_params),
+        )
+        .is_err());
+        assert_eq!(
+            customer.get_bundle_count(&v0_params.vote_round_id).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn import_is_atomic_idempotent_and_uses_the_existing_schema() {
         let (_, params, hotkey, capability) = exported_fixture();
         let capability_json = capability.to_json().unwrap();
@@ -944,7 +1073,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
         for index in 0..2 {
             let data =
                 queries::load_zkp2_inputs(&conn, &params.vote_round_id, WALLET, index).unwrap();
@@ -1009,12 +1138,13 @@ mod tests {
         )
         .unwrap();
         let validated = capability.validate().unwrap();
+        let round_bound_bundles = validated.bind_to_round(&params).unwrap();
 
         crate::recovery::clear(&customer, &params.vote_round_id).unwrap();
         crate::precompute::reset_voting_session_state(&customer, &params.vote_round_id).unwrap();
 
         let conn = customer.conn();
-        for bundle in &validated.bundles {
+        for bundle in &round_bound_bundles {
             assert!(
                 bundle_matches(&conn, &params.vote_round_id, WALLET, bundle).unwrap(),
                 "imported bundle {} changed during cleanup",
@@ -1292,6 +1422,7 @@ mod tests {
 
     fn confirmed_capability_fixture(
         path: &str,
+        vote_protocol: crate::VoteProtocol,
     ) -> (
         VotingDb,
         VotingRoundParams,
@@ -1301,7 +1432,7 @@ mod tests {
         use crate::confirmation::{confirm_delegation_submission, TxEvent, TxEventAttribute};
         use vote_commitment_tree::MemoryTreeServer;
 
-        let (_, params, hotkey, capability) = exported_fixture();
+        let (_, params, hotkey, capability) = exported_fixture_for_protocol(vote_protocol);
         let customer = test_db(path);
         import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
 
@@ -1330,8 +1461,9 @@ mod tests {
         }
 
         let validated = capability.validate().unwrap();
+        let round_bound_bundles = validated.bind_to_round(&params).unwrap();
         let mut server = MemoryTreeServer::empty();
-        for bundle in &validated.bundles {
+        for bundle in &round_bound_bundles {
             let leaf = Option::from(pallas::Base::from_repr(bundle.van)).unwrap();
             server.append(leaf).unwrap();
         }
@@ -1355,7 +1487,8 @@ mod tests {
             types::NoopProgressReporter,
             vote::{DraftVote, VoteSigner},
         };
-        let (customer, params, hotkey, witness) = confirmed_capability_fixture(":memory:");
+        let (customer, params, hotkey, witness) =
+            confirmed_capability_fixture(":memory:", crate::VoteProtocol::V0);
         let committed = crate::vote::commit(
             &customer,
             &params.vote_round_id,
@@ -1391,7 +1524,8 @@ mod tests {
 
         let path = temp_db_path("capability-batch-vote");
         let path_string = path.to_str().unwrap().to_string();
-        let (customer, params, hotkey, witness) = confirmed_capability_fixture(&path_string);
+        let (customer, params, hotkey, witness) =
+            confirmed_capability_fixture(&path_string, crate::VoteProtocol::V1);
         let drafts = [
             DraftVote {
                 proposal_id: 1,

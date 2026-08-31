@@ -2,11 +2,10 @@
 pub(crate) use crate::backend::{halo2_gadgets, orchard, pasta_curves};
 use pasta_curves::group::ff::PrimeField;
 use pasta_curves::pallas;
-use voting_circuits::delegation::{
-    derive_nullifier_domain, gov_null_hash, rho_binding_hash, van_commitment_hash,
-};
+use voting_circuits::delegation::{derive_nullifier_domain, gov_null_hash, rho_binding_hash};
 
 use crate::types::VotingError;
+use crate::VoteProtocol;
 
 /// Ballot divisor in zatoshi.
 ///
@@ -69,7 +68,7 @@ pub fn derive_gov_nullifier(
     Ok(fp_to_bytes(gov_null))
 }
 
-/// Construct a Vote Authority Note (governance commitment, per spec §1.3.3).
+/// Construct a legacy-v0 Vote Authority Note (governance commitment, per spec §1.3.3).
 ///
 /// ```text
 /// num_ballots = total_weight / BALLOT_DIVISOR
@@ -81,8 +80,28 @@ pub fn derive_gov_nullifier(
 /// `van_commitment_hash` also binds the circuit's full proposal-authority mask,
 /// so this crate and `voting-circuits` must be upgraded together.
 ///
-/// Matches `orchard/src/delegation/circuit.rs:van_commitment_hash`.
+/// Matches `orchard/src/delegation/circuit.rs:van_commitment_hash`. Round-aware
+/// callers should use [`construct_van_for_protocol`].
 pub fn construct_van(
+    g_d_new_x: &[u8],
+    pk_d_new_x: &[u8],
+    total_weight: u64,
+    vote_round_id: &[u8],
+    van_comm_rand: &[u8],
+) -> Result<Vec<u8>, VotingError> {
+    construct_van_for_protocol(
+        VoteProtocol::V0,
+        g_d_new_x,
+        pk_d_new_x,
+        total_weight,
+        vote_round_id,
+        van_comm_rand,
+    )
+}
+
+/// Construct a Vote Authority Note with the proof system selected for its round.
+pub fn construct_van_for_protocol(
+    protocol: VoteProtocol,
     g_d_new_x: &[u8],
     pk_d_new_x: &[u8],
     total_weight: u64,
@@ -104,7 +123,18 @@ pub fn construct_van(
     let vri = bytes_to_fp(vote_round_id)?;
     let rcm = bytes_to_fp(van_comm_rand)?;
 
-    let van_comm = van_commitment_hash(g_d, pk_d, num_ballots_base, vri, rcm);
+    let van_comm = match protocol {
+        VoteProtocol::V0 => voting_circuits_v0::delegation::van_commitment_hash(
+            g_d,
+            pk_d,
+            num_ballots_base,
+            vri,
+            rcm,
+        ),
+        VoteProtocol::V1 => {
+            voting_circuits::delegation::van_commitment_hash(g_d, pk_d, num_ballots_base, vri, rcm)
+        }
+    };
 
     Ok(fp_to_bytes(van_comm))
 }
@@ -223,6 +253,21 @@ mod tests {
     }
 
     #[test]
+    fn vote_protocol_selects_distinct_van_commitments() {
+        let g_d = [0x10u8; 32];
+        let pk_d = [0x20u8; 32];
+        let vri = [0x05u8; 32];
+        let rcm = [0x06u8; 32];
+
+        let v0 = construct_van_for_protocol(VoteProtocol::V0, &g_d, &pk_d, 15_000_000, &vri, &rcm)
+            .unwrap();
+        let v1 = construct_van_for_protocol(VoteProtocol::V1, &g_d, &pk_d, 15_000_000, &vri, &rcm)
+            .unwrap();
+
+        assert_ne!(v0, v1);
+    }
+
+    #[test]
     fn test_construct_van_not_trivial() {
         let g_d = [0x10u8; 32];
         let pk_d = [0x20u8; 32];
@@ -295,15 +340,24 @@ mod tests {
         let vri = [0x05u8; 32];
         let rcm = [0x06u8; 32];
 
-        // total_weight = 15_000_000 → num_ballots = 1 (after / BALLOT_DIVISOR),
-        // bound to the circuit's full 51-bit proposal-authority mask.
-        let result = construct_van(&g_d, &pk_d, 15_000_000, &vri, &rcm).unwrap();
-        let expected =
+        // total_weight = 15_000_000 → num_ballots = 1 (after / BALLOT_DIVISOR).
+        let v0 = construct_van(&g_d, &pk_d, 15_000_000, &vri, &rcm).unwrap();
+        let expected_v0 =
+            hex::decode("60658dfc1b7ae3bd06b713ffc6e3c05c369547b10c4a392bd2d45f06fdd2b82d")
+                .unwrap();
+        assert_eq!(
+            v0, expected_v0,
+            "v0 VAN known-answer mismatch — formula may have diverged from voting-circuits 0.11"
+        );
+
+        let v1 = construct_van_for_protocol(VoteProtocol::V1, &g_d, &pk_d, 15_000_000, &vri, &rcm)
+            .unwrap();
+        let expected_v1 =
             hex::decode("5f67a2719c1978820de73ca702555d90780f7d1603709c8a429c622cce135f16")
                 .unwrap();
         assert_eq!(
-            result, expected,
-            "VAN known-answer mismatch — formula may have diverged from orchard reference"
+            v1, expected_v1,
+            "v1 VAN known-answer mismatch — formula may have diverged from voting-circuits 0.12"
         );
     }
 

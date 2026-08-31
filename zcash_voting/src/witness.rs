@@ -396,6 +396,7 @@ mod tests {
     ) -> VotingRoundParams {
         VotingRoundParams {
             vote_round_id: ROUND_ID.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height,
             ea_pk: vec![0; 32],
             nc_root: frontier.root().to_bytes().to_vec(),

@@ -195,6 +195,12 @@ pub struct VotingHotkeyTargetV1 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VotingRoundParams {
     pub vote_round_id: String,
+    /// Proof system fixed for this round.
+    ///
+    /// Missing values from legacy serialized params mean the original `v0`
+    /// protocol. Once persisted, a round cannot be rebound to another version.
+    #[serde(default)]
+    pub vote_protocol: crate::VoteProtocol,
     pub snapshot_height: u64,
     pub ea_pk: Vec<u8>,
     pub nc_root: Vec<u8>,

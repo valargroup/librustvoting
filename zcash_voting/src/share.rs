@@ -697,15 +697,32 @@ fn delivery_nullifier_for_scope(
                 "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
             ),
         })?;
-    nullifier_from_recovery_json(&bundle, proposal_id, share_index)
+    let protocol =
+        crate::storage::queries::load_round_params(&db.conn(), round_id, scope.wallet_id())?
+            .vote_protocol;
+    nullifier_from_recovery_json_for_protocol(&bundle, protocol, proposal_id, share_index)
 }
 
+#[cfg(test)]
 pub(crate) fn nullifier_from_recovery_json(
     commitment_bundle_json: &str,
     proposal_id: u32,
     share_index: u32,
 ) -> Result<[u8; 32], VotingError> {
     let bundle = crate::vote::parse_recovery(commitment_bundle_json)?;
+    ensure_recovery_proposal(&bundle, proposal_id)?;
+    let payload = recover_payload(&bundle, share_index)?;
+    let primary_blind = array32("primary_blind", payload.primary_blind.clone())?;
+    compute_nullifier(&bundle.vote_commitment, share_index, &primary_blind)
+}
+
+pub(crate) fn nullifier_from_recovery_json_for_protocol(
+    commitment_bundle_json: &str,
+    protocol: crate::VoteProtocol,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<[u8; 32], VotingError> {
+    let bundle = crate::vote::parse_recovery_for_protocol(commitment_bundle_json, protocol)?;
     ensure_recovery_proposal(&bundle, proposal_id)?;
     let payload = recover_payload(&bundle, share_index)?;
     let primary_blind = array32("primary_blind", payload.primary_blind.clone())?;
@@ -930,6 +947,20 @@ pub fn recover_wire_json(
     payload.to_wire_json(Some(vc_tree_position), submit_at)
 }
 
+pub(crate) fn recover_wire_json_for_protocol(
+    commitment_bundle_json: &str,
+    protocol: crate::VoteProtocol,
+    proposal_id: u32,
+    share_index: u32,
+    vc_tree_position: u64,
+    submit_at: u64,
+) -> Result<String, VotingError> {
+    let bundle = crate::vote::parse_recovery_for_protocol(commitment_bundle_json, protocol)?;
+    ensure_recovery_proposal(&bundle, proposal_id)?;
+    let payload = recover_payload(&bundle, share_index)?;
+    payload.to_wire_json(Some(vc_tree_position), submit_at)
+}
+
 fn array32(label: &str, value: Vec<u8>) -> Result<[u8; 32], VotingError> {
     value
         .try_into()
@@ -991,6 +1022,7 @@ mod tests {
     fn round_params() -> RoundParams {
         RoundParams {
             vote_round_id: ROUND_ID.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 1000,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],
@@ -1086,6 +1118,29 @@ mod tests {
         assert!(
             value.get("all_enc_shares").is_none(),
             "recovered helper wire JSON does not include all_enc_shares"
+        );
+    }
+
+    #[test]
+    fn round_bound_recovery_applies_the_protocol_proposal_limit() {
+        let mut bundle = recovery_bundle_fixture();
+        bundle.proposal_id = 16;
+        let json = crate::vote::serialize_recovery(&bundle).unwrap();
+
+        // Context-free wire parsing preserves the absolute 1..=50 range.
+        assert!(recover_wire_json(&json, 16, 1, 999, 123).is_ok());
+
+        let error = recover_wire_json_for_protocol(&json, crate::VoteProtocol::V0, 16, 1, 999, 123)
+            .unwrap_err();
+        assert!(error.to_string().contains("1..=15"), "{error}");
+        assert!(
+            nullifier_from_recovery_json_for_protocol(&json, crate::VoteProtocol::V0, 16, 1,)
+                .is_err()
+        );
+
+        assert!(
+            recover_wire_json_for_protocol(&json, crate::VoteProtocol::V1, 16, 1, 999, 123,)
+                .is_ok()
         );
     }
 

@@ -100,6 +100,9 @@ pub(super) async fn resubmit_to_next_helper(
 ) -> Result<ResubmitReport, VotingError> {
     let share = request.share;
     let generation = share::ShareGeneration::new(scope, &share.nullifier);
+    let vote_protocol =
+        crate::storage::queries::load_round_params(&db.conn(), params.round_id, scope.wallet_id())?
+            .vote_protocol;
     let bundle = match vote_recovery::helper_recovery_material_for_wallet(
         db,
         scope.wallet_id(),
@@ -122,8 +125,9 @@ pub(super) async fn resubmit_to_next_helper(
         }
     };
 
-    let recovered_share_wire_json = match share::recover_wire_json(
+    let recovered_share_wire_json = match share::recover_wire_json_for_protocol(
         &bundle.commitment_bundle_json,
+        vote_protocol,
         share.proposal_id,
         share.share_index,
         bundle.vc_tree_position,
@@ -138,8 +142,9 @@ pub(super) async fn resubmit_to_next_helper(
             });
         }
     };
-    let recovered_nullifier = match share::nullifier_from_recovery_json(
+    let recovered_nullifier = match share::nullifier_from_recovery_json_for_protocol(
         &bundle.commitment_bundle_json,
+        vote_protocol,
         share.proposal_id,
         share.share_index,
     ) {

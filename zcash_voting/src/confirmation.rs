@@ -768,6 +768,7 @@ mod tests {
     fn round_params() -> RoundParams {
         RoundParams {
             vote_round_id: ROUND_ID.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 100,
             ea_pk: vec![0xEA_u8; 32],
             nc_root: vec![0xAA_u8; 32],

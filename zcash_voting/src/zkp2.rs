@@ -6,16 +6,15 @@ use pasta_curves::group::{
 };
 use pasta_curves::pallas;
 
-use voting_circuits::vote_proof::{
-    build_vote_proof_from_delegation, derive_vote_authority_transition,
-};
+use voting_circuits::vote_proof::build_vote_proof_from_delegation;
 use voting_circuits::VOTE_COMM_TREE_DEPTH;
 
 use crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX;
 use crate::types::{
     ct_option_to_result, validate_vote_decision, EncryptedShare, Network, ProgressReporter,
-    VoteCommitmentBundle, VotingError, MAX_PROPOSAL_ID, MIN_PROPOSAL_ID,
+    VoteCommitmentBundle, VotingError, MIN_PROPOSAL_ID,
 };
+use crate::VoteProtocol;
 
 // Vote proof build runs circuit synthesis + MockProver + proof generation, which can
 // overflow the default simulator thread stack. Run it on a dedicated large-stack thread.
@@ -33,7 +32,33 @@ pub(crate) struct VoteAuthorityTransitionPlan {
 /// Derives one authority transition with the same native implementation used
 /// by the proof builder, without constructing a proof.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn plan_vote_authority_transition(
+    hotkey_seed: &[u8],
+    network: Network,
+    address_index: u32,
+    total_note_value: u64,
+    gov_comm_rand: &[u8],
+    voting_round_id: &[u8],
+    proposal_id: u32,
+    proposal_authority_old: u64,
+) -> Result<VoteAuthorityTransitionPlan, VotingError> {
+    plan_vote_authority_transition_for_protocol(
+        VoteProtocol::V1,
+        hotkey_seed,
+        network,
+        address_index,
+        total_note_value,
+        gov_comm_rand,
+        voting_round_id,
+        proposal_id,
+        proposal_authority_old,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_vote_authority_transition_for_protocol(
+    protocol: VoteProtocol,
     hotkey_seed: &[u8],
     network: Network,
     address_index: u32,
@@ -50,24 +75,54 @@ pub(crate) fn plan_vote_authority_transition(
     )?;
     let gov_comm_rand = parse_base("gov_comm_rand", gov_comm_rand)?;
     let voting_round_id = parse_base("voting_round_id", voting_round_id)?;
-    let transition = derive_vote_authority_transition(
-        &sk,
-        address_index,
-        total_note_value,
-        gov_comm_rand,
-        voting_round_id,
-        proposal_id as u64,
-        proposal_authority_old,
-    )
-    .map_err(|e| VotingError::InvalidInput {
-        message: format!("cannot plan vote authority transition: {e}"),
-    })?;
+    let transition = match protocol {
+        VoteProtocol::V0 => {
+            let transition = voting_circuits_v0::vote_proof::derive_vote_authority_transition(
+                &sk,
+                address_index,
+                total_note_value,
+                gov_comm_rand,
+                voting_round_id,
+                proposal_id as u64,
+                proposal_authority_old,
+            )
+            .map_err(|e| VotingError::InvalidInput {
+                message: format!("cannot plan v0 vote authority transition: {e}"),
+            })?;
+            (
+                transition.vote_authority_note_old.to_repr(),
+                transition.vote_authority_note_new.to_repr(),
+                transition.proposal_authority_old,
+                transition.proposal_authority_new,
+            )
+        }
+        VoteProtocol::V1 => {
+            let transition = voting_circuits::vote_proof::derive_vote_authority_transition(
+                &sk,
+                address_index,
+                total_note_value,
+                gov_comm_rand,
+                voting_round_id,
+                proposal_id as u64,
+                proposal_authority_old,
+            )
+            .map_err(|e| VotingError::InvalidInput {
+                message: format!("cannot plan v1 vote authority transition: {e}"),
+            })?;
+            (
+                transition.vote_authority_note_old.to_repr(),
+                transition.vote_authority_note_new.to_repr(),
+                transition.proposal_authority_old,
+                transition.proposal_authority_new,
+            )
+        }
+    };
 
     Ok(VoteAuthorityTransitionPlan {
-        vote_authority_note_old: transition.vote_authority_note_old.to_repr(),
-        vote_authority_note_new: transition.vote_authority_note_new.to_repr(),
-        proposal_authority_old: transition.proposal_authority_old,
-        proposal_authority_new: transition.proposal_authority_new,
+        vote_authority_note_old: transition.0,
+        vote_authority_note_new: transition.1,
+        proposal_authority_old: transition.2,
+        proposal_authority_new: transition.3,
     })
 }
 
@@ -79,6 +134,39 @@ fn parse_base(name: &str, bytes: &[u8]) -> Result<pallas::Base, VotingError> {
         pallas::Base::from_repr(bytes),
         &format!("{name} is not a canonical Pallas field element"),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalized_vote_commitment_bundle(
+    proposal_id: u32,
+    anchor_height: u32,
+    voting_round_id: &[u8],
+    alpha_v: pallas::Scalar,
+    proof: Vec<u8>,
+    van_nullifier: pallas::Base,
+    vote_authority_note_new: pallas::Base,
+    vote_commitment: pallas::Base,
+    enc_shares: Vec<EncryptedShare>,
+    shares_hash: pallas::Base,
+    share_blinds: Vec<Vec<u8>>,
+    share_comms: Vec<Vec<u8>>,
+    r_vpk_bytes: [u8; 32],
+) -> VoteCommitmentBundle {
+    VoteCommitmentBundle {
+        van_nullifier: van_nullifier.to_repr().to_vec(),
+        vote_authority_note_new: vote_authority_note_new.to_repr().to_vec(),
+        vote_commitment: vote_commitment.to_repr().to_vec(),
+        proposal_id,
+        proof,
+        enc_shares,
+        anchor_height,
+        vote_round_id: hex::encode(voting_round_id),
+        shares_hash: shares_hash.to_repr().to_vec(),
+        share_blinds,
+        share_comms,
+        r_vpk_bytes: r_vpk_bytes.to_vec(),
+        alpha_v: alpha_v.to_repr().to_vec(),
+    }
 }
 
 /// Build vote commitment + ZKP #2.
@@ -111,6 +199,7 @@ fn parse_base(name: &str, bytes: &[u8]) -> Result<pallas::Base, VotingError> {
 /// * `anchor_height` - Block height at which the tree was snapshotted.
 /// * `progress` - Callback for proof generation progress.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn build_vote_commitment(
     hotkey_seed: &[u8],
     network: Network,
@@ -129,12 +218,54 @@ pub(crate) fn build_vote_commitment(
     single_share: bool,
     progress: &dyn ProgressReporter,
 ) -> Result<VoteCommitmentBundle, VotingError> {
+    build_vote_commitment_for_protocol(
+        VoteProtocol::V1,
+        hotkey_seed,
+        network,
+        address_index,
+        total_note_value,
+        gov_comm_rand,
+        voting_round_id,
+        ea_pk,
+        proposal_id,
+        choice,
+        num_options,
+        van_auth_path,
+        van_position,
+        anchor_height,
+        proposal_authority,
+        single_share,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_vote_commitment_for_protocol(
+    protocol: VoteProtocol,
+    hotkey_seed: &[u8],
+    network: Network,
+    address_index: u32,
+    total_note_value: u64,
+    gov_comm_rand: &[u8],
+    voting_round_id: &[u8],
+    ea_pk: &[u8],
+    proposal_id: u32,
+    choice: u32,
+    num_options: u32,
+    van_auth_path: &[[u8; 32]],
+    van_position: u32,
+    anchor_height: u32,
+    proposal_authority: u64,
+    single_share: bool,
+    progress: &dyn ProgressReporter,
+) -> Result<VoteCommitmentBundle, VotingError> {
     validate_vote_decision(choice, num_options)?;
-    if !(MIN_PROPOSAL_ID..=MAX_PROPOSAL_ID).contains(&proposal_id) {
+    let max_proposal_id = protocol.max_proposal_id();
+    if !(MIN_PROPOSAL_ID..=max_proposal_id).contains(&proposal_id) {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "proposal_id must be {}..={} (1-indexed, matching on-chain IDs; 0 is the circuit sentinel), got {}",
-                MIN_PROPOSAL_ID, MAX_PROPOSAL_ID, proposal_id
+                MIN_PROPOSAL_ID, max_proposal_id, proposal_id
             ),
         });
     }
@@ -195,26 +326,55 @@ pub(crate) fn build_vote_commitment(
     // The caller will need alpha_v to sign the TX2 sighash with rsk_v = ask_v.randomize(&alpha_v).
     let alpha_v = pallas::Scalar::random(&mut voting_crypto_deps::rand::rngs::OsRng);
     let sk_for_proof = sk.clone();
+    enum VersionedVoteProofBundle {
+        V0(voting_circuits_v0::vote_proof::VoteProofBundle),
+        V1(voting_circuits::vote_proof::VoteProofBundle),
+    }
+
     let vote_bundle = std::thread::Builder::new()
         .name("vote-proof-build".to_string())
         .stack_size(VOTE_PROOF_STACK_BYTES)
-        .spawn(move || {
-            build_vote_proof_from_delegation(
-                &sk_for_proof,
-                address_index,
-                total_note_value,
-                gcr,
-                vri,
-                auth_path,
-                van_position,
-                anchor_height,
-                proposal_id as u64,
-                choice as u64,
-                ea_pk_affine,
-                alpha_v,
-                proposal_authority,
-                single_share,
-            )
+        .spawn(move || -> Result<VersionedVoteProofBundle, String> {
+            match protocol {
+                VoteProtocol::V0 => {
+                    voting_circuits_v0::vote_proof::build_vote_proof_from_delegation(
+                        &sk_for_proof,
+                        address_index,
+                        total_note_value,
+                        gcr,
+                        vri,
+                        auth_path,
+                        van_position,
+                        anchor_height,
+                        proposal_id as u64,
+                        choice as u64,
+                        ea_pk_affine,
+                        alpha_v,
+                        proposal_authority,
+                        single_share,
+                    )
+                    .map(VersionedVoteProofBundle::V0)
+                    .map_err(|e| e.to_string())
+                }
+                VoteProtocol::V1 => build_vote_proof_from_delegation(
+                    &sk_for_proof,
+                    address_index,
+                    total_note_value,
+                    gcr,
+                    vri,
+                    auth_path,
+                    van_position,
+                    anchor_height,
+                    proposal_id as u64,
+                    choice as u64,
+                    ea_pk_affine,
+                    alpha_v,
+                    proposal_authority,
+                    single_share,
+                )
+                .map(VersionedVoteProofBundle::V1)
+                .map_err(|e| e.to_string()),
+            }
         })
         .map_err(|e| VotingError::Internal {
             message: format!("failed to spawn vote proof builder thread: {e}"),
@@ -226,52 +386,87 @@ pub(crate) fn build_vote_commitment(
         .map_err(|e| VotingError::ProofFailed {
             message: format!("vote proof generation failed: {}", e),
         })?;
+    #[cfg(test)]
+    match &vote_bundle {
+        VersionedVoteProofBundle::V0(bundle) => {
+            voting_circuits_v0::vote_proof::verify_vote_proof(&bundle.proof, &bundle.instance)
+        }
+        VersionedVoteProofBundle::V1(bundle) => {
+            voting_circuits::vote_proof::verify_vote_proof(&bundle.proof, &bundle.instance)
+        }
+    }
+    .map_err(|message| VotingError::ProofFailed {
+        message: format!("{protocol} vote proof verification failed: {message}"),
+    })?;
     progress.on_progress(1.0);
 
-    // Convert Instance public inputs to byte vectors
-    let van_nullifier = vote_bundle.instance.van_nullifier.to_repr().to_vec();
-    let van_new = vote_bundle
-        .instance
-        .vote_authority_note_new
-        .to_repr()
-        .to_vec();
-    let vote_commitment = vote_bundle.instance.vote_commitment.to_repr().to_vec();
-
-    // Convert encrypted shares from builder output to zcash_voting EncryptedShare format
-    let enc_shares: Vec<EncryptedShare> = vote_bundle
-        .encrypted_shares
-        .iter()
-        .map(|es| EncryptedShare {
-            c1: es.c1.to_vec(),
-            c2: es.c2.to_vec(),
-            share_index: es.share_index,
-            plaintext_value: es.plaintext_value,
-            randomness: es.randomness.to_vec(),
-        })
-        .collect();
-
-    Ok(VoteCommitmentBundle {
-        van_nullifier,
-        vote_authority_note_new: van_new,
-        vote_commitment,
-        proposal_id,
-        proof: vote_bundle.proof,
-        enc_shares,
-        anchor_height,
-        vote_round_id: hex::encode(voting_round_id),
-        shares_hash: vote_bundle.shares_hash.to_repr().to_vec(),
-        share_blinds: vote_bundle
-            .share_blinds
-            .iter()
-            .map(|b| b.to_repr().to_vec())
-            .collect(),
-        share_comms: vote_bundle
-            .share_comms
-            .iter()
-            .map(|c| c.to_repr().to_vec())
-            .collect(),
-        r_vpk_bytes: vote_bundle.r_vpk_bytes.to_vec(),
-        alpha_v: alpha_v.to_repr().to_vec(),
+    Ok(match vote_bundle {
+        VersionedVoteProofBundle::V0(bundle) => normalized_vote_commitment_bundle(
+            proposal_id,
+            anchor_height,
+            voting_round_id,
+            alpha_v,
+            bundle.proof,
+            bundle.instance.van_nullifier,
+            bundle.instance.vote_authority_note_new,
+            bundle.instance.vote_commitment,
+            bundle
+                .encrypted_shares
+                .iter()
+                .map(|share| EncryptedShare {
+                    c1: share.c1.to_vec(),
+                    c2: share.c2.to_vec(),
+                    share_index: share.share_index,
+                    plaintext_value: share.plaintext_value,
+                    randomness: share.randomness.to_vec(),
+                })
+                .collect(),
+            bundle.shares_hash,
+            bundle
+                .share_blinds
+                .iter()
+                .map(|blind| blind.to_repr().to_vec())
+                .collect(),
+            bundle
+                .share_comms
+                .iter()
+                .map(|commitment| commitment.to_repr().to_vec())
+                .collect(),
+            bundle.r_vpk_bytes,
+        ),
+        VersionedVoteProofBundle::V1(bundle) => normalized_vote_commitment_bundle(
+            proposal_id,
+            anchor_height,
+            voting_round_id,
+            alpha_v,
+            bundle.proof,
+            bundle.instance.van_nullifier,
+            bundle.instance.vote_authority_note_new,
+            bundle.instance.vote_commitment,
+            bundle
+                .encrypted_shares
+                .iter()
+                .map(|share| EncryptedShare {
+                    c1: share.c1.to_vec(),
+                    c2: share.c2.to_vec(),
+                    share_index: share.share_index,
+                    plaintext_value: share.plaintext_value,
+                    randomness: share.randomness.to_vec(),
+                })
+                .collect(),
+            bundle.shares_hash,
+            bundle
+                .share_blinds
+                .iter()
+                .map(|blind| blind.to_repr().to_vec())
+                .collect(),
+            bundle
+                .share_comms
+                .iter()
+                .map(|commitment| commitment.to_repr().to_vec())
+                .collect(),
+            bundle.r_vpk_bytes,
+        ),
     })
 }
 
@@ -409,13 +604,37 @@ mod tests {
             &[0u8; 32],
             &[0u8; 32],
             &[0u8; 32],
-            MAX_PROPOSAL_ID + 1,
+            crate::types::MAX_PROPOSAL_ID + 1,
             0,
             2,
             &[[0u8; 32]; 24],
             0,
             1,
             voting_circuits::MAX_PROPOSAL_AUTHORITY,
+            false,
+            &TestReporter,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn vote_protocol_applies_its_proposal_bound_before_proving() {
+        assert!(build_vote_commitment_for_protocol(
+            VoteProtocol::V0,
+            &[0x42; 64],
+            Network::Mainnet,
+            0,
+            1_000_000,
+            &[0u8; 32],
+            &[0u8; 32],
+            &[0u8; 32],
+            16,
+            0,
+            2,
+            &[[0u8; 32]; 24],
+            0,
+            1,
+            VoteProtocol::V0.initial_proposal_authority(),
             false,
             &TestReporter,
         )
@@ -441,6 +660,52 @@ mod tests {
             voting_circuits::MAX_PROPOSAL_AUTHORITY,
             false,
             &TestReporter,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn authority_transition_dispatches_to_selected_protocol() {
+        let seed = [0x42; 64];
+        let zero = [0u8; 32];
+
+        let v0 = plan_vote_authority_transition_for_protocol(
+            VoteProtocol::V0,
+            &seed,
+            Network::Mainnet,
+            0,
+            12_500_000,
+            &zero,
+            &zero,
+            15,
+            VoteProtocol::V0.initial_proposal_authority(),
+        )
+        .unwrap();
+        let v1 = plan_vote_authority_transition_for_protocol(
+            VoteProtocol::V1,
+            &seed,
+            Network::Mainnet,
+            0,
+            12_500_000,
+            &zero,
+            &zero,
+            50,
+            VoteProtocol::V1.initial_proposal_authority(),
+        )
+        .unwrap();
+
+        assert_eq!(v0.proposal_authority_new, 65_535 - (1 << 15));
+        assert_eq!(v1.proposal_authority_new, ((1u64 << 51) - 1) - (1 << 50));
+        assert!(plan_vote_authority_transition_for_protocol(
+            VoteProtocol::V0,
+            &seed,
+            Network::Mainnet,
+            0,
+            12_500_000,
+            &zero,
+            &zero,
+            16,
+            VoteProtocol::V0.initial_proposal_authority(),
         )
         .is_err());
     }

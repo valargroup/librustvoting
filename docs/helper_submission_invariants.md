@@ -1152,9 +1152,11 @@ set of helpers that possessed a share; liveness remains best-effort within the
 reachable fleet and recovery cutoff.
 
 Schema version 16 adds `ambiguous_urls` and `attempting_urls` with default `[]`
-and `target_count` with default `0`. Databases from launch schema version 13
-onward migrate in place; the migration MUST preserve existing round and
-delivery rows. A schema newer than the crate supports is rejected.
+and `target_count` with default `0`. Schema version 17 adds the immutable
+per-round `vote_protocol`, defaulting existing rows to legacy `v0`. Databases
+from launch schema version 13 onward migrate in place; the migration MUST
+preserve existing round and delivery rows. A schema newer than the crate
+supports is rejected.
 
 The internal record keeps `attempting_urls` distinct. The compatibility wire
 view has no separate attempting field, so it merges those helpers into

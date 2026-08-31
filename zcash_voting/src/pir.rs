@@ -120,6 +120,8 @@ mod tests {
     use crate::config::{
         resolve_dynamic_voting_config, resolve_static_voting_config, ResolveVotingConfigOptions,
     };
+    use crate::round_auth::RoundAuthPayloadV3;
+    use crate::VoteProtocol;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use ed25519_dalek::{Signer, SigningKey};
     use pir_types::{
@@ -493,13 +495,9 @@ mod tests {
 
         let ea_pk = [7u8; 32];
         let wallet_layout = compiled_wallet_layout();
-        let mut preimage = b"zcash-shielded-vote:round-auth:v2".to_vec();
-        preimage.extend_from_slice(&hex::decode(ROUND_ID).unwrap());
-        preimage.extend_from_slice(&ea_pk);
-        preimage.extend_from_slice(&wallet_layout.pir_depth.to_le_bytes());
-        preimage.extend_from_slice(&wallet_layout.tier0_layers.to_le_bytes());
-        preimage.extend_from_slice(&wallet_layout.tier1_layers.to_le_bytes());
-        preimage.extend_from_slice(&TEST_POLY_LEN.to_le_bytes());
+        let round_id: [u8; 32] = hex::decode(ROUND_ID).unwrap().try_into().unwrap();
+        let preimage =
+            RoundAuthPayloadV3::new(round_id, ea_pk, wallet_layout, VoteProtocol::V1).to_bytes();
         let sig = signing_key.sign(&preimage).to_bytes();
         let dynamic_bytes = json!({
             "config_version": 1,
@@ -519,7 +517,8 @@ mod tests {
             },
             "rounds": {
                 ROUND_ID: {
-                    "auth_version": 2,
+                    "auth_version": 3,
+                    "circuit_version": "v1",
                     "ea_pk": BASE64.encode(ea_pk),
                     "signatures": [{
                         "key_id": "k1",

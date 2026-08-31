@@ -13,6 +13,7 @@ default = ["zakura"]
 lrz = [
     "voting-crypto-deps/lrz",
     "voting-circuits/lrz",
+    "voting-circuits-v0/lrz",
     "pir-client/upstream",
     "pir-types/upstream",
     "imt-tree/upstream",
@@ -23,6 +24,7 @@ lrz = [
 zakura = [
     "voting-crypto-deps/default",
     "voting-circuits/default",
+    "voting-circuits-v0/default",
     "pir-client/zakura",
     "pir-types/zakura",
     "imt-tree/zakura",
@@ -73,6 +75,7 @@ zeroize = "1"
 
 subtle = "2.6"
 voting-circuits = { workspace = true }
+voting-circuits-v0 = { workspace = true }
 nonempty = "0.11"
 zip32 = "0.2"
 incrementalmerkletree = "0.8"

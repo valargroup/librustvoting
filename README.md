@@ -145,7 +145,8 @@ Pre-launch wallet databases with older schema versions are reset when opened by
 this branch; callers that need to preserve test data should export it before
 upgrading the crate.
 
-The workspace uses the published `voting-circuits 0.12.0-rc.1` release.
+The workspace carries both published circuit releases: `voting-circuits
+0.11.2` for legacy vote protocol `v0` and `0.12.0-rc.1` for `v1`.
 
 ## Dependency Strategy
 
@@ -157,9 +158,9 @@ The LRZ backend uses one Ironwood dependency stack:
   `zcash_client_sqlite 0.22.0-rc.7`, `zcash_keys 0.16.1`,
   `zcash_primitives 0.30.0`, and `zcash_protocol 0.10.4`** from published
   librustzcash releases.
-- **`voting-circuits 0.12.0-rc.1`** from
+- **`voting-circuits 0.11.2` and `0.12.0-rc.1`** from
   [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
-  for the delegation and vote proof circuits.
+  for the legacy `v0` and 50-proposal `v1` delegation and vote proof circuits.
 
 `vote-commitment-tree` and `vote-commitment-tree-client` default to Zakura and
 select their proving stack through mutually exclusive `zakura`/`lrz` features;

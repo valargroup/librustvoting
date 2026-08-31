@@ -1355,6 +1355,7 @@ mod tests {
         let params = crate::VotingRoundParams {
             vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
                 .to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 42,
             ea_pk: vec![1; 32],
             nc_root: vec![2; 32],
@@ -1390,6 +1391,7 @@ mod tests {
         );
         let round_params = crate::VotingRoundParams {
             vote_round_id: "01".repeat(32),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
             ea_pk: vec![1; 32],
             nc_root: vec![2; 32],
@@ -1490,6 +1492,7 @@ mod tests {
         voting_db.set_wallet_id("delegation-persisted-policy");
         let round_params = crate::VotingRoundParams {
             vote_round_id: "03".repeat(32),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
             ea_pk: vec![1; 32],
             nc_root: vec![2; 32],
@@ -1662,6 +1665,7 @@ mod tests {
             round_id: "round-1".to_string(),
             round_params: crate::VotingRoundParams {
                 vote_round_id: "round-1".to_string(),
+                vote_protocol: crate::VoteProtocol::V1,
                 snapshot_height: TESTNET_NU6_SNAPSHOT_HEIGHT,
                 ea_pk: vec![1; 32],
                 nc_root: vec![2; 32],
@@ -1749,6 +1753,7 @@ mod tests {
         let round_params = crate::VotingRoundParams {
             vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
                 .to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
             ea_pk: ea_pk.to_bytes().to_vec(),
             nc_root: vec![2; 32],

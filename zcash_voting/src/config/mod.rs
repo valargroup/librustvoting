@@ -68,8 +68,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    round_auth::{RoundAuthPayloadV2, ROUND_AUTH_VERSION_V2},
+    round_auth::{
+        RoundAuthPayloadV2, RoundAuthPayloadV3, ROUND_AUTH_VERSION_V2, ROUND_AUTH_VERSION_V3,
+    },
     types::validate_vote_round_id_hex,
+    VoteProtocol,
 };
 
 const STATIC_CONFIG_VERSION_V1: u32 = 1;
@@ -96,7 +99,7 @@ impl Default for WalletCapabilities {
     fn default() -> Self {
         Self {
             vote_server: vec![VOTE_SERVER_VERSION_V1.to_string()],
-            vote_protocol: vec![VOTE_PROTOCOL_VERSION_V1.to_string()],
+            vote_protocol: vec![VERSION_V0.to_string(), VOTE_PROTOCOL_VERSION_V1.to_string()],
             tally: vec![VERSION_V0.to_string()],
             pir: vec![VERSION_V0.to_string()],
         }
@@ -182,6 +185,7 @@ where
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupportedVersions {
     pub pir: Vec<String>,
+    /// Voting wire-protocol version, independent of the per-round circuit.
     pub vote_protocol: String,
     pub tally: String,
     pub vote_server: String,
@@ -232,6 +236,9 @@ pub struct AuthenticatedRound {
     pub round_id: String,
     #[serde(with = "base64_bytes")]
     pub ea_pk: Vec<u8>,
+    /// Circuit protocol authenticated by this round's signature.
+    #[serde(default)]
+    pub vote_protocol: VoteProtocol,
 }
 
 impl ResolvedVotingConfig {
@@ -271,9 +278,9 @@ impl ResolvedVotingConfig {
                 ),
             });
         }
-
         Ok(crate::wire::VotingRoundParams {
             vote_round_id: round_id,
+            vote_protocol: trusted_round.vote_protocol,
             snapshot_height,
             ea_pk: trusted_round.ea_pk.clone(),
             nc_root,
@@ -328,17 +335,17 @@ pub struct ResolvedVotingConfigSummary {
 
 impl From<&ResolvedVotingConfig> for ResolvedVotingConfigSummary {
     fn from(config: &ResolvedVotingConfig) -> Self {
-        let authenticated_round_ids = config
+        let authenticated_round_circuits = config
             .authenticated_rounds
             .iter()
-            .map(|round| round.round_id.clone())
+            .map(|round| (&round.round_id, round.vote_protocol))
             .collect::<Vec<_>>();
         Self {
             trusted_key_fingerprint: config.trusted_key_fingerprint.clone(),
             vote_server_fingerprint: fingerprint_json(&config.vote_servers),
             pir_endpoint_fingerprint: fingerprint_json(&config.pir_endpoints),
             pir_layout: config.pir_layout,
-            authenticated_round_set_fingerprint: fingerprint_json(&authenticated_round_ids),
+            authenticated_round_set_fingerprint: fingerprint_json(&authenticated_round_circuits),
             protocol_versions: config.supported_versions.clone(),
         }
     }
@@ -882,6 +889,10 @@ struct WireVotingServiceConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 struct RoundEntry {
     auth_version: u32,
+    /// Per-round circuit selector. Required and signed by auth v3; auth v2
+    /// remains implicitly bound to the legacy v0 circuit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    circuit_version: Option<VoteProtocol>,
     #[serde(with = "base64_bytes")]
     ea_pk: Vec<u8>,
     signatures: Vec<RoundSignature>,
@@ -1071,13 +1082,15 @@ fn authenticate_dynamic_rounds(
     let mut authenticated_rounds = Vec::new();
     let mut skipped_round_ids = Vec::new();
     for (round_id, entry) in rounds {
-        if !verify_round_entry(round_id, entry, trusted_keys, pir_layout) {
+        let Some(vote_protocol) = verify_round_entry(round_id, entry, trusted_keys, pir_layout)
+        else {
             skipped_round_ids.push(round_id.clone());
             continue;
-        }
+        };
         authenticated_rounds.push(AuthenticatedRound {
             round_id: round_id.clone(),
             ea_pk: entry.ea_pk.clone(),
+            vote_protocol,
         });
     }
     AuthenticatedRounds {
@@ -1091,25 +1104,41 @@ fn verify_round_entry(
     entry: &RoundEntry,
     trusted_keys: &[TrustedKey],
     pir_layout: PirLayout,
-) -> bool {
-    if entry.auth_version != ROUND_AUTH_VERSION_V2
-        || entry.ea_pk.len() != 32
-        || entry.signatures.is_empty()
-    {
-        return false;
+) -> Option<VoteProtocol> {
+    if entry.ea_pk.len() != 32 || entry.signatures.is_empty() {
+        return None;
     }
     // Round keys are hex-validated during dynamic-config validation, but decode
     // defensively: an undecodable round id can never authenticate.
     let Ok(round_id_bytes) = hex::decode(round_id) else {
-        return false;
+        return None;
     };
     let Ok(round_id_bytes) = <[u8; 32]>::try_from(round_id_bytes.as_slice()) else {
-        return false;
+        return None;
     };
     let Ok(ea_pk) = <[u8; 32]>::try_from(entry.ea_pk.as_slice()) else {
-        return false;
+        return None;
     };
-    let payload = RoundAuthPayloadV2::new(round_id_bytes, ea_pk, pir_layout).to_bytes();
+    let (vote_protocol, payload) = match entry.auth_version {
+        ROUND_AUTH_VERSION_V2 => {
+            if entry.circuit_version.is_some() {
+                return None;
+            }
+            (
+                VoteProtocol::V0,
+                RoundAuthPayloadV2::new(round_id_bytes, ea_pk, pir_layout).to_bytes(),
+            )
+        }
+        ROUND_AUTH_VERSION_V3 => {
+            let circuit_version = entry.circuit_version?;
+            (
+                circuit_version,
+                RoundAuthPayloadV3::new(round_id_bytes, ea_pk, pir_layout, circuit_version)
+                    .to_bytes(),
+            )
+        }
+        _ => return None,
+    };
 
     for signature in &entry.signatures {
         let Some(key) = trusted_keys
@@ -1133,10 +1162,10 @@ fn verify_round_entry(
         };
         let sig = Signature::from_bytes(&sig_bytes);
         if verifying_key.verify(&payload, &sig).is_ok() {
-            return true;
+            return Some(vote_protocol);
         }
     }
-    false
+    None
 }
 
 fn require_supported(
@@ -1257,6 +1286,17 @@ mod tests {
         RoundAuthPayloadV2::new(round_id, ea_pk, layout).to_bytes()
     }
 
+    fn round_auth_v3_preimage(
+        round_id: &str,
+        ea_pk: &[u8],
+        layout: PirLayout,
+        circuit_version: VoteProtocol,
+    ) -> Vec<u8> {
+        let round_id = hex::decode(round_id).unwrap().try_into().unwrap();
+        let ea_pk = ea_pk.try_into().unwrap();
+        RoundAuthPayloadV3::new(round_id, ea_pk, layout, circuit_version).to_bytes()
+    }
+
     fn test_pir_layout() -> PirLayout {
         PirLayout {
             pir_depth: 19,
@@ -1293,12 +1333,18 @@ mod tests {
         for (round_id, signing_key) in round_signers {
             let ea_pk = [7u8; 32];
             let sig = signing_key
-                .sign(&round_auth_v2_preimage(round_id, &ea_pk, layout))
+                .sign(&round_auth_v3_preimage(
+                    round_id,
+                    &ea_pk,
+                    layout,
+                    VoteProtocol::V1,
+                ))
                 .to_bytes();
             rounds.insert(
                 (*round_id).to_string(),
                 serde_json::json!({
-                    "auth_version": 2,
+                    "auth_version": 3,
+                    "circuit_version": "v1",
                     "ea_pk": BASE64.encode(ea_pk),
                     "signatures": [{
                         "key_id": "k1",
@@ -1400,6 +1446,7 @@ mod tests {
             vec![AuthenticatedRound {
                 round_id: ROUND_ID.to_string(),
                 ea_pk: vec![7u8; 32],
+                vote_protocol: VoteProtocol::V1,
             }]
         );
         assert!(resolved.skipped_round_ids.is_empty());
@@ -1656,7 +1703,6 @@ mod tests {
                 "sig": "IJHHSQaV6x0PVgLL+NBZiOGjDtVdt+A298LVLwqiarhWbEIFUJUGH6qfozLwypuo+3+YFn6HfRG/LM4WXM1MBg=="
             }]
         });
-
         let resolved =
             resolve_test_dynamic(&trusted_key, &serde_json::to_vec(&dynamic).unwrap()).unwrap();
 
@@ -1665,6 +1711,7 @@ mod tests {
             vec![AuthenticatedRound {
                 round_id: ROUND_ID.to_string(),
                 ea_pk: vec![7u8; 32],
+                vote_protocol: VoteProtocol::V0,
             }]
         );
         assert!(resolved.skipped_round_ids.is_empty());
@@ -1709,7 +1756,6 @@ mod tests {
                 }]
             }
         });
-
         let resolved = resolve_dynamic_voting_config(
             resolved_static,
             &serde_json::to_vec(&dynamic).unwrap(),
@@ -1722,6 +1768,7 @@ mod tests {
             vec![AuthenticatedRound {
                 round_id: UI_ROUND_ID.to_string(),
                 ea_pk: BASE64.decode(UI_EA_PK).unwrap(),
+                vote_protocol: VoteProtocol::V0,
             }]
         );
         assert!(resolved.skipped_round_ids.is_empty());
@@ -1771,6 +1818,7 @@ mod tests {
             vec![AuthenticatedRound {
                 round_id: ROUND_ID.to_string(),
                 ea_pk: vec![7u8; 32],
+                vote_protocol: VoteProtocol::V1,
             }]
         );
         assert_eq!(resolved.skipped_round_ids, vec![ROUND_ID_2.to_string()]);
@@ -1866,6 +1914,7 @@ mod tests {
             vec![AuthenticatedRound {
                 round_id: ROUND_ID.to_string(),
                 ea_pk: vec![7u8; 32],
+                vote_protocol: VoteProtocol::V1,
             }]
         );
         assert_eq!(resolved.skipped_round_ids, vec![ROUND_ID_2.to_string()]);
@@ -1893,13 +1942,14 @@ mod tests {
             },
             supported_versions: SupportedVersions {
                 pir: vec!["v0".to_string()],
-                vote_protocol: "v0".to_string(),
+                vote_protocol: "v1".to_string(),
                 tally: "v0".to_string(),
                 vote_server: "v1".to_string(),
             },
             authenticated_rounds: vec![AuthenticatedRound {
                 round_id: ROUND_ID.to_string(),
                 ea_pk: vec![7u8; 32],
+                vote_protocol: VoteProtocol::V0,
             }],
             skipped_round_ids: vec![ROUND_ID_2.to_string()],
             conditions: vec![],
@@ -1913,6 +1963,23 @@ mod tests {
             summary_base.authenticated_round_set_fingerprint,
             summary_with_different_skips.authenticated_round_set_fingerprint
         );
+    }
+
+    #[test]
+    fn config_switch_for_same_round_with_changed_circuit_is_new_chain_or_round() {
+        let current = resolved_config_with_authenticated_round(vec![7u8; 32]);
+        let mut next = current.clone();
+        next.authenticated_rounds[0].vote_protocol = VoteProtocol::V1;
+
+        let current = ResolvedVotingConfigSummary::from(&current);
+        let next = ResolvedVotingConfigSummary::from(&next);
+        assert_ne!(
+            current.authenticated_round_set_fingerprint,
+            next.authenticated_round_set_fingerprint
+        );
+
+        let decision = decide_config_switch(Some(current), next);
+        assert_eq!(decision.kind, ConfigSwitchKind::NewChainOrRound);
     }
 
     fn resolved_config_with_authenticated_round(ea_pk: Vec<u8>) -> ResolvedVotingConfig {
@@ -1937,6 +2004,7 @@ mod tests {
             authenticated_rounds: vec![AuthenticatedRound {
                 round_id: ROUND_ID.to_string(),
                 ea_pk,
+                vote_protocol: VoteProtocol::V0,
             }],
             skipped_round_ids: vec![],
             conditions: vec![],
@@ -1952,10 +2020,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(params.vote_round_id, ROUND_ID);
+        assert_eq!(params.vote_protocol, VoteProtocol::V0);
         assert_eq!(params.snapshot_height, 123);
         assert_eq!(params.ea_pk, vec![7u8; 32]);
         assert_eq!(params.nc_root, vec![2u8; 32]);
         assert_eq!(params.nullifier_imt_root, vec![3u8; 32]);
+    }
+
+    #[test]
+    fn trusted_voting_round_params_uses_authenticated_v1_protocol() {
+        let mut config = resolved_config_with_authenticated_round(vec![7u8; 32]);
+        config.authenticated_rounds[0].vote_protocol = VoteProtocol::V1;
+
+        let params = config
+            .trusted_voting_round_params(ROUND_ID.to_string(), 123, vec![2u8; 32], vec![3u8; 32])
+            .unwrap();
+
+        assert_eq!(params.vote_protocol, VoteProtocol::V1);
     }
 
     #[test]
@@ -2033,32 +2114,148 @@ mod tests {
             vec![AuthenticatedRound {
                 round_id: ROUND_ID.to_string(),
                 ea_pk: vec![7u8; 32],
+                vote_protocol: VoteProtocol::V1,
             }]
         );
     }
 
     #[test]
-    fn resolve_dynamic_voting_config_rejects_legacy_vote_protocol() {
+    fn changing_circuit_version_invalidates_v3_round_signature() {
         let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
         let mut dynamic: serde_json::Value =
             serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
-        dynamic["supported_versions"]["vote_protocol"] = serde_json::json!("v0");
+        dynamic["rounds"][ROUND_ID]["circuit_version"] = serde_json::json!("v0");
         let resolved_static =
             resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
 
-        let error = resolve_dynamic_voting_config(
+        let resolved = resolve_dynamic_voting_config(
             resolved_static,
             &dynamic.to_string().into_bytes(),
             ResolveVotingConfigOptions::default(),
         )
-        .unwrap_err();
+        .unwrap();
+
+        assert_eq!(resolved.supported_versions.vote_protocol, "v1");
+        assert!(resolved.authenticated_rounds.is_empty());
+        assert_eq!(resolved.skipped_round_ids, vec![ROUND_ID.to_string()]);
+    }
+
+    #[test]
+    fn v2_round_signature_is_legacy_v0_only() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let ea_pk = [7u8; 32];
+        let signature = trusted_key
+            .sign(&round_auth_v2_preimage(ROUND_ID, &ea_pk, test_pir_layout()))
+            .to_bytes();
+        let mut dynamic: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
+        dynamic["rounds"][ROUND_ID] = serde_json::json!({
+            "auth_version": 2,
+            "ea_pk": BASE64.encode(ea_pk),
+            "signatures": [{
+                "key_id": "k1",
+                "alg": "ed25519",
+                "sig": BASE64.encode(signature)
+            }]
+        });
+
+        let resolved =
+            resolve_test_dynamic(&trusted_key, &serde_json::to_vec(&dynamic).unwrap()).unwrap();
+        assert_eq!(resolved.supported_versions.vote_protocol, "v1");
+        assert_eq!(
+            resolved.authenticated_rounds[0].vote_protocol,
+            VoteProtocol::V0
+        );
+    }
+
+    #[test]
+    fn dynamic_resolution_accepts_mixed_v2_v0_and_v3_v1_rounds() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let ea_pk = [7u8; 32];
+        let v2_signature = trusted_key
+            .sign(&round_auth_v2_preimage(
+                ROUND_ID_2,
+                &ea_pk,
+                test_pir_layout(),
+            ))
+            .to_bytes();
+        let mut dynamic: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
+        dynamic["rounds"][ROUND_ID_2] = serde_json::json!({
+            "auth_version": 2,
+            "ea_pk": BASE64.encode(ea_pk),
+            "signatures": [{
+                "key_id": "k1",
+                "alg": "ed25519",
+                "sig": BASE64.encode(v2_signature)
+            }]
+        });
+
+        let resolved =
+            resolve_test_dynamic(&trusted_key, &serde_json::to_vec(&dynamic).unwrap()).unwrap();
+
+        assert_eq!(resolved.supported_versions.vote_protocol, "v1");
+        assert_eq!(
+            resolved.authenticated_rounds,
+            vec![
+                AuthenticatedRound {
+                    round_id: ROUND_ID.to_string(),
+                    ea_pk: ea_pk.to_vec(),
+                    vote_protocol: VoteProtocol::V1,
+                },
+                AuthenticatedRound {
+                    round_id: ROUND_ID_2.to_string(),
+                    ea_pk: ea_pk.to_vec(),
+                    vote_protocol: VoteProtocol::V0,
+                },
+            ]
+        );
+        assert!(resolved.skipped_round_ids.is_empty());
+    }
+
+    #[test]
+    fn legacy_authenticated_round_json_defaults_to_v0() {
+        let round: AuthenticatedRound = serde_json::from_value(serde_json::json!({
+            "round_id": ROUND_ID,
+            "ea_pk": BASE64.encode([7u8; 32])
+        }))
+        .unwrap();
+
+        assert_eq!(round.vote_protocol, VoteProtocol::V0);
+    }
+
+    #[test]
+    fn default_capabilities_accept_legacy_wire_protocol_with_v2_round() {
+        let trusted_key = SigningKey::from_bytes(&[3u8; 32]);
+        let ea_pk = [7u8; 32];
+        let signature = trusted_key
+            .sign(&round_auth_v2_preimage(ROUND_ID, &ea_pk, test_pir_layout()))
+            .to_bytes();
+        let resolved_static =
+            resolve_static_voting_config(&source(), &static_bytes(&trusted_key)).unwrap();
+        let mut dynamic: serde_json::Value =
+            serde_json::from_slice(&dynamic_bytes(&trusted_key)).unwrap();
+        dynamic["supported_versions"]["vote_protocol"] = serde_json::json!("v0");
+        dynamic["rounds"][ROUND_ID] = serde_json::json!({
+            "auth_version": 2,
+            "ea_pk": BASE64.encode(ea_pk),
+            "signatures": [{
+                "key_id": "k1",
+                "alg": "ed25519",
+                "sig": BASE64.encode(signature)
+            }]
+        });
+
+        let resolved = resolve_dynamic_voting_config(
+            resolved_static,
+            &serde_json::to_vec(&dynamic).unwrap(),
+            ResolveVotingConfigOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(
-            error,
-            VotingConfigError::UnsupportedVersion {
-                component: "vote_protocol".to_string(),
-                advertised: "v0".to_string(),
-            }
+            resolved.authenticated_rounds[0].vote_protocol,
+            VoteProtocol::V0
         );
     }
 

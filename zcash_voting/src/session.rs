@@ -13,7 +13,7 @@ use crate::phases::{DelegationPhase, SharePhase, VotePhase};
 use crate::share_policy::{round_immediate_share_key, ImmediateShareKey};
 use crate::storage::{queries, VotingDb};
 use crate::types::{
-    validate_proposal_id, validate_vote_decision, validate_vote_options, VotingError,
+    validate_proposal_id_for_protocol, validate_vote_decision, validate_vote_options, VotingError,
 };
 use crate::vote::{validate_draft_vote, DraftVote};
 
@@ -37,7 +37,7 @@ impl VotingDb {
         decision: Decision,
         num_options: u32,
     ) -> Result<(), VotingError> {
-        validate_proposal_id(proposal_id)?;
+        self.validate_round_proposal_id(round_id, proposal_id)?;
         validate_ballot_intent_decision(decision, num_options)?;
 
         self.write_ballot_intent(round_id, proposal_id, decision)
@@ -50,7 +50,18 @@ impl VotingDb {
         draft: &DraftVote,
     ) -> Result<(), VotingError> {
         validate_draft_vote(draft)?;
+        self.validate_round_proposal_id(round_id, draft.proposal_id)?;
         self.write_ballot_intent(round_id, draft.proposal_id, Decision::Choice(draft.choice))
+    }
+
+    fn validate_round_proposal_id(
+        &self,
+        round_id: &str,
+        proposal_id: u32,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let params = queries::load_round_params(&conn, round_id, &self.wallet_id())?;
+        validate_proposal_id_for_protocol(params.vote_protocol, proposal_id)
     }
 
     fn write_ballot_intent(
@@ -957,8 +968,12 @@ pub fn resume_plan(
     round_id: &str,
     proposal_ids: &[u32],
 ) -> Result<RoundPlan, VotingError> {
+    let params = {
+        let conn = db.conn();
+        queries::load_round_params(&conn, round_id, &db.wallet_id())?
+    };
     for &proposal_id in proposal_ids {
-        validate_proposal_id(proposal_id)?;
+        validate_proposal_id_for_protocol(params.vote_protocol, proposal_id)?;
     }
 
     let delegation: BTreeMap<u32, DelegationPhase> =
@@ -1360,6 +1375,7 @@ mod tests {
     fn round_params() -> RoundParams {
         RoundParams {
             vote_round_id: ROUND.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 1000,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],

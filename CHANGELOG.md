@@ -200,10 +200,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   replacement share generation.
 
 ### Changed
-- Expanded the supported proposal-ID and atomic vote-batch ranges from 1–15 to
-  1–50 while retaining 16 encrypted shares per vote commitment. This consumes
-  the breaking circuit and verification-key change from `voting-circuits
-  0.12.0-rc.1`.
+- Added dual vote-circuit protocol support. Authenticated round configuration
+  selects either legacy `v0` limits (1–15 proposals) or `v1` limits (1–50),
+  and that selection is persisted immutably per round with existing databases
+  migrating to `v0`. Existing round-auth v2 signatures remain `v0`; round-auth
+  v3 binds the round's `circuit_version` into each signature and is required
+  for `v1`. The top-level `supported_versions.vote_protocol` remains separate
+  voting wire-protocol negotiation. Both circuits retain 16 encrypted shares
+  per vote commitment; `v1` consumes the breaking circuit and verification-key
+  change from `voting-circuits 0.12.0-rc.1`.
 
 ## v3.1.0-rc.13
 

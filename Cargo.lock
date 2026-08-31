@@ -3269,7 +3269,7 @@ dependencies = [
  "libc",
  "rand 0.8.7",
  "shardtree",
- "voting-circuits",
+ "voting-circuits 0.12.0-rc.1",
  "voting-crypto-deps",
 ]
 
@@ -3290,6 +3290,19 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "vote-commitment-tree",
+ "voting-crypto-deps",
+]
+
+[[package]]
+name = "voting-circuits"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc41d4731d5ec65e6b78b38e7db7c8c3c823dd241447be8d4128ba2b91784a78"
+dependencies = [
+ "blake2b_simd",
+ "incrementalmerkletree",
+ "itertools",
+ "lazy_static",
  "voting-crypto-deps",
 ]
 
@@ -4312,7 +4325,8 @@ dependencies = [
  "valar-ypir",
  "vote-commitment-tree",
  "vote-commitment-tree-client",
- "voting-circuits",
+ "voting-circuits 0.11.2",
+ "voting-circuits 0.12.0-rc.1",
  "voting-crypto-deps",
  "zakura-wallet-lib",
  "zcash_note_encryption",

@@ -49,6 +49,7 @@ impl HelperTransport for ConfirmedHelperTransport {
 fn round_params(round_id: &str) -> RoundParams {
     RoundParams {
         vote_round_id: round_id.to_string(),
+        vote_protocol: zcash_voting::VoteProtocol::V1,
         snapshot_height: 1_000,
         ea_pk: vec![0xEA; 32],
         nc_root: vec![0xAA; 32],

@@ -438,6 +438,7 @@ mod pir_tests {
             crate::Network::Testnet,
             &crate::round::RoundParams {
                 vote_round_id: ROUND_ID.to_string(),
+                vote_protocol: crate::VoteProtocol::V1,
                 snapshot_height: 100,
                 ea_pk: vec![1; 32],
                 nc_root: vec![2; 32],
@@ -701,6 +702,7 @@ mod pir_tests {
     fn snapshot_round_params(nullifier_imt_root: Vec<u8>) -> crate::round::RoundParams {
         crate::round::RoundParams {
             vote_round_id: ROUND_ID.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 100,
             ea_pk: vec![1; 32],
             nc_root: vec![2; 32],
@@ -1100,6 +1102,7 @@ mod tree_sync_tests {
     fn round_params() -> crate::round::RoundParams {
         crate::round::RoundParams {
             vote_round_id: ROUND_ID.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 100,
             ea_pk: vec![1; 32],
             nc_root: vec![2; 32],
@@ -1137,6 +1140,7 @@ mod session_reset_tests {
     fn round_params(round_id: &str) -> crate::round::RoundParams {
         crate::round::RoundParams {
             vote_round_id: round_id.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 100,
             ea_pk: vec![1; 32],
             nc_root: vec![2; 32],

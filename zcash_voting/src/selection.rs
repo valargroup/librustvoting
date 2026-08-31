@@ -880,6 +880,7 @@ mod tests {
         let hotkey = VotingHotkey::from_stored_secret(&[0x77; 64], network).unwrap();
         let round_params = crate::VotingRoundParams {
             vote_round_id: "01".repeat(32),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],

@@ -18,10 +18,7 @@ use orchard::{
 };
 use pasta_curves::group::ff::PrimeField;
 use pasta_curves::{pallas, vesta};
-use voting_circuits::delegation::{
-    build_delegation_bundle, delegation_cached_keys, ImtError, ImtProofData, ImtProvider,
-    PrecomputedRandomness, RealNoteInput,
-};
+use voting_circuits::delegation::{ImtProofData, PrecomputedRandomness};
 use zcash_keys::keys::UnifiedFullViewingKey;
 
 use crate::governance::BUNDLE_NOTE_SLOTS;
@@ -29,6 +26,7 @@ use crate::types::{
     ct_option_to_result, validate_32_bytes, DelegationProgressReporter, DelegationProofResult,
     Network, NoteInfo, VotingError, WitnessData,
 };
+use crate::VoteProtocol;
 
 // ================================================================
 // PIR-backed IMT Provider
@@ -92,26 +90,93 @@ pub fn validate_and_convert_pir_proof(
     Ok(convert_pir_proof(proof))
 }
 
+#[derive(Clone, Debug)]
+struct PreparedImtProof {
+    root: pallas::Base,
+    nf_bounds: [pallas::Base; 3],
+    leaf_pos: u32,
+    path: [pallas::Base; voting_circuits::delegation::IMT_DEPTH],
+}
+
+impl From<&ImtProofData> for PreparedImtProof {
+    fn from(proof: &ImtProofData) -> Self {
+        Self {
+            root: proof.root,
+            nf_bounds: proof.nf_bounds,
+            leaf_pos: proof.leaf_pos,
+            path: proof.path,
+        }
+    }
+}
+
+impl PreparedImtProof {
+    fn into_v0(self) -> voting_circuits_v0::delegation::ImtProofData {
+        voting_circuits_v0::delegation::ImtProofData {
+            root: self.root,
+            nf_bounds: self.nf_bounds,
+            leaf_pos: self.leaf_pos,
+            path: self.path,
+        }
+    }
+
+    fn into_v1(self) -> ImtProofData {
+        ImtProofData {
+            root: self.root,
+            nf_bounds: self.nf_bounds,
+            leaf_pos: self.leaf_pos,
+            path: self.path,
+        }
+    }
+}
+
 /// IMT provider that wraps pre-fetched proofs for real and padded notes.
 struct PirImtProvider {
     root: pallas::Base,
-    cached: HashMap<[u8; 32], ImtProofData>,
+    cached: HashMap<[u8; 32], PreparedImtProof>,
 }
 
-impl ImtProvider for PirImtProvider {
+impl PirImtProvider {
+    fn proof(&self, nf: pallas::Base) -> Result<PreparedImtProof, String> {
+        let key: [u8; 32] = nf.to_repr();
+        self.cached.get(&key).cloned().ok_or_else(|| {
+            format!(
+                "missing precomputed IMT proof for nullifier {}",
+                base_hex(nf)
+            )
+        })
+    }
+}
+
+impl voting_circuits_v0::delegation::ImtProvider for PirImtProvider {
     fn root(&self) -> pallas::Base {
         self.root
     }
 
-    fn non_membership_proof(&self, nf: pallas::Base) -> Result<ImtProofData, ImtError> {
-        let key: [u8; 32] = nf.to_repr();
-        if let Some(proof) = self.cached.get(&key) {
-            return Ok(proof.clone());
-        }
-        Err(ImtError(format!(
-            "missing precomputed IMT proof for nullifier {}",
-            base_hex(nf)
-        )))
+    fn non_membership_proof(
+        &self,
+        nf: pallas::Base,
+    ) -> Result<
+        voting_circuits_v0::delegation::ImtProofData,
+        voting_circuits_v0::delegation::ImtError,
+    > {
+        self.proof(nf)
+            .map(PreparedImtProof::into_v0)
+            .map_err(voting_circuits_v0::delegation::ImtError)
+    }
+}
+
+impl voting_circuits::delegation::ImtProvider for PirImtProvider {
+    fn root(&self) -> pallas::Base {
+        self.root
+    }
+
+    fn non_membership_proof(
+        &self,
+        nf: pallas::Base,
+    ) -> Result<ImtProofData, voting_circuits::delegation::ImtError> {
+        self.proof(nf)
+            .map(PreparedImtProof::into_v1)
+            .map_err(voting_circuits::delegation::ImtError)
     }
 }
 
@@ -295,16 +360,222 @@ type DelegationKeys = (
     plonk::VerifyingKey<EqAffine>,
 );
 
-fn delegation_cached_keys_large_stack() -> Result<&'static DelegationKeys, VotingError> {
+#[derive(Debug)]
+struct PreparedNoteInput {
+    note: orchard::Note,
+    fvk: FullViewingKey,
+    merkle_path: MerklePath,
+    imt_proof: PreparedImtProof,
+    scope: Scope,
+}
+
+impl PreparedNoteInput {
+    fn into_v0(self) -> voting_circuits_v0::delegation::RealNoteInput {
+        voting_circuits_v0::delegation::RealNoteInput {
+            note: self.note,
+            fvk: self.fvk,
+            merkle_path: self.merkle_path,
+            imt_proof: self.imt_proof.into_v0(),
+            scope: self.scope,
+        }
+    }
+
+    fn into_v1(self) -> voting_circuits::delegation::RealNoteInput {
+        voting_circuits::delegation::RealNoteInput {
+            note: self.note,
+            fvk: self.fvk,
+            merkle_path: self.merkle_path,
+            imt_proof: self.imt_proof.into_v1(),
+            scope: self.scope,
+        }
+    }
+}
+
+struct PreparedDelegation {
+    real_inputs: Vec<PreparedNoteInput>,
+    fvk: FullViewingKey,
+    alpha: pallas::Scalar,
+    output_recipient: orchard::Address,
+    vote_round_id: pallas::Base,
+    nc_root: pallas::Base,
+    van_comm_rand: pallas::Base,
+    imt_provider: PirImtProvider,
+}
+
+fn prepare_delegation(
+    full_notes: &[NoteInfo],
+    hotkey_raw_address: &[u8],
+    alpha_bytes: &[u8],
+    van_comm_rand_bytes: &[u8],
+    vote_round_id_bytes: &[u8],
+    merkle_witnesses: &[WitnessData],
+    imt_proofs: &[ImtProofData],
+    extra_imt_proofs: &[([u8; 32], ImtProofData)],
+    network: &Network,
+) -> Result<PreparedDelegation, VotingError> {
+    let n = full_notes.len();
+    if n == 0 || n > BUNDLE_NOTE_SLOTS {
+        return Err(VotingError::InvalidInput {
+            message: format!("expected 1..={BUNDLE_NOTE_SLOTS} notes, got {n}"),
+        });
+    }
+    if merkle_witnesses.len() != n {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "merkle_witnesses count ({}) must match notes count ({n})",
+                merkle_witnesses.len()
+            ),
+        });
+    }
+    if imt_proofs.len() != n {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "imt_proofs count ({}) must match notes count ({n})",
+                imt_proofs.len()
+            ),
+        });
+    }
+
+    let alpha = bytes_to_scalar(alpha_bytes, "alpha")?;
+    let van_comm_rand = bytes_to_base(van_comm_rand_bytes, "van_comm_rand")?;
+    let vote_round_id = bytes_to_base(vote_round_id_bytes, "vote_round_id")?;
+    let addr_arr: [u8; 43] =
+        hotkey_raw_address
+            .try_into()
+            .map_err(|_| VotingError::InvalidInput {
+                message: format!(
+                    "hotkey address must be 43 bytes, got {}",
+                    hotkey_raw_address.len()
+                ),
+            })?;
+    let output_recipient = ct_option_to_result(
+        orchard::Address::from_raw_address_bytes(&addr_arr),
+        "invalid hotkey address bytes",
+    )?;
+
+    let mut real_inputs = Vec::with_capacity(n);
+    let mut imt_cache = extra_imt_proofs
+        .iter()
+        .map(|(nf, proof)| (*nf, PreparedImtProof::from(proof)))
+        .collect::<HashMap<_, _>>();
+    let mut shared_fvk: Option<FullViewingKey> = None;
+    let mut nc_root: Option<pallas::Base> = None;
+    let mut nf_imt_root: Option<pallas::Base> = None;
+
+    for i in 0..n {
+        let (note, note_fvk) = reconstruct_note(&full_notes[i], network)?;
+        let merkle_path = parse_merkle_path(&merkle_witnesses[i])?;
+        let imt_proof = PreparedImtProof::from(&imt_proofs[i]);
+
+        match &shared_fvk {
+            None => shared_fvk = Some(note_fvk.clone()),
+            Some(existing) if existing.to_bytes() != note_fvk.to_bytes() => {
+                return Err(VotingError::InvalidInput {
+                    message: format!("note[{i}] has a different FVK than note[0]"),
+                });
+            }
+            Some(_) => {}
+        }
+
+        let witness_root = bytes_to_base(&merkle_witnesses[i].root, &format!("witness[{i}].root"))?;
+        match nc_root {
+            None => nc_root = Some(witness_root),
+            Some(root) if root != witness_root => {
+                return Err(VotingError::InvalidInput {
+                    message: format!("witness[{i}] has a different nc_root than witness[0]"),
+                });
+            }
+            Some(_) => {}
+        }
+        match nf_imt_root {
+            None => nf_imt_root = Some(imt_proof.root),
+            Some(root) if root != imt_proof.root => {
+                return Err(VotingError::InvalidInput {
+                    message: format!("imt_proof[{i}] has a different root than imt_proof[0]"),
+                });
+            }
+            Some(_) => {}
+        }
+
+        imt_cache.insert(note.nullifier(&note_fvk).to_bytes(), imt_proof.clone());
+        let scope = match full_notes[i].scope {
+            0 => Scope::External,
+            1 => Scope::Internal,
+            _ => {
+                return Err(VotingError::Internal {
+                    message: format!("unexpected scope code: {}", full_notes[i].scope),
+                });
+            }
+        };
+        real_inputs.push(PreparedNoteInput {
+            note,
+            fvk: note_fvk,
+            merkle_path,
+            imt_proof,
+            scope,
+        });
+    }
+
+    let fvk = shared_fvk.expect("guaranteed by n >= 1 check");
+    let nc_root = nc_root.expect("guaranteed by n >= 1 check");
+    let nf_imt_root = nf_imt_root.expect("guaranteed by n >= 1 check");
+
+    Ok(PreparedDelegation {
+        real_inputs,
+        fvk,
+        alpha,
+        output_recipient,
+        vote_round_id,
+        nc_root,
+        van_comm_rand,
+        imt_provider: PirImtProvider {
+            root: nf_imt_root,
+            cached: imt_cache,
+        },
+    })
+}
+
+/// Rebuilds stored v1-shaped randomness as the nominally distinct v0 type.
+fn precomputed_randomness_v0(
+    randomness: &PrecomputedRandomness,
+) -> voting_circuits_v0::delegation::PrecomputedRandomness {
+    voting_circuits_v0::delegation::PrecomputedRandomness {
+        padded_notes: randomness
+            .padded_notes
+            .iter()
+            .map(|note| voting_circuits_v0::delegation::PaddedNoteData {
+                rho: note.rho,
+                rseed: note.rseed,
+            })
+            .collect(),
+        rseed_signed: randomness.rseed_signed,
+        rseed_output: randomness.rseed_output,
+    }
+}
+
+fn delegation_cached_keys_large_stack(
+    protocol: VoteProtocol,
+) -> Result<&'static DelegationKeys, VotingError> {
     // Defense in depth: warm_proving_caches() should normally populate this,
     // but cold callers still get large-stack keygen if warm-up was skipped.
     std::thread::Builder::new()
-        .name("delegation-key-cache".to_string())
+        .name(format!("delegation-key-cache-{protocol}"))
         .stack_size(DELEGATION_STACK_BYTES)
-        .spawn(|| {
-            delegation_cached_keys().map_err(|e| VotingError::ProofFailed {
-                message: format!("delegation key generation failed: {e}"),
-            })
+        .spawn(move || match protocol {
+            VoteProtocol::V0 => {
+                voting_circuits_v0::delegation::delegation_cached_keys().map_err(|e| {
+                    VotingError::ProofFailed {
+                        message: format!("v0 delegation key generation failed: {e}"),
+                    }
+                })
+            }
+            VoteProtocol::V1 => {
+                voting_circuits::delegation::delegation_cached_keys().map_err(|e| {
+                    VotingError::ProofFailed {
+                        message: format!("v1 delegation key generation failed: {e}"),
+                    }
+                })
+            }
         })
         .map_err(|e| VotingError::Internal {
             message: format!("failed to spawn delegation key cache thread: {e}"),
@@ -315,10 +586,149 @@ fn delegation_cached_keys_large_stack() -> Result<&'static DelegationKeys, Votin
         })?
 }
 
-/// Build and prove the delegation ZKP (#1).
+enum VersionedDelegationBundle {
+    V0(voting_circuits_v0::delegation::DelegationBundle),
+    V1(voting_circuits::delegation::DelegationBundle),
+}
+
+trait DelegationInstance {
+    fn to_halo2_instance(&self) -> Vec<vesta::Scalar>;
+    #[cfg(test)]
+    fn verify_proof(&self, proof: &[u8]) -> Result<(), String>;
+    fn into_result(
+        self,
+        proof: Vec<u8>,
+        public_inputs: Vec<Vec<u8>>,
+        rk: Vec<u8>,
+    ) -> DelegationProofResult;
+}
+
+impl DelegationInstance for voting_circuits_v0::delegation::Instance {
+    fn to_halo2_instance(&self) -> Vec<vesta::Scalar> {
+        voting_circuits_v0::delegation::Instance::to_halo2_instance(self)
+    }
+
+    #[cfg(test)]
+    fn verify_proof(&self, proof: &[u8]) -> Result<(), String> {
+        voting_circuits_v0::delegation::verify_delegation_proof(proof, self)
+    }
+
+    fn into_result(
+        self,
+        proof: Vec<u8>,
+        public_inputs: Vec<Vec<u8>>,
+        rk: Vec<u8>,
+    ) -> DelegationProofResult {
+        DelegationProofResult {
+            proof,
+            public_inputs,
+            nf_signed: self.nf_signed.to_bytes().to_vec(),
+            cmx_new: self.cmx_new.to_repr().to_vec(),
+            gov_nullifiers: self
+                .gov_null
+                .iter()
+                .map(|nullifier| nullifier.to_repr().to_vec())
+                .collect(),
+            van_comm: self.van_comm.to_repr().to_vec(),
+            rk,
+        }
+    }
+}
+
+impl DelegationInstance for voting_circuits::delegation::Instance {
+    fn to_halo2_instance(&self) -> Vec<vesta::Scalar> {
+        voting_circuits::delegation::Instance::to_halo2_instance(self)
+    }
+
+    #[cfg(test)]
+    fn verify_proof(&self, proof: &[u8]) -> Result<(), String> {
+        voting_circuits::delegation::verify_delegation_proof(proof, self)
+    }
+
+    fn into_result(
+        self,
+        proof: Vec<u8>,
+        public_inputs: Vec<Vec<u8>>,
+        rk: Vec<u8>,
+    ) -> DelegationProofResult {
+        DelegationProofResult {
+            proof,
+            public_inputs,
+            nf_signed: self.nf_signed.to_bytes().to_vec(),
+            cmx_new: self.cmx_new.to_repr().to_vec(),
+            gov_nullifiers: self
+                .gov_null
+                .iter()
+                .map(|nullifier| nullifier.to_repr().to_vec())
+                .collect(),
+            van_comm: self.van_comm.to_repr().to_vec(),
+            rk,
+        }
+    }
+}
+
+fn prove_delegation_bundle<C, I>(
+    protocol: VoteProtocol,
+    circuit: C,
+    instance: I,
+    keys: &'static DelegationKeys,
+    rk: Vec<u8>,
+) -> Result<DelegationProofResult, VotingError>
+where
+    C: plonk::Circuit<vesta::Scalar> + Send + Sync,
+    C::Config: Send,
+    I: DelegationInstance,
+{
+    let instance_vec = instance.to_halo2_instance();
+    let proof_instance = instance_vec.clone();
+    let (params, pk, _vk) = keys;
+    let proof = std::thread::scope(|scope| -> Result<Vec<u8>, VotingError> {
+        let handle = std::thread::Builder::new()
+            .name(format!("delegation-prove-{protocol}"))
+            .stack_size(DELEGATION_STACK_BYTES)
+            .spawn_scoped(scope, move || -> Result<Vec<u8>, VotingError> {
+                let instance_refs: Vec<&[vesta::Scalar]> = vec![proof_instance.as_slice()];
+                let mut rng = voting_crypto_deps::rand::rngs::OsRng;
+                let mut transcript =
+                    Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
+                plonk::create_proof(
+                    params,
+                    pk,
+                    &[circuit],
+                    &[instance_refs.as_slice()],
+                    &mut rng,
+                    &mut transcript,
+                )
+                .map_err(|e| VotingError::ProofFailed {
+                    message: format!("create {protocol} delegation proof failed: {e}"),
+                })?;
+                Ok(transcript.finalize())
+            })
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to spawn delegation proving thread: {e}"),
+            })?;
+        handle.join().map_err(|_| VotingError::Internal {
+            message: "delegation proving thread panicked".to_string(),
+        })?
+    })?;
+    #[cfg(test)]
+    instance
+        .verify_proof(&proof)
+        .map_err(|message| VotingError::ProofFailed {
+            message: format!("{protocol} delegation proof verification failed: {message}"),
+        })?;
+    let public_inputs = instance_vec
+        .iter()
+        .map(|field| field.to_repr().to_vec())
+        .collect();
+    Ok(instance.into_result(proof, public_inputs, rk))
+}
+
+/// Build and prove the legacy-v0 delegation ZKP (#1).
 ///
 /// Constructs the circuit from wallet notes, Merkle witnesses, and
 /// IMT exclusion proofs (fetched via PIR), then generates a Halo2 proof.
+/// Round-aware callers should use [`build_and_prove_delegation_for_protocol`].
 ///
 /// # Arguments
 ///
@@ -348,215 +758,133 @@ pub fn build_and_prove_delegation(
     progress: &dyn DelegationProgressReporter,
     precomputed_randomness: Option<&PrecomputedRandomness>,
 ) -> Result<DelegationProofResult, VotingError> {
-    let n = full_notes.len();
-    if n == 0 || n > BUNDLE_NOTE_SLOTS {
-        return Err(VotingError::InvalidInput {
-            message: format!("expected 1..={BUNDLE_NOTE_SLOTS} notes, got {n}"),
-        });
-    }
-    if merkle_witnesses.len() != n {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "merkle_witnesses count ({}) must match notes count ({n})",
-                merkle_witnesses.len()
-            ),
-        });
-    }
-    if imt_proofs.len() != n {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "imt_proofs count ({}) must match notes count ({n})",
-                imt_proofs.len()
-            ),
-        });
-    }
+    build_and_prove_delegation_for_protocol(
+        VoteProtocol::V0,
+        full_notes,
+        hotkey_raw_address,
+        alpha_bytes,
+        van_comm_rand_bytes,
+        vote_round_id_bytes,
+        merkle_witnesses,
+        imt_proofs,
+        extra_imt_proofs,
+        network,
+        progress,
+        precomputed_randomness,
+    )
+}
 
-    // Parse scalar/field inputs.
-    let alpha = bytes_to_scalar(alpha_bytes, "alpha")?;
-    let van_comm_rand = bytes_to_base(van_comm_rand_bytes, "van_comm_rand")?;
-    let vote_round_id = bytes_to_base(vote_round_id_bytes, "vote_round_id")?;
-
-    // Parse hotkey address (43-byte raw Orchard address).
-    let addr_arr: [u8; 43] =
-        hotkey_raw_address
-            .try_into()
-            .map_err(|_| VotingError::InvalidInput {
-                message: format!(
-                    "hotkey address must be 43 bytes, got {}",
-                    hotkey_raw_address.len()
-                ),
-            })?;
-    let output_recipient = ct_option_to_result(
-        orchard::Address::from_raw_address_bytes(&addr_arr),
-        "invalid hotkey address bytes",
-    )?;
-
-    // Reconstruct notes and parse Merkle paths + IMT proofs.
-    let mut real_inputs = Vec::with_capacity(n);
-    let mut imt_cache = HashMap::new();
-    for (nf, proof) in extra_imt_proofs {
-        imt_cache.insert(*nf, proof.clone());
-    }
-    let mut shared_fvk: Option<FullViewingKey> = None;
-    let mut nc_root: Option<pallas::Base> = None;
-    let mut nf_imt_root: Option<pallas::Base> = None;
-
-    for i in 0..n {
-        let (note, note_fvk) = reconstruct_note(&full_notes[i], &network)?;
-        let merkle_path = parse_merkle_path(&merkle_witnesses[i])?;
-        let imt_proof = imt_proofs[i].clone();
-
-        // All notes must share the same FVK (same account).
-        match &shared_fvk {
-            None => shared_fvk = Some(note_fvk.clone()),
-            Some(existing) => {
-                if existing.to_bytes() != note_fvk.to_bytes() {
-                    return Err(VotingError::InvalidInput {
-                        message: format!("note[{i}] has a different FVK than note[0]"),
-                    });
-                }
-            }
-        }
-
-        // Verify consistent roots.
-        let witness_root = bytes_to_base(&merkle_witnesses[i].root, &format!("witness[{i}].root"))?;
-        match nc_root {
-            None => nc_root = Some(witness_root),
-            Some(r) if r != witness_root => {
-                return Err(VotingError::InvalidInput {
-                    message: format!("witness[{i}] has a different nc_root than witness[0]"),
-                });
-            }
-            _ => {}
-        }
-        match nf_imt_root {
-            None => nf_imt_root = Some(imt_proof.root),
-            Some(r) if r != imt_proof.root => {
-                return Err(VotingError::InvalidInput {
-                    message: format!("imt_proof[{i}] has a different root than imt_proof[0]"),
-                });
-            }
-            _ => {}
-        }
-
-        // Cache this proof for the ServerImtProvider.
-        let nf = note.nullifier(&note_fvk);
-        imt_cache.insert(nf.to_bytes(), imt_proof.clone());
-
-        let scope = match full_notes[i].scope {
-            0 => Scope::External,
-            1 => Scope::Internal,
-            _ => {
-                return Err(VotingError::Internal {
-                    message: format!("unexpected scope code: {}", full_notes[i].scope),
-                })
-            }
-        };
-        real_inputs.push(RealNoteInput {
-            note,
-            fvk: note_fvk,
-            merkle_path,
-            imt_proof,
-            scope,
-        });
-    }
-
-    let fvk = shared_fvk.expect("guaranteed by n >= 1 check");
-    let nc_root = nc_root.expect("guaranteed by n >= 1 check");
-    let nf_imt_root = nf_imt_root.expect("guaranteed by n >= 1 check");
-
-    // Create IMT provider from pre-fetched proofs for real and padded notes.
-    let imt_provider = PirImtProvider {
-        root: nf_imt_root,
-        cached: imt_cache,
-    };
-
-    // Build the delegation bundle (circuit + instance).
-    let mut rng = voting_crypto_deps::rand::rngs::OsRng;
-    let bundle = build_delegation_bundle(
+/// Builds ZKP #1 with the proof system fixed when the voting round was created.
+#[allow(clippy::too_many_arguments)]
+pub fn build_and_prove_delegation_for_protocol(
+    protocol: VoteProtocol,
+    full_notes: &[NoteInfo],
+    hotkey_raw_address: &[u8],
+    alpha_bytes: &[u8],
+    van_comm_rand_bytes: &[u8],
+    vote_round_id_bytes: &[u8],
+    merkle_witnesses: &[WitnessData],
+    imt_proofs: &[ImtProofData],
+    extra_imt_proofs: &[([u8; 32], ImtProofData)],
+    network: Network,
+    progress: &dyn DelegationProgressReporter,
+    precomputed_randomness: Option<&PrecomputedRandomness>,
+) -> Result<DelegationProofResult, VotingError> {
+    let PreparedDelegation {
         real_inputs,
-        &fvk,
+        fvk,
         alpha,
         output_recipient,
         vote_round_id,
         nc_root,
         van_comm_rand,
-        &imt_provider,
-        &mut rng,
-        precomputed_randomness,
-    )
-    .map_err(|e| VotingError::ProofFailed {
-        message: format!("delegation bundle build failed: {e}"),
-    })?;
+        imt_provider,
+    } = prepare_delegation(
+        full_notes,
+        hotkey_raw_address,
+        alpha_bytes,
+        van_comm_rand_bytes,
+        vote_round_id_bytes,
+        merkle_witnesses,
+        imt_proofs,
+        extra_imt_proofs,
+        &network,
+    )?;
+
+    let mut rng = voting_crypto_deps::rand::rngs::OsRng;
+    let bundle = match protocol {
+        VoteProtocol::V0 => {
+            let real_inputs = real_inputs
+                .into_iter()
+                .map(PreparedNoteInput::into_v0)
+                .collect();
+            let precomputed_randomness = precomputed_randomness.map(precomputed_randomness_v0);
+            let bundle = voting_circuits_v0::delegation::build_delegation_bundle(
+                real_inputs,
+                &fvk,
+                alpha,
+                output_recipient,
+                vote_round_id,
+                nc_root,
+                van_comm_rand,
+                &imt_provider,
+                &mut rng,
+                precomputed_randomness.as_ref(),
+            )
+            .map_err(|e| VotingError::ProofFailed {
+                message: format!("v0 delegation bundle build failed: {e}"),
+            })?;
+            VersionedDelegationBundle::V0(bundle)
+        }
+        VoteProtocol::V1 => {
+            let real_inputs = real_inputs
+                .into_iter()
+                .map(PreparedNoteInput::into_v1)
+                .collect();
+            let bundle = voting_circuits::delegation::build_delegation_bundle(
+                real_inputs,
+                &fvk,
+                alpha,
+                output_recipient,
+                vote_round_id,
+                nc_root,
+                van_comm_rand,
+                &imt_provider,
+                &mut rng,
+                precomputed_randomness,
+            )
+            .map_err(|e| VotingError::ProofFailed {
+                message: format!("v1 delegation bundle build failed: {e}"),
+            })?;
+            VersionedDelegationBundle::V1(bundle)
+        }
+    };
 
     progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(0.1));
-
-    // Fill the downstream cache on a large-stack thread when warm-up was missed.
-    let (params, pk, _vk) = delegation_cached_keys_large_stack()?;
-
+    let keys = delegation_cached_keys_large_stack(protocol)?;
     progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(0.5));
 
-    // Create the proof on a dedicated large-stack thread. For larger circuits,
-    // create_proof can also exhaust the default thread stack on simulator builds.
-    let instance_vec = bundle.instance.to_halo2_instance();
-    let circuit = bundle.circuit;
-    let proof_instance = instance_vec.clone();
-    let proof_bytes = std::thread::scope(|scope| -> Result<Vec<u8>, VotingError> {
-        let handle = std::thread::Builder::new()
-            .name("delegation-prove".to_string())
-            .stack_size(DELEGATION_STACK_BYTES)
-            .spawn_scoped(scope, move || -> Result<Vec<u8>, VotingError> {
-                let instance_refs: Vec<&[vesta::Scalar]> = vec![proof_instance.as_slice()];
-                let mut local_rng = voting_crypto_deps::rand::rngs::OsRng;
-                let mut transcript =
-                    Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
-                plonk::create_proof(
-                    params,
-                    pk,
-                    &[circuit],
-                    &[instance_refs.as_slice()],
-                    &mut local_rng,
-                    &mut transcript,
-                )
-                .map_err(|e| VotingError::ProofFailed {
-                    message: format!("create_proof failed: {e}"),
-                })?;
-                Ok(transcript.finalize())
-            })
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to spawn delegation proving thread: {e}"),
-            })?;
-        handle.join().map_err(|_| VotingError::Internal {
-            message: "delegation proving thread panicked".to_string(),
-        })?
-    })?;
+    let ak: SpendValidatingKey = fvk.into();
+    let rk_bytes: [u8; 32] = (&ak.randomize(&alpha)).into();
+    let result = match bundle {
+        VersionedDelegationBundle::V0(bundle) => prove_delegation_bundle(
+            protocol,
+            bundle.circuit,
+            bundle.instance,
+            keys,
+            rk_bytes.to_vec(),
+        ),
+        VersionedDelegationBundle::V1(bundle) => prove_delegation_bundle(
+            protocol,
+            bundle.circuit,
+            bundle.instance,
+            keys,
+            rk_bytes.to_vec(),
+        ),
+    }?;
 
     progress.on_progress(crate::delegate::DelegationProgress::ProofProgress(1.0));
-
-    // Extract public inputs as 32-byte LE arrays.
-    let public_inputs: Vec<Vec<u8>> = instance_vec
-        .iter()
-        .map(|fe| fe.to_repr().to_vec())
-        .collect();
-
-    // Extract named outputs from the instance.
-    let ak: SpendValidatingKey = fvk.clone().into();
-    let rk_bytes: [u8; 32] = (&ak.randomize(&alpha)).into();
-
-    Ok(DelegationProofResult {
-        proof: proof_bytes,
-        public_inputs,
-        nf_signed: bundle.instance.nf_signed.to_bytes().to_vec(),
-        cmx_new: bundle.instance.cmx_new.to_repr().to_vec(),
-        gov_nullifiers: bundle
-            .instance
-            .gov_null
-            .iter()
-            .map(|g| g.to_repr().to_vec())
-            .collect(),
-        van_comm: bundle.instance.van_comm.to_repr().to_vec(),
-        rk: rk_bytes.to_vec(),
-    })
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -571,7 +899,7 @@ mod tests {
         value::NoteValue, NOTE_COMMITMENT_TREE_DEPTH as TEST_TREE_DEPTH,
     };
     use pasta_curves::group::ff::Field;
-    use voting_circuits::delegation::SpacedLeafImtProvider;
+    use voting_circuits::delegation::{ImtProvider, SpacedLeafImtProvider};
     use voting_crypto_deps::rand::rngs::OsRng;
     use voting_crypto_deps::rand::Rng;
 
@@ -609,6 +937,28 @@ mod tests {
         let converted = validate_and_convert_pir_proof(proof, nf, root).unwrap();
 
         assert_eq!(converted.root, root);
+    }
+
+    #[test]
+    fn pir_imt_provider_converts_proofs_for_both_protocols() {
+        let imt = SpacedLeafImtProvider::new();
+        let nf = pallas::Base::one();
+        let proof = imt.non_membership_proof(nf).unwrap();
+        let provider = PirImtProvider {
+            root: proof.root,
+            cached: HashMap::from([(nf.to_repr(), PreparedImtProof::from(&proof))]),
+        };
+
+        let v0_proof =
+            voting_circuits_v0::delegation::ImtProvider::non_membership_proof(&provider, nf)
+                .unwrap();
+        let v1_proof =
+            voting_circuits::delegation::ImtProvider::non_membership_proof(&provider, nf).unwrap();
+
+        assert_eq!(v0_proof.root, v1_proof.root);
+        assert_eq!(v0_proof.nf_bounds, v1_proof.nf_bounds);
+        assert_eq!(v0_proof.leaf_pos, v1_proof.leaf_pos);
+        assert_eq!(v0_proof.path, v1_proof.path);
     }
 
     #[test]
@@ -827,7 +1177,8 @@ mod tests {
     ///
     /// Creates synthetic wallet notes, builds a Merkle tree, constructs valid IMT
     /// non-membership proofs as `ImtProofData`, and calls
-    /// `build_and_prove_delegation()` to generate a real Halo2 proof.
+    /// `build_and_prove_delegation_for_protocol()` to generate real Halo2
+    /// proofs with both supported circuit versions.
     ///
     /// Uses a full note-slot bundle to avoid padding (no PIR server needed for
     /// padded notes).
@@ -992,67 +1343,73 @@ mod tests {
             count: count.clone(),
         };
 
-        println!("Starting build_and_prove_delegation (keygen + proving)...");
-        println!("This will take a while (keygen + proving)...");
+        for protocol in [VoteProtocol::V0, VoteProtocol::V1] {
+            count.store(0, Ordering::Relaxed);
+            println!("Starting {protocol} delegation proof (keygen + proving)...");
 
-        let start = std::time::Instant::now();
-        let result = build_and_prove_delegation(
-            &full_notes,
-            &hotkey_raw_address,
-            &alpha.to_repr(),
-            &van_comm_rand.to_repr(),
-            &vote_round_id.to_repr(),
-            &merkle_witnesses,
-            &imt_proofs,
-            &[],
-            Network::Mainnet,
-            &reporter,
-            None,
-        )
-        .expect("build_and_prove_delegation should succeed");
-        let elapsed = start.elapsed();
+            let start = std::time::Instant::now();
+            let result = build_and_prove_delegation_for_protocol(
+                protocol,
+                &full_notes,
+                &hotkey_raw_address,
+                &alpha.to_repr(),
+                &van_comm_rand.to_repr(),
+                &vote_round_id.to_repr(),
+                &merkle_witnesses,
+                &imt_proofs,
+                &[],
+                Network::Mainnet,
+                &reporter,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{protocol} delegation proof should succeed: {error}"));
+            let elapsed = start.elapsed();
 
-        println!("Proof generated in {:.1}s", elapsed.as_secs_f64());
+            println!(
+                "{protocol} proof generated in {:.1}s",
+                elapsed.as_secs_f64()
+            );
 
-        // 8. Verify result structure
-        assert!(!result.proof.is_empty(), "proof bytes should be non-empty");
-        assert_eq!(
-            result.public_inputs.len(),
-            14,
-            "should have 14 public inputs"
-        );
-        for (i, pi) in result.public_inputs.iter().enumerate() {
-            assert_eq!(pi.len(), 32, "public_input[{i}] should be 32 bytes");
+            // 8. Verify result structure
+            assert!(!result.proof.is_empty(), "proof bytes should be non-empty");
+            assert_eq!(
+                result.public_inputs.len(),
+                14,
+                "should have 14 public inputs"
+            );
+            for (i, pi) in result.public_inputs.iter().enumerate() {
+                assert_eq!(pi.len(), 32, "public_input[{i}] should be 32 bytes");
+            }
+            assert_eq!(result.nf_signed.len(), 32, "nf_signed should be 32 bytes");
+            assert_eq!(result.cmx_new.len(), 32, "cmx_new should be 32 bytes");
+            assert_eq!(
+                result.gov_nullifiers.len(),
+                5,
+                "should have 5 gov nullifiers"
+            );
+            for (i, gn) in result.gov_nullifiers.iter().enumerate() {
+                assert_eq!(gn.len(), 32, "gov_nullifier[{i}] should be 32 bytes");
+            }
+            assert_eq!(result.van_comm.len(), 32, "van_comm should be 32 bytes");
+            assert_eq!(result.rk.len(), 32, "rk should be 32 bytes");
+
+            // Verify proof is NOT the old mock pattern
+            assert_ne!(
+                &result.proof[..result.proof.len().min(256)],
+                &vec![0xAB; result.proof.len().min(256)][..],
+                "proof should not be mock data"
+            );
+
+            // Verify progress was reported (at least 3 calls: 0.1, 0.5, 1.0)
+            let progress_count = count.load(Ordering::Relaxed);
+            assert!(
+                progress_count >= 3,
+                "expected at least 3 progress callbacks, got {progress_count}"
+            );
+
+            println!("=== {protocol} test passed ===");
+            println!("  Proof size: {} bytes", result.proof.len());
+            println!("  Progress callbacks: {progress_count}");
         }
-        assert_eq!(result.nf_signed.len(), 32, "nf_signed should be 32 bytes");
-        assert_eq!(result.cmx_new.len(), 32, "cmx_new should be 32 bytes");
-        assert_eq!(
-            result.gov_nullifiers.len(),
-            5,
-            "should have 5 gov nullifiers"
-        );
-        for (i, gn) in result.gov_nullifiers.iter().enumerate() {
-            assert_eq!(gn.len(), 32, "gov_nullifier[{i}] should be 32 bytes");
-        }
-        assert_eq!(result.van_comm.len(), 32, "van_comm should be 32 bytes");
-        assert_eq!(result.rk.len(), 32, "rk should be 32 bytes");
-
-        // Verify proof is NOT the old mock pattern
-        assert_ne!(
-            &result.proof[..result.proof.len().min(256)],
-            &vec![0xAB; result.proof.len().min(256)][..],
-            "proof should not be mock data"
-        );
-
-        // Verify progress was reported (at least 3 calls: 0.1, 0.5, 1.0)
-        let progress_count = count.load(Ordering::Relaxed);
-        assert!(
-            progress_count >= 3,
-            "expected at least 3 progress callbacks, got {progress_count}"
-        );
-
-        println!("=== Test passed ===");
-        println!("  Proof size: {} bytes", result.proof.len());
-        println!("  Progress callbacks: {progress_count}");
     }
 }

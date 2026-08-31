@@ -143,6 +143,7 @@ mod tests {
     fn test_params() -> VotingRoundParams {
         VotingRoundParams {
             vote_round_id: "test-round-1".to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 1000,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],
@@ -157,7 +158,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
     }
 
     #[test]

@@ -21,10 +21,12 @@ use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
 use crate::{
     round::VotingDb,
     types::{
-        validate_proposal_id, validate_vote_decision, validate_vote_round_id_hex,
-        CastVoteSignature, EncryptedShare, Network, ProgressReporter, SharePayload,
-        VoteCommitmentBundle, VotingError, VotingHotkey, WireEncryptedShare, MAX_PROPOSAL_ID,
+        validate_proposal_id, validate_proposal_id_for_protocol, validate_vote_decision,
+        validate_vote_round_id_hex, CastVoteSignature, EncryptedShare, Network, ProgressReporter,
+        SharePayload, VoteCommitmentBundle, VotingError, VotingHotkey, WireEncryptedShare,
+        MAX_PROPOSAL_ID,
     },
+    VoteProtocol,
 };
 
 /// Number of siblings in a vote-authority-note witness.
@@ -107,6 +109,26 @@ fn validate_atomic_vote_batch(draft_votes: &[DraftVote]) -> Result<(), VotingErr
         });
     }
     validate_draft_votes(draft_votes)
+}
+
+fn validate_draft_votes_for_protocol(
+    protocol: VoteProtocol,
+    draft_votes: &[DraftVote],
+) -> Result<(), VotingError> {
+    if draft_votes.len() > protocol.max_vote_batch_actions() {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "atomic vote batch must contain at most {} actions for vote protocol {}, got {}",
+                protocol.max_vote_batch_actions(),
+                protocol,
+                draft_votes.len()
+            ),
+        });
+    }
+    for draft in draft_votes {
+        validate_proposal_id_for_protocol(protocol, draft.proposal_id)?;
+    }
+    Ok(())
 }
 
 /// VAN Merkle witness produced by `precompute::van_witness`.
@@ -647,6 +669,11 @@ pub fn prepare_atomic_vote_batch(
     let (secret, network) = signer_secret_and_network(signer);
     db.require_round_network(batch.round_id, network, "vote signer")?;
     let wallet_id = db.wallet_id();
+    let vote_protocol = {
+        let conn = db.conn();
+        crate::storage::queries::load_round_params(&conn, batch.round_id, &wallet_id)?.vote_protocol
+    };
+    validate_draft_votes_for_protocol(vote_protocol, batch.drafts)?;
 
     // Capture every proposal row under one read transaction. The proofs run
     // after this transaction is released and persistence revalidates the same
@@ -765,7 +792,8 @@ pub fn prepare_atomic_vote_batch(
     let mut authority = first_state.zkp2.proposal_authority;
     let mut proof_plans = Vec::with_capacity(batch.drafts.len());
     for (index, (draft, state)) in batch.drafts.iter().zip(captured.iter()).enumerate() {
-        let transition = crate::zkp2::plan_vote_authority_transition(
+        let transition = crate::zkp2::plan_vote_authority_transition_for_protocol(
+            state.zkp2.vote_protocol,
             secret,
             network,
             state.zkp2.address_index,
@@ -1132,7 +1160,8 @@ fn build_batch_proofs(
                         bundle_index,
                         stages,
                     };
-                    let result = crate::zkp2::build_vote_commitment(
+                    let result = crate::zkp2::build_vote_commitment_for_protocol(
+                        plan.state.zkp2.vote_protocol,
                         hotkey_seed,
                         plan.state.network,
                         plan.state.zkp2.address_index,
@@ -1497,6 +1526,11 @@ pub fn prepare_commit(
     db.require_round_network(round_id, network, "vote signer")?;
 
     let wallet_id = db.wallet_id();
+    let vote_protocol = {
+        let conn = db.conn();
+        crate::storage::queries::load_round_params(&conn, round_id, &wallet_id)?.vote_protocol
+    };
+    validate_proposal_id_for_protocol(vote_protocol, draft.proposal_id)?;
     let recovered = {
         let mut conn = db.conn();
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
@@ -1914,6 +1948,8 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
     bundle_index: u32,
     batch_digest: [u8; 32],
 ) -> Result<Vec<VoteRecoveryBundle>, VotingError> {
+    let vote_protocol =
+        crate::storage::queries::load_round_params(conn, round_id, wallet_id)?.vote_protocol;
     let mut stmt = conn
         .prepare(
             "SELECT commitment_bundle_json FROM votes
@@ -1937,9 +1973,10 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
         })?;
     let mut recoveries = Vec::new();
     for row in rows {
-        let recovery = parse_recovery(&row.map_err(|e| VotingError::Internal {
+        let recovery_json = row.map_err(|e| VotingError::Internal {
             message: format!("read vote batch recovery row failed: {e}"),
-        })?)?;
+        })?;
+        let recovery = parse_recovery_for_protocol(&recovery_json, vote_protocol)?;
         if recovery
             .batch
             .as_ref()
@@ -2006,6 +2043,8 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
     proposal_id: u32,
     choice: Option<u32>,
 ) -> Result<(), VotingError> {
+    let vote_protocol =
+        crate::storage::queries::load_round_params(conn, round_id, wallet_id)?.vote_protocol;
     let mut stmt = conn
         .prepare(
             "SELECT bundle_index, choice, commitment_bundle_json
@@ -2048,7 +2087,7 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
         let bundle_index = u32::try_from(bundle_index).map_err(|_| VotingError::Internal {
             message: format!("stored bundle_index must be non-negative, got {bundle_index}"),
         })?;
-        let recovery = parse_recovery(&recovery_json)?;
+        let recovery = parse_recovery_for_protocol(&recovery_json, vote_protocol)?;
         validate_recovery_matches_stored_vote(
             &recovery,
             round_id,
@@ -2237,6 +2276,8 @@ pub(crate) fn record_vc_position_with_conn(
     proposal_id: u32,
     vc_tree_position: u64,
 ) -> Result<(), VotingError> {
+    let vote_protocol =
+        crate::storage::queries::load_round_params(conn, round_id, wallet_id)?.vote_protocol;
     let vc_tree_position_i64 =
         i64::try_from(vc_tree_position).map_err(|_| VotingError::InvalidInput {
             message: format!("vc_tree_position {vc_tree_position} does not fit in SQLite i64"),
@@ -2279,7 +2320,7 @@ pub(crate) fn record_vc_position_with_conn(
     }
 
     if let Some(json) = stored_json {
-        let mut recovery = parse_recovery(&json)?;
+        let mut recovery = parse_recovery_for_protocol(&json, vote_protocol)?;
         validate_recovery_matches_stored_vote(
             &recovery,
             round_id,
@@ -2334,10 +2375,34 @@ pub(crate) fn recovery_bundle_with_conn(
     bundle_index: u32,
     proposal_id: u32,
 ) -> Result<Option<VoteRecoveryBundle>, VotingError> {
-    recovery_json_with_conn(conn, wallet_id, round_id, bundle_index, proposal_id)?
-        .as_deref()
-        .map(parse_recovery)
-        .transpose()
+    let Some(json) = recovery_json_with_conn(conn, wallet_id, round_id, bundle_index, proposal_id)?
+    else {
+        return Ok(None);
+    };
+    let vote_protocol =
+        crate::storage::queries::load_round_params(conn, round_id, wallet_id)?.vote_protocol;
+    parse_recovery_for_protocol(&json, vote_protocol).map(Some)
+}
+
+pub(crate) fn parse_recovery_for_protocol(
+    json: &str,
+    protocol: VoteProtocol,
+) -> Result<VoteRecoveryBundle, VotingError> {
+    let recovery = parse_recovery(json)?;
+    validate_proposal_id_for_protocol(protocol, recovery.proposal_id)?;
+    if let Some(batch) = recovery.batch.as_ref() {
+        if batch.size as usize > protocol.max_vote_batch_actions() {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "persisted vote batch contains {} actions, exceeding the {} maximum for vote protocol {}",
+                    batch.size,
+                    protocol.max_vote_batch_actions(),
+                    protocol
+                ),
+            });
+        }
+    }
+    Ok(recovery)
 }
 
 fn recovery_json_with_conn(
@@ -3073,6 +3138,8 @@ fn validate_prepared_vote_state(
 ) -> Result<(), VotingError> {
     let stale = if current.network != captured.network {
         Some("round network")
+    } else if current.zkp2.vote_protocol != captured.zkp2.vote_protocol {
+        Some("vote protocol")
     } else if current.zkp2.gov_comm_rand != captured.zkp2.gov_comm_rand {
         Some("governance commitment randomness")
     } else if current.zkp2.total_note_value != captured.zkp2.total_note_value {
@@ -3419,6 +3486,7 @@ mod tests {
     fn round_params() -> RoundParams {
         RoundParams {
             vote_round_id: ROUND_ID.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 1000,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],
@@ -4853,6 +4921,22 @@ mod tests {
             err.to_string().contains("encryption authority key changed"),
             "{err}"
         );
+        assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_vote_rejects_changed_vote_protocol() {
+        let db = db_with_vote();
+        let prepared = prepared_vote_fixture(&db);
+        db.conn()
+            .execute(
+                "UPDATE rounds SET vote_protocol = 'v0' WHERE round_id = ?1 AND wallet_id = ?2",
+                rusqlite::params![ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+
+        let err = persist_prepared_commit(&db, prepared).unwrap_err();
+        assert!(err.to_string().contains("vote protocol changed"), "{err}");
         assert!(recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().is_none());
     }
 

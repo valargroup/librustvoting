@@ -74,8 +74,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.138
-      # The end-to-end delegation proof runs keygen plus proving, so it is
-      # marked #[ignore] for the default suite and run here under --release.
+      # The end-to-end proof tests run keygen plus proving, so they are marked
+      # #[ignore] for the default suite and run here under --release.
       - name: Run ignored Zakura proof tests
         run: |
           cargo nextest run --release -p zcash_voting \

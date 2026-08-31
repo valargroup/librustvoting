@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 16;
+const CURRENT_VERSION: u32 = 17;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -54,6 +54,10 @@ DROP TABLE imt_proofs;",
         "ALTER TABLE share_delegations ADD COLUMN ambiguous_urls TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE share_delegations ADD COLUMN attempting_urls TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE share_delegations ADD COLUMN target_count INTEGER NOT NULL DEFAULT 0;",
+    ),
+    (
+        16,
+        "ALTER TABLE rounds ADD COLUMN vote_protocol TEXT NOT NULL DEFAULT 'v0' CHECK (vote_protocol IN ('v0','v1'));",
     ),
 ];
 
@@ -172,6 +176,14 @@ mod tests {
             .replace("    target_count    INTEGER NOT NULL DEFAULT 0,\n", "")
     }
 
+    /// Strips the per-round protocol column added at version 17.
+    fn without_vote_protocol(schema: &str) -> String {
+        schema.replace(
+            "    vote_protocol       TEXT NOT NULL DEFAULT 'v0' CHECK (vote_protocol IN ('v0','v1')),\n",
+            "",
+        )
+    }
+
     /// The bundle-scoped `imt_proofs` table that version 15 replaced with
     /// `pir_proof_cache`, exactly as `001_init.sql` created it through v14.
     const V14_IMT_PROOFS_SQL: &str = "CREATE TABLE imt_proofs (
@@ -190,7 +202,9 @@ mod tests {
 
     /// The version-14 schema: no `pir_proof_cache` yet, `imt_proofs` still present.
     fn v14_schema() -> String {
-        let schema = without_durable_ambiguous_deliveries(include_str!("migrations/001_init.sql"));
+        let schema = without_vote_protocol(&without_durable_ambiguous_deliveries(include_str!(
+            "migrations/001_init.sql"
+        )));
         format!(
             "{}\n{}\n",
             without_pir_proof_cache(&schema),
@@ -209,14 +223,30 @@ mod tests {
         stripped
     }
 
+    /// The version-16 schema, before rounds recorded their vote protocol.
+    fn v16_schema() -> String {
+        without_vote_protocol(include_str!("migrations/001_init.sql"))
+    }
+
     fn test_params() -> VotingRoundParams {
         VotingRoundParams {
             vote_round_id: "test-round".to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 1000,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],
             nullifier_imt_root: vec![0xBB; 32],
         }
+    }
+
+    fn insert_legacy_round(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO rounds
+             (round_id, wallet_id, network, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at)
+             VALUES ('test-round', 'wallet', 'testnet', 1000, ?1, ?2, ?3, 0, 0)",
+            rusqlite::params![vec![0xEA_u8; 32], vec![0xAA_u8; 32], vec![0xBB_u8; 32]],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -283,14 +313,7 @@ mod tests {
         // would cost that round's voting weight permanently.
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(&launch_schema()).unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
+        insert_legacy_round(&conn);
         queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
         conn.execute(
             "UPDATE bundles SET van_comm_rand = ?1, gov_comm = ?2
@@ -326,6 +349,15 @@ mod tests {
         assert_eq!(van_comm_rand, vec![0xAB; 32]);
         assert_eq!(gov_comm, vec![0xCD; 32]);
 
+        let vote_protocol: String = conn
+            .query_row(
+                "SELECT vote_protocol FROM rounds WHERE round_id = 'test-round'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vote_protocol, "v0");
+
         // The round survives and gains the new column, unset.
         let stored_policy: Option<String> = conn
             .query_row(
@@ -348,6 +380,23 @@ mod tests {
         assert_eq!(delivery.1, "[]");
         assert_eq!(delivery.2, "[]");
         assert_eq!(delivery.3, 0);
+    }
+
+    #[test]
+    fn migrate_from_v16_marks_existing_rounds_as_v0() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v16_schema()).unwrap();
+        insert_legacy_round(&conn);
+        conn.pragma_update(None, "user_version", 16).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let stored = queries::load_round_params(&conn, "test-round", "wallet").unwrap();
+        assert_eq!(stored.vote_protocol, crate::VoteProtocol::V0);
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
     }
 
     #[test]
@@ -383,14 +432,7 @@ mod tests {
     fn migrate_from_v14_creates_pir_proof_cache_and_preserves_state() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(&v14_schema()).unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
+        insert_legacy_round(&conn);
         queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
         // A cached proof from the old bundle-scoped table; v15 must carry it
         // over so an upgrade mid-round does not refetch from the PIR server.
@@ -520,6 +562,7 @@ mod tests {
 
         let round_columns = table_columns(&conn, "rounds");
         assert!(round_columns.contains(&"network".to_string()));
+        assert!(round_columns.contains(&"vote_protocol".to_string()));
     }
 
     /// Verify that the bundles table columns exist after migration and can round-trip BLOB data.

@@ -1,11 +1,15 @@
 //! Canonical payloads signed by dynamic-config round attestations.
 
-use crate::config::PirLayout;
+use crate::{config::PirLayout, VoteProtocol};
 
 /// Dynamic-config authentication version using [`RoundAuthPayloadV2`].
 pub const ROUND_AUTH_VERSION_V2: u32 = 2;
 
+/// Dynamic-config authentication version using [`RoundAuthPayloadV3`].
+pub const ROUND_AUTH_VERSION_V3: u32 = 3;
+
 const ROUND_AUTH_DOMAIN_TAG_V2: [u8; 33] = *b"zcash-shielded-vote:round-auth:v2";
+const ROUND_AUTH_DOMAIN_TAG_V3: [u8; 33] = *b"zcash-shielded-vote:round-auth:v3";
 
 /// Typed round-auth v2 signing payload.
 ///
@@ -52,6 +56,62 @@ impl RoundAuthPayloadV2 {
     }
 }
 
+/// Typed round-auth v3 signing payload.
+///
+/// This extends v2's fixed-width encoding with the two ASCII bytes of the
+/// selected circuit version (`v0` or `v1`). The versioned domain keeps v2
+/// signatures byte-for-byte compatible while preventing a dynamic-config
+/// mirror from changing the circuit selected for an authenticated round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoundAuthPayloadV3 {
+    domain: [u8; 33],
+    round_id: [u8; 32],
+    ea_pk: [u8; 32],
+    pir_depth: u32,
+    tier0_layers: u32,
+    tier1_layers: u32,
+    poly_len: u32,
+    circuit_version: VoteProtocol,
+}
+
+impl RoundAuthPayloadV3 {
+    /// Constructs the payload for a round and its selected circuit version.
+    pub fn new(
+        round_id: [u8; 32],
+        ea_pk: [u8; 32],
+        pir_layout: PirLayout,
+        circuit_version: VoteProtocol,
+    ) -> Self {
+        Self {
+            domain: ROUND_AUTH_DOMAIN_TAG_V3,
+            round_id,
+            ea_pk,
+            pir_depth: pir_layout.pir_depth,
+            tier0_layers: pir_layout.tier0_layers,
+            tier1_layers: pir_layout.tier1_layers,
+            poly_len: pir_layout.poly_len,
+            circuit_version,
+        }
+    }
+
+    /// Returns the canonical fixed-width bytes to sign or verify.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(33 + 32 + 32 + 16 + 2);
+        bytes.extend_from_slice(&self.domain);
+        bytes.extend_from_slice(&self.round_id);
+        bytes.extend_from_slice(&self.ea_pk);
+        bytes.extend_from_slice(&self.pir_depth.to_le_bytes());
+        bytes.extend_from_slice(&self.tier0_layers.to_le_bytes());
+        bytes.extend_from_slice(&self.tier1_layers.to_le_bytes());
+        bytes.extend_from_slice(&self.poly_len.to_le_bytes());
+        bytes.extend_from_slice(match self.circuit_version {
+            VoteProtocol::V0 => b"v0",
+            VoteProtocol::V1 => b"v1",
+        });
+        bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,6 +137,32 @@ mod tests {
 
         assert_eq!(
             RoundAuthPayloadV2::new(round_id, ea_pk, layout).to_bytes(),
+            expected
+        );
+    }
+
+    #[test]
+    fn encoding_matches_round_auth_v3_wire_format() {
+        let round_id = [1u8; 32];
+        let ea_pk = [2u8; 32];
+        let layout = PirLayout {
+            pir_depth: 19,
+            tier0_layers: 12,
+            tier1_layers: 7,
+            poly_len: 4096,
+        };
+
+        let mut expected = ROUND_AUTH_DOMAIN_TAG_V3.to_vec();
+        expected.extend_from_slice(&round_id);
+        expected.extend_from_slice(&ea_pk);
+        expected.extend_from_slice(&19u32.to_le_bytes());
+        expected.extend_from_slice(&12u32.to_le_bytes());
+        expected.extend_from_slice(&7u32.to_le_bytes());
+        expected.extend_from_slice(&4096u32.to_le_bytes());
+        expected.extend_from_slice(b"v1");
+
+        assert_eq!(
+            RoundAuthPayloadV3::new(round_id, ea_pk, layout, VoteProtocol::V1).to_bytes(),
             expected
         );
     }

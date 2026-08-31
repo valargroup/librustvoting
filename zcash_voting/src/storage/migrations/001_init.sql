@@ -10,6 +10,7 @@ CREATE TABLE rounds (
     phase               INTEGER NOT NULL DEFAULT 0,
     created_at          INTEGER NOT NULL,
     bundle_policy_json  TEXT,
+    vote_protocol       TEXT NOT NULL DEFAULT 'v0' CHECK (vote_protocol IN ('v0','v1')),
     PRIMARY KEY (round_id, wallet_id)
 );
 

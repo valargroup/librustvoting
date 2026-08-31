@@ -1265,7 +1265,8 @@ impl VotingDb {
             bundle_index,
         )?;
 
-        let result = crate::zkp1::build_and_prove_delegation(
+        let result = crate::zkp1::build_and_prove_delegation_for_protocol(
+            params.vote_protocol,
             &notes,
             &keys.hotkey_raw_address,
             &alpha,
@@ -1398,7 +1399,8 @@ impl VotingDb {
                 ),
             })?;
 
-        let bundle = crate::zkp2::build_vote_commitment(
+        let bundle = crate::zkp2::build_vote_commitment_for_protocol(
+            state.zkp2.vote_protocol,
             hotkey_seed,
             state.network,
             state.zkp2.address_index,
@@ -2387,6 +2389,7 @@ mod tests {
         let ea_pk = pasta_curves::pallas::Point::from(voting_circuits::spend_auth_g_affine());
         VotingRoundParams {
             vote_round_id: ROUND_ID.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: TESTNET_NU6_SNAPSHOT_HEIGHT,
             ea_pk: ea_pk.to_bytes().to_vec(),
             nc_root: vec![0xAA; 32],
@@ -6094,10 +6097,10 @@ mod tests {
             101
         );
 
-        // Store votes for proposal 0 across both bundles
+        // Store votes for proposal 1 across both bundles
         let conn = db.conn();
-        queries::store_vote(&conn, ROUND_ID, W, 0, 0, 0, &[0xAA; 32]).unwrap();
-        queries::store_vote(&conn, ROUND_ID, W, 1, 0, 0, &[0xBB; 32]).unwrap();
+        queries::store_vote(&conn, ROUND_ID, W, 0, 1, 0, &[0xAA; 32]).unwrap();
+        queries::store_vote(&conn, ROUND_ID, W, 1, 1, 0, &[0xBB; 32]).unwrap();
         drop(conn);
 
         let votes = db.get_votes(ROUND_ID).unwrap();
@@ -6106,20 +6109,20 @@ mod tests {
         assert_eq!(votes[1].bundle_index, 1);
 
         // Record bundle 0's vote submission, verify bundle 1 still has no tx.
-        db.record_vote_submission(ROUND_ID, 0, 0, "vote-tx")
+        db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
             .unwrap();
         assert_eq!(
-            db.get_vote_tx_hash(ROUND_ID, 0, 0).unwrap().as_deref(),
+            db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
             Some("vote-tx")
         );
-        assert_eq!(db.get_vote_tx_hash(ROUND_ID, 1, 0).unwrap(), None);
+        assert_eq!(db.get_vote_tx_hash(ROUND_ID, 1, 1).unwrap(), None);
 
         // Verify proposal_authority reflects per-bundle submission state
         let conn = db.conn();
         let zkp2_0 = queries::load_zkp2_inputs(&conn, ROUND_ID, W, 0).unwrap();
         assert_eq!(
             zkp2_0.proposal_authority,
-            voting_circuits::MAX_PROPOSAL_AUTHORITY & !(1u64 << 0)
+            voting_circuits::MAX_PROPOSAL_AUTHORITY & !(1u64 << 1)
         );
         let zkp2_1 = queries::load_zkp2_inputs(&conn, ROUND_ID, W, 1).unwrap();
         assert_eq!(

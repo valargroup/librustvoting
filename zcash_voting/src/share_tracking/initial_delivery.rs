@@ -422,6 +422,9 @@ pub(crate) async fn submit_committed_share_to_helpers(
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
     let scope = share::ShareOperationScope::capture(db);
+    let vote_protocol =
+        crate::storage::queries::load_round_params(&db.conn(), round_id, scope.wallet_id())?
+            .vote_protocol;
     let configured = ConfiguredHelperFleet::new(request.configured_server_urls)?;
     let planned = canonical_helper_url_list(&request.plan.target_servers)?;
     if planned.len() != request.plan.target_servers.len() {
@@ -466,7 +469,10 @@ pub(crate) async fn submit_committed_share_to_helpers(
             proposal_id,
         )? {
             vote_recovery::HelperRecoveryMaterial::Ready(bundle) => {
-                let recovery = crate::vote::parse_recovery(&bundle.commitment_bundle_json)?;
+                let recovery = crate::vote::parse_recovery_for_protocol(
+                    &bundle.commitment_bundle_json,
+                    vote_protocol,
+                )?;
                 if recovery.vote_commitment != *expected_vote_commitment {
                     return Err(VotingError::InvalidInput {
                         message: format!(
@@ -476,8 +482,9 @@ pub(crate) async fn submit_committed_share_to_helpers(
                         ),
                     });
                 }
-                let expected_nullifier = share::nullifier_from_recovery_json(
+                let expected_nullifier = share::nullifier_from_recovery_json_for_protocol(
                     &bundle.commitment_bundle_json,
+                    vote_protocol,
                     proposal_id,
                     request.share_index,
                 )?;

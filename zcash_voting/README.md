@@ -124,6 +124,15 @@ Resolution fails closed when the field is missing or malformed, the tier-layer
 sum does not equal `pir_depth`, the depth is outside the voting circuit's
 supported range of 1 through 29, or `poly_len` is not `2048` or `4096`.
 
+The top-level `supported_versions.vote_protocol` remains independent voting
+wire-protocol negotiation (`v0` or `v1`) and does not select a proof circuit.
+Circuit selection is authenticated per round. Existing `auth_version: 2`
+entries omit a selector and remain implicitly on the legacy `v0` circuit. An
+`auth_version: 3` entry must include `"circuit_version": "v0"` or `"v1"`; v3
+adds that value to the signed round ID, election key, and PIR layout. This
+permits legacy and 50-proposal rounds in the same dynamic config without
+letting a config mirror change a round's circuit after signing.
+
 Roll out the additive `pir_layout` object (including `poly_len`) in published
 dynamic config before shipping wallet builds that require it. Older wallets
 ignore unknown fields. New clients that resolve config without it, or that
@@ -391,8 +400,8 @@ This release line requires Rust 1.91 or newer.
 - **`orchard 0.15`** from [zcash/orchard](https://github.com/zcash/orchard),
   with `unstable-voting-circuits` enabled for the governance proof paths
   (or `zakura-orchard 1.0.0` with the `zakura` feature).
-- **`voting-circuits 0.12.0-rc.1`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
-  for the delegation and vote proof circuits.
+- **`voting-circuits 0.11.2` and `0.12.0-rc.1`** from [valargroup/voting-circuits](https://github.com/valargroup/voting-circuits)
+  for legacy `v0` and 50-proposal `v1` delegation and vote proof circuits.
 - **`vote-commitment-tree 0.6.0`** and
   **`vote-commitment-tree-client 0.8.0`** for vote commitment tree state
   and optional HTTP sync.

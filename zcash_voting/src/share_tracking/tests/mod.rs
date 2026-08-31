@@ -425,6 +425,7 @@ fn seed_round_and_bundle(db: &VotingDb) {
         crate::Network::Testnet,
         &RoundParams {
             vote_round_id: ROUND_ID.to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 1000,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],

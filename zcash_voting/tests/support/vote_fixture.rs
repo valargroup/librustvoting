@@ -23,6 +23,7 @@ pub fn db_with_confirmed_committed_vote() -> VotingDb {
         Network::Testnet,
         &RoundParams {
             vote_round_id: ROUND_ID.to_string(),
+            vote_protocol: zcash_voting::VoteProtocol::V1,
             snapshot_height: 1_000,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],

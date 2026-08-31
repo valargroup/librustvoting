@@ -896,6 +896,7 @@ mod tests {
     fn target_round_params(value: u64) -> VotingRoundParams {
         VotingRoundParams {
             vote_round_id: hex::encode(pallas::Base::from(value).to_repr()),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: 100,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0xAA; 32],

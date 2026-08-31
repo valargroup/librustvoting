@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::note_bundling::BundlePolicy;
 use crate::storage::{KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord};
 use crate::types::{Network, NoteInfo, VotingError, VotingRoundParams, WitnessData};
+use crate::VoteProtocol;
 
 mod share_delegations;
 
@@ -283,6 +284,12 @@ pub(crate) fn network_from_storage(value: &str) -> Result<Network, VotingError> 
     }
 }
 
+fn vote_protocol_from_storage(value: &str) -> Result<VoteProtocol, VotingError> {
+    value.parse().map_err(|_| VotingError::Internal {
+        message: format!("stored vote protocol is invalid: {value}"),
+    })
+}
+
 pub fn insert_round(
     conn: &Connection,
     wallet_id: &str,
@@ -295,13 +302,15 @@ pub fn insert_round(
         .unwrap()
         .as_secs() as i64;
 
+    let vote_protocol = params.vote_protocol.to_string();
     conn.execute(
-        "INSERT INTO rounds (round_id, wallet_id, network, snapshot_height, ea_pk, nc_root, nullifier_imt_root, session_json, phase, created_at)
-         VALUES (:round_id, :wallet_id, :network, :snapshot_height, :ea_pk, :nc_root, :nullifier_imt_root, :session_json, :phase, :created_at)",
+        "INSERT INTO rounds (round_id, wallet_id, network, vote_protocol, snapshot_height, ea_pk, nc_root, nullifier_imt_root, session_json, phase, created_at)
+         VALUES (:round_id, :wallet_id, :network, :vote_protocol, :snapshot_height, :ea_pk, :nc_root, :nullifier_imt_root, :session_json, :phase, :created_at)",
         named_params! {
             ":round_id": params.vote_round_id,
             ":wallet_id": wallet_id,
             ":network": network_to_storage(network),
+            ":vote_protocol": vote_protocol,
             ":snapshot_height": params.snapshot_height as i64,
             ":ea_pk": params.ea_pk,
             ":nc_root": params.nc_root,
@@ -415,27 +424,45 @@ pub fn load_round_params_with_network(
     round_id: &str,
     wallet_id: &str,
 ) -> Result<(VotingRoundParams, Network), VotingError> {
-    conn.query_row(
-        "SELECT round_id, network, snapshot_height, ea_pk, nc_root, nullifier_imt_root FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
+    let row = conn
+        .query_row(
+        "SELECT round_id, network, vote_protocol, snapshot_height, ea_pk, nc_root, nullifier_imt_root FROM rounds WHERE round_id = :round_id AND wallet_id = :wallet_id",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
         |row| {
-            let network: String = row.get(1)?;
             Ok((
-                VotingRoundParams {
-                vote_round_id: row.get(0)?,
-                    snapshot_height: row.get::<_, i64>(2)? as u64,
-                    ea_pk: row.get(3)?,
-                    nc_root: row.get(4)?,
-                    nullifier_imt_root: row.get(5)?,
-                },
-                network,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
             ))
         },
     )
     .map_err(|e| VotingError::InvalidInput {
         message: format!("round not found: {} ({})", round_id, e),
-    })
-    .and_then(|(params, network)| Ok((params, network_from_storage(&network)?)))
+    })?;
+    let (
+        vote_round_id,
+        network,
+        vote_protocol,
+        snapshot_height,
+        ea_pk,
+        nc_root,
+        nullifier_imt_root,
+    ) = row;
+    Ok((
+        VotingRoundParams {
+            vote_round_id,
+            vote_protocol: vote_protocol_from_storage(&vote_protocol)?,
+            snapshot_height: snapshot_height as u64,
+            ea_pk,
+            nc_root,
+            nullifier_imt_root,
+        },
+        network_from_storage(&network)?,
+    ))
 }
 
 pub fn load_round_network(
@@ -1512,6 +1539,8 @@ pub struct Zkp2DelegationData {
     pub address_index: u32,
     pub ea_pk: Vec<u8>,
     pub voting_round_id: String,
+    /// Proof system fixed when the round was created.
+    pub vote_protocol: VoteProtocol,
     /// Current proposal authority bitmask, decremented per submitted vote.
     /// Bit `i` is set iff the voter has not yet cast a vote for proposal `i`.
     /// Since proposal IDs are 1-indexed (matching on-chain IDs), bit 0 is never
@@ -1543,10 +1572,6 @@ pub(crate) struct VotePreparationState {
     pub vote: Option<VoteRowState>,
 }
 
-/// Initial authority bitmask. Bit 0 is the dead sentinel (proposal_id=0 is
-/// rejected by the circuit); bits 1–50 are the usable slots.
-const MAX_PROPOSAL_AUTHORITY: u64 = voting_circuits::MAX_PROPOSAL_AUTHORITY;
-
 /// Load all fields ZKP #2 needs from the bundles table (persisted during delegation).
 /// Computes proposal_authority from submitted votes — each submitted vote clears its
 /// proposal's bit, so the next vote's VAN reconstruction matches what's in the VC tree.
@@ -1556,29 +1581,41 @@ pub fn load_zkp2_inputs(
     wallet_id: &str,
     bundle_index: u32,
 ) -> Result<Zkp2DelegationData, VotingError> {
-    let data = conn.query_row(
-        "SELECT b.van_comm_rand, b.total_note_value, b.address_index, r.ea_pk, r.round_id \
+    let row = conn.query_row(
+        "SELECT b.van_comm_rand, b.total_note_value, b.address_index, r.ea_pk, r.round_id, r.vote_protocol \
          FROM bundles b JOIN rounds r ON b.round_id = r.round_id AND b.wallet_id = r.wallet_id \
          WHERE b.round_id = :round_id AND b.wallet_id = :wallet_id AND b.bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| {
-            Ok(Zkp2DelegationData {
-                gov_comm_rand: row.get(0)?,
-                total_note_value: row.get::<_, i64>(1)? as u64,
-                address_index: row.get::<_, i64>(2)? as u32,
-                ea_pk: row.get(3)?,
-                voting_round_id: row.get(4)?,
-                proposal_authority: 0, // computed below
-            })
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
         },
     )
     .map_err(|e| VotingError::InvalidInput {
         message: format!("failed to load ZKP2 inputs for round={}, bundle={} ({})", round_id, bundle_index, e),
     })?;
+    let (gov_comm_rand, total_note_value, address_index, ea_pk, voting_round_id, vote_protocol) =
+        row;
+    let vote_protocol = vote_protocol_from_storage(&vote_protocol)?;
+    let data = Zkp2DelegationData {
+        gov_comm_rand,
+        total_note_value: total_note_value as u64,
+        address_index: address_index as u32,
+        ea_pk,
+        voting_round_id,
+        vote_protocol,
+        proposal_authority: 0, // computed below
+    };
 
     // Compute current proposal_authority by clearing bits for votes with a
     // durable tx hash for THIS bundle specifically.
-    let mut authority = MAX_PROPOSAL_AUTHORITY;
+    let mut authority = data.vote_protocol.initial_proposal_authority();
     let mut stmt = conn
         .prepare("SELECT proposal_id FROM votes WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index AND tx_hash IS NOT NULL")
         .map_err(|e| VotingError::Internal {
@@ -1593,16 +1630,102 @@ pub fn load_zkp2_inputs(
             message: format!("failed to query submitted votes: {}", e),
         })?;
     for row in rows {
-        let pid = row.map_err(|e| VotingError::Internal {
+        let stored_pid = row.map_err(|e| VotingError::Internal {
             message: format!("failed to read proposal_id: {}", e),
-        })? as u64;
-        authority &= !(1u64 << pid);
+        })?;
+        let max_proposal_id = data.vote_protocol.max_proposal_id();
+        if !(1..=i64::from(max_proposal_id)).contains(&stored_pid) {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "stored submitted proposal_id {stored_pid} is invalid for vote protocol {} (expected 1..={max_proposal_id})",
+                    data.vote_protocol
+                ),
+            });
+        }
+        authority &= !(1u64 << stored_pid as u32);
     }
 
     Ok(Zkp2DelegationData {
         proposal_authority: authority,
         ..data
     })
+}
+
+#[cfg(test)]
+mod vote_protocol_storage_tests {
+    use super::*;
+
+    const ROUND_ID: &str = "protocol-round";
+    const WALLET_ID: &str = "protocol-wallet";
+
+    fn setup(protocol: VoteProtocol) -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::storage::migrations::migrate(&mut conn).unwrap();
+        insert_round(
+            &conn,
+            WALLET_ID,
+            Network::Testnet,
+            &VotingRoundParams {
+                vote_round_id: ROUND_ID.to_string(),
+                vote_protocol: protocol,
+                snapshot_height: 100,
+                ea_pk: vec![0xEA; 32],
+                nc_root: vec![0xAA; 32],
+                nullifier_imt_root: vec![0xBB; 32],
+            },
+            None,
+        )
+        .unwrap();
+        insert_bundle(&conn, ROUND_ID, WALLET_ID, 0, &[1]).unwrap();
+        conn.execute(
+            "UPDATE bundles
+             SET van_comm_rand = ?1, total_note_value = 1000, address_index = 0
+             WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 0",
+            rusqlite::params![vec![0xCC_u8; 32], ROUND_ID, WALLET_ID],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn round_protocol_round_trips_and_selects_initial_authority() {
+        for protocol in [VoteProtocol::V0, VoteProtocol::V1] {
+            let conn = setup(protocol);
+
+            assert_eq!(
+                load_round_params(&conn, ROUND_ID, WALLET_ID)
+                    .unwrap()
+                    .vote_protocol,
+                protocol
+            );
+            let zkp2 = load_zkp2_inputs(&conn, ROUND_ID, WALLET_ID, 0).unwrap();
+            assert_eq!(zkp2.vote_protocol, protocol);
+            assert_eq!(
+                zkp2.proposal_authority,
+                protocol.initial_proposal_authority()
+            );
+        }
+    }
+
+    #[test]
+    fn zkp2_rejects_submitted_proposal_outside_round_protocol() {
+        let conn = setup(VoteProtocol::V0);
+        conn.execute(
+            "INSERT INTO votes
+             (round_id, wallet_id, bundle_index, proposal_id, choice, created_at, tx_hash)
+             VALUES (?1, ?2, 0, 16, 0, 0, 'submitted')",
+            rusqlite::params![ROUND_ID, WALLET_ID],
+        )
+        .unwrap();
+
+        let error = load_zkp2_inputs(&conn, ROUND_ID, WALLET_ID, 0).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("proposal_id 16 is invalid for vote protocol v0"),
+            "{error}"
+        );
+    }
 }
 
 /// Load the read-only snapshot used before preparing or committing a vote.

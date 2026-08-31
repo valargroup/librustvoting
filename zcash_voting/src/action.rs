@@ -433,7 +433,8 @@ pub(crate) fn build_governance_pczt(
     let van_comm_rand: [u8; 32] = van_comm_rand_fp.to_repr();
 
     // Compute VAN
-    let van = governance::construct_van(
+    let van = governance::construct_van_for_protocol(
+        params.vote_protocol,
         &derived_g_d_new_x,
         &derived_pk_d_new_x,
         total_weight,
@@ -802,6 +803,7 @@ mod tests {
             // Hex string representing 32 bytes
             vote_round_id: "0101010101010101010101010101010101010101010101010101010101010101"
                 .to_string(),
+            vote_protocol: crate::VoteProtocol::V1,
             snapshot_height: MAINNET_NU5_SNAPSHOT_HEIGHT,
             ea_pk: vec![0xEA; 32],
             nc_root: vec![0x01; 32],

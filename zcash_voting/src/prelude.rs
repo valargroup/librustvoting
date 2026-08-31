@@ -89,12 +89,13 @@ pub use crate::share_tracking::{
     ShareTrackingReport,
 };
 pub use crate::types::{
-    validate_proposal_id, validate_vote_decision, validate_vote_options, DelegationProgressBridge,
-    DelegationProgressReporter, Network, NoopProgressReporter, NoteInfo, NoteRef,
-    PirCachePrecomputeResult, PirCacheValidationReport, PirProofCacheEntry, PirProofCacheStatus,
-    ProgressReporter, RoundBoundVotingHotkeyTarget, SelectedNotes, SharePayload,
-    VoteCommitStageBridge, VoteCommitStageReporter, VotingHotkey, VotingHotkeyTarget, WitnessData,
-    MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID, MIN_VOTE_OPTIONS,
+    validate_proposal_id, validate_proposal_id_for_protocol, validate_vote_decision,
+    validate_vote_options, DelegationProgressBridge, DelegationProgressReporter, Network,
+    NoopProgressReporter, NoteInfo, NoteRef, PirCachePrecomputeResult, PirCacheValidationReport,
+    PirProofCacheEntry, PirProofCacheStatus, ProgressReporter, RoundBoundVotingHotkeyTarget,
+    SelectedNotes, SharePayload, VoteCommitStageBridge, VoteCommitStageReporter, VotingHotkey,
+    VotingHotkeyTarget, WitnessData, MAX_PROPOSAL_ID, MAX_VOTE_OPTIONS, MIN_PROPOSAL_ID,
+    MIN_VOTE_OPTIONS,
 };
 pub use crate::vote::{
     commit as commit_vote, commit_atomic_vote_batch, commit_batch, parse_recovery,
@@ -114,7 +115,10 @@ pub use crate::wire::{
     DelegationSubmissionWire, SignedVoteBatchView, VoteCommitmentBatchWire, VoteCommitmentWire,
     VoteShareWire, VotingHotkeyTargetV1,
 };
-pub use crate::{warm_proving_caches, warm_zkp2_proving_cache};
+pub use crate::{
+    warm_proving_caches, warm_proving_caches_for, warm_zkp2_proving_cache,
+    warm_zkp2_proving_cache_for, VoteProtocol,
+};
 
 pub use crate::precompute::delegation_pir;
 

@@ -18,6 +18,7 @@ use zip32::Scope;
 
 use crate::governance::BUNDLE_NOTE_SLOTS;
 pub use crate::wire::VotingRoundParams;
+use crate::VoteProtocol;
 
 /// Lowest valid on-chain proposal identifier. Proposal id 0 is reserved by the
 /// vote circuit.
@@ -1000,6 +1001,23 @@ pub fn validate_proposal_id(proposal_id: u32) -> Result<(), VotingError> {
             message: format!(
                 "proposal_id must be {}..={}, got {}",
                 MIN_PROPOSAL_ID, MAX_PROPOSAL_ID, proposal_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validates a proposal id against the proof system fixed for its round.
+pub fn validate_proposal_id_for_protocol(
+    protocol: VoteProtocol,
+    proposal_id: u32,
+) -> Result<(), VotingError> {
+    let max_proposal_id = protocol.max_proposal_id();
+    if !(MIN_PROPOSAL_ID..=max_proposal_id).contains(&proposal_id) {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "proposal_id must be {}..={} for vote protocol {}, got {}",
+                MIN_PROPOSAL_ID, max_proposal_id, protocol, proposal_id
             ),
         });
     }
