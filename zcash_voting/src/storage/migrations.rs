@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 16;
+pub(super) const CURRENT_VERSION: u32 = 16;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.

@@ -72,7 +72,80 @@ fn validate_delegation_keys_for_round(
     keys.validate_target_round(params)
 }
 
-fn validate_network_matches_round(
+fn load_delegation_signing_request_with_conn(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    keys: &DelegationKeys,
+) -> Result<DelegationSigningRequest, VotingError> {
+    let (params, stored_network) =
+        queries::load_round_params_with_network(conn, round_id, wallet_id)?;
+    validate_delegation_keys_for_round(&params, stored_network, keys)?;
+    let sighash = queries::load_pczt_sighash(conn, round_id, wallet_id, bundle_index)?;
+    let alpha = queries::load_alpha(conn, round_id, wallet_id, bundle_index)?;
+
+    Ok(DelegationSigningRequest {
+        account_index: keys.account_index,
+        network: stored_network,
+        seed_fingerprint: keys.seed_fingerprint,
+        sighash: sighash
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!("pczt_sighash must be 32 bytes, got {}", sighash.len()),
+            })?,
+        alpha: alpha
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!("alpha must be 32 bytes, got {}", alpha.len()),
+            })?,
+    })
+}
+
+fn load_delegation_submission_with_checked_signature(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    signature: &[u8],
+    sighash: &[u8],
+    mismatch_message: &str,
+) -> Result<DelegationSubmissionData, VotingError> {
+    let data = queries::load_delegation_submission_data(conn, round_id, wallet_id, bundle_index)?;
+    let stored_sighash = queries::load_pczt_sighash(conn, round_id, wallet_id, bundle_index)?;
+    if stored_sighash.len() != 32 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "pczt_sighash must be 32 bytes, got {}",
+                stored_sighash.len()
+            ),
+        });
+    }
+    if stored_sighash.as_slice() != sighash {
+        return Err(VotingError::InvalidInput {
+            message: mismatch_message.to_string(),
+        });
+    }
+    verify_delegation_spend_auth_signature(&data.rk, &stored_sighash, signature)?;
+
+    Ok(DelegationSubmissionData {
+        proof: data.proof,
+        rk: data.rk,
+        nf_signed: data.nf_signed,
+        cmx_new: data.cmx_new,
+        gov_comm: data.gov_comm,
+        gov_nullifiers: data.gov_nullifiers,
+        alpha: data.alpha,
+        vote_round_id: data.vote_round_id,
+        spend_auth_sig: signature.to_vec(),
+        sighash: stored_sighash,
+        tx1_effects: data.tx1_effects,
+    })
+}
+
+pub(crate) fn validate_network_matches_round(
     stored_network: Network,
     requested_network: Network,
     label: &str,
@@ -598,29 +671,35 @@ impl VotingDb {
     ) -> Result<DelegationSigningRequest, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let (params, stored_network) =
-            queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
-        validate_delegation_keys_for_round(&params, stored_network, keys)?;
-        let sighash = queries::load_pczt_sighash(&conn, round_id, &wallet_id, bundle_index)?;
-        let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
+        load_delegation_signing_request_with_conn(&conn, round_id, &wallet_id, bundle_index, keys)
+    }
 
-        Ok(DelegationSigningRequest {
-            account_index: keys.account_index,
-            network: stored_network,
-            seed_fingerprint: keys.seed_fingerprint,
-            sighash: sighash
-                .as_slice()
-                .try_into()
-                .map_err(|_| VotingError::Internal {
-                    message: format!("pczt_sighash must be 32 bytes, got {}", sighash.len()),
-                })?,
-            alpha: alpha
-                .as_slice()
-                .try_into()
-                .map_err(|_| VotingError::Internal {
-                    message: format!("alpha must be 32 bytes, got {}", alpha.len()),
-                })?,
-        })
+    pub(crate) fn get_recoverable_delegation_signing_request(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        keys: &DelegationKeys,
+        authority: crate::recoverable_authority::RecoverableBundleUseV1<'_>,
+    ) -> Result<DelegationSigningRequest, VotingError> {
+        let wallet_id = self.wallet_id();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| VotingError::Internal {
+                message: format!("begin recoverable delegation signing read failed: {error}"),
+            })?;
+        authority.validate_persisted_with_conn(&tx, &wallet_id, round_id, bundle_index)?;
+        let request = load_delegation_signing_request_with_conn(
+            &tx,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            keys,
+        )?;
+        tx.commit().map_err(|error| VotingError::Internal {
+            message: format!("finish recoverable delegation signing read failed: {error}"),
+        })?;
+        Ok(request)
     }
 
     /// Build a governance-specific PCZT for Keystone signing.
@@ -638,6 +717,44 @@ impl VotingDb {
         keys: &DelegationKeys,
         consensus_branch_id: u32,
     ) -> Result<GovernancePczt, VotingError> {
+        self.build_governance_pczt_inner(
+            round_id,
+            bundle_index,
+            notes,
+            keys,
+            consensus_branch_id,
+            None,
+        )
+    }
+
+    pub(crate) fn build_governance_pczt_with_van_blinding(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        notes: &[NoteInfo],
+        keys: &DelegationKeys,
+        consensus_branch_id: u32,
+        van_blinding: &crate::recoverable_authority::RecoverableVanBlindingV1,
+    ) -> Result<GovernancePczt, VotingError> {
+        self.build_governance_pczt_inner(
+            round_id,
+            bundle_index,
+            notes,
+            keys,
+            consensus_branch_id,
+            Some(van_blinding),
+        )
+    }
+
+    fn build_governance_pczt_inner(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        notes: &[NoteInfo],
+        keys: &DelegationKeys,
+        consensus_branch_id: u32,
+        recoverable_van_blinding: Option<&crate::recoverable_authority::RecoverableVanBlindingV1>,
+    ) -> Result<GovernancePczt, VotingError> {
         let wallet_id = self.wallet_id();
         let (params, stored_network) = {
             let conn = self.conn();
@@ -653,19 +770,35 @@ impl VotingDb {
             (params, stored_network)
         };
         let padded_note_secrets = self.ensure_padded_secrets(round_id, bundle_index, notes)?;
-        let result = crate::action::build_governance_pczt(
-            notes,
-            &params,
-            stored_network,
-            &keys.fvk_bytes,
-            &keys.hotkey_raw_address,
-            consensus_branch_id,
-            keys.coin_type,
-            &keys.seed_fingerprint,
-            keys.account_index,
-            &keys.round_name,
-            &padded_note_secrets,
-        )?;
+        let result = match recoverable_van_blinding {
+            Some(van_blinding) => crate::action::build_governance_pczt_with_van_blinding(
+                notes,
+                &params,
+                stored_network,
+                &keys.fvk_bytes,
+                &keys.hotkey_raw_address,
+                consensus_branch_id,
+                keys.coin_type,
+                &keys.seed_fingerprint,
+                keys.account_index,
+                &keys.round_name,
+                &padded_note_secrets,
+                van_blinding,
+            )?,
+            None => crate::action::build_governance_pczt(
+                notes,
+                &params,
+                stored_network,
+                &keys.fvk_bytes,
+                &keys.hotkey_raw_address,
+                consensus_branch_id,
+                keys.coin_type,
+                &keys.seed_fingerprint,
+                keys.account_index,
+                &keys.round_name,
+                &padded_note_secrets,
+            )?,
+        };
         // Compute total note value from input notes
         let total_note_value: u64 = notes
             .iter()
@@ -1349,11 +1482,55 @@ impl VotingDb {
         single_share: bool,
         progress: &dyn ProgressReporter,
     ) -> Result<PreparedVoteProof, VotingError> {
+        let spending_key = crate::hotkey::spending_key_from_hotkey_seed(
+            hotkey_seed,
+            signer_network,
+            crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX,
+        )?;
+        self.prepare_vote_commitment_with_spending_key(
+            round_id,
+            bundle_index,
+            &spending_key,
+            signer_network,
+            None,
+            proposal_id,
+            choice,
+            num_options,
+            van_auth_path,
+            van_position,
+            anchor_height,
+            single_share,
+            progress,
+        )
+    }
+
+    /// Captures vote state and builds ZKP #2 with an already-derived Orchard
+    /// voting key.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_vote_commitment_with_spending_key(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        spending_key: &orchard::keys::SpendingKey,
+        signer_network: crate::Network,
+        recoverable_authority: Option<crate::recoverable_authority::RecoverableBundleUseV1<'_>>,
+        proposal_id: u32,
+        choice: u32,
+        num_options: u32,
+        van_auth_path: &[[u8; 32]],
+        van_position: u32,
+        anchor_height: u32,
+        single_share: bool,
+        progress: &dyn ProgressReporter,
+    ) -> Result<PreparedVoteProof, VotingError> {
         let mut conn = self.conn();
         let wallet_id = self.wallet_id();
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("failed to begin vote preparation transaction: {e}"),
         })?;
+        if let Some(authority) = recoverable_authority {
+            authority.validate_persisted_with_conn(&tx, &wallet_id, round_id, bundle_index)?;
+        }
         // Check the signer's network before loading the rest of the state. Capturing
         // state first makes a mismatched network surface as a missing-row error from
         // the ZKP2 lookup, which hides the real cause from the caller.
@@ -1398,9 +1575,8 @@ impl VotingDb {
                 ),
             })?;
 
-        let bundle = crate::zkp2::build_vote_commitment(
-            hotkey_seed,
-            state.network,
+        let bundle = crate::zkp2::build_vote_commitment_from_spending_key(
+            spending_key,
             state.zkp2.address_index,
             state.zkp2.total_note_value,
             &state.zkp2.gov_comm_rand,
@@ -1491,6 +1667,27 @@ impl VotingDb {
             "signature",
             "sighash",
             "sighash does not match stored PCZT sighash",
+            None,
+        )
+    }
+
+    pub(crate) fn get_recoverable_delegation_submission_with_signature(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        signature: &[u8],
+        sighash: &[u8],
+        authority: crate::recoverable_authority::RecoverableBundleUseV1<'_>,
+    ) -> Result<DelegationSubmissionData, VotingError> {
+        self.get_delegation_submission_with_checked_signature(
+            round_id,
+            bundle_index,
+            signature,
+            sighash,
+            "signature",
+            "sighash",
+            "sighash does not match stored PCZT sighash",
+            Some(authority),
         )
     }
 
@@ -1503,6 +1700,7 @@ impl VotingDb {
         signature_label: &str,
         sighash_label: &str,
         mismatch_message: &str,
+        authority: Option<crate::recoverable_authority::RecoverableBundleUseV1<'_>>,
     ) -> Result<DelegationSubmissionData, VotingError> {
         if signature.len() != 64 {
             return Err(VotingError::InvalidInput {
@@ -1518,39 +1716,42 @@ impl VotingDb {
             });
         }
 
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let data =
-            queries::load_delegation_submission_data(&conn, round_id, &wallet_id, bundle_index)?;
-        let stored_sighash = queries::load_pczt_sighash(&conn, round_id, &wallet_id, bundle_index)?;
-        if stored_sighash.len() != 32 {
-            return Err(VotingError::Internal {
-                message: format!(
-                    "pczt_sighash must be 32 bytes, got {}",
-                    stored_sighash.len()
-                ),
-            });
+        if let Some(authority) = authority {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(|error| VotingError::Internal {
+                    message: format!(
+                        "begin recoverable delegation submission read failed: {error}"
+                    ),
+                })?;
+            authority.validate_persisted_with_conn(&tx, &wallet_id, round_id, bundle_index)?;
+            let data = load_delegation_submission_with_checked_signature(
+                &tx,
+                round_id,
+                &wallet_id,
+                bundle_index,
+                signature,
+                sighash,
+                mismatch_message,
+            )?;
+            tx.commit().map_err(|error| VotingError::Internal {
+                message: format!("finish recoverable delegation submission read failed: {error}"),
+            })?;
+            Ok(data)
+        } else {
+            let conn = self.conn();
+            load_delegation_submission_with_checked_signature(
+                &conn,
+                round_id,
+                &wallet_id,
+                bundle_index,
+                signature,
+                sighash,
+                mismatch_message,
+            )
         }
-        if stored_sighash.as_slice() != sighash {
-            return Err(VotingError::InvalidInput {
-                message: mismatch_message.to_string(),
-            });
-        }
-        verify_delegation_spend_auth_signature(&data.rk, &stored_sighash, signature)?;
-
-        Ok(DelegationSubmissionData {
-            proof: data.proof,
-            rk: data.rk,
-            nf_signed: data.nf_signed,
-            cmx_new: data.cmx_new,
-            gov_comm: data.gov_comm,
-            gov_nullifiers: data.gov_nullifiers,
-            alpha: data.alpha,
-            vote_round_id: data.vote_round_id,
-            spend_auth_sig: signature.to_vec(),
-            sighash: stored_sighash,
-            tx1_effects: data.tx1_effects,
-        })
     }
 
     /// Delete local bundle rows with index >= `keep_count`, so that only the
@@ -1783,9 +1984,9 @@ impl VotingDb {
     }
 
     /// Clears unconfirmed recovery artifacts while preserving ballot intent,
-    /// recorded vote confirmations, and imported delegation capabilities. Use
-    /// `clear_round`/`delete_round` to remove the whole round, including
-    /// recorded decisions.
+    /// the durable recoverable-ballot lock, recorded vote confirmations, and
+    /// imported delegation capabilities. Use `clear_round`/`delete_round` to
+    /// remove the whole round, including recorded decisions.
     pub fn clear_recovery_state(&self, round_id: &str) -> Result<(), VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();

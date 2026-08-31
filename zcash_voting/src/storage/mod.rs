@@ -10,6 +10,9 @@ use crate::types::{Network, VotingError};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = migrations::CURRENT_VERSION;
+
 /// Current phase of a voting round.
 ///
 /// Discriminants are ordered lifecycle ranks; `advance_round_phase` compares
@@ -157,7 +160,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
