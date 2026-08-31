@@ -313,32 +313,12 @@ Failure to find an initial VAN is not by itself permission to delegate again.
 Ordinary transaction reconciliation must first establish that the delegation
 was never confirmed and that its source notes remain usable.
 
-### Votes awaiting helper completion
-
-Authority recovery does not by itself restore a vote that was broadcast while
-helper-share delivery was still incomplete. During that interval,
-`zcash_voting` exports and imports a versioned backup of the complete pending
-vote or ordered atomic batch and its existing helper-tracker state. Multiple
-pending votes may coexist; updating or retiring one must not discard or
-resurrect another.
-
-The wallet durably stores the required state before each vote or helper POST
-that depends on it. Because the backup contains ballot secrets, it must be
-encrypted, authenticated, crash-safe, and able to detect stale rollback. The
-storage layout and atomic-update mechanism are implementation details.
-
-Restore validates the authority, round, bundle, batch, confirmed tree
-positions, complete original helper plans, and delivery identities before
-resuming the existing tracker. It preserves durable schedules, targets, and
-accepted, ambiguous, and interrupted evidence, and it permits no helper POST
-without a real confirmed tree position. Helper behavior continues to follow
-the [helper submission invariants](helper_submission_invariants.md).
-
-The backup remains available until an unsubmitted intent is validly replaced
-or the tracker marks every expected share confirmed. Ordinary recovery cleanup
-must not remove the last restorable copy while helper completion is pending.
-Retirement must not allow an older backup to reappear as live state. Complete
-confirmed vote history is not retained.
+Authority recovery does not preserve an interrupted helper-delivery ledger.
+After reconstructing the authority and vote state, the existing helper recovery
+path applies unchanged. In that exceptional case it may send shares to another
+set of configured helpers, potentially the complete fleet. Version 1 accepts
+that recovery-only privacy cost instead of adding helper checkpoint, import, or
+delivery behavior to this feature.
 
 ## Batching
 
@@ -370,12 +350,14 @@ after their authorities and delegation bundles have already been constructed.
 - Funds in custody remain dependent on the retained or redelivered capability.
 - Custom note selection remains outside the recoverable path unless it carries
   a complete, versioned recovery description.
+- Helper selection, delivery, tracking, persistence, and recovery policy remain
+  unchanged.
 
 ## Ownership
 
 | Component | Responsibility |
 | --- | --- |
-| `zcash_voting` | Versioned context and source types; master-to-round-root, hotkey, and self-custody bundle derivation; custody capability validation; round selection; VAN recovery; pending-vote export/import; shared vectors and fixtures |
+| `zcash_voting` | Versioned context and source types; master-to-round-root, hotkey, and self-custody bundle derivation; custody capability validation; round selection; VAN recovery; shared vectors and fixtures |
 | Wallet integration | Seed or master provider; master creation and rotation; rollback-protected round and source bindings; retained per-round roots; encrypted backups; snapshot rescan; independently authenticated recovery checkpoint; recovery UX |
 | Current Keystone integration | Master-backup gate, account binding, rollback-protected generation selection, and existing PCZT or PCZT-batch signing |
 | Keystone firmware | No version 1 change; a future root provider may use the same boundary |
@@ -399,7 +381,8 @@ Reviewers are being asked to approve these directions:
    snapshot height, and block hash;
 6. recovery by validated VAN transition traversal rather than saved transaction
    history;
-7. reuse of the existing helper tracker for votes awaiting helper completion;
+7. no helper-delivery or tracker-checkpoint change, with existing recovery
+   fan-out accepted for the exceptional restore path;
 8. master rotation that can change only unused authorities, with every round and
    source binding rollback-protected and immutable once use is possible; and
 9. no circuit, vote-chain, batching, or Keystone firmware change in version 1.
