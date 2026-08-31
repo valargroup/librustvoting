@@ -202,9 +202,13 @@ field element. `VAN` is the already-computed commitment containing the one
 hotkey address, delegated weight, round, and VAN blinding value. `round_id` is
 the same voting-round field element used in the VAN and ZKP #1.
 
-The same seven inputs always produce the same `rho_signed`. A fresh delegation
-setup will normally produce a different value because the VAN blinding value
-and any padding-note secrets are fresh.
+The same seven inputs always produce the same `rho_signed`. Local voting hotkey
+delegation derives its VAN blinding from the hotkey secret, network, round
+parameters, bundle index, and real note identities. Restoring or reusing all of
+those inputs reproduces the same VAN. `rho_signed` also reproduces only when all
+five real and padding note commitments are the same; a fresh voting database
+may sample different padding note secrets. Public target delegation has no
+local hotkey secret and continues to sample a fresh VAN blinding.
 
 ### How the signed note is made
 
