@@ -17,6 +17,7 @@ use std::{
 };
 
 use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
+use sha2::{Digest, Sha256};
 
 use crate::{
     round::VotingDb,
@@ -38,6 +39,7 @@ pub const MAX_VOTE_BATCH_ACTIONS: usize = 15;
 
 const VOTE_RECOVERY_FORMAT: &str = "zcash_voting_vote_recovery_v1";
 const VOTE_BATCH_RECOVERY_FORMAT: &str = "zcash_voting_vote_batch_recovery_v1";
+const RECOVERABLE_BALLOT_FINGERPRINT_DOMAIN: &[u8] = b"zcash_voting/recoverable-complete-ballot/v1";
 
 /// Wallet-supplied cast-vote intent for one proposal in one bundle.
 pub use crate::wire::DraftVote;
@@ -637,11 +639,30 @@ pub fn prepare_atomic_vote_batch(
     signer: VoteSigner<'_>,
     batch: AtomicVoteBatch<'_>,
 ) -> Result<PreparedAtomicVoteBatch, VotingError> {
+    prepare_atomic_vote_batch_with_signer(db, resolve_batch_vote_signer(signer), batch)
+}
+
+pub(crate) fn prepare_recoverable_atomic_vote_batch_v1(
+    db: &VotingDb,
+    authority: crate::recoverable_authority::RecoverableBundleUseV1<'_>,
+    batch: AtomicVoteBatch<'_>,
+) -> Result<PreparedAtomicVoteBatch, VotingError> {
+    prepare_atomic_vote_batch_with_signer(
+        db,
+        resolve_recoverable_batch_vote_signer(authority)?,
+        batch,
+    )
+}
+
+fn prepare_atomic_vote_batch_with_signer(
+    db: &VotingDb,
+    signer: ResolvedBatchVoteSigner<'_>,
+    batch: AtomicVoteBatch<'_>,
+) -> Result<PreparedAtomicVoteBatch, VotingError> {
     validate_atomic_vote_batch(batch.drafts)?;
     let bundle_count = db.get_bundle_count(batch.round_id)?;
     crate::round::validate_bundle_index(bundle_count, batch.bundle_index, "voting")?;
-    let (secret, network) = signer_secret_and_network(signer);
-    db.require_round_network(batch.round_id, network, "vote signer")?;
+    let network = signer.network();
     let wallet_id = db.wallet_id();
 
     // Capture every proposal row under one read transaction. The proofs run
@@ -652,6 +673,13 @@ pub fn prepare_atomic_vote_batch(
         let tx = conn.transaction().map_err(|e| VotingError::Internal {
             message: format!("failed to begin vote batch preparation transaction: {e}"),
         })?;
+        validate_batch_vote_signer_with_conn(
+            &tx,
+            &wallet_id,
+            batch.round_id,
+            batch.bundle_index,
+            signer,
+        )?;
         let mut recoveries = Vec::with_capacity(batch.drafts.len());
         for draft in batch.drafts {
             recoveries.push(recovery_bundle_with_conn(
@@ -761,16 +789,31 @@ pub fn prepare_atomic_vote_batch(
     let mut authority = first_state.zkp2.proposal_authority;
     let mut proof_plans = Vec::with_capacity(batch.drafts.len());
     for (index, (draft, state)) in batch.drafts.iter().zip(captured.iter()).enumerate() {
-        let transition = crate::zkp2::plan_vote_authority_transition(
-            secret,
-            network,
-            state.zkp2.address_index,
-            state.zkp2.total_note_value,
-            &state.zkp2.gov_comm_rand,
-            &round_id_bytes,
-            draft.proposal_id,
-            authority,
-        )?;
+        let transition = match signer {
+            ResolvedBatchVoteSigner::Legacy { secret, network } => {
+                crate::zkp2::plan_vote_authority_transition(
+                    secret,
+                    network,
+                    state.zkp2.address_index,
+                    state.zkp2.total_note_value,
+                    &state.zkp2.gov_comm_rand,
+                    &round_id_bytes,
+                    draft.proposal_id,
+                    authority,
+                )?
+            }
+            ResolvedBatchVoteSigner::Recoverable { spending_key, .. } => {
+                crate::zkp2::plan_vote_authority_transition_from_spending_key(
+                    &spending_key,
+                    state.zkp2.address_index,
+                    state.zkp2.total_note_value,
+                    &state.zkp2.gov_comm_rand,
+                    &round_id_bytes,
+                    draft.proposal_id,
+                    authority,
+                )?
+            }
+        };
         authority = transition.proposal_authority_new;
         let (auth_path, position) = if index == 0 {
             (batch.witness.auth_path_fixed()?, batch.witness.position)
@@ -791,7 +834,7 @@ pub fn prepare_atomic_vote_batch(
     }
 
     let bundles = build_batch_proofs(
-        secret,
+        signer,
         batch.bundle_index,
         batch.witness.anchor_height,
         &round_id_bytes,
@@ -846,12 +889,23 @@ pub fn prepare_atomic_vote_batch(
             proposal_id: plan.draft.proposal_id,
             bundle_index: batch.bundle_index,
         });
-        let signature = crate::vote_commitment::sign_cast_vote_digest(
-            secret,
-            network,
-            &batch_digest,
-            &bundle.alpha_v,
-        )?;
+        let signature = match signer {
+            ResolvedBatchVoteSigner::Legacy { secret, network } => {
+                crate::vote_commitment::sign_cast_vote_digest(
+                    secret,
+                    network,
+                    &batch_digest,
+                    &bundle.alpha_v,
+                )?
+            }
+            ResolvedBatchVoteSigner::Recoverable { spending_key, .. } => {
+                crate::vote_commitment::sign_cast_vote_digest_with_spending_key(
+                    &spending_key,
+                    &batch_digest,
+                    &bundle.alpha_v,
+                )?
+            }
+        };
         let vote_auth_sig = array64("vote_auth_sig", signature.vote_auth_sig)?;
         let mut recovery =
             VoteRecoveryBundle::from_parts(batch.bundle_index, &plan.draft, bundle, vote_auth_sig)?;
@@ -893,12 +947,21 @@ pub fn persist_prepared_atomic_vote_batch(
     db: &VotingDb,
     prepared: PreparedAtomicVoteBatch,
 ) -> Result<SignedVoteBatch, VotingError> {
-    persist_prepared_atomic_vote_batch_inner(db, prepared, || {})
+    persist_prepared_atomic_vote_batch_inner(db, prepared, None, || {})
+}
+
+pub(crate) fn persist_prepared_recoverable_atomic_vote_batch_v1(
+    db: &VotingDb,
+    prepared: PreparedAtomicVoteBatch,
+    proposal_count: u32,
+) -> Result<SignedVoteBatch, VotingError> {
+    persist_prepared_atomic_vote_batch_inner(db, prepared, Some(proposal_count), || {})
 }
 
 fn persist_prepared_atomic_vote_batch_inner<F>(
     db: &VotingDb,
     prepared: PreparedAtomicVoteBatch,
+    recoverable_proposal_count: Option<u32>,
     after_persist: F,
 ) -> Result<SignedVoteBatch, VotingError>
 where
@@ -925,7 +988,7 @@ where
         .iter()
         .map(|prepared| signed_commitment_from_parts(&prepared.commit, &prepared.recovery))
         .collect::<Result<Vec<_>, _>>()?;
-    persist_prepared_commits(db, prepared_commits)?;
+    persist_prepared_commits(db, prepared_commits, recoverable_proposal_count)?;
     after_persist();
     Ok(SignedVoteBatch {
         bundle_index,
@@ -1095,7 +1158,7 @@ fn single_leaf_auth_path(
 
 #[allow(clippy::too_many_arguments)]
 fn build_batch_proofs(
-    hotkey_seed: &[u8],
+    signer: ResolvedBatchVoteSigner<'_>,
     bundle_index: u32,
     anchor_height: u32,
     round_id_bytes: &[u8],
@@ -1128,24 +1191,47 @@ fn build_batch_proofs(
                         bundle_index,
                         stages,
                     };
-                    let result = crate::zkp2::build_vote_commitment(
-                        hotkey_seed,
-                        plan.state.network,
-                        plan.state.zkp2.address_index,
-                        plan.state.zkp2.total_note_value,
-                        &plan.state.zkp2.gov_comm_rand,
-                        round_id_bytes,
-                        &plan.state.zkp2.ea_pk,
-                        plan.draft.proposal_id,
-                        plan.draft.choice,
-                        plan.draft.num_options,
-                        &plan.auth_path,
-                        plan.position,
-                        anchor_height,
-                        plan.proposal_authority,
-                        plan.draft.single_share,
-                        &progress,
-                    )
+                    let result = match signer {
+                        ResolvedBatchVoteSigner::Legacy { secret, network } => {
+                            crate::zkp2::build_vote_commitment(
+                                secret,
+                                network,
+                                plan.state.zkp2.address_index,
+                                plan.state.zkp2.total_note_value,
+                                &plan.state.zkp2.gov_comm_rand,
+                                round_id_bytes,
+                                &plan.state.zkp2.ea_pk,
+                                plan.draft.proposal_id,
+                                plan.draft.choice,
+                                plan.draft.num_options,
+                                &plan.auth_path,
+                                plan.position,
+                                anchor_height,
+                                plan.proposal_authority,
+                                plan.draft.single_share,
+                                &progress,
+                            )
+                        }
+                        ResolvedBatchVoteSigner::Recoverable { spending_key, .. } => {
+                            crate::zkp2::build_vote_commitment_from_spending_key(
+                                &spending_key,
+                                plan.state.zkp2.address_index,
+                                plan.state.zkp2.total_note_value,
+                                &plan.state.zkp2.gov_comm_rand,
+                                round_id_bytes,
+                                &plan.state.zkp2.ea_pk,
+                                plan.draft.proposal_id,
+                                plan.draft.choice,
+                                plan.draft.num_options,
+                                &plan.auth_path,
+                                plan.position,
+                                anchor_height,
+                                plan.proposal_authority,
+                                plan.draft.single_share,
+                                &progress,
+                            )
+                        }
+                    }
                     .and_then(|bundle| {
                         if bundle.vote_authority_note_new != plan.expected_new_van {
                             return Err(VotingError::Internal {
@@ -1328,6 +1414,65 @@ impl<'a> VoteSigner<'a> {
     /// Builds a vote signer from crate-owned voting hotkey material.
     pub fn hotkey(hotkey: &'a VotingHotkey) -> Self {
         Self::Hotkey { hotkey }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResolvedBatchVoteSigner<'a> {
+    Legacy {
+        secret: &'a [u8],
+        network: Network,
+    },
+    Recoverable {
+        spending_key: orchard::keys::SpendingKey,
+        authority: crate::recoverable_authority::RecoverableBundleUseV1<'a>,
+    },
+}
+
+impl ResolvedBatchVoteSigner<'_> {
+    fn network(self) -> Network {
+        match self {
+            Self::Legacy { network, .. } => network,
+            Self::Recoverable { authority, .. } => authority.authority_root().context().network(),
+        }
+    }
+}
+
+fn resolve_batch_vote_signer(signer: VoteSigner<'_>) -> ResolvedBatchVoteSigner<'_> {
+    let (secret, network) = signer_secret_and_network(signer);
+    ResolvedBatchVoteSigner::Legacy { secret, network }
+}
+
+fn resolve_recoverable_batch_vote_signer(
+    authority: crate::recoverable_authority::RecoverableBundleUseV1<'_>,
+) -> Result<ResolvedBatchVoteSigner<'_>, VotingError> {
+    let hotkey = authority.authority_root().voting_hotkey()?;
+    Ok(ResolvedBatchVoteSigner::Recoverable {
+        spending_key: hotkey.orchard_spending_key(),
+        authority,
+    })
+}
+
+fn validate_batch_vote_signer_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    signer: ResolvedBatchVoteSigner<'_>,
+) -> Result<(), VotingError> {
+    match signer {
+        ResolvedBatchVoteSigner::Legacy { network, .. } => {
+            let stored_network =
+                crate::storage::queries::load_round_network(conn, round_id, wallet_id)?;
+            crate::storage::operations::validate_network_matches_round(
+                stored_network,
+                network,
+                "vote signer",
+            )
+        }
+        ResolvedBatchVoteSigner::Recoverable { authority, .. } => {
+            authority.validate_persisted_with_conn(conn, wallet_id, round_id, bundle_index)
+        }
     }
 }
 
@@ -1635,7 +1780,7 @@ pub fn persist_prepared_commit(
     db: &VotingDb,
     prepared: PreparedVoteCommit,
 ) -> Result<CommittedVote, VotingError> {
-    persist_prepared_commits(db, vec![prepared])?
+    persist_prepared_commits(db, vec![prepared], None)?
         .pop()
         .ok_or_else(|| VotingError::Internal {
             message: "single prepared vote persistence returned no vote".to_string(),
@@ -1645,6 +1790,7 @@ pub fn persist_prepared_commit(
 fn persist_prepared_commits(
     db: &VotingDb,
     prepared: Vec<PreparedVoteCommit>,
+    recoverable_proposal_count: Option<u32>,
 ) -> Result<Vec<CommittedVote>, VotingError> {
     if prepared.is_empty() {
         return Err(VotingError::Internal {
@@ -1671,6 +1817,26 @@ fn persist_prepared_commits(
         .map_err(|e| VotingError::Internal {
             message: format!("failed to begin prepared vote persistence transaction: {e}"),
         })?;
+    if let Some(proposal_count) = recoverable_proposal_count {
+        let recoveries = prepared
+            .iter()
+            .map(|vote| vote.recovery.clone())
+            .collect::<Vec<_>>();
+        let ballot_fingerprint = validate_recoverable_ballot_intents_with_conn(
+            &tx,
+            &prepared[0].wallet_id,
+            &prepared[0].round_id,
+            proposal_count,
+            &recoveries,
+        )?;
+        crate::storage::queries::lock_recoverable_ballot(
+            &tx,
+            &prepared[0].round_id,
+            &prepared[0].wallet_id,
+            proposal_count,
+            ballot_fingerprint,
+        )?;
+    }
     let fresh_proposal_ids = prepared
         .iter()
         .filter(|vote| matches!(&vote.captured_state, CapturedVoteState::Fresh(_)))
@@ -1901,6 +2067,107 @@ pub fn record_batch_submission(
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("commit vote batch submission transaction failed: {e}"),
     })
+}
+
+fn validate_recoverable_ballot_intents_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    proposal_count: u32,
+    recoveries: &[VoteRecoveryBundle],
+) -> Result<[u8; 32], VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT proposal_id, skipped, choice FROM ballot_intent
+             WHERE round_id = :round_id AND wallet_id = :wallet_id
+             ORDER BY proposal_id",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("prepare recoverable ballot intent query failed: {e}"),
+        })?;
+    let intents = stmt
+        .query_map(
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+            },
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("query recoverable ballot intents failed: {e}"),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::Internal {
+            message: format!("read recoverable ballot intents failed: {e}"),
+        })?;
+    if intents.len() != proposal_count as usize
+        || intents
+            .iter()
+            .enumerate()
+            .any(|(index, (proposal_id, _, _))| {
+                *proposal_id != index as i64 + crate::types::MIN_PROPOSAL_ID as i64
+            })
+    {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "recoverable ballot requires one terminal intent for each proposal 1..={proposal_count}"
+            ),
+        });
+    }
+
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(RECOVERABLE_BALLOT_FINGERPRINT_DOMAIN);
+    fingerprint.update(proposal_count.to_le_bytes());
+    let mut selected = Vec::with_capacity(recoveries.len());
+    for (proposal_id, skipped, choice) in intents {
+        let proposal_id = u32::try_from(proposal_id).map_err(|_| VotingError::Internal {
+            message: format!(
+                "stored recoverable ballot proposal_id must be non-negative, got {proposal_id}"
+            ),
+        })?;
+        fingerprint.update(proposal_id.to_le_bytes());
+        match (skipped, choice) {
+            (true, None) => fingerprint.update([0]),
+            (false, Some(choice)) => {
+                let choice = u32::try_from(choice).map_err(|_| VotingError::Internal {
+                    message: format!(
+                        "stored recoverable ballot choice must be non-negative, got {choice}"
+                    ),
+                })?;
+                fingerprint.update([1]);
+                fingerprint.update(choice.to_le_bytes());
+                selected.push((proposal_id, choice));
+            }
+            _ => {
+                return Err(VotingError::Internal {
+                    message: format!(
+                        "stored recoverable ballot intent is invalid for proposal {proposal_id}"
+                    ),
+                });
+            }
+        }
+    }
+    if selected.len() != recoveries.len()
+        || selected
+            .iter()
+            .zip(recoveries)
+            .any(|((proposal_id, choice), recovery)| {
+                *proposal_id != recovery.proposal_id || *choice != recovery.vote_decision
+            })
+    {
+        return Err(VotingError::InvalidInput {
+            message: "persisted recoverable batch no longer matches the complete ballot"
+                .to_string(),
+        });
+    }
+
+    Ok(fingerprint.finalize().into())
 }
 
 pub(crate) fn load_vote_batch_recoveries_with_conn(
@@ -4620,7 +4887,7 @@ mod tests {
             .map(|prepared| serialize_recovery(&prepared.recovery).unwrap())
             .collect::<Vec<_>>();
 
-        let signed = persist_prepared_atomic_vote_batch_inner(&db, prepared, || {
+        let signed = persist_prepared_atomic_vote_batch_inner(&db, prepared, None, || {
             std::thread::scope(|scope| {
                 scope
                     .spawn(|| {

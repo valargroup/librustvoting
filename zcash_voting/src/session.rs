@@ -5,7 +5,7 @@
 //! APIs in `crate::phases`. The wallet executes each step with its own
 //! network/proof/sign plumbing.
 
-use rusqlite::{named_params, TransactionBehavior};
+use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,6 +73,27 @@ impl VotingDb {
             })?;
         let skipped_bool = skipped != 0;
         let choice_u32 = choice.map(|c| c as u32);
+        let existing = tx
+            .query_row(
+                "SELECT skipped, choice FROM ballot_intent
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND proposal_id = :proposal_id",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":proposal_id": proposal_id as i64,
+                },
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| VotingError::Internal {
+                message: format!("read current ballot intent failed: {e}"),
+            })?;
+        if existing == Some((skipped_bool, choice)) {
+            return Ok(());
+        }
+        queries::ensure_recoverable_ballot_intents_mutable(&tx, round_id, &wallet_id)?;
         queries::ensure_no_submitted_vote_conflict_for_intent(
             &tx,
             round_id,

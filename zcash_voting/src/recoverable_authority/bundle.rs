@@ -197,6 +197,28 @@ impl<'a> RecoverableBundleUseV1<'a> {
         })
     }
 
+    pub(crate) fn authority_root(self) -> &'a VotingAuthorityRootV1 {
+        self.authority_root
+    }
+
+    pub(crate) fn current_round(self) -> &'a ValidatedRecoverableVotingRoundV1 {
+        self.current_round
+    }
+
+    pub(crate) fn bundle_index(self) -> u32 {
+        self.bundle_material.bundle_index()
+    }
+
+    pub(crate) fn expected_material(
+        self,
+    ) -> Result<RecoverableExpectedBundleMaterialV1<'a>, VotingError> {
+        self.authority_root
+            .validate_binding(self.authority_binding)?;
+        self.current_round
+            .validate_authority_context(self.authority_root.context())?;
+        expected_persisted_material(self.authority_root, self.bundle_material)
+    }
+
     /// Checks the validated chain round against its stored row within the
     /// caller's database snapshot.
     pub(crate) fn validate_persisted_round_with_conn(
@@ -238,7 +260,7 @@ impl<'a> RecoverableBundleUseV1<'a> {
             return Err(bundle_material_mismatch());
         }
 
-        let expected = expected_persisted_material(self.authority_root, self.bundle_material)?;
+        let expected = self.expected_material()?;
         let persisted = queries::load_persisted_recoverable_bundle_material(
             conn,
             round_id,
@@ -268,17 +290,17 @@ impl<'a> RecoverableBundleUseV1<'a> {
     }
 }
 
-struct ExpectedPersistedMaterial<'a> {
-    van_blinding: Zeroizing<[u8; 32]>,
-    van: [u8; 32],
-    total_note_value: u64,
+pub(crate) struct RecoverableExpectedBundleMaterialV1<'a> {
+    pub(crate) van_blinding: Zeroizing<[u8; 32]>,
+    pub(crate) van: [u8; 32],
+    pub(crate) total_note_value: u64,
     delegation_tx_hash: Option<&'a str>,
 }
 
 fn expected_persisted_material<'a>(
     root: &VotingAuthorityRootV1,
     material: RecoverableBundleMaterialV1<'a>,
-) -> Result<ExpectedPersistedMaterial<'a>, VotingError> {
+) -> Result<RecoverableExpectedBundleMaterialV1<'a>, VotingError> {
     match material {
         RecoverableBundleMaterialV1::RecoverableSelfCustody(identity) => {
             let blinding = identity.derive_van_blinding(root);
@@ -295,7 +317,7 @@ fn expected_persisted_material<'a>(
             )?
             .try_into()
             .expect("construct_van returns 32 bytes");
-            Ok(ExpectedPersistedMaterial {
+            Ok(RecoverableExpectedBundleMaterialV1 {
                 van_blinding: Zeroizing::new(*blinding.as_bytes()),
                 van,
                 total_note_value,
@@ -318,7 +340,7 @@ fn expected_persisted_material<'a>(
                 .iter()
                 .find(|bundle| bundle.bundle_index() == bundle_index)
                 .ok_or_else(bundle_material_mismatch)?;
-            Ok(ExpectedPersistedMaterial {
+            Ok(RecoverableExpectedBundleMaterialV1 {
                 van_blinding: Zeroizing::new(*bundle.van_blinding()),
                 van: *bundle.van_commitment(),
                 total_note_value: bundle.total_note_value(),

@@ -123,15 +123,24 @@ pub(crate) fn sign_cast_vote_digest(
     digest: &[u8; 32],
     alpha_v: &[u8],
 ) -> Result<CastVoteSignature, VotingError> {
-    use pasta_curves::group::ff::PrimeField;
-
     // Derive the voting hotkey SpendingKey from seed.
     let sk = crate::hotkey::spending_key_from_hotkey_seed(
         hotkey_seed,
         network,
         crate::hotkey::VOTING_HOTKEY_ACCOUNT_INDEX,
     )?;
-    let ask = orchard::keys::SpendAuthorizingKey::from(&sk);
+    sign_cast_vote_digest_with_spending_key(&sk, digest, alpha_v)
+}
+
+/// Signs a batch digest with an already-derived recoverable Orchard key.
+pub(crate) fn sign_cast_vote_digest_with_spending_key(
+    spending_key: &orchard::keys::SpendingKey,
+    digest: &[u8; 32],
+    alpha_v: &[u8],
+) -> Result<CastVoteSignature, VotingError> {
+    use pasta_curves::group::ff::PrimeField;
+
+    let ask = orchard::keys::SpendAuthorizingKey::from(spending_key);
 
     // Deserialize alpha_v
     let alpha_v_arr: [u8; 32] = alpha_v.try_into().map_err(|_| VotingError::Internal {
