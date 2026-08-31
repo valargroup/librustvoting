@@ -12,10 +12,14 @@ use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zcash_protocol::value::MAX_MONEY;
+use zeroize::Zeroizing;
 
 use crate::{
     action::derive_hotkey_x_coords_from_raw_address,
     governance::{construct_van, BALLOT_DIVISOR},
+    recoverable_authority::{
+        ValidatedRecoverableVotingRoundV1, VotingAuthorityRootBindingV1, VotingAuthorityRootV1,
+    },
     storage::{queries, RoundPhase, VotingDb},
     types::{
         validate_round_params, validate_vote_chain_id, Network, RoundBoundVotingHotkeyTarget,
@@ -148,7 +152,9 @@ impl DelegationCapabilityV1 {
         Self::from_json_with_validation(json).map(|(capability, _)| capability)
     }
 
-    fn from_json_with_validation(json: &[u8]) -> Result<(Self, ValidatedCapability), VotingError> {
+    fn from_json_with_validation(
+        json: &[u8],
+    ) -> Result<(Self, ValidatedDelegationCapabilityMaterialV1), VotingError> {
         if json.len() > MAX_DELEGATION_CAPABILITY_JSON_BYTES {
             return Err(invalid(format!(
                 "delegation capability JSON exceeds {MAX_DELEGATION_CAPABILITY_JSON_BYTES} bytes"
@@ -171,7 +177,7 @@ impl DelegationCapabilityV1 {
         serde_json::to_vec(self).map_err(internal_serialize)
     }
 
-    fn validate(&self) -> Result<ValidatedCapability, VotingError> {
+    fn validate(&self) -> Result<ValidatedDelegationCapabilityMaterialV1, VotingError> {
         if self.format_version != CAPABILITY_FORMAT_VERSION {
             return Err(invalid(format!(
                 "format_version must be {CAPABILITY_FORMAT_VERSION}, got {}",
@@ -211,19 +217,24 @@ impl DelegationCapabilityV1 {
                 .checked_add(total_note_value)
                 .filter(|total| *total <= MAX_MONEY)
                 .ok_or_else(|| invalid("capability voting weight exceeds MAX_MONEY"))?;
-            let van_comm_rand = decode_field(&bundle.van_comm_rand)?;
+            let van_comm_rand = Zeroizing::new(decode_field(&bundle.van_comm_rand)?);
             let tx_hash = decode_hash(&bundle.delegation_tx_hash)?;
             if !tx_hashes.insert(tx_hash) {
                 return Err(invalid("delegation transaction hashes must be unique"));
             }
-            let van_comm: [u8; 32] =
-                construct_van(&g_d_x, &pk_d_x, total_note_value, &round_id, &van_comm_rand)?
-                    .try_into()
-                    .expect("construct_van returns 32 bytes");
+            let van_comm: [u8; 32] = construct_van(
+                &g_d_x,
+                &pk_d_x,
+                total_note_value,
+                &round_id,
+                van_comm_rand.as_slice(),
+            )?
+            .try_into()
+            .expect("construct_van returns 32 bytes");
             if !van_commitments.insert(van_comm) {
                 return Err(invalid("delegation VAN commitments must be unique"));
             }
-            bundles.push(ValidatedBundle {
+            bundles.push(ValidatedDelegationCapabilityBundleMaterialV1 {
                 index: bundle.bundle_index,
                 total_note_value,
                 rand: van_comm_rand,
@@ -231,7 +242,13 @@ impl DelegationCapabilityV1 {
                 tx_hash: bundle.delegation_tx_hash.clone(),
             });
         }
-        Ok(ValidatedCapability { target, bundles })
+        Ok(ValidatedDelegationCapabilityMaterialV1 {
+            target,
+            vote_chain_id: self.vote_chain_id.clone(),
+            vote_round_id: round_id,
+            digest: None,
+            bundles,
+        })
     }
 }
 
@@ -249,17 +266,92 @@ pub struct ImportDelegationCapabilityParams<'a> {
     pub session_json: Option<&'a str>,
 }
 
-struct ValidatedCapability {
-    target: VotingHotkeyTarget,
-    bundles: Vec<ValidatedBundle>,
+/// Independently authenticated context for validating a custody capability
+/// against one recoverable voting authority.
+#[derive(Clone, Copy)]
+pub struct ValidateRecoverableDelegationCapabilityV1Params<'a> {
+    pub authority_root: &'a VotingAuthorityRootV1,
+    pub authority_binding: &'a VotingAuthorityRootBindingV1,
+    /// Vote-chain round joined to its existing authenticated v2 config entry.
+    pub validated_round: &'a ValidatedRecoverableVotingRoundV1,
 }
 
-struct ValidatedBundle {
+/// Inputs for atomically importing a validated recoverable-authority custody
+/// capability into the existing voting schema.
+pub struct ImportRecoverableDelegationCapabilityV1Params<'a> {
+    pub validation: ValidateRecoverableDelegationCapabilityV1Params<'a>,
+    /// Used only if the importer creates the round row.
+    pub session_json: Option<&'a str>,
+}
+
+/// Validated custody capability material bound to a recoverable authority.
+///
+/// This type deliberately has no `Debug` or serialization implementation
+/// because the VAN blindings are privacy-sensitive. It can be constructed only
+/// by [`validate_recoverable_delegation_capability_v1`].
+pub struct ValidatedDelegationCapabilityMaterialV1 {
+    target: VotingHotkeyTarget,
+    vote_chain_id: String,
+    vote_round_id: [u8; 32],
+    digest: Option<DelegationCapabilityDigest>,
+    bundles: Vec<ValidatedDelegationCapabilityBundleMaterialV1>,
+}
+
+impl ValidatedDelegationCapabilityMaterialV1 {
+    pub fn target(&self) -> &VotingHotkeyTarget {
+        &self.target
+    }
+
+    pub fn vote_chain_id(&self) -> &str {
+        &self.vote_chain_id
+    }
+
+    pub fn vote_round_id(&self) -> &[u8; 32] {
+        &self.vote_round_id
+    }
+
+    pub fn digest(&self) -> DelegationCapabilityDigest {
+        self.digest
+            .expect("public validated capability material always has a digest")
+    }
+
+    pub fn bundles(&self) -> &[ValidatedDelegationCapabilityBundleMaterialV1] {
+        &self.bundles
+    }
+}
+
+/// One ordered bundle in a validated custody capability.
+///
+/// This type deliberately has no `Debug` or serialization implementation
+/// because the VAN blinding is privacy-sensitive.
+pub struct ValidatedDelegationCapabilityBundleMaterialV1 {
     index: u32,
     total_note_value: u64,
-    rand: [u8; 32],
+    rand: Zeroizing<[u8; 32]>,
     van: [u8; 32],
     tx_hash: String,
+}
+
+impl ValidatedDelegationCapabilityBundleMaterialV1 {
+    pub fn bundle_index(&self) -> u32 {
+        self.index
+    }
+
+    pub fn total_note_value(&self) -> u64 {
+        self.total_note_value
+    }
+
+    pub fn van_blinding(&self) -> &[u8; 32] {
+        &self.rand
+    }
+
+    pub fn van_commitment(&self) -> &[u8; 32] {
+        &self.van
+    }
+
+    pub fn delegation_tx_hash(&self) -> &str {
+        &self.tx_hash
+    }
 }
 
 /// Exports a capability from completed funds controller delegation state.
@@ -380,24 +472,104 @@ pub fn import_delegation_capability(
     capability_json: &[u8],
     context: ImportDelegationCapabilityParams<'_>,
 ) -> Result<DelegationCapabilityDigest, VotingError> {
-    validate_vote_chain_id(context.expected_chain_id)?;
-    validate_round_params(context.expected_round_params)?;
-    i64::try_from(context.expected_round_params.snapshot_height)
+    let validated = validate_delegation_capability_for_target(
+        capability_json,
+        &context.voting_hotkey.delegation_target(),
+        context.expected_chain_id,
+        context.expected_network,
+        context.expected_round_params,
+    )?;
+    import_validated_delegation_capability(
+        db,
+        &validated,
+        context.expected_network,
+        context.expected_round_params,
+        context.session_json,
+    )
+}
+
+/// Validates an exact canonical custody capability against one recoverable
+/// authority and validated chain round.
+pub fn validate_recoverable_delegation_capability_v1(
+    capability_json: &[u8],
+    context: ValidateRecoverableDelegationCapabilityV1Params<'_>,
+) -> Result<ValidatedDelegationCapabilityMaterialV1, VotingError> {
+    context
+        .authority_root
+        .validate_binding(context.authority_binding)?;
+    context
+        .validated_round
+        .validate_authority_context(context.authority_root.context())?;
+    let expected_round_params = context.validated_round.round_params();
+    let expected_chain_id = context.validated_round.vote_chain_id();
+    let expected_network = context.validated_round.network();
+    let root_hotkey = context.authority_root.voting_hotkey()?;
+
+    validate_delegation_capability_for_target(
+        capability_json,
+        &root_hotkey.delegation_target(),
+        expected_chain_id,
+        expected_network,
+        expected_round_params,
+    )
+}
+
+/// Atomically imports a custody capability after binding it to a recoverable
+/// authority. The legacy capability format and database rows remain
+/// unchanged.
+pub fn import_recoverable_delegation_capability_v1(
+    db: &VotingDb,
+    capability_json: &[u8],
+    context: ImportRecoverableDelegationCapabilityV1Params<'_>,
+) -> Result<DelegationCapabilityDigest, VotingError> {
+    let validated =
+        validate_recoverable_delegation_capability_v1(capability_json, context.validation)?;
+    import_validated_delegation_capability(
+        db,
+        &validated,
+        context.validation.validated_round.network(),
+        context.validation.validated_round.round_params(),
+        context.session_json,
+    )
+}
+
+fn validate_delegation_capability_for_target(
+    capability_json: &[u8],
+    expected_target: &VotingHotkeyTarget,
+    expected_chain_id: &str,
+    expected_network: Network,
+    expected_round_params: &VotingRoundParams,
+) -> Result<ValidatedDelegationCapabilityMaterialV1, VotingError> {
+    validate_vote_chain_id(expected_chain_id)?;
+    validate_round_params(expected_round_params)?;
+    i64::try_from(expected_round_params.snapshot_height)
         .map_err(|_| invalid("snapshot_height does not fit in SQLite INTEGER"))?;
-    let (capability, validated) =
+    let (capability, mut validated) =
         DelegationCapabilityV1::from_json_with_validation(capability_json)?;
-    if capability.vote_chain_id != context.expected_chain_id
-        || capability.vote_round_id != context.expected_round_params.vote_round_id
-        || validated.target.network() != context.expected_network
-        || context.voting_hotkey.network() != context.expected_network
-        || validated.target != context.voting_hotkey.delegation_target()
+    if capability.vote_chain_id != expected_chain_id
+        || capability.vote_round_id != expected_round_params.vote_round_id
+        || validated.target.network() != expected_network
+        || expected_target.network() != expected_network
+        || &validated.target != expected_target
     {
         return Err(invalid(
             "delegation capability does not match the trusted voter context",
         ));
     }
+    validated.digest = Some(DelegationCapabilityDigest::from_package_bytes(
+        capability_json,
+    ));
+    Ok(validated)
+}
 
-    let digest = DelegationCapabilityDigest::from_package_bytes(capability_json);
+fn import_validated_delegation_capability(
+    db: &VotingDb,
+    validated: &ValidatedDelegationCapabilityMaterialV1,
+    expected_network: Network,
+    expected_round_params: &VotingRoundParams,
+    session_json: Option<&str>,
+) -> Result<DelegationCapabilityDigest, VotingError> {
+    let round_id = hex::encode(validated.vote_round_id());
     let wallet_id = db.wallet_id();
     let mut conn = db.conn();
     let tx = conn
@@ -405,10 +577,10 @@ pub fn import_delegation_capability(
         .map_err(|e| VotingError::Internal {
             message: format!("begin delegation capability import failed: {e}"),
         })?;
-    if queries::has_round(&tx, &capability.vote_round_id, &wallet_id)? {
+    if queries::has_round(&tx, &round_id, &wallet_id)? {
         let (stored, network) =
-            queries::load_round_params_with_network(&tx, &capability.vote_round_id, &wallet_id)?;
-        if stored != *context.expected_round_params || network != context.expected_network {
+            queries::load_round_params_with_network(&tx, &round_id, &wallet_id)?;
+        if stored != *expected_round_params || network != expected_network {
             return Err(invalid(
                 "stored round context conflicts with the capability",
             ));
@@ -417,20 +589,20 @@ pub fn import_delegation_capability(
         queries::insert_round(
             &tx,
             &wallet_id,
-            context.expected_network,
-            context.expected_round_params,
-            context.session_json,
+            expected_network,
+            expected_round_params,
+            session_json,
         )?;
     }
 
-    let stored_count = queries::get_bundle_count(&tx, &capability.vote_round_id, &wallet_id)?;
+    let stored_count = queries::get_bundle_count(&tx, &round_id, &wallet_id)?;
     if stored_count == 0 {
         for bundle in &validated.bundles {
-            insert_bundle(&tx, &capability.vote_round_id, &wallet_id, bundle)?;
+            insert_bundle(&tx, &round_id, &wallet_id, bundle)?;
         }
     } else if stored_count == validated.bundles.len() as u32 {
         for bundle in &validated.bundles {
-            if !bundle_matches(&tx, &capability.vote_round_id, &wallet_id, bundle)? {
+            if !bundle_matches(&tx, &round_id, &wallet_id, bundle)? {
                 return Err(invalid("stored bundle state conflicts with the capability"));
             }
         }
@@ -444,7 +616,7 @@ pub fn import_delegation_capability(
          WHERE round_id = :round_id AND wallet_id = :wallet_id AND phase < :phase",
         named_params! {
             ":phase": RoundPhase::DelegationProved as i32,
-            ":round_id": capability.vote_round_id,
+            ":round_id": round_id,
             ":wallet_id": wallet_id,
         },
     )
@@ -454,7 +626,7 @@ pub fn import_delegation_capability(
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("commit delegation capability import failed: {e}"),
     })?;
-    Ok(digest)
+    Ok(validated.digest())
 }
 
 type ProviderBundleRow = (u32, [u8; 32], [u8; 32], u64, u32, Option<String>);
@@ -534,7 +706,7 @@ fn insert_bundle(
     conn: &rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
-    bundle: &ValidatedBundle,
+    bundle: &ValidatedDelegationCapabilityBundleMaterialV1,
 ) -> Result<(), VotingError> {
     conn.execute(
         "INSERT INTO bundles (
@@ -546,7 +718,7 @@ fn insert_bundle(
             ":round_id": round_id,
             ":wallet_id": wallet_id,
             ":bundle_index": i64::from(bundle.index),
-            ":rand": bundle.rand,
+            ":rand": &bundle.rand[..],
             ":van": bundle.van,
             ":total": bundle.total_note_value as i64,
             ":tx_hash": bundle.tx_hash,
@@ -560,7 +732,7 @@ fn bundle_matches(
     conn: &rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
-    bundle: &ValidatedBundle,
+    bundle: &ValidatedDelegationCapabilityBundleMaterialV1,
 ) -> Result<bool, VotingError> {
     conn.query_row(
         "SELECT COALESCE(b.note_positions_blob IS NULL
@@ -587,7 +759,7 @@ fn bundle_matches(
             ":round_id": round_id,
             ":wallet_id": wallet_id,
             ":bundle_index": i64::from(bundle.index),
-            ":rand": bundle.rand,
+            ":rand": &bundle.rand[..],
             ":van": bundle.van,
             ":total": bundle.total_note_value as i64,
             ":tx_hash": bundle.tx_hash,
@@ -607,15 +779,21 @@ fn canonical_total(num_ballots: u64) -> Result<u64, VotingError> {
 }
 
 fn decode_field(value: &str) -> Result<[u8; 32], VotingError> {
-    let decoded = BASE64_STANDARD
-        .decode(value)
-        .map_err(|_| invalid("van_comm_rand must be canonical padded standard Base64"))?;
-    if value.len() != 44 || !value.ends_with('=') || BASE64_STANDARD.encode(&decoded) != value {
+    let decoded = Zeroizing::new(
+        BASE64_STANDARD
+            .decode(value)
+            .map_err(|_| invalid("van_comm_rand must be canonical padded standard Base64"))?,
+    );
+    if value.len() != 44
+        || !value.ends_with('=')
+        || BASE64_STANDARD.encode(decoded.as_slice()) != value
+    {
         return Err(invalid(
             "van_comm_rand must be canonical padded standard Base64",
         ));
     }
     let bytes: [u8; 32] = decoded
+        .as_slice()
         .try_into()
         .map_err(|_| invalid("van_comm_rand must decode to 32 bytes"))?;
     if pallas::Base::from_repr(bytes).is_none().into() {
@@ -769,6 +947,74 @@ mod tests {
         (db, params, hotkey, capability)
     }
 
+    fn recoverable_authority_fixture(
+        params: &VotingRoundParams,
+        root_byte: u8,
+    ) -> (
+        VotingAuthorityRootV1,
+        VotingAuthorityRootBindingV1,
+        crate::recoverable_authority::RecoverableVotingHotkeyV1,
+        ValidatedRecoverableVotingRoundV1,
+    ) {
+        let context = crate::recoverable_authority::VotingAuthorityContextV1::from_fingerprint(
+            Network::Regtest,
+            0,
+            [0x22; 32],
+            CHAIN_ID,
+            hex::decode(&params.vote_round_id)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let request = crate::recoverable_authority::SoftwareRegisteredKeyRequestV1::new(
+            crate::recoverable_authority::RegisteredKeyApplicationV1::new(0xA11C),
+            context,
+        );
+        let root = VotingAuthorityRootV1::from_registered_key_output(&request, [root_byte; 64]);
+        let authority_binding = VotingAuthorityRootBindingV1::bind(&root);
+        let validated_round =
+            crate::recoverable_authority::test_validated_recoverable_voting_round_v1(
+                Network::Regtest,
+                CHAIN_ID,
+                params.clone(),
+                [0xAB; 32],
+                3,
+            );
+        let hotkey = root.voting_hotkey().unwrap();
+        (root, authority_binding, hotkey, validated_round)
+    }
+
+    fn recoverable_capability_fixture() -> (
+        VotingRoundParams,
+        VotingAuthorityRootV1,
+        VotingAuthorityRootBindingV1,
+        crate::recoverable_authority::RecoverableVotingHotkeyV1,
+        ValidatedRecoverableVotingRoundV1,
+        Vec<u8>,
+    ) {
+        let params = round_params();
+        let (root, authority_binding, hotkey, validated_round) =
+            recoverable_authority_fixture(&params, 0x55);
+        let target = hotkey.round_bound_delegation_target();
+        let provider = test_db(":memory:");
+        seed_provider(&provider, &params, &[&target, &target]);
+        let capability = export_delegation_capability(
+            &provider,
+            &target,
+            &[b"tx-zero".to_vec(), b"tx-one".to_vec()],
+        )
+        .unwrap();
+        (
+            params,
+            root,
+            authority_binding,
+            hotkey,
+            validated_round,
+            capability.canonical_json().to_vec(),
+        )
+    }
+
     fn import_context<'a>(
         hotkey: &'a VotingHotkey,
         params: &'a VotingRoundParams,
@@ -779,6 +1025,18 @@ mod tests {
             expected_network: Network::Regtest,
             expected_round_params: params,
             session_json: Some("{\"round\":1}"),
+        }
+    }
+
+    fn recoverable_validation_context<'a>(
+        root: &'a VotingAuthorityRootV1,
+        authority_binding: &'a VotingAuthorityRootBindingV1,
+        validated_round: &'a ValidatedRecoverableVotingRoundV1,
+    ) -> ValidateRecoverableDelegationCapabilityV1Params<'a> {
+        ValidateRecoverableDelegationCapabilityV1Params {
+            authority_root: root,
+            authority_binding,
+            validated_round,
         }
     }
 
@@ -995,6 +1253,224 @@ mod tests {
         );
         drop(customer);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn recoverable_authority_import_validates_root_round_hotkey_and_material() {
+        let (params, root, authority_binding, hotkey, validated_round, capability_json) =
+            recoverable_capability_fixture();
+        let material = validate_recoverable_delegation_capability_v1(
+            &capability_json,
+            recoverable_validation_context(&root, &authority_binding, &validated_round),
+        )
+        .unwrap();
+        assert_eq!(material.vote_chain_id(), CHAIN_ID);
+        assert_eq!(hex::encode(material.vote_round_id()), params.vote_round_id);
+        assert_eq!(material.target(), &hotkey.delegation_target());
+        assert_eq!(material.bundles().len(), 2);
+        assert_eq!(material.bundles()[0].bundle_index(), 0);
+        assert_eq!(material.bundles()[0].total_note_value(), 2 * BALLOT_DIVISOR);
+        assert!(
+            material.digest() == DelegationCapabilityDigest::from_package_bytes(&capability_json)
+        );
+
+        let customer = test_db(":memory:");
+        let digest = import_recoverable_delegation_capability_v1(
+            &customer,
+            &capability_json,
+            ImportRecoverableDelegationCapabilityV1Params {
+                validation: recoverable_validation_context(
+                    &root,
+                    &authority_binding,
+                    &validated_round,
+                ),
+                session_json: Some("{\"round\":1}"),
+            },
+        )
+        .unwrap();
+        assert!(digest == material.digest());
+        assert_eq!(customer.get_bundle_count(&params.vote_round_id).unwrap(), 2);
+
+        let (wrong_root, wrong_binding, _, _) = recoverable_authority_fixture(&params, 0x56);
+        let error = validate_recoverable_delegation_capability_v1(
+            &capability_json,
+            recoverable_validation_context(&wrong_root, &wrong_binding, &validated_round),
+        )
+        .err()
+        .expect("another authority root must fail");
+        assert!(
+            error.to_string().contains("trusted voter context"),
+            "{error}"
+        );
+
+        let mut stale_params = params.clone();
+        stale_params.vote_round_id = hex::encode(pallas::Base::from(8).to_repr());
+        let stale_round = crate::recoverable_authority::test_validated_recoverable_voting_round_v1(
+            Network::Regtest,
+            CHAIN_ID,
+            stale_params,
+            [0xAB; 32],
+            3,
+        );
+        let error = validate_recoverable_delegation_capability_v1(
+            &capability_json,
+            recoverable_validation_context(&root, &authority_binding, &stale_round),
+        )
+        .err()
+        .expect("a different current round payload must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match authority context"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recoverable_custody_bundle_use_accepts_exact_import_and_rejects_mismatch() {
+        let (params, root, authority_binding, _, validated_round, capability_json) =
+            recoverable_capability_fixture();
+        let material = validate_recoverable_delegation_capability_v1(
+            &capability_json,
+            recoverable_validation_context(&root, &authority_binding, &validated_round),
+        )
+        .unwrap();
+        let customer = test_db(":memory:");
+        import_recoverable_delegation_capability_v1(
+            &customer,
+            &capability_json,
+            ImportRecoverableDelegationCapabilityV1Params {
+                validation: recoverable_validation_context(
+                    &root,
+                    &authority_binding,
+                    &validated_round,
+                ),
+                session_json: None,
+            },
+        )
+        .unwrap();
+        let authority = crate::recoverable_authority::RecoverableBundleUseV1::new(
+            &root,
+            &authority_binding,
+            &validated_round,
+            crate::recoverable_authority::RecoverableBundleMaterialV1::CustodyCapability {
+                capability: &material,
+                bundle_index: 0,
+            },
+        )
+        .unwrap();
+
+        {
+            let conn = customer.conn();
+            authority
+                .validate_persisted_with_conn(&conn, WALLET, &params.vote_round_id, 0)
+                .unwrap();
+        }
+
+        customer
+            .conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 0",
+                rusqlite::params!["11".repeat(32), &params.vote_round_id, WALLET],
+            )
+            .unwrap();
+        let error = {
+            let conn = customer.conn();
+            authority
+                .validate_persisted_with_conn(&conn, WALLET, &params.vote_round_id, 0)
+                .err()
+                .expect("mismatched custody provenance must fail before authority use")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the selected recoverable bundle"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recoverable_bundle_use_rejects_persisted_round_parameter_mismatch() {
+        let (params, root, authority_binding, _, validated_round, capability_json) =
+            recoverable_capability_fixture();
+        let material = validate_recoverable_delegation_capability_v1(
+            &capability_json,
+            recoverable_validation_context(&root, &authority_binding, &validated_round),
+        )
+        .unwrap();
+        let customer = test_db(":memory:");
+        import_recoverable_delegation_capability_v1(
+            &customer,
+            &capability_json,
+            ImportRecoverableDelegationCapabilityV1Params {
+                validation: recoverable_validation_context(
+                    &root,
+                    &authority_binding,
+                    &validated_round,
+                ),
+                session_json: None,
+            },
+        )
+        .unwrap();
+        let authority = crate::recoverable_authority::RecoverableBundleUseV1::new(
+            &root,
+            &authority_binding,
+            &validated_round,
+            crate::recoverable_authority::RecoverableBundleMaterialV1::CustodyCapability {
+                capability: &material,
+                bundle_index: 0,
+            },
+        )
+        .unwrap();
+
+        customer
+            .conn()
+            .execute(
+                "UPDATE rounds SET ea_pk = ?1 WHERE round_id = ?2 AND wallet_id = ?3",
+                rusqlite::params![vec![0xFF_u8; 32], &params.vote_round_id, WALLET],
+            )
+            .unwrap();
+        let key_error = {
+            let conn = customer.conn();
+            authority
+                .validate_persisted_with_conn(&conn, WALLET, &params.vote_round_id, 0)
+                .err()
+                .expect("a mismatched persisted election key must fail")
+        };
+        assert!(
+            key_error
+                .to_string()
+                .contains("persisted round parameters do not match"),
+            "{key_error}"
+        );
+
+        customer
+            .conn()
+            .execute(
+                "UPDATE rounds SET ea_pk = ?1, snapshot_height = ?2
+                 WHERE round_id = ?3 AND wallet_id = ?4",
+                rusqlite::params![
+                    &params.ea_pk,
+                    params.snapshot_height + 1,
+                    &params.vote_round_id,
+                    WALLET
+                ],
+            )
+            .unwrap();
+        let height_error = {
+            let conn = customer.conn();
+            authority
+                .validate_persisted_with_conn(&conn, WALLET, &params.vote_round_id, 0)
+                .err()
+                .expect("a mismatched persisted snapshot height must fail")
+        };
+        assert!(
+            height_error
+                .to_string()
+                .contains("persisted round parameters do not match"),
+            "{height_error}"
+        );
     }
 
     #[test]

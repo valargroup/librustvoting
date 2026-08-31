@@ -70,10 +70,13 @@ pub use pir::{
 };
 
 pub use delegation_capability::{
-    export_delegation_capability, import_delegation_capability, DelegationCapabilityBundleV1,
-    DelegationCapabilityDigest, DelegationCapabilityV1, ExportedDelegationCapability,
-    ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
-    MAX_DELEGATION_CAPABILITY_JSON_BYTES,
+    export_delegation_capability, import_delegation_capability,
+    import_recoverable_delegation_capability_v1, validate_recoverable_delegation_capability_v1,
+    DelegationCapabilityBundleV1, DelegationCapabilityDigest, DelegationCapabilityV1,
+    ExportedDelegationCapability, ImportDelegationCapabilityParams,
+    ImportRecoverableDelegationCapabilityV1Params, ValidateRecoverableDelegationCapabilityV1Params,
+    ValidatedDelegationCapabilityBundleMaterialV1, ValidatedDelegationCapabilityMaterialV1,
+    MAX_DELEGATION_CAPABILITY_BUNDLES, MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
 pub use governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use note_bundling::{

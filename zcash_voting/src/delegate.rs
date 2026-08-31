@@ -30,9 +30,13 @@ use crate::{
         VotingHotkey, VotingHotkeyTarget,
     },
 };
-use zcash_client_backend::data_api::{Account, WalletRead};
+use prost::Message;
+use zcash_client_backend::{
+    data_api::{Account, WalletRead},
+    proto::service::TreeState,
+};
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_protocol::consensus::{NetworkConstants, Parameters};
+use zcash_protocol::consensus::{BlockHeight, NetworkConstants, Parameters};
 
 /// Wallet-derived keys and chain parameters needed to build a delegation PCZT.
 ///
@@ -314,6 +318,126 @@ pub struct PrepareDelegationBundleForTargetParams<'a> {
     pub bundle_policy: BundlePolicy,
 }
 
+/// Parameters for preparing one canonical recoverable self-custody bundle.
+pub struct PrepareRecoverableDelegationBundleV1Params<'a> {
+    pub lwd: DelegationLwdInputs,
+    pub session_json: Option<&'a str>,
+    pub account_uuid: &'a str,
+    pub authority_root: &'a crate::recoverable_authority::VotingAuthorityRootV1,
+    pub authority_binding: crate::recoverable_authority::VotingAuthorityRootBindingV1,
+    /// Vote-chain round joined to its existing authenticated v2 config entry.
+    pub validated_round: &'a crate::recoverable_authority::ValidatedRecoverableVotingRoundV1,
+    pub bundle_index: u32,
+}
+
+fn validate_recoverable_account_binding(
+    context: &crate::recoverable_authority::VotingAuthorityContextV1,
+    account_index: u32,
+    orchard_fvk_bytes: &[u8],
+) -> Result<(), VotingError> {
+    if context.account_index() != account_index {
+        return Err(VotingError::InvalidInput {
+            message: "recoverable authority account index does not match wallet account"
+                .to_string(),
+        });
+    }
+    context.validate_orchard_fvk(orchard_fvk_bytes)
+}
+
+fn validate_recoverable_snapshot_binding<C, P, CL, R>(
+    wallet_db: &WalletDb<C, P, CL, R>,
+    lwd: &DelegationLwdInputs,
+    validated_round: &crate::recoverable_authority::ValidatedRecoverableVotingRoundV1,
+) -> Result<(), VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    if &lwd.round_params != validated_round.round_params() {
+        return Err(VotingError::InvalidInput {
+            message: "validated chain round parameters do not match delegation round".to_string(),
+        });
+    }
+    if validated_round.network() != lwd.network
+        || lwd.round_params.vote_round_id != validated_round.round_id()
+    {
+        return Err(VotingError::InvalidInput {
+            message: "validated chain round does not match delegation round".to_string(),
+        });
+    }
+    if validated_round.snapshot_height() != lwd.round_params.snapshot_height {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "vote-chain snapshot height {} does not match delegation snapshot height {}",
+                validated_round.snapshot_height(),
+                lwd.round_params.snapshot_height
+            ),
+        });
+    }
+
+    let tree_state = TreeState::decode(lwd.anchor_tree_state_bytes.as_slice()).map_err(|e| {
+        VotingError::InvalidInput {
+            message: format!("failed to decode recoverable delegation TreeState: {e}"),
+        }
+    })?;
+    if tree_state.height != validated_round.snapshot_height() {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "TreeState height {} does not match vote-chain snapshot height {}",
+                tree_state.height,
+                validated_round.snapshot_height()
+            ),
+        });
+    }
+
+    // Round auth stores the same RPC/display-order bytes encoded by
+    // `TreeState.hash`. `BlockHash::to_string` converts the wallet DB's internal
+    // byte order back to that canonical lowercase RPC representation.
+    let chain_snapshot_hash = hex::encode(validated_round.snapshot_block_hash());
+    if tree_state.hash != chain_snapshot_hash {
+        return Err(VotingError::InvalidInput {
+            message: "TreeState hash does not match vote-chain snapshot block hash".to_string(),
+        });
+    }
+
+    let snapshot_height = u32::try_from(validated_round.snapshot_height())
+        .map(BlockHeight::from_u32)
+        .map_err(|_| VotingError::InvalidInput {
+            message: format!(
+                "vote-chain snapshot height {} does not fit in u32",
+                validated_round.snapshot_height()
+            ),
+        })?;
+    let fully_scanned_height = wallet_fully_scanned_height(wallet_db)?;
+    if fully_scanned_height < validated_round.snapshot_height() {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "wallet is not fully scanned to vote-chain snapshot height {}. Fully scanned height is {}.",
+                validated_round.snapshot_height(),
+                fully_scanned_height
+            ),
+        });
+    }
+    let wallet_hash = wallet_db
+        .get_block_hash(snapshot_height)
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load wallet snapshot block hash: {e}"),
+        })?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "wallet has no retained block hash at vote-chain snapshot height {}",
+                validated_round.snapshot_height()
+            ),
+        })?;
+    if wallet_hash.to_string() != chain_snapshot_hash {
+        return Err(VotingError::InvalidInput {
+            message: "wallet snapshot block hash does not match vote-chain snapshot block hash"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 enum PrepareDelegationTarget<'a> {
     Local(&'a VotingHotkey),
     RoundBound(&'a RoundBoundVotingHotkeyTarget),
@@ -349,6 +473,7 @@ struct PrepareDelegationBundleInnerParams<'a> {
     target: PrepareDelegationTarget<'a>,
     bundle_index: u32,
     bundle_policy: BundlePolicy,
+    recoverable_v1: bool,
 }
 
 /// Plain delegation bundle state reused by precompute, signing, and submission.
@@ -364,6 +489,18 @@ pub struct PreparedDelegationBundle {
     pub anchor_tree_state_bytes: Vec<u8>,
     pub network: Network,
     pub round_name: String,
+}
+
+/// Prepared recoverable bundle that cannot invoke the legacy random setup path.
+///
+/// The authority binding, validated chain round, and canonical bundle material
+/// are retained together. `setup` is therefore deterministic by construction.
+pub struct PreparedRecoverableDelegationBundleV1<'a> {
+    prepared: PreparedDelegationBundle,
+    authority_root: &'a crate::recoverable_authority::VotingAuthorityRootV1,
+    authority_binding: crate::recoverable_authority::VotingAuthorityRootBindingV1,
+    recoverable_bundle: crate::recoverable_authority::RecoverableSelfCustodyBundleV1,
+    validated_round: &'a crate::recoverable_authority::ValidatedRecoverableVotingRoundV1,
 }
 
 /// Validates round params and resolves lightwalletd anchor and branch state.
@@ -422,6 +559,7 @@ where
             target: PrepareDelegationTarget::Local(params.voting_hotkey),
             bundle_index: params.bundle_index,
             bundle_policy: params.bundle_policy,
+            recoverable_v1: false,
         },
     )
 }
@@ -456,8 +594,75 @@ where
             target: PrepareDelegationTarget::RoundBound(params.voting_target),
             bundle_index: params.bundle_index,
             bundle_policy: params.bundle_policy,
+            recoverable_v1: false,
         },
     )
+}
+
+/// Prepares one bundle under the frozen recoverable self-custody policy.
+///
+/// Unlike [`prepare_delegation_bundle_for_target`], the returned typestate does
+/// not expose a random setup method. Preparation fails closed if the wallet no
+/// longer retains the vote-chain snapshot block hash needed to prove that its
+/// scan and the supplied lightwalletd tree state are on the same fork.
+pub fn prepare_recoverable_delegation_bundle_v1<'a, C, P, CL, R>(
+    voting_db: &VotingDb,
+    wallet_db: &WalletDb<C, P, CL, R>,
+    params: PrepareRecoverableDelegationBundleV1Params<'a>,
+) -> Result<PreparedRecoverableDelegationBundleV1<'a>, VotingError>
+where
+    C: Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    params
+        .authority_root
+        .validate_binding(&params.authority_binding)?;
+    params
+        .validated_round
+        .validate_authority_context(params.authority_root.context())?;
+    let context = params.authority_root.context();
+    if params.lwd.network != context.network()
+        || params.lwd.round_params.vote_round_id != hex::encode(context.vote_round_id())
+    {
+        return Err(VotingError::InvalidInput {
+            message: "recoverable authority context does not match delegation round".to_string(),
+        });
+    }
+    let account_keys = load_account_keys(wallet_db, params.account_uuid)?;
+    validate_recoverable_account_binding(
+        context,
+        account_keys.account_index,
+        &account_keys.orchard_fvk_bytes,
+    )?;
+    validate_recoverable_snapshot_binding(wallet_db, &params.lwd, params.validated_round)?;
+    let hotkey = params.authority_root.voting_hotkey()?;
+    let target = hotkey.round_bound_delegation_target();
+    let prepared = prepare_delegation_bundle_inner(
+        voting_db,
+        wallet_db,
+        PrepareDelegationBundleInnerParams {
+            lwd: params.lwd,
+            session_json: params.session_json,
+            account_uuid: params.account_uuid,
+            target: PrepareDelegationTarget::RoundBound(&target),
+            bundle_index: params.bundle_index,
+            bundle_policy: crate::recoverable_authority::recoverable_bundle_policy_v1(),
+            recoverable_v1: true,
+        },
+    )?;
+    let recoverable_bundle =
+        crate::recoverable_authority::RecoverableSelfCustodyBundleV1::from_canonical_bundle(
+            prepared.bundle_index,
+            prepared.bundle_note_infos.clone(),
+        )?;
+    prepared.validate_recoverable_authority(params.authority_root, &recoverable_bundle)?;
+    Ok(PreparedRecoverableDelegationBundleV1 {
+        prepared,
+        authority_root: params.authority_root,
+        authority_binding: params.authority_binding,
+        recoverable_bundle,
+        validated_round: params.validated_round,
+    })
 }
 
 fn prepare_delegation_bundle_inner<C, P, CL, R>(
@@ -499,7 +704,7 @@ where
     let scanned_height = wallet_fully_scanned_height(wallet_db)?;
 
     // Gather the wallet inputs.
-    let wallet_inputs = match params.target {
+    let mut wallet_inputs = match params.target {
         PrepareDelegationTarget::Local(voting_hotkey) => {
             gather_delegation_wallet_inputs(GatherDelegationWalletParams {
                 wallet_db,
@@ -524,8 +729,17 @@ where
         }
     };
 
+    if params.recoverable_v1 {
+        wallet_inputs.round_note_infos = crate::recoverable_authority::canonical_recoverable_notes(
+            &wallet_inputs.round_note_infos,
+        )?;
+    }
+
     // Ensure the round is present in the voting database.
     voting_db.ensure_round(network, &round_params, None)?;
+    if params.recoverable_v1 {
+        require_recoverable_bundle_policy_v1(voting_db, &round_id)?;
+    }
     let (layout, bundle_note_infos) = ensure_delegation_bundle_selection(
         voting_db,
         &round_id,
@@ -573,6 +787,21 @@ fn ensure_delegation_bundle_selection(
         round_id,
     )?;
     Ok((layout, bundle_note_infos))
+}
+
+fn require_recoverable_bundle_policy_v1(
+    voting_db: &VotingDb,
+    round_id: &str,
+) -> Result<(), VotingError> {
+    let required = crate::recoverable_authority::recoverable_bundle_policy_v1();
+    let effective = voting_db.effective_bundle_policy(round_id, required)?;
+    if effective != required {
+        return Err(VotingError::InvalidInput {
+            message: "existing delegation bundles were not planned under recoverable-v1"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Inputs gathered from lightwalletd and the wallet before voting-DB work.
@@ -684,6 +913,22 @@ impl PreparedSigner {
     }
 }
 
+fn validate_prepared_signer_pczt(
+    pczt_bytes: &[u8],
+    signer: &PreparedSigner,
+) -> Result<(), VotingError> {
+    if !pczt_bytes.is_empty() {
+        let provided_sighash = pczt_sighash(pczt_bytes)?;
+        let PreparedSigner::Signature { sighash, .. } = signer;
+        if provided_sighash != *sighash {
+            return Err(VotingError::InvalidInput {
+                message: "pczt_bytes sighash does not match delegation signer sighash".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Validated delegation transaction fields for one bundle.
 ///
 /// The sighash is retained for wallet-side signing checks. The vote-chain wire
@@ -771,6 +1016,48 @@ impl PreparedDelegationBundle {
                     "delegation branch id 0x{actual:08X} does not match snapshot height {} branch id 0x{expected:08X}",
                     self.round_params.snapshot_height
                 ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_recoverable_authority(
+        &self,
+        root: &crate::recoverable_authority::VotingAuthorityRootV1,
+        recoverable_bundle: &crate::recoverable_authority::RecoverableSelfCustodyBundleV1,
+    ) -> Result<(), VotingError> {
+        let context = root.context();
+        if context.network() != self.network {
+            return Err(VotingError::InvalidInput {
+                message: "recoverable authority network does not match prepared delegation"
+                    .to_string(),
+            });
+        }
+        validate_recoverable_account_binding(
+            context,
+            self.delegation_keys.account_index,
+            &self.delegation_keys.fvk_bytes,
+        )?;
+        if hex::encode(context.vote_round_id()) != self.round_id {
+            return Err(VotingError::InvalidInput {
+                message: "recoverable authority round does not match prepared delegation"
+                    .to_string(),
+            });
+        }
+        if !recoverable_bundle
+            .identity()
+            .matches_notes(self.bundle_index, &self.bundle_note_infos)
+        {
+            return Err(VotingError::InvalidInput {
+                message: "recoverable bundle identity does not match prepared delegation notes"
+                    .to_string(),
+            });
+        }
+        let hotkey = root.voting_hotkey()?;
+        if hotkey.raw_orchard_address() != &self.delegation_keys.hotkey_raw_address {
+            return Err(VotingError::InvalidInput {
+                message: "recoverable authority hotkey does not match delegation target"
+                    .to_string(),
             });
         }
         Ok(())
@@ -865,6 +1152,30 @@ impl PreparedDelegationBundle {
         )
     }
 
+    /// Builds this bundle with the deterministic VAN blinding selected by one
+    /// matching recoverable authority root and canonical bundle plan.
+    pub(crate) fn setup_with_recoverable_authority(
+        &self,
+        voting_db: &VotingDb,
+        root: &crate::recoverable_authority::VotingAuthorityRootV1,
+        recoverable_bundle: &crate::recoverable_authority::RecoverableSelfCustodyBundleV1,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<DelegationSetup, VotingError> {
+        self.validate_snapshot_branch_id_provider()?;
+        self.validate_recoverable_authority(root, recoverable_bundle)?;
+        let van_blinding = recoverable_bundle.derive_van_blinding(root);
+        crate::delegate::setup_with_recoverable_van_blinding(
+            voting_db,
+            &self.round_id,
+            self.bundle_index,
+            &self.bundle_note_infos,
+            &self.delegation_keys,
+            &self.branch_id_provider,
+            &van_blinding,
+            stages,
+        )
+    }
+
     /// Generates and persists the delegation proof for this prepared bundle.
     pub fn prove(
         &self,
@@ -907,16 +1218,7 @@ impl PreparedDelegationBundle {
         pczt_bytes: Vec<u8>,
         signer: PreparedSigner,
     ) -> Result<SignedDelegationBundle, VotingError> {
-        if !pczt_bytes.is_empty() {
-            let provided_sighash = pczt_sighash(&pczt_bytes)?;
-            let PreparedSigner::Signature { sighash, .. } = &signer;
-            if provided_sighash != *sighash {
-                return Err(VotingError::InvalidInput {
-                    message: "pczt_bytes sighash does not match delegation signer sighash"
-                        .to_string(),
-                });
-            }
-        }
+        validate_prepared_signer_pczt(&pczt_bytes, &signer)?;
         let submission = self.submission(voting_db, signer)?;
         Ok(SignedDelegationBundle {
             submission,
@@ -971,6 +1273,196 @@ impl PreparedDelegationBundle {
             delegated_weight_zatoshi: self.delegated_weight_zatoshi()?,
             bundle_count: self.layout.bundle_count,
             bundle_index: self.bundle_index,
+        })
+    }
+}
+
+impl PreparedRecoverableDelegationBundleV1<'_> {
+    fn bundle_use(
+        &self,
+    ) -> Result<crate::recoverable_authority::RecoverableBundleUseV1<'_>, VotingError> {
+        crate::recoverable_authority::RecoverableBundleUseV1::new(
+            self.authority_root,
+            &self.authority_binding,
+            self.validated_round,
+            crate::recoverable_authority::RecoverableBundleMaterialV1::RecoverableSelfCustody(
+                self.recoverable_bundle.identity(),
+            ),
+        )
+    }
+
+    fn validate_persisted_material(&self, voting_db: &VotingDb) -> Result<(), VotingError> {
+        let wallet_id = voting_db.wallet_id();
+        let conn = voting_db.conn();
+        self.bundle_use()?.validate_persisted_with_conn(
+            &conn,
+            &wallet_id,
+            &self.prepared.round_id,
+            self.prepared.bundle_index,
+        )
+    }
+
+    fn validate_persisted_round(&self, voting_db: &VotingDb) -> Result<(), VotingError> {
+        let wallet_id = voting_db.wallet_id();
+        let conn = voting_db.conn();
+        self.bundle_use()?.validate_persisted_round_with_conn(
+            &conn,
+            &wallet_id,
+            &self.prepared.round_id,
+        )
+    }
+
+    pub fn authority_binding(&self) -> &crate::recoverable_authority::VotingAuthorityRootBindingV1 {
+        &self.authority_binding
+    }
+
+    pub fn bundle_identity(&self) -> &crate::recoverable_authority::RecoverableBundleIdentityV1 {
+        self.recoverable_bundle.identity()
+    }
+
+    pub fn round_id(&self) -> &str {
+        &self.prepared.round_id
+    }
+
+    pub fn bundle_index(&self) -> u32 {
+        self.prepared.bundle_index
+    }
+
+    pub fn eligible_weight_zatoshi(&self) -> u64 {
+        self.prepared.eligible_weight_zatoshi()
+    }
+
+    pub fn delegated_weight_zatoshi(&self) -> Result<u64, VotingError> {
+        self.prepared.delegated_weight_zatoshi()
+    }
+
+    pub fn ensure_witnesses<C, P, CL, R>(
+        &self,
+        voting_db: &VotingDb,
+        wallet_db: &WalletDb<C, P, CL, R>,
+    ) -> Result<(), VotingError>
+    where
+        C: Borrow<rusqlite::Connection>,
+        P: Parameters,
+    {
+        self.prepared.ensure_witnesses(voting_db, wallet_db)
+    }
+
+    pub fn precompute<C, P, CL, R>(
+        &self,
+        voting_db: &VotingDb,
+        wallet_db: &WalletDb<C, P, CL, R>,
+        pir_client: &crate::recoverable_authority::RecoverablePirClientV1,
+    ) -> Result<PreparedDelegationReport, VotingError>
+    where
+        C: Borrow<rusqlite::Connection>,
+        P: Parameters,
+    {
+        pir_client.validate_round(self.validated_round)?;
+        self.prepared
+            .precompute(voting_db, wallet_db, pir_client.inner())
+    }
+
+    /// Builds deterministic setup; no random alternative exists on this type.
+    pub fn setup(
+        &self,
+        voting_db: &VotingDb,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<DelegationSetup, VotingError> {
+        self.validate_persisted_round(voting_db)?;
+        self.prepared.setup_with_recoverable_authority(
+            voting_db,
+            self.authority_root,
+            &self.recoverable_bundle,
+            stages,
+        )
+    }
+
+    pub fn prove(
+        &self,
+        voting_db: &VotingDb,
+        pir_client: &crate::recoverable_authority::RecoverablePirClientV1,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<DelegationProof, VotingError> {
+        self.validate_persisted_material(voting_db)?;
+        pir_client.validate_round(self.validated_round)?;
+        self.prepared.prove(voting_db, pir_client.inner(), stages)
+    }
+
+    pub fn signing_request(
+        &self,
+        voting_db: &VotingDb,
+    ) -> Result<DelegationSigningRequest, VotingError> {
+        voting_db.get_recoverable_delegation_signing_request(
+            &self.prepared.round_id,
+            self.prepared.bundle_index,
+            &self.prepared.delegation_keys,
+            self.bundle_use()?,
+        )
+    }
+
+    pub fn submission(
+        &self,
+        voting_db: &VotingDb,
+        signer: PreparedSigner,
+    ) -> Result<DelegationSubmission, VotingError> {
+        let PreparedSigner::Signature { sig, sighash } = signer;
+        let data = voting_db.get_recoverable_delegation_submission_with_signature(
+            &self.prepared.round_id,
+            self.prepared.bundle_index,
+            &sig,
+            &sighash,
+            self.bundle_use()?,
+        )?;
+        delegation_submission_from_data(data)
+    }
+
+    pub fn signed_bundle(
+        &self,
+        voting_db: &VotingDb,
+        pczt_bytes: Vec<u8>,
+        signer: PreparedSigner,
+    ) -> Result<SignedDelegationBundle, VotingError> {
+        validate_prepared_signer_pczt(&pczt_bytes, &signer)?;
+        let submission = self.submission(voting_db, signer)?;
+        Ok(SignedDelegationBundle {
+            submission,
+            pczt_bytes,
+            eligible_weight_zatoshi: self.eligible_weight_zatoshi(),
+            delegated_weight_zatoshi: self.delegated_weight_zatoshi()?,
+            bundle_count: self.prepared.layout.bundle_count,
+            bundle_index: self.prepared.bundle_index,
+        })
+    }
+
+    /// Builds the existing Keystone request after deterministic setup.
+    pub fn keystone_request(
+        &self,
+        voting_db: &VotingDb,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<KeystoneSigningRequest, VotingError> {
+        let setup = self.setup(voting_db, stages)?;
+        let redacted_pczt_bytes = redact_delegation_pczt_for_signer(&setup.pczt_bytes)?;
+        let display_weight_zatoshi =
+            crate::round::raw_bundle_weight(&self.prepared.bundle_note_infos)?;
+        let display_memo = display_memo(&self.prepared.round_name, display_weight_zatoshi);
+        let action_index = crate::wire::BoundedU32::try_from(setup.action_index).map_err(|_| {
+            VotingError::InvalidInput {
+                message: format!("action_index {} does not fit u32", setup.action_index),
+            }
+        })?;
+
+        Ok(KeystoneSigningRequest {
+            pczt_bytes: setup.pczt_bytes,
+            redacted_pczt_bytes,
+            pczt_sighash: setup.pczt_sighash.to_vec(),
+            rk: setup.rk.to_vec(),
+            action_index: action_index.0,
+            display_memo,
+            eligible_weight_zatoshi: self.eligible_weight_zatoshi(),
+            delegated_weight_zatoshi: self.delegated_weight_zatoshi()?,
+            bundle_count: self.prepared.layout.bundle_count,
+            bundle_index: self.prepared.bundle_index,
         })
     }
 }
@@ -1061,6 +1553,44 @@ pub fn setup(
     })
 }
 
+/// Builds and persists a governance PCZT using a typed deterministic VAN
+/// blinding. Callers normally use
+/// [`PreparedDelegationBundle::setup_with_recoverable_authority`], which also
+/// checks the authority context and canonical bundle identity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn setup_with_recoverable_van_blinding(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    notes: &[NoteInfo],
+    keys: &DelegationKeys,
+    branch_id_provider: &dyn BranchIdProvider,
+    van_blinding: &crate::recoverable_authority::RecoverableVanBlindingV1,
+    stages: &dyn DelegationProgressReporter,
+) -> Result<DelegationSetup, VotingError> {
+    let consensus_branch_id = branch_id_provider.consensus_branch_id()?;
+    stages.on_progress(DelegationProgress::PcztBuilding);
+    let pczt = db.build_governance_pczt_with_van_blinding(
+        round_id,
+        bundle_index,
+        notes,
+        keys,
+        consensus_branch_id,
+        van_blinding,
+    )?;
+    stages.on_progress(DelegationProgress::PcztBuilt);
+
+    let pczt_sighash = array32("pczt_sighash", pczt.pczt_sighash)?;
+    Ok(DelegationSetup {
+        pczt_bytes: pczt.pczt_bytes,
+        pczt_sighash,
+        rk: array32("rk", pczt.rk)?,
+        action_index: pczt.action_index,
+        action_bytes: pczt.action_bytes,
+        tx1_effects: pczt.tx1_effects,
+    })
+}
+
 /// Loads the account-scoped data needed to sign a delegation PCZT locally.
 ///
 /// Call [`setup`] first so the PCZT sighash and spend auth randomizer have been
@@ -1119,6 +1649,12 @@ pub fn submission(
         }
     }?;
 
+    delegation_submission_from_data(data)
+}
+
+fn delegation_submission_from_data(
+    data: crate::types::DelegationSubmissionData,
+) -> Result<DelegationSubmission, VotingError> {
     Ok(DelegationSubmission {
         proof: data.proof,
         rk: array32("rk", data.rk)?,
@@ -1456,6 +1992,452 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_prepare_rejects_account_mismatch_before_db_writes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, _) = setup_test_account_for_network(&mut conn, Network::Regtest);
+        let wallet_db = WalletDb::from_connection(
+            &conn,
+            Network::Regtest,
+            SystemClock,
+            voting_crypto_deps::rand::rngs::OsRng,
+        );
+        let account_uuid = account_uuid.expose_uuid().to_string();
+        let account_keys = load_account_keys(&wallet_db, &account_uuid).unwrap();
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "01".repeat(32),
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        let context = crate::recoverable_authority::VotingAuthorityContextV1::from_orchard_fvk(
+            Network::Regtest,
+            account_keys.account_index + 1,
+            &account_keys.orchard_fvk_bytes,
+            "vote-chain-test",
+            hex::decode(&round_params.vote_round_id)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let request = crate::recoverable_authority::SoftwareRegisteredKeyRequestV1::new(
+            crate::recoverable_authority::RegisteredKeyApplicationV1::new(0xA11C),
+            context,
+        );
+        let root = crate::recoverable_authority::VotingAuthorityRootV1::from_registered_key_output(
+            &request, [0x55; 64],
+        );
+        let validated_round =
+            crate::recoverable_authority::test_validated_recoverable_voting_round_v1(
+                Network::Regtest,
+                "vote-chain-test",
+                round_params.clone(),
+                [0xAB; 32],
+                3,
+            );
+        let authority_binding =
+            crate::recoverable_authority::VotingAuthorityRootBindingV1::bind(&root);
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("recoverable-account-mismatch");
+
+        let error = prepare_recoverable_delegation_bundle_v1(
+            &voting_db,
+            &wallet_db,
+            PrepareRecoverableDelegationBundleV1Params {
+                lwd: DelegationLwdInputs {
+                    network: Network::Regtest,
+                    round_params,
+                    resolved_round_name: "Demo Round".to_string(),
+                    anchor_tree_state_bytes: vec![],
+                    branch_id_provider: LightwalletdBranchIdProvider::resolved(u32::from(
+                        BranchId::Nu6_3,
+                    )),
+                },
+                session_json: None,
+                account_uuid: &account_uuid,
+                authority_root: &root,
+                authority_binding,
+                validated_round: &validated_round,
+                bundle_index: 0,
+            },
+        )
+        .err()
+        .expect("mismatched account must fail before preparing delegation");
+
+        assert!(error.to_string().contains("account index"), "{error}");
+        assert!(voting_db.list_rounds().unwrap().is_empty());
+    }
+
+    fn recoverable_test_material<C, P, CL, R>(
+        wallet_db: &WalletDb<C, P, CL, R>,
+        account_uuid: &str,
+        round_params: &crate::VotingRoundParams,
+        snapshot_block_hash: [u8; 32],
+    ) -> (
+        crate::recoverable_authority::VotingAuthorityRootV1,
+        crate::recoverable_authority::ValidatedRecoverableVotingRoundV1,
+        crate::recoverable_authority::VotingAuthorityRootBindingV1,
+    )
+    where
+        C: Borrow<rusqlite::Connection>,
+        P: Parameters,
+    {
+        let account_keys = load_account_keys(wallet_db, account_uuid).unwrap();
+        let round_id: [u8; 32] = hex::decode(&round_params.vote_round_id)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let context = crate::recoverable_authority::VotingAuthorityContextV1::from_orchard_fvk(
+            Network::Regtest,
+            account_keys.account_index,
+            &account_keys.orchard_fvk_bytes,
+            "vote-chain-test",
+            round_id,
+        )
+        .unwrap();
+        let request = crate::recoverable_authority::SoftwareRegisteredKeyRequestV1::new(
+            crate::recoverable_authority::RegisteredKeyApplicationV1::new(0xA11C),
+            context,
+        );
+        let root = crate::recoverable_authority::VotingAuthorityRootV1::from_registered_key_output(
+            &request, [0x55; 64],
+        );
+        let validated_round = recoverable_test_round(round_params, snapshot_block_hash);
+        let authority_binding =
+            crate::recoverable_authority::VotingAuthorityRootBindingV1::bind(&root);
+        (root, validated_round, authority_binding)
+    }
+
+    fn recoverable_test_round(
+        round_params: &crate::VotingRoundParams,
+        snapshot_block_hash: [u8; 32],
+    ) -> crate::recoverable_authority::ValidatedRecoverableVotingRoundV1 {
+        crate::recoverable_authority::test_validated_recoverable_voting_round_v1(
+            Network::Regtest,
+            "vote-chain-test",
+            round_params.clone(),
+            snapshot_block_hash,
+            3,
+        )
+    }
+
+    fn recoverable_test_lwd_inputs(
+        round_params: crate::VotingRoundParams,
+        tree_state_block_hash: [u8; 32],
+    ) -> DelegationLwdInputs {
+        let tree_state = TreeState {
+            network: "regtest".to_string(),
+            height: round_params.snapshot_height,
+            hash: hex::encode(tree_state_block_hash),
+            time: 0,
+            sapling_tree: String::new(),
+            orchard_tree: String::new(),
+            ironwood_tree: String::new(),
+        };
+        DelegationLwdInputs {
+            network: Network::Regtest,
+            round_params,
+            resolved_round_name: "Demo Round".to_string(),
+            anchor_tree_state_bytes: tree_state.encode_to_vec(),
+            branch_id_provider: LightwalletdBranchIdProvider::resolved(u32::from(BranchId::Nu6_3)),
+        }
+    }
+
+    fn insert_wallet_snapshot_block(
+        conn: &Connection,
+        snapshot_height: u32,
+        display_order_hash: [u8; 32],
+    ) {
+        conn.execute("DELETE FROM scan_queue", []).unwrap();
+        conn.execute(
+            "INSERT INTO scan_queue (block_range_start, block_range_end, priority)
+             VALUES (0, ?1, 10)",
+            params![snapshot_height + 1],
+        )
+        .unwrap();
+        let mut internal_hash = display_order_hash;
+        internal_hash.reverse();
+        conn.execute(
+            "INSERT OR REPLACE INTO blocks (
+                height, hash, time, sapling_tree, sapling_commitment_tree_size,
+                orchard_commitment_tree_size, sapling_output_count, orchard_action_count
+             )
+             VALUES (?1, ?2, 0, ?3, 0, 0, 0, 0)",
+            params![snapshot_height, internal_hash, Vec::<u8>::new()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recoverable_prepare_rejects_tree_state_hash_mismatch_before_db_writes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, _) = setup_test_account_for_network(&mut conn, Network::Regtest);
+        let account_uuid = account_uuid.expose_uuid().to_string();
+        let wallet_db = WalletDb::from_connection(
+            &conn,
+            Network::Regtest,
+            SystemClock,
+            voting_crypto_deps::rand::rngs::OsRng,
+        );
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "01".repeat(32),
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        let (root, validated_round, authority_binding) =
+            recoverable_test_material(&wallet_db, &account_uuid, &round_params, [0xAB; 32]);
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("recoverable-tree-state-hash-mismatch");
+
+        let error = prepare_recoverable_delegation_bundle_v1(
+            &voting_db,
+            &wallet_db,
+            PrepareRecoverableDelegationBundleV1Params {
+                lwd: recoverable_test_lwd_inputs(round_params, [0xCD; 32]),
+                session_json: None,
+                account_uuid: &account_uuid,
+                authority_root: &root,
+                authority_binding,
+                validated_round: &validated_round,
+                bundle_index: 0,
+            },
+        )
+        .err()
+        .expect("mismatched TreeState hash must fail before preparing delegation");
+
+        assert!(error.to_string().contains("TreeState hash"), "{error}");
+        assert!(voting_db.list_rounds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recoverable_prepare_rejects_wallet_hash_mismatch_before_db_writes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let (account_uuid, _) = setup_test_account_for_network(&mut conn, Network::Regtest);
+        let snapshot_height = u32::try_from(REGTEST_NU6_3_SNAPSHOT_HEIGHT).unwrap();
+        insert_wallet_snapshot_block(&conn, snapshot_height, [0xCD; 32]);
+        let account_uuid = account_uuid.expose_uuid().to_string();
+        let wallet_db = WalletDb::from_connection(
+            &conn,
+            Network::Regtest,
+            SystemClock,
+            voting_crypto_deps::rand::rngs::OsRng,
+        );
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "01".repeat(32),
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        let (root, validated_round, authority_binding) =
+            recoverable_test_material(&wallet_db, &account_uuid, &round_params, [0xAB; 32]);
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("recoverable-wallet-hash-mismatch");
+
+        let error = prepare_recoverable_delegation_bundle_v1(
+            &voting_db,
+            &wallet_db,
+            PrepareRecoverableDelegationBundleV1Params {
+                lwd: recoverable_test_lwd_inputs(round_params, [0xAB; 32]),
+                session_json: None,
+                account_uuid: &account_uuid,
+                authority_root: &root,
+                authority_binding,
+                validated_round: &validated_round,
+                bundle_index: 0,
+            },
+        )
+        .err()
+        .expect("mismatched wallet hash must fail before preparing delegation");
+
+        assert!(
+            error.to_string().contains("wallet snapshot block hash"),
+            "{error}"
+        );
+        assert!(voting_db.list_rounds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recoverable_snapshot_binding_normalizes_wallet_hash_byte_order() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup_test_account_for_network(&mut conn, Network::Regtest);
+        let snapshot_height = u32::try_from(REGTEST_NU6_3_SNAPSHOT_HEIGHT).unwrap();
+        let expected_display_hash = std::array::from_fn(|index| index as u8);
+        insert_wallet_snapshot_block(&conn, snapshot_height, expected_display_hash);
+        let wallet_db = WalletDb::from_connection(
+            &conn,
+            Network::Regtest,
+            SystemClock,
+            voting_crypto_deps::rand::rngs::OsRng,
+        );
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "01".repeat(32),
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        let validated_round = recoverable_test_round(&round_params, expected_display_hash);
+        let lwd = recoverable_test_lwd_inputs(round_params, expected_display_hash);
+
+        validate_recoverable_snapshot_binding(&wallet_db, &lwd, &validated_round).unwrap();
+    }
+
+    #[test]
+    fn recoverable_snapshot_binding_rejects_missing_retained_wallet_hash() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        setup_test_account_for_network(&mut conn, Network::Regtest);
+        let snapshot_height = u32::try_from(REGTEST_NU6_3_SNAPSHOT_HEIGHT).unwrap();
+        insert_wallet_snapshot_block(&conn, snapshot_height + 1, [0xCD; 32]);
+        let wallet_db = WalletDb::from_connection(
+            &conn,
+            Network::Regtest,
+            SystemClock,
+            voting_crypto_deps::rand::rngs::OsRng,
+        );
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "01".repeat(32),
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        let validated_round = recoverable_test_round(&round_params, [0xAB; 32]);
+        let lwd = recoverable_test_lwd_inputs(round_params, [0xAB; 32]);
+
+        let error = validate_recoverable_snapshot_binding(&wallet_db, &lwd, &validated_round)
+            .expect_err("a pruned wallet snapshot hash must fail closed");
+
+        assert!(
+            error.to_string().contains("no retained block hash"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recoverable_delegation_accepts_only_deterministic_persisted_setup() {
+        let (voting_db, round_params, _, mut prepared) = prepared_wallet_delegation_fixture();
+        let round_id = hex::decode(&round_params.vote_round_id)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let context = crate::recoverable_authority::VotingAuthorityContextV1::from_orchard_fvk(
+            Network::Regtest,
+            prepared.delegation_keys.account_index,
+            &prepared.delegation_keys.fvk_bytes,
+            "vote-chain-test",
+            round_id,
+        )
+        .unwrap();
+        let request = crate::recoverable_authority::SoftwareRegisteredKeyRequestV1::new(
+            crate::recoverable_authority::RegisteredKeyApplicationV1::new(0xA11C),
+            context,
+        );
+        let root = crate::recoverable_authority::VotingAuthorityRootV1::from_registered_key_output(
+            &request, [0x55; 64],
+        );
+        let validated_round = recoverable_test_round(&round_params, [0xAB; 32]);
+        let authority_binding =
+            crate::recoverable_authority::VotingAuthorityRootBindingV1::bind(&root);
+        let hotkey = root.voting_hotkey().unwrap();
+        prepared.delegation_keys = DelegationKeys::with_voting_target(
+            prepared.delegation_keys.fvk_bytes.clone(),
+            hotkey.delegation_target(),
+            Some(hotkey.round_bound_delegation_target()),
+            prepared.delegation_keys.seed_fingerprint,
+            prepared.delegation_keys.account_index,
+            prepared.delegation_keys.round_name.clone(),
+        );
+        let recoverable_bundle =
+            crate::recoverable_authority::RecoverableSelfCustodyBundleV1::from_canonical_bundle(
+                prepared.bundle_index,
+                prepared.bundle_note_infos.clone(),
+            )
+            .unwrap();
+        prepared
+            .validate_recoverable_authority(&root, &recoverable_bundle)
+            .unwrap();
+
+        let legacy_setup = prepared
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let recoverable = PreparedRecoverableDelegationBundleV1 {
+            prepared,
+            authority_root: &root,
+            authority_binding,
+            recoverable_bundle,
+            validated_round: &validated_round,
+        };
+
+        let signing_error = recoverable
+            .signing_request(&voting_db)
+            .err()
+            .expect("legacy random setup must fail before signing export");
+        let submission_error = recoverable
+            .submission(
+                &voting_db,
+                PreparedSigner::signature([0; 64], legacy_setup.pczt_sighash),
+            )
+            .err()
+            .expect("legacy random setup must fail before submission assembly");
+        for error in [signing_error, submission_error] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("persisted bundle material does not match"),
+                "{error}"
+            );
+        }
+
+        voting_db
+            .clear_unsigned_delegation_setup_fields(recoverable.round_id())
+            .unwrap();
+        voting_db
+            .conn()
+            .execute(
+                "UPDATE rounds SET snapshot_height = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3",
+                rusqlite::params![
+                    round_params.snapshot_height + 1,
+                    &round_params.vote_round_id,
+                    voting_db.wallet_id()
+                ],
+            )
+            .unwrap();
+        let setup_error = recoverable
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .err()
+            .expect("stale persisted round parameters must fail before recoverable setup");
+        assert!(
+            setup_error
+                .to_string()
+                .contains("persisted round parameters do not match"),
+            "{setup_error}"
+        );
+        voting_db
+            .conn()
+            .execute(
+                "UPDATE rounds SET snapshot_height = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3",
+                rusqlite::params![
+                    round_params.snapshot_height,
+                    &round_params.vote_round_id,
+                    voting_db.wallet_id()
+                ],
+            )
+            .unwrap();
+        recoverable
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        recoverable
+            .signing_request(&voting_db)
+            .expect("deterministic recoverable setup must remain signable");
+    }
+
+    #[test]
     fn prepare_delegation_bundle_returns_plain_reusable_bundle_state() {
         let (_voting_db, round_params, hotkey, prepared) = prepared_wallet_delegation_fixture();
         let divisor = crate::governance::BALLOT_DIVISOR;
@@ -1521,6 +2503,39 @@ mod tests {
 
         assert_eq!(resumed.bundle_count, 6);
         assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn recoverable_delegation_rejects_a_persisted_non_v1_bundle_policy() {
+        let voting_db = VotingDb::open_in_memory().unwrap();
+        voting_db.set_wallet_id("recoverable-policy-mismatch");
+        let round_params = crate::VotingRoundParams {
+            vote_round_id: "04".repeat(32),
+            snapshot_height: REGTEST_NU6_3_SNAPSHOT_HEIGHT,
+            ea_pk: vec![1; 32],
+            nc_root: vec![2; 32],
+            nullifier_imt_root: vec![3; 32],
+        };
+        voting_db
+            .ensure_round(Network::Regtest, &round_params, None)
+            .unwrap();
+        voting_db
+            .ensure_bundles_with_policy(
+                &round_params.vote_round_id,
+                &[note_info(0, crate::governance::BALLOT_DIVISOR)],
+                BundlePolicy::new(1).unwrap(),
+            )
+            .unwrap();
+
+        let error = require_recoverable_bundle_policy_v1(&voting_db, &round_params.vote_round_id)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("were not planned under recoverable-v1"),
+            "{error}"
+        );
     }
 
     #[test]

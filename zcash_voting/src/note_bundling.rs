@@ -284,6 +284,26 @@ impl Default for BundlePolicy {
     }
 }
 
+// Keep these values independent of the mutable wallet defaults. Any change
+// would alter historical recoverable bundle identities.
+const RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE: usize = 5;
+const RECOVERABLE_V1_MAX_PRIVACY_BUNDLES: usize = 2;
+const RECOVERABLE_V1_PRIVACY_DROP_BPS: u32 = 100;
+const RECOVERABLE_V1_MAX_PRIVACY_DROP_ZATOSHI: u64 = 100_000_000_000;
+
+/// Exact policy frozen for recoverable self-custody authority version 1.
+pub(crate) fn recoverable_bundle_policy_v1() -> BundlePolicy {
+    BundlePolicy {
+        max_real_notes_per_bundle: RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE,
+        bundle_addition_threshold_zatoshi: None,
+        privacy_trim: Some(PrivacyTrimPolicy {
+            max_bundles: RECOVERABLE_V1_MAX_PRIVACY_BUNDLES,
+            drop_bps: RECOVERABLE_V1_PRIVACY_DROP_BPS,
+            max_drop_zatoshi: Some(RECOVERABLE_V1_MAX_PRIVACY_DROP_ZATOSHI),
+        }),
+    }
+}
+
 /// What the privacy trim removed from a bundle plan.
 ///
 /// Reported separately from the sub-ballot drop because the two mean different
