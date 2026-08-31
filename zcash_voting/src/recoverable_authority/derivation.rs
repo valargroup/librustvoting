@@ -25,6 +25,7 @@ const MASTER_GENERATION_ID_DOMAIN: &[u8] = b"zcash_voting/keystone-master-genera
 const MASTER_TO_ROOT_DOMAIN: &[u8] = b"zcash_voting/master-to-round-root/v1";
 const ROOT_TO_HOTKEY_DOMAIN: &[u8] = b"zcash_voting/root-to-orchard-hotkey/v1";
 const ROOT_BINDING_DOMAIN: &[u8] = b"zcash_voting/authority-root-binding/v1";
+const MAX_ROOT_BINDING_JSON_BYTES: usize = 2_048;
 
 /// Public scope of one Keystone host voting-master generation.
 ///
@@ -328,6 +329,13 @@ impl VotingAuthorityRootBindingV1 {
 
     /// Parses and validates the strict version 1 public root-binding schema.
     pub fn from_json(json: &str) -> Result<Self, VotingError> {
+        if json.len() > MAX_ROOT_BINDING_JSON_BYTES {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "voting authority root binding JSON exceeds {MAX_ROOT_BINDING_JSON_BYTES} bytes"
+                ),
+            });
+        }
         let dto: VotingAuthorityRootBindingDto =
             serde_json::from_str(json).map_err(|error| VotingError::InvalidInput {
                 message: format!("invalid voting authority root binding JSON: {error}"),
@@ -1230,5 +1238,8 @@ mod tests {
             &hex::encode_upper(master.generation_id()),
         );
         assert!(VotingAuthorityRootBindingV1::from_json(&uppercase).is_err());
+
+        let oversized = format!("{json}{}", " ".repeat(MAX_ROOT_BINDING_JSON_BYTES));
+        assert!(VotingAuthorityRootBindingV1::from_json(&oversized).is_err());
     }
 }
