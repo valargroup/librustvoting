@@ -56,10 +56,13 @@ fallback, replenishment, overdue recovery, fleet changes, legacy delivery
 state that predates complete-plan persistence, and single-share mode fall
 outside it. New SDK planning atomically persists the complete commitment-wide
 plan before any POST and reuses it across restart; it never replans only the
-missing subset. `LegacyBestEffort` records that delivery rows already existed
-without a complete original plan. It is metadata about old state, not
-permission to discard or recompute a plan. The
-statement also makes no claim about the combined view of colluding helpers.
+missing subset. New plans without preexisting delivery rows report
+`SharePlacementGuarantee::Strict`.
+`SharePlacementGuarantee::LegacyBestEffort` (abbreviated `LegacyBestEffort`
+below) records that delivery rows already existed without a complete original
+plan. It is metadata about old state, not permission to discard or recompute a
+plan. The statement also makes no claim about the combined view of colluding
+helpers.
 
 ## Terminology and state model
 
@@ -321,8 +324,8 @@ Regression tests:
 `round_immediate_share_key_uses_highest_bundle_lowest_voted_proposal_and_share_zero`,
 `immediate_batch_position_stays_aligned_and_does_not_perturb_other_plan`,
 `immediate_marker_is_distinct_when_all_shares_submit_immediately`,
-`single_share_mode_rejects_non_singleton_batches`,
-`helper_planning_derives_single_share_mode_from_payload_count`, and the
+`single_share_mode_is_exempt_from_complete_batch_usage_cap`,
+`single_share_mode_rejects_non_singleton_batches`, and the
 round-plan tests in [`session.rs`](../zcash_voting/src/session.rs). The policy
 tests are in
 [`share_policy/tests/initial_placement.rs`](../zcash_voting/src/share_policy/tests/initial_placement.rs).
@@ -356,6 +359,10 @@ returns zero. The high-level entry point does not accept an unvalidated raw
 list: `HelperClient::preflight_fleet` canonicalizes the complete fleet, rejects
 empty or duplicate canonical identities, derives the readiness target
 internally, and returns `HelperFleetPreflight`.
+FFI boundaries may reconstruct the same public snapshot with
+`HelperFleetPreflight::from_readiness`; it applies the same nonempty,
+canonical, and distinct configured-fleet checks and additionally requires the
+ready list to be a distinct subset of that fleet.
 `CommittedVote::prepare_share_delivery` consumes that validated snapshot.
 It also consumes the complete proposal-id roster from the authenticated round
 configuration. The roster must be nonempty, distinct, and exactly match the
@@ -387,9 +394,11 @@ Enforcement:
 [`share_submission_target_count`](../zcash_voting/src/share_policy/server_order.rs),
 `require_share_servers` in
 [`share_policy/initial_placement.rs`](../zcash_voting/src/share_policy/initial_placement.rs),
-and `HelperFleetPreflight`, complete-plan validation, and committed delivery in
-[`share_tracking/configured_fleet.rs`](../zcash_voting/src/share_tracking/configured_fleet.rs)
-and
+`HelperClient::preflight_fleet` and `HelperFleetPreflight` in
+[`helper/client.rs`](../zcash_voting/src/helper/client.rs), complete-plan
+validation in
+[`share_tracking/delivery_plan.rs`](../zcash_voting/src/share_tracking/delivery_plan.rs),
+and committed delivery in
 [`share_tracking/initial_delivery.rs`](../zcash_voting/src/share_tracking/initial_delivery.rs).
 
 Regression tests:
@@ -405,8 +414,9 @@ includes
 `tracking_rejects_duplicate_spelling_fleet_before_effects`, and
 `tracking_rejects_empty_fleet_before_effects` in
 [`share_tracking/tests/initial_delivery.rs`](../zcash_voting/src/share_tracking/tests/initial_delivery.rs).
-The wallet boundary is covered by
-`helper_planning_rejects_exact_and_canonical_duplicates`.
+The public boundary is also covered by
+`current_boundary_rejects_schema_invalid_bodies_and_canonical_duplicates` in
+[`helper_share_adversarial.rs`](../zcash_voting/tests/helper_share_adversarial.rs).
 
 ### Helper selection and balancing
 
@@ -572,8 +582,8 @@ report invalid or unfinished entries as not ready.
 
 | Operation or limit | Default | Enforced by |
 | --- | ---: | --- |
-| Initial readiness window | 2 seconds (from `SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS`) | `HelperClient::preflight` |
-| Absolute readiness deadline | 30 seconds (from `SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS`) | `HelperClient::preflight` |
+| Initial readiness window | 2 seconds (from `SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS`) | `HelperClient::preflight_fleet` |
+| Absolute readiness deadline | 30 seconds (from `SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS`) | `HelperClient::preflight_fleet` |
 | One status GET | 5 seconds | `HelperClient::share_status` |
 | Concurrent status GETs per share | 4 (from `SHARE_STATUS_MAX_CONCURRENT_POLLS`) | `poll_share_helpers` |
 | Total status quorum search for one share | 10 seconds (from `SHARE_STATUS_POLL_BUDGET_MILLISECONDS`) | `poll_share_helpers` |
@@ -678,11 +688,14 @@ For current POST classification:
 | 2xx with missing or unknown submission status | Ambiguous | Never |
 | Other 5xx statuses | Ambiguous non-transient failure | Never |
 | Other non-2xx statuses | Definite non-transient failure | Never |
-| Malformed caller-supplied JSON | Local definite failure | No request |
+| Body outside the closed `VoteShareWire` schema | Local definite failure | No request |
 
-Malformed caller JSON is rejected before the submission enters the scored
-network path. It therefore performs no request and does not increment or clear
-the selected helper's health state.
+Caller-supplied bodies are parsed as the closed `VoteShareWire` schema,
+validated, and canonically reserialized before submission. Invalid JSON,
+unknown or duplicate fields, oversized bodies, noncanonical encodings, and
+protocol-invalid values are rejected before the submission enters the scored
+network path. Rejection therefore performs no request and does not increment
+or clear the selected helper's health state.
 
 Every 5xx response is ambiguous because the helper may have processed the
 share before returning a server error. The narrower set `500`, `502`, `503`,
@@ -814,9 +827,6 @@ provided by
 `committed_vote_submission_keeps_degraded_planned_target_before_healthy_fallback`,
 `stale_committed_vote_submission_is_rejected_before_side_effects`,
 `generation_bound_preparation_rejects_replacement_after_validation`,
-`stale_handle_cannot_prepare_same_commitment_replacement`,
-`same_commitment_replacement_after_plan_load_stops_every_post`,
-`prepared_batch_stays_bound_to_its_starting_wallet`,
 `repeated_committed_submission_preserves_the_original_schedule`,
 `repeated_partial_committed_submission_sends_original_schedule_to_new_helper`,
 `repeated_committed_submission_does_not_resurrect_zero_schedule`,
@@ -825,7 +835,10 @@ provided by
 covered by `initial_delivery_does_not_recreate_share_after_recovery_cleanup`.
 The high-level boundary regressions in
 [`share_tracking/tests/delivery_plan.rs`](../zcash_voting/src/share_tracking/tests/delivery_plan.rs)
-are `complete_plan_is_persisted_and_reused`,
+are `stale_handle_cannot_prepare_same_commitment_replacement`,
+`same_commitment_replacement_after_plan_load_stops_every_post`,
+`prepared_batch_stays_bound_to_its_starting_wallet`,
+`complete_plan_is_persisted_and_reused`,
 `preconfirmation_plan_survives_confirmation_restart_and_submission`,
 `restart_reuses_the_plan_and_resumes_definite_delivery_deficits`,
 `fleet_churn_and_target_drift_fail_before_network`,
@@ -1191,8 +1204,9 @@ in `storage/operations.rs` for public submission and VC-position writes, and
 recovery-identity derivation under the same reservation,
 `record_rejects_recovery_for_a_different_proposal` in `share.rs` for binding
 the embedded recovery proposal to the durable key,
-`stale_helper_results_do_not_mutate_replacement_share` in `share.rs` for
-identity-bound confirmation and placement updates, and
+`wrong_nullifier_generation_cannot_apply_any_delivery_transition` in
+`share_tracking/tests/initial_delivery.rs` for identity-bound confirmation and
+placement updates, and
 `changed_choice_ignores_stale_share_confirmations` and
 `skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
 
@@ -1294,15 +1308,17 @@ Configured helper bases:
 
 Every endpoint appends `/shielded-vote/v1` after any configured mount path.
 Round IDs accepted by the client are 64 hexadecimal characters or base64 that
-decodes to exactly 32 bytes. Share IDs in status paths are nonempty
-hexadecimal. Both are normalized to lowercase hexadecimal.
+decodes to exactly 32 bytes; the bytes must encode a canonical Pallas
+base-field element. Share IDs in status paths are exactly 64 hexadecimal
+characters. Both are normalized to lowercase hexadecimal.
 
-Direct POST APIs validate that a supplied body is JSON, but do not
-schema-validate arbitrary caller JSON. Crate-generated payloads additionally
-validate round identity, proposal and option fields, share lengths and indexes,
-tree position, `submit_at`, and the relationship to persisted recovery
-material. One helper request contains only the selected encrypted share, never
-the complete `all_enc_shares` collection.
+Direct POST APIs require the closed `VoteShareWire` schema. They reject unknown
+or duplicate fields, bodies larger than 4096 bytes, noncanonical encodings,
+unsafe integer values, and invalid round identity, proposal, option, share,
+tree-position, or `submit_at` fields, then canonically reserialize the body
+before dispatch. Crate-generated payloads additionally validate their
+relationship to persisted recovery material. One helper request contains only
+the selected encrypted share, never the complete `all_enc_shares` collection.
 
 Enforcement:
 [`helper/url.rs`](../zcash_voting/src/helper/url.rs),
