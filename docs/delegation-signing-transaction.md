@@ -205,10 +205,14 @@ the same voting-round field element used in the VAN and ZKP #1.
 The same seven inputs always produce the same `rho_signed`. Local voting hotkey
 delegation derives its VAN blinding from the hotkey secret, network, round
 parameters, bundle index, and real note identities. Restoring or reusing all of
-those inputs reproduces the same VAN. `rho_signed` also reproduces only when all
-five real and padding note commitments are the same; a fresh voting database
-may sample different padding note secrets. Public target delegation has no
-local hotkey secret and continues to sample a fresh VAN blinding.
+those inputs reproduces the same VAN. A fresh voting database may generate
+different padding notes, so rebuilding the delegation can produce a different
+`rho_signed` and PCZT even though it reconstructs the same VAN. That difference
+does not affect an already-confirmed delegation. Once the VAN and its on-chain
+leaf position have been recovered, later voting uses the VAN blinding and a
+Merkle witness for that position, not `rho_signed` or the padding-note secrets.
+Public target delegation has no local hotkey secret and continues to sample a
+fresh VAN blinding.
 
 ### How the signed note is made
 
