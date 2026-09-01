@@ -293,8 +293,13 @@ none. The transaction may still have committed; that stays visible as
    column null, so the attempt journal is the only evidence that a dispatched
    vote may still commit. Re-selecting the same choice is never refused.
 11. Partial bundle deletion is refused while any bundle in the pruned range has a
-    non-rejected delegation attempt, or a vote or batch attempt that can still be
-    confirmed. An attempt references its round, not its bundle, so pruning would
+    non-rejected delegation attempt, a vote or batch attempt that can still be
+    confirmed, or an unconfirmed domain hash that is itself a reconciliation
+    candidate. That last has no journal row behind it, so the attempt checks
+    cannot see it, and deleting the bundle would take both the candidate and the
+    recovery a committed response needs; as in cleanup, only a real chain hash
+    counts and a candidate proved failed is retired, which reopens pruning.
+    An attempt references its round, not its bundle, so pruning would
     cascade away the bundle, vote, proof, and recovery rows a transaction that
     later commits needs, while leaving its journal evidence behind. Delegation is
     the one kind barred whatever its evidence: pruning cascades away
@@ -647,8 +652,10 @@ state transitions.
   after its transaction commits?
 - Can a reservation failure after an ambiguous dispatch be reported as a plain
   error, hiding an attempt that may still commit?
-- Can recovery cleanup erase an unconfirmed domain hash that is still the only
-  reconciliation candidate for its row?
+- Can recovery cleanup or bundle pruning erase an unconfirmed domain hash that is
+  still the only reconciliation candidate for its row?
+- Can a cancelled reconciliation let this attempt's rejection be reported as
+  terminal while a known candidate may still commit?
 - Does an outstanding reservation keep proving its owner is alive, rather than
   only recording when it was made?
 - Can one endpoint's confirmation for the wrong submission end a lookup that
@@ -791,7 +798,10 @@ state transitions.
   covers the between-retry dispatch gate, and
   `an_accepted_candidate_recorded_mid_call_is_not_overridden_by_a_rejection`
   covers the same gate on the rejection path, where the candidate's `accepted`
-  state is invisible to the live-attempt query.
+  state is invisible to the live-attempt query, and
+  `a_cancelled_reconciliation_does_not_make_a_rejection_terminal` covers the
+  candidate keeping that outcome non-terminal when the reconciliation settled
+  nothing.
 - `vote::tests::batch_recovery_is_bound_to_the_row_that_supplied_it` covers
   per-member row binding for atomic batches.
 - `vote::tests::recovery_replacement_is_refused_while_an_attempt_covers_the_row`
@@ -812,8 +822,10 @@ state transitions.
   covers binding a recovered payload to its storage row.
 - `round::tests::delete_skipped_bundles_refuses_to_prune_an_attempted_bundle`,
   `delete_skipped_bundles_prunes_past_a_rejected_attempt_and_its_journal_row`,
-  `delete_skipped_bundles_still_refuses_a_hashless_delegation_attempt`, and
-  `delete_skipped_bundles_prunes_past_a_hashless_vote_attempt` cover the
+  `delete_skipped_bundles_still_refuses_a_hashless_delegation_attempt`,
+  `delete_skipped_bundles_prunes_past_a_hashless_vote_attempt`,
+  `delete_skipped_bundles_refuses_a_legacy_domain_candidate`, and
+  `delete_skipped_bundles_prunes_past_an_opaque_legacy_identifier` cover the
   bundle-pruning guard, its rejected-attempt boundary, and the split between
   delegation's unconditional bar and a vote attempt that can never be confirmed.
 - `session::tests::ballot_intent_change_is_refused_while_a_vote_attempt_is_live`,

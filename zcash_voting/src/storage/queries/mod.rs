@@ -2823,6 +2823,46 @@ pub fn delete_bundles_from(
             ),
         });
     }
+    // A hash a pre-lifecycle host recorded is a reconciliation candidate with no
+    // journal row behind it, so the attempt check above cannot see it. Deleting
+    // the bundle would take that candidate and the recovery a committed response
+    // needs. Only a real chain hash bars pruning: an opaque legacy identifier is
+    // never a candidate, and a candidate a lookup proves failed is retired,
+    // which clears the column and lets a later prune proceed.
+    let has_domain_candidate: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM bundles
+                  WHERE round_id = :round_id AND wallet_id = :wallet_id
+                    AND bundle_index >= :from_index
+                    AND van_leaf_position IS NULL
+                    AND length(delegation_tx_hash) = 64
+                    AND delegation_tx_hash NOT GLOB '*[^0-9a-fA-F]*'
+                 UNION ALL
+                 SELECT 1 FROM votes
+                  WHERE round_id = :round_id AND wallet_id = :wallet_id
+                    AND bundle_index >= :from_index
+                    AND vc_tree_position IS NULL
+                    AND length(tx_hash) = 64
+                    AND tx_hash NOT GLOB '*[^0-9a-fA-F]*'
+             )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":from_index": from_index as i64,
+            },
+            |row| row.get(0),
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to check domain tx hashes before bundle deletion: {e}"),
+        })?;
+    if has_domain_candidate {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} has an unconfirmed transaction hash at or after bundle {from_index} that may still commit; reconcile it before pruning bundles"
+            ),
+        });
+    }
     // Every attempt still standing here is either rejected or a hashless vote
     // attempt this SDK can never identify or confirm. Remove them with the
     // bundles they describe rather than leaving journal rows that outlive their

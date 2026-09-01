@@ -1374,6 +1374,60 @@ mod tests {
     }
 
     #[test]
+    fn delete_skipped_bundles_refuses_a_legacy_domain_candidate() {
+        let db = test_db("wallet-prune-legacy-hash");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::new(1).unwrap())
+            .unwrap();
+        // A pre-lifecycle host recorded this; there is no journal row behind it,
+        // so the attempt check cannot see it.
+        db.conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash=?3
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=1",
+                rusqlite::params![ROUND_ID, db.wallet_id(), "a".repeat(64)],
+            )
+            .unwrap();
+
+        let error = db.delete_skipped_bundles(ROUND_ID, 1).unwrap_err();
+
+        // Pruning would delete the candidate and the recovery a committed
+        // response needs.
+        assert!(
+            error.to_string().contains("unconfirmed transaction hash"),
+            "{error}"
+        );
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 2);
+    }
+
+    #[test]
+    fn delete_skipped_bundles_prunes_past_an_opaque_legacy_identifier() {
+        let db = test_db("wallet-prune-opaque-hash");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::new(1).unwrap())
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash='legacy-hash'
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=1",
+                rusqlite::params![ROUND_ID, db.wallet_id()],
+            )
+            .unwrap();
+
+        // Never a reconciliation candidate, so barring pruning on one would
+        // freeze the round with nothing able to release it.
+        db.delete_skipped_bundles(ROUND_ID, 1).unwrap();
+
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 1);
+    }
+
+    #[test]
     fn delete_skipped_bundles_prunes_past_a_rejected_attempt_and_its_journal_row() {
         let db = test_db("wallet-prune-rejected");
         let notes = vec![

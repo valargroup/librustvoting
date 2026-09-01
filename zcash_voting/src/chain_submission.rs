@@ -665,10 +665,28 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     // This attempt is already journaled as rejected, so any
                     // remaining live attempt is an earlier one — from this call
                     // or a previous one — that may still commit.
-                    if last_unknown.is_some() || has_live_attempt(self.db, wallet_id, &identity)? {
-                        let earlier = last_unknown.as_deref().unwrap_or("dispatched, no response");
+                    //
+                    // A candidate that survived the reconciliation above is such
+                    // an attempt too, and `has_live_attempt` cannot see it:
+                    // `accepted` is neither `attempting` nor `outcome_unknown`.
+                    // Re-read rather than reuse the set from before, because a
+                    // committed failure there retires its candidates. This also
+                    // covers a reconciliation that was cancelled and so reached
+                    // no conclusion at all.
+                    let known_tx_hashes = known_hashes(self.db, wallet_id, &identity)?;
+                    if last_unknown.is_some()
+                        || !known_tx_hashes.is_empty()
+                        || has_live_attempt(self.db, wallet_id, &identity)?
+                    {
+                        let earlier = match &last_unknown {
+                            Some(message) => message.clone(),
+                            None if !known_tx_hashes.is_empty() => {
+                                "a known candidate may still commit".to_string()
+                            }
+                            None => "dispatched, no response".to_string(),
+                        };
                         return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                            known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
+                            known_tx_hashes,
                             message: format!(
                                 "an earlier attempt's outcome is unknown ({earlier}); a later attempt was rejected with code {}: {}",
                                 result.code, result.log
@@ -4051,5 +4069,94 @@ mod tests {
             *covered_during_reservation.lock().unwrap(),
             "the identity must be covered before its reservation is journaled"
         );
+    }
+
+    /// Records a racing accepted candidate during the POST, then cancels, so
+    /// the rejection branch's reconciliation reaches no conclusion.
+    struct RacingThenCancelTransport {
+        inner: MockTransport,
+        db_path: String,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ChainTransport for RacingThenCancelTransport {
+        fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(url, timeout)
+        }
+
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            body: Vec<u8>,
+            timeout: Duration,
+        ) -> ChainFuture<'a> {
+            let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                rusqlite::params![ROUND_ID, WALLET, vec![0xEE_u8; 32], TX_HASH_2],
+            )
+            .unwrap();
+            self.inner.post_json(url, body, timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_reconciliation_does_not_make_a_rejection_terminal() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_cancel_race_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+
+        let inner = MockTransport::default();
+        inner.responses.lock().unwrap().extend([
+            Ok(response(
+                422,
+                r#"{"tx_hash":"","code":7,"log":"invalid proof"}"#,
+            )),
+            // Never classified: the lookup's own cancellation check fires first.
+            Ok(response(404, r#"{"detail":"not found"}"#)),
+        ]);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport = Arc::new(RacingThenCancelTransport {
+            inner,
+            db_path: path.to_str().unwrap().to_string(),
+            cancelled: Arc::clone(&cancelled),
+        });
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let cancel = || cancelled.load(std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        // The reconciliation was cancelled, so it settled nothing, and the
+        // racing candidate is `accepted` — which `has_live_attempt` does not
+        // match. Reporting this attempt's rejection as terminal would tell the
+        // host the submission cannot land while that candidate may still commit.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
+                if known_tx_hashes == &vec![TX_HASH_2.to_string()]),
+            "got {outcome:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }
