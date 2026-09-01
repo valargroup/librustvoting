@@ -231,7 +231,17 @@ impl ChainClient {
             }
             let url = join_url(endpoint, &["tx", &tx_hash])?;
             match self.get(&url).await {
-                Ok(response) if response.status() == 404 => saw_pending = true,
+                // A 404 is protocol evidence that the transaction is not yet
+                // committed, so it has to meet the same body-size and
+                // content-type rules as any other response. A reverse proxy's
+                // HTML wrong-route page would otherwise make a broken endpoint
+                // look indefinitely uncommitted.
+                Ok(response) if response.status() == 404 => {
+                    match validate_json_response(&response) {
+                        Ok(()) => saw_pending = true,
+                        Err(error) => last_error = Some(error),
+                    }
+                }
                 Ok(response) if response.status() == 200 || response.status() == 422 => {
                     match validate_json_response(&response)
                         .and_then(|()| parse_confirmation(response))
@@ -662,6 +672,34 @@ mod tests {
         // endpoint's own evidence.
         assert!(matches!(error, ChainError::Decode(_)), "got {error:?}");
         assert!(error.is_ambiguous());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_404_is_not_accepted_as_protocol_evidence() {
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(typed_response(
+                404,
+                "<html>bad route</html>",
+                "text/html",
+            )));
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://one.example".to_string()]).unwrap(),
+        );
+
+        let error = client
+            .transaction_status(LOOKUP_HASH, &|| false)
+            .await
+            .unwrap_err();
+
+        // A reverse proxy's wrong-route page is not the chain saying "not yet
+        // committed"; treating it as one would make a broken endpoint look
+        // indefinitely uncommitted.
+        assert!(matches!(error, ChainError::Decode(_)), "got {error:?}");
     }
 
     #[test]

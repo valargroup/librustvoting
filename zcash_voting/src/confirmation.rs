@@ -319,13 +319,7 @@ fn record_vote_batch_confirmation(
             recovery.proposal_id,
             &confirmation.tx_hash,
         )?;
-        require_vote_recovery_json(
-            &tx,
-            round_id,
-            wallet_id,
-            bundle_index,
-            recovery.proposal_id,
-        )?;
+        require_vote_recovery_json(&tx, round_id, wallet_id, bundle_index, recovery.proposal_id)?;
         crate::vote::record_vc_position_with_conn(
             &tx,
             wallet_id,

@@ -686,12 +686,41 @@ pub(crate) fn signed_commitment_with_conn(
     bundle_index: u32,
     proposal_id: u32,
 ) -> Result<SignedVoteCommitment, VotingError> {
-    let recovery = recovery_bundle_with_conn(conn, wallet_id, round_id, bundle_index, proposal_id)?
+    let state = crate::storage::queries::load_vote_row_state(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+    )?
+    .ok_or_else(|| VotingError::InvalidInput {
+        message: format!(
+            "vote row not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+        ),
+    })?;
+    let recovery_json = state
+        .commitment_bundle_json
+        .as_deref()
         .ok_or_else(|| VotingError::InvalidInput {
             message: format!(
                 "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
             ),
         })?;
+    let recovery = parse_recovery(recovery_json)?;
+    // The payload is built from the recovery's own embedded identity, while the
+    // attempt is journaled under the requested one. A migrated or inconsistent
+    // row whose JSON names a different round, bundle, proposal, choice, or
+    // commitment would otherwise spend this bundle's VAN on the wrong proposal,
+    // and the reservation rebuild would reproduce the same mismatch rather than
+    // catch it.
+    validate_recovery_matches_stored_vote(
+        &recovery,
+        round_id,
+        bundle_index,
+        proposal_id,
+        state.choice,
+        state.commitment.as_deref(),
+    )?;
     ensure_singleton_vote_recovery(&recovery)?;
     let commit = commit_from_recovery(&recovery)?;
     signed_commitment_from_parts(&commit, &recovery)
@@ -3338,7 +3367,9 @@ fn commit_from_recovery(bundle: &VoteRecoveryBundle) -> Result<VoteCommit, Votin
     })
 }
 
-fn stored_vote_commitment_bytes(bundle: &VoteRecoveryBundle) -> Result<Vec<u8>, VotingError> {
+pub(crate) fn stored_vote_commitment_bytes(
+    bundle: &VoteRecoveryBundle,
+) -> Result<Vec<u8>, VotingError> {
     serde_json::to_vec(&serde_json::json!({
         "van_nullifier": hex::encode(bundle.van_nullifier),
         "vote_authority_note_new": hex::encode(bundle.vote_authority_note_new),

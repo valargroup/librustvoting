@@ -29,6 +29,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   range that still holds a non-rejected attempt.
 - `normalize_tx_hash` no longer trims surrounding whitespace, so the client and
   the storage boundary share one exact definition of a transaction hash.
+- A recovered singleton vote payload is now validated against the storage row
+  it was loaded from before it can be serialized or dispatched.
 
 ### Fixed
 

@@ -83,7 +83,14 @@ Accepted or OutcomeUnknown with a known hash
 
 Evidence precedence is **Confirmed > Accepted > OutcomeUnknown > Attempting**.
 Weaker evidence cannot replace stronger evidence. Rejected is terminal only
-for its exact attempt.
+for its exact attempt: a later attempt's definite rejection or failure cannot
+disprove an earlier attempt in the same call whose outcome is unknown, so the
+call reports `OutcomeUnknown` rather than a terminal result.
+
+A confirmation this lifecycle has already applied is durable, and it outranks
+any later network answer. Reconciliation reports it directly instead of
+re-deriving it from a lookup, so a lagging or pruned endpoint cannot downgrade
+a completed submission to "not yet committed" after a restart.
 
 ## Typed identity and payload invariants
 
@@ -98,18 +105,24 @@ for its exact attempt.
    it to hash to the same payload digest as the bytes about to be dispatched.
    The rebuild is given the reservation's own connection, so it cannot re-enter
    the shared database handle.
-3. Delegation accepts `SignedDelegationBundle`; singleton vote accepts a
+3. A recovered payload is bound to the storage row it was loaded from. Its
+   embedded round, bundle, proposal, choice, and commitment must match the row
+   the caller named, because the payload is serialized from the embedded
+   identity while the attempt is journaled under the requested one. The
+   reservation rebuild reproduces the same recovery, so it cannot catch this by
+   itself.
+4. Delegation accepts `SignedDelegationBundle`; singleton vote accepts a
    recovered `CommittedVote`; atomic vote accepts a recovered
    `SignedVoteBatch`. The SDK derives network fields from these types. A member
    of a persisted atomic batch is refused by the singleton path: dispatching one
    member to `cast-vote` could spend part of the batch independently, and its
    committed response could not be applied because confirmation rejects batch
    members.
-4. The host cannot supply an arbitrary JSON map, a transaction hash to mark as
+5. The host cannot supply an arbitrary JSON map, a transaction hash to mark as
    accepted, or chain events to record outside the confirmation lifecycle.
-5. Canonical JSON is serialized once for one call. Every retry in that call
+6. Canonical JSON is serialized once for one call. Every retry in that call
    sends byte-identical content.
-6. Server-returned transaction hashes must be exactly 32 bytes encoded as 64
+7. Server-returned transaction hashes must be exactly 32 bytes encoded as 64
    hexadecimal characters and are normalized to lowercase before persistence
    or lookup. Canonicalization is enforced at the storage boundary, not only in
    the client, so the older recording APIs cannot store one transaction under a
@@ -122,7 +135,7 @@ for its exact attempt.
    no surrounding whitespace accepted on either side. A padded or otherwise
    non-conforming stored value stays opaque at rest and is skipped as a
    candidate, so it can never be confirmed into a conflict with itself.
-7. The local payload digest is never accepted where a chain hash is required.
+8. The local payload digest is never accepted where a chain hash is required.
 
 ## Durable dispatch invariants
 
@@ -256,7 +269,9 @@ runs when the returned hash is unreadable.
 Other 4xx responses are terminal except the spent-nullifier compatibility
 case. Other 5xx responses are outcome-unknown but non-retryable in the current
 call. Before a replay, the lifecycle queries every known chain hash. Exhausted
-ambiguity returns `OutcomeUnknown`, never definite rejection.
+ambiguity returns `OutcomeUnknown`, never definite rejection. Once any attempt
+in a call is outcome-unknown, a later attempt's rejection or definite failure
+is reported as `OutcomeUnknown` too, because it is definite only for itself.
 
 The host owns the network route. A Tor or proxy transport MUST fail closed and
 MUST NOT fall back to a direct connection. Hyper connection pooling must not
@@ -290,9 +305,11 @@ hosts do not parse the log.
    two committed candidates.
 2. HTTP 200 is a committed transaction response and parses height, code, log,
    and events.
-3. HTTP 404 means not yet committed and may fail over to another endpoint.
-   Lookup gives each configured endpoint one attempt; it does not retry the
-   same endpoint.
+3. HTTP 404 means not yet committed and may fail over to another endpoint. A
+   404 is protocol evidence, so it must satisfy the same body-size and
+   content-type rules as any other response; an unusable one is evidence of
+   nothing. Lookup gives each configured endpoint one attempt; it does not
+   retry the same endpoint.
 4. A structured HTTP 422 transaction result is committed failure.
 5. Invalid content type, oversized body, malformed JSON, or missing required
    fields is an unusable response, not confirmation, and failover continues to
@@ -439,6 +456,10 @@ state transitions.
 - Can a spent-nullifier response discard known hashes or recovery material?
 - Can an unresolved nullifier be reported as success?
 - Can weaker evidence overwrite accepted or confirmed evidence?
+- Can a later attempt's rejection hide an earlier attempt that may still commit?
+- Can a durable confirmation be downgraded by a later lookup?
+- Can an unusable 404 be accepted as protocol evidence?
+- Is a recovered payload bound to the storage row it was journaled against?
 - Can late cancellation replace a completed request result?
 - Can confirmation partially update an atomic batch?
 - Are endpoint identity, request deadlines, body limits, JSON content type,
@@ -460,6 +481,8 @@ state transitions.
   "not yet committed".
 - `chain::tests::the_hash_rule_is_exact_and_shared_with_storage` covers the one
   shared, whitespace-exact transaction-hash rule.
+- `chain::tests::a_malformed_404_is_not_accepted_as_protocol_evidence` covers
+  404 response validation.
 - `chain::tests::accepted_result_with_unusable_hash_is_ambiguous` and
   `chain::tests::rejected_result_with_unusable_hash_stays_definite_and_keeps_its_log`
   cover the split classification of an unreadable server-returned hash.
@@ -499,6 +522,12 @@ state transitions.
   covers shared locking for concurrent operations and reclamation afterwards.
 - `chain_submission::tests::a_padded_legacy_hash_is_treated_as_opaque` covers the
   whitespace-exact candidate rule.
+- `chain_submission::tests::an_earlier_unknown_attempt_survives_a_later_rejection`
+  covers evidence precedence across attempts within one call.
+- `chain_submission::tests::a_durable_confirmation_is_not_downgraded_by_a_lagging_endpoint`
+  covers the durable-confirmation short circuit.
+- `chain_submission::tests::a_recovery_row_identity_mismatch_is_refused_before_dispatch`
+  covers binding a recovered payload to its storage row.
 - `round::tests::delete_skipped_bundles_refuses_to_prune_an_attempted_bundle` and
   `delete_skipped_bundles_prunes_past_a_rejected_attempt_and_its_journal_row`
   cover the bundle-pruning guard and its rejected-attempt boundary.

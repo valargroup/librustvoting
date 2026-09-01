@@ -7,7 +7,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use rusqlite::{named_params, TransactionBehavior};
+use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -490,6 +490,19 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                             log: result.log,
                         });
                     }
+                    // A rejection is definite only for the attempt that
+                    // received it. If an earlier attempt in this call may still
+                    // commit, reporting a terminal rejection would let the host
+                    // conclude the vote cannot land when it still can.
+                    if let Some(earlier) = last_unknown {
+                        return Ok(ChainLifecycleOutcome::OutcomeUnknown {
+                            known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
+                            message: format!(
+                                "an earlier attempt's outcome is unknown ({earlier}); a later attempt was rejected with code {}: {}",
+                                result.code, result.log
+                            ),
+                        });
+                    }
                     return Ok(ChainLifecycleOutcome::Rejected {
                         code: result.code,
                         log: result.log,
@@ -518,10 +531,18 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                         mark_attempt(self.db, wallet_id, attempt_id, "rejected", None)?;
                     }
                     if !error.is_retryable() || attempt_index + 1 == attempts {
-                        if error.is_ambiguous() {
+                        // As above: a definite failure here cannot disprove an
+                        // earlier attempt that may still commit.
+                        if error.is_ambiguous() || last_unknown.is_some() {
+                            let message = match &last_unknown {
+                                Some(earlier) => format!(
+                                    "an earlier attempt's outcome is unknown ({earlier}); a later attempt failed: {error}"
+                                ),
+                                None => error.to_string(),
+                            };
                             return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                                 known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
-                                message: error.to_string(),
+                                message,
                             });
                         }
                         return Err(error.into());
@@ -554,6 +575,17 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         // otherwise report a stale operation as actively pending.
         if cancel() {
             return Ok(ChainLifecycleOutcome::Cancelled);
+        }
+        // A confirmation this lifecycle already applied is the strongest
+        // evidence there is, and it is durable. Re-querying the network could
+        // only weaken it: a lagging or pruned endpoint answering 404 would
+        // report a completed submission as indefinitely uncommitted.
+        if let Some((tx_hash, confirmation)) = durable_confirmation(self.db, wallet_id, identity)? {
+            return Ok(ChainLifecycleOutcome::Confirmed {
+                tx_hash,
+                confirmation,
+                reconciled: true,
+            });
         }
         let hashes = known_hashes(self.db, wallet_id, identity)?;
         if hashes.is_empty() {
@@ -637,6 +669,140 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         Ok(ChainLifecycleOutcome::Pending {
             known_tx_hashes: hashes,
         })
+    }
+}
+
+/// The confirmation already recorded for this identity, if there is one.
+///
+/// Reads only durable domain state: the transaction hash and the event-derived
+/// tree positions that the confirmation transaction commits together. A partial
+/// row means confirmation has not happened, so this returns `None` and normal
+/// reconciliation continues.
+fn durable_confirmation(
+    db: &VotingDb,
+    wallet_id: &str,
+    identity: &ChainSubmissionIdentity,
+) -> Result<Option<(String, ChainConfirmation)>, VotingError> {
+    let conn = db.conn();
+    let bundle: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT delegation_tx_hash, van_leaf_position FROM bundles
+              WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3",
+            rusqlite::params![
+                identity.round_id,
+                wallet_id,
+                i64::from(identity.bundle_index)
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(internal("load durable confirmation bundle fields"))?;
+    let Some((delegation_tx_hash, van_leaf_position)) = bundle else {
+        return Ok(None);
+    };
+    let Some(van_leaf_position) = van_leaf_position.and_then(|value| u32::try_from(value).ok())
+    else {
+        return Ok(None);
+    };
+    match identity.kind {
+        ChainSubmissionKind::Delegation => {
+            let Some(tx_hash) = delegation_tx_hash else {
+                return Ok(None);
+            };
+            Ok(Some((
+                tx_hash.clone(),
+                ChainConfirmation::Delegation(DelegationConfirmation {
+                    tx_hash,
+                    van_leaf_position,
+                }),
+            )))
+        }
+        ChainSubmissionKind::Vote => {
+            let proposal_id = identity.require_proposal_id()?;
+            let Some(state) = queries::load_vote_row_state(
+                &conn,
+                &identity.round_id,
+                wallet_id,
+                identity.bundle_index,
+                proposal_id,
+            )?
+            else {
+                return Ok(None);
+            };
+            let (Some(tx_hash), Some(vc_tree_position)) = (state.tx_hash, state.vc_tree_position)
+            else {
+                return Ok(None);
+            };
+            let Ok(vc_tree_position) = u64::try_from(vc_tree_position) else {
+                return Ok(None);
+            };
+            Ok(Some((
+                tx_hash.clone(),
+                ChainConfirmation::Vote(VoteConfirmation {
+                    tx_hash,
+                    van_leaf_position,
+                    vc_tree_position,
+                }),
+            )))
+        }
+        ChainSubmissionKind::VoteBatch => {
+            let batch_digest = identity.require_batch_digest()?;
+            let recoveries = match vote::load_vote_batch_recoveries_with_conn(
+                &conn,
+                wallet_id,
+                &identity.round_id,
+                identity.bundle_index,
+                batch_digest,
+            ) {
+                Ok(recoveries) => recoveries,
+                // Without the member rows there is nothing to report as
+                // confirmed; ordinary reconciliation takes over.
+                Err(VotingError::InvalidInput { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let mut tx_hash: Option<String> = None;
+            let mut proposal_ids = Vec::with_capacity(recoveries.len());
+            let mut vc_tree_positions = Vec::with_capacity(recoveries.len());
+            for recovery in &recoveries {
+                let Some(state) = queries::load_vote_row_state(
+                    &conn,
+                    &identity.round_id,
+                    wallet_id,
+                    identity.bundle_index,
+                    recovery.proposal_id,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let (Some(member_hash), Some(position)) = (state.tx_hash, state.vc_tree_position)
+                else {
+                    return Ok(None);
+                };
+                let Ok(position) = u64::try_from(position) else {
+                    return Ok(None);
+                };
+                // A batch advances together or not at all, so members that
+                // disagree are not a confirmed batch.
+                if tx_hash.get_or_insert_with(|| member_hash.clone()) != &member_hash {
+                    return Ok(None);
+                }
+                proposal_ids.push(recovery.proposal_id);
+                vc_tree_positions.push(position);
+            }
+            let Some(tx_hash) = tx_hash else {
+                return Ok(None);
+            };
+            Ok(Some((
+                tx_hash.clone(),
+                ChainConfirmation::VoteBatch(VoteBatchConfirmation {
+                    tx_hash,
+                    batch_digest: batch_digest.to_vec(),
+                    van_leaf_position,
+                    proposal_ids,
+                    vc_tree_positions,
+                }),
+            )))
+        }
     }
 }
 
@@ -1245,7 +1411,7 @@ mod tests {
     use crate::{
         chain::{
             transport::{ChainFuture, ChainResponse, ChainTransport, ChainTransportError},
-            ChainEndpointSet,
+            ChainClientConfig, ChainEndpointSet,
         },
         round::RoundParams,
         Network,
@@ -1672,6 +1838,38 @@ mod tests {
         );
     }
 
+    /// Stores a vote row whose columns agree with the recovery it carries, the
+    /// way the vote lifecycle writes them.
+    fn store_vote_with_recovery(
+        db: &VotingDb,
+        proposal_id: u32,
+        recovery: &crate::vote::VoteRecoveryBundle,
+    ) {
+        let commitment = crate::vote::stored_vote_commitment_bytes(recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET,
+            0,
+            proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE votes SET commitment_bundle_json=?1
+                  WHERE round_id=?2 AND wallet_id=?3 AND bundle_index=0 AND proposal_id=?4",
+                rusqlite::params![
+                    crate::vote::serialize_recovery(recovery).unwrap(),
+                    ROUND_ID,
+                    WALLET,
+                    proposal_id as i64
+                ],
+            )
+            .unwrap();
+    }
+
     fn journal_attempt(db: &VotingDb, state: &str, tx_hash: Option<&str>) -> i64 {
         let conn = db.conn();
         conn.execute(
@@ -1874,7 +2072,6 @@ mod tests {
         use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};
 
         let db = test_db();
-        queries::store_vote(&db.conn(), ROUND_ID, WALLET, 0, 1, 0, &[0xAA; 32]).unwrap();
         let recovery = VoteRecoveryBundle {
             vote_round_id: ROUND_ID.to_string(),
             bundle_index: 0,
@@ -1907,17 +2104,7 @@ mod tests {
                 size: 1,
             }),
         };
-        db.conn()
-            .execute(
-                "UPDATE votes SET commitment_bundle_json=?1
-                  WHERE round_id=?2 AND wallet_id=?3 AND bundle_index=0 AND proposal_id=1",
-                rusqlite::params![
-                    crate::vote::serialize_recovery(&recovery).unwrap(),
-                    ROUND_ID,
-                    WALLET
-                ],
-            )
-            .unwrap();
+        store_vote_with_recovery(&db, 1, &recovery);
         let transport = Arc::new(MockTransport::default());
         let client = accepted_client(transport.clone());
         let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
@@ -1980,8 +2167,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retirement_never_clears_a_confirmed_domain_hash() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash=?1, van_leaf_position=5
+                  WHERE round_id=?2 AND bundle_index=0",
+                rusqlite::params![TX_HASH, ROUND_ID],
+            )
+            .unwrap();
+
+        retire_failed_candidate(
+            &db,
+            WALLET,
+            &ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+            TX_HASH,
+        )
+        .unwrap();
+
+        // A recorded confirmation position means this row is not the failed
+        // candidate's, so retirement must leave it alone.
+        assert_eq!(
+            db.get_delegation_tx_hash(ROUND_ID, 0).unwrap().as_deref(),
+            Some(TX_HASH)
+        );
+    }
+
     #[tokio::test]
-    async fn retirement_never_clears_a_confirmed_domain_hash() {
+    async fn a_durable_confirmation_is_not_downgraded_by_a_lagging_endpoint() {
         let db = test_db();
         db.conn()
             .execute(
@@ -1991,24 +2205,88 @@ mod tests {
             )
             .unwrap();
         let transport = Arc::new(MockTransport::default());
-        transport.responses.lock().unwrap().push_back(Ok(response(
-            200,
-            r#"{"height":42,"code":7,"log":"deliver failed","events":[]}"#,
-        )));
+        // A pruned or lagging endpoint that no longer indexes the transaction.
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(response(404, r#"{"message":"not indexed"}"#)));
         let client = accepted_client(transport.clone());
         let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
 
-        lifecycle
+        let outcome = lifecycle
             .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
             .await
             .unwrap();
 
-        // A recorded confirmation position means this row is not the failed
-        // candidate's, so retirement must leave it alone.
+        // The applied confirmation is durable and is the strongest evidence
+        // there is; a later lookup must not be able to weaken it back to
+        // "pending" after a restart or an endpoint switch.
         assert_eq!(
-            db.get_delegation_tx_hash(ROUND_ID, 0).unwrap().as_deref(),
-            Some(TX_HASH)
+            outcome,
+            ChainLifecycleOutcome::Confirmed {
+                tx_hash: TX_HASH.to_string(),
+                confirmation: ChainConfirmation::Delegation(crate::wire::DelegationConfirmation {
+                    tx_hash: TX_HASH.to_string(),
+                    van_leaf_position: 5,
+                }),
+                reconciled: true,
+            }
         );
+        assert_eq!(*transport.gets.lock().unwrap(), 0, "no lookup is needed");
+    }
+
+    #[tokio::test]
+    async fn a_recovery_row_identity_mismatch_is_refused_before_dispatch() {
+        use crate::types::EncryptedShare;
+        use crate::vote::VoteRecoveryBundle;
+
+        let db = test_db();
+        // Recovery JSON whose embedded proposal disagrees with the row it is
+        // stored on, as a migrated or inconsistent database could hold.
+        let recovery = VoteRecoveryBundle {
+            vote_round_id: ROUND_ID.to_string(),
+            bundle_index: 0,
+            proposal_id: 2,
+            vote_decision: 0,
+            anchor_height: 123,
+            vc_tree_position: 0,
+            single_share: false,
+            num_options: 3,
+            van_nullifier: [0x10; 32],
+            vote_authority_note_new: [0x11; 32],
+            vote_commitment: [0x12; 32],
+            proof: vec![0x13; 96],
+            shares_hash: [0x14; 32],
+            r_vpk: [0x15; 32],
+            alpha_v: [0x16; 32],
+            vote_auth_sig: [0x17; 64],
+            encrypted_shares: vec![EncryptedShare {
+                c1: vec![0x21; 32],
+                c2: vec![0x22; 32],
+                share_index: 0,
+                plaintext_value: 5,
+                randomness: vec![0x23; 32],
+            }],
+            share_blinds: vec![[0x41; 32]],
+            share_comms: vec![[0x51; 32]],
+            batch: None,
+        };
+        store_vote_with_recovery(&db, 1, &recovery);
+        let transport = Arc::new(MockTransport::default());
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let error = lifecycle
+            .submit_vote(ROUND_ID, 0, 1, &|| false)
+            .await
+            .unwrap_err();
+
+        // Serializing the embedded identity while journaling the requested one
+        // would spend this bundle's VAN on the wrong proposal, and the
+        // reservation rebuild would reproduce the mismatch rather than catch it.
+        assert!(error.to_string().contains("mismatch"), "{error}");
+        assert_eq!(*transport.posts.lock().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2090,6 +2368,51 @@ mod tests {
         // the process lifetime.
         let after = operation_lock(&key).unwrap();
         assert_eq!(Arc::strong_count(&after), 1);
+    }
+
+    #[tokio::test]
+    async fn an_earlier_unknown_attempt_survives_a_later_rejection() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            // Ambiguous: this POST may still have reached the chain.
+            Ok(response(503, r#"{"message":"busy"}"#)),
+            // The retry is definitively rejected.
+            Ok(response(
+                200,
+                r#"{"tx_hash":"","code":5,"log":"bad nonce"}"#,
+            )),
+        ]);
+        let config = ChainClientConfig::default()
+            .with_retry_delays(vec![Duration::from_millis(1)])
+            .unwrap();
+        let client = ChainClient::with_config(
+            transport.clone(),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            config,
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // The rejection is definite only for the attempt that received it. The
+        // earlier attempt may still commit, so a terminal-looking `Rejected`
+        // would let the host conclude the submission cannot land.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
+                if message.contains("earlier attempt") && message.contains("bad nonce")),
+            "got {outcome:?}"
+        );
+        assert_eq!(*transport.posts.lock().unwrap(), 2);
     }
 
     #[test]
