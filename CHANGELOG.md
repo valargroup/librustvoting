@@ -83,7 +83,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   inside; a contended refresh is skipped. It no longer waits on SQLite's write
   lock either, which another connection or process can hold.
 - Cancellation is rechecked after the durable-confirmation reread that precedes
-  reconciliation's final classification chain.
+  reconciliation's final classification chain, and after the state reads on the
+  no-candidate path, which has no lookup loop behind it to check again.
 - Cancellation is rechecked after the candidate set is rebuilt following
   retirement and after the durable-confirmation reread, before the submission is
   classified.

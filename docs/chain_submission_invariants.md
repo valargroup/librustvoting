@@ -654,8 +654,9 @@ hosts do not parse the log.
    before the lock was taken.
 7. Cancellation is checked on entry to reconciliation and before reservation,
    dispatch, retry, failover, backoff, and confirmation application, and again
-   as soon as each transaction-status request returns, and both before and after
-   failed candidates are retired, because that retirement is a durable mutation
+   as soon as each transaction-status request returns, after the state reads on
+   the no-candidate path, which has no lookup loop behind it to check again, and
+   both before and after failed candidates are retired, because that retirement is a durable mutation
    of its own and its wait on SQLite widens the gap before the submission is
    classified. The entry check covers
    the no-candidate fast path, so a cancelled operation is never reported to the
@@ -993,7 +994,8 @@ state transitions.
   `chain::tests::request_timeout_is_bounded_so_a_reservation_cannot_outlive_the_grace`
   covers the deadline cap the reservation freshness bound depends on.
 - `chain_submission::tests::cancellation_is_observed_before_the_no_candidate_fast_path`
-  covers the reconciliation entry cancellation check.
+  and `cancellation_during_the_no_candidate_reads_is_observed` cover the
+  cancellation checks on either side of that path's state reads.
 - `chain_submission::tests::the_identity_lock_registry_is_bounded_by_live_operations`
   covers shared locking for concurrent operations and reclamation afterwards.
 - `chain_submission::tests::a_padded_legacy_hash_is_treated_as_opaque` covers the

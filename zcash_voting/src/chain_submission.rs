@@ -987,7 +987,14 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // an `attempting` one. Both mean a transaction may still commit, and
             // that evidence has to survive across calls: reporting `Pending`
             // would let a later call return a terminal rejection.
-            if has_live_attempt(self.db, wallet_id, identity)? {
+            let live = has_live_attempt(self.db, wallet_id, identity)?;
+            // Both of those reads wait on the database, and this path has no
+            // lookup loop after them to check again. Reporting either answer
+            // says the operation is active, which a cancelled one is not.
+            if cancel() {
+                return Ok(ChainLifecycleOutcome::Cancelled);
+            }
+            if live {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                     known_tx_hashes: hashes,
                     message: "an earlier attempt was dispatched without a usable response"
@@ -6068,5 +6075,28 @@ mod tests {
         );
         drop(db);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_the_no_candidate_reads_is_observed() {
+        let db = test_db();
+        // A hashless dispatched attempt: no candidate to look up, so this call
+        // takes the fast path and never reaches the lookup loop's checks.
+        journal_attempt(&db, "outcome_unknown", None);
+        let transport = Arc::new(MockTransport::default());
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        // False on entry, true by the time the state reads have finished.
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2;
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &cancel)
+            .await
+            .unwrap();
+
+        // Reporting the ambiguity would say the operation is active, which a
+        // cancelled one is not.
+        assert_eq!(outcome, ChainLifecycleOutcome::Cancelled);
     }
 }
