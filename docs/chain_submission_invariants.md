@@ -475,7 +475,11 @@ hosts do not parse the log.
 3. Exactly one committed successful candidate is adopted and confirmed. A
    terminal lookup error on an unrelated candidate is retained rather than
    returned, so it cannot discard a candidate that already committed; it is
-   reported only when no candidate succeeded. Either confirmed outcome —
+   reported only when no candidate succeeded and nothing else may still commit.
+   A lookup that could not be completed is an absence of evidence, not evidence
+   of absence, so a dispatched attempt still awaiting a usable response outranks
+   it. `reconcile` reaches that exit directly, without the submission loop's
+   ambiguity handling around it, so the rule is applied there. Either confirmed outcome —
    freshly parsed or durable — is proof of success on this path.
 4. No successful known candidate returns `AlreadySpentUnresolved` and
    preserves all attempts and recovery material. That outcome asserts the known
@@ -813,7 +817,8 @@ state transitions.
 - Can a later attempt's rejection hide an earlier attempt that may still commit?
 - Can a durable confirmation be downgraded by a later lookup, or missed by the
   spent-nullifier path?
-- Can a terminal lookup error on one candidate discard another that committed?
+- Can a terminal lookup error on one candidate discard another that committed,
+  or a dispatched attempt that may still commit?
 - Is every failed candidate retired, including when a success is adopted in the
   same lookup?
 - Can a vote's recovery generation be replaced while an attempt covers it?
@@ -970,6 +975,7 @@ state transitions.
 - `chain_submission::tests::a_committed_failure_does_not_override_hashless_ambiguity`,
   `every_committed_failure_candidate_is_retired`,
   `a_successful_candidate_survives_a_terminal_lookup_error`,
+  `a_terminal_lookup_error_does_not_downgrade_durable_ambiguity`,
   `adopting_a_success_still_retires_the_failed_candidates`, and
   `a_spent_nullifier_response_accepts_a_durable_confirmation` cover the
   reconciliation precedence and retirement rules.

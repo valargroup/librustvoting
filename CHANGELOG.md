@@ -66,6 +66,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   existing meaning, including opaque legacy identifiers the candidate set omits.
 - Cancellation is rechecked after the candidate set is rebuilt following
   retirement, before the submission is classified.
+- A terminal lookup error no longer replaces the ambiguity of an attempt that
+  was dispatched without a usable response. `reconcile` reaches that exit
+  directly, so the submission loop's ambiguity handling could not repair it.
 - Reconciliation no longer reports a committed failure as terminal while a
   candidate journaled during the lookup may still commit, and the candidate list
   it reports is rebuilt after retirement so a transaction just proven failed is

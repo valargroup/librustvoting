@@ -1072,6 +1072,20 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             return Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash });
         }
         if let Some(error) = terminal_error {
+            // A lookup that could not be completed is an absence of evidence,
+            // not evidence of absence, so it must not outrank a dispatched
+            // request that may still commit. `reconcile` reaches this exit
+            // directly, without the submission loop's ambiguity handling around
+            // it, so the check belongs here.
+            if has_live_attempt(self.db, wallet_id, identity)? {
+                return Ok(ChainLifecycleOutcome::OutcomeUnknown {
+                    known_tx_hashes: hashes,
+                    message: format!(
+                        "an earlier attempt was dispatched without a usable response; \
+                         a candidate lookup also failed: {error}"
+                    ),
+                });
+            }
             return Err(error.into());
         }
         if let Some(message) = unresolved {
@@ -5111,7 +5125,7 @@ mod tests {
         // about this call's earlier attempt, whose transaction may still commit.
         assert!(
             matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
-                if message.contains("timed out")),
+                if message.contains("dispatched without a usable response")),
             "got {outcome:?}"
         );
         drop(db);
@@ -5243,7 +5257,7 @@ mod tests {
         // transaction may still commit.
         assert!(
             matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
-                if message.contains("timed out")),
+                if message.contains("dispatched without a usable response")),
             "got {outcome:?}"
         );
         drop(db);
@@ -5549,6 +5563,37 @@ mod tests {
         assert_eq!(
             attempt_states(&db),
             vec!["rejected".to_string(), "accepted".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_lookup_error_does_not_downgrade_durable_ambiguity() {
+        let db = test_db();
+        // An earlier retry left this behind: dispatched, never classified.
+        journal_attempt(&db, "outcome_unknown", None);
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(response(401, r#"{"message":"unauthorized"}"#)));
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // `reconcile` reaches this exit directly, with none of the submission
+        // loop's ambiguity handling around it. A lookup that could not be
+        // completed is an absence of evidence, not evidence of absence, so it
+        // must not outrank a dispatched request that may still commit.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
+                if known_tx_hashes == &vec![TX_HASH.to_string()]),
+            "got {outcome:?}"
         );
     }
 }
