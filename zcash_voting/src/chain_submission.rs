@@ -428,6 +428,29 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         self.reconcile_locked(&wallet_id, identity, cancel).await
     }
 
+    /// Cancellation's outcome for this call.
+    ///
+    /// Cancellation observed after a broadcast completes does not replace that
+    /// broadcast's result, so a dispatched attempt that may still commit is
+    /// reported as `OutcomeUnknown`. `Cancelled` is reserved for calls with no
+    /// completed ambiguous broadcast.
+    fn cancelled_outcome(
+        &self,
+        wallet_id: &str,
+        identity: &ChainSubmissionIdentity,
+        last_unknown: &Option<String>,
+    ) -> Result<ChainLifecycleOutcome, VotingError> {
+        if last_unknown.is_some() || has_live_attempt(self.db, wallet_id, identity)? {
+            return Ok(ChainLifecycleOutcome::OutcomeUnknown {
+                known_tx_hashes: known_hashes(self.db, wallet_id, identity)?,
+                message: last_unknown.clone().unwrap_or_else(|| {
+                    "an earlier attempt was dispatched without a usable response".to_string()
+                }),
+            });
+        }
+        Ok(ChainLifecycleOutcome::Cancelled)
+    }
+
     async fn submit_body_locked(
         &self,
         wallet_id: &str,
@@ -446,7 +469,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         let mut last_unknown = None;
         for attempt_index in 0..attempts {
             if cancel() {
-                return Ok(ChainLifecycleOutcome::Cancelled);
+                return Ok(self.cancelled_outcome(wallet_id, &identity, &last_unknown)?);
             }
             if attempt_index > 0 {
                 // Another process, or a concurrent legacy recording call, can
@@ -465,8 +488,10 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // intended cost of proving the generation is still current.
             let attempt_id = reserve_attempt(self.db, wallet_id, &identity, &digest, rebuild)?;
             if cancel() {
+                // This reservation is definitely unsent, but an earlier attempt
+                // in this call may still commit.
                 delete_attempt(self.db, wallet_id, attempt_id)?;
-                return Ok(ChainLifecycleOutcome::Cancelled);
+                return Ok(self.cancelled_outcome(wallet_id, &identity, &last_unknown)?);
             }
 
             let result = self
@@ -583,7 +608,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
 
             if attempt_index + 1 < attempts {
                 if cancel() {
-                    return Ok(ChainLifecycleOutcome::Cancelled);
+                    return Ok(self.cancelled_outcome(wallet_id, &identity, &last_unknown)?);
                 }
                 tokio::time::sleep(self.client.retry_delays()[attempt_index]).await;
             }
@@ -2796,6 +2821,69 @@ mod tests {
                 tx_hash: TX_HASH.to_string()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_an_ambiguous_post_preserves_the_ambiguity() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        // Ambiguous: this POST may still have reached the chain.
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(response(503, r#"{"message":"busy"}"#)));
+        let config = ChainClientConfig::default()
+            .with_retry_delays(vec![Duration::from_millis(1)])
+            .unwrap();
+        let client = ChainClient::with_config(
+            transport.clone(),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            config,
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        // The host cancels while that POST is in flight.
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| *transport.posts.lock().unwrap() > 0,
+            )
+            .await
+            .unwrap();
+
+        // Cancellation observed after a broadcast completes does not replace
+        // that broadcast's result: the transaction may still commit.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(attempt_states(&db), vec!["outcome_unknown".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_any_dispatch_is_reported_as_cancelled() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ChainLifecycleOutcome::Cancelled);
+        assert_eq!(*transport.posts.lock().unwrap(), 0);
     }
 
     #[test]

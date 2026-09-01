@@ -395,9 +395,18 @@ fn parse_broadcast_response(response: ChainResponse) -> Result<ChainBroadcastOut
     if response.status() != 422 && !response.is_success() {
         return Err(ChainError::Status(response.status()));
     }
+    let status = response.status();
     validate_json_response(&response)?;
     let parsed: TxResultJson = serde_json::from_slice(response.body())
         .map_err(|_| ChainError::Decode("invalid transaction result JSON".to_string()))?;
+    // 422 denotes failure, so a body reporting success contradicts its own
+    // status. Accepting it would journal an `accepted` attempt and stop retries
+    // for a transaction that was never accepted. Same rule as the lookup path.
+    if status == 422 && parsed.code == 0 {
+        return Err(ChainError::Decode(
+            "HTTP 422 transaction result reported a success code".to_string(),
+        ));
+    }
     // A hash the server returned is response data, not caller input, so an
     // unusable one is classified by what the rest of the response says.
     let tx_hash = match normalize_tx_hash(&parsed.tx_hash) {
@@ -737,6 +746,20 @@ mod tests {
         // contradicts its own status, and an error response must never be able
         // to mutate confirmed voting state.
         assert!(matches!(error, ChainError::Decode(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn a_422_broadcast_claiming_success_is_unusable() {
+        let error = parse_broadcast_response(response(
+            422,
+            &format!(r#"{{"tx_hash":"{LOOKUP_HASH}","code":0,"log":""}}"#),
+        ))
+        .unwrap_err();
+
+        // Accepting it would journal an `accepted` attempt and stop retries for
+        // a transaction the endpoint's own status says was not accepted.
+        assert!(matches!(error, ChainError::Decode(_)), "got {error:?}");
+        assert!(error.is_ambiguous());
     }
 
     #[test]

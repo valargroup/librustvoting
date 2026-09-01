@@ -343,7 +343,9 @@ hosts do not parse the log.
    retry the same endpoint.
 4. A structured HTTP 422 transaction result is committed failure. A 422 body
    reporting a success code contradicts its own status and is unusable, so an
-   error response can never mutate confirmed voting state.
+   error response can never mutate confirmed voting state. The same rule applies
+   to broadcast responses: a 422 claiming success must not journal an accepted
+   attempt or stop retries for a transaction that was not accepted.
 5. Invalid content type, oversized body, malformed JSON, or missing required
    fields is an unusable response, not confirmation, and failover continues to
    the remaining endpoints. One malformed endpoint therefore cannot hide a
@@ -396,7 +398,9 @@ hosts do not parse the log.
    entry check covers the no-candidate fast path, so a cancelled operation is
    never reported to the host as actively pending.
 6. Cancellation observed after a broadcast completes does not replace that
-   broadcast's result.
+   broadcast's result. A call cancelled while a dispatched attempt may still
+   commit reports `OutcomeUnknown`; `Cancelled` is reserved for calls with no
+   completed ambiguous broadcast.
 7. Cancellation before a fresh reservation dispatches removes the definitely
    unsent reservation. Cancellation after dispatch retains uncertainty.
 8. A deleted or replaced generation cannot receive a delayed transport or
@@ -495,7 +499,9 @@ state transitions.
 - Can a terminal lookup error on one candidate discard another that committed?
 - Is every failed candidate retired, or only the reported one?
 - Can a vote's recovery generation be replaced while an attempt covers it?
-- Can an HTTP 422 body claiming success be applied as confirmation?
+- Can an HTTP 422 body claiming success be applied as confirmation, or journaled
+  as an accepted broadcast?
+- Can cancellation erase a completed broadcast whose outcome is unknown?
 - Is any event-derived value synthesized from a shared mutable pointer?
 - Does a hashless dispatched attempt survive as ambiguity across calls?
 - Is a definitely pre-dispatch failure ever recorded as ambiguity?
@@ -578,8 +584,12 @@ state transitions.
   per-member row binding for atomic batches.
 - `vote::tests::recovery_replacement_is_refused_while_an_attempt_covers_the_row`
   covers the persistence-transaction guard and its idempotent rewrite.
-- `chain::tests::a_422_lookup_claiming_success_is_unusable` covers the
-  status/body contradiction.
+- `chain::tests::a_422_lookup_claiming_success_is_unusable` and
+  `a_422_broadcast_claiming_success_is_unusable` cover the status/body
+  contradiction on both the lookup and mutation paths.
+- `chain_submission::tests::cancellation_after_an_ambiguous_post_preserves_the_ambiguity`
+  and `cancellation_before_any_dispatch_is_reported_as_cancelled` cover the
+  boundary between the two cancellation outcomes.
 - `chain_submission::tests::a_committed_failure_does_not_override_hashless_ambiguity`,
   `every_committed_failure_candidate_is_retired`,
   `a_successful_candidate_survives_a_terminal_lookup_error`, and
