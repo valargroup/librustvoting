@@ -18,17 +18,28 @@ pub const MINIMUM_VOTING_NOTE_COUNT: usize = BUNDLE_NOTE_SLOTS;
 /// Minimum quantized voting weight in zatoshi required before a wallet can vote.
 pub const MINIMUM_VOTING_WEIGHT_ZATOSHI: u64 = BALLOT_DIVISOR;
 
+// Version 1 recovery values are also the source for the initial wallet
+// defaults below. Keep them immutable. Future defaults must point to a new
+// versioned constant set instead of changing these values.
+const RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE: usize = 5;
+const RECOVERABLE_V1_BUNDLE_ADDITION_THRESHOLD_ZATOSHI: u64 = 25_000 * 100_000_000;
+const RECOVERABLE_V1_MAX_PRIVACY_BUNDLES: usize = 2;
+const RECOVERABLE_V1_PRIVACY_DROP_BPS: u32 = 100;
+const RECOVERABLE_V1_MAX_PRIVACY_DROP_ZATOSHI: u64 = 100_000_000_000;
+
+const _: () = assert!(RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE == BUNDLE_NOTE_SLOTS);
+
 /// Bundle count the privacy trim aims for when the drop budget allows it.
 ///
 /// Bundle count is `ceil(note_count / BUNDLE_NOTE_SLOTS)`, so a holder whose
 /// value sits in a few large notes plus a long dust tail emits many delegation
 /// submissions that carry almost no voting weight. Trimming that tail shrinks
 /// the observable submission count for exactly those holders.
-pub const DEFAULT_MAX_PRIVACY_BUNDLES: usize = 2;
+pub const DEFAULT_MAX_PRIVACY_BUNDLES: usize = RECOVERABLE_V1_MAX_PRIVACY_BUNDLES;
 
 /// Default share of selected note value the privacy trim may discard, in basis
 /// points. 100 bps is 1%.
-pub const DEFAULT_PRIVACY_DROP_BPS: u32 = 100;
+pub const DEFAULT_PRIVACY_DROP_BPS: u32 = RECOVERABLE_V1_PRIVACY_DROP_BPS;
 
 /// Maximum share of selected note value the privacy trim may discard, in basis
 /// points. 500 bps is 5%.
@@ -38,7 +49,7 @@ pub const MAX_PRIVACY_DROP_BPS: u32 = 500;
 ///
 /// One ZEC is 100,000,000 zatoshi, so this caps the default budget at 1,000 ZEC
 /// even when 1% of the selected balance would be larger.
-pub const DEFAULT_MAX_PRIVACY_DROP_ZATOSHI: u64 = 100_000_000_000;
+pub const DEFAULT_MAX_PRIVACY_DROP_ZATOSHI: u64 = RECOVERABLE_V1_MAX_PRIVACY_DROP_ZATOSHI;
 
 /// Basis-point denominator. Kept explicit so the trim stays integer-only.
 const BPS_DENOMINATOR: u128 = 10_000;
@@ -304,20 +315,12 @@ impl Default for BundlePolicy {
     fn default() -> Self {
         Self {
             planner_version: BundlePlannerVersion::V1,
-            max_real_notes_per_bundle: BUNDLE_NOTE_SLOTS,
+            max_real_notes_per_bundle: RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE,
             bundle_addition_threshold_zatoshi: None,
             privacy_trim: Some(PrivacyTrimPolicy::default()),
         }
     }
 }
-
-// These values are independent of the mutable wallet defaults. Changing them
-// would alter bundle identities reconstructed after voting database loss.
-const RECOVERABLE_V1_MAX_REAL_NOTES_PER_BUNDLE: usize = 5;
-const RECOVERABLE_V1_BUNDLE_ADDITION_THRESHOLD_ZATOSHI: u64 = 25_000 * 100_000_000;
-const RECOVERABLE_V1_MAX_PRIVACY_BUNDLES: usize = 2;
-const RECOVERABLE_V1_PRIVACY_DROP_BPS: u32 = 100;
-const RECOVERABLE_V1_MAX_PRIVACY_DROP_ZATOSHI: u64 = 100_000_000_000;
 
 /// Exact bundle policy for reconstructing version 1 deterministic VANs.
 ///
