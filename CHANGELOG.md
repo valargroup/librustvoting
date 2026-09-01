@@ -44,6 +44,19 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - An ambiguous broadcast whose classification cannot be persisted is reported as
   `OutcomeUnknown` rather than as a storage error; its reservation is still
   durably `attempting`.
+- In-memory ambiguity from a completed broadcast is reported even when the
+  supplementary storage reads that would describe it fail; it needs no storage
+  read to be true.
+- `resume_plan`, the delegation/vote phase queries, and their singular
+  counterparts report the submitted phase for a bundle or vote with a
+  non-rejected journaled attempt carrying a chain transaction hash, and a
+  polling step sources that hash from the same lookup. CheckTx acceptance
+  deliberately leaves the legacy domain column null, so restart planning
+  previously directed the host to delegate or submit again despite a pending
+  transaction — which for a software signer means a second signature and a
+  different transaction.
+- `ChainClient::transaction_status` observes cancellation as soon as each
+  endpoint request returns, before classifying the response.
 - No failure inside a submission call — a lookup, a journal write, a
   reservation, or the cleanup of an unsent one — is reported as that call's
   result while a completed ambiguous broadcast, a known candidate, or a live
