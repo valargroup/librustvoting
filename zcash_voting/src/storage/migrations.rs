@@ -124,6 +124,43 @@ END;",
 -- proof cannot be signed or submitted without the erased PCZT fields. Preserve
 -- its bytes, but make the exact locally rebuildable state eligible for setup
 -- and proof generation again.
+--
+-- A Keystone signature inserted after that cleanup is also unusable because
+-- its signed sighash and randomized key belong to the erased setup. Remove it
+-- before demoting the proof so the rebuilt setup can be signed again.
+DELETE FROM keystone_signatures AS k
+ WHERE EXISTS (
+       SELECT 1
+         FROM bundles b
+         JOIN proofs p
+           ON p.round_id = b.round_id
+          AND p.wallet_id = b.wallet_id
+          AND p.bundle_index = b.bundle_index
+        WHERE b.round_id = k.round_id
+          AND b.wallet_id = k.wallet_id
+          AND b.bundle_index = k.bundle_index
+          AND p.success = 1
+          AND b.note_positions_blob IS NOT NULL
+          AND b.delegation_tx_hash IS NULL
+          AND b.van_leaf_position IS NULL
+          AND b.van_comm_rand IS NULL
+          AND b.dummy_nullifiers IS NULL
+          AND b.rho_signed IS NULL
+          AND b.padded_note_data IS NULL
+          AND b.nf_signed IS NULL
+          AND b.cmx_new IS NULL
+          AND b.alpha IS NULL
+          AND b.rseed_signed IS NULL
+          AND b.rseed_output IS NULL
+          AND b.gov_comm IS NULL
+          AND b.total_note_value IS NULL
+          AND b.address_index IS NULL
+          AND b.rk IS NULL
+          AND b.gov_nullifiers_blob IS NULL
+          AND b.padded_note_secrets IS NULL
+          AND b.pczt_sighash IS NULL
+          AND b.tx1_effects IS NULL
+   );
 UPDATE proofs AS p
    SET success = 0
  WHERE p.success = 1
@@ -153,13 +190,6 @@ UPDATE proofs AS p
           AND b.padded_note_secrets IS NULL
           AND b.pczt_sighash IS NULL
           AND b.tx1_effects IS NULL
-          AND NOT EXISTS (
-              SELECT 1
-                FROM keystone_signatures k
-               WHERE k.round_id = b.round_id
-                 AND k.wallet_id = b.wallet_id
-                 AND k.bundle_index = b.bundle_index
-          )
    );",
     ),
 ];
@@ -581,10 +611,16 @@ mod tests {
         .unwrap();
         queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
         queries::insert_bundle(&conn, "test-round", "wallet", 1, &[2]).unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 2, &[3]).unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 3, &[4]).unwrap();
         store_complete_delegation_setup(&conn, 0);
         store_complete_delegation_setup(&conn, 1);
+        store_complete_delegation_setup(&conn, 2);
+        store_complete_delegation_setup(&conn, 3);
         queries::store_proof(&conn, "test-round", "wallet", 0, &[0xAC; 96]).unwrap();
         queries::store_proof(&conn, "test-round", "wallet", 1, &[0xBD; 96]).unwrap();
+        queries::store_proof(&conn, "test-round", "wallet", 2, &[0xCE; 96]).unwrap();
+        queries::store_proof(&conn, "test-round", "wallet", 3, &[0xDF; 96]).unwrap();
 
         // Reproduce the setup fields cleared by the released reset query. The
         // successful proof row itself survived that cleanup.
@@ -609,8 +645,30 @@ mod tests {
                  tx1_effects = NULL
              WHERE round_id = 'test-round'
                AND wallet_id = 'wallet'
-               AND bundle_index = 0",
+               AND bundle_index IN (0, 2)",
             [],
+        )
+        .unwrap();
+        // This signature arrived after cleanup and is bound to setup that no
+        // longer exists. The intact signature remains a migration control.
+        queries::store_keystone_signature(
+            &conn,
+            "test-round",
+            "wallet",
+            2,
+            &[0x11; 64],
+            &[0x12; 32],
+            &[0x13; 32],
+        )
+        .unwrap();
+        queries::store_keystone_signature(
+            &conn,
+            "test-round",
+            "wallet",
+            3,
+            &[0x21; 64],
+            &[0x22; 32],
+            &[0x23; 32],
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 17).unwrap();
@@ -637,11 +695,36 @@ mod tests {
             .unwrap();
         assert_eq!(reusable, (vec![0xBD; 96], 1));
 
+        let repaired_external: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT proof, success FROM proofs
+                 WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(repaired_external, (vec![0xCE; 96], 0));
+
+        let reusable_external: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT proof, success FROM proofs
+                 WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 3",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reusable_external, (vec![0xDF; 96], 1));
+
+        let signatures = queries::get_keystone_signatures(&conn, "test-round", "wallet").unwrap();
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].bundle_index, 3);
+        assert_eq!(signatures[0].sig, vec![0x21; 64]);
+
         store_complete_delegation_setup(&conn, 0);
-        queries::store_proof(&conn, "test-round", "wallet", 0, &[0xCE; 96]).unwrap();
+        queries::store_proof(&conn, "test-round", "wallet", 0, &[0xE0; 96]).unwrap();
         let regenerated =
             queries::load_delegation_submission_data(&conn, "test-round", "wallet", 0).unwrap();
-        assert_eq!(regenerated.proof, vec![0xCE; 96]);
+        assert_eq!(regenerated.proof, vec![0xE0; 96]);
     }
 
     #[test]
