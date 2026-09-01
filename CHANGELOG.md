@@ -214,6 +214,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- An accepted transaction hash that another submission already owns is no
+  longer journaled as this submission's candidate. The attempt keeps its
+  ambiguity without a hash instead, so a stale or misbehaving endpoint can no
+  longer permanently block a payload with a hash confirmation would refuse.
 - Confirmation writes now re-check cancellation after acquiring the database
   connection and before opening their transaction, so a session invalidated
   while that acquisition waited can no longer have transaction hashes and tree

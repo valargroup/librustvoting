@@ -731,6 +731,25 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             };
             match result {
                 Ok(ChainBroadcastOutcome::Accepted(result)) => {
+                    // A hash another submission already owns cannot become this
+                    // one's candidate. The POST still happened, so the attempt
+                    // keeps its ambiguity rather than its answer: hashless
+                    // `outcome_unknown` says "a transaction may be in flight and
+                    // its hash is not known", which is exactly true here.
+                    if let Some(conflict) =
+                        accepted_hash_is_foreign(self.db, wallet_id, identity, &result.tx_hash)
+                    {
+                        let message = format!(
+                            "vote chain accepted a transaction under a hash that belongs to another submission, so it cannot be a candidate here: {conflict}"
+                        );
+                        *last_unknown = Some(message.clone());
+                        mark_attempt(self.db, wallet_id, attempt_id, "outcome_unknown", None)?;
+                        return Ok(ChainLifecycleOutcome::OutcomeUnknown {
+                            known_tx_hashes: known_hashes(self.db, wallet_id, identity)
+                                .unwrap_or_default(),
+                            message,
+                        });
+                    }
                     // The hash must not go down with a storage failure: it is
                     // the only handle anything will ever have on a transaction
                     // that is already in the mempool.
@@ -1717,6 +1736,70 @@ fn retire_failed_candidate(
     }
     tx.commit()
         .map_err(internal("commit failed candidate retirement"))
+}
+
+/// The proposal whose identity decides hash ownership for this submission.
+///
+/// Ownership is judged per submission, and the rule is expressed in terms of a
+/// proposal: a singleton owns its own, a batch owns whatever its members share,
+/// and a delegation has none. Any member answers for a batch — they all carry
+/// the same digest, which is what the rule compares — so the first is taken.
+fn ownership_proposal(
+    db: &VotingDb,
+    wallet_id: &str,
+    identity: &ChainSubmissionIdentity,
+) -> Result<Option<u32>, VotingError> {
+    match identity.kind {
+        ChainSubmissionKind::Delegation => Ok(None),
+        ChainSubmissionKind::Vote => Ok(Some(identity.require_proposal_id()?)),
+        ChainSubmissionKind::VoteBatch => {
+            let digest = identity.require_batch_digest()?;
+            let members = crate::vote::load_vote_batch_recoveries_with_conn(
+                &db.conn(),
+                wallet_id,
+                &identity.round_id,
+                identity.bundle_index,
+                digest,
+            )?;
+            Ok(members.first().map(|member| member.proposal_id))
+        }
+    }
+}
+
+/// Why an accepted hash may not become this submission's candidate, if it may not.
+///
+/// A hash another submission already owns must not be journaled here. Ownership
+/// is checked at confirmation anyway, but by then it is too late to matter: the
+/// candidate is journaled, a successful candidate is never retired, and every
+/// later submission rediscovers it and exits before dispatch, so the real
+/// payload can never be sent again.
+///
+/// Only a proven conflict counts. A check that could not be made — an
+/// unreadable database, a missing table — is no evidence of one, and the hash
+/// is the only handle anything will ever have on a transaction already in the
+/// mempool. Refusing it on a failed read would trade a bounded ambiguity for a
+/// permanently lost transaction, which is the worse of the two by far.
+fn accepted_hash_is_foreign(
+    db: &VotingDb,
+    wallet_id: &str,
+    identity: &ChainSubmissionIdentity,
+    tx_hash: &str,
+) -> Option<String> {
+    let proposal_id = ownership_proposal(db, wallet_id, identity).ok()?;
+    match crate::storage::queries::ensure_tx_hash_free_for_submission(
+        &db.conn(),
+        &identity.round_id,
+        wallet_id,
+        identity.bundle_index,
+        proposal_id,
+        tx_hash,
+    ) {
+        Ok(()) => None,
+        // The rule reports a conflict it proved as invalid input. Every other
+        // error is the check failing, not the hash failing it.
+        Err(VotingError::InvalidInput { message }) => Some(message),
+        Err(_) => None,
+    }
 }
 
 /// Whether a committed transaction's events describe this submission.
@@ -3797,6 +3880,57 @@ mod tests {
             attempt_states(&db),
             vec!["rejected".to_string(), "rejected".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_hash_owned_by_another_bundle_does_not_become_a_candidate() {
+        let db = test_db();
+        // Bundle 1 already carries this transaction. A stale or misbehaving
+        // endpoint answers this bundle's POST with it anyway.
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (round_id, wallet_id, bundle_index, delegation_tx_hash)
+                 VALUES (?1, ?2, 1, ?3)",
+                rusqlite::params![ROUND_ID, WALLET, TX_HASH],
+            )
+            .unwrap();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            &format!(r#"{{"tx_hash":"{TX_HASH}","code":0,"log":""}}"#),
+        )));
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+
+        let outcome = lifecycle
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false)
+            .await
+            .unwrap();
+
+        // Journaling it would make it a candidate confirmation must refuse, and
+        // a successful candidate is never retired, so every later submission
+        // would rediscover it and exit before dispatch — the payload could
+        // never be sent again.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
+                if message.contains("belongs to another submission")),
+            "got {outcome:?}"
+        );
+        assert_eq!(attempt_states(&db), vec!["outcome_unknown".to_string()]);
+        // The POST happened, so the ambiguity is real and kept — but hashless,
+        // because the hash this call was told is not this submission's.
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM chain_submission_attempts WHERE chain_tx_hash IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.get_delegation_tx_hash(ROUND_ID, 0).unwrap(), None);
     }
 
     #[tokio::test]
@@ -6437,7 +6571,10 @@ mod tests {
 
         // The hash is the only handle on a transaction now in the mempool, and
         // it was established before this supplementary read was attempted. A
-        // database that has become unreadable must not take it away.
+        // database that has become unreadable must not take it away. That
+        // covers the hash-ownership check on this path too: it reads the same
+        // missing tables, and a check that could not be made is no evidence
+        // that the hash belongs to another submission.
         assert_eq!(
             outcome,
             ChainLifecycleOutcome::Accepted {

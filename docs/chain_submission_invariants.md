@@ -11,6 +11,10 @@ submission attempts, confirmation, and recovery.
 response syntax and submission-specific event bindings, but it does not
 independently prove transaction inclusion or establish endpoint consensus.
 
+**A single process is assumed to have exclusive access to the voting database
+at a time.** The lifecycle's in-memory locks and in-flight registry do not
+provide cross-process coordination.
+
 The implementation is authoritative. A change to an invariant below SHOULD
 update this document and the named regression tests in the same pull request.
 
@@ -252,8 +256,18 @@ none. The transaction may still have committed; that stays visible as
    against a bundle is refused when another bundle in the round already carries
    it: the VAN position it commits belongs to that bundle alone, and a stale or
    misbehaving endpoint returning one valid hash for two submissions would
-   otherwise write a position onto a bundle the transaction never touched. An
-   ownership is judged against the attempt journal as well as the domain columns,
+   otherwise write a position onto a bundle the transaction never touched.
+   Ownership is judged before an accepted hash becomes a candidate, not only
+   when one is written. Journaling a foreign hash would create a candidate
+   confirmation must later refuse, and a successful candidate is never retired,
+   so every later submission would rediscover it and exit before dispatch — the
+   real payload could never be sent again. The POST still happened, so the
+   attempt keeps its ambiguity hashless, which says exactly what is true: a
+   transaction may be in flight and its hash is not known. Only a proven
+   conflict does this. A check that could not be made is no evidence of one, and
+   the hash is the only handle on a transaction already in the mempool, so an
+   unreadable database must not cost it. Ownership is judged against the attempt
+   journal as well as the domain columns,
    because CheckTx acceptance deliberately leaves those null and would otherwise
    let reconciliation order decide which identity receives the confirmation. The
    check and the write it guards share one immediate transaction, in the legacy
@@ -1126,6 +1140,10 @@ state transitions.
 - `chain_submission::tests::cancellation_after_an_ambiguous_post_preserves_the_ambiguity`
   and `cancellation_before_any_dispatch_is_reported_as_cancelled` cover the
   boundary between the two cancellation outcomes.
+- `chain_submission::tests::an_accepted_hash_owned_by_another_bundle_does_not_become_a_candidate`
+  covers the ownership check before journaling, and
+  `an_accepted_hash_survives_an_unreadable_final_reread` covers a failed check
+  not being treated as a conflict.
 - `chain_submission::tests::a_committed_failure_does_not_override_hashless_ambiguity`,
   `every_committed_failure_candidate_is_retired`,
   `a_successful_candidate_survives_a_terminal_lookup_error`,

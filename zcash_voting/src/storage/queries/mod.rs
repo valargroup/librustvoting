@@ -2935,6 +2935,31 @@ pub(crate) use crate::chain::canonical_tx_hash;
 ///
 /// Scoped to the bundle rather than the row, because an atomic batch legitimately
 /// records one transaction on every member of its own bundle.
+/// [`ensure_tx_hash_belongs_to_submission`] for a hash that is not recorded yet.
+///
+/// The same rule, asked before a broadcast's hash becomes a candidate rather
+/// than when it is written. A stale or misbehaving endpoint can answer with a
+/// hash another submission already owns; journaling it would make it a
+/// candidate that confirmation must later refuse, and successful candidates are
+/// never retired, so it would block this payload for good.
+pub(crate) fn ensure_tx_hash_free_for_submission(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: Option<u32>,
+    tx_hash: &str,
+) -> Result<(), VotingError> {
+    ensure_tx_hash_belongs_to_submission(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        proposal_id,
+        &canonical_tx_hash(tx_hash),
+    )
+}
+
 fn ensure_tx_hash_belongs_to_submission(
     conn: &Connection,
     round_id: &str,
