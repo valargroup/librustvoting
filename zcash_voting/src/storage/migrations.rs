@@ -191,12 +191,10 @@ UPDATE proofs AS p
     (
         18,
         "ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;
--- Existing setup predates durable PCZT storage. An unsigned successful proof
--- is reusable by a software signer, but cannot produce a Keystone signing
--- request because the exact randomized PCZT is unavailable. Demote only local,
--- unsubmitted proofs without a signature so setup and ZKP1 can be rebuilt as
--- one signing context. Preserve signed, submitted, confirmed, and imported
--- delegations.
+-- Existing setup predates durable PCZT storage, so a successful proof cannot
+-- be bound to the current randomized signing context. Demote every local,
+-- unsubmitted proof without a durable PCZT so ZKP1 can be rebuilt against the
+-- retained setup. Preserve submitted, confirmed, and imported delegations.
 UPDATE proofs AS p
    SET success = 0
  WHERE p.success = 1
@@ -210,13 +208,6 @@ UPDATE proofs AS p
           AND b.note_positions_blob IS NOT NULL
           AND b.delegation_tx_hash IS NULL
           AND b.van_leaf_position IS NULL
-          AND NOT EXISTS (
-              SELECT 1
-                FROM keystone_signatures k
-               WHERE k.round_id = b.round_id
-                 AND k.wallet_id = b.wallet_id
-                 AND k.bundle_index = b.bundle_index
-          )
    );
 -- Clear every remaining locally rebuildable setup that has neither a usable
 -- proof nor a durable signature. Its binding fields cannot be paired with a
@@ -871,7 +862,7 @@ mod tests {
             .unwrap();
         assert_eq!(repaired_external, (vec![0xCE; 96], 0));
 
-        let reusable_external: (Vec<u8>, i64) = conn
+        let repaired_signed: (Vec<u8>, i64) = conn
             .query_row(
                 "SELECT proof, success FROM proofs
                  WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 3",
@@ -879,7 +870,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(reusable_external, (vec![0xDF; 96], 1));
+        assert_eq!(repaired_signed, (vec![0xDF; 96], 0));
 
         let repaired_partial: (Vec<u8>, i64) = conn
             .query_row(
@@ -913,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_v18_repairs_legacy_unsigned_setup_and_proofs() {
+    fn migrate_v18_repairs_legacy_setup_and_proofs() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(&v18_schema()).unwrap();
         queries::insert_round(
@@ -936,6 +927,9 @@ mod tests {
             store_complete_v18_delegation_setup(&conn, bundle_index);
         }
         queries::store_proof(&conn, "test-round", "wallet", 1, &[0xA1; 96]).unwrap();
+        // Represent a released database where proof A survived a reset before
+        // setup B and its Keystone signature were persisted. Without the exact
+        // PCZT, migration cannot prove that the successful proof belongs to B.
         queries::store_proof(&conn, "test-round", "wallet", 2, &[0xA2; 96]).unwrap();
         queries::store_keystone_signature(
             &conn,
@@ -997,7 +991,7 @@ mod tests {
             .unwrap();
         assert_eq!(repaired_proof, (vec![0xA1; 96], 0));
 
-        let signed_proof: (Vec<u8>, i64) = conn
+        let repaired_signed_proof: (Vec<u8>, i64) = conn
             .query_row(
                 "SELECT proof, success FROM proofs
                  WHERE round_id = 'test-round'
@@ -1007,7 +1001,17 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(signed_proof, (vec![0xA2; 96], 1));
+        assert_eq!(repaired_signed_proof, (vec![0xA2; 96], 0));
+
+        let signatures = queries::get_keystone_signatures(&conn, "test-round", "wallet").unwrap();
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].bundle_index, 2);
+        assert_eq!(signatures[0].sig, vec![0xA2; 64]);
+
+        queries::store_proof(&conn, "test-round", "wallet", 2, &[0xB2; 96]).unwrap();
+        let reproved =
+            queries::load_delegation_submission_data(&conn, "test-round", "wallet", 2).unwrap();
+        assert_eq!(reproved.proof, vec![0xB2; 96]);
 
         store_complete_delegation_setup(&conn, 0);
         assert_eq!(setup_presence(0), (true, true, true));
