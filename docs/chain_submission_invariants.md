@@ -87,6 +87,13 @@ for its exact attempt: a later attempt's definite rejection or failure cannot
 disprove an earlier attempt in the same call whose outcome is unknown, so the
 call reports `OutcomeUnknown` rather than a terminal result.
 
+A durable confirmation belongs to the submission it was recorded for. A
+confirmed atomic-batch member carries a transaction hash and a tree position
+like any confirmed singleton, so the singleton shortcut checks the row's
+persisted batch markers before treating those fields as its own confirmation;
+otherwise a `cast-vote-batch` transaction would be reported as confirming a
+singleton submission the dispatch path refuses to create.
+
 A confirmation this lifecycle has already applied is durable, and it outranks
 any later network answer. Reconciliation reports it as `AlreadyConfirmed`
 instead of re-deriving it from a lookup, so a lagging or pruned endpoint cannot
@@ -310,9 +317,11 @@ none. The transaction may still have committed; that stays visible as
     submission columns. This prevents a later DeliverTx failure from pinning a
     domain row to a transaction that did not commit successfully.
 13. A classification that cannot be persisted never turns a possibly committed
-    request into a definite failure. An ambiguous outcome is reported as
-    `OutcomeUnknown`: its reservation is still durably `attempting`, so the
-    ambiguity is real whether or not the classification landed.
+    request into a definite result. Its reservation is still durably
+    `attempting`, so an ambiguous outcome stays `OutcomeUnknown`, and a definite
+    rejection that could not be journaled is reported the same way rather than
+    as terminal — the live reservation is what the evidence rules then see, and
+    a storage failure is no evidence about the submission either way.
 14. An accepted transaction hash is never discarded by a failure to journal it.
     The transaction is already in the mempool and may commit, and the hash is the
     only handle anything will ever have on it, so a storage failure after a usable
@@ -560,19 +569,23 @@ hosts do not parse the log.
    before the lock was taken.
 7. Cancellation is checked on entry to reconciliation and before reservation,
    dispatch, retry, failover, backoff, and confirmation application, and again
-   as soon as each transaction-status request returns, and again after failed
-   candidates are retired, because that retirement is durable work of its own and
-   widens the gap before the confirmation write. The entry check covers
+   as soon as each transaction-status request returns, and both before and after
+   failed candidates are retired, because that retirement is a durable mutation
+   of its own and its wait on SQLite widens the gap before the submission is
+   classified. The entry check covers
    the no-candidate fast path, so a cancelled operation is never reported to the
    host as actively pending; the post-request check covers every result variant,
    not only a committed success, because classifying a 404 or an error reports an
    outcome and classifying a committed failure retires evidence. A cancelled
    operation does neither: the candidate stays journaled, so the next
    reconciliation re-derives whatever this one was about to conclude.
-8. A reconciliation that reports `Cancelled` settled nothing, so a call with a
-   completed ambiguous broadcast reports that broadcast's ambiguity instead.
-   This applies wherever a reconciliation's result is adopted, including the
-   between-retry gate and the rejection path.
+8. A reconciliation that fails to settle does not overwrite what this call
+   already knows. That covers both a `Cancelled` result, which concluded
+   nothing, and a terminal lookup error, which is evidence about someone else's
+   candidate rather than about this call's earlier attempt: with a completed
+   ambiguous broadcast outstanding, either reports that broadcast's ambiguity
+   instead. It applies wherever a reconciliation's result is adopted, including
+   the between-retry gate and the rejection path.
 9. Cancellation observed after a broadcast completes does not replace that
    broadcast's result. A call cancelled while a dispatched attempt may still
    commit reports `OutcomeUnknown`; `Cancelled` is reserved for calls with no
@@ -677,7 +690,12 @@ state transitions.
 - Is a confirmation another writer applies during the candidate lookups allowed
   to be downgraded by a lagging 404 or another candidate's failure?
 - Can a classification that fails to persist turn a possibly committed request
-  into a definite error?
+  into a definite error, or into a terminal rejection?
+- Is every failed candidate retired on every way out of a lookup, including the
+  mixed ones where another candidate returns first?
+- Can a terminal lookup error for someone else's candidate replace this call's
+  own ambiguity?
+- Can a confirmed atomic-batch member be reported as a singleton confirmation?
 - Do an atomic batch's persisted proposal and nullifier bindings participate in
   endpoint failover?
 - Does an outstanding reservation keep proving its owner is alive, rather than
@@ -784,7 +802,16 @@ state transitions.
   `a_confirmation_applied_during_lookup_outranks_a_lagging_404` covers the
   durable-confirmation re-read after the candidate lookups.
 - `chain_submission::tests::a_batch_confirmation_with_wrong_members_fails_over`
-  covers an atomic batch's recovery bindings participating in endpoint failover.
+  covers an atomic batch's recovery bindings participating in endpoint failover,
+  and `a_confirmed_batch_member_is_not_a_singleton_confirmation` covers the
+  singleton shortcut refusing a confirmed member.
+- `chain_submission::tests::a_failed_candidate_is_retired_even_on_a_mixed_status_exit`
+  covers retirement on a lookup that exits through another candidate's unusable
+  response, and `cancellation_after_all_failure_retirement_is_observed` covers
+  the cancellation check that follows it.
+- `chain_submission::tests::a_retry_reconciliation_error_preserves_earlier_ambiguity`
+  and `a_rejection_that_cannot_be_journaled_stays_unknown` cover the two
+  remaining paths that could replace a completed ambiguous broadcast's result.
 - `chain_submission::tests::one_transaction_recorded_in_two_casings_is_looked_up_once`
   and `chain_submission::tests::a_legacy_opaque_hash_does_not_break_reconciliation`
   cover candidate canonicalization and non-normalizable legacy hashes.

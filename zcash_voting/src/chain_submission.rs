@@ -482,7 +482,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         wallet_id: &str,
         identity: &ChainSubmissionIdentity,
         last_unknown: &Option<String>,
-        cause: &VotingError,
+        cause: &str,
     ) -> Result<Option<ChainLifecycleOutcome>, VotingError> {
         let known_tx_hashes = known_hashes(self.db, wallet_id, identity)?;
         if last_unknown.is_none()
@@ -493,12 +493,12 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         }
         let message = match last_unknown {
             Some(earlier) => format!(
-                "an earlier attempt's outcome is unknown ({earlier}); a later attempt could not be \
-                 prepared: {cause}"
+                "an earlier attempt's outcome is unknown ({earlier}); a later attempt did not \
+                 settle: {cause}"
             ),
-            None => format!(
-                "an earlier attempt may still commit; this one could not be prepared: {cause}"
-            ),
+            None => {
+                format!("an earlier attempt may still commit; this one did not settle: {cause}")
+            }
         };
         Ok(Some(ChainLifecycleOutcome::OutcomeUnknown {
             known_tx_hashes,
@@ -531,7 +531,24 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 // record a candidate while this call is between attempts. Apply
                 // the same rule as the preflight below: a known candidate that
                 // may still commit stops this call from broadcasting again.
-                let reconciled = self.reconcile_locked(wallet_id, &identity, cancel).await?;
+                // A terminal lookup error for someone else's candidate is not
+                // evidence about this call's earlier attempt, which may still
+                // commit. Replacing that ambiguity with the unrelated error
+                // would let the host read it as a definite failure.
+                let reconciled = match self.reconcile_locked(wallet_id, &identity, cancel).await {
+                    Ok(reconciled) => reconciled,
+                    Err(error) => {
+                        if let Some(outcome) = self.outstanding_ambiguity(
+                            wallet_id,
+                            &identity,
+                            &last_unknown,
+                            &error.to_string(),
+                        )? {
+                            return Ok(outcome);
+                        }
+                        return Err(error);
+                    }
+                };
                 // A cancelled reconciliation settled nothing, and cancellation
                 // observed after a broadcast completed must not replace its
                 // result. `cancelled_outcome` reports the earlier ambiguity when
@@ -568,9 +585,12 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             {
                 Ok(attempt_id) => attempt_id,
                 Err(error) => {
-                    if let Some(outcome) =
-                        self.outstanding_ambiguity(wallet_id, &identity, &last_unknown, &error)?
-                    {
+                    if let Some(outcome) = self.outstanding_ambiguity(
+                        wallet_id,
+                        &identity,
+                        &last_unknown,
+                        &error.to_string(),
+                    )? {
                         return Ok(outcome);
                     }
                     return Err(error.into());
@@ -627,7 +647,14 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 }
                 Ok(ChainBroadcastOutcome::Rejected(result)) => {
                     let tx_hash = (!result.tx_hash.is_empty()).then_some(result.tx_hash.as_str());
-                    mark_attempt(self.db, wallet_id, attempt_id, "rejected", tx_hash)?;
+                    // Deliberately not fatal. If this cannot be recorded the
+                    // reservation stays durably `attempting`, so the precedence
+                    // checks below see a live attempt and report
+                    // `OutcomeUnknown` — which is right, because an earlier
+                    // attempt in this call may still commit and a persistence
+                    // failure is no evidence about it either way.
+                    let journal_error =
+                        mark_attempt(self.db, wallet_id, attempt_id, "rejected", tx_hash).err();
                     if is_spent_nullifier_log(&result.log) {
                         let reconciled =
                             self.reconcile_locked(wallet_id, &identity, cancel).await?;
@@ -685,12 +712,15 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                         || !known_tx_hashes.is_empty()
                         || has_live_attempt(self.db, wallet_id, &identity)?
                     {
-                        let earlier = match &last_unknown {
-                            Some(message) => message.clone(),
-                            None if !known_tx_hashes.is_empty() => {
+                        let earlier = match (&last_unknown, &journal_error) {
+                            (Some(message), _) => message.clone(),
+                            (None, Some(error)) => {
+                                format!("this rejection could not be journaled: {error}")
+                            }
+                            (None, _) if !known_tx_hashes.is_empty() => {
                                 "a known candidate may still commit".to_string()
                             }
-                            None => "dispatched, no response".to_string(),
+                            (None, _) => "dispatched, no response".to_string(),
                         };
                         return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                             known_tx_hashes,
@@ -899,25 +929,33 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             }
             .into());
         }
+        // Every candidate this lookup proved failed can never confirm, so none of
+        // them may stay live evidence on any path out of here: leaving one
+        // `accepted` makes later submissions rediscover it and exit before
+        // dispatch, and keeps ballot-intent changes, recovery cleanup, and
+        // bundle pruning pinned to a generation that can never confirm. Retiring
+        // per exit missed the mixed-status ones, where another candidate's
+        // unusable response or terminal error returns first.
+        if !committed_failures.is_empty() {
+            // Retirement is a durable mutation, so it is bracketed by the same
+            // cancellation checks as any other write here. The second one covers
+            // the loop's own time waiting on SQLite.
+            if cancel() {
+                return Ok(ChainLifecycleOutcome::Cancelled);
+            }
+            for (failed_hash, _) in &committed_failures {
+                retire_failed_candidate(self.db, wallet_id, identity, failed_hash)?;
+            }
+            if cancel() {
+                return Ok(ChainLifecycleOutcome::Cancelled);
+            }
+        }
         if let Some((hash, response)) = successful.pop() {
             // The status request may have taken arbitrarily long. An account or
             // session invalidated while it was in flight must not have voting
             // state mutated underneath it, so re-check cancellation immediately
             // before the confirmation transaction rather than only before the
             // request.
-            if cancel() {
-                return Ok(ChainLifecycleOutcome::Cancelled);
-            }
-            // Duplicate attempts can produce one success and one or more
-            // failures. Adopting the success must not leave the failures live:
-            // they would keep protecting recovery rows and blocking bundle
-            // pruning even though this lookup proved they failed.
-            for (failed_hash, _) in &committed_failures {
-                retire_failed_candidate(self.db, wallet_id, identity, failed_hash)?;
-            }
-            // Retirement is durable work of its own and can wait on SQLite, so
-            // it widens the gap between the check above and the write below.
-            // Check again immediately before the confirmation transaction.
             if cancel() {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
@@ -934,11 +972,6 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         // and a different candidate's committed failure would report `Rejected`,
         // for a submission that is now durably confirmed.
         if let Some(tx_hash) = durable_confirmation_hash(self.db, wallet_id, identity)? {
-            // These candidates are still proven failed, and leaving one live
-            // would keep it blocking a replacement.
-            for (failed_hash, _) in &committed_failures {
-                retire_failed_candidate(self.db, wallet_id, identity, failed_hash)?;
-            }
             return Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash });
         }
         if let Some(error) = terminal_error {
@@ -956,15 +989,6 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             });
         }
         if !committed_failures.is_empty() {
-            // Each failed candidate's transaction definitively failed at commit,
-            // so none of them may stay live evidence. Leaving one `accepted`
-            // would make every later submission rediscover it and exit before
-            // dispatch, and would keep ballot-intent changes and recovery
-            // cleanup pinned to a generation that can never confirm. Retire all
-            // of them, not just the one whose rejection is reported.
-            for (hash, _) in &committed_failures {
-                retire_failed_candidate(self.db, wallet_id, identity, hash)?;
-            }
             // A hashless attempt that may still commit outranks these
             // rejections, which are definite only for the candidates they name.
             if has_live_attempt(self.db, wallet_id, identity)? {
@@ -1036,6 +1060,20 @@ fn durable_confirmation_hash(
             else {
                 return Ok(None);
             };
+            // A confirmed batch member carries both fields too, so this would
+            // otherwise report a `cast-vote-batch` transaction as confirmation
+            // of a singleton submission — which the singleton dispatch path
+            // refuses to create in the first place. A row whose recovery cannot
+            // be read keeps the legacy behaviour: there is nothing to say it is
+            // a member.
+            let is_batch_member = state
+                .commitment_bundle_json
+                .as_deref()
+                .and_then(|json| vote::parse_recovery(json).ok())
+                .is_some_and(|recovery| recovery.batch.is_some());
+            if is_batch_member {
+                return Ok(None);
+            }
             Ok(match (state.tx_hash, state.vc_tree_position) {
                 (Some(tx_hash), Some(_)) => Some(tx_hash),
                 _ => None,
@@ -4084,7 +4122,7 @@ mod tests {
         // generation as safe to submit.
         assert!(
             matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
-                if message.contains("could not be prepared")),
+                if message.contains("did not settle")),
             "got {outcome:?}"
         );
     }
@@ -4576,6 +4614,233 @@ mod tests {
         assert!(
             matches!(&outcome, ChainLifecycleOutcome::Confirmed { tx_hash, .. }
                 if tx_hash == TX_HASH),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_candidate_is_retired_even_on_a_mixed_status_exit() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        journal_attempt(&db, "accepted", Some(TX_HASH_2));
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            // One candidate is proven to have failed at commit...
+            Ok(response(
+                422,
+                r#"{"height":42,"code":7,"log":"invalid proof","events":[]}"#,
+            )),
+            // ...while the other's answer is unusable, which returns first.
+            Ok(response(200, "not json at all")),
+        ]);
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { .. }),
+            "got {outcome:?}"
+        );
+        // Leaving the proven failure `accepted` would have later submissions
+        // rediscover it and exit before dispatch, and keep cleanup and pruning
+        // pinned to a generation that can never confirm.
+        assert_eq!(
+            attempt_states(&db),
+            vec!["rejected".to_string(), "accepted".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_all_failure_retirement_is_observed() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let inner = MockTransport::default();
+        inner.responses.lock().unwrap().push_back(Ok(response(
+            422,
+            r#"{"height":42,"code":7,"log":"invalid proof","events":[]}"#,
+        )));
+        let client = ChainClient::new(
+            Arc::new(inner),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        // Cancellation lands only after the retirement loop: the checks on
+        // entry, at the loop top, inside the lookup, after the lookup, and
+        // before retiring all see a live operation.
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 5;
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &cancel)
+            .await
+            .unwrap();
+
+        // Retiring is durable work that can wait on SQLite, so a cancelled
+        // operation must not go on to classify the submission afterwards.
+        assert_eq!(outcome, ChainLifecycleOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_batch_member_is_not_a_singleton_confirmation() {
+        use crate::types::EncryptedShare;
+        use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};
+
+        let db = test_db();
+        let recovery = VoteRecoveryBundle {
+            vote_round_id: ROUND_ID.to_string(),
+            bundle_index: 0,
+            proposal_id: 1,
+            vote_decision: 0,
+            anchor_height: 123,
+            vc_tree_position: 0,
+            single_share: false,
+            num_options: 3,
+            van_nullifier: [0x10; 32],
+            vote_authority_note_new: [0x11; 32],
+            vote_commitment: [0x12; 32],
+            proof: vec![0x13; 96],
+            shares_hash: [0x14; 32],
+            r_vpk: [0x15; 32],
+            alpha_v: [0x16; 32],
+            vote_auth_sig: [0x17; 64],
+            encrypted_shares: vec![EncryptedShare {
+                c1: vec![0x21; 32],
+                c2: vec![0x22; 32],
+                share_index: 0,
+                plaintext_value: 5,
+                randomness: vec![0x23; 32],
+            }],
+            share_blinds: vec![[0x41; 32]],
+            share_comms: vec![[0x51; 32]],
+            batch: Some(VoteBatchRecovery {
+                digest: [0xD1; 32],
+                index: 0,
+                size: 1,
+            }),
+        };
+        store_vote_with_recovery(&db, 1, &recovery);
+        // The batch confirmed, so the bundle has a VAN position and its member
+        // row carries both durable fields.
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE bundles SET van_leaf_position=5
+              WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+            rusqlite::params![ROUND_ID, WALLET],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE votes SET tx_hash=?3, vc_tree_position=7
+              WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=1",
+            rusqlite::params![ROUND_ID, WALLET, TX_HASH],
+        )
+        .unwrap();
+        drop(conn);
+
+        let hash =
+            durable_confirmation_hash(&db, WALLET, &ChainSubmissionIdentity::vote(ROUND_ID, 0, 1))
+                .unwrap();
+
+        // Reporting the batch's transaction as confirmation of a singleton
+        // submission contradicts the dispatch path, which refuses to create one
+        // for a batch member at all.
+        assert_eq!(hash, None);
+    }
+
+    #[tokio::test]
+    async fn a_retry_reconciliation_error_preserves_earlier_ambiguity() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_retry_error_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        let inner = MockTransport::default();
+        inner
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Err(ChainTransportError::Timeout));
+        // A terminal, non-retryable lookup error for the racing candidate.
+        inner
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(response(401, r#"{"message":"unauthorized"}"#)));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = ChainClient::with_config(
+            Arc::new(AmbiguousThenCancelTransport {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                cancelled,
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            ChainClientConfig::default()
+                .with_retry_delays(vec![Duration::from_millis(1)])
+                .unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // The lookup error is about someone else's candidate; it says nothing
+        // about this call's earlier attempt, whose transaction may still commit.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
+                if message.contains("timed out")),
+            "got {outcome:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_that_cannot_be_journaled_stays_unknown() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            422,
+            r#"{"tx_hash":"","code":7,"log":"invalid proof"}"#,
+        )));
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_attempt_update
+                 BEFORE UPDATE ON chain_submission_attempts
+                 BEGIN SELECT RAISE(ABORT, 'storage failure'); END",
+            )
+            .unwrap();
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // The reservation is still durably `attempting`, so this submission is
+        // not settled: reporting the storage error, or the rejection as
+        // terminal, would both overstate what is known.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
+                if message.contains("could not be journaled")),
             "got {outcome:?}"
         );
     }
