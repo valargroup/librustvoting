@@ -113,11 +113,6 @@ impl VotingDb {
             })?;
 
         migrations::migrate(&mut conn)?;
-        // A reservation still marked `attempting` cannot belong to this process,
-        // which has not dispatched anything yet. Recording it as outcome-unknown
-        // keeps its evidence and stops a dead process's reservation from
-        // covering a vote row forever.
-        crate::chain_submission::mark_interrupted_attempts_unknown(&conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),

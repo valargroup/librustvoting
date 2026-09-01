@@ -65,6 +65,7 @@ pub fn confirm_delegation_submission(
         bundle_index,
         tx_hash,
         events,
+        StoredHashConflict::Refuse,
     )
 }
 
@@ -81,9 +82,17 @@ pub(crate) fn confirm_delegation_submission_for_wallet(
     bundle_index: u32,
     tx_hash: &str,
     events: &[TxEvent],
+    conflict: StoredHashConflict,
 ) -> Result<DelegationConfirmation, VotingError> {
     let confirmation = parse_delegation_confirmation_for_round(tx_hash, round_id, events)?;
-    record_delegation_confirmation(db, wallet_id, round_id, bundle_index, &confirmation)?;
+    record_delegation_confirmation(
+        db,
+        wallet_id,
+        round_id,
+        bundle_index,
+        &confirmation,
+        conflict,
+    )?;
     Ok(confirmation)
 }
 
@@ -103,6 +112,7 @@ fn record_delegation_confirmation(
     round_id: &str,
     bundle_index: u32,
     confirmation: &DelegationConfirmation,
+    conflict: StoredHashConflict,
 ) -> Result<(), VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let mut conn = db.conn();
@@ -112,6 +122,15 @@ fn record_delegation_confirmation(
             message: format!("delegation confirmation transaction failed: {e}"),
         })?;
 
+    if conflict == StoredHashConflict::ClearUnconfirmed {
+        clear_unconfirmed_delegation_hash(
+            &tx,
+            round_id,
+            wallet_id,
+            bundle_index,
+            &confirmation.tx_hash,
+        )?;
+    }
     let (stored_hash, stored_van_position) =
         load_bundle_confirmation_fields(&tx, round_id, wallet_id, bundle_index)?;
     check_text_conflict(
@@ -166,6 +185,7 @@ pub fn confirm_vote_submission(
         proposal_id,
         tx_hash,
         events,
+        StoredHashConflict::Refuse,
     )
 }
 
@@ -173,6 +193,7 @@ pub fn confirm_vote_submission(
 ///
 /// See [`confirm_delegation_submission_for_wallet`] for why the lifecycle
 /// cannot let this re-read the database's current wallet.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn confirm_vote_submission_for_wallet(
     db: &VotingDb,
     wallet_id: &str,
@@ -181,6 +202,7 @@ pub(crate) fn confirm_vote_submission_for_wallet(
     proposal_id: u32,
     tx_hash: &str,
     events: &[TxEvent],
+    conflict: StoredHashConflict,
 ) -> Result<VoteConfirmation, VotingError> {
     let confirmation = parse_vote_confirmation_for_round(tx_hash, round_id, events)?;
     record_vote_confirmation(
@@ -190,6 +212,7 @@ pub(crate) fn confirm_vote_submission_for_wallet(
         bundle_index,
         proposal_id,
         &confirmation,
+        conflict,
     )?;
     Ok(confirmation)
 }
@@ -211,6 +234,7 @@ pub fn confirm_vote_batch_submission(
         expected_batch_digest,
         tx_hash,
         events,
+        StoredHashConflict::Refuse,
     )
 }
 
@@ -218,6 +242,7 @@ pub fn confirm_vote_batch_submission(
 ///
 /// See [`confirm_delegation_submission_for_wallet`] for why the lifecycle
 /// cannot let this re-read the database's current wallet.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn confirm_vote_batch_submission_for_wallet(
     db: &VotingDb,
     wallet_id: &str,
@@ -226,6 +251,7 @@ pub(crate) fn confirm_vote_batch_submission_for_wallet(
     expected_batch_digest: &[u8],
     tx_hash: &str,
     events: &[TxEvent],
+    conflict: StoredHashConflict,
 ) -> Result<VoteBatchConfirmation, VotingError> {
     let expected_batch_digest: [u8; 32] =
         expected_batch_digest
@@ -254,6 +280,7 @@ pub(crate) fn confirm_vote_batch_submission_for_wallet(
         expected_batch_digest,
         &confirmation,
         events,
+        conflict,
     )?;
     Ok(confirmation)
 }
@@ -267,6 +294,7 @@ fn record_vote_batch_confirmation(
     batch_digest: [u8; 32],
     confirmation: &VoteBatchConfirmation,
     events: &[TxEvent],
+    conflict: StoredHashConflict,
 ) -> Result<(), VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let event = required_event_for_round(events, CAST_VOTE_BATCH_EVENT, round_id)?;
@@ -311,6 +339,16 @@ fn record_vote_batch_confirmation(
         .iter()
         .zip(confirmation.vc_tree_positions.iter().copied())
     {
+        if conflict == StoredHashConflict::ClearUnconfirmed {
+            clear_unconfirmed_vote_hash(
+                &tx,
+                round_id,
+                wallet_id,
+                bundle_index,
+                recovery.proposal_id,
+                &confirmation.tx_hash,
+            )?;
+        }
         queries::record_vote_submission(
             &tx,
             round_id,
@@ -359,6 +397,7 @@ fn record_vote_confirmation(
     bundle_index: u32,
     proposal_id: u32,
     confirmation: &VoteConfirmation,
+    conflict: StoredHashConflict,
 ) -> Result<(), VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let mut conn = db.conn();
@@ -376,6 +415,16 @@ fn record_vote_confirmation(
         proposal_id,
     )?;
 
+    if conflict == StoredHashConflict::ClearUnconfirmed {
+        clear_unconfirmed_vote_hash(
+            &tx,
+            round_id,
+            wallet_id,
+            bundle_index,
+            proposal_id,
+            &confirmation.tx_hash,
+        )?;
+    }
     queries::record_vote_submission(
         &tx,
         round_id,
@@ -719,6 +768,102 @@ fn parse_csv_u64(raw: &str) -> Result<Vec<u64>, VotingError> {
         .collect()
 }
 
+/// What to do about a *different* unconfirmed transaction hash already stored on
+/// a row this confirmation is about to write.
+///
+/// The domain writers refuse to overwrite a stored hash, which is the right
+/// default for the standalone recording APIs: a host passing a second hash for a
+/// row it already recorded is reporting a contradiction it should see.
+///
+/// The chain lifecycle is different. It only reaches confirmation after a lookup
+/// proved the winning transaction committed successfully, and consensus
+/// nullifiers let at most one semantic action for a submission identity succeed.
+/// A stored value that differs from that winner therefore either failed, never
+/// landed, or is the same transaction under an encoding this SDK does not
+/// recognize — an opaque identifier a pre-lifecycle host recorded, which the
+/// version-18 migration preserves and candidate selection skips, is exactly that
+/// last case. Refusing would leave the confirmation failing identically on every
+/// later reconciliation, with the position unset for good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoredHashConflict {
+    /// Refuse the confirmation, reporting the contradiction.
+    Refuse,
+    /// Clear a differing hash from a row that has no confirmation position.
+    ///
+    /// Applied inside the confirmation transaction and after the event
+    /// validation, so a confirmation that turns out not to bind to this
+    /// submission rolls the clearing back with it and leaves the stored hash
+    /// available to the next reconciliation.
+    ClearUnconfirmed,
+}
+
+/// Clears a delegation hash that differs from the one being confirmed.
+///
+/// Scoped to a bundle with no recorded VAN position, so a confirmed hash can
+/// never be cleared, and a value equal to the winner is left alone so replay
+/// stays idempotent.
+fn clear_unconfirmed_delegation_hash(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    winning_hash: &str,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "UPDATE bundles SET delegation_tx_hash = NULL
+          WHERE round_id = :round_id AND wallet_id = :wallet_id
+            AND bundle_index = :bundle_index
+            AND delegation_tx_hash IS NOT NULL
+            AND delegation_tx_hash <> :winning_hash
+            AND van_leaf_position IS NULL",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":winning_hash": winning_hash,
+        },
+    )
+    .map(|_| ())
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear conflicting delegation tx hash: {e}"),
+    })
+}
+
+/// Clears a vote hash that differs from the one being confirmed.
+///
+/// Scoped to one proposal row with no recorded VC position. A batch calls this
+/// per member rather than matching the whole bundle: the match is "differs from
+/// the winner" rather than an exact hash, so widening would reach an unrelated
+/// singleton's live submission.
+fn clear_unconfirmed_vote_hash(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    winning_hash: &str,
+) -> Result<(), VotingError> {
+    conn.execute(
+        "UPDATE votes SET tx_hash = NULL
+          WHERE round_id = :round_id AND wallet_id = :wallet_id
+            AND bundle_index = :bundle_index AND proposal_id = :proposal_id
+            AND tx_hash IS NOT NULL
+            AND tx_hash <> :winning_hash
+            AND vc_tree_position IS NULL",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+            ":proposal_id": proposal_id as i64,
+            ":winning_hash": winning_hash,
+        },
+    )
+    .map(|_| ())
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to clear conflicting vote tx hash: {e}"),
+    })
+}
+
 fn load_bundle_confirmation_fields(
     conn: &rusqlite::Connection,
     round_id: &str,
@@ -807,6 +952,46 @@ fn check_text_conflict(
 mod tests {
     use super::*;
     use crate::round::{RoundParams, VotingDb};
+
+    // These exercise the standalone recording APIs, whose contract is to refuse
+    // a contradicting stored hash. The lifecycle's clearing policy has its own
+    // coverage in `chain_submission`.
+    fn record_delegation_confirmation(
+        db: &VotingDb,
+        wallet_id: &str,
+        round_id: &str,
+        bundle_index: u32,
+        confirmation: &DelegationConfirmation,
+    ) -> Result<(), VotingError> {
+        super::record_delegation_confirmation(
+            db,
+            wallet_id,
+            round_id,
+            bundle_index,
+            confirmation,
+            StoredHashConflict::Refuse,
+        )
+    }
+
+    fn record_vote_confirmation(
+        db: &VotingDb,
+        wallet_id: &str,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        confirmation: &VoteConfirmation,
+    ) -> Result<(), VotingError> {
+        super::record_vote_confirmation(
+            db,
+            wallet_id,
+            round_id,
+            bundle_index,
+            proposal_id,
+            confirmation,
+            StoredHashConflict::Refuse,
+        )
+    }
+
     use crate::storage::queries;
     use crate::types::EncryptedShare;
     use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};

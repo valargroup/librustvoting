@@ -17,7 +17,7 @@ use crate::{
     },
     confirmation::{
         confirm_delegation_submission_for_wallet, confirm_vote_batch_submission_for_wallet,
-        confirm_vote_submission_for_wallet,
+        confirm_vote_submission_for_wallet, StoredHashConflict,
     },
     delegate::{self, DelegationSigner, SignedDelegationBundle},
     storage::{queries, VotingDb},
@@ -735,7 +735,6 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             for (failed_hash, _) in &committed_failures {
                 retire_failed_candidate(self.db, wallet_id, identity, failed_hash)?;
             }
-            clear_conflicting_domain_hash(self.db, wallet_id, identity, &hash)?;
             let confirmation = apply_confirmation(self.db, wallet_id, identity, &hash, &response)?;
             return Ok(ChainLifecycleOutcome::Confirmed {
                 tx_hash: hash,
@@ -902,6 +901,7 @@ fn apply_confirmation(
             identity.bundle_index,
             tx_hash,
             &response.events,
+            StoredHashConflict::ClearUnconfirmed,
         )
         .map(ChainConfirmation::Delegation),
         ChainSubmissionKind::Vote => confirm_vote_submission_for_wallet(
@@ -912,6 +912,7 @@ fn apply_confirmation(
             identity.require_proposal_id()?,
             tx_hash,
             &response.events,
+            StoredHashConflict::ClearUnconfirmed,
         )
         .map(ChainConfirmation::Vote),
         ChainSubmissionKind::VoteBatch => confirm_vote_batch_submission_for_wallet(
@@ -922,6 +923,7 @@ fn apply_confirmation(
             &identity.require_batch_digest()?,
             tx_hash,
             &response.events,
+            StoredHashConflict::ClearUnconfirmed,
         )
         .map(ChainConfirmation::VoteBatch),
     }
@@ -1196,100 +1198,6 @@ fn retire_failed_candidate(
         .map_err(internal("commit failed candidate retirement"))
 }
 
-/// Clears an unconfirmed domain hash that would block adopting a proven success.
-///
-/// The delegation and vote writers refuse to overwrite a stored hash with a
-/// different one, so a domain column holding some other unconfirmed value makes
-/// the confirmation transaction fail. Reconciliation would then rediscover the
-/// same committed transaction on every call and fail the same way, leaving the
-/// VAN or VC position unset for good. Two ordinary histories produce that value:
-/// an opaque identifier a pre-lifecycle host recorded, which the version-18
-/// migration deliberately preserves and [`known_hashes`] deliberately skips, and
-/// a hash a concurrent legacy recording call wrote for a different transaction.
-///
-/// Clearing it is sound because `winning_hash` is a transaction this lookup just
-/// proved committed successfully, and consensus nullifiers make at most one
-/// semantic action for a submission identity succeed. The stored value therefore
-/// either failed, never landed, or is the same transaction under an encoding this
-/// SDK does not recognize; none of those may outrank the proven success.
-///
-/// Scoped like [`retire_failed_candidate`]: only rows with no recorded
-/// confirmation position are touched, so a confirmed hash can never be cleared,
-/// and a value equal to the winner is left alone so replay stays idempotent. A
-/// batch clears exactly its own member rows rather than widening to the bundle,
-/// because the match here is "differs from the winner" rather than an exact hash
-/// and would otherwise reach an unrelated singleton's live submission.
-fn clear_conflicting_domain_hash(
-    db: &VotingDb,
-    wallet_id: &str,
-    identity: &ChainSubmissionIdentity,
-    winning_hash: &str,
-) -> Result<(), VotingError> {
-    let mut conn = db.conn();
-    let proposals = match identity.kind {
-        ChainSubmissionKind::Delegation => {
-            conn.execute(
-                "UPDATE bundles SET delegation_tx_hash=NULL
-                  WHERE round_id=:round_id AND wallet_id=:wallet_id
-                    AND bundle_index=:bundle_index
-                    AND delegation_tx_hash IS NOT NULL
-                    AND delegation_tx_hash<>:winning_hash
-                    AND van_leaf_position IS NULL",
-                named_params! {
-                    ":round_id": identity.round_id,
-                    ":wallet_id": wallet_id,
-                    ":bundle_index": i64::from(identity.bundle_index),
-                    ":winning_hash": winning_hash,
-                },
-            )
-            .map_err(internal("clear conflicting delegation domain hash"))?;
-            return Ok(());
-        }
-        ChainSubmissionKind::Vote => vec![identity.require_proposal_id()?],
-        ChainSubmissionKind::VoteBatch => {
-            match vote::load_vote_batch_recoveries_with_conn(
-                &conn,
-                wallet_id,
-                &identity.round_id,
-                identity.bundle_index,
-                identity.require_batch_digest()?,
-            ) {
-                Ok(recoveries) => recoveries
-                    .into_iter()
-                    .map(|recovery| recovery.proposal_id)
-                    .collect(),
-                // Without the member rows there is nothing to clear, and the
-                // confirmation below reports the missing recovery itself.
-                Err(VotingError::InvalidInput { .. }) => Vec::new(),
-                Err(error) => return Err(error),
-            }
-        }
-    };
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(internal("begin conflicting vote hash cleanup"))?;
-    for proposal_id in proposals {
-        tx.execute(
-            "UPDATE votes SET tx_hash=NULL
-              WHERE round_id=:round_id AND wallet_id=:wallet_id
-                AND bundle_index=:bundle_index AND proposal_id=:proposal_id
-                AND tx_hash IS NOT NULL
-                AND tx_hash<>:winning_hash
-                AND vc_tree_position IS NULL",
-            named_params! {
-                ":round_id": identity.round_id,
-                ":wallet_id": wallet_id,
-                ":bundle_index": i64::from(identity.bundle_index),
-                ":proposal_id": i64::from(proposal_id),
-                ":winning_hash": winning_hash,
-            },
-        )
-        .map_err(internal("clear conflicting vote domain hash"))?;
-    }
-    tx.commit()
-        .map_err(internal("commit conflicting vote hash cleanup"))
-}
-
 /// Every chain transaction hash that could identify this submission.
 ///
 /// Candidates come from two sources with different histories: the legacy domain
@@ -1411,10 +1319,15 @@ fn known_hashes(
 /// because nothing ever retires a hashless attempt.
 ///
 /// `attempting` is the one hashless state that may still learn a hash: a POST
-/// dispatched by this process can still return one, and the guarded rows are
-/// exactly what that response would be applied to. Leftovers from an interrupted
-/// process are not in-flight, so [`mark_interrupted_attempts_unknown`] moves them
-/// to `outcome_unknown` when the database is opened.
+/// that has not yet been classified can still return one, and the guarded rows
+/// are exactly what that response would be applied to. That is a claim with an
+/// expiry, not a durable fact, so it is checked against
+/// [`INTERRUPTED_RESERVATION_GRACE_SECS`] on every query rather than rewritten
+/// once. A reservation an interrupted process left behind therefore stops
+/// covering as soon as the grace period elapses, wherever the guard is evaluated
+/// from and whether or not anything reopens the database — a durable downgrade
+/// performed at open would freeze the row until the next open instead, which for
+/// a crash-and-restart inside the grace period is the whole life of the round.
 ///
 /// Dropping coverage for a hashless `outcome_unknown` attempt cannot produce the
 /// mismatch the guards exist to prevent: attaching a transaction's hash and
@@ -1422,7 +1335,17 @@ fn known_hashes(
 /// is none. The transaction may still have committed; that is reported as
 /// ambiguity by [`has_live_attempt`], which is unchanged, and as
 /// `AlreadySpentUnresolved` if a replacement is later refused on chain.
-pub(crate) const CAN_STILL_LEARN_A_HASH: &str = "(chain_tx_hash IS NOT NULL OR state='attempting')";
+pub(crate) const CAN_STILL_LEARN_A_HASH: &str =
+    "(chain_tx_hash IS NOT NULL OR (state='attempting' AND updated_at >= :fresh_cutoff))";
+
+/// The `:fresh_cutoff` bound [`CAN_STILL_LEARN_A_HASH`] expects, as of now.
+///
+/// A reservation touched at or after this instant may still be in flight; an
+/// older one cannot be, because no configurable request deadline reaches back
+/// this far. Every caller of the predicate must bind it.
+pub(crate) fn fresh_attempt_cutoff() -> Result<i64, VotingError> {
+    Ok(now_seconds()?.saturating_sub(INTERRUPTED_RESERVATION_GRACE_SECS))
+}
 
 /// How long a reservation may go untouched before no process can still be
 /// waiting on it.
@@ -1435,77 +1358,14 @@ pub(crate) const CAN_STILL_LEARN_A_HASH: &str = "(chain_tx_hash IS NOT NULL OR s
 /// The doubling leaves room for the database work and scheduling either side of
 /// the request itself.
 ///
-/// It also bounds the freeze a crashed reservation causes by minutes rather than
-/// by the life of the round.
+/// It bounds the freeze a crashed reservation causes by minutes rather than by
+/// the life of the round.
 const INTERRUPTED_RESERVATION_GRACE_SECS: i64 =
     2 * crate::chain::MAX_REQUEST_TIMEOUT.as_secs() as i64;
 
 #[cfg(test)]
 pub(crate) fn interrupted_reservation_grace_secs() -> i64 {
     INTERRUPTED_RESERVATION_GRACE_SECS
-}
-
-/// When this process first opened a voting database.
-///
-/// Every reservation this process could still be waiting on was journaled after
-/// this instant, because [`reserve_attempt`] needs an open database. So the
-/// timestamp separates "a POST that may still return a transaction hash" from "a
-/// reservation whose process is gone" without a durable owner column.
-fn process_open_epoch() -> Result<i64, VotingError> {
-    static EPOCH: OnceLock<i64> = OnceLock::new();
-    if let Some(epoch) = EPOCH.get() {
-        return Ok(*epoch);
-    }
-    let now = now_seconds()?;
-    Ok(*EPOCH.get_or_init(|| now))
-}
-
-/// Downgrades reservations left behind by an interrupted process.
-///
-/// An `attempting` row means "a POST is in flight and its response may still
-/// name a transaction hash", which is a fact about a live process rather than
-/// about the database. A row that predates this process cannot be one: it was
-/// journaled by a process that died between [`reserve_attempt`] and
-/// [`mark_attempt`], and no response will ever arrive for it. Recording that
-/// makes the state model's "a process interruption leaves it outcome-unknown"
-/// durable instead of merely descriptive, and stops the reservation from
-/// conferring [`CAN_STILL_LEARN_A_HASH`] coverage forever.
-///
-/// Two conditions must both hold, because opening a database is not the same as
-/// being the only handle on it. A host that opens a second [`VotingDb`], or runs
-/// a second process, while a POST is in flight must not strip that POST's
-/// coverage: its response could then attach a hash and event positions to a
-/// generation replaced in the window the downgrade opened.
-///
-/// - [`process_open_epoch`] excludes every reservation this process could still
-///   be waiting on. This is exact, and it is what protects a second handle in
-///   the same process.
-/// - [`INTERRUPTED_RESERVATION_GRACE_SECS`] excludes any reservation recent
-///   enough to still be in flight anywhere, which is what protects another
-///   process. A reservation is `attempting` only between [`reserve_attempt`] and
-///   the [`mark_attempt`] that classifies its response, so it cannot outlive its
-///   own request deadline by more than scheduling slop.
-///
-/// Evidence is unchanged by the downgrade: both states mean the same thing to
-/// [`has_live_attempt`], [`known_hashes`], and every candidate query.
-pub(crate) fn mark_interrupted_attempts_unknown(
-    conn: &rusqlite::Connection,
-) -> Result<(), VotingError> {
-    let now = now_seconds()?;
-    conn.execute(
-        "UPDATE chain_submission_attempts
-            SET state='outcome_unknown', updated_at=:now
-          WHERE state='attempting'
-            AND created_at < :epoch
-            AND updated_at < :stale_before",
-        named_params! {
-            ":now": now,
-            ":epoch": process_open_epoch()?,
-            ":stale_before": now.saturating_sub(INTERRUPTED_RESERVATION_GRACE_SECS),
-        },
-    )
-    .map(|_| ())
-    .map_err(internal("downgrade interrupted chain attempt reservations"))
 }
 
 /// Vote rows still covered by a journaled chain submission attempt.
@@ -1544,7 +1404,11 @@ pub(crate) fn attempt_protected_vote_rows(
             .map_err(internal("prepare attempted vote coverage query"))?;
         let rows = stmt
             .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":fresh_cutoff": fresh_attempt_cutoff()?,
+                },
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -3422,5 +3286,69 @@ mod tests {
             .unwrap();
         assert_eq!(hash.as_deref(), Some(TX_HASH));
         assert_eq!(position, Some(5));
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_that_fails_validation_keeps_the_competing_hash() {
+        let db = test_db();
+        // A valid candidate hash a legacy recording call wrote. It is a real
+        // reconciliation source, so losing it would lose the only record of a
+        // transaction that may yet commit.
+        db.conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash=?3
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                rusqlite::params![ROUND_ID, WALLET, TX_HASH_2],
+            )
+            .unwrap();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let transport = Arc::new(MockTransport::default());
+        // A faulty endpoint reports success for our candidate but returns events
+        // that bind to a different round, so confirmation must refuse them.
+        let events = serde_json::to_string(&vec![crate::confirmation::TxEvent {
+            event_type: "delegate_vote".to_string(),
+            attributes: vec![
+                crate::confirmation::TxEventAttribute {
+                    key: "vote_round_id".to_string(),
+                    value: "9".repeat(64),
+                },
+                crate::confirmation::TxEventAttribute {
+                    key: "leaf_index".to_string(),
+                    value: "5".to_string(),
+                },
+            ],
+        }])
+        .unwrap();
+        // `known_hashes` reads the domain column before the journal, so the
+        // competing candidate is queried first and is still pending; the
+        // journaled candidate is the one that comes back committed.
+        transport.responses.lock().unwrap().extend([
+            Ok(response(404, r#"{"detail":"not found"}"#)),
+            Ok(response(
+                200,
+                &format!(r#"{{"height":42,"code":0,"log":"","events":{events}}}"#),
+            )),
+        ]);
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let result = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await;
+
+        assert!(result.is_err(), "got {result:?}");
+        // Clearing happens inside the confirmation transaction and after the
+        // event validation, so a confirmation that turns out not to bind to this
+        // submission takes the clearing back with it.
+        let stored: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT delegation_tx_hash FROM bundles
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                rusqlite::params![ROUND_ID, WALLET],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(TX_HASH_2));
     }
 }

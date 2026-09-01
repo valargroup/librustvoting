@@ -1806,19 +1806,25 @@ mod tests {
         state: &str,
         chain_tx_hash: Option<&str>,
     ) {
+        // Journaled now, so an `attempting` row reads as a POST still in flight.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         db.conn()
             .execute(
                 "INSERT INTO chain_submission_attempts
                  (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
                   payload_digest, chain_tx_hash, state, created_at, updated_at)
-                 VALUES (?1, ?2, 'vote', 0, ?3, X'', ?4, ?5, ?6, 1, 1)",
+                 VALUES (?1, ?2, 'vote', 0, ?3, X'', ?4, ?5, ?6, ?7, ?7)",
                 rusqlite::params![
                     ROUND,
                     W,
                     proposal_id as i64,
                     vec![0xCC_u8; 32],
                     chain_tx_hash,
-                    state
+                    state,
+                    now
                 ],
             )
             .unwrap();
@@ -1912,6 +1918,29 @@ mod tests {
             "{error}"
         );
         assert!(stored_vote_recovery(&db).is_some());
+    }
+
+    #[test]
+    fn a_stale_reservation_does_not_refuse_a_ballot_intent_change() {
+        let db = db_with_uncommitted_vote();
+        // An interrupted process left this behind. No POST can still be in
+        // flight for it, so it can never learn a hash and never be confirmed.
+        // The check is by age rather than by a rewrite performed at open, so it
+        // takes effect here without anything reopening the database.
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, 2, X'', ?3, 'attempting', 1, 1)",
+                rusqlite::params![ROUND, W, vec![0xCC_u8; 32]],
+            )
+            .unwrap();
+
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
+
+        assert_eq!(stored_vote_recovery(&db), None);
     }
 
     #[test]

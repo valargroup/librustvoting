@@ -2805,6 +2805,7 @@ pub fn delete_bundles_from(
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":from_index": from_index as i64,
+                ":fresh_cutoff": crate::chain_submission::fresh_attempt_cutoff()?,
             },
             |row| row.get(0),
         )

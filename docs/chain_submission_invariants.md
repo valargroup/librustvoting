@@ -116,35 +116,36 @@ treating it as coverage would freeze that proposal's recovery generation, ballot
 intent, and bundle pruning for the life of the round.
 
 `attempting` is the one hashless state that may still learn a hash, because a
-POST dispatched by this process can still return one, and the covered rows are
-exactly what that response would be applied to. That is a fact about a live
-process rather than about the database, so opening a database records an
-`attempting` row as `outcome_unknown` only when it is known to belong to a
-process that is gone. This makes "a process interruption leaves it
-outcome-unknown" durable rather than merely descriptive.
+POST that has not yet been classified can still return one, and the covered rows
+are exactly what that response would be applied to. Stripping a live POST's
+coverage is the failure to avoid here: its response could otherwise attach a hash
+and event positions to a generation replaced in the meantime, which is exactly
+the mismatch the cleanup guards exist to stop.
 
-Opening a database is not the same as being the only handle on it, so two
-conditions must both hold. A row must predate this process's first open, which
-exactly excludes every reservation this process could still be waiting on and is
-what protects a second handle in the same process. And it must have gone
-untouched for longer than any POST can take, which excludes a reservation another
-process may still have in flight. Neither guard alone is enough: the first is
-blind to other processes, and the second rests on a request deadline a host
-configures. Stripping a live POST's coverage is what they prevent — its response
-could otherwise attach a hash and event positions to a generation replaced in the
-window the downgrade opened, which is exactly the mismatch the cleanup guards
-exist to stop.
+"A POST is in flight" is a claim with an expiry rather than a durable fact, so it
+is checked by age every time a guard runs. A reservation is `attempting` only
+between its journaling and the response classification that follows its POST, so
+it cannot outlive that call's request deadline by more than scheduling slop; one
+untouched for longer than any configurable deadline cannot be in flight in any
+process. The grace period is derived from the largest deadline a host may
+configure rather than chosen independently, and the client refuses a longer one:
+the coverage query cannot see a per-call client configuration, so without that cap
+a host could configure the distinction away and make a live reservation look
+abandoned.
 
-A reservation is `attempting` only between its journaling and the response
-classification that follows its POST, so it cannot outlive that call's request
-deadline by more than scheduling slop. The grace period is derived from the
-largest deadline a host may configure rather than chosen independently, and the
-client refuses a longer one: the coverage query cannot see a per-call client
-configuration, so without that cap a host could configure the distinction away
-and make a live reservation look abandoned. The grace period also bounds the
-freeze a crashed reservation causes by minutes rather than by the life of the
-round. Evidence is unchanged by the downgrade either way: both states mean the
-same thing to every candidate and live-attempt query.
+Checking at query time rather than rewriting the row once is what makes the bound
+hold. A downgrade pass performed when the database is opened would leave a
+reservation abandoned by a crash *inside* the grace period untouched, and if the
+restarted process keeps its handle open nothing would revisit the row once the
+grace elapsed — restoring the permanent freeze for exactly the case the state is
+meant to describe. It also means opening a database mutates no attempt state, so
+a second handle or a second process cannot disturb a reservation the other is
+waiting on.
+
+Evidence is unaffected by any of this: `attempting` and `outcome_unknown` still
+mean the same thing to every candidate and live-attempt query, so an expired
+reservation keeps reporting its ambiguity as `OutcomeUnknown`. Only coverage
+expires.
 
 Dropping coverage cannot produce the mismatch the cleanup guards exist to
 prevent. Attaching a transaction's hash and event-derived positions to a
@@ -422,8 +423,9 @@ hosts do not parse the log.
    `OutcomeUnknown`, never as `Pending`. A broken or incompatible endpoint must
    stay distinguishable from a genuine 404, and an unresolved candidate blocks
    rebroadcast exactly as a pending one does, because it may still commit.
-8. Adopting a candidate this lookup proved committed first clears any *different*
-   unconfirmed hash in the domain column for that submission. The domain writers
+8. Adopting a candidate this lookup proved committed clears any *different*
+   unconfirmed hash in the domain column for that submission, inside the
+   confirmation transaction and after the event validation. The domain writers
    refuse to overwrite a stored hash with a different one, so an opaque
    identifier a pre-lifecycle host recorded — which the version-18 migration
    preserves and candidate selection skips — or a hash a concurrent legacy
@@ -433,7 +435,12 @@ hosts do not parse the log.
    semantic action for an identity succeed, so a stored value that differs from a
    proven success either failed, never landed, or is the same transaction under an
    unrecognized encoding. It is scoped to rows with no recorded confirmation
-   position, and a batch clears exactly its own member rows.
+   position, and a batch clears exactly its own member rows. Ordering it after
+   validation matters: a confirmation whose events do not bind to this submission
+   rolls the clearing back with it, so a faulty endpoint cannot destroy the only
+   record of a competing candidate. The standalone recording APIs keep refusing a
+   contradicting stored hash, because a host passing one is reporting a
+   contradiction it should see.
 9. The winning hash and event-derived positions are committed together by the
    existing confirmation transaction. Attempt evidence is retained separately;
    a crash on either side is recoverable because the attempt hash and the
@@ -496,14 +503,12 @@ Schema version 18 adds `chain_submission_attempts`. Launch-version databases
 migrate in place and retain all existing round, delegation, vote, and helper
 state. A newer unsupported schema remains rejected.
 
-Opening the database records as `outcome_unknown` an `attempting` reservation
-only when it both predates this process's first open and has gone untouched for
-longer than any POST can take. A reservation this process could have made, or
-that another process may still have in flight, is left alone, so neither a second
-handle on the same file nor a second process can strip an in-flight POST's
-coverage. Either way the attempt's evidence is preserved and only the claim that a
-POST is still in flight is retired, which is what distinguishes a hashless attempt
-that may still learn a transaction hash from one that cannot.
+Opening a database mutates no attempt state. Whether an `attempting` reservation
+is still in flight is decided by its age wherever a guard needs to know, so
+neither a second handle on the same file nor a second process can disturb a
+reservation the other is waiting on, and a reservation an interrupted process left
+behind stops conferring coverage as soon as the grace period elapses rather than
+at the next open.
 
 Each attempt stores wallet, round, kind, bundle, proposal sentinel or batch
 digest, ordered attempt number, local payload digest, optional server chain
@@ -558,6 +563,10 @@ state transitions.
   that may return a transaction hash?
 - Can opening a second database handle, or a second process, strip an in-flight
   POST's coverage?
+- Is a reservation abandoned inside the grace period ever revisited once it
+  elapses, without waiting for the database to be reopened?
+- Can a confirmation that fails validation still have destroyed a competing
+  candidate's hash?
 - Can a configurable request deadline outlive the reservation grace period?
 - Can an unconfirmed hash already in a domain column block a proven success from
   ever being applied?
@@ -661,9 +670,12 @@ state transitions.
   and `retirement_never_clears_a_confirmed_domain_hash` cover domain-hash
   retirement and its confirmed-row boundary.
 - `chain_submission::tests::adopting_a_success_clears_a_conflicting_unconfirmed_domain_hash`
-  covers adopting a proven success past an opaque legacy identifier, and
+  covers adopting a proven success past an opaque legacy identifier,
+  `a_confirmation_that_fails_validation_keeps_the_competing_hash` covers the
+  validation-before-mutation ordering that keeps a competing candidate when the
+  events do not bind, and
   `chain::tests::request_timeout_is_bounded_so_a_reservation_cannot_outlive_the_grace`
-  covers the deadline cap the reservation grace period depends on.
+  covers the deadline cap the reservation freshness bound depends on.
 - `chain_submission::tests::cancellation_is_observed_before_the_no_candidate_fast_path`
   covers the reconciliation entry cancellation check.
 - `chain_submission::tests::the_identity_lock_registry_is_bounded_by_live_operations`
@@ -729,10 +741,11 @@ state transitions.
   for.
 - `storage::operations::tests::a_hashless_unknown_vote_attempt_does_not_freeze_recovery_state`
   covers the same rule at the recovery-cleanup boundary, and
-  `opening_the_database_downgrades_an_interrupted_reservation`,
-  `opening_a_second_handle_keeps_this_process_reservation_in_flight`, and
-  `opening_a_handle_keeps_another_process_reservation_in_flight` cover the
-  interrupted-reservation downgrade and both of its live-process boundaries.
+  `a_reservation_still_in_flight_protects_its_recovery_generation` and
+  `a_reservation_older_than_any_deadline_protects_nothing` cover the freshness
+  bound on a hashless reservation, the second without reopening the database.
+  `session::tests::a_stale_reservation_does_not_refuse_a_ballot_intent_change`
+  covers the same bound at the ballot-intent guard.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
   covers storage-boundary hash canonicalization and idempotent replay.
 - storage migration tests cover version 18 fresh and in-place schemas, including

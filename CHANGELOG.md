@@ -34,19 +34,22 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   such an attempt protects nothing, and nothing ever retires one; their
   ambiguity is still reported as `OutcomeUnknown`. Delegation attempts keep
   protecting `van_comm_rand` unconditionally.
-- Opening the database records as `outcome_unknown` an `attempting` reservation
-  only when it both predates this process's first open and has gone untouched
-  for longer than any POST can take, making the documented interruption
-  transition durable without changing what the attempt is evidence of. A
-  reservation this process could still be waiting on, or that another process
-  may still have in flight, is left alone, so neither a second handle nor a
-  second process can strip an in-flight POST's coverage.
+- Whether a hashless `attempting` reservation still covers the rows it names is
+  decided by its age each time a guard runs, rather than by a downgrade pass at
+  database open. A reservation an interrupted process left behind therefore
+  stops covering as soon as the grace period elapses, even if nothing reopens
+  the database, and opening one mutates no attempt state — so neither a second
+  handle nor a second process can disturb a reservation the other is waiting
+  on. The attempt's evidence is unchanged; only coverage expires.
 - Adopting a chain candidate a lookup proved committed now clears a different
-  unconfirmed transaction hash left in the delegation or vote domain column
-  first. The domain writers refuse to overwrite a stored hash, so an opaque
-  identifier recorded before the lifecycle existed, or one written concurrently
-  through the legacy API, previously made the confirmation fail on every
-  reconciliation and left the VAN or VC position unset permanently.
+  unconfirmed transaction hash left in the delegation or vote domain column,
+  inside the confirmation transaction and after the event validation. The domain
+  writers refuse to overwrite a stored hash, so an opaque identifier recorded
+  before the lifecycle existed, or one written concurrently through the legacy
+  API, previously made the confirmation fail on every reconciliation and left the
+  VAN or VC position unset permanently. A confirmation whose events do not bind
+  to the submission rolls the clearing back with it. The standalone
+  `confirm_*_submission` APIs still refuse a contradicting stored hash.
 - `ChainClientConfig::with_request_timeout` now rejects a deadline above five
   minutes. The deadline bounds how long an attempt reservation stays
   `attempting`, which is what distinguishes a POST another process may still
