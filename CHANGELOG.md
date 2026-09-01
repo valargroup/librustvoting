@@ -214,6 +214,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Confirmation writes now re-check cancellation after acquiring the database
+  connection and before opening their transaction, so a session invalidated
+  while that acquisition waited can no longer have transaction hashes and tree
+  positions persisted underneath it.
+- `store_delegation_tx_hash` now performs its hash-ownership check and its write
+  in one immediate transaction, so two writers recording the same hash for
+  different bundles can no longer both observe no carrier.
 - A chain candidate a lookup proved failed is now retired before the refusal to
   apply two successes for one submission, so that exit can no longer leave a
   failed candidate blocking replacement, ballot-intent changes, and pruning.

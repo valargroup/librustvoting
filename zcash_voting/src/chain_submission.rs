@@ -1128,7 +1128,15 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             if cancel() {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
-            let confirmation = apply_confirmation(self.db, wallet_id, identity, &hash, &response)?;
+            // The check above ran before `apply_confirmation` waited on the
+            // database connection. It checks again once it holds it, so a
+            // session invalidated during that wait cannot have hashes and tree
+            // positions written underneath it.
+            let Some(confirmation) =
+                apply_confirmation(self.db, wallet_id, identity, &hash, &response, cancel)?
+            else {
+                return Ok(ChainLifecycleOutcome::Cancelled);
+            };
             return Ok(ChainLifecycleOutcome::Confirmed {
                 tx_hash: hash,
                 confirmation,
@@ -1328,13 +1336,20 @@ fn durable_confirmation_hash(
     }
 }
 
+/// Records a confirmation, or reports that cancellation arrived first.
+///
+/// `Ok(None)` means the write was abandoned before it opened, because the
+/// callback said so once the database connection was already held. The caller's
+/// own check runs before that acquisition, and acquiring it can block for as
+/// long as another writer holds the connection.
 fn apply_confirmation(
     db: &VotingDb,
     wallet_id: &str,
     identity: &ChainSubmissionIdentity,
     tx_hash: &str,
     response: &ChainTxConfirmation,
-) -> Result<ChainConfirmation, VotingError> {
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<ChainConfirmation>, VotingError> {
     // The captured wallet is passed into the confirmation transaction rather
     // than checked here and re-read there: an account switch between the check
     // and the write would otherwise scope the confirmation to the new wallet.
@@ -1347,8 +1362,9 @@ fn apply_confirmation(
             tx_hash,
             &response.events,
             StoredHashConflict::ClearUnconfirmed,
+            cancel,
         )
-        .map(ChainConfirmation::Delegation),
+        .map(|confirmation| confirmation.map(ChainConfirmation::Delegation)),
         ChainSubmissionKind::Vote => confirm_vote_submission_for_wallet(
             db,
             wallet_id,
@@ -1358,8 +1374,9 @@ fn apply_confirmation(
             tx_hash,
             &response.events,
             StoredHashConflict::ClearUnconfirmed,
+            cancel,
         )
-        .map(ChainConfirmation::Vote),
+        .map(|confirmation| confirmation.map(ChainConfirmation::Vote)),
         ChainSubmissionKind::VoteBatch => confirm_vote_batch_submission_for_wallet(
             db,
             wallet_id,
@@ -1369,8 +1386,9 @@ fn apply_confirmation(
             tx_hash,
             &response.events,
             StoredHashConflict::ClearUnconfirmed,
+            cancel,
         )
-        .map(ChainConfirmation::VoteBatch),
+        .map(|confirmation| confirmation.map(ChainConfirmation::VoteBatch)),
     }
 }
 
@@ -3473,7 +3491,9 @@ mod tests {
                 log: String::new(),
                 events,
             },
+            &|| false,
         )
+        .unwrap()
         .unwrap();
 
         let stored: Option<String> = db
@@ -3777,6 +3797,42 @@ mod tests {
             attempt_states(&db),
             vec!["rejected".to_string(), "rejected".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_arriving_during_the_confirmation_wait_writes_nothing() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let transport = Arc::new(MockTransport::default());
+        let events = serde_json::to_string(&delegate_vote_events("5")).unwrap();
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            &format!(r#"{{"height":42,"code":0,"log":"","events":{events}}}"#),
+        )));
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        // Cancelled exactly when the database connection is already held, which
+        // is true at one place only: inside the confirmation write, past every
+        // checkpoint the caller performs. Every lifecycle checkpoint runs with
+        // the connection free and so sees "not cancelled".
+        let cancel = || db.try_conn().is_none();
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &cancel)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, ChainLifecycleOutcome::Cancelled),
+            "got {outcome:?}"
+        );
+        // The lookup ran, so this is the confirmation window and not an early
+        // exit that never reached it.
+        assert_eq!(*transport.gets.lock().unwrap(), 1);
+        assert_eq!(db.get_delegation_tx_hash(ROUND_ID, 0).unwrap(), None);
+        // The candidate stays journaled: the next reconciliation re-derives the
+        // confirmation this one declined to apply.
+        assert_eq!(attempt_states(&db), vec!["accepted".to_string()]);
     }
 
     #[tokio::test]

@@ -43,6 +43,34 @@ pub struct TxEventAttribute {
     pub value: String,
 }
 
+/// A cancel callback for the public confirmation APIs, which have no operation
+/// to cancel: the caller drives the write directly.
+fn never_cancelled() -> bool {
+    false
+}
+
+/// Unwraps a confirmation recorded under [`never_cancelled`].
+///
+/// `None` cannot happen there. It is reported rather than unwrapped because a
+/// panic in a durable-write path is the worse failure of the two.
+fn uncancellable<T>(confirmation: Option<T>) -> Result<T, VotingError> {
+    confirmation.ok_or_else(|| VotingError::Internal {
+        message: "confirmation reported cancellation without a cancel callback".to_string(),
+    })
+}
+
+/// Whether a durable confirmation write must be abandoned before it opens.
+///
+/// Called with the database connection already held and the transaction not yet
+/// opened. That is the only point where the answer is still both current and
+/// free: the caller's check ran before the connection was acquired, and
+/// acquiring it can block for as long as another writer holds it. An account
+/// switch or session invalidation arriving in that window must not have
+/// transaction hashes and tree positions persisted underneath it.
+fn cancelled_before_writing(cancel: &dyn Fn() -> bool) -> bool {
+    cancel()
+}
+
 /// Parses and records a confirmed delegation transaction in one durable step.
 ///
 /// # Errors
@@ -66,7 +94,9 @@ pub fn confirm_delegation_submission(
         tx_hash,
         events,
         StoredHashConflict::Refuse,
+        &never_cancelled,
     )
+    .and_then(uncancellable)
 }
 
 /// [`confirm_delegation_submission`] against an explicitly named wallet.
@@ -75,6 +105,7 @@ pub fn confirm_delegation_submission(
 /// must persist under that wallet. Re-reading the database's current wallet here
 /// would let an account switch land the confirmation on the wrong account, or
 /// lose it outright.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn confirm_delegation_submission_for_wallet(
     db: &VotingDb,
     wallet_id: &str,
@@ -83,17 +114,21 @@ pub(crate) fn confirm_delegation_submission_for_wallet(
     tx_hash: &str,
     events: &[TxEvent],
     conflict: StoredHashConflict,
-) -> Result<DelegationConfirmation, VotingError> {
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<DelegationConfirmation>, VotingError> {
     let confirmation = parse_delegation_confirmation_for_round(tx_hash, round_id, events)?;
-    record_delegation_confirmation(
+    if !record_delegation_confirmation(
         db,
         wallet_id,
         round_id,
         bundle_index,
         &confirmation,
         conflict,
-    )?;
-    Ok(confirmation)
+        cancel,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(confirmation))
 }
 
 /// Records a confirmed delegation transaction atomically.
@@ -106,6 +141,7 @@ pub(crate) fn confirm_delegation_submission_for_wallet(
 ///
 /// Returns an error when the bundle row is missing, stored confirmation fields
 /// conflict, or the DB transaction cannot commit.
+#[allow(clippy::too_many_arguments)]
 fn record_delegation_confirmation(
     db: &VotingDb,
     wallet_id: &str,
@@ -113,9 +149,13 @@ fn record_delegation_confirmation(
     bundle_index: u32,
     confirmation: &DelegationConfirmation,
     conflict: StoredHashConflict,
-) -> Result<(), VotingError> {
+    cancel: &dyn Fn() -> bool,
+) -> Result<bool, VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let mut conn = db.conn();
+    if cancelled_before_writing(cancel) {
+        return Ok(false);
+    }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::Internal {
@@ -158,7 +198,8 @@ fn record_delegation_confirmation(
     }
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("commit delegation confirmation transaction failed: {e}"),
-    })
+    })?;
+    Ok(true)
 }
 
 /// Parses and records a confirmed cast-vote transaction in one durable step.
@@ -186,7 +227,9 @@ pub fn confirm_vote_submission(
         tx_hash,
         events,
         StoredHashConflict::Refuse,
+        &never_cancelled,
     )
+    .and_then(uncancellable)
 }
 
 /// [`confirm_vote_submission`] against an explicitly named wallet.
@@ -203,9 +246,10 @@ pub(crate) fn confirm_vote_submission_for_wallet(
     tx_hash: &str,
     events: &[TxEvent],
     conflict: StoredHashConflict,
-) -> Result<VoteConfirmation, VotingError> {
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<VoteConfirmation>, VotingError> {
     let confirmation = parse_vote_confirmation_for_round(tx_hash, round_id, events)?;
-    record_vote_confirmation(
+    if !record_vote_confirmation(
         db,
         wallet_id,
         round_id,
@@ -213,8 +257,11 @@ pub(crate) fn confirm_vote_submission_for_wallet(
         proposal_id,
         &confirmation,
         conflict,
-    )?;
-    Ok(confirmation)
+        cancel,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(confirmation))
 }
 
 /// Parses and atomically records a confirmed atomic cast-vote batch.
@@ -235,7 +282,9 @@ pub fn confirm_vote_batch_submission(
         tx_hash,
         events,
         StoredHashConflict::Refuse,
+        &never_cancelled,
     )
+    .and_then(uncancellable)
 }
 
 /// [`confirm_vote_batch_submission`] against an explicitly named wallet.
@@ -252,7 +301,8 @@ pub(crate) fn confirm_vote_batch_submission_for_wallet(
     tx_hash: &str,
     events: &[TxEvent],
     conflict: StoredHashConflict,
-) -> Result<VoteBatchConfirmation, VotingError> {
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<VoteBatchConfirmation>, VotingError> {
     let expected_batch_digest: [u8; 32] =
         expected_batch_digest
             .try_into()
@@ -272,7 +322,7 @@ pub(crate) fn confirm_vote_batch_submission_for_wallet(
             ),
         });
     }
-    record_vote_batch_confirmation(
+    if !record_vote_batch_confirmation(
         db,
         wallet_id,
         round_id,
@@ -281,8 +331,11 @@ pub(crate) fn confirm_vote_batch_submission_for_wallet(
         &confirmation,
         events,
         conflict,
-    )?;
-    Ok(confirmation)
+        cancel,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(confirmation))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -295,7 +348,8 @@ fn record_vote_batch_confirmation(
     confirmation: &VoteBatchConfirmation,
     events: &[TxEvent],
     conflict: StoredHashConflict,
-) -> Result<(), VotingError> {
+    cancel: &dyn Fn() -> bool,
+) -> Result<bool, VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let event = required_event_for_round(events, CAST_VOTE_BATCH_EVENT, round_id)?;
     let event_nullifiers = parse_csv_strings(required_attribute(
@@ -304,6 +358,9 @@ fn record_vote_batch_confirmation(
         VAN_NULLIFIERS_ATTRIBUTE,
     )?)?;
     let mut conn = db.conn();
+    if cancelled_before_writing(cancel) {
+        return Ok(false);
+    }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::Internal {
@@ -358,7 +415,8 @@ fn record_vote_batch_confirmation(
     )?;
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("commit vote batch confirmation transaction failed: {e}"),
-    })
+    })?;
+    Ok(true)
 }
 
 /// Records a confirmed cast-vote transaction atomically.
@@ -372,6 +430,7 @@ fn record_vote_batch_confirmation(
 /// Returns an error when the vote or bundle row is missing, stored confirmation
 /// fields conflict, ballot intent no longer matches the vote, or the DB
 /// transaction cannot commit.
+#[allow(clippy::too_many_arguments)]
 fn record_vote_confirmation(
     db: &VotingDb,
     wallet_id: &str,
@@ -380,9 +439,13 @@ fn record_vote_confirmation(
     proposal_id: u32,
     confirmation: &VoteConfirmation,
     conflict: StoredHashConflict,
-) -> Result<(), VotingError> {
+    cancel: &dyn Fn() -> bool,
+) -> Result<bool, VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let mut conn = db.conn();
+    if cancelled_before_writing(cancel) {
+        return Ok(false);
+    }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::Internal {
@@ -434,7 +497,8 @@ fn record_vote_confirmation(
 
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("commit vote confirmation transaction failed: {e}"),
-    })
+    })?;
+    Ok(true)
 }
 
 fn require_vote_recovery_json(
@@ -1042,7 +1106,9 @@ mod tests {
             bundle_index,
             confirmation,
             StoredHashConflict::Refuse,
+            &never_cancelled,
         )
+        .map(|_| ())
     }
 
     fn record_vote_confirmation(
@@ -1061,7 +1127,9 @@ mod tests {
             proposal_id,
             confirmation,
             StoredHashConflict::Refuse,
+            &never_cancelled,
         )
+        .map(|_| ())
     }
 
     use crate::storage::queries;
@@ -1571,6 +1639,58 @@ mod tests {
                 .van_leaf_position,
             42
         );
+    }
+
+    #[test]
+    fn a_confirmation_checks_cancellation_behind_the_connection_it_waits_for() {
+        let db = test_db();
+        insert_bundle(&db, 0);
+        let held = std::sync::atomic::AtomicBool::new(false);
+        // Runs where the real callback runs. The caller's own check is long
+        // past by now, and the connection this write needs is already held —
+        // `try_conn` returning `None` is that fact. Had the check stayed in
+        // front of the acquisition, the connection would still be free here.
+        let cancel = || {
+            held.store(db.try_conn().is_none(), std::sync::atomic::Ordering::SeqCst);
+            true
+        };
+
+        let outcome = confirm_delegation_submission_for_wallet(
+            &db,
+            WALLET_ID,
+            ROUND_ID,
+            0,
+            "tx-1",
+            &[event_with_attrs(
+                DELEGATE_VOTE_EVENT,
+                &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "42")],
+            )],
+            StoredHashConflict::Refuse,
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(
+            outcome.is_none(),
+            "a cancelled write reports no confirmation"
+        );
+        assert!(
+            held.load(std::sync::atomic::Ordering::SeqCst),
+            "the check must run behind the connection acquisition, not in front of it"
+        );
+        // Waiting for that connection can take as long as another writer holds
+        // it. Nothing may be persisted for an operation cancelled in the
+        // meantime.
+        let stored: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT delegation_tx_hash FROM bundles
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                rusqlite::params![ROUND_ID, WALLET_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None);
     }
 
     #[test]

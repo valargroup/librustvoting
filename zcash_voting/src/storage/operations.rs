@@ -1575,15 +1575,32 @@ impl VotingDb {
 
     // --- Recovery state ---
 
+    /// Records a delegation transaction hash.
+    ///
+    /// The ownership check that refuses a hash another bundle already carries
+    /// and the write it guards share one immediate transaction, as in
+    /// [`Self::mark_delegation_submitted`]. In autocommit they were two, and two
+    /// writers recording the same hash for different bundles could both see no
+    /// carrier before either wrote. Delegation events carry no bundle binding,
+    /// so a hash on two bundles lets one transaction's VAN position be applied
+    /// to a bundle it never touched.
     pub fn store_delegation_tx_hash(
         &self,
         round_id: &str,
         bundle_index: u32,
         tx_hash: &str,
     ) -> Result<(), VotingError> {
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
-        queries::store_delegation_tx_hash(&conn, round_id, &wallet_id, bundle_index, tx_hash)
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin delegation tx hash transaction failed: {e}"),
+            })?;
+        queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit delegation tx hash transaction failed: {e}"),
+        })
     }
 
     pub fn get_delegation_tx_hash(
@@ -6474,6 +6491,75 @@ mod tests {
                 .contains("already recorded for another bundle"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_delegation_hash_ownership_check_holds_the_write_lock() {
+        // A file-backed database, because the point is two connections.
+        let path = std::env::temp_dir().join(format!(
+            "zv-delegation-carrier-{}-{:?}.sqlite",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+        let db = VotingDb::open(&path_string).unwrap();
+        db.set_wallet_id(W);
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (round_id, wallet_id, bundle_index) VALUES (?1, ?2, 1)",
+                rusqlite::params![ROUND_ID, W],
+            )
+            .unwrap();
+        let hash = "a".repeat(64);
+
+        // Another writer records the same hash on bundle 0 and has not committed
+        // yet. In WAL a reader outside the write lock still sees the old
+        // snapshot, so an ownership check made there would find no carrier.
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other
+            .busy_timeout(crate::storage::SQLITE_BUSY_TIMEOUT)
+            .unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        other
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 0",
+                rusqlite::params![hash, ROUND_ID, W],
+            )
+            .unwrap();
+        let commit = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            other.execute_batch("COMMIT").unwrap();
+        });
+
+        let result = db.store_delegation_tx_hash(ROUND_ID, 1, &hash);
+
+        commit.join().unwrap();
+        // Whatever this call decided, it must not have decided it against a
+        // snapshot the other writer had already moved past. Delegation events
+        // carry no bundle binding, so one hash on two bundles lets one
+        // transaction's VAN position land on a bundle it never touched.
+        assert!(result.is_err(), "the carrier must be seen");
+        let carriers: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM bundles
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND delegation_tx_hash = ?3",
+                rusqlite::params![ROUND_ID, W, hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(carriers, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
     }
 
     #[test]

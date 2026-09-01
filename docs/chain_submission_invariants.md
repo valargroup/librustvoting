@@ -251,7 +251,12 @@ none. The transaction may still have committed; that stays visible as
    otherwise write a position onto a bundle the transaction never touched. An
    ownership is judged against the attempt journal as well as the domain columns,
    because CheckTx acceptance deliberately leaves those null and would otherwise
-   let reconciliation order decide which identity receives the confirmation. An
+   let reconciliation order decide which identity receives the confirmation. The
+   check and the write it guards share one immediate transaction, in the legacy
+   `store_delegation_tx_hash` entry point as well as in `mark_delegation_submitted`:
+   in autocommit they are two, and under WAL a check made outside the write lock
+   reads a snapshot another writer has already moved past, so two writers
+   recording the same hash for different bundles could both find no carrier. An
    atomic batch legitimately records one transaction on every member of its own
    bundle, and only such a batch does: within a bundle the hash may be shared
    only by rows whose recovery carries the same batch digest, because a
@@ -718,7 +723,13 @@ hosts do not parse the log.
    pending. The check that follows the lookups covers the candidate-set rebuild
    and the live-attempt read together — both read state the classifications
    below them consume — so no classification is preceded by a database wait of
-   its own. The post-request check covers every result variant, not only a
+   its own. The confirmation write checks once more itself, after it holds the
+   database connection and before it opens its transaction: the caller's check
+   necessarily runs before that acquisition, and acquiring the connection waits
+   for however long another writer holds it. A session invalidated in that
+   window must not have transaction hashes and tree positions persisted
+   underneath it; the candidate stays journaled, so the next reconciliation
+   re-derives the confirmation this one declined to apply. The post-request check covers every result variant, not only a
    committed success, because classifying a 404 or an error reports an outcome
    and classifying a committed failure retires evidence. A cancelled operation
    does neither: the candidate stays journaled, so the next reconciliation
@@ -999,6 +1010,12 @@ state transitions.
   and `chain_submission::tests::reservation_accepts_the_matching_durable_generation`
   cover the in-transaction payload rebuild, including that a mismatch dispatches
   nothing and journals nothing.
+- `confirmation::tests::a_confirmation_checks_cancellation_behind_the_connection_it_waits_for`
+  and `chain_submission::tests::cancellation_arriving_during_the_confirmation_wait_writes_nothing`
+  cover the check inside the confirmation write, including that it runs behind
+  the connection acquisition rather than in front of it.
+- `storage::operations::tests::the_delegation_hash_ownership_check_holds_the_write_lock`
+  covers the carrier check and its write sharing one immediate transaction.
 - `chain_submission::tests::cancellation_after_lookup_suppresses_the_confirmation_write`
   covers the cancellation checkpoint immediately before confirmation, and
   `cancellation_after_a_lookup_stops_before_retiring_evidence` covers the
