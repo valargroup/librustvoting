@@ -732,10 +732,22 @@ impl VotingDb {
             &result.padded_note_secrets,
             &result.pczt_sighash,
             &result.tx1_effects,
+            &result.pczt_bytes,
             &result.rk,
             &result.gov_nullifiers,
         )?;
         Ok(result)
+    }
+
+    /// Load the exact delegation PCZT and signing fields persisted by setup.
+    pub(crate) fn get_delegation_pczt_fields(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::load_delegation_pczt_fields(&conn, round_id, &wallet_id, bundle_index)
     }
 
     /// Cache tree state fetched from lightwalletd by SDK.
@@ -5097,6 +5109,7 @@ mod tests {
                 &[],
                 &[0x09; 32],
                 tx1_effects,
+                &[0x0C],
                 &[0x0A; 32],
                 &gov_nullifiers,
             )
@@ -5119,6 +5132,64 @@ mod tests {
         assert_eq!(
             queries::load_tx1_effects(&conn, ROUND_ID, W, 0).unwrap(),
             effects
+        );
+    }
+
+    #[test]
+    fn test_delegation_pczt_is_persisted_write_once() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        let conn = db.conn();
+        queries::insert_bundle(&conn, ROUND_ID, W, 0, &[0]).unwrap();
+        let gov_nullifiers = vec![vec![0x0B; 32]; BUNDLE_NOTE_SLOTS];
+
+        let store = |delegation_pczt: &[u8]| {
+            queries::store_delegation_data_with_pczt_fields(
+                &conn,
+                ROUND_ID,
+                W,
+                0,
+                &[0x01; 32],
+                &[],
+                &[0x02; 32],
+                &[],
+                &[0x03; 32],
+                &[0x04; 32],
+                &[0x05; 32],
+                &[0x06; 32],
+                &[0x07; 32],
+                &[0x08; 32],
+                1,
+                0,
+                &[],
+                &[0x09; 32],
+                &crate::tx1::placeholder_tx1_effects(),
+                delegation_pczt,
+                &[0x0A; 32],
+                &gov_nullifiers,
+            )
+        };
+
+        let pczt = vec![0xAA, 0xBB];
+        store(&pczt).unwrap();
+        store(&pczt).unwrap();
+        assert_eq!(
+            queries::load_delegation_pczt_fields(&conn, ROUND_ID, W, 0)
+                .unwrap()
+                .0,
+            pczt
+        );
+
+        let err = store(&[0xCC]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("refusing to overwrite delegation_pczt"));
+        assert_eq!(
+            queries::load_delegation_pczt_fields(&conn, ROUND_ID, W, 0)
+                .unwrap()
+                .0,
+            vec![0xAA, 0xBB]
         );
     }
 
@@ -5212,6 +5283,7 @@ mod tests {
             &[],
             &[0x06; 32],
             &crate::tx1::placeholder_tx1_effects(),
+            &[0x07],
             &rk,
             &gov_nullifiers,
         )
@@ -6241,6 +6313,7 @@ mod tests {
                 &[],
                 &stored_sighash,
                 &crate::tx1::placeholder_tx1_effects(),
+                &[0x90],
                 &rk,
                 &[vec![0x89; 32]],
             )

@@ -1152,6 +1152,7 @@ mod session_reset_tests {
             "UPDATE bundles
              SET pczt_sighash = :sighash,
                  tx1_effects = :tx1_effects,
+                 delegation_pczt = :delegation_pczt,
                  padded_note_secrets = :secrets,
                  padded_note_data = :padded
              WHERE round_id = :round_id
@@ -1163,6 +1164,7 @@ mod session_reset_tests {
                 ":bundle_index": bundle_index,
                 ":sighash": vec![0xAAu8; 32],
                 ":tx1_effects": crate::tx1::placeholder_tx1_effects(),
+                ":delegation_pczt": vec![0xDDu8; 2],
                 ":secrets": vec![0xBBu8; 64],
                 ":padded": vec![0xCCu8; 32],
             },
@@ -1176,7 +1178,23 @@ mod session_reset_tests {
             queries::load_pczt_sighash(&conn, round_id, WALLET_ID, bundle_index).is_ok();
         let has_tx1_effects =
             queries::load_tx1_effects(&conn, round_id, WALLET_ID, bundle_index).is_ok();
+        let has_delegation_pczt = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM bundles
+                     WHERE round_id = ?1
+                       AND wallet_id = ?2
+                       AND bundle_index = ?3
+                       AND delegation_pczt IS NOT NULL
+                 )",
+                rusqlite::params![round_id, WALLET_ID, bundle_index],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0;
         assert_eq!(has_sighash, has_tx1_effects);
+        assert_eq!(has_sighash, has_delegation_pczt);
         has_sighash
     }
 
