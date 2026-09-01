@@ -6357,6 +6357,95 @@ mod tests {
         assert_eq!(stored_recovery(&db), None);
     }
 
+    #[test]
+    fn recovery_cleanup_preserves_a_legacy_candidate_hash_and_its_recovery() {
+        let db = db_with_recoverable_vote();
+        // A pre-lifecycle host recorded a real chain hash and left no journal
+        // row. `known_hashes` still reads it as a reconciliation candidate.
+        db.conn()
+            .execute(
+                "UPDATE votes SET tx_hash=?3
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=1",
+                rusqlite::params![ROUND_ID, W, "a".repeat(64)],
+            )
+            .unwrap();
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        // Clearing would take the only handle on a transaction that may still
+        // commit and the recovery a committed response needs, in one statement.
+        let row: (Option<String>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT tx_hash, commitment_bundle_json FROM votes
+                 WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=1",
+                rusqlite::params![ROUND_ID, W],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(row.1.as_deref(), Some(r#"{"generation":"exact"}"#));
+    }
+
+    #[test]
+    fn recovery_cleanup_still_clears_an_opaque_legacy_identifier() {
+        let db = db_with_recoverable_vote();
+        // Never a reconciliation candidate, so treating it as coverage would
+        // freeze this row's recovery with nothing able to release it.
+        db.conn()
+            .execute(
+                "UPDATE votes SET tx_hash='legacy-hash'
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=1",
+                rusqlite::params![ROUND_ID, W],
+            )
+            .unwrap();
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        assert_eq!(stored_recovery(&db), None);
+    }
+
+    #[test]
+    fn recovery_cleanup_preserves_a_legacy_delegation_candidate() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE bundles
+                    SET van_comm_rand=?1, note_positions_blob=?2, delegation_tx_hash=?3
+                  WHERE round_id=?4 AND wallet_id=?5 AND bundle_index=0",
+                rusqlite::params![
+                    vec![0xA5_u8; 32],
+                    vec![0x01_u8; 8],
+                    "a".repeat(64),
+                    ROUND_ID,
+                    W
+                ],
+            )
+            .unwrap();
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+        db.clear_unsigned_delegation_setup_fields(ROUND_ID).unwrap();
+
+        // Clearing the hash also unblocks the setup cleanup, which would then
+        // erase the `van_comm_rand` no retry can resample while the delegation
+        // may already have spent the bundle's governance nullifiers.
+        let row: (Option<String>, Option<Vec<u8>>) = db
+            .conn()
+            .query_row(
+                "SELECT delegation_tx_hash, van_comm_rand FROM bundles
+                 WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                rusqlite::params![ROUND_ID, W],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(row.1, Some(vec![0xA5; 32]));
+    }
+
     fn batch_recovery_json(bundle_index: u32, proposal_id: u32, digest: [u8; 32]) -> String {
         use crate::types::EncryptedShare;
         use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};

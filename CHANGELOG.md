@@ -75,6 +75,18 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   minutes. The deadline bounds how long an attempt reservation stays
   `attempting`, which is what distinguishes a POST another process may still
   have in flight from an abandoned reservation.
+- Recovery cleanup no longer clears an unconfirmed `votes.tx_hash` or
+  `bundles.delegation_tx_hash` that is a valid chain transaction hash. Such a
+  hash is a reconciliation candidate with no journal row behind it, so clearing
+  it took the only handle on a transaction that may still commit along with the
+  recovery a committed response needs — and on the delegation side it also
+  unblocked the setup cleanup that erases `van_comm_rand`. Opaque legacy
+  identifiers are still cleared, since they are never candidates.
+- A retry whose reservation cannot be taken reports `OutcomeUnknown` instead of
+  the persistence error when an earlier attempt in the same call may still
+  commit.
+- The in-flight reservation registry is keyed by submission identity rather than
+  by journal row id, which restarts per database file.
 - A chain submission attempt's own definite rejection or non-retryable transport
   failure no longer reports a terminal outcome while a known candidate for the
   same submission is still outstanding. A candidate another writer recorded

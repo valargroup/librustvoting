@@ -471,6 +471,41 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         Ok(ChainLifecycleOutcome::Cancelled)
     }
 
+    /// The ambiguity that outranks a definite failure reported here, if any.
+    ///
+    /// An earlier attempt in this call whose outcome is unknown, a journaled
+    /// attempt that may still commit, or a known candidate hash all mean the
+    /// submission may yet land, so a failure definite only for this attempt must
+    /// not be reported as the call's result.
+    fn outstanding_ambiguity(
+        &self,
+        wallet_id: &str,
+        identity: &ChainSubmissionIdentity,
+        last_unknown: &Option<String>,
+        cause: &VotingError,
+    ) -> Result<Option<ChainLifecycleOutcome>, VotingError> {
+        let known_tx_hashes = known_hashes(self.db, wallet_id, identity)?;
+        if last_unknown.is_none()
+            && known_tx_hashes.is_empty()
+            && !has_live_attempt(self.db, wallet_id, identity)?
+        {
+            return Ok(None);
+        }
+        let message = match last_unknown {
+            Some(earlier) => format!(
+                "an earlier attempt's outcome is unknown ({earlier}); a later attempt could not be \
+                 prepared: {cause}"
+            ),
+            None => format!(
+                "an earlier attempt may still commit; this one could not be prepared: {cause}"
+            ),
+        };
+        Ok(Some(ChainLifecycleOutcome::OutcomeUnknown {
+            known_tx_hashes,
+            message,
+        }))
+    }
+
     async fn submit_body_locked(
         &self,
         wallet_id: &str,
@@ -506,11 +541,28 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // transaction. That repeats the delegation signature verification
             // and recovery reads up to `attempts` times per call, which is the
             // intended cost of proving the generation is still current.
-            let attempt_id = reserve_attempt(self.db, wallet_id, &identity, &digest, rebuild)?;
+            // A failure here is definite only for this attempt. An earlier one
+            // in this call may still commit, and a concurrent change to the
+            // now-uncovered generation is exactly what makes this rebuild fail
+            // as stale — so reporting the persistence error alone would hide the
+            // ambiguity and invite the host to treat the replacement as safe to
+            // submit.
+            let attempt_id = match reserve_attempt(self.db, wallet_id, &identity, &digest, rebuild)
+            {
+                Ok(attempt_id) => attempt_id,
+                Err(error) => {
+                    if let Some(outcome) =
+                        self.outstanding_ambiguity(wallet_id, &identity, &last_unknown, &error)?
+                    {
+                        return Ok(outcome);
+                    }
+                    return Err(error.into());
+                }
+            };
             // Held until this iteration ends, which is after the response is
             // classified on every path. While it lives, the rows this payload
             // was built from stay covered no matter what the wall clock does.
-            let _in_flight = InFlightAttempt::register(attempt_id);
+            let _in_flight = InFlightAttempt::register(wallet_id, &identity);
             if cancel() {
                 // This reservation is definitely unsent, but an earlier attempt
                 // in this call may still commit.
@@ -1468,24 +1520,8 @@ fn known_hashes(
 /// is none. The transaction may still have committed; that is reported as
 /// ambiguity by [`has_live_attempt`], which is unchanged, and as
 /// `AlreadySpentUnresolved` if a replacement is later refused on chain.
-pub(crate) fn can_still_learn_a_hash() -> String {
-    let live = in_flight_attempt_ids();
-    let live_clause = if live.is_empty() {
-        String::new()
-    } else {
-        // Ids this process minted in `reserve_attempt`, so there is nothing to
-        // escape.
-        let ids = live
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(" OR id IN ({ids})")
-    };
-    format!(
-        "(chain_tx_hash IS NOT NULL          OR (state='attempting' AND (updated_at >= :fresh_cutoff{live_clause})))"
-    )
-}
+pub(crate) const CAN_STILL_LEARN_A_HASH: &str =
+    "(chain_tx_hash IS NOT NULL OR (state='attempting' AND updated_at >= :fresh_cutoff))";
 
 /// The `:fresh_cutoff` bound [`can_still_learn_a_hash`] expects, as of now.
 ///
@@ -1502,47 +1538,89 @@ pub(crate) fn fresh_attempt_cutoff() -> Result<i64, VotingError> {
     Ok(now_seconds()?.saturating_sub(INTERRUPTED_RESERVATION_GRACE_SECS))
 }
 
-/// Reservations this process is waiting on a response for, right now.
+/// One submission this process has an outstanding POST for.
 ///
-/// Registered by the submission loop and released when the response is
-/// classified, so membership is exact and needs no clock at all. It is what
-/// keeps a live POST covered across a wall-clock adjustment; the age test exists
-/// for the reservations this registry cannot know about, namely another
-/// process's, and for the crashed ones no registry will ever hold.
-fn in_flight_attempt_ids() -> Vec<i64> {
-    IN_FLIGHT_ATTEMPTS
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
-        .lock()
-        .map(|live| live.iter().copied().collect())
-        .unwrap_or_default()
+/// Keyed by the durable identity rather than by the journal row's id. Row ids
+/// restart per database file, so two handles on different files mint the same
+/// id: an id-keyed registry would report one database's expired reservation as
+/// live because another currently owns that number, and releasing either guard
+/// would uncover the other. The identity is the thing coverage is actually
+/// about, and it means the same thing in every database.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct InFlightKey {
+    wallet_id: String,
+    round_id: String,
+    kind: &'static str,
+    bundle_index: u32,
+    proposal_key: i64,
+    batch_digest: Vec<u8>,
 }
 
-static IN_FLIGHT_ATTEMPTS: OnceLock<Mutex<BTreeSet<i64>>> = OnceLock::new();
+/// Outstanding reservations, counted so overlapping registrations of one
+/// identity cannot uncover each other when the first of them is released.
+static IN_FLIGHT_ATTEMPTS: OnceLock<Mutex<BTreeMap<InFlightKey, usize>>> = OnceLock::new();
+
+fn in_flight_registry() -> &'static Mutex<BTreeMap<InFlightKey, usize>> {
+    IN_FLIGHT_ATTEMPTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Submissions this process is waiting on a response for in one round, right
+/// now.
+///
+/// Exact and clock-free, which is what keeps a live POST covered across a
+/// wall-clock adjustment. The age test in [`CAN_STILL_LEARN_A_HASH`] exists for
+/// the reservations this registry cannot know about: another process's, and the
+/// crashed ones no registry will ever hold.
+fn in_flight_for_round(round_id: &str, wallet_id: &str) -> Vec<InFlightKey> {
+    let Ok(live) = in_flight_registry().lock() else {
+        return Vec::new();
+    };
+    live.keys()
+        .filter(|key| key.round_id == round_id && key.wallet_id == wallet_id)
+        .cloned()
+        .collect()
+}
+
+/// Whether this process has an outstanding POST for a bundle in the pruned
+/// range.
+pub(crate) fn has_in_flight_at_or_after(round_id: &str, wallet_id: &str, from_index: u32) -> bool {
+    in_flight_for_round(round_id, wallet_id)
+        .iter()
+        .any(|key| key.bundle_index >= from_index)
+}
 
 /// Keeps one reservation registered as in flight for as long as it is held.
 ///
 /// Releasing on drop rather than at each exit means an early return, an error,
-/// or a panic between the POST and its classification cannot leave a stale id
+/// or a panic between the POST and its classification cannot leave an entry
 /// pinning coverage for the life of the process.
-struct InFlightAttempt(i64);
+struct InFlightAttempt(InFlightKey);
 
 impl InFlightAttempt {
-    fn register(attempt_id: i64) -> Self {
-        if let Ok(mut live) = IN_FLIGHT_ATTEMPTS
-            .get_or_init(|| Mutex::new(BTreeSet::new()))
-            .lock()
-        {
-            live.insert(attempt_id);
+    fn register(wallet_id: &str, identity: &ChainSubmissionIdentity) -> Self {
+        let key = InFlightKey {
+            wallet_id: wallet_id.to_string(),
+            round_id: identity.round_id.clone(),
+            kind: identity.kind.as_str(),
+            bundle_index: identity.bundle_index,
+            proposal_key: identity.proposal_key(),
+            batch_digest: identity.batch_key().to_vec(),
+        };
+        if let Ok(mut live) = in_flight_registry().lock() {
+            *live.entry(key.clone()).or_insert(0) += 1;
         }
-        Self(attempt_id)
+        Self(key)
     }
 }
 
 impl Drop for InFlightAttempt {
     fn drop(&mut self) {
-        if let Some(lock) = IN_FLIGHT_ATTEMPTS.get() {
-            if let Ok(mut live) = lock.lock() {
-                live.remove(&self.0);
+        if let Ok(mut live) = in_flight_registry().lock() {
+            if let Some(count) = live.get_mut(&self.0) {
+                *count -= 1;
+                if *count == 0 {
+                    live.remove(&self.0);
+                }
             }
         }
     }
@@ -1600,8 +1678,7 @@ pub(crate) fn attempt_protected_vote_rows(
                        FROM chain_submission_attempts
                       WHERE round_id=:round_id AND wallet_id=:wallet_id
                         AND state<>'rejected' AND kind IN ('vote','vote_batch')
-                        AND {}",
-                can_still_learn_a_hash()
+                        AND {CAN_STILL_LEARN_A_HASH}"
             ))
             .map_err(internal("prepare attempted vote coverage query"))?;
         let rows = stmt
@@ -1634,6 +1711,22 @@ pub(crate) fn attempt_protected_vote_rows(
             } else if let Ok(digest) = <[u8; 32]>::try_from(digest.as_slice()) {
                 batch_digests
                     .entry(bundle_index)
+                    .or_default()
+                    .insert(digest);
+            }
+        }
+    }
+    // A reservation this process is waiting on is exact and clock-free, so it
+    // covers whatever the age test above made of its row.
+    for key in in_flight_for_round(round_id, wallet_id) {
+        if key.kind == ChainSubmissionKind::Vote.as_str() {
+            if let Ok(proposal_id) = u32::try_from(key.proposal_key) {
+                protected.insert((key.bundle_index, proposal_id));
+            }
+        } else if key.kind == ChainSubmissionKind::VoteBatch.as_str() {
+            if let Ok(digest) = <[u8; 32]>::try_from(key.batch_digest.as_slice()) {
+                batch_digests
+                    .entry(key.bundle_index)
                     .or_default()
                     .insert(digest);
             }
@@ -3576,8 +3669,6 @@ mod tests {
             let conn = db.conn();
             queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
         }
-        // A high explicit id so registering it cannot collide with another
-        // test's auto-incremented rows in this shared process registry.
         const ATTEMPT_ID: i64 = 9_000_001;
         // Timestamps that look older than the grace period. A forward step of
         // the system clock while the POST is in flight produces exactly this:
@@ -3593,7 +3684,8 @@ mod tests {
             )
             .unwrap();
 
-        let in_flight = InFlightAttempt::register(ATTEMPT_ID);
+        let identity = ChainSubmissionIdentity::vote(ROUND_ID, 0, 3);
+        let in_flight = InFlightAttempt::register(WALLET, &identity);
         let covered = {
             let conn = db.conn();
             attempt_protected_vote_rows(&conn, ROUND_ID, WALLET).unwrap()
@@ -3804,6 +3896,109 @@ mod tests {
         assert!(
             RESERVATION_HEARTBEAT.as_secs() as i64 * 4 < INTERRUPTED_RESERVATION_GRACE_SECS,
             "heartbeat must be far below the grace period"
+        );
+    }
+
+    #[test]
+    fn in_flight_coverage_does_not_cross_databases() {
+        let first = test_db();
+        let second = test_db();
+        {
+            let conn = first.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+        }
+        {
+            let conn = second.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 4, 1, &[0xCC; 32]).unwrap();
+        }
+        // Both databases mint row id 1 for their first reservation, and both
+        // reservations are stale, so an id-keyed registry would let the one
+        // being registered stand in for the other.
+        for (db, proposal_id) in [(&first, 3_i64), (&second, 4_i64)] {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, ?3, X'', ?4, 'attempting', 1, 1)",
+                rusqlite::params![ROUND_ID, WALLET, proposal_id, vec![0xCC_u8; 32]],
+            )
+            .unwrap();
+            assert_eq!(
+                conn.last_insert_rowid(),
+                1,
+                "both databases must mint the same row id"
+            );
+        }
+
+        let identity = ChainSubmissionIdentity::vote(ROUND_ID, 0, 3);
+        let in_flight = InFlightAttempt::register(WALLET, &identity);
+
+        let covered_first = {
+            let conn = first.conn();
+            attempt_protected_vote_rows(&conn, ROUND_ID, WALLET).unwrap()
+        };
+        let covered_second = {
+            let conn = second.conn();
+            attempt_protected_vote_rows(&conn, ROUND_ID, WALLET).unwrap()
+        };
+        assert!(covered_first.contains(&(0, 3)), "{covered_first:?}");
+        // The other database's expired reservation must not be reported live
+        // just because an unrelated handle currently owns that row id.
+        assert!(!covered_second.contains(&(0, 4)), "{covered_second:?}");
+        // Keying by identity does carry the registration into any database
+        // holding the same wallet and round, such as a copy opened alongside.
+        // That over-protects a row rather than under-protecting one, which is
+        // the safe direction and the opposite of an id collision.
+        assert!(covered_second.contains(&(0, 3)), "{covered_second:?}");
+        drop(in_flight);
+    }
+
+    #[tokio::test]
+    async fn a_reservation_failure_after_an_ambiguous_post_stays_unknown() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        // First attempt times out: ambiguous, no hash. The retry's rebuild then
+        // fails because the durable generation changed underneath it.
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Err(ChainTransportError::Timeout));
+        let client = ChainClient::with_config(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            ChainClientConfig::default()
+                .with_retry_delays(vec![Duration::from_millis(1)])
+                .unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+        let stale = |_: &rusqlite::Connection| -> Result<Vec<u8>, VotingError> {
+            Ok(b"different bytes".to_vec())
+        };
+        let rebuild = move |conn: &rusqlite::Connection| -> Result<Vec<u8>, VotingError> {
+            // Matches on the first reservation, diverges on the retry.
+            static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                echo_rebuild(conn)
+            } else {
+                stale(conn)
+            }
+        };
+
+        let outcome = lifecycle
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &rebuild, &|| false)
+            .await
+            .unwrap();
+
+        // The first attempt's transaction may still commit. Reporting only the
+        // persistence error would invite the host to treat the replacement
+        // generation as safe to submit.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
+                if message.contains("could not be prepared")),
+            "got {outcome:?}"
         );
     }
 }

@@ -131,6 +131,15 @@ until it classifies the response. That needs no clock, so no adjustment to the
 system clock can make a live POST look abandoned and let cleanup erase the
 material its response is about to be confirmed against.
 
+The registry is keyed by the submission identity and wallet, not by the journal
+row's id. Row ids restart per database file, so two handles on different files
+mint the same id: an id-keyed registry would report one database's expired
+reservation as live because another currently owns that number, and releasing
+either guard would uncover the other. Keying by identity can instead carry a
+registration into another database holding the same wallet and round, such as a
+copy opened alongside, which over-protects a row rather than under-protecting
+one.
+
 A reservation this registry cannot know about — another process's, or one no
 registry will ever hold because its process is gone — falls back to age. For that
 to mean anything, `updated_at` has to record that the *owner was alive*, not
@@ -253,7 +262,16 @@ none. The transaction may still have committed; that stays visible as
    confirmation position, so retirement can only remove a hash this
    reconciliation just proved failed.
 8. Routine session reset and recovery cleanup do not delete chain submission
-   attempts, and they do not erase material a **covering** attempt needs.
+   attempts, and they do not erase material a **covering** attempt needs, nor an
+   unconfirmed domain hash that is itself a reconciliation candidate. A hash a
+   pre-lifecycle host recorded has no journal row behind it, so clearing it would
+   take the only handle on a transaction that may still commit together with the
+   recovery a committed response needs. Only a real chain hash counts: an opaque
+   legacy identifier is never a candidate, so treating one as coverage would
+   freeze that row with nothing able to release it. On the delegation side the
+   same rule also keeps `clear_unsigned_delegation_setup_fields` blocked, which
+   would otherwise erase `van_comm_rand`. A candidate a lookup proves failed is
+   retired, which clears the column and lets a later cleanup proceed.
    Coverage is scoped to the exact attempted submission: a singleton attempt
    covers its own proposal row, and a batch attempt covers exactly the rows
    whose recovery carries that batch digest. A row whose recovery cannot be read
@@ -505,12 +523,19 @@ hosts do not parse the log.
    identity the process has ever seen.
 3. After acquiring the lock, the lifecycle re-reads the exact durable recovery
    generation. A stale handle fails before network dispatch.
-4. Attempt insertion, its round and owner validation, and the payload rebuild
+4. A reservation that cannot be taken is a failure definite only for its own
+   attempt. If an earlier attempt in the call is outcome-unknown, a journaled
+   attempt may still commit, or a candidate hash is known, the call reports
+   `OutcomeUnknown` rather than the persistence error: a concurrent change to the
+   now-uncovered generation is exactly what makes a rebuild fail as stale, and
+   reporting only the error would invite the host to treat the replacement as
+   safe to submit.
+5. Attempt insertion, its round and owner validation, and the payload rebuild
    that proves the generation is unchanged all share one immediate SQLite
    transaction. A generation replaced or cleared by another connection after
    the payload was serialized is therefore caught before dispatch, not merely
    before the lock was taken.
-5. Cancellation is checked on entry to reconciliation and before reservation,
+6. Cancellation is checked on entry to reconciliation and before reservation,
    dispatch, retry, failover, backoff, and confirmation application, and again
    as soon as each transaction-status request returns. The entry check covers
    the no-candidate fast path, so a cancelled operation is never reported to the
@@ -519,13 +544,13 @@ hosts do not parse the log.
    outcome and classifying a committed failure retires evidence. A cancelled
    operation does neither: the candidate stays journaled, so the next
    reconciliation re-derives whatever this one was about to conclude.
-6. Cancellation observed after a broadcast completes does not replace that
+7. Cancellation observed after a broadcast completes does not replace that
    broadcast's result. A call cancelled while a dispatched attempt may still
    commit reports `OutcomeUnknown`; `Cancelled` is reserved for calls with no
    completed ambiguous broadcast.
-7. Cancellation before a fresh reservation dispatches removes the definitely
+8. Cancellation before a fresh reservation dispatches removes the definitely
    unsent reservation. Cancellation after dispatch retains uncertainty.
-8. A deleted or replaced generation cannot receive a delayed transport or
+9. A deleted or replaced generation cannot receive a delayed transport or
    confirmation result. Cancellation is re-checked immediately before the
    confirmation transaction, so a session invalidated while a status request
    was in flight does not have voting state mutated underneath it. This narrows
@@ -609,6 +634,12 @@ state transitions.
 - Can a confirmation that fails validation still have destroyed a competing
   candidate's hash?
 - Can a wall-clock adjustment expire a reservation whose POST is still in flight?
+- Can two database handles collide in the in-flight registry, so one's expired
+  reservation reads as live or one's release uncovers the other?
+- Can a reservation failure after an ambiguous dispatch be reported as a plain
+  error, hiding an attempt that may still commit?
+- Can recovery cleanup erase an unconfirmed domain hash that is still the only
+  reconciliation candidate for its row?
 - Does an outstanding reservation keep proving its owner is alive, rather than
   only recording when it was made?
 - Can one endpoint's confirmation for the wrong submission end a lookup that
@@ -744,7 +775,9 @@ state transitions.
 - `chain_submission::tests::a_hashless_unknown_attempt_survives_across_calls`
   covers durable ambiguity with no learned hash.
 - `chain_submission::tests::a_definite_pre_dispatch_failure_is_not_recorded_as_ambiguity`
-  covers the boundary that keeps a definite rejection terminal.
+  covers the boundary that keeps a definite rejection terminal, and
+  `a_reservation_failure_after_an_ambiguous_post_stays_unknown` covers a retry
+  whose reservation fails while an earlier attempt may still commit.
 - `chain_submission::tests::a_candidate_recorded_between_attempts_stops_further_dispatch`
   covers the between-retry dispatch gate, and
   `an_accepted_candidate_recorded_mid_call_is_not_overridden_by_a_rejection`
@@ -805,8 +838,15 @@ state transitions.
   `chain_submission::tests::a_heartbeat_marks_only_an_outstanding_reservation_as_still_owned`
   covers the refresh that makes `updated_at` mean "the owner was alive", its
   state and wallet scoping, and its margin against the grace period.
+  `chain_submission::tests::in_flight_coverage_does_not_cross_databases` covers
+  the identity keying that keeps two handles minting the same row id apart.
   `session::tests::a_stale_reservation_does_not_refuse_a_ballot_intent_change`
   covers the same bound at the ballot-intent guard.
+- `storage::operations::tests::recovery_cleanup_preserves_a_legacy_candidate_hash_and_its_recovery`,
+  `recovery_cleanup_preserves_a_legacy_delegation_candidate`, and
+  `recovery_cleanup_still_clears_an_opaque_legacy_identifier` cover an
+  unconfirmed domain hash as coverage and the opaque-identifier boundary that
+  keeps it from freezing a row.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
   covers storage-boundary hash canonicalization and idempotent replay.
 - storage migration tests cover version 18 fresh and in-place schemas, including

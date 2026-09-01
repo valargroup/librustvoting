@@ -2799,7 +2799,7 @@ pub fn delete_bundles_from(
                         AND bundle_index >= :from_index AND state <> 'rejected'
                         AND (kind = 'delegation' OR {})
                  )",
-                crate::chain_submission::can_still_learn_a_hash()
+                crate::chain_submission::CAN_STILL_LEARN_A_HASH
             ),
             named_params! {
                 ":round_id": round_id,
@@ -2812,7 +2812,11 @@ pub fn delete_bundles_from(
         .map_err(|e| VotingError::Internal {
             message: format!("failed to check chain attempts before bundle deletion: {e}"),
         })?;
-    if attempted {
+    // A reservation this process is waiting on is exact and clock-free, so it
+    // bars pruning whatever the age test above made of its journal row.
+    if attempted
+        || crate::chain_submission::has_in_flight_at_or_after(round_id, wallet_id, from_index)
+    {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "round {round_id} has a chain submission attempt at or after bundle {from_index} that may still commit; reconcile it before pruning bundles"
@@ -3337,12 +3341,21 @@ pub fn clear_recovery_state(
     .map_err(|e| VotingError::Internal {
         message: format!("failed to clear keystone signatures: {}", e),
     })?;
+    // As for votes below: a delegation hash a pre-lifecycle host recorded is a
+    // reconciliation candidate with no journal row behind it, and clearing it
+    // also unblocks `clear_unsigned_delegation_setup_fields`, which would then
+    // erase the `van_comm_rand` no retry can resample while the delegation may
+    // already have spent the bundle's governance nullifiers.
     conn.execute(
         "UPDATE bundles SET delegation_tx_hash = NULL
          WHERE round_id = :round_id
            AND wallet_id = :wallet_id
            AND note_positions_blob IS NOT NULL
            AND van_leaf_position IS NULL
+           AND NOT (
+               length(delegation_tx_hash) = 64
+               AND delegation_tx_hash NOT GLOB '*[^0-9a-fA-F]*'
+           )
            AND NOT EXISTS (
                SELECT 1
                  FROM chain_submission_attempts a
@@ -3366,7 +3379,7 @@ pub fn clear_recovery_state(
     let candidates = {
         let mut stmt = conn
             .prepare(
-                "SELECT bundle_index, proposal_id FROM votes
+                "SELECT bundle_index, proposal_id, tx_hash FROM votes
                   WHERE round_id = :round_id AND wallet_id = :wallet_id
                     AND vc_tree_position IS NULL",
             )
@@ -3376,7 +3389,13 @@ pub fn clear_recovery_state(
         let rows = stmt
             .query_map(
                 named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to query vote recovery cleanup rows: {e}"),
@@ -3386,13 +3405,25 @@ pub fn clear_recovery_state(
                 message: format!("failed to read vote recovery cleanup row: {e}"),
             })?
     };
-    for (bundle_index, proposal_id) in candidates {
+    for (bundle_index, proposal_id, tx_hash) in candidates {
         let (Ok(bundle_index), Ok(proposal_id)) =
             (u32::try_from(bundle_index), u32::try_from(proposal_id))
         else {
             continue;
         };
         if protected.contains(&(bundle_index, proposal_id)) {
+            continue;
+        }
+        // A domain hash a pre-lifecycle host recorded is a reconciliation
+        // candidate in its own right, with no journal row to protect it.
+        // Clearing it here would take the only handle on a transaction that may
+        // still commit, and the recovery a committed response needs, in the same
+        // statement. Only a real chain hash counts: an opaque legacy identifier
+        // is never a candidate, so treating one as coverage would freeze this
+        // row's recovery with nothing able to release it. A candidate a lookup
+        // proves failed is retired, which clears the column and lets a later
+        // cleanup proceed.
+        if tx_hash.as_deref().is_some_and(crate::chain::is_tx_hash) {
             continue;
         }
         conn.execute(
