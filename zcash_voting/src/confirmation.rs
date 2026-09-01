@@ -58,8 +58,32 @@ pub fn confirm_delegation_submission(
     tx_hash: &str,
     events: &[TxEvent],
 ) -> Result<DelegationConfirmation, VotingError> {
+    confirm_delegation_submission_for_wallet(
+        db,
+        &db.wallet_id(),
+        round_id,
+        bundle_index,
+        tx_hash,
+        events,
+    )
+}
+
+/// [`confirm_delegation_submission`] against an explicitly named wallet.
+///
+/// The chain lifecycle captures its wallet when it takes the identity lock and
+/// must persist under that wallet. Re-reading the database's current wallet here
+/// would let an account switch land the confirmation on the wrong account, or
+/// lose it outright.
+pub(crate) fn confirm_delegation_submission_for_wallet(
+    db: &VotingDb,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    tx_hash: &str,
+    events: &[TxEvent],
+) -> Result<DelegationConfirmation, VotingError> {
     let confirmation = parse_delegation_confirmation_for_round(tx_hash, round_id, events)?;
-    record_delegation_confirmation(db, round_id, bundle_index, &confirmation)?;
+    record_delegation_confirmation(db, wallet_id, round_id, bundle_index, &confirmation)?;
     Ok(confirmation)
 }
 
@@ -75,13 +99,13 @@ pub fn confirm_delegation_submission(
 /// conflict, or the DB transaction cannot commit.
 fn record_delegation_confirmation(
     db: &VotingDb,
+    wallet_id: &str,
     round_id: &str,
     bundle_index: u32,
     confirmation: &DelegationConfirmation,
 ) -> Result<(), VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let mut conn = db.conn();
-    let wallet_id = db.wallet_id();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::Internal {
@@ -89,7 +113,7 @@ fn record_delegation_confirmation(
         })?;
 
     let (stored_hash, stored_van_position) =
-        load_bundle_confirmation_fields(&tx, round_id, &wallet_id, bundle_index)?;
+        load_bundle_confirmation_fields(&tx, round_id, wallet_id, bundle_index)?;
     check_text_conflict(
         stored_hash.as_deref(),
         &confirmation.tx_hash,
@@ -100,7 +124,7 @@ fn record_delegation_confirmation(
     queries::store_delegation_tx_hash(
         &tx,
         round_id,
-        &wallet_id,
+        wallet_id,
         bundle_index,
         &confirmation.tx_hash,
     )?;
@@ -108,7 +132,7 @@ fn record_delegation_confirmation(
         queries::store_van_position(
             &tx,
             round_id,
-            &wallet_id,
+            wallet_id,
             bundle_index,
             confirmation.van_leaf_position,
         )?;
@@ -134,14 +158,69 @@ pub fn confirm_vote_submission(
     tx_hash: &str,
     events: &[TxEvent],
 ) -> Result<VoteConfirmation, VotingError> {
+    confirm_vote_submission_for_wallet(
+        db,
+        &db.wallet_id(),
+        round_id,
+        bundle_index,
+        proposal_id,
+        tx_hash,
+        events,
+    )
+}
+
+/// [`confirm_vote_submission`] against an explicitly named wallet.
+///
+/// See [`confirm_delegation_submission_for_wallet`] for why the lifecycle
+/// cannot let this re-read the database's current wallet.
+pub(crate) fn confirm_vote_submission_for_wallet(
+    db: &VotingDb,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    tx_hash: &str,
+    events: &[TxEvent],
+) -> Result<VoteConfirmation, VotingError> {
     let confirmation = parse_vote_confirmation_for_round(tx_hash, round_id, events)?;
-    record_vote_confirmation(db, round_id, bundle_index, proposal_id, &confirmation)?;
+    record_vote_confirmation(
+        db,
+        wallet_id,
+        round_id,
+        bundle_index,
+        proposal_id,
+        &confirmation,
+    )?;
     Ok(confirmation)
 }
 
 /// Parses and atomically records a confirmed atomic cast-vote batch.
 pub fn confirm_vote_batch_submission(
     db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    expected_batch_digest: &[u8],
+    tx_hash: &str,
+    events: &[TxEvent],
+) -> Result<VoteBatchConfirmation, VotingError> {
+    confirm_vote_batch_submission_for_wallet(
+        db,
+        &db.wallet_id(),
+        round_id,
+        bundle_index,
+        expected_batch_digest,
+        tx_hash,
+        events,
+    )
+}
+
+/// [`confirm_vote_batch_submission`] against an explicitly named wallet.
+///
+/// See [`confirm_delegation_submission_for_wallet`] for why the lifecycle
+/// cannot let this re-read the database's current wallet.
+pub(crate) fn confirm_vote_batch_submission_for_wallet(
+    db: &VotingDb,
+    wallet_id: &str,
     round_id: &str,
     bundle_index: u32,
     expected_batch_digest: &[u8],
@@ -169,6 +248,7 @@ pub fn confirm_vote_batch_submission(
     }
     record_vote_batch_confirmation(
         db,
+        wallet_id,
         round_id,
         bundle_index,
         expected_batch_digest,
@@ -178,8 +258,10 @@ pub fn confirm_vote_batch_submission(
     Ok(confirmation)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_vote_batch_confirmation(
     db: &VotingDb,
+    wallet_id: &str,
     round_id: &str,
     bundle_index: u32,
     batch_digest: [u8; 32],
@@ -194,7 +276,6 @@ fn record_vote_batch_confirmation(
         VAN_NULLIFIERS_ATTRIBUTE,
     )?)?;
     let mut conn = db.conn();
-    let wallet_id = db.wallet_id();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::Internal {
@@ -202,7 +283,7 @@ fn record_vote_batch_confirmation(
         })?;
     let recoveries = crate::vote::load_vote_batch_recoveries_with_conn(
         &tx,
-        &wallet_id,
+        wallet_id,
         round_id,
         bundle_index,
         batch_digest,
@@ -233,7 +314,7 @@ fn record_vote_batch_confirmation(
         queries::record_vote_submission(
             &tx,
             round_id,
-            &wallet_id,
+            wallet_id,
             bundle_index,
             recovery.proposal_id,
             &confirmation.tx_hash,
@@ -241,13 +322,13 @@ fn record_vote_batch_confirmation(
         require_vote_recovery_json(
             &tx,
             round_id,
-            &wallet_id,
+            wallet_id,
             bundle_index,
             recovery.proposal_id,
         )?;
         crate::vote::record_vc_position_with_conn(
             &tx,
-            &wallet_id,
+            wallet_id,
             round_id,
             bundle_index,
             recovery.proposal_id,
@@ -257,7 +338,7 @@ fn record_vote_batch_confirmation(
     advance_van_position_in_tx(
         &tx,
         round_id,
-        &wallet_id,
+        wallet_id,
         bundle_index,
         confirmation.van_leaf_position,
     )?;
@@ -279,6 +360,7 @@ fn record_vote_batch_confirmation(
 /// transaction cannot commit.
 fn record_vote_confirmation(
     db: &VotingDb,
+    wallet_id: &str,
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
@@ -286,7 +368,6 @@ fn record_vote_confirmation(
 ) -> Result<(), VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let mut conn = db.conn();
-    let wallet_id = db.wallet_id();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::Internal {
@@ -295,7 +376,7 @@ fn record_vote_confirmation(
 
     crate::vote::ensure_singleton_vote_update_with_conn(
         &tx,
-        &wallet_id,
+        wallet_id,
         round_id,
         bundle_index,
         proposal_id,
@@ -304,22 +385,22 @@ fn record_vote_confirmation(
     queries::record_vote_submission(
         &tx,
         round_id,
-        &wallet_id,
+        wallet_id,
         bundle_index,
         proposal_id,
         &confirmation.tx_hash,
     )?;
-    require_vote_recovery_json(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
+    require_vote_recovery_json(&tx, round_id, wallet_id, bundle_index, proposal_id)?;
     advance_van_position_in_tx(
         &tx,
         round_id,
-        &wallet_id,
+        wallet_id,
         bundle_index,
         confirmation.van_leaf_position,
     )?;
     crate::vote::record_vc_position_with_conn(
         &tx,
-        &wallet_id,
+        wallet_id,
         round_id,
         bundle_index,
         proposal_id,
@@ -1337,8 +1418,8 @@ mod tests {
             van_leaf_position: 42,
         };
 
-        record_delegation_confirmation(&db, ROUND_ID, 0, &confirmation).unwrap();
-        record_delegation_confirmation(&db, ROUND_ID, 0, &confirmation).unwrap();
+        record_delegation_confirmation(&db, WALLET_ID, ROUND_ID, 0, &confirmation).unwrap();
+        record_delegation_confirmation(&db, WALLET_ID, ROUND_ID, 0, &confirmation).unwrap();
 
         assert_eq!(
             queries::get_delegation_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0)
@@ -1362,6 +1443,7 @@ mod tests {
         insert_bundle(&db, 0);
         record_delegation_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             &DelegationConfirmation {
@@ -1373,6 +1455,7 @@ mod tests {
 
         let err = record_delegation_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             &DelegationConfirmation {
@@ -1391,6 +1474,7 @@ mod tests {
         insert_bundle(&db, 0);
         record_delegation_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             &DelegationConfirmation {
@@ -1402,6 +1486,7 @@ mod tests {
 
         let err = record_delegation_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             &DelegationConfirmation {
@@ -1437,8 +1522,8 @@ mod tests {
             vc_tree_position: 789,
         };
 
-        record_vote_confirmation(&db, ROUND_ID, 0, 1, &confirmation).unwrap();
-        record_vote_confirmation(&db, ROUND_ID, 0, 1, &confirmation).unwrap();
+        record_vote_confirmation(&db, WALLET_ID, ROUND_ID, 0, 1, &confirmation).unwrap();
+        record_vote_confirmation(&db, WALLET_ID, ROUND_ID, 0, 1, &confirmation).unwrap();
 
         assert_eq!(
             queries::get_vote_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0, 1)
@@ -1649,6 +1734,7 @@ mod tests {
 
         let error = record_vote_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             1,
@@ -1684,6 +1770,7 @@ mod tests {
         store_recovery_json(&db, 0, 1, &valid_recovery_json(456));
         record_delegation_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             &DelegationConfirmation {
@@ -1695,6 +1782,7 @@ mod tests {
 
         record_vote_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             1,
@@ -1734,9 +1822,11 @@ mod tests {
             tx_hash: "delegation-tx".to_string(),
             van_leaf_position: 7,
         };
-        record_delegation_confirmation(&db, ROUND_ID, 0, &delegation_confirmation).unwrap();
+        record_delegation_confirmation(&db, WALLET_ID, ROUND_ID, 0, &delegation_confirmation)
+            .unwrap();
         record_vote_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             1,
@@ -1748,7 +1838,8 @@ mod tests {
         )
         .unwrap();
 
-        record_delegation_confirmation(&db, ROUND_ID, 0, &delegation_confirmation).unwrap();
+        record_delegation_confirmation(&db, WALLET_ID, ROUND_ID, 0, &delegation_confirmation)
+            .unwrap();
 
         assert_eq!(
             queries::get_delegation_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0)
@@ -1772,6 +1863,7 @@ mod tests {
         store_recovery_json(&db, 0, 2, &recovery_json(457, ROUND_ID, 0, 2, 2));
         record_delegation_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             &DelegationConfirmation {
@@ -1791,9 +1883,9 @@ mod tests {
             vc_tree_position: 790,
         };
 
-        record_vote_confirmation(&db, ROUND_ID, 0, 1, &first_confirmation).unwrap();
-        record_vote_confirmation(&db, ROUND_ID, 0, 2, &second_confirmation).unwrap();
-        record_vote_confirmation(&db, ROUND_ID, 0, 1, &first_confirmation).unwrap();
+        record_vote_confirmation(&db, WALLET_ID, ROUND_ID, 0, 1, &first_confirmation).unwrap();
+        record_vote_confirmation(&db, WALLET_ID, ROUND_ID, 0, 2, &second_confirmation).unwrap();
+        record_vote_confirmation(&db, WALLET_ID, ROUND_ID, 0, 1, &first_confirmation).unwrap();
 
         assert_eq!(
             queries::load_van_position(&db.conn(), ROUND_ID, WALLET_ID, 0).unwrap(),
@@ -1821,6 +1913,7 @@ mod tests {
 
         let err = record_vote_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             1,
@@ -1850,6 +1943,7 @@ mod tests {
 
         let err = record_vote_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             1,
@@ -1898,6 +1992,7 @@ mod tests {
 
         let err = record_vote_confirmation(
             &db,
+            WALLET_ID,
             ROUND_ID,
             0,
             1,

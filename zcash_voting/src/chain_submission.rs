@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,7 +16,8 @@ use crate::{
         ChainTxConfirmation, ChainTxStatus,
     },
     confirmation::{
-        confirm_delegation_submission, confirm_vote_batch_submission, confirm_vote_submission,
+        confirm_delegation_submission_for_wallet, confirm_vote_batch_submission_for_wallet,
+        confirm_vote_submission_for_wallet,
     },
     delegate::{self, DelegationSigner, SignedDelegationBundle},
     storage::{queries, VotingDb},
@@ -549,6 +550,11 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         identity: &ChainSubmissionIdentity,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
+        // Checked before the no-candidate fast path below, which would
+        // otherwise report a stale operation as actively pending.
+        if cancel() {
+            return Ok(ChainLifecycleOutcome::Cancelled);
+        }
         let hashes = known_hashes(self.db, wallet_id, identity)?;
         if hashes.is_empty() {
             return Ok(ChainLifecycleOutcome::Pending {
@@ -622,7 +628,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // would make every later submission rediscover it and exit before
             // dispatch, and would keep ballot-intent changes and recovery
             // cleanup pinned to a generation that can never confirm.
-            retire_attempts_for_hash(self.db, wallet_id, identity, &hash)?;
+            retire_failed_candidate(self.db, wallet_id, identity, &hash)?;
             return Ok(ChainLifecycleOutcome::Rejected {
                 code: failure.code,
                 log: failure.log,
@@ -641,21 +647,22 @@ fn apply_confirmation(
     tx_hash: &str,
     response: &ChainTxConfirmation,
 ) -> Result<ChainConfirmation, VotingError> {
-    // Confirmation writes go through the existing wallet-scoped `confirm_*`
-    // entry points. Refuse rather than record this submission against a wallet
-    // the host switched to while the status request was in flight.
-    ensure_operation_wallet(db, wallet_id)?;
+    // The captured wallet is passed into the confirmation transaction rather
+    // than checked here and re-read there: an account switch between the check
+    // and the write would otherwise scope the confirmation to the new wallet.
     match identity.kind {
-        ChainSubmissionKind::Delegation => confirm_delegation_submission(
+        ChainSubmissionKind::Delegation => confirm_delegation_submission_for_wallet(
             db,
+            wallet_id,
             &identity.round_id,
             identity.bundle_index,
             tx_hash,
             &response.events,
         )
         .map(ChainConfirmation::Delegation),
-        ChainSubmissionKind::Vote => confirm_vote_submission(
+        ChainSubmissionKind::Vote => confirm_vote_submission_for_wallet(
             db,
+            wallet_id,
             &identity.round_id,
             identity.bundle_index,
             identity.require_proposal_id()?,
@@ -663,8 +670,9 @@ fn apply_confirmation(
             &response.events,
         )
         .map(ChainConfirmation::Vote),
-        ChainSubmissionKind::VoteBatch => confirm_vote_batch_submission(
+        ChainSubmissionKind::VoteBatch => confirm_vote_batch_submission_for_wallet(
             db,
+            wallet_id,
             &identity.round_id,
             identity.bundle_index,
             &identity.require_batch_digest()?,
@@ -855,51 +863,93 @@ fn delete_attempt(db: &VotingDb, wallet_id: &str, attempt_id: i64) -> Result<(),
         .map_err(internal("delete definitely-unsent chain attempt"))
 }
 
-/// Marks every attempt carrying this hash as definitively rejected.
+/// Retires every record of a candidate whose transaction failed at commit.
 ///
-/// A candidate whose transaction committed with a nonzero code can never
-/// confirm, so its journal row must stop being live evidence: otherwise later
-/// submissions rediscover it and exit before dispatch, and ballot-intent
-/// changes and recovery cleanup stay pinned to a generation that failed.
-fn retire_attempts_for_hash(
+/// Such a transaction can never confirm, so it must stop being live evidence:
+/// otherwise later submissions rediscover it and exit before dispatch, and
+/// ballot-intent changes and recovery cleanup stay pinned to a generation that
+/// failed.
+///
+/// Both reconciliation sources are retired together. The attempt journal is one;
+/// the other is the legacy domain column, which a pre-lifecycle host may have
+/// written and which `known_hashes` still reads. Clearing the domain hash is
+/// scoped to an exact match on a row with no recorded confirmation position, so
+/// it can only ever remove a hash this reconciliation just proved failed, never
+/// a confirmed one.
+fn retire_failed_candidate(
     db: &VotingDb,
     wallet_id: &str,
     identity: &ChainSubmissionIdentity,
     tx_hash: &str,
 ) -> Result<(), VotingError> {
-    db.conn()
-        .execute(
-            "UPDATE chain_submission_attempts
-                SET state='rejected', updated_at=:now
-              WHERE round_id=:round_id AND wallet_id=:wallet_id
-                AND kind=:kind AND bundle_index=:bundle_index
-                AND proposal_id=:proposal_id AND batch_digest=:batch_digest
-                AND chain_tx_hash=:tx_hash AND state<>'rejected'",
-            named_params! {
-                ":now": now_seconds()?,
-                ":round_id": identity.round_id,
-                ":wallet_id": wallet_id,
-                ":kind": identity.kind.as_str(),
-                ":bundle_index": i64::from(identity.bundle_index),
-                ":proposal_id": identity.proposal_key(),
-                ":batch_digest": identity.batch_key(),
-                ":tx_hash": tx_hash,
-            },
-        )
-        .map(|_| ())
-        .map_err(internal("retire committed-failure chain attempt"))
-}
-
-/// Fails when the database's wallet is no longer the one this operation began
-/// under, so a mid-flight account switch cannot write to the wrong wallet.
-fn ensure_operation_wallet(db: &VotingDb, wallet_id: &str) -> Result<(), VotingError> {
-    if db.wallet_id() == wallet_id {
-        Ok(())
-    } else {
-        Err(VotingError::InvalidInput {
-            message: "wallet changed during a chain submission operation".to_string(),
-        })
+    let now = now_seconds()?;
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(internal("begin failed candidate retirement"))?;
+    tx.execute(
+        "UPDATE chain_submission_attempts
+            SET state='rejected', updated_at=:now
+          WHERE round_id=:round_id AND wallet_id=:wallet_id
+            AND kind=:kind AND bundle_index=:bundle_index
+            AND proposal_id=:proposal_id AND batch_digest=:batch_digest
+            AND chain_tx_hash=:tx_hash AND state<>'rejected'",
+        named_params! {
+            ":now": now,
+            ":round_id": identity.round_id,
+            ":wallet_id": wallet_id,
+            ":kind": identity.kind.as_str(),
+            ":bundle_index": i64::from(identity.bundle_index),
+            ":proposal_id": identity.proposal_key(),
+            ":batch_digest": identity.batch_key(),
+            ":tx_hash": tx_hash,
+        },
+    )
+    .map_err(internal("retire committed-failure chain attempt"))?;
+    match identity.kind {
+        ChainSubmissionKind::Delegation => {
+            tx.execute(
+                "UPDATE bundles SET delegation_tx_hash=NULL
+                  WHERE round_id=:round_id AND wallet_id=:wallet_id
+                    AND bundle_index=:bundle_index
+                    AND delegation_tx_hash=:tx_hash
+                    AND van_leaf_position IS NULL",
+                named_params! {
+                    ":round_id": identity.round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": i64::from(identity.bundle_index),
+                    ":tx_hash": tx_hash,
+                },
+            )
+            .map_err(internal("clear failed delegation domain hash"))?;
+        }
+        // A batch records the same hash on every member, so the bundle-wide
+        // match below is the batch's own rows; an exact hash match cannot reach
+        // an unrelated submission.
+        ChainSubmissionKind::Vote | ChainSubmissionKind::VoteBatch => {
+            tx.execute(
+                // `proposal_key` is the proposal for a singleton and the -1
+                // sentinel for a batch, which widens the match to the batch's
+                // own member rows.
+                "UPDATE votes SET tx_hash=NULL
+                  WHERE round_id=:round_id AND wallet_id=:wallet_id
+                    AND bundle_index=:bundle_index
+                    AND (:proposal_id = -1 OR proposal_id = :proposal_id)
+                    AND tx_hash=:tx_hash
+                    AND vc_tree_position IS NULL",
+                named_params! {
+                    ":round_id": identity.round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": i64::from(identity.bundle_index),
+                    ":proposal_id": identity.proposal_key(),
+                    ":tx_hash": tx_hash,
+                },
+            )
+            .map_err(internal("clear failed vote domain hash"))?;
+        }
     }
+    tx.commit()
+        .map_err(internal("commit failed candidate retirement"))
 }
 
 /// Every chain transaction hash that could identify this submission.
@@ -1162,18 +1212,29 @@ fn internal(context: &'static str) -> impl FnOnce(rusqlite::Error) -> VotingErro
 
 type OperationLock = Arc<tokio::sync::Mutex<()>>;
 
+/// Returns the process-wide lock serializing operations for one identity.
+///
+/// The registry holds weak references and the caller holds the only strong one
+/// for the duration of its operation. Two concurrent operations on the same
+/// identity still share one mutex, because the second upgrades the entry while
+/// the first is holding it; once no operation is left, the entry becomes
+/// reclaimable. A long-lived wallet moves through many rounds and proposals, so
+/// keeping a strong reference per identity forever would grow without bound.
 fn operation_lock(key: &str) -> Result<OperationLock, VotingError> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, OperationLock>>> = OnceLock::new();
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     let mut locks = LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|error| VotingError::Internal {
             message: format!("chain operation lock registry poisoned: {error}"),
         })?;
-    Ok(locks
-        .entry(key.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone())
+    if let Some(live) = locks.get(key).and_then(Weak::upgrade) {
+        return Ok(live);
+    }
+    locks.retain(|_, entry| entry.strong_count() > 0);
+    let lock: OperationLock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key.to_string(), Arc::downgrade(&lock));
+    Ok(lock)
 }
 
 #[cfg(test)]
@@ -1879,6 +1940,156 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn a_committed_failure_also_clears_the_legacy_domain_hash() {
+        let db = test_db();
+        // A pre-lifecycle host recorded this submission in the legacy column.
+        db.conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash=?1 WHERE round_id=?2 AND bundle_index=0",
+                rusqlite::params![TX_HASH, ROUND_ID],
+            )
+            .unwrap();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            r#"{"height":42,"code":7,"log":"deliver failed","events":[]}"#,
+        )));
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+
+        let outcome = lifecycle.reconcile(&identity, &|| false).await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ChainLifecycleOutcome::Rejected { code: 7, .. }
+        ));
+        // The domain column is a reconciliation source too, so leaving the
+        // failed hash there would rediscover it forever and never dispatch a
+        // replacement.
+        assert_eq!(db.get_delegation_tx_hash(ROUND_ID, 0).unwrap(), None);
+        let next = lifecycle.reconcile(&identity, &|| false).await.unwrap();
+        assert_eq!(
+            next,
+            ChainLifecycleOutcome::Pending {
+                known_tx_hashes: Vec::new()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_never_clears_a_confirmed_domain_hash() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash=?1, van_leaf_position=5
+                  WHERE round_id=?2 AND bundle_index=0",
+                rusqlite::params![TX_HASH, ROUND_ID],
+            )
+            .unwrap();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            r#"{"height":42,"code":7,"log":"deliver failed","events":[]}"#,
+        )));
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // A recorded confirmation position means this row is not the failed
+        // candidate's, so retirement must leave it alone.
+        assert_eq!(
+            db.get_delegation_tx_hash(ROUND_ID, 0).unwrap().as_deref(),
+            Some(TX_HASH)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_observed_before_the_no_candidate_fast_path() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| true)
+            .await
+            .unwrap();
+
+        // With no known candidate there is nothing to look up, but a cancelled
+        // operation must not be presented to the host as actively pending.
+        assert_eq!(outcome, ChainLifecycleOutcome::Cancelled);
+    }
+
+    #[test]
+    fn confirmation_persists_under_the_captured_wallet() {
+        let db = test_db();
+        let events = vec![crate::confirmation::TxEvent {
+            event_type: "delegate_vote".to_string(),
+            attributes: vec![
+                crate::confirmation::TxEventAttribute {
+                    key: "vote_round_id".to_string(),
+                    value: ROUND_ID.to_string(),
+                },
+                crate::confirmation::TxEventAttribute {
+                    key: "leaf_index".to_string(),
+                    value: "5".to_string(),
+                },
+            ],
+        }];
+        // The host switches accounts after this operation captured its wallet.
+        db.set_wallet_id("wallet-2");
+
+        apply_confirmation(
+            &db,
+            WALLET,
+            &ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+            TX_HASH,
+            &ChainTxConfirmation {
+                height: 9,
+                code: 0,
+                log: String::new(),
+                events,
+            },
+        )
+        .unwrap();
+
+        let stored: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT delegation_tx_hash FROM bundles
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                rusqlite::params![ROUND_ID, WALLET],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(TX_HASH));
+    }
+
+    #[test]
+    fn the_identity_lock_registry_is_bounded_by_live_operations() {
+        let key = format!("registry-test/{ROUND_ID}/delegation/0/-1");
+        for _ in 0..64 {
+            let lock = operation_lock(&key).unwrap();
+            // Two live acquisitions of one identity must share one mutex, or
+            // the lock would stop serializing that identity.
+            let concurrent = operation_lock(&key).unwrap();
+            assert!(Arc::ptr_eq(&lock, &concurrent));
+            // Only the registry's weak reference survives this scope.
+            assert_eq!(Arc::strong_count(&lock), 2);
+        }
+        // A long-lived wallet moves through many identities; each must become
+        // reclaimable once its operation ends rather than being retained for
+        // the process lifetime.
+        let after = operation_lock(&key).unwrap();
+        assert_eq!(Arc::strong_count(&after), 1);
     }
 
     #[test]

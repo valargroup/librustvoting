@@ -142,7 +142,11 @@ for its exact attempt.
    entered the mempool, so leaving its hash in the candidate set would have
    lookup report it as pending and block the replacement payload forever. An
    attempt whose transaction is later found to have committed with a nonzero
-   code is transitioned to rejected for the same reason.
+   code is transitioned to rejected for the same reason, and so is the legacy
+   domain hash it came from, which is also a reconciliation source. Clearing a
+   domain hash is scoped to an exact match on a row with no recorded
+   confirmation position, so retirement can only remove a hash this
+   reconciliation just proved failed.
 8. Routine session reset and recovery cleanup do not delete chain submission
    attempts, and they do not erase material an attempt still covers. Coverage
    is scoped to the exact attempted submission: a singleton attempt covers its
@@ -320,21 +324,32 @@ hosts do not parse the log.
    write, and reservation in the operation uses that captured wallet. A host
    that switches accounts mid-flight therefore cannot lose an accepted hash to a
    zero-row update, nor leave a definitely-unsent reservation behind; the
-   confirmation write additionally refuses to run under a different wallet.
-2. After acquiring the lock, the lifecycle re-reads the exact durable recovery
+   confirmation write is performed under the captured wallet as well: the
+   `confirm_*_for_wallet` entry points take it as an argument rather than
+   re-reading mutable state, so there is no window between checking the wallet
+   and persisting under it.
+2. The identity lock registry holds weak references. Concurrent operations on
+   one identity still share a mutex, because a second acquisition upgrades the
+   entry the first is holding, but an identity with no live operation becomes
+   reclaimable. A long-lived wallet moves through many rounds and proposals, so
+   the registry must stay bounded by active identities rather than by every
+   identity the process has ever seen.
+3. After acquiring the lock, the lifecycle re-reads the exact durable recovery
    generation. A stale handle fails before network dispatch.
-3. Attempt insertion, its round and owner validation, and the payload rebuild
+4. Attempt insertion, its round and owner validation, and the payload rebuild
    that proves the generation is unchanged all share one immediate SQLite
    transaction. A generation replaced or cleared by another connection after
    the payload was serialized is therefore caught before dispatch, not merely
    before the lock was taken.
-4. Cancellation is checked before reservation, dispatch, retry, failover,
-   backoff, and confirmation application.
-5. Cancellation observed after a broadcast completes does not replace that
+5. Cancellation is checked on entry to reconciliation and before reservation,
+   dispatch, retry, failover, backoff, and confirmation application. The
+   entry check covers the no-candidate fast path, so a cancelled operation is
+   never reported to the host as actively pending.
+6. Cancellation observed after a broadcast completes does not replace that
    broadcast's result.
-6. Cancellation before a fresh reservation dispatches removes the definitely
+7. Cancellation before a fresh reservation dispatches removes the definitely
    unsent reservation. Cancellation after dispatch retains uncertainty.
-7. A deleted or replaced generation cannot receive a delayed transport or
+8. A deleted or replaced generation cannot receive a delayed transport or
    confirmation result. Cancellation is re-checked immediately before the
    confirmation transaction, so a session invalidated while a status request
    was in flight does not have voting state mutated underneath it. This narrows
@@ -414,7 +429,10 @@ state transitions.
   forever?
 - Can bundle pruning delete the state a possibly-committed transaction needs?
 - Can an account switch mid-flight lose an accepted hash or write to the wrong
-  wallet?
+  wallet, including between a wallet check and the write it guards?
+- Can a failed candidate survive in a legacy domain column after retirement?
+- Is cancellation observed even when there is nothing to look up?
+- Is the identity lock registry bounded by active identities?
 - Does `prelude` expose the lifecycle the crate documentation recommends?
 - Are retries byte-identical within one live call?
 - Is the software-delegation crash recovery gap still explicit?
@@ -470,7 +488,15 @@ state transitions.
 - `chain_submission::tests::an_unreadable_lookup_is_reported_unknown_and_still_blocks_rebroadcast`
   covers the `OutcomeUnknown` reconciliation outcome and its rebroadcast bar.
 - `chain_submission::tests::outcomes_are_journaled_under_the_wallet_that_reserved_them`
-  covers wallet capture across an account switch.
+  and `confirmation_persists_under_the_captured_wallet` cover wallet capture
+  across an account switch, for both the journal and the confirmation write.
+- `chain_submission::tests::a_committed_failure_also_clears_the_legacy_domain_hash`
+  and `retirement_never_clears_a_confirmed_domain_hash` cover domain-hash
+  retirement and its confirmed-row boundary.
+- `chain_submission::tests::cancellation_is_observed_before_the_no_candidate_fast_path`
+  covers the reconciliation entry cancellation check.
+- `chain_submission::tests::the_identity_lock_registry_is_bounded_by_live_operations`
+  covers shared locking for concurrent operations and reclamation afterwards.
 - `chain_submission::tests::a_padded_legacy_hash_is_treated_as_opaque` covers the
   whitespace-exact candidate rule.
 - `round::tests::delete_skipped_bundles_refuses_to_prune_an_attempted_bundle` and
