@@ -650,6 +650,10 @@ pub struct DelegationInputs {
     pub delegation_keys: DelegationKeys,
 }
 /// PCZT setup output that callers hand to a signer or QR encoder.
+///
+/// The exact serialized PCZT is persisted with its binding fields so an
+/// external signing request can be reconstructed after background proving or
+/// process restart without resampling setup randomness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegationSetup {
     pub pczt_bytes: Vec<u8>,
@@ -817,7 +821,7 @@ pub struct SignedDelegationBundle {
 /// Voting PCZT request that should be signed by an external signer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeystoneSigningRequest {
-    /// Full setup output persisted for later proof and submission assembly.
+    /// Exact full PCZT persisted by the delegation setup lifecycle.
     pub pczt_bytes: Vec<u8>,
     /// Redacted PCZT bytes safe to send to the signer role.
     pub redacted_pczt_bytes: Vec<u8>,
@@ -1128,27 +1132,44 @@ impl PreparedDelegationBundle {
         )
     }
 
-    /// Builds the redacted Keystone signing request for this prepared bundle.
+    /// Builds or reloads the exact Keystone signing request for this bundle.
+    ///
+    /// Setup persists the serialized PCZT together with its write-once sighash
+    /// and randomized key. Repeated calls, including calls after ZKP #1 was
+    /// generated in the background, return that same PCZT instead of rebuilding
+    /// randomized signing state.
     pub fn keystone_request(
         &self,
         voting_db: &VotingDb,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<KeystoneSigningRequest, VotingError> {
-        let setup = self.setup(voting_db, stages)?;
-        let redacted_pczt_bytes = redact_delegation_pczt_for_signer(&setup.pczt_bytes)?;
+        self.ensure_setup(voting_db, stages)?;
+        let (pczt_bytes, stored_sighash, stored_rk) =
+            voting_db.get_delegation_pczt_fields(&self.round_id, self.bundle_index)?;
+        let persisted_sighash = array32("pczt_sighash", stored_sighash)?;
+        let recomputed_sighash = pczt_sighash(&pczt_bytes)?;
+        if recomputed_sighash != persisted_sighash {
+            return Err(VotingError::Internal {
+                message: "persisted delegation PCZT sighash does not match stored setup"
+                    .to_string(),
+            });
+        }
+        let rk = array32("rk", stored_rk)?;
+        let action_index = crate::action::delegation_pczt_action_index(&pczt_bytes, &rk)?;
+        let redacted_pczt_bytes = redact_delegation_pczt_for_signer(&pczt_bytes)?;
         let display_weight_zatoshi = crate::round::raw_bundle_weight(&self.bundle_note_infos)?;
         let display_memo = display_memo(&self.round_name, display_weight_zatoshi);
-        let action_index = crate::wire::BoundedU32::try_from(setup.action_index).map_err(|_| {
+        let action_index = crate::wire::BoundedU32::try_from(action_index).map_err(|_| {
             VotingError::InvalidInput {
-                message: format!("action_index {} does not fit u32", setup.action_index),
+                message: format!("action_index {action_index} does not fit u32"),
             }
         })?;
 
         Ok(KeystoneSigningRequest {
-            pczt_bytes: setup.pczt_bytes,
+            pczt_bytes,
             redacted_pczt_bytes,
-            pczt_sighash: setup.pczt_sighash.to_vec(),
-            rk: setup.rk.to_vec(),
+            pczt_sighash: persisted_sighash.to_vec(),
+            rk: rk.to_vec(),
             action_index: action_index.0,
             display_memo,
             eligible_weight_zatoshi: self.eligible_weight_zatoshi(),
@@ -1705,19 +1726,30 @@ mod tests {
             .unwrap();
         assert_eq!(operation_order.get(), 2);
 
-        match outcome {
+        let generated_pczt = match outcome {
             DelegationProofOutcome::Generated { proof, setup } => {
                 assert_eq!(proof, expected_proof);
-                assert!(!setup
-                    .expect("setup built by this call")
-                    .pczt_bytes
-                    .is_empty());
+                let pczt_bytes = setup.expect("setup built by this call").pczt_bytes;
+                assert!(!pczt_bytes.is_empty());
+                pczt_bytes
             }
             DelegationProofOutcome::Reused => panic!("proof should be generated"),
-        }
+        };
         assert!(voting_db
             .has_persisted_delegation_proof(&prepared.round_id, prepared.bundle_index)
             .unwrap());
+
+        let keystone_request = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        assert_eq!(keystone_request.pczt_bytes, generated_pczt);
+        assert!(!keystone_request.redacted_pczt_bytes.is_empty());
+        assert_eq!(
+            pczt_sighash(&keystone_request.pczt_bytes)
+                .unwrap()
+                .as_slice(),
+            keystone_request.pczt_sighash
+        );
 
         let reused = prepared
             .ensure_proof_with(
@@ -1763,6 +1795,40 @@ mod tests {
                 setup: None,
             }
         );
+    }
+
+    #[test]
+    fn ensure_proof_failure_preserves_generated_setup_for_keystone_retry() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+
+        let err = prepared
+            .ensure_proof_with(
+                &voting_db,
+                &crate::types::NoopProgressReporter,
+                || {
+                    Err(VotingError::Internal {
+                        message: "PIR precompute failed".to_string(),
+                    })
+                },
+                || panic!("proof must not run after precompute failure"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("PIR precompute failed"));
+        assert_eq!(
+            voting_db
+                .delegation_phase(&prepared.round_id, prepared.bundle_index)
+                .unwrap(),
+            DelegationPhase::PcztBuilt
+        );
+
+        let first = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let retried = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        assert_eq!(retried, first);
+        assert!(!first.pczt_bytes.is_empty());
     }
 
     #[test]

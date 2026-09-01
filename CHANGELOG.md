@@ -11,9 +11,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Added crate-owned delegation proof reuse through
   `DelegationPhase::has_persisted_proof`,
   `VotingDb::has_persisted_delegation_proof`, and
-  `PreparedDelegationBundle::{ensure_setup, ensure_proof}`. Wallets retain PIR
-  transport and retry ownership without recreating the durable phase state
-  machine.
+  `PreparedDelegationBundle::{ensure_setup, ensure_proof}`. The lifecycle also
+  persists the exact finalized PCZT with its write-once signing fields, so a
+  Keystone request can be reloaded after background proving or process restart.
+  Wallets retain PIR transport and retry ownership without recreating the
+  durable phase state machine.
 
 ### Fixed
 
@@ -21,7 +23,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   successful proof so wallets can resume signing without regenerating ZKP1.
   Existing databases whose released cleanup already erased those fields retain
   the old proof bytes but rebuild setup and ZKP1 instead of reusing a proof that
-  can no longer be signed.
+  can no longer be signed. Schema version 19 also rebuilds unsigned legacy
+  setup that predates durable PCZT storage while preserving proved, signed,
+  submitted, confirmed, and imported state.
 
 ## v3.1.0-rc.15
 

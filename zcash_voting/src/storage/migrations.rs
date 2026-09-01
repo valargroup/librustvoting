@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 18;
+const CURRENT_VERSION: u32 = 19;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -188,6 +188,50 @@ UPDATE proofs AS p
           AND b.tx1_effects IS NULL
    );",
     ),
+    (
+        18,
+        "ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;
+-- Existing unsigned setup predates durable PCZT storage. Its randomized
+-- binding fields cannot be paired with a newly generated signer request, so
+-- clear only locally rebuildable setup. Successful proofs, Keystone
+-- signatures, submitted delegations, confirmed delegations, and imported
+-- capabilities remain untouched.
+UPDATE bundles
+   SET van_comm_rand = NULL,
+       dummy_nullifiers = NULL,
+       rho_signed = NULL,
+       padded_note_data = NULL,
+       nf_signed = NULL,
+       cmx_new = NULL,
+       alpha = NULL,
+       rseed_signed = NULL,
+       rseed_output = NULL,
+       gov_comm = NULL,
+       total_note_value = NULL,
+       address_index = NULL,
+       rk = NULL,
+       gov_nullifiers_blob = NULL,
+       padded_note_secrets = NULL,
+       pczt_sighash = NULL,
+       tx1_effects = NULL
+ WHERE delegation_pczt IS NULL
+   AND note_positions_blob IS NOT NULL
+   AND delegation_tx_hash IS NULL
+   AND van_leaf_position IS NULL
+   AND bundle_index NOT IN (
+       SELECT bundle_index
+         FROM proofs
+        WHERE round_id = bundles.round_id
+          AND wallet_id = bundles.wallet_id
+          AND success = 1
+   )
+   AND bundle_index NOT IN (
+       SELECT bundle_index
+         FROM keystone_signatures
+        WHERE round_id = bundles.round_id
+          AND wallet_id = bundles.wallet_id
+   );",
+    ),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
@@ -318,8 +362,18 @@ mod tests {
         format!("{}{}", &schema[..start], &schema[start + next..])
     }
 
+    fn v18_schema() -> String {
+        let schema = include_str!("migrations/001_init.sql");
+        let stripped = schema.replace("    delegation_pczt     BLOB,\n", "");
+        assert_ne!(
+            stripped, schema,
+            "v18_schema must drop the column added at version 19"
+        );
+        stripped
+    }
+
     fn v16_schema() -> String {
-        without_helper_share_plans(include_str!("migrations/001_init.sql"))
+        without_helper_share_plans(&v18_schema())
     }
 
     fn v15_schema() -> String {
@@ -396,8 +450,54 @@ mod tests {
             &[],
             &[0x09; 32],
             &crate::tx1::placeholder_tx1_effects(),
+            &[0x0C],
             &[0x0A; 32],
             &gov_nullifiers,
+        )
+        .unwrap();
+    }
+
+    fn store_complete_v18_delegation_setup(conn: &Connection, bundle_index: u32) {
+        conn.execute(
+            "UPDATE bundles
+             SET van_comm_rand = ?1,
+                 dummy_nullifiers = ?2,
+                 rho_signed = ?3,
+                 padded_note_data = ?4,
+                 nf_signed = ?5,
+                 cmx_new = ?6,
+                 alpha = ?7,
+                 rseed_signed = ?8,
+                 rseed_output = ?9,
+                 gov_comm = ?10,
+                 total_note_value = 1,
+                 address_index = 0,
+                 padded_note_secrets = ?11,
+                 pczt_sighash = ?12,
+                 tx1_effects = ?13,
+                 rk = ?14,
+                 gov_nullifiers_blob = ?15
+             WHERE round_id = 'test-round'
+               AND wallet_id = 'wallet'
+               AND bundle_index = ?16",
+            rusqlite::params![
+                vec![0x01_u8; 32],
+                Vec::<u8>::new(),
+                vec![0x02_u8; 32],
+                Vec::<u8>::new(),
+                vec![0x03_u8; 32],
+                vec![0x04_u8; 32],
+                vec![0x05_u8; 32],
+                vec![0x06_u8; 32],
+                vec![0x07_u8; 32],
+                vec![0x08_u8; 32],
+                Vec::<u8>::new(),
+                vec![0x09_u8; 32],
+                crate::tx1::placeholder_tx1_effects(),
+                vec![0x0A_u8; 32],
+                vec![0x0B_u8; 32 * crate::governance::BUNDLE_NOTE_SLOTS],
+                bundle_index,
+            ],
         )
         .unwrap();
     }
@@ -428,8 +528,7 @@ mod tests {
     #[test]
     fn test_migrate_from_prelaunch_version_resets_existing_state() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("migrations/001_init.sql"))
-            .unwrap();
+        conn.execute_batch(&v18_schema()).unwrap();
         queries::insert_round(
             &conn,
             "wallet",
@@ -476,7 +575,10 @@ mod tests {
         .unwrap();
         queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
         conn.execute(
-            "UPDATE bundles SET van_comm_rand = ?1, gov_comm = ?2
+            "UPDATE bundles
+             SET van_comm_rand = ?1,
+                 gov_comm = ?2,
+                 delegation_tx_hash = 'submitted'
              WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 0",
             rusqlite::params![vec![0xAB_u8; 32], vec![0xCD_u8; 32]],
         )
@@ -595,8 +697,7 @@ mod tests {
     #[test]
     fn migrate_v17_repairs_legacy_cleaned_successful_proof() {
         let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("migrations/001_init.sql"))
-            .unwrap();
+        conn.execute_batch(&v18_schema()).unwrap();
         queries::insert_round(
             &conn,
             "wallet",
@@ -610,11 +711,11 @@ mod tests {
         queries::insert_bundle(&conn, "test-round", "wallet", 2, &[3]).unwrap();
         queries::insert_bundle(&conn, "test-round", "wallet", 3, &[4]).unwrap();
         queries::insert_bundle(&conn, "test-round", "wallet", 4, &[5]).unwrap();
-        store_complete_delegation_setup(&conn, 0);
-        store_complete_delegation_setup(&conn, 1);
-        store_complete_delegation_setup(&conn, 2);
-        store_complete_delegation_setup(&conn, 3);
-        store_complete_delegation_setup(&conn, 4);
+        store_complete_v18_delegation_setup(&conn, 0);
+        store_complete_v18_delegation_setup(&conn, 1);
+        store_complete_v18_delegation_setup(&conn, 2);
+        store_complete_v18_delegation_setup(&conn, 3);
+        store_complete_v18_delegation_setup(&conn, 4);
         queries::store_proof(&conn, "test-round", "wallet", 0, &[0xAC; 96]).unwrap();
         queries::store_proof(&conn, "test-round", "wallet", 1, &[0xBD; 96]).unwrap();
         queries::store_proof(&conn, "test-round", "wallet", 2, &[0xCE; 96]).unwrap();
@@ -744,6 +845,82 @@ mod tests {
         let regenerated =
             queries::load_delegation_submission_data(&conn, "test-round", "wallet", 0).unwrap();
         assert_eq!(regenerated.proof, vec![0xE0; 96]);
+    }
+
+    #[test]
+    fn migrate_v18_adds_durable_pczt_and_resets_only_unsigned_setup() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v18_schema()).unwrap();
+        queries::insert_round(
+            &conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        for bundle_index in 0..4 {
+            queries::insert_bundle(
+                &conn,
+                "test-round",
+                "wallet",
+                bundle_index,
+                &[bundle_index as u64],
+            )
+            .unwrap();
+            store_complete_v18_delegation_setup(&conn, bundle_index);
+        }
+        queries::store_proof(&conn, "test-round", "wallet", 1, &[0xA1; 96]).unwrap();
+        queries::store_keystone_signature(
+            &conn,
+            "test-round",
+            "wallet",
+            2,
+            &[0xA2; 64],
+            &[0x09; 32],
+            &[0x0A; 32],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE bundles SET delegation_tx_hash = 'submitted'
+             WHERE round_id = 'test-round'
+               AND wallet_id = 'wallet'
+               AND bundle_index = 3",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 18).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert!(table_columns(&conn, "bundles").contains(&"delegation_pczt".to_string()));
+        let setup_presence = |bundle_index| {
+            conn.query_row(
+                "SELECT pczt_sighash IS NOT NULL,
+                        rk IS NOT NULL,
+                        delegation_pczt IS NOT NULL
+                 FROM bundles
+                 WHERE round_id = 'test-round'
+                   AND wallet_id = 'wallet'
+                   AND bundle_index = ?1",
+                [bundle_index],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? != 0,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(setup_presence(0), (false, false, false));
+        assert_eq!(setup_presence(1), (true, true, false));
+        assert_eq!(setup_presence(2), (true, true, false));
+        assert_eq!(setup_presence(3), (true, true, false));
+
+        store_complete_delegation_setup(&conn, 0);
+        assert_eq!(setup_presence(0), (true, true, true));
     }
 
     #[test]

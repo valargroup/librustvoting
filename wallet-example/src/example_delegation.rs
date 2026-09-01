@@ -428,28 +428,28 @@ where
         .context("assemble signed delegation submission")
 }
 
-/// Builds TX1, the redacted Keystone signing transaction for one bundle.
+/// Builds or reloads TX1 and the redacted Keystone signing request for a bundle.
 ///
 /// TX1 is a consensus-shaped Zcash PCZT used to obtain a ZIP-244 SpendAuth
 /// signature. It is not the vote-chain delegation submission and must never be
 /// broadcast to the Zcash network. The returned request includes signer-facing
-/// redacted PCZT bytes, display metadata, bundle weights, and the local setup
-/// needed to verify and submit the later signed PCZT.
+/// redacted PCZT bytes, display metadata, bundle weights, and the exact
+/// crate-persisted setup needed to verify and submit the later signed PCZT.
 ///
 /// # Errors
 ///
-/// Returns an error if PCZT setup fails, redaction fails, or bundle weight
-/// cannot be calculated.
+/// Returns an error if PCZT setup or durable reload fails, redaction fails, or
+/// bundle weight cannot be calculated.
 pub fn build_keystone_delegation_request(
     voting_db: &VotingDb,
     prepared: &PreparedDelegationBundle,
 ) -> Result<KeystoneSigningRequest> {
-    // Build the full governance PCZT. The signer only receives the redacted
-    // bytes, but the complete setup is needed for later proof/submission checks.
+    // Ensure the full governance PCZT exists, then reload that exact request.
+    // The signer receives only its redacted view.
     let progress = NoopProgressReporter;
     prepared
         .keystone_request(voting_db, &progress)
-        .context("build Keystone delegation request")
+        .context("build or reload Keystone delegation request")
 }
 
 /// Proves a bundle and assembles a submission from a Keystone-signed PCZT.

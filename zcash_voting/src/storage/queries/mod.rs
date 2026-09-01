@@ -999,11 +999,13 @@ pub fn store_delegation_data(
         Some(tx1_effects),
         None,
         None,
+        None,
     )
 }
 
-/// Persist delegation action data, the finalized TX1 effects, and PCZT-derived
-/// public inputs that the later delegation proof must reproduce.
+/// Persist delegation action data, the exact TX1 PCZT, finalized TX1 effects,
+/// and PCZT-derived public inputs that later signing and proof generation must
+/// reproduce.
 pub(crate) fn store_delegation_data_with_pczt_fields(
     conn: &Connection,
     round_id: &str,
@@ -1024,6 +1026,7 @@ pub(crate) fn store_delegation_data_with_pczt_fields(
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     pczt_sighash: &[u8],
     tx1_effects: &[u8],
+    delegation_pczt: &[u8],
     rk: &[u8],
     gov_nullifiers: &[Vec<u8>],
 ) -> Result<(), VotingError> {
@@ -1048,6 +1051,7 @@ pub(crate) fn store_delegation_data_with_pczt_fields(
         padded_note_secrets,
         pczt_sighash,
         Some(tx1_effects),
+        Some(delegation_pczt),
         Some(rk),
         Some(gov_nullifiers_blob.as_slice()),
     )
@@ -1073,6 +1077,7 @@ fn store_delegation_data_inner(
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     pczt_sighash: &[u8],
     tx1_effects: Option<&[u8]>,
+    delegation_pczt: Option<&[u8]>,
     rk: Option<&[u8]>,
     gov_nullifiers_blob: Option<&[u8]>,
 ) -> Result<(), VotingError> {
@@ -1093,22 +1098,29 @@ fn store_delegation_data_inner(
     // Serialize padded_note_secrets as flat blob: N * 64 bytes (rho[32] || rseed[32] per entry).
     let secrets_blob = encode_padded_note_secrets(padded_note_secrets);
 
-    let existing: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+    let existing: Option<(
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    )> = conn
         .query_row(
-            "SELECT padded_note_secrets, pczt_sighash, tx1_effects FROM bundles \
+            "SELECT padded_note_secrets, pczt_sighash, tx1_effects, delegation_pczt FROM bundles \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| VotingError::Internal {
             message: format!("failed to load existing delegation data: {}", e),
         })?;
-    let Some((existing_secrets, existing_sighash, existing_tx1_effects)) = existing else {
+    let Some((existing_secrets, existing_sighash, existing_tx1_effects, existing_delegation_pczt)) =
+        existing
+    else {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "bundle not found: round={}, bundle={}",
@@ -1146,6 +1158,18 @@ fn store_delegation_data_inner(
             });
         }
     }
+    if let (Some(existing_delegation_pczt), Some(delegation_pczt)) =
+        (existing_delegation_pczt, delegation_pczt)
+    {
+        if existing_delegation_pczt != delegation_pczt {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "refusing to overwrite delegation_pczt for round={}, bundle={}",
+                    round_id, bundle_index
+                ),
+            });
+        }
+    }
 
     let rows = conn
         .execute(
@@ -1157,6 +1181,7 @@ fn store_delegation_data_inner(
              padded_note_secrets = COALESCE(padded_note_secrets, :secrets), \
              pczt_sighash = COALESCE(pczt_sighash, :sighash), \
              tx1_effects = COALESCE(tx1_effects, :tx1_effects), \
+             delegation_pczt = COALESCE(delegation_pczt, :delegation_pczt), \
              rk = COALESCE(:rk, rk), \
              gov_nullifiers_blob = COALESCE(:gov_nullifiers_blob, gov_nullifiers_blob) \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
@@ -1176,6 +1201,7 @@ fn store_delegation_data_inner(
                 ":secrets": secrets_blob,
                 ":sighash": pczt_sighash,
                 ":tx1_effects": tx1_effects,
+                ":delegation_pczt": delegation_pczt,
                 ":rk": rk,
                 ":gov_nullifiers_blob": gov_nullifiers_blob,
                 ":round_id": round_id,
@@ -1391,6 +1417,33 @@ pub fn load_pczt_sighash(
     )
     .map_err(|e| VotingError::InvalidInput {
         message: format!("no pczt_sighash for round={}, bundle={} ({})", round_id, bundle_index, e),
+    })
+}
+
+/// Load the exact persisted delegation PCZT and its write-once signing fields.
+pub(crate) fn load_delegation_pczt_fields(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), VotingError> {
+    conn.query_row(
+        "SELECT delegation_pczt, pczt_sighash, rk FROM bundles
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .map_err(|e| VotingError::InvalidInput {
+        message: format!(
+            "no persisted delegation PCZT for round={}, bundle={} ({})",
+            round_id, bundle_index, e
+        ),
     })
 }
 
@@ -3205,7 +3258,8 @@ pub fn clear_unsigned_delegation_setup_fields(
              gov_nullifiers_blob = NULL,
              padded_note_secrets = NULL,
              pczt_sighash = NULL,
-             tx1_effects = NULL
+             tx1_effects = NULL,
+             delegation_pczt = NULL
          WHERE round_id = :round_id
            AND wallet_id = :wallet_id
            AND note_positions_blob IS NOT NULL

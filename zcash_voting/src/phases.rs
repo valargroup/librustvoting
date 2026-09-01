@@ -515,6 +515,7 @@ mod tests {
             &[],
             &[0x09; 32],
             &crate::tx1::placeholder_tx1_effects(),
+            &[0x0C],
             &[0x0A; 32],
             &gov_nullifiers,
         )
