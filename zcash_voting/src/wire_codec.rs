@@ -725,6 +725,7 @@ impl From<session::DelegationRecoveryWork> for DelegationRecoveryWorkView {
                 .as_str()
                 .to_string(),
             tx_hash: work.tx_hash,
+            candidate_tx_hashes: work.candidate_tx_hashes,
         }
     }
 }
@@ -736,6 +737,7 @@ impl From<session::VoteRecoveryWork> for VoteRecoveryWorkView {
             bundle_index: work.bundle_index,
             proposal_id: work.proposal_id,
             tx_hash: work.tx_hash,
+            candidate_tx_hashes: work.candidate_tx_hashes,
             vc_tree_position: work.vc_tree_position,
             share_indexes: work.share_indexes,
         }
@@ -1745,6 +1747,7 @@ mod tests {
                 bundle_index: 2,
                 phase: crate::phases::DelegationPhase::Submitted,
                 tx_hash: Some("delegation-tx".to_string()),
+                candidate_tx_hashes: vec!["delegation-tx".to_string()],
             }],
             recovered_vote_work: vec![
                 session::VoteRecoveryWork {
@@ -1752,6 +1755,7 @@ mod tests {
                     bundle_index: 4,
                     proposal_id: 12,
                     tx_hash: None,
+                    candidate_tx_hashes: Vec::new(),
                     vc_tree_position: None,
                     share_indexes: Vec::new(),
                 },
@@ -1760,6 +1764,7 @@ mod tests {
                     bundle_index: 5,
                     proposal_id: 13,
                     tx_hash: Some("batch-tx".to_string()),
+                    candidate_tx_hashes: vec!["batch-tx".to_string()],
                     vc_tree_position: None,
                     share_indexes: Vec::new(),
                 },
@@ -1768,6 +1773,7 @@ mod tests {
                     bundle_index: 6,
                     proposal_id: 14,
                     tx_hash: None,
+                    candidate_tx_hashes: Vec::new(),
                     vc_tree_position: Some(99),
                     share_indexes: vec![0, 1],
                 },

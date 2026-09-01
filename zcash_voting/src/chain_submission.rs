@@ -1038,7 +1038,14 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         let hashes = if committed_failures.is_empty() {
             hashes
         } else {
-            known_hashes(self.db, wallet_id, identity)?
+            let rebuilt = known_hashes(self.db, wallet_id, identity)?;
+            // That read can wait on SQLite, so cancellation may have arrived
+            // since the check above and every classification below is a claim
+            // this operation is no longer entitled to make.
+            if cancel() {
+                return Ok(ChainLifecycleOutcome::Cancelled);
+            }
+            rebuilt
         };
         if let Some((hash, response)) = successful.pop() {
             // The status request may have taken arbitrarily long. An account or
@@ -1988,6 +1995,42 @@ pub(crate) fn vote_candidate_hashes(
             hashes
                 .entry((bundle_index, proposal_id))
                 .or_insert_with(|| hash.clone());
+        }
+    }
+    Ok(hashes)
+}
+
+/// Every chain transaction that could identify one vote row.
+///
+/// The vote counterpart of [`delegation_candidates`], and the same rule: a
+/// caller shown one of two live candidates can wait on a transaction that never
+/// commits while the other does, which here also stalls the helper-share
+/// delivery that follows confirmation.
+pub(crate) fn vote_candidates(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Vec<String>, VotingError> {
+    let mut candidates = Vec::new();
+    if let Some(hash) =
+        queries::get_vote_tx_hash(conn, round_id, wallet_id, bundle_index, proposal_id)?
+    {
+        candidates.push(hash);
+    }
+    if let Some(hash) =
+        vote_candidate_hashes(conn, round_id, wallet_id)?.remove(&(bundle_index, proposal_id))
+    {
+        candidates.push(hash);
+    }
+    let mut hashes: Vec<String> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Ok(canonical) = crate::chain::normalize_tx_hash(&candidate) else {
+            continue;
+        };
+        if !hashes.contains(&canonical) {
+            hashes.push(canonical);
         }
     }
     Ok(hashes)

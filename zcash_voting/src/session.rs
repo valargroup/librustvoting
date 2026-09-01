@@ -379,7 +379,14 @@ pub struct DelegationRecoveryWork {
     pub bundle_index: u32,
     pub phase: DelegationPhase,
     /// Present only when `kind == DelegationRecoveryWorkKind::PollDelegation`.
+    ///
+    /// One candidate, for compatibility; see `candidate_tx_hashes`.
     pub tx_hash: Option<String>,
+    /// Every transaction that could identify this delegation.
+    ///
+    /// Polling one while another commits is how a confirmed delegation goes
+    /// unnoticed. `ChainSubmissionLifecycle::reconcile` checks them all.
+    pub candidate_tx_hashes: Vec<String>,
 }
 
 /// Durable delegation state for one eligible bundle.
@@ -439,7 +446,14 @@ pub struct VoteRecoveryWork {
     /// recovery anchor for batch work.
     pub proposal_id: u32,
     /// Present only for poll work.
+    ///
+    /// One candidate, for compatibility; see `candidate_tx_hashes`.
     pub tx_hash: Option<String>,
+    /// Every transaction that could identify this vote.
+    ///
+    /// Polling one while another commits leaves the vote unconfirmed, which
+    /// also stalls the helper-share delivery that follows confirmation.
+    pub candidate_tx_hashes: Vec<String>,
     /// Present only when `kind == VoteRecoveryWorkKind::SubmitShares`.
     pub vc_tree_position: Option<u64>,
     /// Empty unless `kind == VoteRecoveryWorkKind::SubmitShares`.
@@ -618,6 +632,7 @@ fn recovered_delegation_work_from_steps(
                     bundle_index,
                     phase,
                     tx_hash: None,
+                    candidate_tx_hashes: Vec::new(),
                 });
             }
             NextStep::PollDelegation { bundle_index } => {
@@ -634,8 +649,15 @@ fn recovered_delegation_work_from_steps(
                             "poll delegation step missing tx_hash for round={round_id}, bundle={bundle_index}"
                         ))
                     })?;
+                let candidate_tx_hashes = crate::chain_submission::delegation_candidates(
+                    &db.conn(),
+                    round_id,
+                    &db.wallet_id(),
+                    bundle_index,
+                )?;
                 work.push(DelegationRecoveryWork {
                     kind: DelegationRecoveryWorkKind::PollDelegation,
+                    candidate_tx_hashes,
                     bundle_index,
                     phase,
                     tx_hash: Some(tx_hash),
@@ -703,6 +725,7 @@ fn recovered_vote_work_from_steps(
                 bundle_index,
                 proposal_id,
                 tx_hash: None,
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: None,
                 share_indexes: Vec::new(),
             }),
@@ -714,6 +737,7 @@ fn recovered_vote_work_from_steps(
                 bundle_index,
                 proposal_id,
                 tx_hash: None,
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: None,
                 share_indexes: Vec::new(),
             }),
@@ -729,11 +753,19 @@ fn recovered_vote_work_from_steps(
                             "poll vote step missing tx_hash for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
                         ))
                     })?;
+                let candidate_tx_hashes = crate::chain_submission::vote_candidates(
+                    &db.conn(),
+                    round_id,
+                    &db.wallet_id(),
+                    bundle_index,
+                    proposal_id,
+                )?;
                 work.push(VoteRecoveryWork {
                     kind: VoteRecoveryWorkKind::PollVote,
                     bundle_index,
                     proposal_id,
                     tx_hash: Some(tx_hash),
+                    candidate_tx_hashes,
                     vc_tree_position: None,
                     share_indexes: Vec::new(),
                 });
@@ -750,11 +782,19 @@ fn recovered_vote_work_from_steps(
                             "poll vote batch step missing tx_hash for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
                         ))
                     })?;
+                let candidate_tx_hashes = crate::chain_submission::vote_candidates(
+                    &db.conn(),
+                    round_id,
+                    &db.wallet_id(),
+                    bundle_index,
+                    proposal_id,
+                )?;
                 work.push(VoteRecoveryWork {
                     kind: VoteRecoveryWorkKind::PollVoteBatch,
                     bundle_index,
                     proposal_id,
                     tx_hash: Some(tx_hash),
+                    candidate_tx_hashes,
                     vc_tree_position: None,
                     share_indexes: Vec::new(),
                 });
@@ -828,6 +868,7 @@ fn push_submit_share_work(
         bundle_index,
         proposal_id,
         tx_hash: None,
+        candidate_tx_hashes: Vec::new(),
         vc_tree_position: Some(vc_tree_position),
         share_indexes: vec![share_index],
     });
@@ -1804,6 +1845,7 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Submitted,
                 tx_hash: Some("a".repeat(64)),
+                candidate_tx_hashes: vec!["a".repeat(64)],
             }]
         );
         // The canonical status field describes the same bundle, so it has to
@@ -1851,6 +1893,47 @@ mod tests {
         // commits while the other does, and never apply its VAN position.
         assert_eq!(
             status.candidate_tx_hashes,
+            vec!["b".repeat(64), "a".repeat(64)]
+        );
+    }
+
+    #[test]
+    fn two_different_vote_candidates_are_both_exposed() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+        db.conn()
+            .execute(
+                "UPDATE votes SET tx_hash=?3
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=2",
+                rusqlite::params![ROUND, W, "b".repeat(64)],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, 2, X'', ?3, ?4, 'accepted', 1, 1)",
+                rusqlite::params![ROUND, W, vec![0xCC_u8; 32], "a".repeat(64)],
+            )
+            .unwrap();
+
+        let work = resume_plan(&db, ROUND, &[1, 2, 3])
+            .unwrap()
+            .recovered_vote_work
+            .into_iter()
+            .find(|work| work.kind == VoteRecoveryWorkKind::PollVote)
+            .expect("poll work");
+
+        // Polling one while the other commits leaves the vote unconfirmed, and
+        // that also stalls the helper-share delivery that follows confirmation.
+        assert_eq!(
+            work.candidate_tx_hashes,
             vec!["b".repeat(64), "a".repeat(64)]
         );
     }
@@ -1920,6 +2003,7 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Prepared,
                 tx_hash: None,
+                candidate_tx_hashes: Vec::new(),
             }]
         );
     }
@@ -2111,6 +2195,7 @@ mod tests {
                 bundle_index: 0,
                 proposal_id: 2,
                 tx_hash: Some("vtx".to_string()),
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: None,
                 share_indexes: Vec::new(),
             }]
@@ -2174,6 +2259,7 @@ mod tests {
                 bundle_index: 0,
                 proposal_id: 2,
                 tx_hash: Some("vtx".to_string()),
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: None,
                 share_indexes: Vec::new(),
             }]
@@ -2219,6 +2305,7 @@ mod tests {
                 bundle_index: 0,
                 proposal_id: 1,
                 tx_hash: Some("batch-tx".to_string()),
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: None,
                 share_indexes: Vec::new(),
             }]
@@ -2253,6 +2340,7 @@ mod tests {
                 bundle_index: 0,
                 proposal_id: 2,
                 tx_hash: None,
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: None,
                 share_indexes: Vec::new(),
             }]
@@ -2286,6 +2374,7 @@ mod tests {
                 bundle_index: 0,
                 proposal_id: 1,
                 tx_hash: None,
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: None,
                 share_indexes: Vec::new(),
             }]
@@ -2462,6 +2551,7 @@ mod tests {
                 bundle_index: 0,
                 proposal_id: 1,
                 tx_hash: Some("batch-tx".to_string()),
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: None,
                 share_indexes: Vec::new(),
             }]
@@ -2853,6 +2943,7 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Submitted,
                 tx_hash: Some("dtx".to_string()),
+                candidate_tx_hashes: Vec::new(),
             }]
         );
     }
@@ -3035,6 +3126,7 @@ mod tests {
                 bundle_index: 1,
                 proposal_id: 1,
                 tx_hash: None,
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: Some(42),
                 share_indexes: vec![0, 1],
             }]
@@ -3231,6 +3323,7 @@ mod tests {
                 bundle_index: 0,
                 proposal_id: 2,
                 tx_hash: None,
+                candidate_tx_hashes: Vec::new(),
                 vc_tree_position: Some(42),
                 share_indexes: vec![0],
             }]

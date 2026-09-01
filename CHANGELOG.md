@@ -58,11 +58,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   different transaction.
 - `ChainClient::transaction_status` observes cancellation as soon as each
   endpoint request returns, before classifying the response.
-- `DelegationStatus` and its FFI view gain `candidate_tx_hashes`, every
-  transaction that could identify the delegation. The domain column and the
+- `DelegationStatus`, `DelegationRecoveryWork`, `VoteRecoveryWork`, and their
+  FFI views gain `candidate_tx_hashes`, every transaction that could identify
+  the submission. The domain column and the
   attempt journal can hold different hashes, and a host shown only one can wait
   on a transaction that never commits while the other does. `tx_hash` keeps its
   existing meaning, including opaque legacy identifiers the candidate set omits.
+- Cancellation is rechecked after the candidate set is rebuilt following
+  retirement, before the submission is classified.
 - Reconciliation no longer reports a committed failure as terminal while a
   candidate journaled during the lookup may still commit, and the candidate list
   it reports is rebuilt after retirement so a transaction just proven failed is

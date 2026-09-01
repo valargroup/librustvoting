@@ -382,7 +382,11 @@ pub struct DelegationRecoveryWorkView {
     pub kind: String,
     pub bundle_index: u32,
     pub phase: String,
+    /// One candidate, for compatibility; see `candidate_tx_hashes`.
     pub tx_hash: Option<String>,
+    /// Every transaction that could identify this delegation.
+    #[serde(default)]
+    pub candidate_tx_hashes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,7 +394,11 @@ pub struct VoteRecoveryWorkView {
     pub kind: String,
     pub bundle_index: u32,
     pub proposal_id: u32,
+    /// One candidate, for compatibility; see `candidate_tx_hashes`.
     pub tx_hash: Option<String>,
+    /// Every transaction that could identify this vote.
+    #[serde(default)]
+    pub candidate_tx_hashes: Vec<String>,
     pub vc_tree_position: Option<u64>,
     pub share_indexes: Vec<u32>,
 }
