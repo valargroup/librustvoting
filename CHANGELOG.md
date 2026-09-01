@@ -41,6 +41,16 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   reservation this process could still be waiting on, or that another process
   may still have in flight, is left alone, so neither a second handle nor a
   second process can strip an in-flight POST's coverage.
+- Adopting a chain candidate a lookup proved committed now clears a different
+  unconfirmed transaction hash left in the delegation or vote domain column
+  first. The domain writers refuse to overwrite a stored hash, so an opaque
+  identifier recorded before the lifecycle existed, or one written concurrently
+  through the legacy API, previously made the confirmation fail on every
+  reconciliation and left the VAN or VC position unset permanently.
+- `ChainClientConfig::with_request_timeout` now rejects a deadline above five
+  minutes. The deadline bounds how long an attempt reservation stays
+  `attempting`, which is what distinguishes a POST another process may still
+  have in flight from an abandoned reservation.
 - A chain submission attempt's own definite rejection or non-retryable transport
   failure no longer reports a terminal outcome while a known candidate for the
   same submission is still outstanding. A candidate another writer recorded

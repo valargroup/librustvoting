@@ -137,11 +137,14 @@ exist to stop.
 
 A reservation is `attempting` only between its journaling and the response
 classification that follows its POST, so it cannot outlive that call's request
-deadline by more than scheduling slop. The grace period is therefore set far
-above any workable deadline, which also bounds the freeze a crashed reservation
-causes by minutes rather than by the life of the round. Evidence is unchanged by
-the downgrade either way: both states mean the same thing to every candidate and
-live-attempt query.
+deadline by more than scheduling slop. The grace period is derived from the
+largest deadline a host may configure rather than chosen independently, and the
+client refuses a longer one: the coverage query cannot see a per-call client
+configuration, so without that cap a host could configure the distinction away
+and make a live reservation look abandoned. The grace period also bounds the
+freeze a crashed reservation causes by minutes rather than by the life of the
+round. Evidence is unchanged by the downgrade either way: both states mean the
+same thing to every candidate and live-attempt query.
 
 Dropping coverage cannot produce the mismatch the cleanup guards exist to
 prevent. Attaching a transaction's hash and event-derived positions to a
@@ -330,7 +333,9 @@ body limit and `application/json` content type even when a custom transport
 does not.
 
 Caller-configurable durations must be nonzero and representable by Tokio's
-monotonic clock. Endpoint lists must be nonempty, canonical HTTP or HTTPS base
+monotonic clock. The request deadline additionally has an upper bound, because it
+is what limits how long an attempt reservation can stay `attempting`, and the
+interrupted-reservation downgrade is derived from that limit. Endpoint lists must be nonempty, canonical HTTP or HTTPS base
 URLs without credentials, query, or fragment, and distinct after
 canonicalization. Invalid endpoint configuration fails before storage or
 network effects.
@@ -417,12 +422,24 @@ hosts do not parse the log.
    `OutcomeUnknown`, never as `Pending`. A broken or incompatible endpoint must
    stay distinguishable from a genuine 404, and an unresolved candidate blocks
    rebroadcast exactly as a pending one does, because it may still commit.
-8. The winning hash and event-derived positions are committed together by the
+8. Adopting a candidate this lookup proved committed first clears any *different*
+   unconfirmed hash in the domain column for that submission. The domain writers
+   refuse to overwrite a stored hash with a different one, so an opaque
+   identifier a pre-lifecycle host recorded — which the version-18 migration
+   preserves and candidate selection skips — or a hash a concurrent legacy
+   recording call wrote would otherwise make the confirmation transaction fail,
+   and fail identically on every later reconciliation, leaving the position unset
+   for good. Clearing is sound because consensus nullifiers let at most one
+   semantic action for an identity succeed, so a stored value that differs from a
+   proven success either failed, never landed, or is the same transaction under an
+   unrecognized encoding. It is scoped to rows with no recorded confirmation
+   position, and a batch clears exactly its own member rows.
+9. The winning hash and event-derived positions are committed together by the
    existing confirmation transaction. Attempt evidence is retained separately;
    a crash on either side is recoverable because the attempt hash and the
    domain record are both idempotent and neither overwrites conflicting state.
-9. Atomic-batch members advance together or not at all.
-10. Event round, bundle, proposal order, batch digest, and nullifier bindings
+10. Atomic-batch members advance together or not at all.
+11. Event round, bundle, proposal order, batch digest, and nullifier bindings
     are validated by the existing confirmation parser before writes.
 
 ## Concurrency and cancellation invariants
@@ -541,6 +558,9 @@ state transitions.
   that may return a transaction hash?
 - Can opening a second database handle, or a second process, strip an in-flight
   POST's coverage?
+- Can a configurable request deadline outlive the reservation grace period?
+- Can an unconfirmed hash already in a domain column block a proven success from
+  ever being applied?
 - Can a candidate another writer recorded mid-call be missed by a terminal
   rejection or a terminal transport failure?
 - Does dropping coverage for a hashless attempt still report its ambiguity?
@@ -640,6 +660,10 @@ state transitions.
 - `chain_submission::tests::a_committed_failure_also_clears_the_legacy_domain_hash`
   and `retirement_never_clears_a_confirmed_domain_hash` cover domain-hash
   retirement and its confirmed-row boundary.
+- `chain_submission::tests::adopting_a_success_clears_a_conflicting_unconfirmed_domain_hash`
+  covers adopting a proven success past an opaque legacy identifier, and
+  `chain::tests::request_timeout_is_bounded_so_a_reservation_cannot_outlive_the_grace`
+  covers the deadline cap the reservation grace period depends on.
 - `chain_submission::tests::cancellation_is_observed_before_the_no_candidate_fast_path`
   covers the reconciliation entry cancellation check.
 - `chain_submission::tests::the_identity_lock_registry_is_bounded_by_live_operations`

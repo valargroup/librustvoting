@@ -735,6 +735,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             for (failed_hash, _) in &committed_failures {
                 retire_failed_candidate(self.db, wallet_id, identity, failed_hash)?;
             }
+            clear_conflicting_domain_hash(self.db, wallet_id, identity, &hash)?;
             let confirmation = apply_confirmation(self.db, wallet_id, identity, &hash, &response)?;
             return Ok(ChainLifecycleOutcome::Confirmed {
                 tx_hash: hash,
@@ -1195,6 +1196,100 @@ fn retire_failed_candidate(
         .map_err(internal("commit failed candidate retirement"))
 }
 
+/// Clears an unconfirmed domain hash that would block adopting a proven success.
+///
+/// The delegation and vote writers refuse to overwrite a stored hash with a
+/// different one, so a domain column holding some other unconfirmed value makes
+/// the confirmation transaction fail. Reconciliation would then rediscover the
+/// same committed transaction on every call and fail the same way, leaving the
+/// VAN or VC position unset for good. Two ordinary histories produce that value:
+/// an opaque identifier a pre-lifecycle host recorded, which the version-18
+/// migration deliberately preserves and [`known_hashes`] deliberately skips, and
+/// a hash a concurrent legacy recording call wrote for a different transaction.
+///
+/// Clearing it is sound because `winning_hash` is a transaction this lookup just
+/// proved committed successfully, and consensus nullifiers make at most one
+/// semantic action for a submission identity succeed. The stored value therefore
+/// either failed, never landed, or is the same transaction under an encoding this
+/// SDK does not recognize; none of those may outrank the proven success.
+///
+/// Scoped like [`retire_failed_candidate`]: only rows with no recorded
+/// confirmation position are touched, so a confirmed hash can never be cleared,
+/// and a value equal to the winner is left alone so replay stays idempotent. A
+/// batch clears exactly its own member rows rather than widening to the bundle,
+/// because the match here is "differs from the winner" rather than an exact hash
+/// and would otherwise reach an unrelated singleton's live submission.
+fn clear_conflicting_domain_hash(
+    db: &VotingDb,
+    wallet_id: &str,
+    identity: &ChainSubmissionIdentity,
+    winning_hash: &str,
+) -> Result<(), VotingError> {
+    let mut conn = db.conn();
+    let proposals = match identity.kind {
+        ChainSubmissionKind::Delegation => {
+            conn.execute(
+                "UPDATE bundles SET delegation_tx_hash=NULL
+                  WHERE round_id=:round_id AND wallet_id=:wallet_id
+                    AND bundle_index=:bundle_index
+                    AND delegation_tx_hash IS NOT NULL
+                    AND delegation_tx_hash<>:winning_hash
+                    AND van_leaf_position IS NULL",
+                named_params! {
+                    ":round_id": identity.round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": i64::from(identity.bundle_index),
+                    ":winning_hash": winning_hash,
+                },
+            )
+            .map_err(internal("clear conflicting delegation domain hash"))?;
+            return Ok(());
+        }
+        ChainSubmissionKind::Vote => vec![identity.require_proposal_id()?],
+        ChainSubmissionKind::VoteBatch => {
+            match vote::load_vote_batch_recoveries_with_conn(
+                &conn,
+                wallet_id,
+                &identity.round_id,
+                identity.bundle_index,
+                identity.require_batch_digest()?,
+            ) {
+                Ok(recoveries) => recoveries
+                    .into_iter()
+                    .map(|recovery| recovery.proposal_id)
+                    .collect(),
+                // Without the member rows there is nothing to clear, and the
+                // confirmation below reports the missing recovery itself.
+                Err(VotingError::InvalidInput { .. }) => Vec::new(),
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(internal("begin conflicting vote hash cleanup"))?;
+    for proposal_id in proposals {
+        tx.execute(
+            "UPDATE votes SET tx_hash=NULL
+              WHERE round_id=:round_id AND wallet_id=:wallet_id
+                AND bundle_index=:bundle_index AND proposal_id=:proposal_id
+                AND tx_hash IS NOT NULL
+                AND tx_hash<>:winning_hash
+                AND vc_tree_position IS NULL",
+            named_params! {
+                ":round_id": identity.round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": i64::from(identity.bundle_index),
+                ":proposal_id": i64::from(proposal_id),
+                ":winning_hash": winning_hash,
+            },
+        )
+        .map_err(internal("clear conflicting vote domain hash"))?;
+    }
+    tx.commit()
+        .map_err(internal("commit conflicting vote hash cleanup"))
+}
+
 /// Every chain transaction hash that could identify this submission.
 ///
 /// Candidates come from two sources with different histories: the legacy domain
@@ -1334,12 +1429,21 @@ pub(crate) const CAN_STILL_LEARN_A_HASH: &str = "(chain_tx_hash IS NOT NULL OR s
 ///
 /// A row is `attempting` only between its reservation and the response
 /// classification that follows its POST, so it is bounded by that call's request
-/// deadline. Ten minutes is far beyond any workable deadline — the SDK default is
-/// ten seconds — while keeping the freeze a crashed reservation causes bounded by
-/// minutes rather than by the life of the round. A host that configures a request
-/// timeout above this loses only the cross-process half of the guard; the
-/// [`process_open_epoch`] half is exact and unaffected.
-const INTERRUPTED_RESERVATION_GRACE_SECS: i64 = 600;
+/// deadline. Deriving this from [`MAX_REQUEST_TIMEOUT`] rather than picking a
+/// number keeps the two from drifting apart: a host cannot configure a deadline
+/// that outlives the grace period and make a live reservation look abandoned.
+/// The doubling leaves room for the database work and scheduling either side of
+/// the request itself.
+///
+/// It also bounds the freeze a crashed reservation causes by minutes rather than
+/// by the life of the round.
+const INTERRUPTED_RESERVATION_GRACE_SECS: i64 =
+    2 * crate::chain::MAX_REQUEST_TIMEOUT.as_secs() as i64;
+
+#[cfg(test)]
+pub(crate) fn interrupted_reservation_grace_secs() -> i64 {
+    INTERRUPTED_RESERVATION_GRACE_SECS
+}
 
 /// When this process first opened a voting database.
 ///
@@ -3269,5 +3373,54 @@ mod tests {
         );
         drop(db);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn adopting_a_success_clears_a_conflicting_unconfirmed_domain_hash() {
+        let db = test_db();
+        // A pre-lifecycle host recorded an opaque identifier the v18 migration
+        // deliberately preserves. `known_hashes` skips it as a candidate, but
+        // the domain writer still refuses to overwrite it.
+        db.conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash='legacy-hash'
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                rusqlite::params![ROUND_ID, WALLET],
+            )
+            .unwrap();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let transport = Arc::new(MockTransport::default());
+        let events = serde_json::to_string(&delegate_vote_events("5")).unwrap();
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            &format!(r#"{{"height":42,"code":0,"log":"","events":{events}}}"#),
+        )));
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // Without clearing the conflict the confirmation transaction fails, and
+        // every later reconciliation rediscovers the same committed transaction
+        // and fails the same way: the VAN position stays unset for good.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::Confirmed { tx_hash, .. }
+                if tx_hash == TX_HASH),
+            "got {outcome:?}"
+        );
+        let (hash, position): (Option<String>, Option<i64>) = db
+            .conn()
+            .query_row(
+                "SELECT delegation_tx_hash, van_leaf_position FROM bundles
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                rusqlite::params![ROUND_ID, WALLET],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(hash.as_deref(), Some(TX_HASH));
+        assert_eq!(position, Some(5));
     }
 }

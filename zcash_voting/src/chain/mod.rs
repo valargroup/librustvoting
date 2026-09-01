@@ -21,6 +21,19 @@ use transport::{ChainResponse, ChainTransport, MAX_CHAIN_RESPONSE_BYTES};
 
 const API_PREFIX: [&str; 2] = ["shielded-vote", "v1"];
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest request deadline a host may configure.
+///
+/// An attempt reservation stays `attempting` from the moment it is journaled
+/// until the response to its POST is classified, so this deadline bounds how long
+/// one can be in flight. `chain_submission` relies on that bound to tell a
+/// reservation another process may still be waiting on from one whose process is
+/// gone, and it cannot see this configuration: the client is per-call, while the
+/// database is shared. Capping the deadline here keeps the two in a fixed
+/// relationship rather than leaving a host able to configure the distinction
+/// away. Five minutes is far beyond any workable deadline for a single HTTP
+/// request; the default is ten seconds.
+pub(crate) const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(4)];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +87,14 @@ impl Default for ChainClientConfig {
 impl ChainClientConfig {
     pub fn with_request_timeout(mut self, timeout: Duration) -> Result<Self, VotingError> {
         validate_duration(timeout, "request_timeout")?;
+        if timeout > MAX_REQUEST_TIMEOUT {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "request_timeout must be at most {} seconds",
+                    MAX_REQUEST_TIMEOUT.as_secs()
+                ),
+            });
+        }
         self.request_timeout = timeout;
         Ok(self)
     }
@@ -614,6 +635,24 @@ mod tests {
         assert_eq!(posts[0].1, posts[1].1);
         assert!(posts[0].0.starts_with("https://one.example/"));
         assert!(posts[1].0.starts_with("https://two.example/"));
+    }
+
+    #[test]
+    fn request_timeout_is_bounded_so_a_reservation_cannot_outlive_the_grace() {
+        ChainClientConfig::default()
+            .with_request_timeout(MAX_REQUEST_TIMEOUT)
+            .expect("the cap itself is configurable");
+        let error = ChainClientConfig::default()
+            .with_request_timeout(MAX_REQUEST_TIMEOUT + Duration::from_secs(1))
+            .unwrap_err();
+        assert!(error.to_string().contains("at most 300 seconds"), "{error}");
+        // `chain_submission` decides that a reservation untouched for longer
+        // than its grace period cannot be in flight anywhere. That holds only
+        // while no configurable deadline can keep one `attempting` for longer.
+        assert!(
+            i64::try_from(MAX_REQUEST_TIMEOUT.as_secs()).unwrap()
+                < crate::chain_submission::interrupted_reservation_grace_secs(),
+        );
     }
 
     #[test]
