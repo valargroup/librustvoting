@@ -6,6 +6,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+### Added
+
+- Added crate-owned delegation proof reuse through
+  `DelegationPhase::has_persisted_proof`,
+  `VotingDb::has_persisted_delegation_proof`, and
+  `PreparedDelegationBundle::{ensure_setup, ensure_proof}`. Wallets retain PIR
+  transport and retry ownership without recreating the durable phase state
+  machine.
+
 ### Fixed
 
 - Session cleanup now preserves delegation setup fields for bundles with a

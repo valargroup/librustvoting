@@ -695,6 +695,35 @@ pub struct DelegationProof {
     pub gov_nullifiers: [[u8; 32]; BUNDLE_NOTE_SLOTS],
 }
 
+/// Result of ensuring that one prepared delegation bundle has persisted setup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DelegationSetupOutcome {
+    /// This call built and persisted setup.
+    Generated(DelegationSetup),
+    /// Setup was already persisted by an earlier attempt.
+    Reused,
+    /// A successful proof was already persisted, so setup must not be rebuilt.
+    ProofAlreadyPersisted,
+}
+
+/// Result of ensuring that one prepared delegation bundle has a persisted ZKP #1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DelegationProofOutcome {
+    /// This call generated and persisted the proof.
+    Generated {
+        /// The newly generated proof and public submission fields.
+        proof: DelegationProof,
+        /// The PCZT setup built by this call.
+        ///
+        /// This is `None` when setup was already persisted by an earlier
+        /// attempt. Software signers can still load the persisted signing
+        /// request and assemble a signed bundle with empty `pczt_bytes`.
+        setup: Option<DelegationSetup>,
+    },
+    /// A successful proof was already persisted, so no setup or proving ran.
+    Reused,
+}
+
 /// Signature source used when assembling a delegation transaction payload.
 pub enum DelegationSigner {
     /// Signature that already covers the stored PCZT sighash.
@@ -947,6 +976,97 @@ impl PreparedDelegationBundle {
         )
     }
 
+    /// Ensures that this bundle's PCZT setup is persisted without rebuilding it.
+    ///
+    /// Hosts can call this while establishing a PIR connection, then pass the
+    /// same prepared bundle to [`PreparedDelegationBundle::ensure_proof`]. The
+    /// typed outcome distinguishes a newly built PCZT, reusable persisted setup,
+    /// and a proof that already completed. Callers do not need to match database
+    /// phases or storage error strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the persisted phase cannot be loaded or setup fails.
+    pub fn ensure_setup(
+        &self,
+        voting_db: &VotingDb,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<DelegationSetupOutcome, VotingError> {
+        match voting_db.delegation_phase(&self.round_id, self.bundle_index)? {
+            DelegationPhase::Prepared => self
+                .setup(voting_db, stages)
+                .map(DelegationSetupOutcome::Generated),
+            DelegationPhase::PcztBuilt => {
+                stages.on_progress(DelegationProgress::PcztBuilt);
+                Ok(DelegationSetupOutcome::Reused)
+            }
+            DelegationPhase::Proved | DelegationPhase::Submitted | DelegationPhase::Confirmed => {
+                stages.on_progress(DelegationProgress::ProofComplete);
+                Ok(DelegationSetupOutcome::ProofAlreadyPersisted)
+            }
+        }
+    }
+
+    /// Ensures that this bundle's setup, witness/PIR precompute, and ZKP #1 are
+    /// persisted.
+    ///
+    /// The crate owns the durable phase interpretation:
+    ///
+    /// - a prepared bundle builds setup before proving;
+    /// - a bundle with persisted setup reuses it without rebuilding randomized
+    ///   PCZT state; and
+    /// - a proved, submitted, or confirmed bundle returns
+    ///   [`DelegationProofOutcome::Reused`] without contacting PIR.
+    ///
+    /// Callers retain ownership of PIR transport construction and retries. A
+    /// retry with another client can call this method again on the same prepared
+    /// bundle; persisted setup is reused and a completed proof is not regenerated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the persisted phase cannot be loaded, setup or
+    /// precompute fails, or proof generation or persistence fails.
+    pub fn ensure_proof<C, P, CL, R>(
+        &self,
+        voting_db: &VotingDb,
+        wallet_db: &WalletDb<C, P, CL, R>,
+        pir_client: &pir_client::PirClientBlocking,
+        stages: &dyn DelegationProgressReporter,
+    ) -> Result<DelegationProofOutcome, VotingError>
+    where
+        C: Borrow<rusqlite::Connection>,
+        P: Parameters,
+    {
+        self.ensure_proof_with(
+            voting_db,
+            stages,
+            || {
+                self.precompute(voting_db, wallet_db, pir_client)
+                    .map(|_| ())
+            },
+            || self.prove(voting_db, pir_client, stages),
+        )
+    }
+
+    fn ensure_proof_with(
+        &self,
+        voting_db: &VotingDb,
+        stages: &dyn DelegationProgressReporter,
+        precompute: impl FnOnce() -> Result<(), VotingError>,
+        prove: impl FnOnce() -> Result<DelegationProof, VotingError>,
+    ) -> Result<DelegationProofOutcome, VotingError> {
+        let setup = match self.ensure_setup(voting_db, stages)? {
+            DelegationSetupOutcome::Generated(setup) => Some(setup),
+            DelegationSetupOutcome::Reused => None,
+            DelegationSetupOutcome::ProofAlreadyPersisted => {
+                return Ok(DelegationProofOutcome::Reused)
+            }
+        };
+        precompute()?;
+        let proof = prove()?;
+        Ok(DelegationProofOutcome::Generated { proof, setup })
+    }
+
     /// Assembles chain-ready submission fields for this prepared bundle.
     pub fn submission(
         &self,
@@ -962,9 +1082,9 @@ impl PreparedDelegationBundle {
     /// Assembles a signed delegation bundle plus wallet-facing metadata.
     ///
     /// Pass the full PCZT bytes returned by [`PreparedDelegationBundle::setup`]
-    /// for software signing. External signer flows that must not retain the PCZT
-    /// in the returned payload can pass an empty vector after verifying the
-    /// signature against the stored setup sighash.
+    /// when they are available. A resumed software or external signer flow can
+    /// pass an empty vector after signing or verifying the persisted setup
+    /// sighash.
     pub fn signed_bundle(
         &self,
         voting_db: &VotingDb,
@@ -1549,6 +1669,130 @@ mod tests {
     }
 
     #[test]
+    fn ensure_proof_builds_setup_and_reuses_the_persisted_proof() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        let expected_proof = test_delegation_proof();
+        let operation_order = std::cell::Cell::new(0);
+
+        let outcome = prepared
+            .ensure_proof_with(
+                &voting_db,
+                &crate::types::NoopProgressReporter,
+                || {
+                    assert_eq!(operation_order.get(), 0);
+                    operation_order.set(1);
+                    Ok(())
+                },
+                || {
+                    assert_eq!(operation_order.get(), 1);
+                    operation_order.set(2);
+                    assert_eq!(
+                        voting_db
+                            .delegation_phase(&prepared.round_id, prepared.bundle_index)
+                            .unwrap(),
+                        DelegationPhase::PcztBuilt
+                    );
+                    crate::storage::queries::store_proof(
+                        &voting_db.conn(),
+                        &prepared.round_id,
+                        &voting_db.wallet_id(),
+                        prepared.bundle_index,
+                        &expected_proof.bytes,
+                    )?;
+                    Ok(expected_proof.clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(operation_order.get(), 2);
+
+        match outcome {
+            DelegationProofOutcome::Generated { proof, setup } => {
+                assert_eq!(proof, expected_proof);
+                assert!(!setup
+                    .expect("setup built by this call")
+                    .pczt_bytes
+                    .is_empty());
+            }
+            DelegationProofOutcome::Reused => panic!("proof should be generated"),
+        }
+        assert!(voting_db
+            .has_persisted_delegation_proof(&prepared.round_id, prepared.bundle_index)
+            .unwrap());
+
+        let reused = prepared
+            .ensure_proof_with(
+                &voting_db,
+                &crate::types::NoopProgressReporter,
+                || panic!("persisted proof must not be precomputed again"),
+                || panic!("persisted proof must not be regenerated"),
+            )
+            .unwrap();
+        assert_eq!(reused, DelegationProofOutcome::Reused);
+    }
+
+    #[test]
+    fn ensure_proof_reuses_persisted_setup_without_rebuilding_it() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        prepared
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let expected_proof = test_delegation_proof();
+
+        let outcome = prepared
+            .ensure_proof_with(
+                &voting_db,
+                &crate::types::NoopProgressReporter,
+                || Ok(()),
+                || {
+                    crate::storage::queries::store_proof(
+                        &voting_db.conn(),
+                        &prepared.round_id,
+                        &voting_db.wallet_id(),
+                        prepared.bundle_index,
+                        &expected_proof.bytes,
+                    )?;
+                    Ok(expected_proof.clone())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            DelegationProofOutcome::Generated {
+                proof: expected_proof,
+                setup: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ensure_setup_reports_persisted_setup_and_proof_without_rebuilding() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        let generated = prepared
+            .ensure_setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        assert!(matches!(generated, DelegationSetupOutcome::Generated(_)));
+
+        let reused = prepared
+            .ensure_setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        assert_eq!(reused, DelegationSetupOutcome::Reused);
+
+        crate::storage::queries::store_proof(
+            &voting_db.conn(),
+            &prepared.round_id,
+            &voting_db.wallet_id(),
+            prepared.bundle_index,
+            &[0xAB; 96],
+        )
+        .unwrap();
+        let proved = prepared
+            .ensure_setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        assert_eq!(proved, DelegationSetupOutcome::ProofAlreadyPersisted);
+    }
+
+    #[test]
     fn delegation_note_selection_reuses_the_persisted_bundle_policy() {
         let voting_db = VotingDb::open_in_memory().unwrap();
         voting_db.set_wallet_id("delegation-persisted-policy");
@@ -1757,6 +2001,17 @@ mod tests {
             anchor_tree_state_bytes: vec![0xAA],
             network: Network::Testnet,
             round_name: "Demo Round".to_string(),
+        }
+    }
+
+    fn test_delegation_proof() -> DelegationProof {
+        DelegationProof {
+            bytes: vec![0xAB; 96],
+            rk: [0x11; 32],
+            nf_signed: [0x22; 32],
+            cmx_new: [0x33; 32],
+            van_comm: [0x44; 32],
+            gov_nullifiers: [[0x55; 32]; BUNDLE_NOTE_SLOTS],
         }
     }
 
