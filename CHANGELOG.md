@@ -25,7 +25,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - A ballot-intent change is refused while a non-rejected chain submission
   attempt still covers that vote or its batch, and recovery cleanup now scopes
   attempt protection to the attempted proposal or batch digest rather than the
-  whole bundle.
+  whole bundle. `delete_skipped_bundles` likewise refuses to prune a bundle
+  range that still holds a non-rejected attempt.
+- `normalize_tx_hash` no longer trims surrounding whitespace, so the client and
+  the storage boundary share one exact definition of a transaction hash.
 
 ### Fixed
 

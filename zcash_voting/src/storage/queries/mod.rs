@@ -2779,6 +2779,51 @@ pub fn delete_bundles_from(
             ),
         });
     }
+    // A submission attempt references its round, not its bundle, so deleting a
+    // bundle would cascade away the vote, proof, and recovery rows while the
+    // journal row survives. A transaction that later commits could then be
+    // neither rebuilt nor confirmed, even though the evidence that it may exist
+    // is still on disk.
+    let attempted: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM chain_submission_attempts
+                  WHERE round_id = :round_id AND wallet_id = :wallet_id
+                    AND bundle_index >= :from_index AND state <> 'rejected'
+             )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":from_index": from_index as i64,
+            },
+            |row| row.get(0),
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to check chain attempts before bundle deletion: {e}"),
+        })?;
+    if attempted {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} has a chain submission attempt at or after bundle {from_index} that may still commit; reconcile it before pruning bundles"
+            ),
+        });
+    }
+    // Attempts for pruned bundles are all definitively rejected by this point.
+    // Remove them with the bundles they describe rather than leaving journal
+    // rows that outlive their subject.
+    tx.execute(
+        "DELETE FROM chain_submission_attempts
+          WHERE round_id = :round_id AND wallet_id = :wallet_id
+            AND bundle_index >= :from_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":from_index": from_index as i64,
+        },
+    )
+    .map_err(|e| VotingError::Internal {
+        message: format!("failed to delete chain attempts for pruned bundles: {e}"),
+    })?;
 
     let rows = tx
         .execute(
@@ -2815,21 +2860,10 @@ pub fn delete_bundles_from(
 
 /// Canonical storage form of a transaction hash.
 ///
-/// Chain transaction hashes are 32 bytes rendered as 64 hexadecimal characters,
-/// and hexadecimal casing carries no meaning. The chain lifecycle learns hashes
-/// in lowercase, while the older recording APIs store whatever casing their
-/// caller passed. Canonicalizing at every persistence boundary stops one
-/// transaction from being stored, compared, and reconciled as two.
-///
-/// A value that is not exactly 64 hexadecimal characters is returned unchanged,
-/// so opaque legacy identifiers and test fixtures keep their existing meaning.
-pub(crate) fn canonical_tx_hash(value: &str) -> String {
-    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        value.to_ascii_lowercase()
-    } else {
-        value.to_string()
-    }
-}
+/// Re-exported from the chain client so the storage boundary and the client
+/// cannot disagree about what a transaction hash is; see
+/// [`crate::chain::canonical_tx_hash`].
+pub(crate) use crate::chain::canonical_tx_hash;
 
 pub fn store_delegation_tx_hash(
     conn: &Connection,

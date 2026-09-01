@@ -21,7 +21,7 @@ use crate::{
     delegate::{self, DelegationSigner, SignedDelegationBundle},
     storage::{queries, VotingDb},
     types::VotingError,
-    vote::{self, CommittedVote},
+    vote,
     wire::{
         DelegationConfirmation, DelegationSubmissionWire, VoteBatchConfirmation,
         VoteCommitmentBatchWire, VoteCommitmentWire, VoteConfirmation,
@@ -242,17 +242,22 @@ impl<'a> ChainSubmissionLifecycle<'a> {
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
         let round_id = bundle.submission.vote_round_id.clone();
         let identity = ChainSubmissionIdentity::delegation(&round_id, bundle.bundle_index);
-        let lock = operation_lock(&identity.lock_key(&self.db.wallet_id()))?;
+        let wallet_id = self.db.wallet_id();
+        let lock = operation_lock(&identity.lock_key(&wallet_id))?;
         let _guard = lock.lock().await;
-        let recovered = delegate::submission(
-            self.db,
-            &round_id,
-            bundle.bundle_index,
-            DelegationSigner::signature(
-                bundle.submission.spend_auth_sig,
-                bundle.submission.sighash,
-            ),
-        )?;
+        let recovered = {
+            let conn = self.db.conn();
+            delegate::submission_with_conn(
+                &conn,
+                &wallet_id,
+                &round_id,
+                bundle.bundle_index,
+                DelegationSigner::signature(
+                    bundle.submission.spend_auth_sig,
+                    bundle.submission.sighash,
+                ),
+            )?
+        };
         if recovered != bundle.submission {
             return Err(VotingError::InvalidInput {
                 message: "signed delegation does not match durable bundle generation".to_string(),
@@ -262,13 +267,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         let wire = DelegationSubmissionWire::try_from(&bundle.submission)?;
         let body = wire.to_json()?.into_bytes();
         let rebuild = delegation_rebuild(
-            self.db.wallet_id(),
+            wallet_id.clone(),
             round_id.clone(),
             bundle.bundle_index,
             bundle.submission.spend_auth_sig,
             bundle.submission.sighash,
         );
-        self.submit_body_locked(identity, body, &rebuild, cancel)
+        self.submit_body_locked(&wallet_id, identity, body, &rebuild, cancel)
             .await
     }
 
@@ -282,13 +287,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
         let identity = ChainSubmissionIdentity::delegation(round_id, bundle_index);
-        let lock = operation_lock(&identity.lock_key(&self.db.wallet_id()))?;
+        let wallet_id = self.db.wallet_id();
+        let lock = operation_lock(&identity.lock_key(&wallet_id))?;
         let _guard = lock.lock().await;
         let signature = decode_canonical_array::<64>(&wire.spend_auth_sig, "spend_auth_sig")?;
         let sighash = {
             let conn = self.db.conn();
-            let bytes =
-                queries::load_pczt_sighash(&conn, round_id, &self.db.wallet_id(), bundle_index)?;
+            let bytes = queries::load_pczt_sighash(&conn, round_id, &wallet_id, bundle_index)?;
             bytes
                 .try_into()
                 .map_err(|bytes: Vec<u8>| VotingError::Internal {
@@ -313,13 +318,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         }
         let body = expected.to_json()?.into_bytes();
         let rebuild = delegation_rebuild(
-            self.db.wallet_id(),
+            wallet_id.clone(),
             round_id.to_string(),
             bundle_index,
             signature,
             sighash,
         );
-        self.submit_body_locked(identity, body, &rebuild, cancel)
+        self.submit_body_locked(&wallet_id, identity, body, &rebuild, cancel)
             .await
     }
 
@@ -331,27 +336,28 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
         let identity = ChainSubmissionIdentity::vote(round_id, bundle_index, proposal_id);
-        let lock = operation_lock(&identity.lock_key(&self.db.wallet_id()))?;
-        let _guard = lock.lock().await;
-        let committed = CommittedVote::recover(self.db, round_id, bundle_index, proposal_id)?;
-        let signed = committed.signed_commitment(self.db)?;
-        let wire = VoteCommitmentWire::try_from(&signed)?;
-        let body = wire.to_json()?.into_bytes();
         let wallet_id = self.db.wallet_id();
-        let round_id = round_id.to_string();
+        let lock = operation_lock(&identity.lock_key(&wallet_id))?;
+        let _guard = lock.lock().await;
+        // `singleton_vote_body` loads and validates the exact recovery
+        // generation and refuses a member of a persisted atomic batch, so the
+        // outer body and the reservation rebuild share one implementation.
+        let body = {
+            let conn = self.db.conn();
+            singleton_vote_body(&conn, &wallet_id, round_id, bundle_index, proposal_id)?
+        };
+        let rebuild_wallet_id = wallet_id.clone();
+        let owned_round_id = round_id.to_string();
         let rebuild = move |conn: &rusqlite::Connection| -> Result<Vec<u8>, VotingError> {
-            let signed = vote::signed_commitment_with_conn(
+            singleton_vote_body(
                 conn,
-                &wallet_id,
-                &round_id,
+                &rebuild_wallet_id,
+                &owned_round_id,
                 bundle_index,
                 proposal_id,
-            )?;
-            Ok(VoteCommitmentWire::try_from(&signed)?
-                .to_json()?
-                .into_bytes())
+            )
         };
-        self.submit_body_locked(identity, body, &rebuild, cancel)
+        self.submit_body_locked(&wallet_id, identity, body, &rebuild, cancel)
             .await
     }
 
@@ -363,25 +369,35 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
         let lock_identity = ChainSubmissionIdentity::vote_batch(round_id, bundle_index, [0; 32]);
-        let lock = operation_lock(&lock_identity.lock_key(&self.db.wallet_id()))?;
+        let wallet_id = self.db.wallet_id();
+        let lock = operation_lock(&lock_identity.lock_key(&wallet_id))?;
         let _guard = lock.lock().await;
-        let batch = vote::recover_atomic_vote_batch(self.db, round_id, bundle_index, proposal_id)?;
+        let batch = {
+            let conn = self.db.conn();
+            vote::recover_atomic_vote_batch_with_conn(
+                &conn,
+                &wallet_id,
+                round_id,
+                bundle_index,
+                proposal_id,
+            )?
+        };
         let body = batch_body_from_json(&batch.batch_json)?;
         let identity =
             ChainSubmissionIdentity::vote_batch(round_id, bundle_index, batch.batch_digest);
-        let wallet_id = self.db.wallet_id();
+        let rebuild_wallet_id = wallet_id.clone();
         let owned_round_id = round_id.to_string();
         let rebuild = move |conn: &rusqlite::Connection| -> Result<Vec<u8>, VotingError> {
             let batch = vote::recover_atomic_vote_batch_with_conn(
                 conn,
-                &wallet_id,
+                &rebuild_wallet_id,
                 &owned_round_id,
                 bundle_index,
                 proposal_id,
             )?;
             batch_body_from_json(&batch.batch_json)
         };
-        self.submit_body_locked(identity, body, &rebuild, cancel)
+        self.submit_body_locked(&wallet_id, identity, body, &rebuild, cancel)
             .await
     }
 
@@ -390,26 +406,31 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         identity: &ChainSubmissionIdentity,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
-        let lock = operation_lock(&identity.lock_key(&self.db.wallet_id()))?;
+        let wallet_id = self.db.wallet_id();
+        let lock = operation_lock(&identity.lock_key(&wallet_id))?;
         let _guard = lock.lock().await;
-        self.reconcile_locked(identity, cancel).await
+        self.reconcile_locked(&wallet_id, identity, cancel).await
     }
 
     async fn submit_body_locked(
         &self,
+        wallet_id: &str,
         identity: ChainSubmissionIdentity,
         body: Vec<u8>,
         rebuild: PayloadRebuild<'_>,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
-        let existing = self.reconcile_locked(&identity, cancel).await?;
+        let existing = self.reconcile_locked(wallet_id, &identity, cancel).await?;
         match &existing {
             ChainLifecycleOutcome::Confirmed { .. }
             | ChainLifecycleOutcome::Rejected { .. }
             | ChainLifecycleOutcome::Cancelled => return Ok(existing),
-            ChainLifecycleOutcome::Pending { known_tx_hashes } if !known_tx_hashes.is_empty() => {
-                return Ok(existing)
-            }
+            // A known candidate that is pending, or whose status could not be
+            // read, must not be rebroadcast: it may still commit.
+            ChainLifecycleOutcome::Pending { known_tx_hashes }
+            | ChainLifecycleOutcome::OutcomeUnknown {
+                known_tx_hashes, ..
+            } if !known_tx_hashes.is_empty() => return Ok(existing),
             _ => {}
         }
 
@@ -421,7 +442,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
             if attempt_index > 0 {
-                let reconciled = self.reconcile_locked(&identity, cancel).await?;
+                let reconciled = self.reconcile_locked(wallet_id, &identity, cancel).await?;
                 if matches!(reconciled, ChainLifecycleOutcome::Confirmed { .. }) {
                     return Ok(reconciled);
                 }
@@ -431,9 +452,9 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // transaction. That repeats the delegation signature verification
             // and recovery reads up to `attempts` times per call, which is the
             // intended cost of proving the generation is still current.
-            let attempt_id = reserve_attempt(self.db, &identity, &digest, rebuild)?;
+            let attempt_id = reserve_attempt(self.db, wallet_id, &identity, &digest, rebuild)?;
             if cancel() {
-                delete_attempt(self.db, attempt_id)?;
+                delete_attempt(self.db, wallet_id, attempt_id)?;
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
 
@@ -443,21 +464,28 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 .await;
             match result {
                 Ok(ChainBroadcastOutcome::Accepted(result)) => {
-                    mark_attempt(self.db, attempt_id, "accepted", Some(&result.tx_hash))?;
+                    mark_attempt(
+                        self.db,
+                        wallet_id,
+                        attempt_id,
+                        "accepted",
+                        Some(&result.tx_hash),
+                    )?;
                     return Ok(ChainLifecycleOutcome::Accepted {
                         tx_hash: result.tx_hash,
                     });
                 }
                 Ok(ChainBroadcastOutcome::Rejected(result)) => {
                     let tx_hash = (!result.tx_hash.is_empty()).then_some(result.tx_hash.as_str());
-                    mark_attempt(self.db, attempt_id, "rejected", tx_hash)?;
+                    mark_attempt(self.db, wallet_id, attempt_id, "rejected", tx_hash)?;
                     if is_spent_nullifier_log(&result.log) {
-                        let reconciled = self.reconcile_locked(&identity, cancel).await?;
+                        let reconciled =
+                            self.reconcile_locked(wallet_id, &identity, cancel).await?;
                         if matches!(reconciled, ChainLifecycleOutcome::Confirmed { .. }) {
                             return Ok(reconciled);
                         }
                         return Ok(ChainLifecycleOutcome::AlreadySpentUnresolved {
-                            known_tx_hashes: known_hashes(self.db, &identity)?,
+                            known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
                             log: result.log,
                         });
                     }
@@ -467,11 +495,11 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     });
                 }
                 Ok(ChainBroadcastOutcome::OutcomeUnknown { message }) => {
-                    mark_attempt(self.db, attempt_id, "outcome_unknown", None)?;
+                    mark_attempt(self.db, wallet_id, attempt_id, "outcome_unknown", None)?;
                     last_unknown = Some(message);
                 }
                 Ok(ChainBroadcastOutcome::Cancelled) => {
-                    mark_attempt(self.db, attempt_id, "outcome_unknown", None)?;
+                    mark_attempt(self.db, wallet_id, attempt_id, "outcome_unknown", None)?;
                     return Ok(ChainLifecycleOutcome::Cancelled);
                 }
                 Err(error) => {
@@ -482,16 +510,16 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                         )
                     );
                     if definitely_unsent {
-                        delete_attempt(self.db, attempt_id)?;
+                        delete_attempt(self.db, wallet_id, attempt_id)?;
                     } else if error.is_ambiguous() {
-                        mark_attempt(self.db, attempt_id, "outcome_unknown", None)?;
+                        mark_attempt(self.db, wallet_id, attempt_id, "outcome_unknown", None)?;
                     } else {
-                        mark_attempt(self.db, attempt_id, "rejected", None)?;
+                        mark_attempt(self.db, wallet_id, attempt_id, "rejected", None)?;
                     }
                     if !error.is_retryable() || attempt_index + 1 == attempts {
                         if error.is_ambiguous() {
                             return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                                known_tx_hashes: known_hashes(self.db, &identity)?,
+                                known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
                                 message: error.to_string(),
                             });
                         }
@@ -510,17 +538,18 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         }
 
         Ok(ChainLifecycleOutcome::OutcomeUnknown {
-            known_tx_hashes: known_hashes(self.db, &identity)?,
+            known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
             message: last_unknown.unwrap_or_else(|| "submission outcome is unknown".to_string()),
         })
     }
 
     async fn reconcile_locked(
         &self,
+        wallet_id: &str,
         identity: &ChainSubmissionIdentity,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
-        let hashes = known_hashes(self.db, identity)?;
+        let hashes = known_hashes(self.db, wallet_id, identity)?;
         if hashes.is_empty() {
             return Ok(ChainLifecycleOutcome::Pending {
                 known_tx_hashes: hashes,
@@ -528,6 +557,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         }
         let mut successful = Vec::new();
         let mut any_pending = false;
+        let mut unresolved = None;
         let mut committed_failures = Vec::new();
         for hash in &hashes {
             if cancel() {
@@ -538,9 +568,17 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 Ok(ChainTxStatus::Committed(confirmation)) if confirmation.code == 0 => {
                     successful.push((hash.clone(), confirmation));
                 }
-                Ok(ChainTxStatus::Committed(confirmation)) => committed_failures.push(confirmation),
+                Ok(ChainTxStatus::Committed(confirmation)) => {
+                    committed_failures.push((hash.clone(), confirmation))
+                }
                 Err(ChainError::Cancelled) => return Ok(ChainLifecycleOutcome::Cancelled),
-                Err(error) if error.is_retryable() || error.is_ambiguous() => any_pending = true,
+                // A lookup we could not complete or could not read is not
+                // evidence that the transaction is absent. Keep it distinct from
+                // a genuine 404 so a broken or incompatible endpoint is not
+                // reported as "not yet committed".
+                Err(error) if error.is_retryable() || error.is_ambiguous() => {
+                    unresolved.get_or_insert(error.to_string());
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -560,11 +598,17 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             if cancel() {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
-            let confirmation = apply_confirmation(self.db, identity, &hash, &response)?;
+            let confirmation = apply_confirmation(self.db, wallet_id, identity, &hash, &response)?;
             return Ok(ChainLifecycleOutcome::Confirmed {
                 tx_hash: hash,
                 confirmation,
                 reconciled: true,
+            });
+        }
+        if let Some(message) = unresolved {
+            return Ok(ChainLifecycleOutcome::OutcomeUnknown {
+                known_tx_hashes: hashes,
+                message,
             });
         }
         if any_pending {
@@ -572,7 +616,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 known_tx_hashes: hashes,
             });
         }
-        if let Some(failure) = committed_failures.into_iter().next() {
+        if let Some((hash, failure)) = committed_failures.into_iter().next() {
+            // The candidate's transaction definitively failed at commit, so its
+            // journal row must stop being live evidence. Leaving it `accepted`
+            // would make every later submission rediscover it and exit before
+            // dispatch, and would keep ballot-intent changes and recovery
+            // cleanup pinned to a generation that can never confirm.
+            retire_attempts_for_hash(self.db, wallet_id, identity, &hash)?;
             return Ok(ChainLifecycleOutcome::Rejected {
                 code: failure.code,
                 log: failure.log,
@@ -586,10 +636,15 @@ impl<'a> ChainSubmissionLifecycle<'a> {
 
 fn apply_confirmation(
     db: &VotingDb,
+    wallet_id: &str,
     identity: &ChainSubmissionIdentity,
     tx_hash: &str,
     response: &ChainTxConfirmation,
 ) -> Result<ChainConfirmation, VotingError> {
+    // Confirmation writes go through the existing wallet-scoped `confirm_*`
+    // entry points. Refuse rather than record this submission against a wallet
+    // the host switched to while the status request was in flight.
+    ensure_operation_wallet(db, wallet_id)?;
     match identity.kind {
         ChainSubmissionKind::Delegation => confirm_delegation_submission(
             db,
@@ -652,6 +707,20 @@ fn delegation_rebuild(
     }
 }
 
+fn singleton_vote_body(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Vec<u8>, VotingError> {
+    let signed =
+        vote::signed_commitment_with_conn(conn, wallet_id, round_id, bundle_index, proposal_id)?;
+    Ok(VoteCommitmentWire::try_from(&signed)?
+        .to_json()?
+        .into_bytes())
+}
+
 fn batch_body_from_json(batch_json: &str) -> Result<Vec<u8>, VotingError> {
     let wire: VoteCommitmentBatchWire =
         serde_json::from_str(batch_json).map_err(|_| VotingError::Internal {
@@ -682,11 +751,11 @@ fn stale_generation_error() -> VotingError {
 /// describe what is stored.
 fn reserve_attempt(
     db: &VotingDb,
+    wallet_id: &str,
     identity: &ChainSubmissionIdentity,
     payload_digest: &[u8; 32],
     rebuild: PayloadRebuild<'_>,
 ) -> Result<i64, VotingError> {
-    let wallet_id = db.wallet_id();
     let now = now_seconds()?;
     let mut conn = db.conn();
     let tx = conn
@@ -732,8 +801,16 @@ fn reserve_attempt(
     Ok(id)
 }
 
+/// Records one attempt's classified outcome.
+///
+/// Scoped by the wallet captured when the attempt was reserved, not by the
+/// database's current wallet. A host that switches accounts while a POST is in
+/// flight must still be able to journal the response it already received;
+/// re-reading the current wallet here would update zero rows and lose an
+/// accepted transaction hash.
 fn mark_attempt(
     db: &VotingDb,
+    wallet_id: &str,
     attempt_id: i64,
     state: &str,
     tx_hash: Option<&str>,
@@ -752,7 +829,7 @@ fn mark_attempt(
                 ":tx_hash": tx_hash,
                 ":now": now,
                 ":id": attempt_id,
-                ":wallet_id": db.wallet_id(),
+                ":wallet_id": wallet_id,
             },
         )
         .map_err(internal("record chain attempt outcome"))?;
@@ -764,14 +841,65 @@ fn mark_attempt(
     Ok(())
 }
 
-fn delete_attempt(db: &VotingDb, attempt_id: i64) -> Result<(), VotingError> {
+/// Removes a reservation whose request was definitely never dispatched.
+///
+/// Wallet-scoped like [`mark_attempt`], so an account switch cannot leave the
+/// reservation behind.
+fn delete_attempt(db: &VotingDb, wallet_id: &str, attempt_id: i64) -> Result<(), VotingError> {
     db.conn()
         .execute(
             "DELETE FROM chain_submission_attempts WHERE id=?1 AND wallet_id=?2",
-            rusqlite::params![attempt_id, db.wallet_id()],
+            rusqlite::params![attempt_id, wallet_id],
         )
         .map(|_| ())
         .map_err(internal("delete definitely-unsent chain attempt"))
+}
+
+/// Marks every attempt carrying this hash as definitively rejected.
+///
+/// A candidate whose transaction committed with a nonzero code can never
+/// confirm, so its journal row must stop being live evidence: otherwise later
+/// submissions rediscover it and exit before dispatch, and ballot-intent
+/// changes and recovery cleanup stay pinned to a generation that failed.
+fn retire_attempts_for_hash(
+    db: &VotingDb,
+    wallet_id: &str,
+    identity: &ChainSubmissionIdentity,
+    tx_hash: &str,
+) -> Result<(), VotingError> {
+    db.conn()
+        .execute(
+            "UPDATE chain_submission_attempts
+                SET state='rejected', updated_at=:now
+              WHERE round_id=:round_id AND wallet_id=:wallet_id
+                AND kind=:kind AND bundle_index=:bundle_index
+                AND proposal_id=:proposal_id AND batch_digest=:batch_digest
+                AND chain_tx_hash=:tx_hash AND state<>'rejected'",
+            named_params! {
+                ":now": now_seconds()?,
+                ":round_id": identity.round_id,
+                ":wallet_id": wallet_id,
+                ":kind": identity.kind.as_str(),
+                ":bundle_index": i64::from(identity.bundle_index),
+                ":proposal_id": identity.proposal_key(),
+                ":batch_digest": identity.batch_key(),
+                ":tx_hash": tx_hash,
+            },
+        )
+        .map(|_| ())
+        .map_err(internal("retire committed-failure chain attempt"))
+}
+
+/// Fails when the database's wallet is no longer the one this operation began
+/// under, so a mid-flight account switch cannot write to the wrong wallet.
+fn ensure_operation_wallet(db: &VotingDb, wallet_id: &str) -> Result<(), VotingError> {
+    if db.wallet_id() == wallet_id {
+        Ok(())
+    } else {
+        Err(VotingError::InvalidInput {
+            message: "wallet changed during a chain submission operation".to_string(),
+        })
+    }
 }
 
 /// Every chain transaction hash that could identify this submission.
@@ -784,45 +912,50 @@ fn delete_attempt(db: &VotingDb, attempt_id: i64) -> Result<(), VotingError> {
 /// candidates and reported as an invariant violation.
 fn known_hashes(
     db: &VotingDb,
+    wallet_id: &str,
     identity: &ChainSubmissionIdentity,
 ) -> Result<Vec<String>, VotingError> {
+    let conn = db.conn();
     let mut candidates = match identity.kind {
-        ChainSubmissionKind::Delegation => db
-            .get_delegation_tx_hash(&identity.round_id, identity.bundle_index)?
-            .into_iter()
-            .collect(),
-        ChainSubmissionKind::Vote => db
-            .get_vote_tx_hash(
+        ChainSubmissionKind::Delegation => queries::get_delegation_tx_hash(
+            &conn,
+            &identity.round_id,
+            wallet_id,
+            identity.bundle_index,
+        )?
+        .into_iter()
+        .collect(),
+        ChainSubmissionKind::Vote => queries::get_vote_tx_hash(
+            &conn,
+            &identity.round_id,
+            wallet_id,
+            identity.bundle_index,
+            identity.require_proposal_id()?,
+        )?
+        .into_iter()
+        .collect(),
+        ChainSubmissionKind::VoteBatch => {
+            let recoveries = match vote::load_vote_batch_recoveries_with_conn(
+                &conn,
+                wallet_id,
                 &identity.round_id,
                 identity.bundle_index,
-                identity.require_proposal_id()?,
-            )?
-            .into_iter()
-            .collect(),
-        ChainSubmissionKind::VoteBatch => {
-            let recoveries = {
-                let conn = db.conn();
-                match vote::load_vote_batch_recoveries_with_conn(
-                    &conn,
-                    &db.wallet_id(),
-                    &identity.round_id,
-                    identity.bundle_index,
-                    identity.require_batch_digest()?,
-                ) {
-                    Ok(recoveries) => recoveries,
-                    // The member rows can legitimately be gone, for example
-                    // after recovery cleanup on a batch with no live attempt.
-                    // That removes a source of candidate hashes; it is not a
-                    // reason to fail reconciliation, which can still use the
-                    // attempt journal below.
-                    Err(VotingError::InvalidInput { .. }) => Vec::new(),
-                    Err(error) => return Err(error),
-                }
+                identity.require_batch_digest()?,
+            ) {
+                Ok(recoveries) => recoveries,
+                // The member rows can legitimately be gone, for example after
+                // recovery cleanup on a batch with no live attempt. That removes
+                // a source of candidate hashes; it is not a reason to fail
+                // reconciliation, which can still use the attempt journal below.
+                Err(VotingError::InvalidInput { .. }) => Vec::new(),
+                Err(error) => return Err(error),
             };
             let mut hashes = Vec::new();
             for recovery in recoveries {
-                if let Some(hash) = db.get_vote_tx_hash(
+                if let Some(hash) = queries::get_vote_tx_hash(
+                    &conn,
                     &identity.round_id,
+                    wallet_id,
                     identity.bundle_index,
                     recovery.proposal_id,
                 )? {
@@ -832,15 +965,18 @@ fn known_hashes(
             hashes
         }
     };
-    let conn = db.conn();
     let mut stmt = conn
         .prepare(
+            // A definitively rejected attempt never entered the mempool, so its
+            // hash can never commit. Leaving it a candidate would make lookup
+            // report it as pending and block the replacement payload from ever
+            // being posted.
             "SELECT chain_tx_hash
                FROM chain_submission_attempts
               WHERE round_id=:round_id AND wallet_id=:wallet_id
                 AND kind=:kind AND bundle_index=:bundle_index
                 AND proposal_id=:proposal_id AND batch_digest=:batch_digest
-                AND chain_tx_hash IS NOT NULL
+                AND chain_tx_hash IS NOT NULL AND state<>'rejected'
               ORDER BY id",
         )
         .map_err(internal("prepare known chain hashes query"))?;
@@ -848,7 +984,7 @@ fn known_hashes(
         .query_map(
             named_params! {
                 ":round_id": identity.round_id,
-                ":wallet_id": db.wallet_id(),
+                ":wallet_id": wallet_id,
                 ":kind": identity.kind.as_str(),
                 ":bundle_index": i64::from(identity.bundle_index),
                 ":proposal_id": identity.proposal_key(),
@@ -1056,6 +1192,7 @@ mod tests {
 
     const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const TX_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const WALLET: &str = "wallet-1";
 
     #[derive(Default)]
     struct MockTransport {
@@ -1145,7 +1282,7 @@ mod tests {
         let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
 
         let outcome = lifecycle
-            .submit_body_locked(identity, b"{}".to_vec(), &echo_rebuild, &|| false)
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false)
             .await
             .unwrap();
 
@@ -1186,11 +1323,17 @@ mod tests {
         let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
 
         lifecycle
-            .submit_body_locked(identity.clone(), b"{}".to_vec(), &echo_rebuild, &|| false)
+            .submit_body_locked(
+                WALLET,
+                identity.clone(),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
             .await
             .unwrap();
         let outcome = lifecycle
-            .submit_body_locked(identity, b"{}".to_vec(), &echo_rebuild, &|| false)
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false)
             .await
             .unwrap();
 
@@ -1225,7 +1368,13 @@ mod tests {
         let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
 
         lifecycle
-            .submit_body_locked(identity.clone(), b"{}".to_vec(), &echo_rebuild, &|| false)
+            .submit_body_locked(
+                WALLET,
+                identity.clone(),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
             .await
             .unwrap();
         let outcome = lifecycle.reconcile(&identity, &|| false).await.unwrap();
@@ -1282,6 +1431,7 @@ mod tests {
         set_generation(&db, b"generation-two");
         let error = lifecycle
             .submit_body_locked(
+                WALLET,
                 identity,
                 b"generation-one".to_vec(),
                 &durable_rebuild,
@@ -1320,6 +1470,7 @@ mod tests {
         set_generation(&db, b"generation-one");
         let outcome = lifecycle
             .submit_body_locked(
+                WALLET,
                 ChainSubmissionIdentity::delegation(ROUND_ID, 0),
                 b"generation-one".to_vec(),
                 &durable_rebuild,
@@ -1359,7 +1510,13 @@ mod tests {
         let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
 
         lifecycle
-            .submit_body_locked(identity.clone(), b"{}".to_vec(), &echo_rebuild, &|| false)
+            .submit_body_locked(
+                WALLET,
+                identity.clone(),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
             .await
             .unwrap();
 
@@ -1391,7 +1548,13 @@ mod tests {
         let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
 
         lifecycle
-            .submit_body_locked(identity.clone(), b"{}".to_vec(), &echo_rebuild, &|| false)
+            .submit_body_locked(
+                WALLET,
+                identity.clone(),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
             .await
             .unwrap();
         // A row written before hashes were canonicalized at the storage
@@ -1446,6 +1609,276 @@ mod tests {
                 known_tx_hashes: Vec::new()
             }
         );
+    }
+
+    fn journal_attempt(db: &VotingDb, state: &str, tx_hash: Option<&str>) -> i64 {
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO chain_submission_attempts
+             (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+              payload_digest, chain_tx_hash, state, created_at, updated_at)
+             VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, ?5, 1, 1)",
+            rusqlite::params![ROUND_ID, WALLET, vec![0xCC_u8; 32], tx_hash, state],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn attempt_states(db: &VotingDb) -> Vec<String> {
+        db.conn()
+            .prepare("SELECT state FROM chain_submission_attempts ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_rejected_attempt_hash_is_not_a_reconciliation_candidate() {
+        let db = test_db();
+        journal_attempt(&db, "rejected", Some(TX_HASH));
+        let transport = Arc::new(MockTransport::default());
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // A CheckTx rejection never entered the mempool, so its hash can never
+        // commit. Keeping it a candidate would have lookup report it as pending
+        // and block the replacement payload from ever being posted.
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::Pending {
+                known_tx_hashes: Vec::new()
+            }
+        );
+        assert_eq!(*transport.gets.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_committed_failure_retires_its_attempt_and_frees_the_next_submission() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            Ok(response(
+                200,
+                &format!(r#"{{"tx_hash":"{TX_HASH}","code":0,"log":""}}"#),
+            )),
+            Ok(response(
+                200,
+                r#"{"height":42,"code":7,"log":"deliver failed","events":[]}"#,
+            )),
+            Ok(response(
+                200,
+                &format!(r#"{{"tx_hash":"{TX_HASH}","code":0,"log":""}}"#),
+            )),
+        ]);
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+
+        lifecycle
+            .submit_body_locked(
+                WALLET,
+                identity.clone(),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+        let rejected = lifecycle.reconcile(&identity, &|| false).await.unwrap();
+
+        assert!(matches!(
+            rejected,
+            ChainLifecycleOutcome::Rejected { code: 7, .. }
+        ));
+        assert_eq!(attempt_states(&db), vec!["rejected".to_string()]);
+
+        // The failed candidate must stop blocking dispatch: a replacement
+        // payload is posted instead of rediscovering a transaction that can
+        // never confirm.
+        let outcome = lifecycle
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::Accepted {
+                tx_hash: TX_HASH.to_string()
+            }
+        );
+        assert_eq!(*transport.posts.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_lookup_is_reported_unknown_and_still_blocks_rebroadcast() {
+        let db = test_db();
+        journal_attempt(&db, "outcome_unknown", Some(TX_HASH));
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            Ok(response(200, "{not json")),
+            Ok(response(200, "{not json")),
+        ]);
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+
+        let outcome = lifecycle.reconcile(&identity, &|| false).await.unwrap();
+
+        // A broken or incompatible endpoint must be distinguishable from a
+        // genuine 404, or callers poll forever believing the transaction is
+        // simply not indexed yet.
+        assert!(
+            matches!(
+                &outcome,
+                ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
+                    if known_tx_hashes == &vec![TX_HASH.to_string()]
+            ),
+            "got {outcome:?}"
+        );
+
+        let resubmit = lifecycle
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            resubmit,
+            ChainLifecycleOutcome::OutcomeUnknown { .. }
+        ));
+        assert_eq!(
+            *transport.posts.lock().unwrap(),
+            0,
+            "a candidate whose status could not be read may still commit"
+        );
+    }
+
+    #[test]
+    fn outcomes_are_journaled_under_the_wallet_that_reserved_them() {
+        let db = test_db();
+        let attempt_id = journal_attempt(&db, "attempting", None);
+        // The host switches accounts while the request is in flight.
+        db.set_wallet_id("wallet-2");
+
+        mark_attempt(&db, WALLET, attempt_id, "accepted", Some(TX_HASH)).unwrap();
+
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+        assert_eq!(
+            known_hashes(&db, WALLET, &identity).unwrap(),
+            vec![TX_HASH.to_string()],
+            "an accepted hash must not be lost to an account switch"
+        );
+        // And the reservation's owner is what a definitely-unsent deletion uses.
+        let unsent = journal_attempt(&db, "attempting", None);
+        delete_attempt(&db, WALLET, unsent).unwrap();
+        assert_eq!(attempt_states(&db), vec!["accepted".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_padded_legacy_hash_is_treated_as_opaque() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash=?1 WHERE round_id=?2 AND bundle_index=0",
+                rusqlite::params![format!(" {TX_HASH} "), ROUND_ID],
+            )
+            .unwrap();
+        let transport = Arc::new(MockTransport::default());
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // Storage leaves a padded value unchanged, so accepting it here would
+        // confirm a hash that then conflicts with the padded stored value.
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::Pending {
+                known_tx_hashes: Vec::new()
+            }
+        );
+        assert_eq!(*transport.gets.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_member_is_never_dispatched_as_a_singleton_vote() {
+        use crate::types::EncryptedShare;
+        use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};
+
+        let db = test_db();
+        queries::store_vote(&db.conn(), ROUND_ID, WALLET, 0, 1, 0, &[0xAA; 32]).unwrap();
+        let recovery = VoteRecoveryBundle {
+            vote_round_id: ROUND_ID.to_string(),
+            bundle_index: 0,
+            proposal_id: 1,
+            vote_decision: 0,
+            anchor_height: 123,
+            vc_tree_position: 0,
+            single_share: false,
+            num_options: 3,
+            van_nullifier: [0x10; 32],
+            vote_authority_note_new: [0x11; 32],
+            vote_commitment: [0x12; 32],
+            proof: vec![0x13; 96],
+            shares_hash: [0x14; 32],
+            r_vpk: [0x15; 32],
+            alpha_v: [0x16; 32],
+            vote_auth_sig: [0x17; 64],
+            encrypted_shares: vec![EncryptedShare {
+                c1: vec![0x21; 32],
+                c2: vec![0x22; 32],
+                share_index: 0,
+                plaintext_value: 5,
+                randomness: vec![0x23; 32],
+            }],
+            share_blinds: vec![[0x41; 32]],
+            share_comms: vec![[0x51; 32]],
+            batch: Some(VoteBatchRecovery {
+                digest: [0xD1; 32],
+                index: 0,
+                size: 1,
+            }),
+        };
+        db.conn()
+            .execute(
+                "UPDATE votes SET commitment_bundle_json=?1
+                  WHERE round_id=?2 AND wallet_id=?3 AND bundle_index=0 AND proposal_id=1",
+                rusqlite::params![
+                    crate::vote::serialize_recovery(&recovery).unwrap(),
+                    ROUND_ID,
+                    WALLET
+                ],
+            )
+            .unwrap();
+        let transport = Arc::new(MockTransport::default());
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let error = lifecycle
+            .submit_vote(ROUND_ID, 0, 1, &|| false)
+            .await
+            .unwrap_err();
+
+        // Posting one member to `cast-vote` could spend part of the batch
+        // independently, and confirmation would reject it afterwards anyway.
+        assert!(error.to_string().contains("atomic batch"), "{error}");
+        assert_eq!(*transport.posts.lock().unwrap(), 0);
+        let attempts: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chain_submission_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
     }
 
     #[test]

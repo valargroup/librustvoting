@@ -436,14 +436,41 @@ fn validate_json_response(response: &ChainResponse) -> Result<(), ChainError> {
     Ok(())
 }
 
+/// Whether a value is exactly a chain transaction hash.
+///
+/// One rule, used by both the client and the storage boundary. Deliberately
+/// exact: an earlier version trimmed surrounding whitespace here while the
+/// storage canonicalizer did not, so a padded legacy row was rejected as opaque
+/// at rest but accepted as a reconciliation candidate, and confirming it would
+/// then conflict with the padded stored value instead of advancing the domain
+/// row.
+pub(crate) fn is_tx_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Validates a transaction hash and returns its canonical lowercase form.
 pub fn normalize_tx_hash(value: &str) -> Result<String, ChainError> {
-    let trimmed = value.trim();
-    if trimmed.len() == 64 && trimmed.chars().all(|char| char.is_ascii_hexdigit()) {
-        Ok(trimmed.to_ascii_lowercase())
+    if is_tx_hash(value) {
+        Ok(value.to_ascii_lowercase())
     } else {
         Err(ChainError::InvalidRequest(
-            "transaction hash must be 64 hexadecimal characters".to_string(),
+            "transaction hash must be exactly 64 hexadecimal characters".to_string(),
         ))
+    }
+}
+
+/// Canonical storage form of a transaction hash.
+///
+/// Hexadecimal casing carries no meaning, so one transaction must not be stored,
+/// compared, and reconciled as two. Anything that is not a chain transaction
+/// hash is returned unchanged, so opaque legacy identifiers keep their exact
+/// stored meaning; [`known_hashes`](crate::chain_submission) then skips them
+/// rather than failing reconciliation.
+pub(crate) fn canonical_tx_hash(value: &str) -> String {
+    if is_tx_hash(value) {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
     }
 }
 
@@ -635,6 +662,27 @@ mod tests {
         // endpoint's own evidence.
         assert!(matches!(error, ChainError::Decode(_)), "got {error:?}");
         assert!(error.is_ambiguous());
+    }
+
+    #[test]
+    fn the_hash_rule_is_exact_and_shared_with_storage() {
+        let padded = format!(" {LOOKUP_HASH} ");
+        // Trimming here while the storage boundary requires an exact length
+        // would accept a padded legacy row as a candidate and then confirm a
+        // hash that conflicts with the padded stored value.
+        assert!(normalize_tx_hash(&padded).is_err());
+        assert_eq!(canonical_tx_hash(&padded), padded);
+        assert!(!is_tx_hash(&padded));
+
+        assert_eq!(
+            normalize_tx_hash(&LOOKUP_HASH.to_ascii_uppercase()).unwrap(),
+            LOOKUP_HASH
+        );
+        assert_eq!(
+            canonical_tx_hash(&LOOKUP_HASH.to_ascii_uppercase()),
+            LOOKUP_HASH
+        );
+        assert_eq!(canonical_tx_hash("legacy-hash"), "legacy-hash");
     }
 
     #[test]

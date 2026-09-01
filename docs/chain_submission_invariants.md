@@ -100,7 +100,11 @@ for its exact attempt.
    the shared database handle.
 3. Delegation accepts `SignedDelegationBundle`; singleton vote accepts a
    recovered `CommittedVote`; atomic vote accepts a recovered
-   `SignedVoteBatch`. The SDK derives network fields from these types.
+   `SignedVoteBatch`. The SDK derives network fields from these types. A member
+   of a persisted atomic batch is refused by the singleton path: dispatching one
+   member to `cast-vote` could spend part of the batch independently, and its
+   committed response could not be applied because confirmation rejects batch
+   members.
 4. The host cannot supply an arbitrary JSON map, a transaction hash to mark as
    accepted, or chain events to record outside the confirmation lifecycle.
 5. Canonical JSON is serialized once for one call. Every retry in that call
@@ -113,7 +117,11 @@ for its exact attempt.
    hash is unusable is an unusable response, not a rejection; a rejected
    result's unusable hash is discarded while its code and log stay definite,
    because a rejected duplicate's hash never identified the earlier
-   transaction.
+   transaction. What counts as a transaction hash is one exact rule shared by
+   the client and the storage boundary: exactly 64 hexadecimal characters, with
+   no surrounding whitespace accepted on either side. A padded or otherwise
+   non-conforming stored value stays opaque at rest and is skipped as a
+   candidate, so it can never be confirmed into a conflict with itself.
 7. The local payload digest is never accepted where a chain hash is required.
 
 ## Durable dispatch invariants
@@ -129,7 +137,12 @@ for its exact attempt.
 6. Repeated byte-identical attempts share a payload digest but remain distinct
    ordered attempts. A re-signed payload has a different digest.
 7. Accepted chain hashes and all earlier unknown attempts remain available for
-   reconciliation until explicit round or account deletion.
+   reconciliation until explicit round or account deletion. A definitively
+   rejected attempt is not a reconciliation candidate: its transaction never
+   entered the mempool, so leaving its hash in the candidate set would have
+   lookup report it as pending and block the replacement payload forever. An
+   attempt whose transaction is later found to have committed with a nonzero
+   code is transitioned to rejected for the same reason.
 8. Routine session reset and recovery cleanup do not delete chain submission
    attempts, and they do not erase material an attempt still covers. Coverage
    is scoped to the exact attempted submission: a singleton attempt covers its
@@ -142,7 +155,12 @@ for its exact attempt.
    attempt is refused. CheckTx acceptance deliberately leaves the legacy vote
    column null, so the attempt journal is the only evidence that a dispatched
    vote may still commit. Re-selecting the same choice is never refused.
-10. CheckTx acceptance alone never updates the legacy delegation or vote
+10. Partial bundle deletion is refused while any bundle in the pruned range has
+    a non-rejected attempt. An attempt references its round, not its bundle, so
+    pruning would cascade away the bundle, vote, proof, and recovery rows a
+    transaction that later commits needs, while leaving its journal evidence
+    behind. Attempts for pruned bundles are removed with them.
+11. CheckTx acceptance alone never updates the legacy delegation or vote
     submission columns. This prevents a later DeliverTx failure from pinning a
     domain row to a transaction that did not commit successfully.
 
@@ -282,18 +300,27 @@ hosts do not parse the log.
 6. Delegation confirmation uses `confirm_delegation_submission`; singleton vote
    uses `confirm_vote_submission`; atomic batch uses
    `confirm_vote_batch_submission`.
-7. The winning hash and event-derived positions are committed together by the
+7. A candidate whose status could not be read is reported as
+   `OutcomeUnknown`, never as `Pending`. A broken or incompatible endpoint must
+   stay distinguishable from a genuine 404, and an unresolved candidate blocks
+   rebroadcast exactly as a pending one does, because it may still commit.
+8. The winning hash and event-derived positions are committed together by the
    existing confirmation transaction. Attempt evidence is retained separately;
    a crash on either side is recoverable because the attempt hash and the
    domain record are both idempotent and neither overwrites conflicting state.
-8. Atomic-batch members advance together or not at all.
-9. Event round, bundle, proposal order, batch digest, and nullifier bindings are
-   validated by the existing confirmation parser before writes.
+9. Atomic-batch members advance together or not at all.
+10. Event round, bundle, proposal order, batch digest, and nullifier bindings
+    are validated by the existing confirmation parser before writes.
 
 ## Concurrency and cancellation invariants
 
 1. A process-wide asynchronous lock serializes operations for one submission
-   identity. Unrelated submissions remain independent.
+   identity. Unrelated submissions remain independent. The wallet identity is
+   captured once, where that lock is keyed, and every durable read, journal
+   write, and reservation in the operation uses that captured wallet. A host
+   that switches accounts mid-flight therefore cannot lose an accepted hash to a
+   zero-row update, nor leave a definitely-unsent reservation behind; the
+   confirmation write additionally refuses to run under a different wallet.
 2. After acquiring the lock, the lifecycle re-reads the exact durable recovery
    generation. A stale handle fails before network dispatch.
 3. Attempt insertion, its round and owner validation, and the payload rebuild
@@ -380,6 +407,14 @@ state transitions.
 - Can an unreadable server hash turn a definite rejection into a replay, or
   bypass the spent-nullifier classifier?
 - Can one transaction stored in two casings reconcile as two candidates?
+- Do the client and the storage boundary agree exactly on what a transaction
+  hash is?
+- Can a member of an atomic batch be dispatched as a singleton vote?
+- Can a rejected or committed-failure candidate block a replacement payload
+  forever?
+- Can bundle pruning delete the state a possibly-committed transaction needs?
+- Can an account switch mid-flight lose an accepted hash or write to the wrong
+  wallet?
 - Does `prelude` expose the lifecycle the crate documentation recommends?
 - Are retries byte-identical within one live call?
 - Is the software-delegation crash recovery gap still explicit?
@@ -405,6 +440,8 @@ state transitions.
   `chain::tests::unusable_lookup_response_is_not_reported_as_pending` cover
   lookup failover past an unusable response and the refusal to downgrade one to
   "not yet committed".
+- `chain::tests::the_hash_rule_is_exact_and_shared_with_storage` covers the one
+  shared, whitespace-exact transaction-hash rule.
 - `chain::tests::accepted_result_with_unusable_hash_is_ambiguous` and
   `chain::tests::rejected_result_with_unusable_hash_stays_definite_and_keeps_its_log`
   cover the split classification of an unreadable server-returned hash.
@@ -425,6 +462,20 @@ state transitions.
   cover candidate canonicalization and non-normalizable legacy hashes.
 - `chain_submission::tests::identities_cannot_pair_a_kind_with_the_wrong_key`
   covers the constructor-only submission identity.
+- `chain_submission::tests::a_batch_member_is_never_dispatched_as_a_singleton_vote`
+  covers the batch-member refusal on the singleton path.
+- `chain_submission::tests::a_rejected_attempt_hash_is_not_a_reconciliation_candidate`
+  and `a_committed_failure_retires_its_attempt_and_frees_the_next_submission`
+  cover attempt retirement and the unblocking of a replacement payload.
+- `chain_submission::tests::an_unreadable_lookup_is_reported_unknown_and_still_blocks_rebroadcast`
+  covers the `OutcomeUnknown` reconciliation outcome and its rebroadcast bar.
+- `chain_submission::tests::outcomes_are_journaled_under_the_wallet_that_reserved_them`
+  covers wallet capture across an account switch.
+- `chain_submission::tests::a_padded_legacy_hash_is_treated_as_opaque` covers the
+  whitespace-exact candidate rule.
+- `round::tests::delete_skipped_bundles_refuses_to_prune_an_attempted_bundle` and
+  `delete_skipped_bundles_prunes_past_a_rejected_attempt_and_its_journal_row`
+  cover the bundle-pruning guard and its rejected-attempt boundary.
 - `session::tests::ballot_intent_change_is_refused_while_a_vote_attempt_is_live`,
   `session::tests::reselecting_the_same_choice_is_not_refused_by_a_live_attempt`,
   and `session::tests::a_rejected_attempt_does_not_refuse_a_ballot_intent_change`

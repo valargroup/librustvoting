@@ -1274,6 +1274,74 @@ mod tests {
         );
     }
 
+    fn journal_delegation_attempt(db: &VotingDb, bundle_index: u32, state: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'delegation', ?3, -1, X'', ?4, ?5, 1, 1)",
+                rusqlite::params![
+                    ROUND_ID,
+                    db.wallet_id(),
+                    bundle_index as i64,
+                    vec![0xCC_u8; 32],
+                    state
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn delete_skipped_bundles_refuses_to_prune_an_attempted_bundle() {
+        let db = test_db("wallet-prune-attempted");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::new(1).unwrap())
+            .unwrap();
+        journal_delegation_attempt(&db, 1, "outcome_unknown");
+
+        let error = db.delete_skipped_bundles(ROUND_ID, 1).unwrap_err();
+
+        // An attempt references its round, not its bundle, so pruning would
+        // cascade away the setup a transaction that later commits needs, while
+        // leaving the journal evidence that it may exist.
+        assert!(
+            error.to_string().contains("chain submission attempt"),
+            "{error}"
+        );
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 2);
+    }
+
+    #[test]
+    fn delete_skipped_bundles_prunes_past_a_rejected_attempt_and_its_journal_row() {
+        let db = test_db("wallet-prune-rejected");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::new(1).unwrap())
+            .unwrap();
+        journal_delegation_attempt(&db, 1, "rejected");
+
+        db.delete_skipped_bundles(ROUND_ID, 1).unwrap();
+
+        // A rejection is definite, so it must not freeze bundle pruning; the
+        // journal row goes with the bundle it describes.
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 1);
+        let remaining: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chain_submission_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
     #[test]
     fn delete_skipped_bundles_clears_policy_when_no_rows_remain() {
         // keep_count == 0 removes every bundle row but leaves the rounds row.

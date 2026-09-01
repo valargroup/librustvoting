@@ -673,6 +673,12 @@ impl CommittedVote {
 /// Connection-scoped for the same reason as
 /// [`recover_atomic_vote_batch_with_conn`]: the chain lifecycle re-derives this
 /// payload inside its reservation transaction.
+///
+/// Rejects a member of a persisted atomic batch. Neither `CommittedVote::recover`
+/// nor `signed_commitment` inspects the batch metadata, so without this check a
+/// member could be serialized alone and dispatched to `cast-vote`, spending part
+/// of a batch independently; even a committed response could not be applied,
+/// because `confirm_vote_submission` rejects batch members.
 pub(crate) fn signed_commitment_with_conn(
     conn: &rusqlite::Connection,
     wallet_id: &str,
@@ -686,6 +692,7 @@ pub(crate) fn signed_commitment_with_conn(
                 "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
             ),
         })?;
+    ensure_singleton_vote_recovery(&recovery)?;
     let commit = commit_from_recovery(&recovery)?;
     signed_commitment_from_parts(&commit, &recovery)
 }
