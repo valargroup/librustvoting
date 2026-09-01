@@ -1070,13 +1070,6 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 }
             }
         }
-        if successful.len() > 1 {
-            return Err(VotingError::Internal {
-                message: "multiple chain candidates committed successfully for one submission"
-                    .to_string(),
-            }
-            .into());
-        }
         // Every candidate this lookup proved failed can never confirm, so none of
         // them may stay live evidence on any path out of here: leaving one
         // `accepted` makes later submissions rediscover it and exit before
@@ -1097,6 +1090,17 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             if cancel() {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
+        }
+        // Checked after retirement, not before: this exit applies neither
+        // confirmation, so a proven failure left live here would block a
+        // replacement forever on the one path that already knows the chain
+        // returned something impossible.
+        if successful.len() > 1 {
+            return Err(VotingError::Internal {
+                message: "multiple chain candidates committed successfully for one submission"
+                    .to_string(),
+            }
+            .into());
         }
         // The set read before the lookups is stale in both directions by now:
         // retirement above marked the proven failures `rejected`, and another
@@ -2534,6 +2538,7 @@ mod tests {
     const TX_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const WALLET: &str = "wallet-1";
     const TX_HASH_2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const TX_HASH_3: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     #[derive(Default)]
     struct MockTransport {
@@ -3772,6 +3777,59 @@ mod tests {
             attempt_states(&db),
             vec!["rejected".to_string(), "rejected".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_committed_failure_is_retired_even_when_two_candidates_report_success() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        journal_attempt(&db, "accepted", Some(TX_HASH_2));
+        journal_attempt(&db, "accepted", Some(TX_HASH_3));
+        let transport = Arc::new(MockTransport::default());
+        let events = serde_json::to_string(&delegate_vote_events("5")).unwrap();
+        transport.responses.lock().unwrap().extend([
+            Ok(response(
+                200,
+                r#"{"height":41,"code":7,"log":"deliver failed","events":[]}"#,
+            )),
+            // Two successes for one submission is a chain-level impossibility,
+            // so the call refuses to apply either. That refusal must not also
+            // strand the failure it already proved.
+            Ok(response(
+                200,
+                &format!(r#"{{"height":42,"code":0,"log":"","events":{events}}}"#),
+            )),
+            Ok(response(
+                200,
+                &format!(r#"{{"height":43,"code":0,"log":"","events":{events}}}"#),
+            )),
+        ]);
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let error = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("multiple chain candidates"),
+            "{error}"
+        );
+        // The failure can never confirm. Left `accepted`, it would be
+        // rediscovered by every later submission and block a replacement, a
+        // ballot-intent change, and pruning for good — on the one exit that
+        // already knows something is badly wrong.
+        assert_eq!(
+            attempt_states(&db),
+            vec![
+                "rejected".to_string(),
+                "accepted".to_string(),
+                "accepted".to_string()
+            ]
+        );
+        // Neither success was applied.
+        assert_eq!(db.get_delegation_tx_hash(ROUND_ID, 0).unwrap(), None);
     }
 
     #[tokio::test]

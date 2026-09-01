@@ -315,7 +315,9 @@ none. The transaction may still have committed; that stays visible as
    candidate a lookup discovers is retired, not only the one whose rejection is
    reported, or the remainder would keep blocking a replacement. That holds when
    the lookup also finds a success: adopting it must not leave a duplicate's
-   proven failure live. Clearing a
+   proven failure live, and it holds on the exit that refuses two successes for
+   one submission, which applies neither confirmation but has still proven the
+   failure — retirement precedes that refusal. Clearing a
    domain hash is scoped to an exact match on a row with no recorded
    confirmation position, so retirement can only remove a hash this
    reconciliation just proved failed.
@@ -480,6 +482,21 @@ The timeout covers connection setup, response headers, and the complete body.
 The client wraps custom transport futures in the deadline and validates the
 body limit and `application/json` content type even when a custom transport
 does not.
+
+That validation covers every response the client interprets — 200, 404, and
+422 — and no others. A response classified by its status code alone is not
+body-validated, deliberately: HTTP 429 and 5xx carry whatever page a rate
+limiter or proxy chose to serve, and rejecting them for it would replace
+`Status` with `Decode`, which this client treats as *ambiguous*. A 429 is a
+definite refusal — the request never reached the chain — so downgrading it to
+ambiguity would assert the transaction may have been dispatched and pin the
+submission's state on nothing. The body limit is not applied there either, for
+the same reason and because the allocation has already happened by the time a
+`ChainResponse` exists: bounding what a transport reads is the transport's
+contract, and the client's own check exists to stop it *parsing* more than the
+limit. A 404 is validated because it is protocol evidence — it asserts "not
+committed" — and a proxy's HTML page must not be able to make a broken endpoint
+look indefinitely uncommitted.
 
 Caller-configurable durations must be nonzero and representable by Tokio's
 monotonic clock. The request deadline additionally has an upper bound, because it
@@ -952,6 +969,11 @@ state transitions.
   covers the compatibility classifier boundary.
 - `chain_submission::tests::an_unrelated_confirmation_fails_over_to_the_next_endpoint`
   covers submission-specific event binding participating in endpoint failover.
+- `chain::tests::a_rate_limited_lookup_stays_a_definite_429_whatever_its_body_is`,
+  `a_gateway_error_lookup_stays_a_5xx_whatever_its_body_is`, and
+  `a_broadcast_error_status_is_classified_before_its_body_is_judged` cover the
+  boundary of response-body validation and the ambiguity it must not
+  manufacture.
 - `chain::tests::a_confirmation_whose_height_is_a_json_string_is_decoded` covers
   the height encoding the chain actually serves, and
   `a_confirmation_height_that_is_not_a_decimal_string_is_rejected` covers the
@@ -1093,7 +1115,8 @@ state transitions.
   `a_cancelled_reservation_race_preserves_earlier_ambiguity`,
   `a_confirmation_applied_during_the_post_outranks_acceptance`,
   `a_confirmation_applied_during_the_final_post_is_not_downgraded`,
-  `adopting_a_success_still_retires_the_failed_candidates`, and
+  `adopting_a_success_still_retires_the_failed_candidates`,
+  `a_committed_failure_is_retired_even_when_two_candidates_report_success`, and
   `a_spent_nullifier_response_accepts_a_durable_confirmation` cover the
   reconciliation precedence and retirement rules.
 - `chain_submission::tests::a_spent_nullifier_with_an_unsettled_lookup_stays_unknown`

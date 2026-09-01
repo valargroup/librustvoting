@@ -214,6 +214,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- A chain candidate a lookup proved failed is now retired before the refusal to
+  apply two successes for one submission, so that exit can no longer leave a
+  failed candidate blocking replacement, ballot-intent changes, and pruning.
 - Transaction confirmations now decode a block height served as a JSON string,
   the form the chain actually returns. Reading only the numeric form made every
   real confirmation an unusable response, leaving committed submissions pending

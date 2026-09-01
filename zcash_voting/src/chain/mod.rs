@@ -835,6 +835,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_rate_limited_lookup_stays_a_definite_429_whatever_its_body_is() {
+        let transport = Arc::new(MockTransport::default());
+        // A rate limiter in front of the chain answers with its own HTML page,
+        // and nothing bounds how big that page is.
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(typed_response(
+                429,
+                &"x".repeat(MAX_CHAIN_RESPONSE_BYTES + 1),
+                "text/html",
+            )));
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+
+        let error = client
+            .transaction_status(LOOKUP_HASH, &|| false)
+            .await
+            .unwrap_err();
+
+        // Body validation is for responses this client interprets. Applying it
+        // here would turn a 429 into `Decode`, which is *ambiguous*, and assert
+        // the transaction may have been dispatched by a request the rate limiter
+        // definitely refused. False ambiguity is what blocks replacement.
+        assert!(matches!(error, ChainError::Status(429)), "{error}");
+        assert!(!error.is_ambiguous(), "a 429 is a definite refusal");
+        assert!(error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn a_gateway_error_lookup_stays_a_5xx_whatever_its_body_is() {
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(typed_response(
+                503,
+                "<html>upstream unavailable</html>",
+                "text/html",
+            )));
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+
+        let error = client
+            .transaction_status(LOOKUP_HASH, &|| false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ChainError::Status(503)), "{error}");
+    }
+
+    #[test]
+    fn a_broadcast_error_status_is_classified_before_its_body_is_judged() {
+        let error = parse_broadcast_response(typed_response(
+            503,
+            &"x".repeat(MAX_CHAIN_RESPONSE_BYTES + 1),
+            "text/html",
+        ))
+        .unwrap_err();
+
+        // Same rule on the broadcast side: the status is the evidence, and the
+        // body of a response this client never parses does not change it.
+        assert!(matches!(error, ChainError::Status(503)), "{error}");
+    }
+
     #[test]
     fn endpoint_set_rejects_duplicate_canonical_identity() {
         let error = ChainEndpointSet::new(&[
