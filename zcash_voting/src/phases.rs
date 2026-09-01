@@ -229,24 +229,43 @@ impl VotingDb {
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)? as u32,
-                        phase_from_columns(
-                            row.get::<_, i64>(1)? != 0,
-                            row.get::<_, i64>(2)? != 0,
-                            row.get::<_, i64>(3)? != 0,
-                            row.get::<_, i64>(4)? != 0,
-                        ),
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)? != 0,
+                        row.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to query delegation phases: {e}"),
             })?
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<(u32, bool, bool, bool, bool)>, _>>()
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to read delegation phase row: {e}"),
             })?;
 
-        Ok(rows)
+        // CheckTx acceptance deliberately leaves `delegation_tx_hash` null, so
+        // the journal is the only evidence that a delegation transaction is
+        // already pending. Without this a restart plans `Delegate` for it, and
+        // a software signer asked to sign again produces a different
+        // transaction whose predecessor's hash may then be lost.
+        let submitted = crate::chain_submission::delegation_bundles_with_chain_candidate(
+            &conn, round_id, &wallet_id,
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|(bundle_index, pczt, proved, has_hash, confirmed)| {
+                (
+                    bundle_index,
+                    phase_from_columns(
+                        pczt,
+                        proved,
+                        has_hash || submitted.contains(&bundle_index),
+                        confirmed,
+                    ),
+                )
+            })
+            .collect())
     }
 
     /// Loads the canonical vote phase for one bundle/proposal pair.
@@ -316,22 +335,39 @@ impl VotingDb {
                     Ok((
                         row.get::<_, i64>(0)? as u32,
                         row.get::<_, i64>(1)? as u32,
-                        vote_phase_from_columns(
-                            row.get::<_, i64>(2)? != 0,
-                            row.get::<_, i64>(3)? != 0,
-                            row.get::<_, i64>(4)? != 0,
-                        ),
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)? != 0,
+                        row.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to query vote phases: {e}"),
             })?
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<Result<Vec<(u32, u32, bool, bool, bool)>, _>>()
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to read vote phase row: {e}"),
             })?;
-        Ok(rows)
+        // As for delegation: a vote whose transaction is already pending must
+        // not be planned as one still to submit.
+        let submitted =
+            crate::chain_submission::vote_rows_with_chain_candidate(&conn, round_id, &wallet_id)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(bundle_index, proposal_id, has_hash, confirmed, prepared)| {
+                    (
+                        bundle_index,
+                        proposal_id,
+                        vote_phase_from_columns(
+                            has_hash || submitted.contains(&(bundle_index, proposal_id)),
+                            confirmed,
+                            prepared,
+                        ),
+                    )
+                },
+            )
+            .collect())
     }
 
     /// Loads the canonical helper-share phase for one share record.
@@ -528,6 +564,49 @@ mod tests {
         assert_eq!(
             db.delegation_phase(ROUND_ID, 0).unwrap(),
             DelegationPhase::Confirmed
+        );
+    }
+
+    #[test]
+    fn an_accepted_journal_attempt_reports_a_submitted_phase() {
+        let db = db_with_bundle();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                rusqlite::params![ROUND_ID, db.wallet_id(), vec![0xCC_u8; 32], "a".repeat(64)],
+            )
+            .unwrap();
+
+        let phases = db.delegation_phases(ROUND_ID).unwrap();
+
+        // CheckTx acceptance leaves the domain column null on purpose, so
+        // reading it alone would plan `Delegate` for a bundle whose transaction
+        // is already pending — and a software signer asked to sign again
+        // produces a different transaction.
+        assert_eq!(phases, vec![(0, DelegationPhase::Submitted)]);
+    }
+
+    #[test]
+    fn a_rejected_journal_attempt_does_not_report_submitted() {
+        let db = db_with_bundle();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'rejected', 1, 1)",
+                rusqlite::params![ROUND_ID, db.wallet_id(), vec![0xCC_u8; 32], "a".repeat(64)],
+            )
+            .unwrap();
+
+        // A rejected attempt names a transaction that never entered the mempool,
+        // so it must not stop the host from submitting.
+        assert_ne!(
+            db.delegation_phases(ROUND_ID).unwrap(),
+            vec![(0, DelegationPhase::Submitted)]
         );
     }
 

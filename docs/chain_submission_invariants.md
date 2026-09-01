@@ -357,7 +357,14 @@ created by the confirmed delegation.
    removes attempted delegation setup.
 5. The lifecycle reconciles every known chain hash before another dispatch.
    The host SHOULD invoke reconciliation before requesting fresh software
-   signing work after restart.
+   signing work after restart, and restart planning points it there: a bundle
+   with a non-rejected journaled attempt carrying a chain hash reports the
+   submitted phase even though CheckTx acceptance deliberately left the domain
+   column null. Reading that column alone planned the delegation as still to be
+   made, and a software signer asked to sign again produces a different
+   transaction whose predecessor's hash may then be lost. Votes are planned the
+   same way. A rejected attempt names a transaction that never entered the
+   mempool, so it does not report submitted.
 
 The crash guarantee differs by signer and transaction type:
 
@@ -585,10 +592,14 @@ hosts do not parse the log.
    one — and each failure is definite only for the step that raised it, so the
    rule is applied once where those failures leave the attempt loop rather than
    at each of them. A completed ambiguous broadcast, a known candidate, or a
-   live attempt all outrank it, and the call reports `OutcomeUnknown`. The one
-   exception is a CheckTx acceptance that could not be journaled: it already
-   carries the transaction hash, which is strictly more than the ambiguity it
-   implies.
+   live attempt all outrank it, and the call reports `OutcomeUnknown`. A
+   completed ambiguous broadcast is held in memory and needs no storage read to
+   be true, so it is honoured even when the database has become unreadable —
+   which is one of the things that gets us here; the candidate list is
+   supplementary once that decision is made, and failing to read it does not
+   undo it. The one exception is a CheckTx acceptance that could not be
+   journaled: it already carries the transaction hash, which is strictly more
+   than the ambiguity it implies.
 9. A reconciliation that fails to settle does not overwrite what this call
    already knows. That covers both a `Cancelled` result, which concluded
    nothing, and a terminal lookup error, which is evidence about someone else's
@@ -707,6 +718,9 @@ state transitions.
   own ambiguity?
 - Is that rule applied to every fallible step in a submission call, or only to
   the ones a reviewer happened to name?
+- Does in-memory ambiguity survive a database that has become unreadable?
+- Does restart planning see a journaled accepted transaction, or only the domain
+  columns CheckTx acceptance leaves null?
 - Can a confirmed atomic-batch member be reported as a singleton confirmation?
 - Do an atomic batch's persisted proposal and nullifier bindings participate in
   endpoint failover?
@@ -821,6 +835,11 @@ state transitions.
   covers retirement on a lookup that exits through another candidate's unusable
   response, and `cancellation_after_all_failure_retirement_is_observed` covers
   the cancellation check that follows it.
+- `chain_submission::tests::in_memory_ambiguity_survives_an_unreadable_database`
+  covers ambiguity held in memory outliving the storage reads that describe it.
+- `phases::tests::an_accepted_journal_attempt_reports_a_submitted_phase` and
+  `a_rejected_journal_attempt_does_not_report_submitted` cover restart planning
+  reading the attempt journal, and its rejected-attempt boundary.
 - `chain_submission::tests::a_retry_reconciliation_error_preserves_earlier_ambiguity`,
   `a_rejection_that_cannot_be_journaled_stays_unknown`,
   `a_rejection_path_lookup_error_preserves_earlier_ambiguity`, and

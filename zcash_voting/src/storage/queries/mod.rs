@@ -2799,13 +2799,12 @@ pub fn delete_bundles_from(
                         AND bundle_index >= :from_index AND state <> 'rejected'
                         AND (kind = 'delegation' OR {})
                  )",
-                crate::chain_submission::CAN_STILL_LEARN_A_HASH
+                crate::chain_submission::can_still_learn_a_hash()?
             ),
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":from_index": from_index as i64,
-                ":fresh_cutoff": crate::chain_submission::fresh_attempt_cutoff()?,
             },
             |row| row.get(0),
         )

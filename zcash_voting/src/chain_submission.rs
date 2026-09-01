@@ -462,7 +462,10 @@ impl<'a> ChainSubmissionLifecycle<'a> {
     ) -> Result<ChainLifecycleOutcome, VotingError> {
         if last_unknown.is_some() || has_live_attempt(self.db, wallet_id, identity)? {
             return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                known_tx_hashes: known_hashes(self.db, wallet_id, identity)?,
+                // Supplementary detail. The decision to report ambiguity is
+                // already made, so failing to list the candidates must not undo
+                // it; see `outstanding_ambiguity`.
+                known_tx_hashes: known_hashes(self.db, wallet_id, identity).unwrap_or_default(),
                 message: last_unknown.clone().unwrap_or_else(|| {
                     "an earlier attempt was dispatched without a usable response".to_string()
                 }),
@@ -484,18 +487,31 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         last_unknown: &Option<String>,
         cause: &str,
     ) -> Result<Option<ChainLifecycleOutcome>, VotingError> {
-        let known_tx_hashes = known_hashes(self.db, wallet_id, identity)?;
-        if last_unknown.is_none()
-            && known_tx_hashes.is_empty()
-            && !has_live_attempt(self.db, wallet_id, identity)?
-        {
-            return Ok(None);
+        // `last_unknown` is in-memory evidence of a broadcast this call already
+        // completed, and it needs no storage read to be true. A database that has
+        // become unreadable — which is one of the things that gets us here — must
+        // not be able to erase it, so the reads below happen only when there is
+        // nothing in memory to go on, and the candidate list is best effort once
+        // the decision to report ambiguity is made.
+        if last_unknown.is_none() {
+            let known_tx_hashes = known_hashes(self.db, wallet_id, identity)?;
+            if known_tx_hashes.is_empty() && !has_live_attempt(self.db, wallet_id, identity)? {
+                return Ok(None);
+            }
+            return Ok(Some(ChainLifecycleOutcome::OutcomeUnknown {
+                known_tx_hashes,
+                message: format!(
+                    "an earlier attempt may still commit; this one did not settle: {cause}"
+                ),
+            }));
         }
+        let known_tx_hashes = known_hashes(self.db, wallet_id, identity).unwrap_or_default();
         let message = match last_unknown {
             Some(earlier) => format!(
                 "an earlier attempt's outcome is unknown ({earlier}); a later attempt did not \
                  settle: {cause}"
             ),
+            // Unreachable: handled above, where the storage reads are skipped.
             None => {
                 format!("an earlier attempt may still commit; this one did not settle: {cause}")
             }
@@ -1694,8 +1710,12 @@ fn known_hashes(
 /// is none. The transaction may still have committed; that is reported as
 /// ambiguity by [`has_live_attempt`], which is unchanged, and as
 /// `AlreadySpentUnresolved` if a replacement is later refused on chain.
-pub(crate) const CAN_STILL_LEARN_A_HASH: &str =
-    "(chain_tx_hash IS NOT NULL OR (state='attempting' AND updated_at >= :fresh_cutoff))";
+pub(crate) fn can_still_learn_a_hash() -> Result<String, VotingError> {
+    Ok(format!(
+        "(chain_tx_hash IS NOT NULL OR (state='attempting' AND updated_at >= {}))",
+        fresh_attempt_cutoff()?
+    ))
+}
 
 /// The `:fresh_cutoff` bound [`can_still_learn_a_hash`] expects, as of now.
 ///
@@ -1843,6 +1863,66 @@ pub(crate) fn attempt_protected_vote_rows(
     round_id: &str,
     wallet_id: &str,
 ) -> Result<BTreeSet<(u32, u32)>, VotingError> {
+    attempt_vote_rows(conn, round_id, wallet_id, &can_still_learn_a_hash()?)
+}
+
+/// Vote rows for which this SDK knows a chain transaction that may still commit.
+///
+/// Narrower than coverage: it names only attempts that actually carry a hash, so
+/// something can be looked up. Restart planning uses it to send the host to
+/// reconciliation instead of telling it to submit a vote whose transaction is
+/// already pending.
+pub(crate) fn vote_rows_with_chain_candidate(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<BTreeSet<(u32, u32)>, VotingError> {
+    attempt_vote_rows(conn, round_id, wallet_id, "chain_tx_hash IS NOT NULL")
+}
+
+/// Bundles whose delegation has a journaled chain transaction that may still
+/// commit.
+///
+/// CheckTx acceptance deliberately leaves `bundles.delegation_tx_hash` null, so
+/// the journal is the only place this shows up. Restart planning that read the
+/// domain column alone reported such a bundle as still needing to be delegated,
+/// and for a software signer that means signing again: a second signature over
+/// the same setup is a different transaction, whose hash the first one's may be
+/// lost behind.
+pub(crate) fn delegation_bundles_with_chain_candidate(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<BTreeSet<u32>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT bundle_index FROM chain_submission_attempts
+              WHERE round_id=:round_id AND wallet_id=:wallet_id
+                AND kind='delegation' AND state<>'rejected'
+                AND chain_tx_hash IS NOT NULL",
+        )
+        .map_err(internal("prepare delegation candidate bundles query"))?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(internal("query delegation candidate bundles"))?;
+    let mut bundles = BTreeSet::new();
+    for row in rows {
+        if let Ok(bundle_index) = u32::try_from(row.map_err(internal("read candidate bundle"))?) {
+            bundles.insert(bundle_index);
+        }
+    }
+    Ok(bundles)
+}
+
+fn attempt_vote_rows(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    attempt_filter: &str,
+) -> Result<BTreeSet<(u32, u32)>, VotingError> {
     let mut protected = BTreeSet::new();
     let mut batch_digests: BTreeMap<u32, BTreeSet<[u8; 32]>> = BTreeMap::new();
     {
@@ -1852,16 +1932,14 @@ pub(crate) fn attempt_protected_vote_rows(
                        FROM chain_submission_attempts
                       WHERE round_id=:round_id AND wallet_id=:wallet_id
                         AND state<>'rejected' AND kind IN ('vote','vote_batch')
-                        AND {CAN_STILL_LEARN_A_HASH}"
+                        AND {attempt_filter}"
             ))
             .map_err(internal("prepare attempted vote coverage query"))?;
         let rows = stmt
             .query_map(
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":fresh_cutoff": fresh_attempt_cutoff()?,
-                },
+                // The freshness bound is interpolated rather than bound, so a
+                // filter that does not need it is not forced to name it.
+                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -5034,5 +5112,42 @@ mod tests {
                 if message.contains("timed out")),
             "got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn in_memory_ambiguity_survives_an_unreadable_database() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+        // The journal is gone, so every supplementary read below fails.
+        db.conn()
+            .execute_batch("DROP TABLE chain_submission_attempts")
+            .unwrap();
+
+        let outcome = lifecycle
+            .outstanding_ambiguity(
+                WALLET,
+                &identity,
+                &Some("request timed out".to_string()),
+                "storage failed",
+            )
+            .unwrap();
+
+        // A broadcast this call already completed is in-memory evidence that
+        // needs no storage read to be true, and a database that has become
+        // unreadable is one of the things that gets us here. Losing it would let
+        // the host treat a generation as safe to replace.
+        assert!(
+            matches!(&outcome, Some(ChainLifecycleOutcome::OutcomeUnknown { message, .. })
+                if message.contains("timed out")),
+            "got {outcome:?}"
+        );
+        // With nothing in memory there is no evidence to preserve, so the read
+        // failure is reported rather than invented around.
+        assert!(lifecycle
+            .outstanding_ambiguity(WALLET, &identity, &None, "storage failed")
+            .is_err());
     }
 }
