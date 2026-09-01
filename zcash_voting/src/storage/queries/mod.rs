@@ -2789,7 +2789,7 @@ pub fn delete_bundles_from(
     // have spent the bundle's governance nullifiers is reason enough. Vote
     // attempts protect a confirmation that needs a transaction hash, so one that
     // can no longer learn a hash protects nothing and must not bar pruning
-    // forever; see `chain_submission::CAN_STILL_LEARN_A_HASH`.
+    // forever; see `chain_submission::can_still_learn_a_hash`.
     let attempted: bool = tx
         .query_row(
             &format!(
@@ -2799,7 +2799,7 @@ pub fn delete_bundles_from(
                         AND bundle_index >= :from_index AND state <> 'rejected'
                         AND (kind = 'delegation' OR {})
                  )",
-                crate::chain_submission::CAN_STILL_LEARN_A_HASH
+                crate::chain_submission::can_still_learn_a_hash()
             ),
             named_params! {
                 ":round_id": round_id,

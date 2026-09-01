@@ -212,6 +212,21 @@ pub enum ChainLifecycleOutcome {
 pub enum ChainLifecycleError {
     Voting(VotingError),
     Chain(ChainError),
+    /// CheckTx accepted the transaction, but its hash could not be journaled.
+    ///
+    /// The transaction is in the mempool and may commit, and this hash is the
+    /// only way anything can ever locate it: the SDK does not predict chain
+    /// hashes and cannot find a transaction from its commitment. Returning the
+    /// persistence error alone would discard it, leaving a hashless reservation
+    /// that no reconciliation can resolve.
+    ///
+    /// The host SHOULD retain `tx_hash` and record it once storage recovers, for
+    /// example with `mark_delegation_submitted` or `mark_vote_submitted`, so a
+    /// later reconciliation can confirm it.
+    AcceptedButUnjournaled {
+        tx_hash: String,
+        source: VotingError,
+    },
 }
 
 impl std::fmt::Display for ChainLifecycleError {
@@ -219,6 +234,11 @@ impl std::fmt::Display for ChainLifecycleError {
         match self {
             Self::Voting(error) => write!(f, "{error}"),
             Self::Chain(error) => write!(f, "{error}"),
+            Self::AcceptedButUnjournaled { tx_hash, source } => write!(
+                f,
+                "vote chain accepted transaction {tx_hash} but it could not be journaled \
+                 ({source}); record this hash once storage recovers"
+            ),
         }
     }
 }
@@ -487,6 +507,10 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // and recovery reads up to `attempts` times per call, which is the
             // intended cost of proving the generation is still current.
             let attempt_id = reserve_attempt(self.db, wallet_id, &identity, &digest, rebuild)?;
+            // Held until this iteration ends, which is after the response is
+            // classified on every path. While it lives, the rows this payload
+            // was built from stay covered no matter what the wall clock does.
+            let _in_flight = InFlightAttempt::register(attempt_id);
             if cancel() {
                 // This reservation is definitely unsent, but an earlier attempt
                 // in this call may still commit.
@@ -500,13 +524,21 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 .await;
             match result {
                 Ok(ChainBroadcastOutcome::Accepted(result)) => {
-                    mark_attempt(
+                    // The hash must not go down with a storage failure: it is
+                    // the only handle anything will ever have on a transaction
+                    // that is already in the mempool.
+                    if let Err(error) = mark_attempt(
                         self.db,
                         wallet_id,
                         attempt_id,
                         "accepted",
                         Some(&result.tx_hash),
-                    )?;
+                    ) {
+                        return Err(ChainLifecycleError::AcceptedButUnjournaled {
+                            tx_hash: result.tx_hash,
+                            source: error,
+                        });
+                    }
                     return Ok(ChainLifecycleOutcome::Accepted {
                         tx_hash: result.tx_hash,
                     });
@@ -687,7 +719,16 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             if cancel() {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
-            match self.client.transaction_status(hash, cancel).await {
+            let status = self.client.transaction_status(hash, cancel).await;
+            // Cancellation can arrive while a status request is in flight. Every
+            // branch below either classifies the submission or retires failure
+            // evidence, and a cancelled operation must do neither: the candidate
+            // is still journaled, so the next reconciliation re-derives whatever
+            // this one was about to conclude.
+            if cancel() {
+                return Ok(ChainLifecycleOutcome::Cancelled);
+            }
+            match status {
                 Ok(ChainTxStatus::Pending) => any_pending = true,
                 Ok(ChainTxStatus::Committed(confirmation)) if confirmation.code == 0 => {
                     successful.push((hash.clone(), confirmation));
@@ -1335,16 +1376,84 @@ fn known_hashes(
 /// is none. The transaction may still have committed; that is reported as
 /// ambiguity by [`has_live_attempt`], which is unchanged, and as
 /// `AlreadySpentUnresolved` if a replacement is later refused on chain.
-pub(crate) const CAN_STILL_LEARN_A_HASH: &str =
-    "(chain_tx_hash IS NOT NULL OR (state='attempting' AND updated_at >= :fresh_cutoff))";
+pub(crate) fn can_still_learn_a_hash() -> String {
+    let live = in_flight_attempt_ids();
+    let live_clause = if live.is_empty() {
+        String::new()
+    } else {
+        // Ids this process minted in `reserve_attempt`, so there is nothing to
+        // escape.
+        let ids = live
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(" OR id IN ({ids})")
+    };
+    format!(
+        "(chain_tx_hash IS NOT NULL          OR (state='attempting' AND (updated_at >= :fresh_cutoff{live_clause})))"
+    )
+}
 
-/// The `:fresh_cutoff` bound [`CAN_STILL_LEARN_A_HASH`] expects, as of now.
+/// The `:fresh_cutoff` bound [`can_still_learn_a_hash`] expects, as of now.
 ///
 /// A reservation touched at or after this instant may still be in flight; an
 /// older one cannot be, because no configurable request deadline reaches back
 /// this far. Every caller of the predicate must bind it.
+///
+/// This reads the wall clock, which can step. A forward jump larger than the
+/// grace period would age out a POST that is genuinely in flight, which is why
+/// it is the weaker of the two tests and never the only one: a reservation this
+/// process is waiting on is named by [`in_flight_attempt_ids`] and stays covered
+/// whatever the clock does.
 pub(crate) fn fresh_attempt_cutoff() -> Result<i64, VotingError> {
     Ok(now_seconds()?.saturating_sub(INTERRUPTED_RESERVATION_GRACE_SECS))
+}
+
+/// Reservations this process is waiting on a response for, right now.
+///
+/// Registered by the submission loop and released when the response is
+/// classified, so membership is exact and needs no clock at all. It is what
+/// keeps a live POST covered across a wall-clock adjustment; the age test exists
+/// for the reservations this registry cannot know about, namely another
+/// process's, and for the crashed ones no registry will ever hold.
+fn in_flight_attempt_ids() -> Vec<i64> {
+    IN_FLIGHT_ATTEMPTS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .map(|live| live.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+static IN_FLIGHT_ATTEMPTS: OnceLock<Mutex<BTreeSet<i64>>> = OnceLock::new();
+
+/// Keeps one reservation registered as in flight for as long as it is held.
+///
+/// Releasing on drop rather than at each exit means an early return, an error,
+/// or a panic between the POST and its classification cannot leave a stale id
+/// pinning coverage for the life of the process.
+struct InFlightAttempt(i64);
+
+impl InFlightAttempt {
+    fn register(attempt_id: i64) -> Self {
+        if let Ok(mut live) = IN_FLIGHT_ATTEMPTS
+            .get_or_init(|| Mutex::new(BTreeSet::new()))
+            .lock()
+        {
+            live.insert(attempt_id);
+        }
+        Self(attempt_id)
+    }
+}
+
+impl Drop for InFlightAttempt {
+    fn drop(&mut self) {
+        if let Some(lock) = IN_FLIGHT_ATTEMPTS.get() {
+            if let Ok(mut live) = lock.lock() {
+                live.remove(&self.0);
+            }
+        }
+    }
 }
 
 /// How long a reservation may go untouched before no process can still be
@@ -1380,7 +1489,7 @@ pub(crate) fn interrupted_reservation_grace_secs() -> i64 {
 /// would freeze a proposal's recovery state permanently with no recovery path.
 ///
 /// So are attempts that can no longer learn a chain transaction hash; see
-/// [`CAN_STILL_LEARN_A_HASH`].
+/// [`can_still_learn_a_hash`].
 ///
 /// Rows whose recovery JSON cannot be parsed are covered conservatively when
 /// their bundle has any batch attempt: an unreadable row may still be a member,
@@ -1399,7 +1508,8 @@ pub(crate) fn attempt_protected_vote_rows(
                        FROM chain_submission_attempts
                       WHERE round_id=:round_id AND wallet_id=:wallet_id
                         AND state<>'rejected' AND kind IN ('vote','vote_batch')
-                        AND {CAN_STILL_LEARN_A_HASH}"
+                        AND {}",
+                can_still_learn_a_hash()
             ))
             .map_err(internal("prepare attempted vote coverage query"))?;
         let rows = stmt
@@ -3350,5 +3460,149 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored.as_deref(), Some(TX_HASH_2));
+    }
+
+    #[test]
+    fn a_reservation_this_process_awaits_survives_a_wall_clock_jump() {
+        let db = test_db();
+        {
+            let conn = db.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+        }
+        // A high explicit id so registering it cannot collide with another
+        // test's auto-incremented rows in this shared process registry.
+        const ATTEMPT_ID: i64 = 9_000_001;
+        // Timestamps that look older than the grace period. A forward step of
+        // the system clock while the POST is in flight produces exactly this:
+        // the row is untouched, but "now" has moved past its deadline.
+        let ancient = 1_i64;
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (id, round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'vote', 0, 3, X'', ?4, 'attempting', ?5, ?5)",
+                rusqlite::params![ATTEMPT_ID, ROUND_ID, WALLET, vec![0xCC_u8; 32], ancient],
+            )
+            .unwrap();
+
+        let in_flight = InFlightAttempt::register(ATTEMPT_ID);
+        let covered = {
+            let conn = db.conn();
+            attempt_protected_vote_rows(&conn, ROUND_ID, WALLET).unwrap()
+        };
+        // The age test is the weaker of the two and never the only one: this
+        // process knows it is waiting on the response, so the recovery that
+        // response would be confirmed against must not become erasable just
+        // because the clock moved.
+        assert!(covered.contains(&(0, 3)), "{covered:?}");
+
+        drop(in_flight);
+        let after = {
+            let conn = db.conn();
+            attempt_protected_vote_rows(&conn, ROUND_ID, WALLET).unwrap()
+        };
+        // Once nothing is waiting on it, the stale reservation is an
+        // interrupted one and stops covering.
+        assert!(after.is_empty(), "{after:?}");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_hash_survives_a_failure_to_journal_it() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            &format!(r#"{{"tx_hash":"{TX_HASH}","code":0,"log":""}}"#),
+        )));
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+
+        // Make journaling the outcome fail the way a full disk or a stuck
+        // writer would, after CheckTx has already accepted the transaction.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_attempt_update
+                 BEFORE UPDATE ON chain_submission_attempts
+                 BEGIN SELECT RAISE(ABORT, 'storage failure'); END",
+            )
+            .unwrap();
+
+        let error = lifecycle
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false)
+            .await
+            .unwrap_err();
+
+        // The transaction is in the mempool and this hash is the only handle
+        // anything will ever have on it: the SDK does not predict chain hashes
+        // and cannot find a transaction from its commitment.
+        match error {
+            ChainLifecycleError::AcceptedButUnjournaled { tx_hash, .. } => {
+                assert_eq!(tx_hash, TX_HASH);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Flips a cancellation flag once the status request has actually been
+    /// issued, so cancellation lands after the lookup rather than before it.
+    struct CancelOnLookupTransport {
+        inner: MockTransport,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ChainTransport for CancelOnLookupTransport {
+        fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(url, timeout)
+        }
+
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            body: Vec<u8>,
+            timeout: Duration,
+        ) -> ChainFuture<'a> {
+            self.inner.post_json(url, body, timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_a_lookup_stops_before_retiring_evidence() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let inner = MockTransport::default();
+        // A committed failure: classifying it would retire the attempt.
+        inner.responses.lock().unwrap().push_back(Ok(response(
+            422,
+            r#"{"height":42,"code":7,"log":"invalid proof","events":[]}"#,
+        )));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport = Arc::new(CancelOnLookupTransport {
+            inner,
+            cancelled: Arc::clone(&cancelled),
+        });
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let cancel = || cancelled.load(std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ChainLifecycleOutcome::Cancelled);
+        // A cancelled operation must not mutate durable state on the way out.
+        // The candidate is still journaled, so the next reconciliation
+        // re-derives what this one was about to conclude.
+        assert_eq!(attempt_states(&db), vec!["accepted".to_string()]);
     }
 }

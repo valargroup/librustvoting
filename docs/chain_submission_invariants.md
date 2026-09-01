@@ -123,15 +123,25 @@ and event positions to a generation replaced in the meantime, which is exactly
 the mismatch the cleanup guards exist to stop.
 
 "A POST is in flight" is a claim with an expiry rather than a durable fact, so it
-is checked by age every time a guard runs. A reservation is `attempting` only
-between its journaling and the response classification that follows its POST, so
-it cannot outlive that call's request deadline by more than scheduling slop; one
-untouched for longer than any configurable deadline cannot be in flight in any
-process. The grace period is derived from the largest deadline a host may
-configure rather than chosen independently, and the client refuses a longer one:
-the coverage query cannot see a per-call client configuration, so without that cap
-a host could configure the distinction away and make a live reservation look
-abandoned.
+is decided every time a guard runs, by two tests in order of strength.
+
+A reservation this process is waiting on is named exactly, by an in-memory
+registry the submission loop holds from the moment it journals a reservation
+until it classifies the response. That needs no clock, so no adjustment to the
+system clock can make a live POST look abandoned and let cleanup erase the
+material its response is about to be confirmed against.
+
+A reservation this registry cannot know about — another process's, or one no
+registry will ever hold because its process is gone — falls back to age. A
+reservation is `attempting` only between its journaling and the classification
+that follows its POST, so it cannot outlive that call's request deadline by more
+than scheduling slop; one untouched for longer than any configurable deadline
+cannot be in flight. The grace period is derived from the largest deadline a host
+may configure rather than chosen independently, and the client refuses a longer
+one: the coverage query cannot see a per-call client configuration, so without
+that cap a host could configure the distinction away. This test reads the wall
+clock and is therefore the weaker of the two, which is why it is never the only
+one.
 
 Checking at query time rather than rewriting the row once is what makes the bound
 hold. A downgrade pass performed when the database is opened would leave a
@@ -265,6 +275,13 @@ none. The transaction may still have committed; that stays visible as
 12. CheckTx acceptance alone never updates the legacy delegation or vote
     submission columns. This prevents a later DeliverTx failure from pinning a
     domain row to a transaction that did not commit successfully.
+13. An accepted transaction hash is never discarded by a failure to journal it.
+    The transaction is already in the mempool and may commit, and the hash is the
+    only handle anything will ever have on it, so a storage failure after a usable
+    accepted response returns `AcceptedButUnjournaled` carrying both the hash and
+    the persistence error rather than the error alone. The host SHOULD retain the
+    hash and record it once storage recovers, so a later reconciliation can
+    confirm it.
 
 These rules mirror helper submission's reservation-before-POST and
 strongest-evidence behavior. Chain submissions deliberately differ by allowing
@@ -475,9 +492,14 @@ hosts do not parse the log.
    the payload was serialized is therefore caught before dispatch, not merely
    before the lock was taken.
 5. Cancellation is checked on entry to reconciliation and before reservation,
-   dispatch, retry, failover, backoff, and confirmation application. The
-   entry check covers the no-candidate fast path, so a cancelled operation is
-   never reported to the host as actively pending.
+   dispatch, retry, failover, backoff, and confirmation application, and again
+   as soon as each transaction-status request returns. The entry check covers
+   the no-candidate fast path, so a cancelled operation is never reported to the
+   host as actively pending; the post-request check covers every result variant,
+   not only a committed success, because classifying a 404 or an error reports an
+   outcome and classifying a committed failure retires evidence. A cancelled
+   operation does neither: the candidate stays journaled, so the next
+   reconciliation re-derives whatever this one was about to conclude.
 6. Cancellation observed after a broadcast completes does not replace that
    broadcast's result. A call cancelled while a dispatched attempt may still
    commit reports `OutcomeUnknown`; `Cancelled` is reserved for calls with no
@@ -567,6 +589,10 @@ state transitions.
   elapses, without waiting for the database to be reopened?
 - Can a confirmation that fails validation still have destroyed a competing
   candidate's hash?
+- Can a wall-clock adjustment expire a reservation whose POST is still in flight?
+- Is cancellation observed after a lookup returns, for every result variant and
+  not only a committed success?
+- Can an accepted transaction hash be lost when journaling it fails?
 - Can a configurable request deadline outlive the reservation grace period?
 - Can an unconfirmed hash already in a domain column block a proven success from
   ever being applied?
@@ -650,7 +676,11 @@ state transitions.
   cover the in-transaction payload rebuild, including that a mismatch dispatches
   nothing and journals nothing.
 - `chain_submission::tests::cancellation_after_lookup_suppresses_the_confirmation_write`
-  covers the cancellation checkpoint immediately before confirmation.
+  covers the cancellation checkpoint immediately before confirmation, and
+  `cancellation_after_a_lookup_stops_before_retiring_evidence` covers the
+  post-request checkpoint on a non-success result variant.
+- `chain_submission::tests::an_accepted_hash_survives_a_failure_to_journal_it`
+  covers `AcceptedButUnjournaled`.
 - `chain_submission::tests::one_transaction_recorded_in_two_casings_is_looked_up_once`
   and `chain_submission::tests::a_legacy_opaque_hash_does_not_break_reconciliation`
   cover candidate canonicalization and non-normalizable legacy hashes.
@@ -744,6 +774,9 @@ state transitions.
   `a_reservation_still_in_flight_protects_its_recovery_generation` and
   `a_reservation_older_than_any_deadline_protects_nothing` cover the freshness
   bound on a hashless reservation, the second without reopening the database.
+  `chain_submission::tests::a_reservation_this_process_awaits_survives_a_wall_clock_jump`
+  covers the in-memory registry taking precedence over that bound, and its
+  release afterwards.
   `session::tests::a_stale_reservation_does_not_refuse_a_ballot_intent_change`
   covers the same bound at the ballot-intent guard.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
