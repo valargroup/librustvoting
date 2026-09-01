@@ -523,19 +523,26 @@ hosts do not parse the log.
    identity the process has ever seen.
 3. After acquiring the lock, the lifecycle re-reads the exact durable recovery
    generation. A stale handle fails before network dispatch.
-4. A reservation that cannot be taken is a failure definite only for its own
+4. The in-flight guard for an identity is taken before its reservation is
+   journaled, not after that transaction commits. The row is durable the instant
+   it commits and coverage decided by age can already read it as stale, so a
+   guard taken afterwards leaves a window in which cleanup may erase the
+   generation the dispatched bytes were built from while the call goes on to
+   POST them. Registering first can only name an identity whose reservation then
+   fails, which over-protects its rows until the guard drops.
+5. A reservation that cannot be taken is a failure definite only for its own
    attempt. If an earlier attempt in the call is outcome-unknown, a journaled
    attempt may still commit, or a candidate hash is known, the call reports
    `OutcomeUnknown` rather than the persistence error: a concurrent change to the
    now-uncovered generation is exactly what makes a rebuild fail as stale, and
    reporting only the error would invite the host to treat the replacement as
    safe to submit.
-5. Attempt insertion, its round and owner validation, and the payload rebuild
+6. Attempt insertion, its round and owner validation, and the payload rebuild
    that proves the generation is unchanged all share one immediate SQLite
    transaction. A generation replaced or cleared by another connection after
    the payload was serialized is therefore caught before dispatch, not merely
    before the lock was taken.
-6. Cancellation is checked on entry to reconciliation and before reservation,
+7. Cancellation is checked on entry to reconciliation and before reservation,
    dispatch, retry, failover, backoff, and confirmation application, and again
    as soon as each transaction-status request returns. The entry check covers
    the no-candidate fast path, so a cancelled operation is never reported to the
@@ -544,13 +551,13 @@ hosts do not parse the log.
    outcome and classifying a committed failure retires evidence. A cancelled
    operation does neither: the candidate stays journaled, so the next
    reconciliation re-derives whatever this one was about to conclude.
-7. Cancellation observed after a broadcast completes does not replace that
+8. Cancellation observed after a broadcast completes does not replace that
    broadcast's result. A call cancelled while a dispatched attempt may still
    commit reports `OutcomeUnknown`; `Cancelled` is reserved for calls with no
    completed ambiguous broadcast.
-8. Cancellation before a fresh reservation dispatches removes the definitely
+9. Cancellation before a fresh reservation dispatches removes the definitely
    unsent reservation. Cancellation after dispatch retains uncertainty.
-9. A deleted or replaced generation cannot receive a delayed transport or
+10. A deleted or replaced generation cannot receive a delayed transport or
    confirmation result. Cancellation is re-checked immediately before the
    confirmation transaction, so a session invalidated while a status request
    was in flight does not have voting state mutated underneath it. This narrows
@@ -636,6 +643,8 @@ state transitions.
 - Can a wall-clock adjustment expire a reservation whose POST is still in flight?
 - Can two database handles collide in the in-flight registry, so one's expired
   reservation reads as live or one's release uncovers the other?
+- Is the in-flight guard held before a reservation becomes durable, or only
+  after its transaction commits?
 - Can a reservation failure after an ambiguous dispatch be reported as a plain
   error, hiding an attempt that may still commit?
 - Can recovery cleanup erase an unconfirmed domain hash that is still the only
@@ -839,7 +848,9 @@ state transitions.
   covers the refresh that makes `updated_at` mean "the owner was alive", its
   state and wallet scoping, and its margin against the grace period.
   `chain_submission::tests::in_flight_coverage_does_not_cross_databases` covers
-  the identity keying that keeps two handles minting the same row id apart.
+  the identity keying that keeps two handles minting the same row id apart, and
+  `the_in_flight_guard_is_held_before_the_reservation_is_journaled` covers the
+  guard being in place while the reservation transaction is still open.
   `session::tests::a_stale_reservation_does_not_refuse_a_ballot_intent_change`
   covers the same bound at the ballot-intent guard.
 - `storage::operations::tests::recovery_cleanup_preserves_a_legacy_candidate_hash_and_its_recovery`,

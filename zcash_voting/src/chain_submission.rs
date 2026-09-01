@@ -541,6 +541,16 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // transaction. That repeats the delegation signature verification
             // and recovery reads up to `attempts` times per call, which is the
             // intended cost of proving the generation is still current.
+            // Registered before the reservation is journaled, not after it
+            // commits. The row is durable the instant that transaction commits,
+            // and coverage decided by age can already read it as stale — a clock
+            // step is all it takes — so a guard taken afterwards leaves a window
+            // where cleanup may erase the generation these bytes were built
+            // from, while this call goes on to POST them and journal a hash that
+            // can no longer be confirmed against what is stored. Registering
+            // first can only name an identity whose reservation then fails,
+            // which over-protects its rows until the guard drops.
+            let _in_flight = InFlightAttempt::register(wallet_id, &identity);
             // A failure here is definite only for this attempt. An earlier one
             // in this call may still commit, and a concurrent change to the
             // now-uncovered generation is exactly what makes this rebuild fail
@@ -559,10 +569,6 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     return Err(error.into());
                 }
             };
-            // Held until this iteration ends, which is after the response is
-            // classified on every path. While it lives, the rows this payload
-            // was built from stay covered no matter what the wall clock does.
-            let _in_flight = InFlightAttempt::register(wallet_id, &identity);
             if cancel() {
                 // This reservation is definitely unsent, but an earlier attempt
                 // in this call may still commit.
@@ -3999,6 +4005,51 @@ mod tests {
             matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
                 if message.contains("could not be prepared")),
             "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_in_flight_guard_is_held_before_the_reservation_is_journaled() {
+        let db = test_db();
+        {
+            let conn = db.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+        }
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            &format!(r#"{{"tx_hash":"{TX_HASH}","code":0,"log":""}}"#),
+        )));
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        // The rebuild runs inside the reservation transaction, before its row is
+        // committed, so only the registry can be covering the identity here.
+        let covered_during_reservation = Arc::new(Mutex::new(false));
+        let observed = Arc::clone(&covered_during_reservation);
+        let rebuild = move |conn: &rusqlite::Connection| -> Result<Vec<u8>, VotingError> {
+            let protected = attempt_protected_vote_rows(conn, ROUND_ID, WALLET)?;
+            *observed.lock().unwrap() = protected.contains(&(0, 3));
+            echo_rebuild(conn)
+        };
+
+        lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::vote(ROUND_ID, 0, 3),
+                b"{}".to_vec(),
+                &rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // A guard taken after the reservation commits leaves a window in which
+        // cleanup can erase the generation these bytes were built from, while
+        // the call goes on to POST them.
+        assert!(
+            *covered_during_reservation.lock().unwrap(),
+            "the identity must be covered before its reservation is journaled"
         );
     }
 }

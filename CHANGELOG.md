@@ -86,7 +86,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the persistence error when an earlier attempt in the same call may still
   commit.
 - The in-flight reservation registry is keyed by submission identity rather than
-  by journal row id, which restarts per database file.
+  by journal row id, which restarts per database file. Its guard is now taken
+  before the reservation is journaled rather than after that transaction
+  commits, closing the window in which the durable row existed uncovered.
 - A chain submission attempt's own definite rejection or non-retryable transport
   failure no longer reports a terminal outcome while a known candidate for the
   same submission is still outstanding. A candidate another writer recorded
