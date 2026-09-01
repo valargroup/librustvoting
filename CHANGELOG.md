@@ -84,6 +84,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   and with it the request deadline the heartbeat exists to keep the reservation
   inside; a contended refresh is skipped. It no longer waits on SQLite's write
   lock either, which another connection or process can hold.
+- Reconciliation rebuilds its candidate set after the lookups, so every answer
+  reports what the journal currently holds: a candidate another writer added
+  during the requests is included, and one this call proved failed is not.
 - Reconciliation reports `OutcomeUnknown` rather than `Pending` while a hashless
   attempt is still live: it may already have committed under a hash nothing can
   locate.

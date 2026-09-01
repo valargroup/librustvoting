@@ -599,7 +599,14 @@ hosts do not parse the log.
    already have committed under a hash nothing can locate, so saying the known
    candidates merely have not committed yet would overstate what this call
    established.
-9. A confirmation another writer applies while these lookups are in flight
+9. The candidate set is rebuilt after the lookups and before any answer is
+   returned. The set read beforehand is stale in both directions by then:
+   retirement has marked proven failures `rejected`, and another writer can
+   journal a candidate while the requests run. Reporting the older set would
+   hand back a transaction this call disproved, or omit one it should be
+   polling — and for a vote, an omitted candidate that commits also stalls the
+   helper-share delivery that follows confirmation.
+10. A confirmation another writer applies while these lookups are in flight
    outranks every weaker answer. The entry shortcut runs before them, so the
    durable state is read again before reporting a terminal error, ambiguity,
    pending, or rejection: a lagging 404 would otherwise report `Pending`, and a
@@ -610,7 +617,7 @@ hosts do not parse the log.
    loop, because a POST can be in flight while another writer confirms.
    Acceptance is not commitment, so it too is weaker than a confirmation already
    applied; the hash the call learned stays in the journal either way.
-10. Adopting a candidate this lookup proved committed clears any *different*
+11. Adopting a candidate this lookup proved committed clears any *different*
    unconfirmed hash in the domain column for that submission, inside the
    confirmation transaction and after the event validation. The domain writers
    refuse to overwrite a stored hash with a different one, so an opaque
@@ -628,12 +635,12 @@ hosts do not parse the log.
    record of a competing candidate. The standalone recording APIs keep refusing a
    contradicting stored hash, because a host passing one is reporting a
    contradiction it should see.
-11. The winning hash and event-derived positions are committed together by the
+12. The winning hash and event-derived positions are committed together by the
    existing confirmation transaction. Attempt evidence is retained separately;
    a crash on either side is recoverable because the attempt hash and the
    domain record are both idempotent and neither overwrites conflicting state.
-12. Atomic-batch members advance together or not at all.
-13. Event round, bundle, proposal order, batch digest, and nullifier bindings
+13. Atomic-batch members advance together or not at all.
+14. Event round, bundle, proposal order, batch digest, and nullifier bindings
     are validated by the existing confirmation parser before writes.
 
 ## Concurrency and cancellation invariants
@@ -843,6 +850,8 @@ state transitions.
   through the retry backoff?
 - Can `Pending` be reported while a hashless attempt may already have committed?
 - Can a supplementary durable read, failing, discard an accepted hash?
+- Is the candidate set a reconciliation reports rebuilt after its lookups, or
+  taken from the snapshot they began with?
 - Can a committed failure be reported as terminal while a candidate journaled
   during the lookup may still commit?
 - Is cancellation observed by the public lookup client, not just by the
@@ -1142,7 +1151,9 @@ state transitions.
   timestamp and the guard's lifetime.
 - `chain_submission::tests::a_hashless_attempt_outranks_a_merely_pending_candidate`
   and `an_accepted_hash_survives_an_unreadable_final_reread` cover the two
-  precedence rules above.
+  precedence rules above, and
+  `a_candidate_journaled_during_a_pending_lookup_is_reported` covers the
+  candidate set being rebuilt after the lookups.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
   covers storage-boundary hash canonicalization and idempotent replay.
 - storage migration tests cover version 18 fresh and in-place schemas, including

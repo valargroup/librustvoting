@@ -1098,22 +1098,19 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
         }
-        // Retirement above just marked the proven failures `rejected`, so the
-        // set read before the lookup now names transactions the journal no
-        // longer treats as candidates. Reporting those back would have the host
-        // keep polling one this call proved had failed.
-        let hashes = if committed_failures.is_empty() {
-            hashes
-        } else {
-            let rebuilt = known_hashes(self.db, wallet_id, identity)?;
-            // That read can wait on SQLite, so cancellation may have arrived
-            // since the check above and every classification below is a claim
-            // this operation is no longer entitled to make.
-            if cancel() {
-                return Ok(ChainLifecycleOutcome::Cancelled);
-            }
-            rebuilt
-        };
+        // The set read before the lookups is stale in both directions by now:
+        // retirement above marked the proven failures `rejected`, and another
+        // writer can journal a candidate while the requests are running. Rebuild
+        // it once here, so every answer below reports what the journal currently
+        // holds rather than what it held before the network work.
+        drop(hashes);
+        let hashes = known_hashes(self.db, wallet_id, identity)?;
+        // That read can wait on SQLite, so cancellation may have arrived since
+        // the check above, and every classification below is a claim this
+        // operation is no longer entitled to make.
+        if cancel() {
+            return Ok(ChainLifecycleOutcome::Cancelled);
+        }
         if let Some((hash, response)) = successful.pop() {
             // The status request may have taken arbitrarily long. An account or
             // session invalidated while it was in flight must not have voting
@@ -1155,7 +1152,12 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // can locate, so reporting that the known candidates simply have not
             // committed yet would overstate what this call established — the same
             // rule the committed-failure and terminal-error branches follow.
-            if has_live_attempt(self.db, wallet_id, identity)? {
+            let live = has_live_attempt(self.db, wallet_id, identity)?;
+            // That read waits on the database, and it sits past the check above.
+            if cancel() {
+                return Ok(ChainLifecycleOutcome::Cancelled);
+            }
+            if live {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                     known_tx_hashes: hashes,
                     message: "an earlier attempt was dispatched without a usable response"
@@ -1175,17 +1177,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // call's answer. `reconcile` reaches this exit directly, without the
             // submission loop's ambiguity handling around it, so the check
             // belongs here.
-            // Re-read rather than trust the pre-lookup snapshot: another
-            // writer can journal a candidate while these requests are running,
-            // and it arrives `accepted`, which the live-attempt query does not
-            // match either.
-            let remaining = known_hashes(self.db, wallet_id, identity)?;
             let live = has_live_attempt(self.db, wallet_id, identity)?;
-            // Those reads wait on the database, and this branch sits past every
+            // That read waits on the database, and this branch sits past every
             // earlier check.
             if cancel() {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
+            let remaining = hashes;
             if !remaining.is_empty() || live {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                     known_tx_hashes: remaining,
@@ -5632,6 +5630,41 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Journals a second candidate while the first one is being looked up.
+    struct JournalDuringLookup {
+        inner: MockTransport,
+        db_path: String,
+        done: Mutex<bool>,
+    }
+    impl ChainTransport for JournalDuringLookup {
+        fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
+            {
+                let mut done = self.done.lock().unwrap();
+                if !*done {
+                    *done = true;
+                    let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+                    conn.execute(
+                        "INSERT INTO chain_submission_attempts
+                         (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                          payload_digest, chain_tx_hash, state, created_at, updated_at)
+                         VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                        rusqlite::params![ROUND_ID, WALLET, vec![0xEE_u8; 32], TX_HASH_2],
+                    )
+                    .unwrap();
+                }
+            }
+            self.inner.get(url, timeout)
+        }
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            body: Vec<u8>,
+            timeout: Duration,
+        ) -> ChainFuture<'a> {
+            self.inner.post_json(url, body, timeout)
+        }
+    }
+
     #[tokio::test]
     async fn a_committed_failure_yields_to_a_candidate_journaled_during_the_lookup() {
         let path = std::env::temp_dir().join(format!(
@@ -5641,41 +5674,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let db = file_test_db(path.to_str().unwrap());
         journal_attempt(&db, "accepted", Some(TX_HASH));
-
-        /// Journals a second candidate while the first one is being looked up.
-        struct JournalDuringLookup {
-            inner: MockTransport,
-            db_path: String,
-            done: Mutex<bool>,
-        }
-        impl ChainTransport for JournalDuringLookup {
-            fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
-                {
-                    let mut done = self.done.lock().unwrap();
-                    if !*done {
-                        *done = true;
-                        let conn = rusqlite::Connection::open(&self.db_path).unwrap();
-                        conn.execute(
-                            "INSERT INTO chain_submission_attempts
-                             (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
-                              payload_digest, chain_tx_hash, state, created_at, updated_at)
-                             VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
-                            rusqlite::params![ROUND_ID, WALLET, vec![0xEE_u8; 32], TX_HASH_2],
-                        )
-                        .unwrap();
-                    }
-                }
-                self.inner.get(url, timeout)
-            }
-            fn post_json<'a>(
-                &'a self,
-                url: &'a str,
-                body: Vec<u8>,
-                timeout: Duration,
-            ) -> ChainFuture<'a> {
-                self.inner.post_json(url, body, timeout)
-            }
-        }
 
         let inner = MockTransport::default();
         inner.responses.lock().unwrap().push_back(Ok(response(
@@ -6337,6 +6335,49 @@ mod tests {
                 tx_hash: TX_HASH.to_string()
             }
         );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_candidate_journaled_during_a_pending_lookup_is_reported() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_pending_race_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let inner = MockTransport::default();
+        // The known candidate is simply not committed yet.
+        inner
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(response(404, r#"{"detail":"not found"}"#)));
+        let client = ChainClient::new(
+            Arc::new(JournalDuringLookup {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                done: Mutex::new(false),
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // Reporting the pre-lookup snapshot would have the host poll only the
+        // candidate it already knew, while the one journaled during the request
+        // commits unnoticed.
+        let reported = match &outcome {
+            ChainLifecycleOutcome::Pending { known_tx_hashes } => known_tx_hashes.clone(),
+            other => panic!("got {other:?}"),
+        };
+        assert!(reported.contains(&TX_HASH_2.to_string()), "{reported:?}");
         drop(db);
         let _ = std::fs::remove_file(&path);
     }
