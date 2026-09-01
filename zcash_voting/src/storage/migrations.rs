@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 17;
+const CURRENT_VERSION: u32 = 18;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -116,6 +116,51 @@ BEGIN
        AND bundle_index = NEW.bundle_index AND proposal_id = NEW.proposal_id
        AND commitment_bundle_json IS NOT NEW.commitment_bundle_json;
 END;",
+    ),
+    (
+        17,
+        "-- Releases through v3.1.0-rc.15 could clear software delegation setup
+-- after ZKP1 succeeded while leaving the proof row marked successful. That
+-- proof cannot be signed or submitted without the erased PCZT fields. Preserve
+-- its bytes, but make the exact locally rebuildable state eligible for setup
+-- and proof generation again.
+UPDATE proofs AS p
+   SET success = 0
+ WHERE p.success = 1
+   AND EXISTS (
+       SELECT 1
+         FROM bundles b
+        WHERE b.round_id = p.round_id
+          AND b.wallet_id = p.wallet_id
+          AND b.bundle_index = p.bundle_index
+          AND b.note_positions_blob IS NOT NULL
+          AND b.delegation_tx_hash IS NULL
+          AND b.van_leaf_position IS NULL
+          AND b.van_comm_rand IS NULL
+          AND b.dummy_nullifiers IS NULL
+          AND b.rho_signed IS NULL
+          AND b.padded_note_data IS NULL
+          AND b.nf_signed IS NULL
+          AND b.cmx_new IS NULL
+          AND b.alpha IS NULL
+          AND b.rseed_signed IS NULL
+          AND b.rseed_output IS NULL
+          AND b.gov_comm IS NULL
+          AND b.total_note_value IS NULL
+          AND b.address_index IS NULL
+          AND b.rk IS NULL
+          AND b.gov_nullifiers_blob IS NULL
+          AND b.padded_note_secrets IS NULL
+          AND b.pczt_sighash IS NULL
+          AND b.tx1_effects IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+                FROM keystone_signatures k
+               WHERE k.round_id = b.round_id
+                 AND k.wallet_id = b.wallet_id
+                 AND k.bundle_index = b.bundle_index
+          )
+   );",
     ),
 ];
 
@@ -301,6 +346,34 @@ mod tests {
             nc_root: vec![0xAA; 32],
             nullifier_imt_root: vec![0xBB; 32],
         }
+    }
+
+    fn store_complete_delegation_setup(conn: &Connection, bundle_index: u32) {
+        let gov_nullifiers = vec![vec![0x0B; 32]; crate::governance::BUNDLE_NOTE_SLOTS];
+        queries::store_delegation_data_with_pczt_fields(
+            conn,
+            "test-round",
+            "wallet",
+            bundle_index,
+            &[0x01; 32],
+            &[],
+            &[0x02; 32],
+            &[],
+            &[0x03; 32],
+            &[0x04; 32],
+            &[0x05; 32],
+            &[0x06; 32],
+            &[0x07; 32],
+            &[0x08; 32],
+            1,
+            0,
+            &[],
+            &[0x09; 32],
+            &crate::tx1::placeholder_tx1_effects(),
+            &[0x0A; 32],
+            &gov_nullifiers,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -491,6 +564,84 @@ mod tests {
             CURRENT_VERSION
         );
         assert_helper_plan_lifecycle(&conn);
+    }
+
+    #[test]
+    fn migrate_v17_repairs_legacy_cleaned_successful_proof() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("migrations/001_init.sql"))
+            .unwrap();
+        queries::insert_round(
+            &conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 1, &[2]).unwrap();
+        store_complete_delegation_setup(&conn, 0);
+        store_complete_delegation_setup(&conn, 1);
+        queries::store_proof(&conn, "test-round", "wallet", 0, &[0xAC; 96]).unwrap();
+        queries::store_proof(&conn, "test-round", "wallet", 1, &[0xBD; 96]).unwrap();
+
+        // Reproduce the setup fields cleared by the released reset query. The
+        // successful proof row itself survived that cleanup.
+        conn.execute(
+            "UPDATE bundles
+             SET van_comm_rand = NULL,
+                 dummy_nullifiers = NULL,
+                 rho_signed = NULL,
+                 padded_note_data = NULL,
+                 nf_signed = NULL,
+                 cmx_new = NULL,
+                 alpha = NULL,
+                 rseed_signed = NULL,
+                 rseed_output = NULL,
+                 gov_comm = NULL,
+                 total_note_value = NULL,
+                 address_index = NULL,
+                 rk = NULL,
+                 gov_nullifiers_blob = NULL,
+                 padded_note_secrets = NULL,
+                 pczt_sighash = NULL,
+                 tx1_effects = NULL
+             WHERE round_id = 'test-round'
+               AND wallet_id = 'wallet'
+               AND bundle_index = 0",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 17).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let repaired: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT proof, success FROM proofs
+                 WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(repaired, (vec![0xAC; 96], 0));
+
+        let reusable: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT proof, success FROM proofs
+                 WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reusable, (vec![0xBD; 96], 1));
+
+        store_complete_delegation_setup(&conn, 0);
+        queries::store_proof(&conn, "test-round", "wallet", 0, &[0xCE; 96]).unwrap();
+        let regenerated =
+            queries::load_delegation_submission_data(&conn, "test-round", "wallet", 0).unwrap();
+        assert_eq!(regenerated.proof, vec![0xCE; 96]);
     }
 
     #[test]
