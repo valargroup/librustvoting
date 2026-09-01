@@ -561,6 +561,12 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     outcome,
                     ChainLifecycleOutcome::OutcomeUnknown { .. }
                         | ChainLifecycleOutcome::Pending { .. }
+                        // Acceptance is not commitment, so it too is weaker than
+                        // a confirmation another writer has already applied.
+                        // Reporting it would send the host polling a submission
+                        // that is durably complete; the hash this call learned
+                        // stays in the journal either way.
+                        | ChainLifecycleOutcome::Accepted { .. }
                 ) =>
             {
                 match durable_confirmation_hash(self.db, wallet_id, &identity)? {
@@ -667,8 +673,17 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 Ok(Some(attempt_id)) => attempt_id,
                 // A candidate appeared between the preflight and this
                 // reservation. Report what it settles rather than adding a
-                // duplicate broadcast to a submission that already has one.
-                Ok(None) => return self.reconcile_locked(wallet_id, identity, cancel).await,
+                // duplicate broadcast to a submission that already has one — and
+                // as at the other reconciliation gates, a cancelled
+                // reconciliation settled nothing and must not replace an earlier
+                // broadcast's ambiguity.
+                Ok(None) => {
+                    let reconciled = self.reconcile_locked(wallet_id, identity, cancel).await?;
+                    if matches!(reconciled, ChainLifecycleOutcome::Cancelled) {
+                        return Ok(self.cancelled_outcome(wallet_id, identity, last_unknown)?);
+                    }
+                    return Ok(reconciled);
+                }
                 Err(error) => {
                     if let Some(outcome) = self.outstanding_ambiguity(
                         wallet_id,
@@ -5949,6 +5964,107 @@ mod tests {
             matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
                 if known_tx_hashes.contains(&TX_HASH_2.to_string())),
             "got {outcome:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_reservation_race_preserves_earlier_ambiguity() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Err(ChainTransportError::Timeout));
+        let client = ChainClient::with_config(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            ChainClientConfig::default()
+                .with_retry_delays(vec![Duration::from_millis(1)])
+                .unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let calls = Arc::new(Mutex::new(0usize));
+        // The rebuild runs inside the reservation transaction, just before its
+        // candidate check. On the retry it records a candidate — the race this
+        // gate exists for — and the operation is cancelled at the same moment.
+        let rebuild = move |conn: &rusqlite::Connection| -> Result<Vec<u8>, VotingError> {
+            let mut seen = calls.lock().unwrap();
+            *seen += 1;
+            if *seen == 2 {
+                queries::store_delegation_tx_hash(conn, ROUND_ID, WALLET, 0, TX_HASH)?;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            echo_rebuild(conn)
+        };
+        let cancel = || cancelled.load(std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &rebuild,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        // The first attempt completed ambiguously and may still commit, so this
+        // gate owes the caller that, not `Cancelled`.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
+                if message.contains("timed out")),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_applied_during_the_post_outranks_acceptance() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_accept_confirm_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        let inner = MockTransport::default();
+        inner.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            &format!(r#"{{"tx_hash":"{TX_HASH_2}","code":0,"log":""}}"#),
+        )));
+        let client = ChainClient::new(
+            Arc::new(ConfirmDuringPostTransport {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                done: Mutex::new(false),
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // Acceptance is not commitment, so it is weaker than a confirmation
+        // already applied. Reporting it would send the host polling a submission
+        // that is durably complete; the hash this call learned stays journaled.
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::AlreadyConfirmed {
+                tx_hash: TX_HASH.to_string()
+            }
         );
         drop(db);
         let _ = std::fs::remove_file(&path);

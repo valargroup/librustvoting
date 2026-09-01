@@ -87,8 +87,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Cancellation is rechecked after the candidate set is rebuilt following
   retirement and after the durable-confirmation reread, before the submission is
   classified.
-- A submission call rereads the durable state before reporting that it is still
-  waiting, so a confirmation another writer applies while its POST is in flight
+- A submission call rereads the durable state before reporting `Accepted`, or
+  that it is still so a confirmation another writer applies while its POST is in flight
   is not downgraded to `OutcomeUnknown` or `Pending`.
 - The attempt reservation refuses to dispatch when a candidate for the same
   submission already exists, checked inside its own immediate transaction. The

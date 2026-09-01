@@ -272,7 +272,17 @@ none. The transaction may still have committed; that stays visible as
    between the preflight and the first dispatch: the legacy recording APIs take
    no lifecycle lock, so only SQLite's own serialization orders one of their
    writes against this one. A candidate found there means the call reports what
-   reconciliation settles rather than adding a duplicate broadcast.
+   reconciliation settles rather than adding a duplicate broadcast, and a
+   cancelled reconciliation at that gate reports an earlier broadcast's ambiguity
+   rather than `Cancelled`, as at every other gate.
+
+   This narrows the window; it does not close it, and is not meant to. A legacy
+   write blocked behind the reservation can commit after it and before the POST
+   starts, and holding SQLite's write lock across a network request to prevent
+   that would stall every other database user for the request deadline. The
+   bounded duplicate it leaves is the case this design already accepts: consensus
+   nullifiers make at most one semantic action succeed, reconciliation retains
+   every candidate, and the loser is retired.
 6. Repeated byte-identical attempts share a payload digest but remain distinct
    ordered attempts. A re-signed payload has a different digest.
 7. Accepted chain hashes and all earlier unknown attempts remain available for
@@ -573,8 +583,10 @@ hosts do not parse the log.
    different candidate's committed failure would report `Rejected`, for a
    submission that is now durably confirmed. Candidates proved failed are still
    retired on that path. A submission call applies the same rule to its own
-   "still waiting" answers, once where they leave the attempt loop, because a
-   POST can be in flight while another writer confirms.
+   "still waiting" answers and to `Accepted`, once where they leave the attempt
+   loop, because a POST can be in flight while another writer confirms.
+   Acceptance is not commitment, so it too is weaker than a confirmation already
+   applied; the hash the call learned stays in the journal either way.
 10. Adopting a candidate this lookup proved committed clears any *different*
    unconfirmed hash in the domain column for that submission, inside the
    confirmation transaction and after the event validation. The domain writers
@@ -856,7 +868,7 @@ state transitions.
   another that is merely pending or unreadable, or a dispatched attempt that may
   still commit?
 - Does a submission call reread the durable state before reporting that it is
-  still waiting?
+  still waiting, or that its POST was accepted?
 - Is every failed candidate retired, including when a success is adopted in the
   same lookup?
 - Can a vote's recovery generation be replaced while an attempt covers it?
@@ -1021,6 +1033,8 @@ state transitions.
   `a_pending_candidate_outranks_another_candidates_lookup_error`,
   `a_candidate_journaled_during_a_failing_lookup_outranks_its_error`,
   `a_candidate_recorded_before_the_reservation_stops_the_dispatch`,
+  `a_cancelled_reservation_race_preserves_earlier_ambiguity`,
+  `a_confirmation_applied_during_the_post_outranks_acceptance`,
   `a_confirmation_applied_during_the_final_post_is_not_downgraded`,
   `adopting_a_success_still_retires_the_failed_candidates`, and
   `a_spent_nullifier_response_accepts_a_durable_confirmation` cover the
