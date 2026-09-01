@@ -6446,6 +6446,56 @@ mod tests {
         assert_eq!(row.1, Some(vec![0xA5; 32]));
     }
 
+    #[test]
+    fn one_transaction_cannot_confirm_two_bundles() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (round_id, wallet_id, bundle_index) VALUES (?1, ?2, 1)",
+                rusqlite::params![ROUND_ID, W],
+            )
+            .unwrap();
+        let hash = "a".repeat(64);
+        queries::store_delegation_tx_hash(&db.conn(), ROUND_ID, W, 0, &hash).unwrap();
+
+        // A stale or misbehaving endpoint can return one syntactically valid
+        // hash for two submissions. Confirming both would write one
+        // transaction's VAN position onto a bundle it never touched.
+        let error =
+            queries::store_delegation_tx_hash(&db.conn(), ROUND_ID, W, 1, &hash).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already recorded for another bundle"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_opaque_legacy_identifier_may_repeat_across_bundles() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (round_id, wallet_id, bundle_index) VALUES (?1, ?2, 1)",
+                rusqlite::params![ROUND_ID, W],
+            )
+            .unwrap();
+        queries::store_delegation_tx_hash(&db.conn(), ROUND_ID, W, 0, "legacy-hash").unwrap();
+
+        // It names no transaction, so two bundles carrying it is a naming
+        // convention rather than a contradiction.
+        queries::store_delegation_tx_hash(&db.conn(), ROUND_ID, W, 1, "legacy-hash").unwrap();
+    }
+
     fn batch_recovery_json(bundle_index: u32, proposal_id: u32, digest: [u8; 32]) -> String {
         use crate::types::EncryptedShare;
         use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};

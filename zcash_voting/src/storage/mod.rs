@@ -8,7 +8,7 @@ use rusqlite::Connection;
 
 use crate::types::{Network, VotingError};
 
-const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current phase of a voting round.
 ///

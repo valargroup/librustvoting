@@ -2926,6 +2926,62 @@ pub fn delete_bundles_from(
 /// [`crate::chain::canonical_tx_hash`].
 pub(crate) use crate::chain::canonical_tx_hash;
 
+/// Refuses a chain transaction already recorded against a different bundle.
+///
+/// One transaction delegates or votes for exactly one bundle: the VAN position
+/// it carries belongs to that bundle alone. A stale or misbehaving endpoint can
+/// return the same syntactically valid hash for two submissions, and confirming
+/// both would write one transaction's position onto a bundle it never touched.
+///
+/// Scoped to the bundle rather than the row, because an atomic batch legitimately
+/// records one transaction on every member of its own bundle.
+fn ensure_tx_hash_belongs_to_bundle(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    tx_hash: &str,
+) -> Result<(), VotingError> {
+    // Only a real chain transaction can confirm anything. An opaque identifier a
+    // pre-lifecycle host recorded names no transaction, so two bundles carrying
+    // the same one is a naming convention, not a contradiction.
+    if !crate::chain::is_tx_hash(tx_hash) {
+        return Ok(());
+    }
+    let claimed: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM bundles
+                  WHERE round_id = :round_id AND wallet_id = :wallet_id
+                    AND bundle_index <> :bundle_index
+                    AND delegation_tx_hash = :tx_hash
+                 UNION ALL
+                 SELECT 1 FROM votes
+                  WHERE round_id = :round_id AND wallet_id = :wallet_id
+                    AND bundle_index <> :bundle_index
+                    AND tx_hash = :tx_hash
+             )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":tx_hash": tx_hash,
+            },
+            |row| row.get(0),
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to check tx hash ownership: {e}"),
+        })?;
+    if claimed {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "transaction {tx_hash} is already recorded for another bundle in round {round_id}; one transaction cannot confirm two submissions"
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn store_delegation_tx_hash(
     conn: &Connection,
     round_id: &str,
@@ -2934,6 +2990,7 @@ pub fn store_delegation_tx_hash(
     tx_hash: &str,
 ) -> Result<(), VotingError> {
     let tx_hash = canonical_tx_hash(tx_hash);
+    ensure_tx_hash_belongs_to_bundle(conn, round_id, wallet_id, bundle_index, &tx_hash)?;
     let rows = conn
         .execute(
             "UPDATE bundles SET delegation_tx_hash = :tx_hash
@@ -3031,6 +3088,7 @@ pub fn record_vote_submission(
     tx_hash: &str,
 ) -> Result<(), VotingError> {
     let tx_hash = canonical_tx_hash(tx_hash);
+    ensure_tx_hash_belongs_to_bundle(conn, round_id, wallet_id, bundle_index, &tx_hash)?;
     ensure_vote_submission_matches_ballot_intent(
         conn,
         round_id,

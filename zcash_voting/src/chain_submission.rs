@@ -1483,11 +1483,25 @@ fn touch_attempt(db: &VotingDb, wallet_id: &str, attempt_id: i64) {
     let Some(conn) = db.try_conn() else {
         return;
     };
-    let _ = conn.execute(
+    // Nor wait on SQLite's own lock: holding this handle's mutex says nothing
+    // about another connection or process holding the write lock, and the
+    // configured busy timeout would then block this task for seconds — with the
+    // POST's deadline among the timers that stop being polled.
+    if conn.busy_timeout(std::time::Duration::ZERO).is_err() {
+        return;
+    }
+    let refreshed = conn.execute(
         "UPDATE chain_submission_attempts SET updated_at=:now
           WHERE id=:id AND wallet_id=:wallet_id AND state='attempting'",
         named_params! { ":now": now, ":id": attempt_id, ":wallet_id": wallet_id },
     );
+    // Restore the timeout every other caller of this connection depends on.
+    let _ = conn.busy_timeout(crate::storage::SQLITE_BUSY_TIMEOUT);
+    // A refusal here is the expected outcome under contention, and skipping is
+    // what best effort means: the cost is this reservation's cross-process
+    // coverage once the grace period elapses, against blocking the request it
+    // is meant to protect.
+    let _ = refreshed;
 }
 
 /// Records one attempt's classified outcome.

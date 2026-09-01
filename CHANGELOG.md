@@ -68,10 +68,19 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   transaction hash, not the newest one per row. Concurrent processes can each be
   accepted with a different hash, and keeping only the newest had a host poll
   the one it kept while the one it dropped committed.
+- Recording a chain transaction hash against a bundle is refused when another
+  bundle in the round already carries it. The VAN position a transaction commits
+  belongs to one bundle, so a stale endpoint returning one valid hash for two
+  submissions could otherwise write a position onto a bundle it never touched.
+  Atomic batches are unaffected — the rule is scoped to the bundle — and opaque
+  legacy identifiers may still repeat.
 - The reservation heartbeat no longer waits for the database connection. It runs
   in the same task as the POST, so blocking on it stopped that task being polled
   and with it the request deadline the heartbeat exists to keep the reservation
-  inside; a contended refresh is skipped.
+  inside; a contended refresh is skipped. It no longer waits on SQLite's write
+  lock either, which another connection or process can hold.
+- Cancellation is rechecked after the durable-confirmation reread that precedes
+  reconciliation's final classification chain.
 - Cancellation is rechecked after the candidate set is rebuilt following
   retirement and after the durable-confirmation reread, before the submission is
   classified.

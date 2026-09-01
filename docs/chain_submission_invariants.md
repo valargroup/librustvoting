@@ -154,9 +154,11 @@ merely when the reservation was made: the two diverge exactly when the wall cloc
 steps forward. So an outstanding reservation refreshes it on a heartbeat far
 shorter than the grace period, and only while it is still `attempting` and only
 under the wallet that reserved it. That refresh never waits for the database: it
-runs in the same task as the POST, so blocking on the connection would stop that
-task being polled, and with it the very deadline the refresh exists to keep the
-reservation inside. A contended refresh is skipped instead. A reservation is `attempting` only between its
+runs in the same task as the POST, so blocking would stop that task being polled,
+and with it the very deadline the refresh exists to keep the reservation inside.
+Neither wait counts — the handle's own mutex, and SQLite's write lock, which
+another connection or process can hold and which the configured busy timeout
+would otherwise sit on for seconds. A contended refresh is skipped instead. A reservation is `attempting` only between its
 journaling and the classification that follows its POST, so it cannot outlive
 that call's request deadline by more than scheduling slop; one untouched for
 longer than any configurable deadline, by an owner that would have refreshed it,
@@ -226,7 +228,15 @@ none. The transaction may still have committed; that stays visible as
    accepted, or chain events to record outside the confirmation lifecycle.
 6. Canonical JSON is serialized once for one call. Every retry in that call
    sends byte-identical content.
-7. Server-returned transaction hashes must be exactly 32 bytes encoded as 64
+7. One chain transaction confirms one bundle. Recording a transaction hash
+   against a bundle is refused when another bundle in the round already carries
+   it: the VAN position it commits belongs to that bundle alone, and a stale or
+   misbehaving endpoint returning one valid hash for two submissions would
+   otherwise write a position onto a bundle the transaction never touched. An
+   atomic batch legitimately records one transaction on every member of its own
+   bundle, so the rule is scoped to the bundle rather than the row, and an
+   opaque identifier names no transaction so it may repeat freely.
+8. Server-returned transaction hashes must be exactly 32 bytes encoded as 64
    hexadecimal characters and are normalized to lowercase before persistence
    or lookup. Canonicalization is enforced at the storage boundary, not only in
    the client, so the older recording APIs cannot store one transaction under a
@@ -239,7 +249,7 @@ none. The transaction may still have committed; that stays visible as
    no surrounding whitespace accepted on either side. A padded or otherwise
    non-conforming stored value stays opaque at rest and is skipped as a
    candidate, so it can never be confirmed into a conflict with itself.
-8. The local payload digest is never accepted where a chain hash is required.
+9. The local payload digest is never accepted where a chain hash is required.
 
 ## Durable dispatch invariants
 
@@ -781,7 +791,9 @@ state transitions.
 - Does every plan surface that names a transaction expose the whole candidate
   set, or select one of several?
 - Is that set every non-rejected attempt carrying a hash, or one per row?
-- Can the reservation heartbeat block the request deadline it protects?
+- Can the reservation heartbeat block the request deadline it protects, on
+  either the handle's mutex or SQLite's own lock?
+- Can one chain transaction confirm two bundles?
 - Can a committed failure be reported as terminal while a candidate journaled
   during the lookup may still commit?
 - Is cancellation observed by the public lookup client, not just by the
@@ -1065,6 +1077,9 @@ state transitions.
   `recovery_cleanup_still_clears_an_opaque_legacy_identifier` cover an
   unconfirmed domain hash as coverage and the opaque-identifier boundary that
   keeps it from freezing a row.
+- `storage::operations::tests::one_transaction_cannot_confirm_two_bundles` and
+  `an_opaque_legacy_identifier_may_repeat_across_bundles` cover one transaction
+  confirming one bundle, and the opaque-identifier boundary.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
   covers storage-boundary hash canonicalization and idempotent replay.
 - storage migration tests cover version 18 fresh and in-place schemas, including
