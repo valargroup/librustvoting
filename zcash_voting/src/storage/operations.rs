@@ -90,6 +90,42 @@ fn validate_network_matches_round(
     Ok(())
 }
 
+/// Persist one proof atomically while treating `DelegationProved` as a minimum
+/// round phase. Another bundle may already have advanced the shared round to a
+/// later phase, which must not prevent this bundle from completing recovery.
+fn persist_delegation_proof_result(
+    conn: &mut rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    result: &DelegationProofResult,
+) -> Result<(), VotingError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to begin proof result transaction: {e}"),
+        })?;
+    queries::store_proof(&tx, round_id, wallet_id, bundle_index, &result.proof)?;
+    queries::store_proof_result_fields_with_van_comm(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        &result.rk,
+        &result.gov_nullifiers,
+        &result.nf_signed,
+        &result.cmx_new,
+        &result.van_comm,
+    )?;
+    let current_phase = queries::get_round_state(&tx, round_id, wallet_id)?.phase;
+    if (current_phase as i32) < RoundPhase::DelegationProved as i32 {
+        queries::advance_round_phase(&tx, round_id, wallet_id, RoundPhase::DelegationProved)?;
+    }
+    tx.commit().map_err(|e| VotingError::Internal {
+        message: format!("failed to commit proof result transaction: {e}"),
+    })
+}
+
 fn delegation_nullifier_targets(
     notes: &[NoteInfo],
     dummy_nullifiers: &[Vec<u8>],
@@ -1157,7 +1193,8 @@ impl VotingDb {
     /// Fetches IMT exclusion proofs from the PIR server for each note's nullifier.
     /// For padded notes (< 5 real notes), the prover fetches proofs internally via PIR.
     ///
-    /// Stores the proof result and advances phase to `DelegationProved`.
+    /// Stores the proof result and advances the round to at least
+    /// `DelegationProved`.
     pub fn build_and_prove_delegation(
         &self,
         round_id: &str,
@@ -1335,31 +1372,11 @@ impl VotingDb {
             prove_elapsed.as_secs_f64()
         );
 
-        // Persist proof bytes, public inputs, and phase together. The public
-        // inputs are checked against the PCZT fields before any partial proof
-        // success state is committed.
+        // Persist proof bytes, public inputs, and the minimum round phase
+        // together. The public inputs are checked against the PCZT fields
+        // before any partial proof success state is committed.
         let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to begin proof result transaction: {e}"),
-            })?;
-        queries::store_proof(&tx, round_id, &wallet_id, bundle_index, &result.proof)?;
-        queries::store_proof_result_fields_with_van_comm(
-            &tx,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            &result.rk,
-            &result.gov_nullifiers,
-            &result.nf_signed,
-            &result.cmx_new,
-            &result.van_comm,
-        )?;
-        queries::advance_round_phase(&tx, round_id, &wallet_id, RoundPhase::DelegationProved)?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to commit proof result transaction: {e}"),
-        })?;
+        persist_delegation_proof_result(&mut conn, round_id, &wallet_id, bundle_index, &result)?;
 
         let total_elapsed = total_start.elapsed();
         eprintln!(
@@ -3098,6 +3115,72 @@ mod tests {
             .expect_err("regression should fail");
 
         assert!(err.to_string().contains("refusing to regress round phase"));
+    }
+
+    #[test]
+    fn test_persist_delegation_proof_keeps_later_round_phase() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+
+        let result = DelegationProofResult {
+            proof: vec![0xA0; 96],
+            public_inputs: Vec::new(),
+            nf_signed: vec![0x30; 32],
+            cmx_new: vec![0x40; 32],
+            gov_nullifiers: vec![vec![0x20; 32]; BUNDLE_NOTE_SLOTS],
+            van_comm: vec![0x50; 32],
+            rk: vec![0x10; 32],
+        };
+        {
+            let conn = db.conn();
+            queries::insert_bundle(&conn, ROUND_ID, W, 0, &[0]).unwrap();
+            queries::store_delegation_data_with_pczt_fields(
+                &conn,
+                ROUND_ID,
+                W,
+                0,
+                &[0x01; 32],
+                &[],
+                &[0x02; 32],
+                &[],
+                &result.nf_signed,
+                &result.cmx_new,
+                &[0x03; 32],
+                &[0x04; 32],
+                &[0x05; 32],
+                &result.van_comm,
+                1,
+                0,
+                &[],
+                &[0x06; 32],
+                &crate::tx1::placeholder_tx1_effects(),
+                &[0x07],
+                &result.rk,
+                &result.gov_nullifiers,
+            )
+            .unwrap();
+        }
+        db.advance_round_phase(ROUND_ID, RoundPhase::VoteReady)
+            .unwrap();
+
+        {
+            let mut conn = db.conn();
+            persist_delegation_proof_result(&mut conn, ROUND_ID, W, 0, &result).unwrap();
+            let stored: (Vec<u8>, i64) = conn
+                .query_row(
+                    "SELECT proof, success FROM proofs
+                     WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                    rusqlite::params![ROUND_ID, W],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, (result.proof, 1));
+        }
+        assert_eq!(
+            db.get_round_state(ROUND_ID).unwrap().phase,
+            RoundPhase::VoteReady
+        );
     }
 
     #[test]

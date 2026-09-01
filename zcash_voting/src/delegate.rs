@@ -1798,6 +1798,40 @@ mod tests {
     }
 
     #[test]
+    fn ensure_proof_failure_preserves_generated_setup_for_keystone_retry() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+
+        let err = prepared
+            .ensure_proof_with(
+                &voting_db,
+                &crate::types::NoopProgressReporter,
+                || {
+                    Err(VotingError::Internal {
+                        message: "PIR precompute failed".to_string(),
+                    })
+                },
+                || panic!("proof must not run after precompute failure"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("PIR precompute failed"));
+        assert_eq!(
+            voting_db
+                .delegation_phase(&prepared.round_id, prepared.bundle_index)
+                .unwrap(),
+            DelegationPhase::PcztBuilt
+        );
+
+        let first = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let retried = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        assert_eq!(retried, first);
+        assert!(!first.pczt_bytes.is_empty());
+    }
+
+    #[test]
     fn ensure_setup_reports_persisted_setup_and_proof_without_rebuilding() {
         let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
         let generated = prepared

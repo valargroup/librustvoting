@@ -122,8 +122,8 @@ END;",
         "-- Releases through v3.1.0-rc.15 could clear software delegation setup
 -- after ZKP1 succeeded while leaving the proof row marked successful. That
 -- proof cannot be signed or submitted without the erased PCZT fields. Preserve
--- its bytes, but make the exact locally rebuildable state eligible for setup
--- and proof generation again.
+-- its bytes, but make any incomplete locally rebuildable setup eligible for
+-- setup and proof generation again.
 --
 -- A Keystone signature inserted after that cleanup is also unusable because
 -- its signed sighash and randomized key belong to the erased setup. Remove it
@@ -139,23 +139,23 @@ DELETE FROM keystone_signatures AS k
           AND b.note_positions_blob IS NOT NULL
           AND b.delegation_tx_hash IS NULL
           AND b.van_leaf_position IS NULL
-          AND b.van_comm_rand IS NULL
-          AND b.dummy_nullifiers IS NULL
-          AND b.rho_signed IS NULL
-          AND b.padded_note_data IS NULL
-          AND b.nf_signed IS NULL
-          AND b.cmx_new IS NULL
-          AND b.alpha IS NULL
-          AND b.rseed_signed IS NULL
-          AND b.rseed_output IS NULL
-          AND b.gov_comm IS NULL
-          AND b.total_note_value IS NULL
-          AND b.address_index IS NULL
-          AND b.rk IS NULL
-          AND b.gov_nullifiers_blob IS NULL
-          AND b.padded_note_secrets IS NULL
-          AND b.pczt_sighash IS NULL
-          AND b.tx1_effects IS NULL
+          AND (b.van_comm_rand IS NULL
+               OR b.dummy_nullifiers IS NULL
+               OR b.rho_signed IS NULL
+               OR b.padded_note_data IS NULL
+               OR b.nf_signed IS NULL
+               OR b.cmx_new IS NULL
+               OR b.alpha IS NULL
+               OR b.rseed_signed IS NULL
+               OR b.rseed_output IS NULL
+               OR b.gov_comm IS NULL
+               OR b.total_note_value IS NULL
+               OR b.address_index IS NULL
+               OR b.rk IS NULL
+               OR b.gov_nullifiers_blob IS NULL
+               OR b.padded_note_secrets IS NULL
+               OR b.pczt_sighash IS NULL
+               OR b.tx1_effects IS NULL)
    );
 UPDATE proofs AS p
    SET success = 0
@@ -169,23 +169,23 @@ UPDATE proofs AS p
           AND b.note_positions_blob IS NOT NULL
           AND b.delegation_tx_hash IS NULL
           AND b.van_leaf_position IS NULL
-          AND b.van_comm_rand IS NULL
-          AND b.dummy_nullifiers IS NULL
-          AND b.rho_signed IS NULL
-          AND b.padded_note_data IS NULL
-          AND b.nf_signed IS NULL
-          AND b.cmx_new IS NULL
-          AND b.alpha IS NULL
-          AND b.rseed_signed IS NULL
-          AND b.rseed_output IS NULL
-          AND b.gov_comm IS NULL
-          AND b.total_note_value IS NULL
-          AND b.address_index IS NULL
-          AND b.rk IS NULL
-          AND b.gov_nullifiers_blob IS NULL
-          AND b.padded_note_secrets IS NULL
-          AND b.pczt_sighash IS NULL
-          AND b.tx1_effects IS NULL
+          AND (b.van_comm_rand IS NULL
+               OR b.dummy_nullifiers IS NULL
+               OR b.rho_signed IS NULL
+               OR b.padded_note_data IS NULL
+               OR b.nf_signed IS NULL
+               OR b.cmx_new IS NULL
+               OR b.alpha IS NULL
+               OR b.rseed_signed IS NULL
+               OR b.rseed_output IS NULL
+               OR b.gov_comm IS NULL
+               OR b.total_note_value IS NULL
+               OR b.address_index IS NULL
+               OR b.rk IS NULL
+               OR b.gov_nullifiers_blob IS NULL
+               OR b.padded_note_secrets IS NULL
+               OR b.pczt_sighash IS NULL
+               OR b.tx1_effects IS NULL)
    );",
     ),
     (
@@ -711,15 +711,18 @@ mod tests {
         queries::insert_bundle(&conn, "test-round", "wallet", 2, &[3]).unwrap();
         queries::insert_bundle(&conn, "test-round", "wallet", 3, &[4]).unwrap();
         queries::insert_bundle(&conn, "test-round", "wallet", 4, &[5]).unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 5, &[6]).unwrap();
         store_complete_v18_delegation_setup(&conn, 0);
         store_complete_v18_delegation_setup(&conn, 1);
         store_complete_v18_delegation_setup(&conn, 2);
         store_complete_v18_delegation_setup(&conn, 3);
         store_complete_v18_delegation_setup(&conn, 4);
+        store_complete_v18_delegation_setup(&conn, 5);
         queries::store_proof(&conn, "test-round", "wallet", 0, &[0xAC; 96]).unwrap();
         queries::store_proof(&conn, "test-round", "wallet", 1, &[0xBD; 96]).unwrap();
         queries::store_proof(&conn, "test-round", "wallet", 2, &[0xCE; 96]).unwrap();
         queries::store_proof(&conn, "test-round", "wallet", 3, &[0xDF; 96]).unwrap();
+        queries::store_proof(&conn, "test-round", "wallet", 5, &[0xE1; 96]).unwrap();
 
         // Reproduce the setup fields cleared by the released reset query. The
         // successful proof row itself survived that cleanup.
@@ -744,8 +747,23 @@ mod tests {
                  tx1_effects = NULL
              WHERE round_id = 'test-round'
                AND wallet_id = 'wallet'
-               AND bundle_index IN (0, 2, 4)",
+               AND bundle_index IN (0, 2, 4, 5)",
             [],
+        )
+        .unwrap();
+        // A retry can durably recreate padded secrets before PCZT construction
+        // finishes. The old proof and signature still belong to the erased
+        // setup and must not survive this partially rebuilt state.
+        conn.execute(
+            "UPDATE bundles
+             SET padded_note_secrets = ?1
+             WHERE round_id = 'test-round'
+               AND wallet_id = 'wallet'
+               AND bundle_index = 5",
+            [vec![
+                0x41_u8;
+                64 * (crate::governance::BUNDLE_NOTE_SLOTS - 1)
+            ]],
         )
         .unwrap();
         // This signature arrived after cleanup and is bound to setup that no
@@ -780,6 +798,16 @@ mod tests {
             &[0x21; 64],
             &[0x22; 32],
             &[0x23; 32],
+        )
+        .unwrap();
+        queries::store_keystone_signature(
+            &conn,
+            "test-round",
+            "wallet",
+            5,
+            &[0x41; 64],
+            &[0x42; 32],
+            &[0x43; 32],
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 17).unwrap();
@@ -825,6 +853,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reusable_external, (vec![0xDF; 96], 1));
+
+        let repaired_partial: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT proof, success FROM proofs
+                 WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 5",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(repaired_partial, (vec![0xE1; 96], 0));
 
         let signatures = queries::get_keystone_signatures(&conn, "test-round", "wallet").unwrap();
         assert_eq!(signatures.len(), 1);
