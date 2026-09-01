@@ -5,9 +5,12 @@
 
 pub mod transport;
 
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
-use serde::Deserialize;
+use serde::{
+    de::{self, Unexpected, Visitor},
+    Deserialize, Deserializer,
+};
 
 #[cfg(test)]
 use crate::wire::DelegationSubmissionWire;
@@ -444,12 +447,62 @@ struct TxResultJson {
 
 #[derive(Deserialize)]
 struct TxConfirmationJson {
+    #[serde(deserialize_with = "deserialize_height")]
     height: u64,
     code: u32,
     #[serde(default)]
     log: String,
     #[serde(default)]
     events: Vec<TxEvent>,
+}
+
+/// Decodes a block height served as a JSON string or as a number.
+///
+/// The chain serves it as a string: `/tx/{hash}` forwards CometBFT's
+/// `result.height`, which is decimal text in the JSON-RPC response, and
+/// re-emits it unchanged. Decoding only the numeric form rejected every real
+/// confirmation — the transaction was committed, the lookup classified the
+/// response as unusable, and the submission stayed pending across every retry
+/// and every endpoint, because an undecodable transaction response is
+/// deliberately treated as stronger evidence than another endpoint's 404. Every
+/// fixture in this module was written with a numeric height, which is why the
+/// mismatch survived the test suite.
+///
+/// The numeric form stays accepted rather than being swapped for the string
+/// one: this decodes a response from a server the client does not deploy in
+/// lockstep with, and the two forms cannot be confused for each other.
+///
+/// The string form is strict decimal — no sign, no whitespace, no radix
+/// prefix — so a value that is not plainly a height is rejected rather than
+/// silently reinterpreted.
+fn deserialize_height<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct HeightVisitor;
+
+    impl Visitor<'_> for HeightVisitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a block height as a decimal string or a non-negative integer")
+        }
+
+        fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(E::invalid_value(Unexpected::Str(value), &self));
+            }
+            value
+                .parse()
+                .map_err(|_| E::invalid_value(Unexpected::Str(value), &self))
+        }
+    }
+
+    deserializer.deserialize_any(HeightVisitor)
 }
 
 fn parse_broadcast_response(response: ChainResponse) -> Result<ChainBroadcastOutcome, ChainError> {
@@ -719,6 +772,67 @@ mod tests {
         // This client is a supported API in its own right, so a caller that
         // asked to stop waiting must not be handed the answer anyway.
         assert!(matches!(error, ChainError::Cancelled), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_whose_height_is_a_json_string_is_decoded() {
+        let transport = Arc::new(MockTransport::default());
+        // The shape `vote-sdk` actually serves: `handleTxStatus` forwards
+        // CometBFT's `result.height`, which is a decimal string, and re-emits it
+        // unchanged. Reading it as a number rejected every real confirmation.
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            r#"{"height":"1234","code":0,"log":"","events":[]}"#,
+        )));
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+
+        let status = client
+            .transaction_status(LOOKUP_HASH, &|| false)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, ChainTxStatus::Committed(confirmation) if confirmation.height == 1234),
+            "a string height is the chain's own encoding, not a malformed response"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_height_that_is_not_a_decimal_string_is_rejected() {
+        for body in [
+            r#"{"height":"","code":0,"log":"","events":[]}"#,
+            r#"{"height":"-1","code":0,"log":"","events":[]}"#,
+            r#"{"height":" 12","code":0,"log":"","events":[]}"#,
+            r#"{"height":"0x0c","code":0,"log":"","events":[]}"#,
+            r#"{"height":true,"code":0,"log":"","events":[]}"#,
+        ] {
+            let transport = Arc::new(MockTransport::default());
+            transport
+                .responses
+                .lock()
+                .unwrap()
+                .push_back(Ok(response(200, body)));
+            let client = ChainClient::new(
+                transport,
+                ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            );
+
+            // Accepting the string form must not turn the height into whatever
+            // the field happens to hold. A response this client cannot read is
+            // unusable, and unusable is not `Pending`.
+            let error = client
+                .transaction_status(LOOKUP_HASH, &|| false)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, ChainError::Decode(_)),
+                "{body} must not decode, got {error}"
+            );
+        }
     }
 
     #[test]

@@ -214,6 +214,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Transaction confirmations now decode a block height served as a JSON string,
+  the form the chain actually returns. Reading only the numeric form made every
+  real confirmation an unusable response, leaving committed submissions pending
+  across every retry and endpoint.
 - Session cleanup now preserves delegation setup fields for bundles with a
   successful proof so wallets can resume signing without regenerating ZKP1.
 

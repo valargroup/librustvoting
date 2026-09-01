@@ -558,7 +558,15 @@ hosts do not parse the log.
    transaction recorded in two casings is queried once and cannot be counted as
    two committed candidates.
 2. HTTP 200 is a committed transaction response and parses height, code, log,
-   and events.
+   and events. Height is accepted both as a decimal string and as a number. The
+   chain serves the string form — `/tx/{hash}` forwards CometBFT's
+   `result.height`, which is decimal text, and re-emits it unchanged — and
+   accepting only the number rejected every real confirmation, because an
+   undecodable transaction response is deliberately stronger evidence than a
+   404 (invariant 6) and so kept the submission pending across every retry and
+   every endpoint. The string form is strict decimal: no sign, no whitespace,
+   no radix prefix, so tolerating the chain's encoding does not become
+   tolerating whatever the field holds.
 3. Cancellation is observed as soon as each endpoint request returns, before
    the response is classified. `ChainClient` is a supported API in its own
    right, so this holds for a caller using it directly and not only for the
@@ -944,6 +952,10 @@ state transitions.
   covers the compatibility classifier boundary.
 - `chain_submission::tests::an_unrelated_confirmation_fails_over_to_the_next_endpoint`
   covers submission-specific event binding participating in endpoint failover.
+- `chain::tests::a_confirmation_whose_height_is_a_json_string_is_decoded` covers
+  the height encoding the chain actually serves, and
+  `a_confirmation_height_that_is_not_a_decimal_string_is_rejected` covers the
+  limit of that tolerance.
 - `chain::tests::unusable_lookup_response_fails_over_to_next_endpoint` and
   `chain::tests::unusable_lookup_response_is_not_reported_as_pending` cover
   lookup failover past an unusable response and the refusal to downgrade one to
