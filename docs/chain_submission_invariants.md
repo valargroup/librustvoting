@@ -153,7 +153,10 @@ to mean anything, `updated_at` has to record that the *owner was alive*, not
 merely when the reservation was made: the two diverge exactly when the wall clock
 steps forward. So an outstanding reservation refreshes it on a heartbeat far
 shorter than the grace period, and only while it is still `attempting` and only
-under the wallet that reserved it. A reservation is `attempting` only between its
+under the wallet that reserved it. That refresh never waits for the database: it
+runs in the same task as the POST, so blocking on the connection would stop that
+task being polled, and with it the very deadline the refresh exists to keep the
+reservation inside. A contended refresh is skipped instead. A reservation is `attempting` only between its
 journaling and the classification that follows its POST, so it cannot outlive
 that call's request deadline by more than scheduling slop; one untouched for
 longer than any configurable deadline, by an owner that would have refreshed it,
@@ -379,8 +382,10 @@ created by the confirmed delegation.
    single hash can wait on a transaction that never commits while the other
    does. `tx_hash` keeps its own meaning as what is recorded, including an
    opaque identifier nothing can look up, which the candidate set excludes.
-   Reconciliation remains the supported way to resolve them, because it checks
-   all of them, adopts the winner, and retires the rest. For a vote, polling the
+   The set is every non-rejected attempt that carries a hash, not the newest one
+   per row: concurrent processes can each be accepted with a different hash for
+   one submission. Reconciliation remains the supported way to resolve them,
+   because it checks all of them, adopts the winner, and retires the rest. For a vote, polling the
    wrong one of two candidates also stalls the helper-share delivery that follows
    confirmation.
    The phase and the hash it implies come from one lookup, everywhere a plan
@@ -764,6 +769,8 @@ state transitions.
   statuses and the recovery work disagree?
 - Does every plan surface that names a transaction expose the whole candidate
   set, or select one of several?
+- Is that set every non-rejected attempt carrying a hash, or one per row?
+- Can the reservation heartbeat block the request deadline it protects?
 - Can a committed failure be reported as terminal while a candidate journaled
   during the lookup may still commit?
 - Is cancellation observed by the public lookup client, not just by the
@@ -900,7 +907,9 @@ state transitions.
   a polling step and the canonical delegation status both finding the hash the
   phase was derived from, `two_different_candidates_are_both_exposed` and
   `two_different_vote_candidates_are_both_exposed` cover the status and the vote
-  polling work carrying both when the two sources disagree.
+  polling work carrying both when the two sources disagree, and
+  `chain_submission::tests::every_journaled_candidate_survives_for_one_submission`
+  covers two accepted attempts for one submission both surviving.
 - `chain_submission::tests::a_committed_failure_yields_to_a_candidate_journaled_during_the_lookup`
   covers a rejection deferring to a candidate that arrived mid-lookup, and
   `a_retired_candidate_is_not_reported_as_pending` covers the reported candidate

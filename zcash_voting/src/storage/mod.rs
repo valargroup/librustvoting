@@ -143,6 +143,19 @@ impl VotingDb {
     pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("database mutex poisoned")
     }
+
+    /// The connection, or `None` if another holder has it right now.
+    ///
+    /// For work that must not wait: an async task blocked on this mutex is not
+    /// being polled, which stops the timers it is running from firing. Only
+    /// suitable where skipping the work is an acceptable outcome.
+    pub(crate) fn try_conn(&self) -> Option<std::sync::MutexGuard<'_, Connection>> {
+        match self.conn.try_lock() {
+            Ok(conn) => Some(conn),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("database mutex poisoned"),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -64,6 +64,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   attempt journal can hold different hashes, and a host shown only one can wait
   on a transaction that never commits while the other does. `tx_hash` keeps its
   existing meaning, including opaque legacy identifiers the candidate set omits.
+- A submission's candidate set is every non-rejected attempt carrying a chain
+  transaction hash, not the newest one per row. Concurrent processes can each be
+  accepted with a different hash, and keeping only the newest had a host poll
+  the one it kept while the one it dropped committed.
+- The reservation heartbeat no longer waits for the database connection. It runs
+  in the same task as the POST, so blocking on it stopped that task being polled
+  and with it the request deadline the heartbeat exists to keep the reservation
+  inside; a contended refresh is skipped.
 - Cancellation is rechecked after the candidate set is rebuilt following
   retirement, before the submission is classified.
 - A terminal lookup error no longer replaces the ambiguity of an attempt that

@@ -1417,16 +1417,23 @@ const RESERVATION_HEARTBEAT: std::time::Duration = std::time::Duration::from_sec
 
 /// Marks an outstanding reservation as still owned, best effort.
 ///
-/// Deliberately infallible. This is a liveness hint for readers that cannot see
-/// this process's in-memory registry; failing a submission because the hint
-/// could not be written would trade a real transaction for a bookkeeping error.
-/// A missed refresh only costs the reservation its cross-process coverage once
-/// the grace period elapses, and only if the clock has moved that far.
+/// Deliberately infallible, and deliberately non-blocking. This is a liveness
+/// hint for readers that cannot see this process's in-memory registry; failing a
+/// submission because the hint could not be written would trade a real
+/// transaction for a bookkeeping error. Waiting for the connection would be
+/// worse still: it runs inside the same task as the POST, so blocking on the
+/// database mutex stops that task being polled, and with it the request
+/// deadline this heartbeat exists to keep the reservation inside. A skipped
+/// refresh costs the reservation its cross-process coverage only once the grace
+/// period elapses, and only if the clock has moved that far.
 fn touch_attempt(db: &VotingDb, wallet_id: &str, attempt_id: i64) {
     let Ok(now) = now_seconds() else {
         return;
     };
-    let _ = db.conn().execute(
+    let Some(conn) = db.try_conn() else {
+        return;
+    };
+    let _ = conn.execute(
         "UPDATE chain_submission_attempts SET updated_at=:now
           WHERE id=:id AND wallet_id=:wallet_id AND state='attempting'",
         named_params! { ":now": now, ":id": attempt_id, ":wallet_id": wallet_id },
@@ -1925,9 +1932,9 @@ pub(crate) fn vote_candidate_hashes(
     conn: &rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
-) -> Result<BTreeMap<(u32, u32), String>, VotingError> {
-    let mut hashes = BTreeMap::new();
-    let mut batch_hashes: BTreeMap<(u32, [u8; 32]), String> = BTreeMap::new();
+) -> Result<BTreeMap<(u32, u32), Vec<String>>, VotingError> {
+    let mut hashes: BTreeMap<(u32, u32), Vec<String>> = BTreeMap::new();
+    let mut batch_hashes: BTreeMap<(u32, [u8; 32]), Vec<String>> = BTreeMap::new();
     {
         let mut stmt = conn
             .prepare(
@@ -1959,12 +1966,19 @@ pub(crate) fn vote_candidate_hashes(
             let Ok(bundle_index) = u32::try_from(bundle_index) else {
                 continue;
             };
+            // Every non-rejected attempt is a candidate. Concurrent processes
+            // can each be accepted with a different hash for one submission, and
+            // keeping only the newest would have a host poll the one it kept
+            // while the one it dropped commits.
             if kind == ChainSubmissionKind::Vote.as_str() {
                 if let Ok(proposal_id) = u32::try_from(proposal_id) {
-                    hashes.insert((bundle_index, proposal_id), hash);
+                    push_unique(hashes.entry((bundle_index, proposal_id)).or_default(), hash);
                 }
             } else if let Ok(digest) = <[u8; 32]>::try_from(digest.as_slice()) {
-                batch_hashes.insert((bundle_index, digest), hash);
+                push_unique(
+                    batch_hashes.entry((bundle_index, digest)).or_default(),
+                    hash,
+                );
             }
         }
     }
@@ -2005,13 +2019,20 @@ pub(crate) fn vote_candidate_hashes(
         let Some(batch) = recovery.batch.as_ref() else {
             continue;
         };
-        if let Some(hash) = batch_hashes.get(&(bundle_index, batch.digest)) {
-            hashes
-                .entry((bundle_index, proposal_id))
-                .or_insert_with(|| hash.clone());
+        if let Some(batch_candidates) = batch_hashes.get(&(bundle_index, batch.digest)) {
+            let row = hashes.entry((bundle_index, proposal_id)).or_default();
+            for hash in batch_candidates {
+                push_unique(row, hash.clone());
+            }
         }
     }
     Ok(hashes)
+}
+
+fn push_unique(into: &mut Vec<String>, hash: String) {
+    if !into.contains(&hash) {
+        into.push(hash);
+    }
 }
 
 /// Every chain transaction that could identify one vote row.
@@ -2033,10 +2054,10 @@ pub(crate) fn vote_candidates(
     {
         candidates.push(hash);
     }
-    if let Some(hash) =
+    if let Some(journaled) =
         vote_candidate_hashes(conn, round_id, wallet_id)?.remove(&(bundle_index, proposal_id))
     {
-        candidates.push(hash);
+        candidates.extend(journaled);
     }
     let mut hashes: Vec<String> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -2067,10 +2088,10 @@ pub(crate) fn delegation_candidates(
     if let Some(hash) = queries::get_delegation_tx_hash(conn, round_id, wallet_id, bundle_index)? {
         candidates.push(hash);
     }
-    if let Some(hash) =
+    if let Some(journaled) =
         delegation_candidate_hashes(conn, round_id, wallet_id)?.remove(&bundle_index)
     {
-        candidates.push(hash);
+        candidates.extend(journaled);
     }
     let mut hashes: Vec<String> = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -2090,7 +2111,7 @@ pub(crate) fn delegation_candidate_hashes(
     conn: &rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
-) -> Result<BTreeMap<u32, String>, VotingError> {
+) -> Result<BTreeMap<u32, Vec<String>>, VotingError> {
     let mut stmt = conn
         .prepare(
             "SELECT bundle_index, chain_tx_hash FROM chain_submission_attempts
@@ -2106,11 +2127,12 @@ pub(crate) fn delegation_candidate_hashes(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(internal("query delegation candidate hashes"))?;
-    let mut hashes = BTreeMap::new();
+    let mut hashes: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     for row in rows {
         let (bundle_index, hash) = row.map_err(internal("read delegation candidate hash"))?;
         if let Ok(bundle_index) = u32::try_from(bundle_index) {
-            hashes.insert(bundle_index, hash);
+            // As for votes: every non-rejected attempt is a candidate.
+            push_unique(hashes.entry(bundle_index).or_default(), hash);
         }
     }
     Ok(hashes)
@@ -5595,5 +5617,34 @@ mod tests {
                 if known_tx_hashes == &vec![TX_HASH.to_string()]),
             "got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn every_journaled_candidate_survives_for_one_submission() {
+        let db = test_db();
+        {
+            let conn = db.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+        }
+        // Two processes were each accepted with a different hash for the same
+        // vote. Keeping only the newest would have a host poll the one it kept
+        // while the one it dropped commits.
+        for hash in [TX_HASH, TX_HASH_2] {
+            db.conn()
+                .execute(
+                    "INSERT INTO chain_submission_attempts
+                     (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                      payload_digest, chain_tx_hash, state, created_at, updated_at)
+                     VALUES (?1, ?2, 'vote', 0, 3, X'', ?3, ?4, 'accepted', 1, 1)",
+                    rusqlite::params![ROUND_ID, WALLET, vec![0xCC_u8; 32], hash],
+                )
+                .unwrap();
+        }
+
+        let conn = db.conn();
+        let candidates = vote_candidates(&conn, ROUND_ID, WALLET, 0, 3).unwrap();
+
+        // The same set `known_hashes` reconciles.
+        assert_eq!(candidates, vec![TX_HASH.to_string(), TX_HASH_2.to_string()]);
     }
 }

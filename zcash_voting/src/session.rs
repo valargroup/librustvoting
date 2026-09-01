@@ -591,7 +591,11 @@ fn delegation_statuses(
                 // can look it up.
                 tx_hash: db
                     .get_delegation_tx_hash(round_id, bundle_index)?
-                    .or_else(|| journaled.get(&bundle_index).cloned()),
+                    .or_else(|| {
+                        journaled
+                            .get(&bundle_index)
+                            .and_then(|hashes| hashes.first().cloned())
+                    }),
                 candidate_tx_hashes: crate::chain_submission::delegation_candidates(
                     &db.conn(),
                     round_id,
@@ -643,7 +647,7 @@ fn recovered_delegation_work_from_steps(
                 })?;
                 let tx_hash = db
                     .get_delegation_tx_hash(round_id, bundle_index)?
-                    .or_else(|| journaled.get(&bundle_index).cloned())
+                    .or_else(|| journaled.get(&bundle_index).and_then(|hashes| hashes.first().cloned()))
                     .ok_or_else(|| {
                         missing_recovery_field(format!(
                             "poll delegation step missing tx_hash for round={round_id}, bundle={bundle_index}"
@@ -747,7 +751,7 @@ fn recovered_vote_work_from_steps(
             } => {
                 let tx_hash = db
                     .get_vote_tx_hash(round_id, bundle_index, proposal_id)?
-                    .or_else(|| journaled.get(&(bundle_index, proposal_id)).cloned())
+                    .or_else(|| journaled.get(&(bundle_index, proposal_id)).and_then(|hashes| hashes.first().cloned()))
                     .ok_or_else(|| {
                         missing_recovery_field(format!(
                             "poll vote step missing tx_hash for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
@@ -776,7 +780,7 @@ fn recovered_vote_work_from_steps(
             } => {
                 let tx_hash = db
                     .get_vote_tx_hash(round_id, bundle_index, proposal_id)?
-                    .or_else(|| journaled.get(&(bundle_index, proposal_id)).cloned())
+                    .or_else(|| journaled.get(&(bundle_index, proposal_id)).and_then(|hashes| hashes.first().cloned()))
                     .ok_or_else(|| {
                         missing_recovery_field(format!(
                             "poll vote batch step missing tx_hash for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
@@ -1040,7 +1044,7 @@ fn active_vote_batches_by_vote(
             if phase == VotePhase::Submitted {
                 let tx_hash = db
                     .get_vote_tx_hash(round_id, bundle_index, recovery.proposal_id)?
-                    .or_else(|| journaled.get(&(bundle_index, recovery.proposal_id)).cloned())
+                    .or_else(|| journaled.get(&(bundle_index, recovery.proposal_id)).and_then(|hashes| hashes.first().cloned()))
                     .ok_or_else(|| VotingError::InvalidInput {
                         message: format!(
                             "submitted atomic vote batch is missing a transaction hash for round={round_id}, bundle={bundle_index}, proposal={}",
