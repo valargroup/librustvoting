@@ -127,19 +127,15 @@ END;",
 --
 -- A Keystone signature inserted after that cleanup is also unusable because
 -- its signed sighash and randomized key belong to the erased setup. Remove it
--- before demoting the proof so the rebuilt setup can be signed again.
+-- whether or not ZKP1 completed, then demote any proof so the rebuilt setup can
+-- be signed again.
 DELETE FROM keystone_signatures AS k
  WHERE EXISTS (
        SELECT 1
          FROM bundles b
-         JOIN proofs p
-           ON p.round_id = b.round_id
-          AND p.wallet_id = b.wallet_id
-          AND p.bundle_index = b.bundle_index
         WHERE b.round_id = k.round_id
           AND b.wallet_id = k.wallet_id
           AND b.bundle_index = k.bundle_index
-          AND p.success = 1
           AND b.note_positions_blob IS NOT NULL
           AND b.delegation_tx_hash IS NULL
           AND b.van_leaf_position IS NULL
@@ -613,10 +609,12 @@ mod tests {
         queries::insert_bundle(&conn, "test-round", "wallet", 1, &[2]).unwrap();
         queries::insert_bundle(&conn, "test-round", "wallet", 2, &[3]).unwrap();
         queries::insert_bundle(&conn, "test-round", "wallet", 3, &[4]).unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 4, &[5]).unwrap();
         store_complete_delegation_setup(&conn, 0);
         store_complete_delegation_setup(&conn, 1);
         store_complete_delegation_setup(&conn, 2);
         store_complete_delegation_setup(&conn, 3);
+        store_complete_delegation_setup(&conn, 4);
         queries::store_proof(&conn, "test-round", "wallet", 0, &[0xAC; 96]).unwrap();
         queries::store_proof(&conn, "test-round", "wallet", 1, &[0xBD; 96]).unwrap();
         queries::store_proof(&conn, "test-round", "wallet", 2, &[0xCE; 96]).unwrap();
@@ -645,7 +643,7 @@ mod tests {
                  tx1_effects = NULL
              WHERE round_id = 'test-round'
                AND wallet_id = 'wallet'
-               AND bundle_index IN (0, 2)",
+               AND bundle_index IN (0, 2, 4)",
             [],
         )
         .unwrap();
@@ -659,6 +657,18 @@ mod tests {
             &[0x11; 64],
             &[0x12; 32],
             &[0x13; 32],
+        )
+        .unwrap();
+        // The same race can happen before ZKP1 is stored. This signature must
+        // still be removed so a rebuilt request is not rejected as a conflict.
+        queries::store_keystone_signature(
+            &conn,
+            "test-round",
+            "wallet",
+            4,
+            &[0x31; 64],
+            &[0x32; 32],
+            &[0x33; 32],
         )
         .unwrap();
         queries::store_keystone_signature(
@@ -719,6 +729,15 @@ mod tests {
         assert_eq!(signatures.len(), 1);
         assert_eq!(signatures[0].bundle_index, 3);
         assert_eq!(signatures[0].sig, vec![0x21; 64]);
+        let proofless_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM proofs
+                 WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 4",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(proofless_count, 0);
 
         store_complete_delegation_setup(&conn, 0);
         queries::store_proof(&conn, "test-round", "wallet", 0, &[0xE0; 96]).unwrap();
