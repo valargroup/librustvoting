@@ -34,6 +34,20 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   such an attempt protects nothing, and nothing ever retires one; their
   ambiguity is still reported as `OutcomeUnknown`. Delegation attempts keep
   protecting `van_comm_rand` unconditionally.
+- A confirmation another writer applies while the candidate lookups are in
+  flight is re-read before reconciliation reports a terminal error, ambiguity,
+  pending, or rejection, so a lagging 404 or another candidate's failure cannot
+  downgrade a submission that is now durably confirmed.
+- An atomic batch's persisted proposal and nullifier bindings are checked inside
+  the lookup, so a first endpoint answering with the wrong members no longer
+  ends the search.
+- An ambiguous broadcast whose classification cannot be persisted is reported as
+  `OutcomeUnknown` rather than as a storage error; its reservation is still
+  durably `attempting`.
+- A reconciliation that reports `Cancelled` no longer replaces an earlier
+  ambiguous broadcast's result at the between-retry gate, and cancellation is
+  rechecked after failed candidates are retired, immediately before the
+  confirmation transaction.
 - `ChainLifecycleError::AcceptedButUnjournaled` reports a CheckTx-accepted
   transaction whose hash could not be journaled, carrying the hash alongside the
   persistence error. The transaction may commit and the hash is the only way to

@@ -316,25 +316,7 @@ fn record_vote_batch_confirmation(
         bundle_index,
         batch_digest,
     )?;
-    let expected_proposals = recoveries
-        .iter()
-        .map(|recovery| recovery.proposal_id)
-        .collect::<Vec<_>>();
-    let expected_nullifiers = recoveries
-        .iter()
-        .map(|recovery| hex::encode(recovery.van_nullifier))
-        .collect::<Vec<_>>();
-    if confirmation.proposal_ids != expected_proposals || event_nullifiers != expected_nullifiers {
-        return Err(VotingError::InvalidInput {
-            message: "cast_vote_batch event actions do not match persisted recovery data"
-                .to_string(),
-        });
-    }
-    if confirmation.vc_tree_positions.len() != recoveries.len() {
-        return Err(VotingError::InvalidInput {
-            message: "cast_vote_batch event has the wrong number of VC positions".to_string(),
-        });
-    }
+    check_batch_matches_recovery(&recoveries, confirmation, &event_nullifiers)?;
     for (recovery, vc_tree_position) in recoveries
         .iter()
         .zip(confirmation.vc_tree_positions.iter().copied())
@@ -498,6 +480,81 @@ fn require_vote_recovery_json(
     }
 }
 
+/// Whether a batch confirmation's event actions match the persisted recovery.
+///
+/// Shared by the confirmation transaction and by the lookup's endpoint-failover
+/// check, so the two cannot drift into disagreeing about what binds a batch.
+fn check_batch_matches_recovery(
+    recoveries: &[crate::vote::VoteRecoveryBundle],
+    confirmation: &VoteBatchConfirmation,
+    event_nullifiers: &[String],
+) -> Result<(), VotingError> {
+    let expected_proposals = recoveries
+        .iter()
+        .map(|recovery| recovery.proposal_id)
+        .collect::<Vec<_>>();
+    let expected_nullifiers = recoveries
+        .iter()
+        .map(|recovery| hex::encode(recovery.van_nullifier))
+        .collect::<Vec<_>>();
+    if confirmation.proposal_ids != expected_proposals || event_nullifiers != expected_nullifiers {
+        return Err(VotingError::InvalidInput {
+            message: "cast_vote_batch event actions do not match persisted recovery data"
+                .to_string(),
+        });
+    }
+    if confirmation.vc_tree_positions.len() != recoveries.len() {
+        return Err(VotingError::InvalidInput {
+            message: "cast_vote_batch event has the wrong number of VC positions".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether a committed batch result binds to the persisted batch, for a lookup
+/// that still has other endpoints to try.
+///
+/// Lenient when the member rows cannot be read: that is a condition of local
+/// storage rather than of the endpoint's answer, so rejecting every endpoint
+/// over it would turn a missing recovery into an endless failover. The
+/// confirmation transaction reports it properly.
+pub(crate) fn vote_batch_binds_to_recovery(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    batch_digest: [u8; 32],
+    tx_hash: &str,
+    events: &[TxEvent],
+) -> bool {
+    let Ok(confirmation) = parse_vote_batch_confirmation_for_round(tx_hash, round_id, events)
+    else {
+        return false;
+    };
+    if confirmation.batch_digest.as_slice() != batch_digest {
+        return false;
+    }
+    let Ok(event) = required_event_for_round(events, CAST_VOTE_BATCH_EVENT, round_id) else {
+        return false;
+    };
+    let Ok(raw) = required_attribute(event, CAST_VOTE_BATCH_EVENT, VAN_NULLIFIERS_ATTRIBUTE) else {
+        return false;
+    };
+    let Ok(event_nullifiers) = parse_csv_strings(raw) else {
+        return false;
+    };
+    let Ok(recoveries) = crate::vote::load_vote_batch_recoveries_with_conn(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        batch_digest,
+    ) else {
+        return true;
+    };
+    check_batch_matches_recovery(&recoveries, &confirmation, &event_nullifiers).is_ok()
+}
+
 /// Whether a committed transaction's events bind it to this delegation.
 ///
 /// The identity-only half of confirmation validation: it needs no database, so a
@@ -511,17 +568,6 @@ pub(crate) fn delegation_events_bind(tx_hash: &str, round_id: &str, events: &[Tx
 /// Whether a committed transaction's events bind it to this singleton vote.
 pub(crate) fn vote_events_bind(tx_hash: &str, round_id: &str, events: &[TxEvent]) -> bool {
     parse_vote_confirmation_for_round(tx_hash, round_id, events).is_ok()
-}
-
-/// Whether a committed transaction's events bind it to this atomic batch.
-pub(crate) fn vote_batch_events_bind(
-    tx_hash: &str,
-    round_id: &str,
-    events: &[TxEvent],
-    expected_batch_digest: &[u8; 32],
-) -> bool {
-    parse_vote_batch_confirmation_for_round(tx_hash, round_id, events)
-        .is_ok_and(|confirmation| confirmation.batch_digest.as_slice() == expected_batch_digest)
 }
 
 fn parse_delegation_confirmation_for_round(

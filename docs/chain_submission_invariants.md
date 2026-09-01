@@ -309,7 +309,11 @@ none. The transaction may still have committed; that stays visible as
 12. CheckTx acceptance alone never updates the legacy delegation or vote
     submission columns. This prevents a later DeliverTx failure from pinning a
     domain row to a transaction that did not commit successfully.
-13. An accepted transaction hash is never discarded by a failure to journal it.
+13. A classification that cannot be persisted never turns a possibly committed
+    request into a definite failure. An ambiguous outcome is reported as
+    `OutcomeUnknown`: its reservation is still durably `attempting`, so the
+    ambiguity is real whether or not the classification landed.
+14. An accepted transaction hash is never discarded by a failure to journal it.
     The transaction is already in the mempool and may commit, and the hash is the
     only handle anything will ever have on it, so a storage failure after a usable
     accepted response returns `AcceptedButUnjournaled` carrying both the hash and
@@ -482,7 +486,14 @@ hosts do not parse the log.
    `OutcomeUnknown`, never as `Pending`. A broken or incompatible endpoint must
    stay distinguishable from a genuine 404, and an unresolved candidate blocks
    rebroadcast exactly as a pending one does, because it may still commit.
-8. Adopting a candidate this lookup proved committed clears any *different*
+8. A confirmation another writer applies while these lookups are in flight
+   outranks every weaker answer. The entry shortcut runs before them, so the
+   durable state is read again before reporting a terminal error, ambiguity,
+   pending, or rejection: a lagging 404 would otherwise report `Pending`, and a
+   different candidate's committed failure would report `Rejected`, for a
+   submission that is now durably confirmed. Candidates proved failed are still
+   retired on that path.
+9. Adopting a candidate this lookup proved committed clears any *different*
    unconfirmed hash in the domain column for that submission, inside the
    confirmation transaction and after the event validation. The domain writers
    refuse to overwrite a stored hash with a different one, so an opaque
@@ -500,12 +511,12 @@ hosts do not parse the log.
    record of a competing candidate. The standalone recording APIs keep refusing a
    contradicting stored hash, because a host passing one is reporting a
    contradiction it should see.
-9. The winning hash and event-derived positions are committed together by the
+10. The winning hash and event-derived positions are committed together by the
    existing confirmation transaction. Attempt evidence is retained separately;
    a crash on either side is recoverable because the attempt hash and the
    domain record are both idempotent and neither overwrites conflicting state.
-10. Atomic-batch members advance together or not at all.
-11. Event round, bundle, proposal order, batch digest, and nullifier bindings
+11. Atomic-batch members advance together or not at all.
+12. Event round, bundle, proposal order, batch digest, and nullifier bindings
     are validated by the existing confirmation parser before writes.
 
 ## Concurrency and cancellation invariants
@@ -549,20 +560,26 @@ hosts do not parse the log.
    before the lock was taken.
 7. Cancellation is checked on entry to reconciliation and before reservation,
    dispatch, retry, failover, backoff, and confirmation application, and again
-   as soon as each transaction-status request returns. The entry check covers
+   as soon as each transaction-status request returns, and again after failed
+   candidates are retired, because that retirement is durable work of its own and
+   widens the gap before the confirmation write. The entry check covers
    the no-candidate fast path, so a cancelled operation is never reported to the
    host as actively pending; the post-request check covers every result variant,
    not only a committed success, because classifying a 404 or an error reports an
    outcome and classifying a committed failure retires evidence. A cancelled
    operation does neither: the candidate stays journaled, so the next
    reconciliation re-derives whatever this one was about to conclude.
-8. Cancellation observed after a broadcast completes does not replace that
+8. A reconciliation that reports `Cancelled` settled nothing, so a call with a
+   completed ambiguous broadcast reports that broadcast's ambiguity instead.
+   This applies wherever a reconciliation's result is adopted, including the
+   between-retry gate and the rejection path.
+9. Cancellation observed after a broadcast completes does not replace that
    broadcast's result. A call cancelled while a dispatched attempt may still
    commit reports `OutcomeUnknown`; `Cancelled` is reserved for calls with no
    completed ambiguous broadcast.
-9. Cancellation before a fresh reservation dispatches removes the definitely
+10. Cancellation before a fresh reservation dispatches removes the definitely
    unsent reservation. Cancellation after dispatch retains uncertainty.
-10. A deleted or replaced generation cannot receive a delayed transport or
+11. A deleted or replaced generation cannot receive a delayed transport or
    confirmation result. Cancellation is re-checked immediately before the
    confirmation transaction, so a session invalidated while a status request
    was in flight does not have voting state mutated underneath it. This narrows
@@ -655,7 +672,14 @@ state transitions.
 - Can recovery cleanup or bundle pruning erase an unconfirmed domain hash that is
   still the only reconciliation candidate for its row?
 - Can a cancelled reconciliation let this attempt's rejection be reported as
-  terminal while a known candidate may still commit?
+  terminal while a known candidate may still commit, or replace an earlier
+  ambiguous broadcast's result at the between-retry gate?
+- Is a confirmation another writer applies during the candidate lookups allowed
+  to be downgraded by a lagging 404 or another candidate's failure?
+- Can a classification that fails to persist turn a possibly committed request
+  into a definite error?
+- Do an atomic batch's persisted proposal and nullifier bindings participate in
+  endpoint failover?
 - Does an outstanding reservation keep proving its owner is alive, rather than
   only recording when it was made?
 - Can one endpoint's confirmation for the wrong submission end a lookup that
@@ -752,7 +776,15 @@ state transitions.
   `cancellation_after_a_lookup_stops_before_retiring_evidence` covers the
   post-request checkpoint on a non-success result variant.
 - `chain_submission::tests::an_accepted_hash_survives_a_failure_to_journal_it`
-  covers `AcceptedButUnjournaled`.
+  covers `AcceptedButUnjournaled`, and
+  `an_ambiguous_outcome_survives_a_failure_to_journal_it` covers the same rule
+  for an ambiguous classification.
+- `chain_submission::tests::a_cancelled_retry_reconciliation_preserves_earlier_ambiguity`
+  covers the between-retry gate, and
+  `a_confirmation_applied_during_lookup_outranks_a_lagging_404` covers the
+  durable-confirmation re-read after the candidate lookups.
+- `chain_submission::tests::a_batch_confirmation_with_wrong_members_fails_over`
+  covers an atomic batch's recovery bindings participating in endpoint failover.
 - `chain_submission::tests::one_transaction_recorded_in_two_casings_is_looked_up_once`
   and `chain_submission::tests::a_legacy_opaque_hash_does_not_break_reconciliation`
   cover candidate canonicalization and non-normalizable legacy hashes.
