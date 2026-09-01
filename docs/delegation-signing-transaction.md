@@ -202,9 +202,33 @@ field element. `VAN` is the already-computed commitment containing the one
 hotkey address, delegated weight, round, and VAN blinding value. `round_id` is
 the same voting-round field element used in the VAN and ZKP #1.
 
-The same seven inputs always produce the same `rho_signed`. A fresh delegation
-setup will normally produce a different value because the VAN blinding value
-and any padding-note secrets are fresh.
+The same seven inputs always produce the same `rho_signed`. Local voting hotkey
+delegation derives its VAN blinding from the hotkey secret, network, round
+parameters, bundle index, and real note identities. Restoring or reusing all of
+those inputs with `recoverable_bundle_policy_v1()` reproduces the same VAN. The
+policy pins the complete bundle shape, including the 25,000 ZEC addition
+threshold used for canonical ZIP-318 notes. A fresh voting database may
+generate different padding notes, so rebuilding the delegation can produce a
+different `rho_signed` and PCZT even though it reconstructs the same VAN. That
+difference does not affect an already-confirmed delegation. Once the VAN and
+its on-chain leaf position have been recovered, later voting uses the VAN
+blinding and a Merkle witness for that position, not `rho_signed` or the
+padding-note secrets. Public target delegation has no local hotkey secret and
+continues to sample a fresh VAN blinding.
+
+Wallets can construct a `DelegationRecoveryClient` from their route-aware GET
+transport and vote-chain endpoint list, then call
+`recover_confirmed_delegations` after an ordinary delegation submission reports
+that its governance nullifier was already spent and transaction-hash
+reconciliation finds no known transaction. The function reconstructs each
+canonical VAN, scans the existing paginated commitment-tree endpoint, checks
+that the pagination covers one consistent leaf sequence, and atomically stores
+the positions of exact matches. This scan is discovery only.
+The normal vote-tree sync still validates the complete tree and verifies each
+recovered VAN at its stored position before producing a ZKP #2 witness. Recovery
+doesn't add a happy-path query, a chain index, or a recovery table, and it
+doesn't reconstruct a transaction hash. It recovers only the initial VAN
+created by ZKP #1; it doesn't discover a successor VAN created by ZKP #2.
 
 ### How the signed note is made
 

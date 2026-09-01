@@ -31,6 +31,9 @@ pub enum ParseError {
 
     #[error("non-canonical Fp encoding ({context})")]
     NonCanonicalFp { context: &'static str },
+
+    #[error("integer out of range ({context}): {value} does not fit in u32")]
+    IntegerOutOfRange { context: &'static str, value: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +116,10 @@ impl ChainTreeState {
         Ok(TreeState {
             next_index: self.next_index,
             root,
-            height: self.height as u32,
+            height: u32::try_from(self.height).map_err(|_| ParseError::IntegerOutOfRange {
+                context: "tree_state.height",
+                value: self.height,
+            })?,
         })
     }
 }
@@ -128,7 +134,10 @@ impl ChainBlockCommitments {
             let _ = i; // suppress unused warning in non-debug
         }
         Ok(BlockCommitments {
-            height: self.height as u32,
+            height: u32::try_from(self.height).map_err(|_| ParseError::IntegerOutOfRange {
+                context: "block_commitments.height",
+                value: self.height,
+            })?,
             start_index: self.start_index,
             leaves,
             root: decode_fp_base64(
@@ -151,7 +160,12 @@ impl QueryCommitmentLeavesResponse {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(BlockCommitmentsPage {
             blocks,
-            next_from_height: self.next_from_height as u32,
+            next_from_height: u32::try_from(self.next_from_height).map_err(|_| {
+                ParseError::IntegerOutOfRange {
+                    context: "commitment_leaves.next_from_height",
+                    value: self.next_from_height,
+                }
+            })?,
         })
     }
 }
@@ -195,6 +209,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_tree_state_rejects_height_above_u32() {
+        let json = r#"{"tree":{"next_index":0,"height":4294967296}}"#;
+        let resp: QueryLatestTreeResponse = serde_json::from_str(json).unwrap();
+        let error = resp.tree.unwrap().into_tree_state().unwrap_err();
+        assert!(matches!(
+            error,
+            ParseError::IntegerOutOfRange {
+                context: "tree_state.height",
+                value: 4_294_967_296,
+            }
+        ));
+    }
+
+    #[test]
     fn parse_block_commitments_with_leaves() {
         // Fp::from(1) = [1, 0, 0, ..., 0] (32 bytes LE)
         let one_bytes = Fp::from(1).to_repr();
@@ -222,6 +250,20 @@ mod tests {
         let page = resp.into_block_commitments_page().unwrap();
         assert!(page.blocks.is_empty());
         assert_eq!(page.next_from_height, 0);
+    }
+
+    #[test]
+    fn parse_page_rejects_cursor_above_u32() {
+        let json = r#"{"blocks":[],"next_from_height":4294967296}"#;
+        let resp: QueryCommitmentLeavesResponse = serde_json::from_str(json).unwrap();
+        let error = resp.into_block_commitments_page().unwrap_err();
+        assert!(matches!(
+            error,
+            ParseError::IntegerOutOfRange {
+                context: "commitment_leaves.next_from_height",
+                value: 4_294_967_296,
+            }
+        ));
     }
 
     #[test]

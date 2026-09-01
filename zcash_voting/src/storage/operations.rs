@@ -690,6 +690,7 @@ impl VotingDb {
             (params, stored_network)
         };
         let padded_note_secrets = self.ensure_padded_secrets(round_id, bundle_index, notes)?;
+        let van_blinding = keys.van_blinding_for_bundle(&params, bundle_index, notes)?;
         let result = crate::action::build_governance_pczt(
             notes,
             &params,
@@ -702,6 +703,7 @@ impl VotingDb {
             keys.account_index,
             &keys.round_name,
             &padded_note_secrets,
+            van_blinding.as_ref(),
         )?;
         // Compute total note value from input notes
         let total_note_value: u64 = notes
@@ -6517,6 +6519,44 @@ mod tests {
         db.clear_round(ROUND_ID).unwrap();
         assert!(db.list_rounds().unwrap().is_empty());
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 0);
+    }
+
+    #[test]
+    fn restored_hotkey_reconstructs_van_after_voting_database_loss() {
+        use orchard::keys::{FullViewingKey, SpendingKey};
+
+        fn build_from_fresh_database(hotkey: &VotingHotkey) -> GovernancePczt {
+            let db = test_db();
+            db.init_round(Network::Regtest, &test_params_nu6_3(), None)
+                .unwrap();
+            let note = identity_test_note();
+            db.ensure_bundles_with_policy(
+                ROUND_ID,
+                std::slice::from_ref(&note),
+                crate::recoverable_bundle_policy_v1(),
+            )
+            .unwrap();
+
+            let spending_key = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
+            let full_viewing_key = FullViewingKey::from(&spending_key);
+            let keys =
+                test_delegation_keys(full_viewing_key.to_bytes().to_vec(), hotkey, [0x42; 32], 0);
+            db.build_governance_pczt(ROUND_ID, 0, &[note], &keys, nu6_3_branch_id())
+                .unwrap()
+        }
+
+        let original = VotingHotkey::from_stored_secret(&[0x43; 64], Network::Regtest).unwrap();
+        let restored =
+            VotingHotkey::from_stored_secret(original.stored_secret(), Network::Regtest).unwrap();
+        let first = build_from_fresh_database(&original);
+        let second = build_from_fresh_database(&restored);
+
+        assert_eq!(first.van_comm_rand, second.van_comm_rand);
+        assert_eq!(first.van, second.van);
+        assert_ne!(
+            first.pczt_sighash, second.pczt_sighash,
+            "non-recovery PCZT randomness should remain fresh"
+        );
     }
 
     /// Share delegation lifecycle: record → query → confirm → resubmit → re-record preserves confirmed.

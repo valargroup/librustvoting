@@ -5,7 +5,7 @@ use pasta_curves::pallas;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::note_bundling::BundlePolicy;
+use crate::note_bundling::{BundlePlannerVersion, BundlePolicy};
 use crate::storage::{KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord};
 use crate::types::{Network, NoteInfo, VotingError, VotingRoundParams, WitnessData};
 
@@ -44,6 +44,8 @@ where
 ///
 /// All fields are required intentionally. Adding a runtime policy field requires
 /// a new persistence DTO and schema version rather than a serde default here.
+/// The version 1 envelope also selects [`BundlePlannerVersion::V1`]; a future
+/// planning algorithm must use a new envelope version.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedBundlePolicyV1 {
@@ -59,19 +61,24 @@ struct PersistedBundlePolicyV1 {
 
 impl From<BundlePolicy> for PersistedBundlePolicyV1 {
     fn from(policy: BundlePolicy) -> Self {
-        Self {
-            max_real_notes_per_bundle: policy.max_real_notes_per_bundle(),
-            bundle_addition_threshold_zatoshi: policy.bundle_addition_threshold(),
-            max_privacy_bundles: policy.max_privacy_bundles(),
-            privacy_drop_bps: policy.privacy_drop_bps(),
-            max_privacy_drop_zatoshi: policy.max_privacy_drop_zatoshi(),
+        match policy.planner_version() {
+            BundlePlannerVersion::V1 => Self {
+                max_real_notes_per_bundle: policy.max_real_notes_per_bundle(),
+                bundle_addition_threshold_zatoshi: policy.bundle_addition_threshold(),
+                max_privacy_bundles: policy.max_privacy_bundles(),
+                privacy_drop_bps: policy.privacy_drop_bps(),
+                max_privacy_drop_zatoshi: policy.max_privacy_drop_zatoshi(),
+            },
         }
     }
 }
 
 impl PersistedBundlePolicyV1 {
     fn into_policy(self) -> Result<BundlePolicy, VotingError> {
-        let mut policy = BundlePolicy::new(self.max_real_notes_per_bundle)?;
+        let mut policy = BundlePolicy::new_with_planner_version(
+            self.max_real_notes_per_bundle,
+            BundlePlannerVersion::V1,
+        )?;
         if let Some(threshold) = self.bundle_addition_threshold_zatoshi {
             policy = policy.with_bundle_addition_threshold(threshold);
         }
@@ -485,9 +492,10 @@ pub fn get_round_state(
         })?;
     let network = network_from_storage(&network)?;
 
-    // proof_generated is true only when ALL bundles are locally proven or
-    // capability-imported AND all bundles have a VAN leaf position. This keeps
-    // the legacy UI field false until every delegation transaction lands.
+    // proof_generated is true only when ALL bundles are locally proven,
+    // capability-imported, or reconstructed from a chain discovery scan AND
+    // all bundles have a VAN leaf position. This keeps the legacy UI field
+    // false until every delegation transaction lands.
     let bundle_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id",
@@ -521,6 +529,13 @@ pub fn get_round_state(
                            AND b.total_note_value IS NOT NULL
                            AND b.address_index = 0
                            AND b.delegation_tx_hash IS NOT NULL
+                       )
+                       OR (
+                           b.van_comm_rand IS NOT NULL
+                           AND b.gov_comm IS NOT NULL
+                           AND b.total_note_value IS NOT NULL
+                           AND b.address_index IS NOT NULL
+                           AND b.van_leaf_position IS NOT NULL
                        )
                    )",
                 named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
@@ -945,6 +960,78 @@ pub fn require_bundle_notes(
 //     Needed again in ZKP #2 (vote commitment) to reconstruct the VAN as a witness.
 //   - dummy_nullifiers: nullifiers generated for zero-value padded note slots (§1.3.5).
 //     Each is 32 bytes. Stored so the witness builder can reconstruct padded notes.
+
+/// Minimal delegation state recovered from an on-chain VAN discovery scan.
+pub(crate) struct RecoveredDelegationState {
+    pub bundle_index: u32,
+    pub van_comm_rand: [u8; 32],
+    pub gov_comm: [u8; 32],
+    pub total_note_value: u64,
+    pub address_index: u32,
+    pub van_leaf_position: u32,
+}
+
+/// Stores one scan-recovered delegation without inventing local proof or
+/// transaction state.
+///
+/// Every field is write-once. Existing identical values make the operation
+/// idempotent; any conflicting value rejects the complete caller transaction.
+pub(crate) fn store_recovered_delegation_state(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    state: &RecoveredDelegationState,
+) -> Result<(), VotingError> {
+    let total_note_value =
+        i64::try_from(state.total_note_value).map_err(|_| VotingError::InvalidInput {
+            message: format!(
+                "delegation bundle {} total note value does not fit in SQLite INTEGER",
+                state.bundle_index
+            ),
+        })?;
+    let rows = conn
+        .execute(
+            "UPDATE bundles
+             SET van_comm_rand = COALESCE(van_comm_rand, :van_comm_rand),
+                 gov_comm = COALESCE(gov_comm, :gov_comm),
+                 total_note_value = COALESCE(total_note_value, :total_note_value),
+                 address_index = COALESCE(address_index, :address_index),
+                 van_leaf_position = COALESCE(van_leaf_position, :van_leaf_position)
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index
+               AND (van_comm_rand IS NULL OR van_comm_rand = :van_comm_rand)
+               AND (gov_comm IS NULL OR gov_comm = :gov_comm)
+               AND (total_note_value IS NULL OR total_note_value = :total_note_value)
+               AND (address_index IS NULL OR address_index = :address_index)
+               AND (van_leaf_position IS NULL OR van_leaf_position = :van_leaf_position)",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": i64::from(state.bundle_index),
+                ":van_comm_rand": state.van_comm_rand.as_slice(),
+                ":gov_comm": state.gov_comm.as_slice(),
+                ":total_note_value": total_note_value,
+                ":address_index": i64::from(state.address_index),
+                ":van_leaf_position": i64::from(state.van_leaf_position),
+            },
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!(
+                "failed to store recovered delegation bundle {}: {error}",
+                state.bundle_index
+            ),
+        })?;
+    if rows == 0 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "recovered delegation bundle is missing or conflicts with stored state: round={round_id}, bundle={}",
+                state.bundle_index
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Persist all delegation action data and finalized TX1 effects in a single
 /// UPDATE on the bundles table. The effects are required by

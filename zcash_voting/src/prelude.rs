@@ -29,6 +29,10 @@ pub use crate::delegation_capability::{
     ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
+pub use crate::delegation_recovery::{
+    recover_confirmed_delegations, DelegationRecoveryClient, DelegationVanRecoveryError,
+    VoteTreeQueryFuture, VoteTreeQueryTransport,
+};
 pub use crate::error::VotingError;
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::helper::client::{
@@ -46,9 +50,10 @@ pub use crate::hotkey::{
 };
 pub use crate::note_bundling::{
     minimum_voting_eligibility_and_plan_for_notes, minimum_voting_eligibility_for_notes,
-    validate_minimum_voting_eligibility_for_notes, voting_power, voting_power_for_round,
-    voting_power_with_policy, BundlePolicy, ChunkResult, MinimumVotingEligibility, PrivacyTrim,
-    MINIMUM_VOTING_NOTE_COUNT, MINIMUM_VOTING_WEIGHT_ZATOSHI,
+    recoverable_bundle_policy_v1, validate_minimum_voting_eligibility_for_notes, voting_power,
+    voting_power_for_round, voting_power_with_policy, BundlePolicy, ChunkResult,
+    MinimumVotingEligibility, PrivacyTrim, MINIMUM_VOTING_NOTE_COUNT,
+    MINIMUM_VOTING_WEIGHT_ZATOSHI,
 };
 pub use crate::phases::{SharePhase, VotePhase, WorkflowPhase};
 pub use crate::pir::{

@@ -101,6 +101,30 @@ impl HttpTreeSyncApi {
     }
 }
 
+/// Parses the response from a round's `latest` commitment-tree endpoint.
+///
+/// This is exposed separately from [`HttpTreeSyncApi`] so callers with their
+/// own routed HTTP transport can reuse the canonical wire decoder.
+pub fn parse_latest_tree_response(body: &[u8]) -> Result<TreeState, HttpSyncError> {
+    let resp: QueryLatestTreeResponse = serde_json::from_slice(body)?;
+    resp.tree
+        .ok_or(HttpSyncError::NoTreeState)?
+        .into_tree_state()
+        .map_err(HttpSyncError::Parse)
+}
+
+/// Parses one response from a round's paginated commitment-leaves endpoint.
+///
+/// This is exposed separately from [`HttpTreeSyncApi`] so callers with their
+/// own routed HTTP transport can reuse the canonical wire decoder.
+pub fn parse_commitment_leaves_response(
+    body: &[u8],
+) -> Result<BlockCommitmentsPage, HttpSyncError> {
+    let resp: QueryCommitmentLeavesResponse = serde_json::from_slice(body)?;
+    resp.into_block_commitments_page()
+        .map_err(HttpSyncError::Parse)
+}
+
 impl TreeSyncApi for HttpTreeSyncApi {
     type Error = HttpSyncError;
 
@@ -109,11 +133,9 @@ impl TreeSyncApi for HttpTreeSyncApi {
             "{}/shielded-vote/v1/commitment-tree/{}/latest",
             self.base_url, self.round_id
         );
-        let resp: QueryLatestTreeResponse = self.get_json(url)?;
-        resp.tree
-            .ok_or(HttpSyncError::NoTreeState)?
-            .into_tree_state()
-            .map_err(HttpSyncError::Parse)
+        let response = self.transport.get(&url)?;
+        let body = self.success_body(&url, response)?;
+        parse_latest_tree_response(&body)
     }
 
     fn get_root_at_height(&self, height: u32) -> Result<Option<Fp>, Self::Error> {
@@ -140,8 +162,8 @@ impl TreeSyncApi for HttpTreeSyncApi {
             "{}/shielded-vote/v1/commitment-tree/{}/leaves?from_height={}&to_height={}",
             self.base_url, self.round_id, from_height, to_height
         );
-        let resp: QueryCommitmentLeavesResponse = self.get_json(url)?;
-        resp.into_block_commitments_page()
-            .map_err(HttpSyncError::Parse)
+        let response = self.transport.get(&url)?;
+        let body = self.success_body(&url, response)?;
+        parse_commitment_leaves_response(&body)
     }
 }
