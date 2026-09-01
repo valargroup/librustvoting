@@ -427,6 +427,10 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 }
             }
 
+            // Each attempt re-derives the payload inside its own reservation
+            // transaction. That repeats the delegation signature verification
+            // and recovery reads up to `attempts` times per call, which is the
+            // intended cost of proving the generation is still current.
             let attempt_id = reserve_attempt(self.db, &identity, &digest, rebuild)?;
             if cancel() {
                 delete_attempt(self.db, attempt_id)?;
@@ -979,21 +983,6 @@ pub(crate) fn attempt_protected_vote_rows(
         }
     }
     Ok(protected)
-}
-
-/// Whether one vote row is still covered by a journaled attempt.
-///
-/// Shares [`attempt_protected_vote_rows`] so that refusing a ballot-intent
-/// change and refusing to clear recovery state can never disagree.
-pub(crate) fn vote_row_has_blocking_attempt(
-    conn: &rusqlite::Connection,
-    round_id: &str,
-    wallet_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-) -> Result<bool, VotingError> {
-    Ok(attempt_protected_vote_rows(conn, round_id, wallet_id)?
-        .contains(&(bundle_index, proposal_id)))
 }
 
 fn now_seconds() -> Result<i64, VotingError> {

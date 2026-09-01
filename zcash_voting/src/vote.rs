@@ -2326,6 +2326,12 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
     }
     drop(stmt);
 
+    // Read attempt coverage once: every candidate row below is checked against
+    // the same snapshot, and this runs inside the caller's ballot-intent
+    // transaction.
+    let attempted =
+        crate::chain_submission::attempt_protected_vote_rows(conn, round_id, wallet_id)?;
+
     let mut batches = Vec::with_capacity(batch_keys.len());
     for (bundle_index, digest) in batch_keys {
         let recoveries =
@@ -2356,13 +2362,7 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
             // yet committed. Clearing its recovery JSON here would leave a
             // transaction that may still commit with nothing to reconcile it
             // against.
-            if crate::chain_submission::vote_row_has_blocking_attempt(
-                conn,
-                round_id,
-                wallet_id,
-                bundle_index,
-                recovery.proposal_id,
-            )? {
+            if attempted.contains(&(bundle_index, recovery.proposal_id)) {
                 return Err(VotingError::InvalidInput {
                     message: format!(
                         "round {round_id} bundle {bundle_index} has a journaled chain submission attempt covering proposal {} that conflicts with ballot intent for proposal {proposal_id}",
@@ -2396,13 +2396,7 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
         }
         // As above: an accepted-but-uncommitted singleton is visible only in the
         // attempt journal, never in `tx_hash`.
-        if crate::chain_submission::vote_row_has_blocking_attempt(
-            conn,
-            round_id,
-            wallet_id,
-            bundle_index,
-            singleton_proposal_id,
-        )? {
+        if attempted.contains(&(bundle_index, singleton_proposal_id)) {
             return Err(VotingError::InvalidInput {
                 message: format!(
                     "round {round_id} bundle {bundle_index} has a journaled chain submission attempt for proposal {singleton_proposal_id} that conflicts with ballot intent"
