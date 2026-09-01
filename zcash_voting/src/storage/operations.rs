@@ -1543,53 +1543,18 @@ impl VotingDb {
         sighash_label: &str,
         mismatch_message: &str,
     ) -> Result<DelegationSubmissionData, VotingError> {
-        if signature.len() != 64 {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "{signature_label} must be 64 bytes, got {}",
-                    signature.len()
-                ),
-            });
-        }
-        if sighash.len() != 32 {
-            return Err(VotingError::InvalidInput {
-                message: format!("{sighash_label} must be 32 bytes, got {}", sighash.len()),
-            });
-        }
-
         let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        let data =
-            queries::load_delegation_submission_data(&conn, round_id, &wallet_id, bundle_index)?;
-        let stored_sighash = queries::load_pczt_sighash(&conn, round_id, &wallet_id, bundle_index)?;
-        if stored_sighash.len() != 32 {
-            return Err(VotingError::Internal {
-                message: format!(
-                    "pczt_sighash must be 32 bytes, got {}",
-                    stored_sighash.len()
-                ),
-            });
-        }
-        if stored_sighash.as_slice() != sighash {
-            return Err(VotingError::InvalidInput {
-                message: mismatch_message.to_string(),
-            });
-        }
-        verify_delegation_spend_auth_signature(&data.rk, &stored_sighash, signature)?;
-
-        Ok(DelegationSubmissionData {
-            proof: data.proof,
-            rk: data.rk,
-            nf_signed: data.nf_signed,
-            cmx_new: data.cmx_new,
-            gov_comm: data.gov_comm,
-            gov_nullifiers: data.gov_nullifiers,
-            alpha: data.alpha,
-            vote_round_id: data.vote_round_id,
-            spend_auth_sig: signature.to_vec(),
-            sighash: stored_sighash,
-            tx1_effects: data.tx1_effects,
-        })
+        delegation_submission_data_with_conn(
+            &conn,
+            round_id,
+            &self.wallet_id(),
+            bundle_index,
+            signature,
+            sighash,
+            signature_label,
+            sighash_label,
+            mismatch_message,
+        )
     }
 
     /// Delete local bundle rows with index >= `keep_count`, so that only the
@@ -1694,9 +1659,12 @@ impl VotingDb {
             .map_err(|e| VotingError::Internal {
                 message: format!("begin delegation submitted transaction failed: {e}"),
             })?;
+        // Compare in the same canonical form the writer persists, so re-recording
+        // one transaction under different hexadecimal casing stays idempotent.
+        let tx_hash = queries::canonical_tx_hash(tx_hash);
         let stored = queries::get_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index)?;
-        check_text_conflict(stored.as_deref(), tx_hash, "delegation tx_hash")?;
-        queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
+        check_text_conflict(stored.as_deref(), &tx_hash, "delegation tx_hash")?;
+        queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, &tx_hash)?;
         tx.commit().map_err(|e| VotingError::Internal {
             message: format!("commit delegation submitted transaction failed: {e}"),
         })
@@ -1720,6 +1688,7 @@ impl VotingDb {
             .map_err(|e| VotingError::Internal {
                 message: format!("begin vote submitted transaction failed: {e}"),
             })?;
+        let tx_hash = queries::canonical_tx_hash(tx_hash);
         crate::vote::ensure_singleton_vote_update_with_conn(
             &tx,
             &wallet_id,
@@ -1729,14 +1698,14 @@ impl VotingDb {
         )?;
         let stored =
             queries::get_vote_tx_hash(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
-        check_text_conflict(stored.as_deref(), tx_hash, "vote tx_hash")?;
+        check_text_conflict(stored.as_deref(), &tx_hash, "vote tx_hash")?;
         queries::record_vote_submission(
             &tx,
             round_id,
             &wallet_id,
             bundle_index,
             proposal_id,
-            tx_hash,
+            &tx_hash,
         )?;
         tx.commit().map_err(|e| VotingError::Internal {
             message: format!("commit vote submitted transaction failed: {e}"),
@@ -1933,9 +1902,20 @@ impl VotingDb {
     /// `clear_round`/`delete_round` to remove the whole round, including
     /// recorded decisions.
     pub fn clear_recovery_state(&self, round_id: &str) -> Result<(), VotingError> {
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
-        queries::clear_recovery_state(&conn, round_id, &wallet_id)
+        let mut conn = self.conn();
+        // Attempt coverage is now read and then acted on, so the whole cleanup
+        // runs in one immediate transaction: a submission journaled between the
+        // read and the writes must not have its recovery material erased.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("begin recovery state cleanup transaction failed: {e}"),
+            })?;
+        queries::clear_recovery_state(&tx, round_id, &wallet_id)?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("commit recovery state cleanup transaction failed: {e}"),
+        })
     }
 
     /// Clears locally prepared unsigned delegation setup fields for one round
@@ -2485,6 +2465,70 @@ impl VotingDb {
 }
 
 /// Accepts missing or matching text fields and rejects conflicting values.
+/// Loads and signature-checks delegation submission data on a caller's connection.
+///
+/// [`VotingDb::conn`] hands out a guard over one shared connection, so code that
+/// already holds a transaction cannot go back through `VotingDb`. Taking the
+/// connection directly lets the chain lifecycle re-derive a delegation payload
+/// inside its reservation transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delegation_submission_data_with_conn(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    signature: &[u8],
+    sighash: &[u8],
+    signature_label: &str,
+    sighash_label: &str,
+    mismatch_message: &str,
+) -> Result<DelegationSubmissionData, VotingError> {
+    if signature.len() != 64 {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "{signature_label} must be 64 bytes, got {}",
+                signature.len()
+            ),
+        });
+    }
+    if sighash.len() != 32 {
+        return Err(VotingError::InvalidInput {
+            message: format!("{sighash_label} must be 32 bytes, got {}", sighash.len()),
+        });
+    }
+
+    let data = queries::load_delegation_submission_data(conn, round_id, wallet_id, bundle_index)?;
+    let stored_sighash = queries::load_pczt_sighash(conn, round_id, wallet_id, bundle_index)?;
+    if stored_sighash.len() != 32 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "pczt_sighash must be 32 bytes, got {}",
+                stored_sighash.len()
+            ),
+        });
+    }
+    if stored_sighash.as_slice() != sighash {
+        return Err(VotingError::InvalidInput {
+            message: mismatch_message.to_string(),
+        });
+    }
+    verify_delegation_spend_auth_signature(&data.rk, &stored_sighash, signature)?;
+
+    Ok(DelegationSubmissionData {
+        proof: data.proof,
+        rk: data.rk,
+        nf_signed: data.nf_signed,
+        cmx_new: data.cmx_new,
+        gov_comm: data.gov_comm,
+        gov_nullifiers: data.gov_nullifiers,
+        alpha: data.alpha,
+        vote_round_id: data.vote_round_id,
+        spend_auth_sig: signature.to_vec(),
+        sighash: stored_sighash,
+        tx1_effects: data.tx1_effects,
+    })
+}
+
 fn check_text_conflict(
     existing: Option<&str>,
     requested: &str,
@@ -6191,6 +6235,181 @@ mod tests {
             .unwrap();
         assert_eq!(retained.0.as_deref(), Some("legacy-hash"));
         assert_eq!(retained.1.as_deref(), Some(r#"{"generation":"exact"}"#));
+    }
+
+    fn batch_recovery_json(bundle_index: u32, proposal_id: u32, digest: [u8; 32]) -> String {
+        use crate::types::EncryptedShare;
+        use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};
+        crate::vote::serialize_recovery(&VoteRecoveryBundle {
+            vote_round_id: ROUND_ID.to_string(),
+            bundle_index,
+            proposal_id,
+            vote_decision: 0,
+            anchor_height: 123,
+            vc_tree_position: 0,
+            single_share: false,
+            num_options: 3,
+            van_nullifier: [0x10; 32],
+            vote_authority_note_new: [0x11; 32],
+            vote_commitment: [0x12; 32],
+            proof: vec![0x13; 96],
+            shares_hash: [0x14; 32],
+            r_vpk: [0x15; 32],
+            alpha_v: [0x16; 32],
+            vote_auth_sig: [0x17; 64],
+            encrypted_shares: vec![EncryptedShare {
+                c1: vec![0x21; 32],
+                c2: vec![0x22; 32],
+                share_index: 0,
+                plaintext_value: 5,
+                randomness: vec![0x23; 32],
+            }],
+            share_blinds: vec![[0x41; 32]],
+            share_comms: vec![[0x51; 32]],
+            batch: Some(VoteBatchRecovery {
+                digest,
+                index: 0,
+                size: 1,
+            }),
+        })
+        .unwrap()
+    }
+
+    fn set_vote_recovery_json(db: &VotingDb, proposal_id: u32, json: &str) {
+        db.conn()
+            .execute(
+                "UPDATE votes SET commitment_bundle_json=?1
+                  WHERE round_id=?2 AND wallet_id=?3 AND bundle_index=0 AND proposal_id=?4",
+                rusqlite::params![json, ROUND_ID, W, proposal_id as i64],
+            )
+            .unwrap();
+    }
+
+    fn insert_batch_attempt(db: &VotingDb, digest: [u8; 32], state: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote_batch', 0, -1, ?3, ?4, ?5, 1, 1)",
+                rusqlite::params![ROUND_ID, W, digest.as_slice(), vec![0xCC_u8; 32], state],
+            )
+            .unwrap();
+    }
+
+    fn vote_recovery_json(db: &VotingDb, proposal_id: u32) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT commitment_bundle_json FROM votes
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=?3",
+                rusqlite::params![ROUND_ID, W, proposal_id as i64],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn batch_attempt_protection_is_scoped_to_its_own_digest() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 2, 0, &[0xBB; 32])
+            .unwrap();
+        set_vote_recovery_json(&db, 1, &batch_recovery_json(0, 1, [0xD1; 32]));
+        set_vote_recovery_json(&db, 2, &batch_recovery_json(0, 2, [0xD2; 32]));
+        // Only the first batch was dispatched.
+        insert_batch_attempt(&db, [0xD1; 32], "outcome_unknown");
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        assert!(
+            vote_recovery_json(&db, 1).is_some(),
+            "the attempted batch's member must keep its recovery material"
+        );
+        assert_eq!(
+            vote_recovery_json(&db, 2),
+            None,
+            "an unrelated batch in the same bundle must still be clearable"
+        );
+    }
+
+    #[test]
+    fn unparseable_vote_recovery_is_protected_while_a_batch_attempt_is_live() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        set_vote_recovery_json(&db, 1, r#"{"generation":"opaque"}"#);
+        insert_batch_attempt(&db, [0xD1; 32], "attempting");
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        // Membership cannot be read, so the row is kept: erasing a member of a
+        // batch that may still commit is the failure being prevented.
+        assert_eq!(
+            vote_recovery_json(&db, 1).as_deref(),
+            Some(r#"{"generation":"opaque"}"#)
+        );
+    }
+
+    #[test]
+    fn a_rejected_batch_attempt_does_not_freeze_recovery_state() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        set_vote_recovery_json(&db, 1, &batch_recovery_json(0, 1, [0xD1; 32]));
+        insert_batch_attempt(&db, [0xD1; 32], "rejected");
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        // Rejection is definite for that attempt, and nothing ever deletes the
+        // row, so treating it as coverage would freeze this proposal forever.
+        assert_eq!(vote_recovery_json(&db, 1), None);
+    }
+
+    #[test]
+    fn mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent() {
+        const UPPER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let lower = UPPER.to_ascii_lowercase();
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+
+        db.mark_delegation_submitted(ROUND_ID, 0, UPPER).unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, UPPER).unwrap();
+
+        assert_eq!(
+            db.get_delegation_tx_hash(ROUND_ID, 0).unwrap().as_deref(),
+            Some(lower.as_str())
+        );
+        assert_eq!(
+            db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
+            Some(lower.as_str())
+        );
+        // Re-recording the same transaction in either casing is the same
+        // transaction, not a conflict.
+        db.mark_delegation_submitted(ROUND_ID, 0, &lower).unwrap();
+        db.mark_delegation_submitted(ROUND_ID, 0, UPPER).unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, &lower).unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, UPPER).unwrap();
+
+        // A non-hex legacy identifier keeps its exact stored meaning.
+        assert_eq!(queries::canonical_tx_hash("Legacy-Hash"), "Legacy-Hash");
     }
 
     #[test]

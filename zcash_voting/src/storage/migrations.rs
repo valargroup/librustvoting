@@ -143,7 +143,21 @@ END;",
 CREATE INDEX chain_submission_attempts_identity
     ON chain_submission_attempts(
         round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest, id
-    );",
+    );
+-- Canonicalize transaction hashes recorded before the chain lifecycle existed.
+-- The older recording APIs preserved caller casing, so the same transaction
+-- could be stored as uppercase in a domain row and lowercase in the attempt
+-- journal, and then reconciled as two candidates. Only values that are exactly
+-- 64 hexadecimal characters are chain transaction hashes; anything else is left
+-- untouched.
+UPDATE bundles SET delegation_tx_hash = lower(delegation_tx_hash)
+ WHERE delegation_tx_hash IS NOT NULL
+   AND length(delegation_tx_hash) = 64
+   AND delegation_tx_hash NOT GLOB '*[^0-9a-fA-F]*';
+UPDATE votes SET tx_hash = lower(tx_hash)
+ WHERE tx_hash IS NOT NULL
+   AND length(tx_hash) = 64
+   AND tx_hash NOT GLOB '*[^0-9a-fA-F]*';",
     ),
 ];
 
@@ -287,6 +301,11 @@ mod tests {
         format!("{}{}", &schema[..start], &schema[start + next..])
     }
 
+    /// The version-17 schema: everything before the v18 chain-attempt journal.
+    fn v17_schema() -> String {
+        without_chain_submission_attempts(include_str!("migrations/001_init.sql"))
+    }
+
     fn v16_schema() -> String {
         without_helper_share_plans(&without_chain_submission_attempts(include_str!(
             "migrations/001_init.sql"
@@ -343,6 +362,59 @@ mod tests {
             nc_root: vec![0xAA; 32],
             nullifier_imt_root: vec![0xBB; 32],
         }
+    }
+
+    #[test]
+    fn v18_canonicalizes_existing_hex_tx_hashes_and_keeps_legacy_identifiers() {
+        const UPPER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v17_schema()).unwrap();
+        conn.pragma_update(None, "user_version", 17).unwrap();
+        queries::insert_round(
+            &conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
+        conn.execute(
+            "UPDATE bundles SET delegation_tx_hash=?1
+              WHERE round_id='test-round' AND wallet_id='wallet' AND bundle_index=0",
+            rusqlite::params![UPPER],
+        )
+        .unwrap();
+        queries::store_vote(&conn, "test-round", "wallet", 0, 1, 0, &[0xAA; 32]).unwrap();
+        queries::store_vote(&conn, "test-round", "wallet", 0, 2, 0, &[0xBB; 32]).unwrap();
+        conn.execute(
+            "UPDATE votes SET tx_hash = CASE proposal_id WHEN 1 THEN ?1 ELSE 'legacy-hash' END
+              WHERE round_id='test-round' AND wallet_id='wallet'",
+            rusqlite::params![UPPER],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let delegation: String = conn
+            .query_row("SELECT delegation_tx_hash FROM bundles", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(delegation, UPPER.to_ascii_lowercase());
+        let hashes: Vec<String> = conn
+            .prepare("SELECT tx_hash FROM votes ORDER BY proposal_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // Only 64-character hexadecimal values are chain transaction hashes; an
+        // opaque legacy identifier keeps its exact stored meaning.
+        assert_eq!(
+            hashes,
+            vec![UPPER.to_ascii_lowercase(), "legacy-hash".to_string()]
+        );
     }
 
     #[test]

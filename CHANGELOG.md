@@ -6,6 +6,27 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+### Added
+- Added the SDK-owned vote-chain submission lifecycle: `ChainClient`,
+  `ChainEndpointSet`, host-owned `ChainTransport`, and
+  `ChainSubmissionLifecycle` for delegation, singleton vote, and atomic
+  vote-batch submission. Attempts are journaled in the new schema-18
+  `chain_submission_attempts` table before dispatch, known transaction hashes
+  are reconciled before replay, CheckTx acceptance is distinguished from
+  committed success, and spent-nullifier ambiguity is surfaced as
+  `AlreadySpentUnresolved`. The supported surface is re-exported from
+  `prelude`. See `docs/chain_submission_invariants.md`.
+
+### Changed
+- Transaction hashes are now canonicalized to lowercase at the storage
+  boundary, including in `mark_delegation_submitted`, `mark_vote_submitted`,
+  and confirmation. The schema-18 migration lowercases existing 64-character
+  hexadecimal hashes; other stored identifiers are untouched.
+- A ballot-intent change is refused while a non-rejected chain submission
+  attempt still covers that vote or its batch, and recovery cleanup now scopes
+  attempt protection to the attempted proposal or batch digest rather than the
+  whole bundle.
+
 ### Fixed
 
 - Session cleanup now preserves delegation setup fields for bundles with a

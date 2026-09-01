@@ -2813,6 +2813,24 @@ pub fn delete_bundles_from(
 
 // --- Recovery state: TX hashes ---
 
+/// Canonical storage form of a transaction hash.
+///
+/// Chain transaction hashes are 32 bytes rendered as 64 hexadecimal characters,
+/// and hexadecimal casing carries no meaning. The chain lifecycle learns hashes
+/// in lowercase, while the older recording APIs store whatever casing their
+/// caller passed. Canonicalizing at every persistence boundary stops one
+/// transaction from being stored, compared, and reconciled as two.
+///
+/// A value that is not exactly 64 hexadecimal characters is returned unchanged,
+/// so opaque legacy identifiers and test fixtures keep their existing meaning.
+pub(crate) fn canonical_tx_hash(value: &str) -> String {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    }
+}
+
 pub fn store_delegation_tx_hash(
     conn: &Connection,
     round_id: &str,
@@ -2820,6 +2838,7 @@ pub fn store_delegation_tx_hash(
     bundle_index: u32,
     tx_hash: &str,
 ) -> Result<(), VotingError> {
+    let tx_hash = canonical_tx_hash(tx_hash);
     let rows = conn
         .execute(
             "UPDATE bundles SET delegation_tx_hash = :tx_hash
@@ -2841,7 +2860,7 @@ pub fn store_delegation_tx_hash(
         if let Some(existing) =
             existing_delegation_tx_hash(conn, round_id, wallet_id, bundle_index)?
         {
-            if existing.as_deref() == Some(tx_hash) {
+            if existing.as_deref() == Some(tx_hash.as_str()) {
                 return Ok(());
             }
             if existing.is_some() {
@@ -2916,6 +2935,7 @@ pub fn record_vote_submission(
     proposal_id: u32,
     tx_hash: &str,
 ) -> Result<(), VotingError> {
+    let tx_hash = canonical_tx_hash(tx_hash);
     ensure_vote_submission_matches_ballot_intent(
         conn,
         round_id,
@@ -2969,7 +2989,7 @@ pub fn record_vote_submission(
         if let Some(existing) =
             existing_vote_tx_hash(conn, round_id, wallet_id, bundle_index, proposal_id)?
         {
-            if existing.as_deref() == Some(tx_hash) {
+            if existing.as_deref() == Some(tx_hash.as_str()) {
                 return Ok(());
             }
             if existing.is_some() {
@@ -3290,27 +3310,63 @@ pub fn clear_recovery_state(
     .map_err(|e| VotingError::Internal {
         message: format!("failed to clear delegation tx hashes: {}", e),
     })?;
-    conn.execute(
-        "UPDATE votes SET tx_hash = NULL, commitment_bundle_json = NULL
-         WHERE round_id = :round_id
-           AND wallet_id = :wallet_id
-           AND vc_tree_position IS NULL
-           AND NOT EXISTS (
-               SELECT 1
-                 FROM chain_submission_attempts a
-                WHERE a.round_id = votes.round_id
-                  AND a.wallet_id = votes.wallet_id
-                  AND a.bundle_index = votes.bundle_index
-                  AND (
-                      (a.kind = 'vote' AND a.proposal_id = votes.proposal_id) OR
-                      a.kind = 'vote_batch'
-                  )
-           )",
-        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear vote recovery columns: {}", e),
-    })?;
+    // Attempt coverage is decided per row rather than in SQL: a vote-batch
+    // attempt protects exactly the rows whose recovery carries that batch
+    // digest, which requires parsing the recovery JSON. Matching the bundle
+    // alone used to freeze every vote in the bundle, so a later singleton or a
+    // different batch could never clear its retryable recovery state again.
+    let protected =
+        crate::chain_submission::attempt_protected_vote_rows(conn, round_id, wallet_id)?;
+    let candidates = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT bundle_index, proposal_id FROM votes
+                  WHERE round_id = :round_id AND wallet_id = :wallet_id
+                    AND vc_tree_position IS NULL",
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to prepare vote recovery cleanup query: {e}"),
+            })?;
+        let rows = stmt
+            .query_map(
+                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to query vote recovery cleanup rows: {e}"),
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to read vote recovery cleanup row: {e}"),
+            })?
+    };
+    for (bundle_index, proposal_id) in candidates {
+        let (Ok(bundle_index), Ok(proposal_id)) =
+            (u32::try_from(bundle_index), u32::try_from(proposal_id))
+        else {
+            continue;
+        };
+        if protected.contains(&(bundle_index, proposal_id)) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE votes SET tx_hash = NULL, commitment_bundle_json = NULL
+             WHERE round_id = :round_id
+               AND wallet_id = :wallet_id
+               AND bundle_index = :bundle_index
+               AND proposal_id = :proposal_id
+               AND vc_tree_position IS NULL",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to clear vote recovery columns: {}", e),
+        })?;
+    }
     Ok(())
 }
 

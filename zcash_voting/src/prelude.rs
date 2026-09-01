@@ -3,7 +3,53 @@
 //! Wallets should prefer this module over importing from internal modules. The
 //! prelude intentionally contains the setup, precompute, and delegation types
 //! needed by mobile SDK boundaries without exposing proof-circuit internals.
+//!
+//! The chain submission lifecycle is part of that supported surface, so the
+//! documented import path actually reaches it:
+//!
+//! ```
+//! use std::sync::Arc;
+//!
+//! use zcash_voting::prelude::*;
+//!
+//! fn build_lifecycle<'a>(
+//!     db: &'a VotingDb,
+//!     client: &'a ChainClient,
+//! ) -> ChainSubmissionLifecycle<'a> {
+//!     ChainSubmissionLifecycle::new(db, client)
+//! }
+//!
+//! fn build_client(
+//!     transport: Arc<dyn ChainTransport>,
+//!     endpoints: &[String],
+//! ) -> Result<ChainClient, VotingError> {
+//!     Ok(ChainClient::with_config(
+//!         transport,
+//!         ChainEndpointSet::new(endpoints)?,
+//!         ChainClientConfig::default(),
+//!     ))
+//! }
+//!
+//! let identity = ChainSubmissionIdentity::vote(
+//!     "0101010101010101010101010101010101010101010101010101010101010101",
+//!     0,
+//!     1,
+//! );
+//! assert_eq!(identity.kind(), ChainSubmissionKind::Vote);
+//! assert_eq!(identity.proposal_id(), Some(1));
+//! ```
 
+pub use crate::chain::transport::{
+    ChainFuture, ChainResponse, ChainTransport, ChainTransportError, MAX_CHAIN_RESPONSE_BYTES,
+};
+pub use crate::chain::{
+    ChainBroadcastOutcome, ChainClient, ChainClientConfig, ChainEndpointSet, ChainError,
+    ChainTxConfirmation, ChainTxResult, ChainTxStatus,
+};
+pub use crate::chain_submission::{
+    ChainConfirmation, ChainLifecycleError, ChainLifecycleOutcome, ChainSubmissionIdentity,
+    ChainSubmissionKind, ChainSubmissionLifecycle,
+};
 pub use crate::confirmation::{
     confirm_delegation_submission, confirm_vote_batch_submission, confirm_vote_submission,
     DelegationConfirmation, TxEvent, TxEventAttribute, VoteBatchConfirmation, VoteConfirmation,

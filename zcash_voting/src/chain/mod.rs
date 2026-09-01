@@ -223,6 +223,7 @@ impl ChainClient {
     ) -> Result<ChainTxStatus, ChainError> {
         let tx_hash = normalize_tx_hash(tx_hash)?;
         let mut saw_pending = false;
+        let mut unusable_commit = None;
         let mut last_error = None;
         for endpoint in self.endpoints.as_slice() {
             if cancel() {
@@ -232,12 +233,26 @@ impl ChainClient {
             match self.get(&url).await {
                 Ok(response) if response.status() == 404 => saw_pending = true,
                 Ok(response) if response.status() == 200 || response.status() == 422 => {
-                    validate_json_response(&response)?;
-                    return parse_confirmation(response).map(ChainTxStatus::Committed);
+                    match validate_json_response(&response)
+                        .and_then(|()| parse_confirmation(response))
+                    {
+                        Ok(confirmation) => return Ok(ChainTxStatus::Committed(confirmation)),
+                        // An unusable response is not confirmation, and it is not
+                        // a reason to stop looking. Keep failing over so one
+                        // malformed endpoint cannot permanently hide a committed
+                        // result that another endpoint can still serve.
+                        Err(error) => unusable_commit.get_or_insert(error),
+                    };
                 }
                 Ok(response) => last_error = Some(ChainError::Status(response.status())),
                 Err(error) => last_error = Some(ChainError::Transport(error)),
             }
+        }
+        // A transaction-response endpoint that could not be decoded is stronger
+        // evidence than another endpoint's 404: reporting `Pending` here would
+        // assert "not yet committed" on an endpoint that said otherwise.
+        if let Some(error) = unusable_commit {
+            return Err(error);
         }
         if saw_pending {
             Ok(ChainTxStatus::Pending)
@@ -359,15 +374,24 @@ fn parse_broadcast_response(response: ChainResponse) -> Result<ChainBroadcastOut
     validate_json_response(&response)?;
     let parsed: TxResultJson = serde_json::from_slice(response.body())
         .map_err(|_| ChainError::Decode("invalid transaction result JSON".to_string()))?;
-    let tx_hash = if parsed.tx_hash.is_empty() {
-        if parsed.code == 0 {
+    // A hash the server returned is response data, not caller input, so an
+    // unusable one is classified by what the rest of the response says.
+    let tx_hash = match normalize_tx_hash(&parsed.tx_hash) {
+        Ok(hash) => hash,
+        // Acceptance without a usable hash leaves the outcome unknown: the
+        // transaction may well be in the mempool under a hash we cannot learn.
+        // Report an unusable response so retry and failover continue, rather
+        // than a rejection that would stop them.
+        Err(_) if parsed.code == 0 => {
             return Err(ChainError::Decode(
-                "accepted transaction result omitted tx_hash".to_string(),
-            ));
+                "accepted transaction result did not return a usable tx_hash".to_string(),
+            ))
         }
-        String::new()
-    } else {
-        normalize_tx_hash(&parsed.tx_hash)?
+        // A rejection is definite on its own evidence, and a rejected
+        // duplicate's hash never identified the earlier transaction anyway.
+        // Drop the unusable hash and keep the code and log, which the
+        // spent-nullifier classifier still needs.
+        Err(_) => String::new(),
     };
     let result = ChainTxResult {
         tx_hash,
@@ -546,5 +570,100 @@ mod tests {
     fn spent_nullifier_classifier_is_narrow_and_case_insensitive() {
         assert!(is_spent_nullifier_log("Nullifier already spent: abcd"));
         assert!(!is_spent_nullifier_log("unrelated nullifier failure"));
+    }
+
+    const LOOKUP_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn typed_response(status: u16, body: &str, content_type: &str) -> ChainResponse {
+        ChainResponse::new(
+            status,
+            body.as_bytes().to_vec(),
+            Some(content_type.to_string()),
+        )
+    }
+
+    fn two_endpoint_client(transport: Arc<MockTransport>) -> ChainClient {
+        ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&[
+                "https://one.example".to_string(),
+                "https://two.example".to_string(),
+            ])
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn unusable_lookup_response_fails_over_to_next_endpoint() {
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            Ok(typed_response(200, "<html>proxy error</html>", "text/html")),
+            Ok(response(
+                200,
+                r#"{"height":9,"code":0,"log":"","events":[]}"#,
+            )),
+        ]);
+        let client = two_endpoint_client(transport);
+
+        let status = client
+            .transaction_status(LOOKUP_HASH, &|| false)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(status, ChainTxStatus::Committed(confirmation) if confirmation.height == 9),
+            "a malformed first endpoint must not hide a committed result"
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_lookup_response_is_not_reported_as_pending() {
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            Ok(response(404, r#"{"message":"not indexed"}"#)),
+            Ok(response(200, "{not json")),
+        ]);
+        let client = two_endpoint_client(transport);
+
+        let error = client
+            .transaction_status(LOOKUP_HASH, &|| false)
+            .await
+            .unwrap_err();
+
+        // One endpoint answered with a transaction response we could not read.
+        // Reporting `Pending` would assert "not yet committed" against that
+        // endpoint's own evidence.
+        assert!(matches!(error, ChainError::Decode(_)), "got {error:?}");
+        assert!(error.is_ambiguous());
+    }
+
+    #[test]
+    fn accepted_result_with_unusable_hash_is_ambiguous() {
+        let error = parse_broadcast_response(response(
+            200,
+            r#"{"tx_hash":"not-a-hash","code":0,"log":""}"#,
+        ))
+        .unwrap_err();
+
+        assert!(matches!(error, ChainError::Decode(_)), "got {error:?}");
+        assert!(error.is_ambiguous() && error.is_retryable());
+    }
+
+    #[test]
+    fn rejected_result_with_unusable_hash_stays_definite_and_keeps_its_log() {
+        let outcome = parse_broadcast_response(response(
+            200,
+            r#"{"tx_hash":"not-a-hash","code":9,"log":"nullifier already spent: ab"}"#,
+        ))
+        .unwrap();
+
+        // The rejection is definite on its own evidence, and the log must
+        // survive so the spent-nullifier classifier still runs.
+        let ChainBroadcastOutcome::Rejected(result) = outcome else {
+            panic!("expected a definite rejection, got {outcome:?}");
+        };
+        assert_eq!(result.code, 9);
+        assert!(result.tx_hash.is_empty());
+        assert!(is_spent_nullifier_log(&result.log));
     }
 }

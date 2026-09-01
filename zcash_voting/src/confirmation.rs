@@ -384,7 +384,7 @@ fn parse_delegation_confirmation_for_round(
     let raw_leaf_index = required_attribute(event, DELEGATE_VOTE_EVENT, LEAF_INDEX_ATTRIBUTE)?;
     let van_leaf_position = parse_compat_u32(raw_leaf_index, "delegate_vote leaf_index")?;
     Ok(DelegationConfirmation {
-        tx_hash: tx_hash.to_string(),
+        tx_hash: queries::canonical_tx_hash(tx_hash),
         van_leaf_position,
     })
 }
@@ -452,7 +452,7 @@ fn parse_vote_batch_confirmation_for_round(
         });
     }
     Ok(VoteBatchConfirmation {
-        tx_hash: tx_hash.to_string(),
+        tx_hash: queries::canonical_tx_hash(tx_hash),
         batch_digest,
         van_leaf_position,
         proposal_ids,
@@ -476,7 +476,7 @@ fn parse_vote_confirmation_leaf_index(
     let van_leaf_position = parse_u32(parts[0].trim(), "cast_vote VAN leaf position")?;
     let vc_tree_position = parse_u64(parts[1].trim(), "cast_vote VC tree position")?;
     Ok(VoteConfirmation {
-        tx_hash: tx_hash.to_string(),
+        tx_hash: queries::canonical_tx_hash(tx_hash),
         van_leaf_position,
         vc_tree_position,
     })

@@ -7,7 +7,11 @@ pub use crate::helper::transport::{
 };
 
 /// Largest vote-chain response accepted by the SDK.
-pub const MAX_CHAIN_RESPONSE_BYTES: usize = 256 * 1024;
+///
+/// Deliberately the same limit the shared request core already enforces, so the
+/// two cannot drift apart into a transport that reads more than the client
+/// validates.
+pub const MAX_CHAIN_RESPONSE_BYTES: usize = crate::helper::transport::MAX_HELPER_RESPONSE_BYTES;
 
 pub type ChainFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ChainResponse, ChainTransportError>> + Send + 'a>>;

@@ -1789,6 +1789,85 @@ mod tests {
         );
     }
 
+    fn journal_vote_attempt(db: &VotingDb, proposal_id: u32, state: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, ?3, X'', ?4, ?5, 1, 1)",
+                rusqlite::params![ROUND, W, proposal_id as i64, vec![0xCC_u8; 32], state],
+            )
+            .unwrap();
+    }
+
+    fn db_with_uncommitted_vote() -> VotingDb {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+        db
+    }
+
+    fn stored_vote_recovery(db: &VotingDb) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT commitment_bundle_json FROM votes
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=2",
+                rusqlite::params![ROUND, W],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn ballot_intent_change_is_refused_while_a_vote_attempt_is_live() {
+        let db = db_with_uncommitted_vote();
+        // CheckTx acceptance leaves `votes.tx_hash` null on purpose, so the
+        // journal is the only evidence that this vote may still commit.
+        journal_vote_attempt(&db, 2, "outcome_unknown");
+
+        let error = db
+            .set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("journaled chain submission attempt"),
+            "{error}"
+        );
+        assert!(
+            stored_vote_recovery(&db).is_some(),
+            "the material needed to reconcile that attempt must survive"
+        );
+    }
+
+    #[test]
+    fn reselecting_the_same_choice_is_not_refused_by_a_live_attempt() {
+        let db = db_with_uncommitted_vote();
+        journal_vote_attempt(&db, 2, "accepted");
+
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+
+        assert!(stored_vote_recovery(&db).is_some());
+    }
+
+    #[test]
+    fn a_rejected_attempt_does_not_refuse_a_ballot_intent_change() {
+        let db = db_with_uncommitted_vote();
+        journal_vote_attempt(&db, 2, "rejected");
+
+        // Nothing ever deletes a rejected attempt, so blocking on one would
+        // freeze this proposal's ballot intent with no recovery path.
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
+
+        assert_eq!(stored_vote_recovery(&db), None);
+    }
+
     #[test]
     fn submitted_but_unconfirmed_vote_yields_poll() {
         let db = db_with_bundle();

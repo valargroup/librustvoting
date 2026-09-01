@@ -88,10 +88,16 @@ for its exact attempt.
 ## Typed identity and payload invariants
 
 1. The supported mutations are delegation, singleton cast-vote, and atomic
-   cast-vote batch.
+   cast-vote batch. A submission identity is constructible only through its
+   kind-specific constructor, so its kind, proposal, and batch digest cannot
+   disagree; the storage `CHECK` enforces the same pairing at rest.
 2. A lifecycle call validates its exact wallet, round, bundle, proposal or
    batch digest, and durable recovery generation before any storage or network
-   effect.
+   effect. The generation check is not a pre-flight read: the reservation
+   transaction re-derives the canonical payload from durable state and requires
+   it to hash to the same payload digest as the bytes about to be dispatched.
+   The rebuild is given the reservation's own connection, so it cannot re-enter
+   the shared database handle.
 3. Delegation accepts `SignedDelegationBundle`; singleton vote accepts a
    recovered `CommittedVote`; atomic vote accepts a recovered
    `SignedVoteBatch`. The SDK derives network fields from these types.
@@ -101,7 +107,13 @@ for its exact attempt.
    sends byte-identical content.
 6. Server-returned transaction hashes must be exactly 32 bytes encoded as 64
    hexadecimal characters and are normalized to lowercase before persistence
-   or lookup.
+   or lookup. Canonicalization is enforced at the storage boundary, not only in
+   the client, so the older recording APIs cannot store one transaction under a
+   casing that later reconciles as a second candidate. An accepted result whose
+   hash is unusable is an unusable response, not a rejection; a rejected
+   result's unusable hash is discarded while its code and log stay definite,
+   because a rejected duplicate's hash never identified the earlier
+   transaction.
 7. The local payload digest is never accepted where a chain hash is required.
 
 ## Durable dispatch invariants
@@ -119,10 +131,20 @@ for its exact attempt.
 7. Accepted chain hashes and all earlier unknown attempts remain available for
    reconciliation until explicit round or account deletion.
 8. Routine session reset and recovery cleanup do not delete chain submission
-   attempts.
-9. CheckTx acceptance alone never updates the legacy delegation or vote
-   submission columns. This prevents a later DeliverTx failure from pinning a
-   domain row to a transaction that did not commit successfully.
+   attempts, and they do not erase material an attempt still covers. Coverage
+   is scoped to the exact attempted submission: a singleton attempt covers its
+   own proposal row, and a batch attempt covers exactly the rows whose recovery
+   carries that batch digest. A row whose recovery cannot be read is covered
+   conservatively while its bundle has any batch attempt. `rejected` attempts
+   confer no coverage; nothing deletes those rows, so treating them as coverage
+   would freeze a proposal's recovery state permanently.
+9. A ballot-intent change that would erase material covered by a non-rejected
+   attempt is refused. CheckTx acceptance deliberately leaves the legacy vote
+   column null, so the attempt journal is the only evidence that a dispatched
+   vote may still commit. Re-selecting the same choice is never refused.
+10. CheckTx acceptance alone never updates the legacy delegation or vote
+    submission columns. This prevents a later DeliverTx failure from pinning a
+    domain row to a transaction that did not commit successfully.
 
 These rules mirror helper submission's reservation-before-POST and
 strongest-evidence behavior. Chain submissions deliberately differ by allowing
@@ -138,6 +160,8 @@ created by the confirmed delegation.
 1. Once any delegation attempt is journaled, ordinary session reset, retry
    cleanup, and recovery cleanup MUST preserve `van_comm_rand`, `gov_comm`, the
    proof, PCZT sighash, nullifiers, signature inputs, and related setup fields.
+   Delegation coverage is per bundle, matching the delegation attempt's own
+   bundle index.
 2. Delegation confirmation does not clear those fields.
 3. Resubmission MUST reuse the persisted delegation setup and
    `van_comm_rand`; it MUST NOT rebuild the bundle by sampling another
@@ -202,6 +226,11 @@ The client may retry or fail over after:
 - HTTP 429; or
 - HTTP 500, 502, 503, or 504.
 
+An accepted broadcast whose transaction hash is unusable is an unusable
+response and keeps retry and failover going. A definite rejection is classified
+from its code and log alone, so the spent-nullifier compatibility path still
+runs when the returned hash is unreadable.
+
 Other 4xx responses are terminal except the spent-nullifier compatibility
 case. Other 5xx responses are outcome-unknown but non-retryable in the current
 call. Before a replay, the lifecycle queries every known chain hash. Exhausted
@@ -231,13 +260,25 @@ hosts do not parse the log.
 
 ## Transaction lookup and confirmation invariants
 
-1. Transaction lookup accepts only normalized 32-byte hexadecimal hashes.
+1. Transaction lookup accepts only normalized 32-byte hexadecimal hashes. A
+   stored candidate that is not one, such as an opaque identifier recorded by a
+   pre-lifecycle host, is skipped rather than failing reconciliation for that
+   identity. Candidates are canonicalized before deduplication, so one
+   transaction recorded in two casings is queried once and cannot be counted as
+   two committed candidates.
 2. HTTP 200 is a committed transaction response and parses height, code, log,
    and events.
 3. HTTP 404 means not yet committed and may fail over to another endpoint.
+   Lookup gives each configured endpoint one attempt; it does not retry the
+   same endpoint.
 4. A structured HTTP 422 transaction result is committed failure.
 5. Invalid content type, oversized body, malformed JSON, or missing required
-   fields is an unusable response, not confirmation.
+   fields is an unusable response, not confirmation, and failover continues to
+   the remaining endpoints. One malformed endpoint therefore cannot hide a
+   committed result another endpoint can still serve. If no endpoint returns a
+   usable transaction response, the unusable-response error is reported rather
+   than `Pending`: an endpoint that answered about the transaction is stronger
+   evidence than another endpoint's 404.
 6. Delegation confirmation uses `confirm_delegation_submission`; singleton vote
    uses `confirm_vote_submission`; atomic batch uses
    `confirm_vote_batch_submission`.
@@ -255,17 +296,24 @@ hosts do not parse the log.
    identity. Unrelated submissions remain independent.
 2. After acquiring the lock, the lifecycle re-reads the exact durable recovery
    generation. A stale handle fails before network dispatch.
-3. The exact generation is re-read while holding the process identity lock.
-   Attempt insertion and its round/owner validation then share one immediate
-   SQLite transaction. The host advances cancellation before destructive
-   session cleanup, so a cleanup race is observed before dispatch.
-4. Cancellation is checked before reservation, dispatch, retry, failover, and
-   backoff.
-5. Cancellation observed after a request completes does not replace its result.
+3. Attempt insertion, its round and owner validation, and the payload rebuild
+   that proves the generation is unchanged all share one immediate SQLite
+   transaction. A generation replaced or cleared by another connection after
+   the payload was serialized is therefore caught before dispatch, not merely
+   before the lock was taken.
+4. Cancellation is checked before reservation, dispatch, retry, failover,
+   backoff, and confirmation application.
+5. Cancellation observed after a broadcast completes does not replace that
+   broadcast's result.
 6. Cancellation before a fresh reservation dispatches removes the definitely
    unsent reservation. Cancellation after dispatch retains uncertainty.
 7. A deleted or replaced generation cannot receive a delayed transport or
-   confirmation result.
+   confirmation result. Cancellation is re-checked immediately before the
+   confirmation transaction, so a session invalidated while a status request
+   was in flight does not have voting state mutated underneath it. This narrows
+   the window rather than closing it, which is safe because the winning hash
+   stays in the attempt journal and confirmation is idempotent: a suppressed
+   confirmation is re-derived by the next reconciliation.
 
 Vizor implements host cancellation with a monotonically increasing operation
 epoch. Account/session invalidation advances the epoch synchronously; every
@@ -284,9 +332,13 @@ hash, evidence state, and timestamps. It stores neither the canonical request
 body nor a locally predicted chain hash. Deleting the owning round cascades to
 its attempts.
 
+Version 18 also canonicalizes transaction hashes already stored by earlier
+recording APIs: a `bundles.delegation_tx_hash` or `votes.tx_hash` of exactly 64
+hexadecimal characters is lowercased once, and anything else is left untouched.
+
 Existing public submission-recording functions remain compatible. The new
 high-level lifecycle is the supported boundary for SDK-owned network
-submission and confirmation.
+submission and confirmation, and `prelude` is its supported import path.
 
 ## Host responsibilities and trust boundaries
 
@@ -316,6 +368,19 @@ state transitions.
 - Can arbitrary caller JSON or a caller-supplied accepted hash reach the
   lifecycle?
 - Can a stale recovery generation reach storage or network work?
+- Is the generation proven unchanged inside the reservation transaction, or
+  only before it?
+- Can a ballot-intent change erase material an accepted-but-uncommitted
+  submission still needs?
+- Can a rejected attempt permanently freeze recovery state or ballot intent?
+- Is attempt-based cleanup protection scoped to the attempted proposal or batch
+  digest, rather than the whole bundle?
+- Can one malformed endpoint hide a committed transaction from lookup?
+- Can an unusable transaction response be reported as "not yet committed"?
+- Can an unreadable server hash turn a definite rejection into a replay, or
+  bypass the spent-nullifier classifier?
+- Can one transaction stored in two casings reconcile as two candidates?
+- Does `prelude` expose the lifecycle the crate documentation recommends?
 - Are retries byte-identical within one live call?
 - Is the software-delegation crash recovery gap still explicit?
 - Can a spent-nullifier response discard known hashes or recovery material?
@@ -336,18 +401,50 @@ state transitions.
   endpoint identity validation.
 - `chain::tests::spent_nullifier_classifier_is_narrow_and_case_insensitive`
   covers the compatibility classifier boundary.
+- `chain::tests::unusable_lookup_response_fails_over_to_next_endpoint` and
+  `chain::tests::unusable_lookup_response_is_not_reported_as_pending` cover
+  lookup failover past an unusable response and the refusal to downgrade one to
+  "not yet committed".
+- `chain::tests::accepted_result_with_unusable_hash_is_ambiguous` and
+  `chain::tests::rejected_result_with_unusable_hash_stays_definite_and_keeps_its_log`
+  cover the split classification of an unreadable server-returned hash.
 - `chain_submission::tests::check_tx_acceptance_is_journaled_without_domain_mutation`
   covers the CheckTx/committed-domain separation.
 - `chain_submission::tests::known_pending_hash_is_reconciled_without_another_post`
   covers reconcile-before-replay for accepted candidates.
 - `chain_submission::tests::committed_failure_rejects_without_pinning_domain_hash`
   covers DeliverTx failure classification without a partial domain write.
+- `chain_submission::tests::reservation_rejects_a_changed_durable_generation`
+  and `chain_submission::tests::reservation_accepts_the_matching_durable_generation`
+  cover the in-transaction payload rebuild, including that a mismatch dispatches
+  nothing and journals nothing.
+- `chain_submission::tests::cancellation_after_lookup_suppresses_the_confirmation_write`
+  covers the cancellation checkpoint immediately before confirmation.
+- `chain_submission::tests::one_transaction_recorded_in_two_casings_is_looked_up_once`
+  and `chain_submission::tests::a_legacy_opaque_hash_does_not_break_reconciliation`
+  cover candidate canonicalization and non-normalizable legacy hashes.
+- `chain_submission::tests::identities_cannot_pair_a_kind_with_the_wrong_key`
+  covers the constructor-only submission identity.
+- `session::tests::ballot_intent_change_is_refused_while_a_vote_attempt_is_live`,
+  `session::tests::reselecting_the_same_choice_is_not_refused_by_a_live_attempt`,
+  and `session::tests::a_rejected_attempt_does_not_refuse_a_ballot_intent_change`
+  cover the ballot-intent guard and its anti-deadlock boundary.
 - `storage::operations::tests::attempted_delegation_cleanup_preserves_van_randomizer`
   covers the post-attempt `van_comm_rand`, legacy hash, and Keystone-signature
   cleanup prohibition.
 - `storage::operations::tests::attempted_vote_cleanup_preserves_exact_recovery_generation`
   covers post-attempt vote payload recovery across generic recovery cleanup.
-- storage migration tests cover version 18 fresh and in-place schemas.
+- `storage::operations::tests::batch_attempt_protection_is_scoped_to_its_own_digest`,
+  `storage::operations::tests::unparseable_vote_recovery_is_protected_while_a_batch_attempt_is_live`,
+  and `storage::operations::tests::a_rejected_batch_attempt_does_not_freeze_recovery_state`
+  cover digest-scoped cleanup protection, its conservative unreadable-recovery
+  case, and the rejected-attempt boundary.
+- `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
+  covers storage-boundary hash canonicalization and idempotent replay.
+- storage migration tests cover version 18 fresh and in-place schemas, including
+  `storage::migrations::tests::v18_canonicalizes_existing_hex_tx_hashes_and_keeps_legacy_identifiers`.
+- The `prelude` doc test covers the documented import path reaching the chain
+  lifecycle surface.
 - Vizor's `voting_providers_test.dart` covers account-switch cancellation,
   bounded spent-nullifier reconciliation, delayed transaction indexing,
   restart confirmation, and stale confirmation suppression through the FFI

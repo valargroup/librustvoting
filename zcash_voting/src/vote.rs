@@ -668,6 +668,28 @@ impl CommittedVote {
     }
 }
 
+/// Rebuilds a singleton vote's signed commitment from persisted recovery state.
+///
+/// Connection-scoped for the same reason as
+/// [`recover_atomic_vote_batch_with_conn`]: the chain lifecycle re-derives this
+/// payload inside its reservation transaction.
+pub(crate) fn signed_commitment_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<SignedVoteCommitment, VotingError> {
+    let recovery = recovery_bundle_with_conn(conn, wallet_id, round_id, bundle_index, proposal_id)?
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: format!(
+                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+            ),
+        })?;
+    let commit = commit_from_recovery(&recovery)?;
+    signed_commitment_from_parts(&commit, &recovery)
+}
+
 fn signed_commitment_from_parts(
     commit: &VoteCommit,
     recovery: &VoteRecoveryBundle,
@@ -1186,7 +1208,24 @@ pub fn recover_atomic_vote_batch(
     bundle_index: u32,
     proposal_id: u32,
 ) -> Result<SignedVoteBatch, VotingError> {
-    let requested = recovery_bundle(db, round_id, bundle_index, proposal_id)?.ok_or_else(|| {
+    let conn = db.conn();
+    recover_atomic_vote_batch_with_conn(&conn, &db.wallet_id(), round_id, bundle_index, proposal_id)
+}
+
+/// Connection-scoped form of [`recover_atomic_vote_batch`].
+///
+/// Taking a connection rather than a [`VotingDb`] lets a caller rebuild the exact
+/// batch payload inside a transaction it already holds. Reaching back through
+/// `VotingDb` there would deadlock on the single shared connection.
+pub(crate) fn recover_atomic_vote_batch_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<SignedVoteBatch, VotingError> {
+    let requested = recovery_bundle_with_conn(conn, wallet_id, round_id, bundle_index, proposal_id)?
+        .ok_or_else(|| {
         VotingError::InvalidInput {
             message: format!(
                 "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
@@ -1200,16 +1239,8 @@ pub fn recover_atomic_vote_batch(
             message: "vote is a singleton; use recover_signed_commitments".to_string(),
         })?;
     let digest = batch.digest;
-    let recoveries = {
-        let conn = db.conn();
-        load_vote_batch_recoveries_with_conn(
-            &conn,
-            &db.wallet_id(),
-            round_id,
-            bundle_index,
-            digest,
-        )?
-    };
+    let recoveries =
+        load_vote_batch_recoveries_with_conn(conn, wallet_id, round_id, bundle_index, digest)?;
     let mut commitments = Vec::with_capacity(recoveries.len());
     for recovery in &recoveries {
         let commit = commit_from_recovery(recovery)?;
@@ -2320,6 +2351,25 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
                     ),
                 });
             }
+            // CheckTx acceptance deliberately leaves `tx_hash` null, so the
+            // column above cannot see a batch that has been dispatched but not
+            // yet committed. Clearing its recovery JSON here would leave a
+            // transaction that may still commit with nothing to reconcile it
+            // against.
+            if crate::chain_submission::vote_row_has_blocking_attempt(
+                conn,
+                round_id,
+                wallet_id,
+                bundle_index,
+                recovery.proposal_id,
+            )? {
+                return Err(VotingError::InvalidInput {
+                    message: format!(
+                        "round {round_id} bundle {bundle_index} has a journaled chain submission attempt covering proposal {} that conflicts with ballot intent for proposal {proposal_id}",
+                        recovery.proposal_id
+                    ),
+                });
+            }
         }
         batches.push((bundle_index, recoveries));
     }
@@ -2341,6 +2391,21 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
             return Err(VotingError::InvalidInput {
                 message: format!(
                     "round {round_id} bundle {bundle_index} has a submitted singleton vote that conflicts with ballot intent for proposal {singleton_proposal_id}"
+                ),
+            });
+        }
+        // As above: an accepted-but-uncommitted singleton is visible only in the
+        // attempt journal, never in `tx_hash`.
+        if crate::chain_submission::vote_row_has_blocking_attempt(
+            conn,
+            round_id,
+            wallet_id,
+            bundle_index,
+            singleton_proposal_id,
+        )? {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "round {round_id} bundle {bundle_index} has a journaled chain submission attempt for proposal {singleton_proposal_id} that conflicts with ballot intent"
                 ),
             });
         }

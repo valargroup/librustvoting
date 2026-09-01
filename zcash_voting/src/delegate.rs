@@ -1182,7 +1182,40 @@ pub fn submission(
             db.get_delegation_submission_with_signature(round_id, bundle_index, &sig, &sighash)
         }
     }?;
+    submission_from_data(data)
+}
 
+/// Connection-scoped form of [`submission`].
+///
+/// [`VotingDb::conn`] guards one shared connection, so a caller that already
+/// holds a transaction must pass that connection in rather than reaching back
+/// through `VotingDb`. The chain lifecycle uses this to re-derive the exact
+/// delegation payload inside its reservation transaction.
+pub(crate) fn submission_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    signer: DelegationSigner,
+) -> Result<DelegationSubmission, VotingError> {
+    let DelegationSigner::Signature { sig, sighash } = signer;
+    let data = crate::storage::operations::delegation_submission_data_with_conn(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        &sig,
+        &sighash,
+        "signature",
+        "sighash",
+        "sighash does not match stored PCZT sighash",
+    )?;
+    submission_from_data(data)
+}
+
+fn submission_from_data(
+    data: crate::types::DelegationSubmissionData,
+) -> Result<DelegationSubmission, VotingError> {
     Ok(DelegationSubmission {
         proof: data.proof,
         rk: array32("rk", data.rk)?,
