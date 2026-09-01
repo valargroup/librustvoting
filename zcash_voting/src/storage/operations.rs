@@ -6557,6 +6557,68 @@ mod tests {
         queries::record_vote_submission(&conn, ROUND_ID, W, 0, 2, &hash).unwrap();
     }
 
+    #[test]
+    fn a_hash_journaled_for_another_bundle_cannot_be_confirmed_here() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (round_id, wallet_id, bundle_index) VALUES (?1, ?2, 1)",
+                rusqlite::params![ROUND_ID, W],
+            )
+            .unwrap();
+        let hash = "a".repeat(64);
+        // CheckTx acceptance for bundle 0 journals the hash and deliberately
+        // leaves `bundles.delegation_tx_hash` null, so the domain columns say
+        // nothing about who owns it.
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                rusqlite::params![ROUND_ID, W, vec![0xCC_u8; 32], &hash],
+            )
+            .unwrap();
+
+        // Without the journal in the ownership check, whichever identity
+        // reconciled first would take the confirmation.
+        let error =
+            queries::store_delegation_tx_hash(&db.conn(), ROUND_ID, W, 1, &hash).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("already recorded for another bundle"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_hash_journaled_for_this_submission_still_confirms() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        let hash = "a".repeat(64);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                rusqlite::params![ROUND_ID, W, vec![0xCC_u8; 32], &hash],
+            )
+            .unwrap();
+
+        // Its own journal row must not block the confirmation it is evidence for.
+        queries::store_delegation_tx_hash(&db.conn(), ROUND_ID, W, 0, &hash).unwrap();
+    }
+
     fn batch_recovery_json(bundle_index: u32, proposal_id: u32, digest: [u8; 32]) -> String {
         use crate::types::EncryptedShare;
         use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};

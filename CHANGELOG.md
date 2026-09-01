@@ -69,7 +69,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   accepted with a different hash, and keeping only the newest had a host poll
   the one it kept while the one it dropped committed.
 - Recording a chain transaction hash against a bundle is refused when another
-  bundle in the round already carries it. The VAN position a transaction commits
+  bundle in the round already carries it, in the attempt journal as well as the
+  domain columns — CheckTx acceptance leaves those columns null, so without the
+  journal, reconciliation order decided which identity got the confirmation. The VAN position a transaction commits
   belongs to one bundle, so a stale endpoint returning one valid hash for two
   submissions could otherwise write a position onto a bundle it never touched.
   Within a bundle the hash may be shared only by rows whose recovery carries the
@@ -82,6 +84,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   and with it the request deadline the heartbeat exists to keep the reservation
   inside; a contended refresh is skipped. It no longer waits on SQLite's write
   lock either, which another connection or process can hold.
+- An attempt reservation is timestamped immediately before its insert rather
+  than on entry, so the blocking connection acquisition and payload rebuild do
+  not spend part of its freshness grace before it exists.
+- The in-flight guard is released once a response is classified, instead of
+  being held through the retry backoff, where it kept asserting coverage for a
+  POST that was already answered.
 - Cancellation is rechecked after the durable-confirmation reread that precedes
   reconciliation's final classification chain, and after the state reads on the
   no-candidate path, which has no lookup loop behind it to check again.

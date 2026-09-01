@@ -662,7 +662,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // can no longer be confirmed against what is stored. Registering
             // first can only name an identity whose reservation then fails,
             // which over-protects its rows until the guard drops.
-            let _in_flight = InFlightAttempt::register(wallet_id, identity);
+            let in_flight = InFlightAttempt::register(wallet_id, identity);
             // A failure here is definite only for this attempt. An earlier one
             // in this call may still commit, and a concurrent change to the
             // now-uncovered generation is exactly what makes this rebuild fail
@@ -932,6 +932,12 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 }
             }
 
+            // This attempt's response is classified, so no POST of ours is
+            // outstanding. Holding the guard across the backoff would keep
+            // asserting coverage that cleanup, ballot-intent changes, and bundle
+            // pruning all obey — for as long as the configured delay, which the
+            // host chooses.
+            drop(in_flight);
             if attempt_index + 1 < attempts {
                 if cancel() {
                     return Ok(self.cancelled_outcome(wallet_id, identity, last_unknown)?);
@@ -1124,7 +1130,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         // weaker answer below: a lagging 404 would otherwise report `Pending`,
         // and a different candidate's committed failure would report `Rejected`,
         // for a submission that is now durably confirmed.
-        if let Some(tx_hash) = durable_confirmation_hash(self.db, wallet_id, identity)? {
+        let durable = durable_confirmation_hash(self.db, wallet_id, identity)?;
+        // That read waits on the database too, and every answer below it asserts
+        // this operation is still active.
+        if cancel() {
+            return Ok(ChainLifecycleOutcome::Cancelled);
+        }
+        if let Some(tx_hash) = durable {
             return Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash });
         }
         if let Some(message) = unresolved {
@@ -1426,7 +1438,6 @@ fn reserve_attempt(
     payload_digest: &[u8; 32],
     rebuild: PayloadRebuild<'_>,
 ) -> Result<Option<i64>, VotingError> {
-    let now = now_seconds()?;
     let mut conn = db.conn();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1455,6 +1466,10 @@ fn reserve_attempt(
     if !known_hashes_with_conn(&tx, wallet_id, identity)?.is_empty() {
         return Ok(None);
     }
+    // Taken here, not on entry: acquiring the connection and rebuilding the
+    // payload both block, and a reservation stamped before that wait is already
+    // part-spent against the freshness grace another process reads it by.
+    let now = now_seconds()?;
     tx.execute(
         "INSERT INTO chain_submission_attempts
          (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
@@ -1936,6 +1951,25 @@ pub(crate) fn has_in_flight_at_or_after(round_id: &str, wallet_id: &str, from_in
     in_flight_for_round(round_id, wallet_id)
         .iter()
         .any(|key| key.bundle_index >= from_index)
+}
+
+/// How many live registrations one identity currently has.
+///
+/// The registry is counted, so an overlap shows up here as a value above one.
+#[cfg(test)]
+fn in_flight_count(wallet_id: &str, identity: &ChainSubmissionIdentity) -> usize {
+    let key = InFlightKey {
+        wallet_id: wallet_id.to_string(),
+        round_id: identity.round_id.clone(),
+        kind: identity.kind.as_str(),
+        bundle_index: identity.bundle_index,
+        proposal_key: identity.proposal_key(),
+        batch_digest: identity.batch_key().to_vec(),
+    };
+    in_flight_registry()
+        .lock()
+        .map(|live| live.get(&key).copied().unwrap_or(0))
+        .unwrap_or(0)
 }
 
 /// Keeps one reservation registered as in flight for as long as it is held.
@@ -6098,5 +6132,80 @@ mod tests {
         // Reporting the ambiguity would say the operation is active, which a
         // cancelled one is not.
         assert_eq!(outcome, ChainLifecycleOutcome::Cancelled);
+    }
+
+    #[test]
+    fn a_reservation_is_stamped_after_its_blocking_validation() {
+        let db = test_db();
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // The rebuild stands in for the blocking work between entry and the
+        // insert: acquiring the connection, and re-deriving the payload.
+        let rebuild = |conn: &rusqlite::Connection| -> Result<Vec<u8>, VotingError> {
+            std::thread::sleep(Duration::from_millis(1100));
+            echo_rebuild(conn)
+        };
+
+        let id = reserve_attempt(
+            &db,
+            WALLET,
+            &identity,
+            &Sha256::digest(b"{}").into(),
+            &rebuild,
+        )
+        .unwrap()
+        .unwrap();
+
+        let stamped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT created_at FROM chain_submission_attempts WHERE id=?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // A reservation stamped on entry is already part-spent against the
+        // freshness grace another process reads it by.
+        assert!(stamped > before, "stamped={stamped} before={before}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_in_flight_guard_is_released_before_the_backoff() {
+        let db = test_db();
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+        let transport = Arc::new(MockTransport::default());
+        // Retryable, and journaled as rejected: once classified, nothing of
+        // ours is outstanding.
+        transport.responses.lock().unwrap().extend([
+            Ok(response(429, r#"{"message":"slow down"}"#)),
+            Ok(response(429, r#"{"message":"slow down"}"#)),
+        ]);
+        let client = ChainClient::with_config(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            ChainClientConfig::default()
+                .with_retry_delays(vec![Duration::from_secs(30)])
+                .unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        // Sampled while the backoff is sleeping: the first POST completes at
+        // once, so by the time this fires the call is waiting to retry.
+        let sampled = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            in_flight_count(WALLET, &ChainSubmissionIdentity::delegation(ROUND_ID, 0))
+        };
+        let submit =
+            lifecycle
+                .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false);
+        let (during_backoff, _) = tokio::join!(sampled, submit);
+
+        // Held across the backoff, this reads 1, and cleanup, ballot-intent
+        // changes, and bundle pruning would all defer to a POST that has already
+        // been answered — for a delay the host chooses.
+        assert_eq!(during_backoff, 0);
     }
 }

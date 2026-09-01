@@ -134,7 +134,10 @@ is decided every time a guard runs, by two tests in order of strength.
 
 A reservation this process is waiting on is named exactly, by an in-memory
 registry the submission loop holds from the moment it journals a reservation
-until it classifies the response. That needs no clock, so no adjustment to the
+until it classifies the response — and no longer. It is released before any
+retry backoff: the answer is in by then, and holding it through a delay the host
+chooses would keep cleanup, ballot-intent changes, and bundle pruning deferring
+to a POST that is already over. That needs no clock, so no adjustment to the
 system clock can make a live POST look abandoned and let cleanup erase the
 material its response is about to be confirmed against.
 
@@ -158,7 +161,12 @@ runs in the same task as the POST, so blocking would stop that task being polled
 and with it the very deadline the refresh exists to keep the reservation inside.
 Neither wait counts — the handle's own mutex, and SQLite's write lock, which
 another connection or process can hold and which the configured busy timeout
-would otherwise sit on for seconds. A contended refresh is skipped instead. A reservation is `attempting` only between its
+would otherwise sit on for seconds. A contended refresh is skipped instead.
+
+A reservation's timestamp is taken immediately before its insert, after the
+connection has been acquired and the payload rebuilt. Both of those block, and a
+reservation stamped on entry would arrive already part-spent against the grace
+another process reads it by. A reservation is `attempting` only between its
 journaling and the classification that follows its POST, so it cannot outlive
 that call's request deadline by more than scheduling slop; one untouched for
 longer than any configurable deadline, by an owner that would have refreshed it,
@@ -233,6 +241,9 @@ none. The transaction may still have committed; that stays visible as
    it: the VAN position it commits belongs to that bundle alone, and a stale or
    misbehaving endpoint returning one valid hash for two submissions would
    otherwise write a position onto a bundle the transaction never touched. An
+   ownership is judged against the attempt journal as well as the domain columns,
+   because CheckTx acceptance deliberately leaves those null and would otherwise
+   let reconciliation order decide which identity receives the confirmation. An
    atomic batch legitimately records one transaction on every member of its own
    bundle, and only such a batch does: within a bundle the hash may be shared
    only by rows whose recovery carries the same batch digest, because a
@@ -811,7 +822,10 @@ state transitions.
 - Can the reservation heartbeat block the request deadline it protects, on
   either the handle's mutex or SQLite's own lock?
 - Can one chain transaction confirm two bundles, or two singleton proposals in
-  one bundle?
+  one bundle, including when its only record is the attempt journal?
+- Is a reservation stamped before or after the blocking work that precedes it?
+- Is the in-flight guard released once the response is classified, or held
+  through the retry backoff?
 - Can a committed failure be reported as terminal while a candidate journaled
   during the lookup may still commit?
 - Is cancellation observed by the public lookup client, not just by the
@@ -1101,9 +1115,14 @@ state transitions.
 - `storage::operations::tests::one_transaction_cannot_confirm_two_bundles`,
   `one_transaction_cannot_confirm_two_singleton_votes`,
   `atomic_batch_members_still_share_one_transaction`, and
-  `an_opaque_legacy_identifier_may_repeat_across_bundles` cover one transaction
-  confirming one submission, the batch exception, and the opaque-identifier
-  boundary.
+  `an_opaque_legacy_identifier_may_repeat_across_bundles`,
+  `a_hash_journaled_for_another_bundle_cannot_be_confirmed_here`, and
+  `a_hash_journaled_for_this_submission_still_confirms` cover one transaction
+  confirming one submission, the batch exception, the opaque-identifier
+  boundary, and ownership read from the attempt journal.
+- `chain_submission::tests::a_reservation_is_stamped_after_its_blocking_validation`
+  and `the_in_flight_guard_is_released_before_the_backoff` cover the reservation
+  timestamp and the guard's lifetime.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
   covers storage-boundary hash canonicalization and idempotent replay.
 - storage migration tests cover version 18 fresh and in-place schemas, including

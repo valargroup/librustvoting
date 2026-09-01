@@ -2989,6 +2989,67 @@ fn ensure_tx_hash_belongs_to_submission(
         return conflict("another bundle");
     }
 
+    // CheckTx acceptance deliberately leaves those columns null, so a hash can
+    // be journaled against one submission and invisible above. Without this,
+    // which identity receives a confirmation would come down to whichever
+    // reconciliation ran first.
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, bundle_index, proposal_id, batch_digest
+               FROM chain_submission_attempts
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND state <> 'rejected' AND chain_tx_hash = :tx_hash",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare journal ownership query: {e}"),
+        })?;
+    let journaled = stmt
+        .query_map(
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":tx_hash": tx_hash,
+            },
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to query journal ownership: {e}"),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read journal ownership row: {e}"),
+        })?;
+    let own_digest = match proposal_id {
+        Some(proposal_id) => {
+            batch_digest_for_vote(conn, round_id, wallet_id, bundle_index, proposal_id)?
+        }
+        None => None,
+    };
+    for (kind, carrier_bundle, carrier_proposal, carrier_digest) in &journaled {
+        if *carrier_bundle != i64::from(bundle_index) {
+            return conflict("another bundle");
+        }
+        let Some(proposal_id) = proposal_id else {
+            continue;
+        };
+        if kind == "vote" && *carrier_proposal != i64::from(proposal_id) {
+            return conflict("another proposal in this bundle");
+        }
+        if kind == "vote_batch" {
+            let carrier_digest = <[u8; 32]>::try_from(carrier_digest.as_slice()).ok();
+            if own_digest.is_none() || own_digest != carrier_digest {
+                return conflict("an atomic batch in this bundle");
+            }
+        }
+    }
+
     // Within one bundle, only the members of a single atomic batch share a
     // transaction. Two singleton `cast_vote` rows never do: the event carries no
     // proposal binding, so accepting one proposal's transaction for another
