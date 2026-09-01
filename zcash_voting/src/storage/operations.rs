@@ -6496,6 +6496,67 @@ mod tests {
         queries::store_delegation_tx_hash(&db.conn(), ROUND_ID, W, 1, "legacy-hash").unwrap();
     }
 
+    #[test]
+    fn one_transaction_cannot_confirm_two_singleton_votes() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 2, 0, &[0xBB; 32])
+            .unwrap();
+        let hash = "a".repeat(64);
+        db.mark_vote_submitted(ROUND_ID, 0, 1, &hash).unwrap();
+
+        // A singleton `cast_vote` event carries no proposal binding, so
+        // accepting proposal 1's transaction for proposal 2 would mark 2
+        // confirmed on evidence that never mentioned it.
+        let error = db.mark_vote_submitted(ROUND_ID, 0, 2, &hash).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("another proposal in this bundle"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn atomic_batch_members_still_share_one_transaction() {
+        const DIGEST: [u8; 32] = [0xD7; 32];
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        for proposal_id in [1_u32, 2] {
+            db.insert_vote_fixture(ROUND_ID, 0, proposal_id, 0, &[0xAA; 32])
+                .unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE votes SET commitment_bundle_json=?4
+                      WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=?3",
+                    rusqlite::params![
+                        ROUND_ID,
+                        W,
+                        proposal_id as i64,
+                        batch_recovery_json(0, proposal_id, DIGEST)
+                    ],
+                )
+                .unwrap();
+        }
+        let hash = "a".repeat(64);
+
+        // One atomic transaction confirms every member of its own batch, so the
+        // rule above must not reach them. `mark_vote_submitted` refuses batch
+        // members outright, so this is the path the batch confirmation takes.
+        let conn = db.conn();
+        queries::record_vote_submission(&conn, ROUND_ID, W, 0, 1, &hash).unwrap();
+        queries::record_vote_submission(&conn, ROUND_ID, W, 0, 2, &hash).unwrap();
+    }
+
     fn batch_recovery_json(bundle_index: u32, proposal_id: u32, digest: [u8; 32]) -> String {
         use crate::types::EncryptedShare;
         use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};

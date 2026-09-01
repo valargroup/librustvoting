@@ -72,8 +72,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   bundle in the round already carries it. The VAN position a transaction commits
   belongs to one bundle, so a stale endpoint returning one valid hash for two
   submissions could otherwise write a position onto a bundle it never touched.
-  Atomic batches are unaffected — the rule is scoped to the bundle — and opaque
-  legacy identifiers may still repeat.
+  Within a bundle the hash may be shared only by rows whose recovery carries the
+  same atomic batch digest: a singleton `cast_vote` event has no proposal
+  binding, so two singleton proposals sharing a transaction would mark one
+  confirmed on evidence that never mentioned it. Opaque legacy identifiers may
+  still repeat.
 - The reservation heartbeat no longer waits for the database connection. It runs
   in the same task as the POST, so blocking on it stopped that task being polled
   and with it the request deadline the heartbeat exists to keep the reservation

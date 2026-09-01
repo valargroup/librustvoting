@@ -2935,20 +2935,33 @@ pub(crate) use crate::chain::canonical_tx_hash;
 ///
 /// Scoped to the bundle rather than the row, because an atomic batch legitimately
 /// records one transaction on every member of its own bundle.
-fn ensure_tx_hash_belongs_to_bundle(
+fn ensure_tx_hash_belongs_to_submission(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
+    proposal_id: Option<u32>,
     tx_hash: &str,
 ) -> Result<(), VotingError> {
     // Only a real chain transaction can confirm anything. An opaque identifier a
-    // pre-lifecycle host recorded names no transaction, so two bundles carrying
-    // the same one is a naming convention, not a contradiction.
+    // pre-lifecycle host recorded names no transaction, so two submissions
+    // carrying the same one is a naming convention, not a contradiction.
     if !crate::chain::is_tx_hash(tx_hash) {
         return Ok(());
     }
-    let claimed: bool = conn
+    let conflict = |detail: &str| {
+        Err(VotingError::InvalidInput {
+            message: format!(
+                "transaction {tx_hash} is already recorded for {detail} in round {round_id}; one transaction cannot confirm two submissions"
+            ),
+        })
+    };
+
+    // The VAN position a transaction commits belongs to one bundle, so a carrier
+    // in any other bundle is a contradiction. Cross-kind reuse inside one bundle
+    // is left to the confirmation parser, which will not accept a `delegate_vote`
+    // event for a vote identity or the reverse.
+    let foreign: bool = conn
         .query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM bundles
@@ -2972,14 +2985,93 @@ fn ensure_tx_hash_belongs_to_bundle(
         .map_err(|e| VotingError::Internal {
             message: format!("failed to check tx hash ownership: {e}"),
         })?;
-    if claimed {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "transaction {tx_hash} is already recorded for another bundle in round {round_id}; one transaction cannot confirm two submissions"
-            ),
-        });
+    if foreign {
+        return conflict("another bundle");
+    }
+
+    // Within one bundle, only the members of a single atomic batch share a
+    // transaction. Two singleton `cast_vote` rows never do: the event carries no
+    // proposal binding, so accepting one proposal's transaction for another
+    // would mark it confirmed on evidence that never mentioned it.
+    let Some(proposal_id) = proposal_id else {
+        return Ok(());
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT proposal_id FROM votes
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index = :bundle_index AND proposal_id <> :proposal_id
+                AND tx_hash = :tx_hash",
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare tx hash sibling query: {e}"),
+        })?;
+    let carriers = stmt
+        .query_map(
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+                ":tx_hash": tx_hash,
+            },
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to query tx hash siblings: {e}"),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to read tx hash sibling: {e}"),
+        })?;
+    if carriers.is_empty() {
+        return Ok(());
+    }
+    let digest = batch_digest_for_vote(conn, round_id, wallet_id, bundle_index, proposal_id)?;
+    for carrier in carriers {
+        let Ok(carrier) = u32::try_from(carrier) else {
+            return conflict("another proposal");
+        };
+        let carrier_digest =
+            batch_digest_for_vote(conn, round_id, wallet_id, bundle_index, carrier)?;
+        if digest.is_none() || digest != carrier_digest {
+            return conflict("another proposal in this bundle");
+        }
     }
     Ok(())
+}
+
+/// The atomic batch a vote row belongs to, if its recovery says it belongs to
+/// one. A row whose recovery is absent or unreadable belongs to no batch, which
+/// is the conservative answer for the sharing rule above.
+fn batch_digest_for_vote(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<Option<[u8; 32]>, VotingError> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT commitment_bundle_json FROM votes
+              WHERE round_id = :round_id AND wallet_id = :wallet_id
+                AND bundle_index = :bundle_index AND proposal_id = :proposal_id",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+            },
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load vote recovery for batch check: {e}"),
+        })?
+        .flatten();
+    Ok(json
+        .and_then(|json| crate::vote::parse_recovery(&json).ok())
+        .and_then(|recovery| recovery.batch.map(|batch| batch.digest)))
 }
 
 pub fn store_delegation_tx_hash(
@@ -2990,7 +3082,7 @@ pub fn store_delegation_tx_hash(
     tx_hash: &str,
 ) -> Result<(), VotingError> {
     let tx_hash = canonical_tx_hash(tx_hash);
-    ensure_tx_hash_belongs_to_bundle(conn, round_id, wallet_id, bundle_index, &tx_hash)?;
+    ensure_tx_hash_belongs_to_submission(conn, round_id, wallet_id, bundle_index, None, &tx_hash)?;
     let rows = conn
         .execute(
             "UPDATE bundles SET delegation_tx_hash = :tx_hash
@@ -3088,7 +3180,14 @@ pub fn record_vote_submission(
     tx_hash: &str,
 ) -> Result<(), VotingError> {
     let tx_hash = canonical_tx_hash(tx_hash);
-    ensure_tx_hash_belongs_to_bundle(conn, round_id, wallet_id, bundle_index, &tx_hash)?;
+    ensure_tx_hash_belongs_to_submission(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+        Some(proposal_id),
+        &tx_hash,
+    )?;
     ensure_vote_submission_matches_ballot_intent(
         conn,
         round_id,

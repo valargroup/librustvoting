@@ -234,8 +234,12 @@ none. The transaction may still have committed; that stays visible as
    misbehaving endpoint returning one valid hash for two submissions would
    otherwise write a position onto a bundle the transaction never touched. An
    atomic batch legitimately records one transaction on every member of its own
-   bundle, so the rule is scoped to the bundle rather than the row, and an
-   opaque identifier names no transaction so it may repeat freely.
+   bundle, and only such a batch does: within a bundle the hash may be shared
+   only by rows whose recovery carries the same batch digest, because a
+   singleton `cast_vote` event has no proposal binding and accepting one
+   proposal's transaction for another would mark it confirmed on evidence that
+   never mentioned it. A row with no readable recovery belongs to no batch. An
+   opaque identifier names no transaction, so it may repeat freely.
 8. Server-returned transaction hashes must be exactly 32 bytes encoded as 64
    hexadecimal characters and are normalized to lowercase before persistence
    or lookup. Canonicalization is enforced at the storage boundary, not only in
@@ -793,7 +797,8 @@ state transitions.
 - Is that set every non-rejected attempt carrying a hash, or one per row?
 - Can the reservation heartbeat block the request deadline it protects, on
   either the handle's mutex or SQLite's own lock?
-- Can one chain transaction confirm two bundles?
+- Can one chain transaction confirm two bundles, or two singleton proposals in
+  one bundle?
 - Can a committed failure be reported as terminal while a candidate journaled
   during the lookup may still commit?
 - Is cancellation observed by the public lookup client, not just by the
@@ -1077,9 +1082,12 @@ state transitions.
   `recovery_cleanup_still_clears_an_opaque_legacy_identifier` cover an
   unconfirmed domain hash as coverage and the opaque-identifier boundary that
   keeps it from freezing a row.
-- `storage::operations::tests::one_transaction_cannot_confirm_two_bundles` and
+- `storage::operations::tests::one_transaction_cannot_confirm_two_bundles`,
+  `one_transaction_cannot_confirm_two_singleton_votes`,
+  `atomic_batch_members_still_share_one_transaction`, and
   `an_opaque_legacy_identifier_may_repeat_across_bundles` cover one transaction
-  confirming one bundle, and the opaque-identifier boundary.
+  confirming one submission, the batch exception, and the opaque-identifier
+  boundary.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
   covers storage-boundary hash canonicalization and idempotent replay.
 - storage migration tests cover version 18 fresh and in-place schemas, including
