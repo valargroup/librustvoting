@@ -78,6 +78,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - A submission call rereads the durable state before reporting that it is still
   waiting, so a confirmation another writer applies while its POST is in flight
   is not downgraded to `OutcomeUnknown` or `Pending`.
+- The attempt reservation refuses to dispatch when a candidate for the same
+  submission already exists, checked inside its own immediate transaction. The
+  legacy recording APIs take no lifecycle lock, so one recorded between the
+  preflight and the dispatch was previously invisible and the call broadcast a
+  duplicate.
 - A terminal lookup error now ranks below every kind of evidence, not just a
   dispatched attempt: a candidate another endpoint reported pending, and one
   whose own answer was unreadable, both outrank it. `reconcile` reaches that exit

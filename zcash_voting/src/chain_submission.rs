@@ -664,7 +664,11 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // ambiguity and invite the host to treat the replacement as safe to
             // submit.
             let attempt_id = match reserve_attempt(self.db, wallet_id, identity, &digest, rebuild) {
-                Ok(attempt_id) => attempt_id,
+                Ok(Some(attempt_id)) => attempt_id,
+                // A candidate appeared between the preflight and this
+                // reservation. Report what it settles rather than adding a
+                // duplicate broadcast to a submission that already has one.
+                Ok(None) => return self.reconcile_locked(wallet_id, identity, cancel).await,
                 Err(error) => {
                     if let Some(outcome) = self.outstanding_ambiguity(
                         wallet_id,
@@ -1121,12 +1125,17 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // call's answer. `reconcile` reaches this exit directly, without the
             // submission loop's ambiguity handling around it, so the check
             // belongs here.
-            if has_live_attempt(self.db, wallet_id, identity)? {
+            // Re-read rather than trust the pre-lookup snapshot: another
+            // writer can journal a candidate while these requests are running,
+            // and it arrives `accepted`, which the live-attempt query does not
+            // match either.
+            let remaining = known_hashes(self.db, wallet_id, identity)?;
+            if !remaining.is_empty() || has_live_attempt(self.db, wallet_id, identity)? {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                    known_tx_hashes: hashes,
+                    known_tx_hashes: remaining,
                     message: format!(
-                        "an earlier attempt was dispatched without a usable response; \
-                         a candidate lookup also failed: {error}"
+                        "a candidate for this submission may still commit; \
+                         another candidate's lookup failed: {error}"
                     ),
                 });
             }
@@ -1394,7 +1403,7 @@ fn reserve_attempt(
     identity: &ChainSubmissionIdentity,
     payload_digest: &[u8; 32],
     rebuild: PayloadRebuild<'_>,
-) -> Result<i64, VotingError> {
+) -> Result<Option<i64>, VotingError> {
     let now = now_seconds()?;
     let mut conn = db.conn();
     let tx = conn
@@ -1415,6 +1424,14 @@ fn reserve_attempt(
     let rebuilt: [u8; 32] = Sha256::digest(rebuild(&tx)?).into();
     if rebuilt != *payload_digest {
         return Err(stale_generation_error());
+    }
+    // The preflight ran before this transaction. A legacy recording call takes
+    // no lifecycle lock, so a candidate it wrote in between is invisible until
+    // here — and this transaction is immediate, so such a write either landed
+    // before it and is seen now, or waits for it. Dispatching anyway would
+    // broadcast a duplicate for a submission already known to have one.
+    if !known_hashes_with_conn(&tx, wallet_id, identity)?.is_empty() {
+        return Ok(None);
     }
     tx.execute(
         "INSERT INTO chain_submission_attempts
@@ -1437,7 +1454,7 @@ fn reserve_attempt(
     let id = tx.last_insert_rowid();
     tx.commit()
         .map_err(internal("commit chain attempt reservation"))?;
-    Ok(id)
+    Ok(Some(id))
 }
 
 /// How often an outstanding reservation refreshes its `updated_at`.
@@ -1676,10 +1693,22 @@ fn known_hashes(
     wallet_id: &str,
     identity: &ChainSubmissionIdentity,
 ) -> Result<Vec<String>, VotingError> {
-    let conn = db.conn();
+    known_hashes_with_conn(&db.conn(), wallet_id, identity)
+}
+
+/// [`known_hashes`] against a caller-held connection.
+///
+/// The reservation needs this inside its own transaction: a legacy recording
+/// call does not take the lifecycle's operation lock, so only SQLite's own
+/// serialization can order it against the dispatch gate.
+fn known_hashes_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    identity: &ChainSubmissionIdentity,
+) -> Result<Vec<String>, VotingError> {
     let mut candidates = match identity.kind {
         ChainSubmissionKind::Delegation => queries::get_delegation_tx_hash(
-            &conn,
+            conn,
             &identity.round_id,
             wallet_id,
             identity.bundle_index,
@@ -1687,7 +1716,7 @@ fn known_hashes(
         .into_iter()
         .collect(),
         ChainSubmissionKind::Vote => queries::get_vote_tx_hash(
-            &conn,
+            conn,
             &identity.round_id,
             wallet_id,
             identity.bundle_index,
@@ -1697,7 +1726,7 @@ fn known_hashes(
         .collect(),
         ChainSubmissionKind::VoteBatch => {
             let recoveries = match vote::load_vote_batch_recoveries_with_conn(
-                &conn,
+                conn,
                 wallet_id,
                 &identity.round_id,
                 identity.bundle_index,
@@ -1714,7 +1743,7 @@ fn known_hashes(
             let mut hashes = Vec::new();
             for recovery in recoveries {
                 if let Some(hash) = queries::get_vote_tx_hash(
-                    &conn,
+                    conn,
                     &identity.round_id,
                     wallet_id,
                     identity.bundle_index,
@@ -5183,7 +5212,7 @@ mod tests {
         // about this call's earlier attempt, whose transaction may still commit.
         assert!(
             matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
-                if message.contains("dispatched without a usable response")),
+                if message.contains("may still commit")),
             "got {outcome:?}"
         );
         drop(db);
@@ -5315,7 +5344,7 @@ mod tests {
         // transaction may still commit.
         assert!(
             matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
-                if message.contains("dispatched without a usable response")),
+                if message.contains("may still commit")),
             "got {outcome:?}"
         );
         drop(db);
@@ -5796,6 +5825,116 @@ mod tests {
             ChainLifecycleOutcome::AlreadyConfirmed {
                 tx_hash: TX_HASH.to_string()
             }
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_candidate_recorded_before_the_reservation_stops_the_dispatch() {
+        let db = test_db();
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+        // A legacy recording call takes no lifecycle lock, so it can land after
+        // the preflight. The reservation transaction is immediate, so such a
+        // write either committed before it and is seen here, or waits for it.
+        queries::store_delegation_tx_hash(&db.conn(), ROUND_ID, WALLET, 0, TX_HASH).unwrap();
+
+        let reserved = reserve_attempt(
+            &db,
+            WALLET,
+            &identity,
+            &Sha256::digest(b"{}").into(),
+            &echo_rebuild,
+        )
+        .unwrap();
+
+        // Reserving would commit this call to a duplicate broadcast for a
+        // submission already known to have a transaction outstanding.
+        assert_eq!(reserved, None);
+        let journaled: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chain_submission_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(journaled, 0);
+    }
+
+    #[tokio::test]
+    async fn a_candidate_journaled_during_a_failing_lookup_outranks_its_error() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_error_race_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+
+        /// Journals a second candidate while the first one's lookup runs.
+        struct JournalDuringFailingLookup {
+            inner: MockTransport,
+            db_path: String,
+            done: Mutex<bool>,
+        }
+        impl ChainTransport for JournalDuringFailingLookup {
+            fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
+                {
+                    let mut done = self.done.lock().unwrap();
+                    if !*done {
+                        *done = true;
+                        let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+                        conn.execute(
+                            "INSERT INTO chain_submission_attempts
+                             (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                              payload_digest, chain_tx_hash, state, created_at, updated_at)
+                             VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                            rusqlite::params![ROUND_ID, WALLET, vec![0xEE_u8; 32], TX_HASH_2],
+                        )
+                        .unwrap();
+                    }
+                }
+                self.inner.get(url, timeout)
+            }
+            fn post_json<'a>(
+                &'a self,
+                url: &'a str,
+                body: Vec<u8>,
+                timeout: Duration,
+            ) -> ChainFuture<'a> {
+                self.inner.post_json(url, body, timeout)
+            }
+        }
+
+        let inner = MockTransport::default();
+        inner
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(response(401, r#"{"message":"unauthorized"}"#)));
+        let client = ChainClient::new(
+            Arc::new(JournalDuringFailingLookup {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                done: Mutex::new(false),
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // The candidate arrived `accepted`, which the live-attempt query does
+        // not match, and the pre-lookup snapshot predates it. Returning the
+        // error would end recovery for a transaction that may still commit.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
+                if known_tx_hashes.contains(&TX_HASH_2.to_string())),
+            "got {outcome:?}"
         );
         drop(db);
         let _ = std::fs::remove_file(&path);

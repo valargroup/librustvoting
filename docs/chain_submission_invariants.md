@@ -253,7 +253,12 @@ none. The transaction may still have committed; that stays visible as
 5. The response classification is persisted before another attempt begins, and
    the reconciliation between attempts applies the same dispatch gate as the
    preflight. A candidate that another writer records mid-call therefore stops
-   further broadcasts, not only a confirmation.
+   further broadcasts, not only a confirmation. The reservation applies the same
+   gate inside its own immediate transaction, which is what covers the window
+   between the preflight and the first dispatch: the legacy recording APIs take
+   no lifecycle lock, so only SQLite's own serialization orders one of their
+   writes against this one. A candidate found there means the call reports what
+   reconciliation settles rather than adding a duplicate broadcast.
 6. Repeated byte-identical attempts share a payload digest but remain distinct
    ordered attempts. A re-signed payload has a different digest.
 7. Accepted chain hashes and all earlier unknown attempts remain available for
@@ -484,9 +489,11 @@ hosts do not parse the log.
    A lookup that could not be completed is an absence of evidence, not evidence
    of absence, so it ranks below everything that is evidence: a candidate
    another endpoint reported pending, one whose own answer was unreadable, and a
-   dispatched attempt still awaiting a response. `reconcile` reaches that exit
-   directly, without the submission loop's ambiguity handling around it, so the
-   rule is applied there. Either confirmed outcome —
+   dispatched attempt still awaiting a response. The candidate set is re-read
+   there rather than taken from the snapshot the lookups began with, because
+   another writer can journal one while they run and it arrives `accepted`.
+   `reconcile` reaches that exit directly, without the submission loop's
+   ambiguity handling around it, so the rule is applied there. Either confirmed outcome —
    freshly parsed or durable — is proof of success on this path.
 4. No successful known candidate returns `AlreadySpentUnresolved` and
    preserves all attempts and recovery material. That outcome asserts the known
@@ -842,7 +849,9 @@ state transitions.
 - Is any event-derived value synthesized from a shared mutable pointer?
 - Does a hashless dispatched attempt survive as ambiguity across calls?
 - Is a definitely pre-dispatch failure ever recorded as ambiguity?
-- Does a candidate recorded mid-call stop the remaining retries?
+- Does a candidate recorded mid-call stop the remaining retries, and one
+  recorded between the preflight and the first dispatch stop that dispatch?
+- Are candidates re-read before a terminal lookup error is propagated?
 - Can an unusable 404 be accepted as protocol evidence?
 - Is a recovered payload bound to the storage row it was journaled against?
 - Can late cancellation replace a completed request result?
@@ -993,6 +1002,8 @@ state transitions.
   `a_successful_candidate_survives_a_terminal_lookup_error`,
   `a_terminal_lookup_error_does_not_downgrade_durable_ambiguity`,
   `a_pending_candidate_outranks_another_candidates_lookup_error`,
+  `a_candidate_journaled_during_a_failing_lookup_outranks_its_error`,
+  `a_candidate_recorded_before_the_reservation_stops_the_dispatch`,
   `a_confirmation_applied_during_the_final_post_is_not_downgraded`,
   `adopting_a_success_still_retires_the_failed_candidates`, and
   `a_spent_nullifier_response_accepts_a_durable_confirmation` cover the
