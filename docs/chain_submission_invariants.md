@@ -482,9 +482,11 @@ hosts do not parse the log.
    returned, so it cannot discard a candidate that already committed; it is
    reported only when no candidate succeeded and nothing else may still commit.
    A lookup that could not be completed is an absence of evidence, not evidence
-   of absence, so a dispatched attempt still awaiting a usable response outranks
-   it. `reconcile` reaches that exit directly, without the submission loop's
-   ambiguity handling around it, so the rule is applied there. Either confirmed outcome —
+   of absence, so it ranks below everything that is evidence: a candidate
+   another endpoint reported pending, one whose own answer was unreadable, and a
+   dispatched attempt still awaiting a response. `reconcile` reaches that exit
+   directly, without the submission loop's ambiguity handling around it, so the
+   rule is applied there. Either confirmed outcome —
    freshly parsed or durable — is proof of success on this path.
 4. No successful known candidate returns `AlreadySpentUnresolved` and
    preserves all attempts and recovery material. That outcome asserts the known
@@ -549,7 +551,9 @@ hosts do not parse the log.
    pending, or rejection: a lagging 404 would otherwise report `Pending`, and a
    different candidate's committed failure would report `Rejected`, for a
    submission that is now durably confirmed. Candidates proved failed are still
-   retired on that path.
+   retired on that path. A submission call applies the same rule to its own
+   "still waiting" answers, once where they leave the attempt loop, because a
+   POST can be in flight while another writer confirms.
 10. Adopting a candidate this lookup proved committed clears any *different*
    unconfirmed hash in the domain column for that submission, inside the
    confirmation transaction and after the event validation. The domain writers
@@ -825,7 +829,10 @@ state transitions.
 - Can a durable confirmation be downgraded by a later lookup, or missed by the
   spent-nullifier path?
 - Can a terminal lookup error on one candidate discard another that committed,
-  or a dispatched attempt that may still commit?
+  another that is merely pending or unreadable, or a dispatched attempt that may
+  still commit?
+- Does a submission call reread the durable state before reporting that it is
+  still waiting?
 - Is every failed candidate retired, including when a success is adopted in the
   same lookup?
 - Can a vote's recovery generation be replaced while an attempt covers it?
@@ -985,6 +992,8 @@ state transitions.
   `every_committed_failure_candidate_is_retired`,
   `a_successful_candidate_survives_a_terminal_lookup_error`,
   `a_terminal_lookup_error_does_not_downgrade_durable_ambiguity`,
+  `a_pending_candidate_outranks_another_candidates_lookup_error`,
+  `a_confirmation_applied_during_the_final_post_is_not_downgraded`,
   `adopting_a_success_still_retires_the_failed_candidates`, and
   `a_spent_nullifier_response_accepts_a_durable_confirmation` cover the
   reconciliation precedence and retirement rules.

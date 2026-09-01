@@ -552,6 +552,22 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             )
             .await
         {
+            // A durable confirmation another writer applied while this call was
+            // in flight outranks every "still waiting" answer the loop can
+            // reach, and there are several of those. Checked once here rather
+            // than at each, for the same reason the ambiguity handling below is.
+            Ok(outcome)
+                if matches!(
+                    outcome,
+                    ChainLifecycleOutcome::OutcomeUnknown { .. }
+                        | ChainLifecycleOutcome::Pending { .. }
+                ) =>
+            {
+                match durable_confirmation_hash(self.db, wallet_id, &identity)? {
+                    Some(tx_hash) => Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash }),
+                    None => Ok(outcome),
+                }
+            }
             Ok(outcome) => Ok(outcome),
             // The exception: this one already carries the accepted hash, which
             // is the only handle on a transaction in the mempool and strictly
@@ -905,6 +921,14 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             }
         }
 
+        // Another writer can apply the confirmation while this call's last POST
+        // is in flight. The lookup path rereads the durable state before
+        // reporting anything weaker; this exit has to as well, or a completed
+        // submission is handed back as unresolved and the host keeps recovering
+        // it.
+        if let Some(tx_hash) = durable_confirmation_hash(self.db, wallet_id, identity)? {
+            return Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash });
+        }
         Ok(ChainLifecycleOutcome::OutcomeUnknown {
             known_tx_hashes: known_hashes(self.db, wallet_id, identity)?,
             message: last_unknown
@@ -928,7 +952,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         // evidence there is, and it is durable. Re-querying the network could
         // only weaken it: a lagging or pruned endpoint answering 404 would
         // report a completed submission as indefinitely uncommitted.
-        if let Some(tx_hash) = durable_confirmation_hash(self.db, wallet_id, identity)? {
+        let durable = durable_confirmation_hash(self.db, wallet_id, identity)?;
+        // That read waits on the database mutex, and everything below it
+        // classifies the submission. One check here covers the whole chain.
+        if cancel() {
+            return Ok(ChainLifecycleOutcome::Cancelled);
+        }
+        if let Some(tx_hash) = durable {
             return Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash });
         }
         let hashes = known_hashes(self.db, wallet_id, identity)?;
@@ -1071,23 +1101,6 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         if let Some(tx_hash) = durable_confirmation_hash(self.db, wallet_id, identity)? {
             return Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash });
         }
-        if let Some(error) = terminal_error {
-            // A lookup that could not be completed is an absence of evidence,
-            // not evidence of absence, so it must not outrank a dispatched
-            // request that may still commit. `reconcile` reaches this exit
-            // directly, without the submission loop's ambiguity handling around
-            // it, so the check belongs here.
-            if has_live_attempt(self.db, wallet_id, identity)? {
-                return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                    known_tx_hashes: hashes,
-                    message: format!(
-                        "an earlier attempt was dispatched without a usable response; \
-                         a candidate lookup also failed: {error}"
-                    ),
-                });
-            }
-            return Err(error.into());
-        }
         if let Some(message) = unresolved {
             return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                 known_tx_hashes: hashes,
@@ -1098,6 +1111,26 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             return Ok(ChainLifecycleOutcome::Pending {
                 known_tx_hashes: hashes,
             });
+        }
+        if let Some(error) = terminal_error {
+            // A lookup that could not be completed is an absence of evidence,
+            // not evidence of absence, so it ranks below everything that is
+            // evidence: a candidate another endpoint reported pending, one whose
+            // own answer was unreadable, and a dispatched attempt still awaiting
+            // a response. Only when nothing may still commit is the error this
+            // call's answer. `reconcile` reaches this exit directly, without the
+            // submission loop's ambiguity handling around it, so the check
+            // belongs here.
+            if has_live_attempt(self.db, wallet_id, identity)? {
+                return Ok(ChainLifecycleOutcome::OutcomeUnknown {
+                    known_tx_hashes: hashes,
+                    message: format!(
+                        "an earlier attempt was dispatched without a usable response; \
+                         a candidate lookup also failed: {error}"
+                    ),
+                });
+            }
+            return Err(error.into());
         }
         if !committed_failures.is_empty() {
             // These rejections are definite only for the candidates they name.
@@ -4140,9 +4173,12 @@ mod tests {
         let db = test_db();
         {
             let conn = db.conn();
-            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 4242, 1, &[0xCC; 32]).unwrap();
         }
         const ATTEMPT_ID: i64 = 9_000_001;
+        // A proposal id no other test uses: the in-flight registry is
+        // process-global, so two tests sharing an identity would see each
+        // other's registrations.
         // Timestamps that look older than the grace period. A forward step of
         // the system clock while the POST is in flight produces exactly this:
         // the row is untouched, but "now" has moved past its deadline.
@@ -4152,12 +4188,12 @@ mod tests {
                 "INSERT INTO chain_submission_attempts
                  (id, round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
                   payload_digest, state, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'vote', 0, 3, X'', ?4, 'attempting', ?5, ?5)",
+                 VALUES (?1, ?2, ?3, 'vote', 0, 4242, X'', ?4, 'attempting', ?5, ?5)",
                 rusqlite::params![ATTEMPT_ID, ROUND_ID, WALLET, vec![0xCC_u8; 32], ancient],
             )
             .unwrap();
 
-        let identity = ChainSubmissionIdentity::vote(ROUND_ID, 0, 3);
+        let identity = ChainSubmissionIdentity::vote(ROUND_ID, 0, 4242);
         let in_flight = InFlightAttempt::register(WALLET, &identity);
         let covered = {
             let conn = db.conn();
@@ -4167,7 +4203,7 @@ mod tests {
         // process knows it is waiting on the response, so the recovery that
         // response would be confirmed against must not become erasable just
         // because the clock moved.
-        assert!(covered.contains(&(0, 3)), "{covered:?}");
+        assert!(covered.contains(&(0, 4242)), "{covered:?}");
 
         drop(in_flight);
         let after = {
@@ -4176,7 +4212,7 @@ mod tests {
         };
         // Once nothing is waiting on it, the stale reservation is an
         // interrupted one and stops covering.
-        assert!(after.is_empty(), "{after:?}");
+        assert!(!after.contains(&(0, 4242)), "{after:?}");
     }
 
     #[tokio::test]
@@ -5646,5 +5682,122 @@ mod tests {
 
         // The same set `known_hashes` reconciles.
         assert_eq!(candidates, vec![TX_HASH.to_string(), TX_HASH_2.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_pending_candidate_outranks_another_candidates_lookup_error() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        journal_attempt(&db, "accepted", Some(TX_HASH_2));
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            // One candidate cannot be looked up at all...
+            Ok(response(401, r#"{"message":"unauthorized"}"#)),
+            // ...while the other is genuinely not yet committed.
+            Ok(response(404, r#"{"detail":"not found"}"#)),
+        ]);
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // Failing to learn about one candidate says nothing about the other,
+        // which may still commit. Reporting the error would end the host's
+        // recovery for a submission that is merely waiting.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::Pending { known_tx_hashes }
+                if known_tx_hashes.contains(&TX_HASH_2.to_string())),
+            "got {outcome:?}"
+        );
+    }
+
+    /// Applies a durable confirmation while the final POST is in flight.
+    struct ConfirmDuringPostTransport {
+        inner: MockTransport,
+        db_path: String,
+        done: Mutex<bool>,
+    }
+
+    impl ChainTransport for ConfirmDuringPostTransport {
+        fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
+            self.inner.get(url, timeout)
+        }
+
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            body: Vec<u8>,
+            timeout: Duration,
+        ) -> ChainFuture<'a> {
+            {
+                let mut done = self.done.lock().unwrap();
+                if !*done {
+                    *done = true;
+                    let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+                    conn.execute(
+                        "UPDATE bundles SET delegation_tx_hash=?3, van_leaf_position=5
+                          WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                        rusqlite::params![ROUND_ID, WALLET, TX_HASH],
+                    )
+                    .unwrap();
+                }
+            }
+            self.inner.post_json(url, body, timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_applied_during_the_final_post_is_not_downgraded() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_final_post_confirm_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        let inner = MockTransport::default();
+        // The only attempt ends ambiguously.
+        inner
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Err(ChainTransportError::Timeout));
+        let client = ChainClient::with_config(
+            Arc::new(ConfirmDuringPostTransport {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                done: Mutex::new(false),
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            ChainClientConfig::default()
+                .with_retry_delays(vec![])
+                .unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // The lookup path rereads durable state before reporting anything
+        // weaker; this exit has to as well, or a completed submission is handed
+        // back as unresolved and the host keeps recovering it.
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::AlreadyConfirmed {
+                tx_hash: TX_HASH.to_string()
+            }
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -73,9 +73,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   and with it the request deadline the heartbeat exists to keep the reservation
   inside; a contended refresh is skipped.
 - Cancellation is rechecked after the candidate set is rebuilt following
-  retirement, before the submission is classified.
-- A terminal lookup error no longer replaces the ambiguity of an attempt that
-  was dispatched without a usable response. `reconcile` reaches that exit
+  retirement and after the durable-confirmation reread, before the submission is
+  classified.
+- A submission call rereads the durable state before reporting that it is still
+  waiting, so a confirmation another writer applies while its POST is in flight
+  is not downgraded to `OutcomeUnknown` or `Pending`.
+- A terminal lookup error now ranks below every kind of evidence, not just a
+  dispatched attempt: a candidate another endpoint reported pending, and one
+  whose own answer was unreadable, both outrank it. `reconcile` reaches that exit
   directly, so the submission loop's ambiguity handling could not repair it.
 - Reconciliation no longer reports a committed failure as terminal while a
   candidate journaled during the lookup may still commit, and the candidate list
