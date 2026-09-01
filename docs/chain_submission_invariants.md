@@ -7,6 +7,10 @@ This document records the vote-chain submission invariants implemented by
 delegation, singleton vote, atomic vote-batch, transaction lookup, durable
 submission attempts, confirmation, and recovery.
 
+**Endpoints are treated as trusted by-design.** The lifecycle validates
+response syntax and submission-specific event bindings, but it does not
+independently prove transaction inclusion or establish endpoint consensus.
+
 The implementation is authoritative. A change to an invariant below SHOULD
 update this document and the named regression tests in the same pull request.
 
