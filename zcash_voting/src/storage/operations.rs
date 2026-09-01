@@ -6365,6 +6365,51 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn opening_a_handle_keeps_another_process_reservation_in_flight() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_other_process_attempt_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = VotingDb::open(path.to_str().unwrap()).unwrap();
+        db.set_wallet_id(W);
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        // Journaled long before this process opened anything, so the epoch guard
+        // alone would downgrade it — but touched seconds ago, which is what a
+        // POST another process still has in flight looks like.
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, 1, X'', ?3, 'attempting', 1, ?4)",
+                rusqlite::params![ROUND_ID, W, vec![0xDD_u8; 32], now],
+            )
+            .unwrap();
+
+        let second = VotingDb::open(path.to_str().unwrap()).unwrap();
+        second.set_wallet_id(W);
+
+        let state: String = db
+            .conn()
+            .query_row("SELECT state FROM chain_submission_attempts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "attempting");
+        drop(second);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn batch_recovery_json(bundle_index: u32, proposal_id: u32, digest: [u8; 32]) -> String {
         use crate::types::EncryptedShare;
         use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};

@@ -34,18 +34,26 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   such an attempt protects nothing, and nothing ever retires one; their
   ambiguity is still reported as `OutcomeUnknown`. Delegation attempts keep
   protecting `van_comm_rand` unconditionally.
-- Opening the database records as `outcome_unknown` any `attempting` reservation
-  journaled before this process first opened one, making the documented
-  interruption transition durable without changing what the attempt is evidence
-  of. Reservations this process could still be waiting on are left alone, so a
-  second handle on the same file cannot strip an in-flight POST's coverage.
+- Opening the database records as `outcome_unknown` an `attempting` reservation
+  only when it both predates this process's first open and has gone untouched
+  for longer than any POST can take, making the documented interruption
+  transition durable without changing what the attempt is evidence of. A
+  reservation this process could still be waiting on, or that another process
+  may still have in flight, is left alone, so neither a second handle nor a
+  second process can strip an in-flight POST's coverage.
+- A chain submission attempt's own definite rejection or non-retryable transport
+  failure no longer reports a terminal outcome while a known candidate for the
+  same submission is still outstanding. A candidate another writer recorded
+  while the POST was in flight is `accepted`, which the live-attempt query does
+  not match, so the call could previously return `Rejected` for a submission
+  whose other transaction might still commit.
 - `normalize_tx_hash` no longer trims surrounding whitespace, so the client and
   the storage boundary share one exact definition of a transaction hash.
 - A recovered vote payload, singleton or atomic-batch member, is now validated
   against the storage row it was loaded from before it can be serialized or
   dispatched.
-- Replacing a vote's recovery generation is refused while a non-rejected chain
-  submission attempt covers its row.
+- Replacing a vote's recovery generation is refused while a chain submission
+  attempt that can still be confirmed covers its row.
 - `ChainLifecycleOutcome::AlreadyConfirmed` reports a submission confirmed by an
   earlier call. It carries only the transaction hash, because an earlier
   transaction's VAN position is not recoverable from the bundle's shared

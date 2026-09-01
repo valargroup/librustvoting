@@ -532,6 +532,25 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                             log: result.log,
                         });
                     }
+                    // A candidate hash another writer recorded — a concurrent
+                    // operation's `accepted` attempt, or a legacy domain hash —
+                    // may still commit, and `has_live_attempt` cannot see it:
+                    // `accepted` is neither `attempting` nor `outcome_unknown`.
+                    // Settle it on the network before reporting a rejection that
+                    // is definite only for this attempt's own payload.
+                    if !known_hashes(self.db, wallet_id, &identity)?.is_empty() {
+                        let reconciled =
+                            self.reconcile_locked(wallet_id, &identity, cancel).await?;
+                        // `Cancelled` is excluded deliberately: cancellation
+                        // observed after this broadcast completed must not
+                        // replace its result, and the checks below still have to
+                        // classify it.
+                        if !matches!(reconciled, ChainLifecycleOutcome::Cancelled)
+                            && blocks_further_dispatch(&reconciled)
+                        {
+                            return Ok(reconciled);
+                        }
+                    }
                     // A rejection is definite only for the attempt that
                     // received it. If an earlier attempt in this call may still
                     // commit, reporting a terminal rejection would let the host
@@ -578,10 +597,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     }
                     if !error.is_retryable() || attempt_index + 1 == attempts {
                         // As above: a definite failure here cannot disprove an
-                        // earlier attempt that may still commit.
+                        // earlier attempt that may still commit, and a candidate
+                        // another writer recorded is such an attempt even though
+                        // `has_live_attempt` cannot see its `accepted` state.
                         if error.is_ambiguous()
                             || last_unknown.is_some()
                             || has_live_attempt(self.db, wallet_id, &identity)?
+                            || !known_hashes(self.db, wallet_id, &identity)?.is_empty()
                         {
                             let message = match &last_unknown {
                                 Some(earlier) => format!(
@@ -1307,6 +1329,18 @@ fn known_hashes(
 /// `AlreadySpentUnresolved` if a replacement is later refused on chain.
 pub(crate) const CAN_STILL_LEARN_A_HASH: &str = "(chain_tx_hash IS NOT NULL OR state='attempting')";
 
+/// How long a reservation may go untouched before no process can still be
+/// waiting on it.
+///
+/// A row is `attempting` only between its reservation and the response
+/// classification that follows its POST, so it is bounded by that call's request
+/// deadline. Ten minutes is far beyond any workable deadline — the SDK default is
+/// ten seconds — while keeping the freeze a crashed reservation causes bounded by
+/// minutes rather than by the life of the round. A host that configures a request
+/// timeout above this loses only the cross-process half of the guard; the
+/// [`process_open_epoch`] half is exact and unaffected.
+const INTERRUPTED_RESERVATION_GRACE_SECS: i64 = 600;
+
 /// When this process first opened a voting database.
 ///
 /// Every reservation this process could still be waiting on was journaled after
@@ -1333,12 +1367,20 @@ fn process_open_epoch() -> Result<i64, VotingError> {
 /// durable instead of merely descriptive, and stops the reservation from
 /// conferring [`CAN_STILL_LEARN_A_HASH`] coverage forever.
 ///
-/// Scoped to [`process_open_epoch`] rather than to every `attempting` row,
-/// because opening a database is not the same as being the only handle on it. A
-/// host that opens a second [`VotingDb`] on the same file while a POST is in
-/// flight would otherwise strip that POST's coverage, and the response could
-/// then attach its hash and event positions to a generation replaced in the
-/// window it opened.
+/// Two conditions must both hold, because opening a database is not the same as
+/// being the only handle on it. A host that opens a second [`VotingDb`], or runs
+/// a second process, while a POST is in flight must not strip that POST's
+/// coverage: its response could then attach a hash and event positions to a
+/// generation replaced in the window the downgrade opened.
+///
+/// - [`process_open_epoch`] excludes every reservation this process could still
+///   be waiting on. This is exact, and it is what protects a second handle in
+///   the same process.
+/// - [`INTERRUPTED_RESERVATION_GRACE_SECS`] excludes any reservation recent
+///   enough to still be in flight anywhere, which is what protects another
+///   process. A reservation is `attempting` only between [`reserve_attempt`] and
+///   the [`mark_attempt`] that classifies its response, so it cannot outlive its
+///   own request deadline by more than scheduling slop.
 ///
 /// Evidence is unchanged by the downgrade: both states mean the same thing to
 /// [`has_live_attempt`], [`known_hashes`], and every candidate query.
@@ -1349,8 +1391,14 @@ pub(crate) fn mark_interrupted_attempts_unknown(
     conn.execute(
         "UPDATE chain_submission_attempts
             SET state='outcome_unknown', updated_at=:now
-          WHERE state='attempting' AND created_at < :epoch",
-        named_params! { ":now": now, ":epoch": process_open_epoch()? },
+          WHERE state='attempting'
+            AND created_at < :epoch
+            AND updated_at < :stale_before",
+        named_params! {
+            ":now": now,
+            ":epoch": process_open_epoch()?,
+            ":stale_before": now.saturating_sub(INTERRUPTED_RESERVATION_GRACE_SECS),
+        },
     )
     .map(|_| ())
     .map_err(internal("downgrade interrupted chain attempt reservations"))
@@ -1653,8 +1701,16 @@ mod tests {
         Ok(b"{}".to_vec())
     }
 
+    fn file_test_db(path: &str) -> VotingDb {
+        let db = VotingDb::open(path).unwrap();
+        init_test_db(db)
+    }
+
     fn test_db() -> VotingDb {
-        let db = VotingDb::open_in_memory().unwrap();
+        init_test_db(VotingDb::open_in_memory().unwrap())
+    }
+
+    fn init_test_db(db: VotingDb) -> VotingDb {
         db.set_wallet_id("wallet-1");
         db.create_round(
             Network::Testnet,
@@ -3118,5 +3174,100 @@ mod tests {
             attempt_protected_vote_rows(&conn, ROUND_ID, WALLET).unwrap()
         };
         assert!(protected.contains(&(0, 3)), "{protected:?}");
+    }
+
+    /// A transport that lets another writer record a candidate between this
+    /// call's preflight and its response, the way a second operation or a
+    /// legacy recording call would.
+    struct RacingTransport {
+        inner: MockTransport,
+        db_path: String,
+        raced: Mutex<bool>,
+    }
+
+    impl ChainTransport for RacingTransport {
+        fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
+            self.inner.get(url, timeout)
+        }
+
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            body: Vec<u8>,
+            timeout: Duration,
+        ) -> ChainFuture<'a> {
+            {
+                let mut raced = self.raced.lock().unwrap();
+                if !*raced {
+                    *raced = true;
+                    let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+                    conn.execute(
+                        "INSERT INTO chain_submission_attempts
+                         (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                          payload_digest, chain_tx_hash, state, created_at, updated_at)
+                         VALUES (?1, ?2, 'vote', 0, 3, X'', ?3, ?4, 'accepted', 1, 1)",
+                        rusqlite::params![ROUND_ID, WALLET, vec![0xEE_u8; 32], TX_HASH_2],
+                    )
+                    .unwrap();
+                }
+            }
+            self.inner.post_json(url, body, timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_candidate_recorded_mid_call_is_not_overridden_by_a_rejection() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_racing_candidate_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        {
+            let conn = db.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+        }
+
+        let inner = MockTransport::default();
+        // This attempt's own definite rejection, then the racing candidate's
+        // lookup answering "not yet committed".
+        inner.responses.lock().unwrap().push_back(Ok(response(
+            422,
+            r#"{"tx_hash":"","code":7,"log":"invalid proof"}"#,
+        )));
+        inner
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(response(404, r#"{"detail":"not found"}"#)));
+        let transport = Arc::new(RacingTransport {
+            inner,
+            db_path: path.to_str().unwrap().to_string(),
+            raced: Mutex::new(false),
+        });
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::vote(ROUND_ID, 0, 3);
+
+        let outcome = lifecycle
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false)
+            .await
+            .unwrap();
+
+        // The candidate is `accepted`, which is neither `attempting` nor
+        // `outcome_unknown`, so `has_live_attempt` cannot see it. Reporting this
+        // attempt's rejection as terminal would tell the host the vote cannot
+        // land while another transaction for the same identity is still pending.
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::Pending {
+                known_tx_hashes: vec![TX_HASH_2.to_string()],
+            }
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }
