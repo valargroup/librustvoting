@@ -105,6 +105,32 @@ leave one behind with no hash. Such an attempt keeps the submission
 candidate's committed failure can be reported as terminal while it remains. A definitely pre-dispatch failure creates no such evidence, because
 its reservation is removed, and neither does a rejected attempt.
 
+Reporting that ambiguity is separate from **covering** the durable material an
+attempt would be confirmed against. Coverage exists to protect confirmation, and
+confirmation needs a chain transaction hash: the candidate set is the only route
+to the transaction-status endpoint, and this SDK deliberately cannot predict a
+hash or locate a transaction from its commitment. An attempt that has no hash and
+can no longer be given one therefore protects nothing, while its row is one
+nothing ever retires — no lookup can reach it and no rejection names it — so
+treating it as coverage would freeze that proposal's recovery generation, ballot
+intent, and bundle pruning for the life of the round.
+
+`attempting` is the one hashless state that may still learn a hash, because a
+POST dispatched by this process can still return one, and the covered rows are
+exactly what that response would be applied to. A reservation found in that state
+when the database is opened belongs to a process that died between the
+reservation and its response, so opening the database records it as
+`outcome_unknown`: this makes "a process interruption leaves it outcome-unknown"
+durable rather than merely descriptive. Evidence is unchanged by that downgrade —
+both states mean the same thing to every candidate and live-attempt query.
+
+Dropping coverage cannot produce the mismatch the cleanup guards exist to
+prevent. Attaching a transaction's hash and event-derived positions to a
+generation it did not witness requires that hash, and a hashless attempt has
+none. The transaction may still have committed; that stays visible as
+`OutcomeUnknown`, and a replacement the chain later refuses surfaces as
+`AlreadySpentUnresolved` rather than as success.
+
 ## Typed identity and payload invariants
 
 1. The supported mutations are delegation, singleton cast-vote, and atomic
@@ -183,29 +209,36 @@ its reservation is removed, and neither does a rejected attempt.
    confirmation position, so retirement can only remove a hash this
    reconciliation just proved failed.
 8. Routine session reset and recovery cleanup do not delete chain submission
-   attempts, and they do not erase material an attempt still covers. Coverage
-   is scoped to the exact attempted submission: a singleton attempt covers its
-   own proposal row, and a batch attempt covers exactly the rows whose recovery
-   carries that batch digest. A row whose recovery cannot be read is covered
-   conservatively while its bundle has any batch attempt. `rejected` attempts
-   confer no coverage; nothing deletes those rows, so treating them as coverage
-   would freeze a proposal's recovery state permanently.
-9. Replacing a vote's recovery generation while a non-rejected attempt covers
-    its row is refused inside the vote persistence transaction. Re-preparing the
-    same choice with different parameters does not go through ballot intent, so
+   attempts, and they do not erase material a **covering** attempt needs.
+   Coverage is scoped to the exact attempted submission: a singleton attempt
+   covers its own proposal row, and a batch attempt covers exactly the rows
+   whose recovery carries that batch digest. A row whose recovery cannot be read
+   is covered conservatively while its bundle has any covering batch attempt.
+   Two kinds of attempt confer no coverage, because neither can ever be
+   confirmed and nothing ever deletes either row, so treating them as coverage
+   would freeze a proposal's recovery state permanently: `rejected` attempts,
+   whose rejection is definite for themselves, and attempts with no chain
+   transaction hash that can no longer learn one — every state but `attempting`.
+9. Replacing a vote's recovery generation while a covering attempt names its row
+    is refused inside the vote persistence transaction. Re-preparing the same
+    choice with different parameters does not go through ballot intent, so
     that guard alone cannot see it; without this the lifecycle could dispatch
     stale bytes and a later confirmation could attach the stale transaction's
     hash and positions to the replacement. Rewriting the identical generation
     stays idempotent.
-10. A ballot-intent change that would erase material covered by a non-rejected
-    attempt is refused. CheckTx acceptance deliberately leaves the legacy vote
+10. A ballot-intent change that would erase material a covering attempt needs is
+    refused. CheckTx acceptance deliberately leaves the legacy vote
    column null, so the attempt journal is the only evidence that a dispatched
    vote may still commit. Re-selecting the same choice is never refused.
-11. Partial bundle deletion is refused while any bundle in the pruned range has
-    a non-rejected attempt. An attempt references its round, not its bundle, so
-    pruning would cascade away the bundle, vote, proof, and recovery rows a
-    transaction that later commits needs, while leaving its journal evidence
-    behind. Attempts for pruned bundles are removed with them.
+11. Partial bundle deletion is refused while any bundle in the pruned range has a
+    non-rejected delegation attempt, or a vote or batch attempt that can still be
+    confirmed. An attempt references its round, not its bundle, so pruning would
+    cascade away the bundle, vote, proof, and recovery rows a transaction that
+    later commits needs, while leaving its journal evidence behind. Delegation is
+    the one kind barred whatever its evidence: pruning cascades away
+    `van_comm_rand`, which no retry can resample, and the attempt may already
+    have spent the bundle's governance nullifiers. Attempts for pruned bundles
+    are removed with them.
 12. CheckTx acceptance alone never updates the legacy delegation or vote
     submission columns. This prevents a later DeliverTx failure from pinning a
     domain row to a transaction that did not commit successfully.
@@ -225,7 +258,10 @@ created by the confirmed delegation.
    cleanup, and recovery cleanup MUST preserve `van_comm_rand`, `gov_comm`, the
    proof, PCZT sighash, nullifiers, signature inputs, and related setup fields.
    Delegation coverage is per bundle, matching the delegation attempt's own
-   bundle index.
+   bundle index, and unlike vote coverage it does not depend on the attempt's
+   evidence: `van_comm_rand` cannot be resampled, and a delegation attempt whose
+   transaction hash was never learned may still have spent the bundle's
+   governance nullifiers.
 2. Delegation confirmation does not clear those fields.
 3. Resubmission MUST reuse the persisted delegation setup and
    `van_comm_rand`; it MUST NOT rebuild the bundle by sampling another
@@ -424,6 +460,13 @@ Schema version 18 adds `chain_submission_attempts`. Launch-version databases
 migrate in place and retain all existing round, delegation, vote, and helper
 state. A newer unsupported schema remains rejected.
 
+Opening the database records any leftover `attempting` reservation as
+`outcome_unknown`. The opening process has dispatched nothing, so such a row
+belongs to a process that died between its reservation and its response, and no
+response will ever arrive for it. This preserves its evidence and retires only
+the claim that a POST is still in flight, which is what distinguishes a hashless
+attempt that may still learn a transaction hash from one that cannot.
+
 Each attempt stores wallet, round, kind, bundle, proposal sentinel or batch
 digest, ordered attempt number, local payload digest, optional server chain
 hash, evidence state, and timestamps. It stores neither the canonical request
@@ -471,6 +514,11 @@ state transitions.
 - Can a ballot-intent change erase material an accepted-but-uncommitted
   submission still needs?
 - Can a rejected attempt permanently freeze recovery state or ballot intent?
+- Can an attempt that can never be looked up or confirmed permanently freeze
+  recovery state, ballot intent, or bundle pruning?
+- Is a reservation left behind by an interrupted process still treated as a POST
+  that may return a transaction hash?
+- Does dropping coverage for a hashless attempt still report its ambiguity?
 - Is attempt-based cleanup protection scoped to the attempted proposal or batch
   digest, rather than the whole bundle?
 - Can one malformed endpoint hide a committed transaction from lookup?
@@ -601,13 +649,18 @@ state transitions.
   reconciliation precedence and retirement rules.
 - `chain_submission::tests::a_recovery_row_identity_mismatch_is_refused_before_dispatch`
   covers binding a recovered payload to its storage row.
-- `round::tests::delete_skipped_bundles_refuses_to_prune_an_attempted_bundle` and
-  `delete_skipped_bundles_prunes_past_a_rejected_attempt_and_its_journal_row`
-  cover the bundle-pruning guard and its rejected-attempt boundary.
+- `round::tests::delete_skipped_bundles_refuses_to_prune_an_attempted_bundle`,
+  `delete_skipped_bundles_prunes_past_a_rejected_attempt_and_its_journal_row`,
+  `delete_skipped_bundles_still_refuses_a_hashless_delegation_attempt`, and
+  `delete_skipped_bundles_prunes_past_a_hashless_vote_attempt` cover the
+  bundle-pruning guard, its rejected-attempt boundary, and the split between
+  delegation's unconditional bar and a vote attempt that can never be confirmed.
 - `session::tests::ballot_intent_change_is_refused_while_a_vote_attempt_is_live`,
   `session::tests::reselecting_the_same_choice_is_not_refused_by_a_live_attempt`,
-  and `session::tests::a_rejected_attempt_does_not_refuse_a_ballot_intent_change`
-  cover the ballot-intent guard and its anti-deadlock boundary.
+  `session::tests::a_rejected_attempt_does_not_refuse_a_ballot_intent_change`,
+  `session::tests::a_hashless_unknown_attempt_does_not_refuse_a_ballot_intent_change`,
+  and `session::tests::an_in_flight_reservation_still_refuses_a_ballot_intent_change`
+  cover the ballot-intent guard and both of its anti-deadlock boundaries.
 - `storage::operations::tests::attempted_delegation_cleanup_preserves_van_randomizer`
   covers the post-attempt `van_comm_rand`, legacy hash, and Keystone-signature
   cleanup prohibition.
@@ -618,6 +671,14 @@ state transitions.
   and `storage::operations::tests::a_rejected_batch_attempt_does_not_freeze_recovery_state`
   cover digest-scoped cleanup protection, its conservative unreadable-recovery
   case, and the rejected-attempt boundary.
+- `chain_submission::tests::a_hashless_unknown_attempt_stops_covering_its_vote_row`
+  and `an_accepted_hash_still_covers_its_vote_row` cover the coverage rule end to
+  end, including that the call still reports the ambiguity it dropped coverage
+  for.
+- `storage::operations::tests::a_hashless_unknown_vote_attempt_does_not_freeze_recovery_state`
+  covers the same rule at the recovery-cleanup boundary, and
+  `opening_the_database_downgrades_an_interrupted_reservation` covers the
+  interrupted-reservation downgrade.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
   covers storage-boundary hash canonicalization and idempotent replay.
 - storage migration tests cover version 18 fresh and in-place schemas, including

@@ -1794,14 +1794,32 @@ mod tests {
         );
     }
 
+    /// A journaled chain submission attempt whose transaction hash is known, so
+    /// it is one this SDK could still look up and confirm.
     fn journal_vote_attempt(db: &VotingDb, proposal_id: u32, state: &str) {
+        journal_vote_attempt_with_hash(db, proposal_id, state, Some(&"a".repeat(64)));
+    }
+
+    fn journal_vote_attempt_with_hash(
+        db: &VotingDb,
+        proposal_id: u32,
+        state: &str,
+        chain_tx_hash: Option<&str>,
+    ) {
         db.conn()
             .execute(
                 "INSERT INTO chain_submission_attempts
                  (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
-                  payload_digest, state, created_at, updated_at)
-                 VALUES (?1, ?2, 'vote', 0, ?3, X'', ?4, ?5, 1, 1)",
-                rusqlite::params![ROUND, W, proposal_id as i64, vec![0xCC_u8; 32], state],
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, ?3, X'', ?4, ?5, ?6, 1, 1)",
+                rusqlite::params![
+                    ROUND,
+                    W,
+                    proposal_id as i64,
+                    vec![0xCC_u8; 32],
+                    chain_tx_hash,
+                    state
+                ],
             )
             .unwrap();
     }
@@ -1857,6 +1875,42 @@ mod tests {
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
 
+        assert!(stored_vote_recovery(&db).is_some());
+    }
+
+    #[test]
+    fn a_hashless_unknown_attempt_does_not_refuse_a_ballot_intent_change() {
+        let db = db_with_uncommitted_vote();
+        // A timeout, an unusable accepted response, or an interrupted process
+        // leaves an attempt with no transaction hash. Nothing can ever retire
+        // one, and this SDK can never look one up either, so blocking on it
+        // would freeze this proposal's ballot intent for the life of the round.
+        journal_vote_attempt_with_hash(&db, 2, "outcome_unknown", None);
+
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
+
+        assert_eq!(stored_vote_recovery(&db), None);
+    }
+
+    #[test]
+    fn an_in_flight_reservation_still_refuses_a_ballot_intent_change() {
+        let db = db_with_uncommitted_vote();
+        // `attempting` is the one hashless state whose POST can still return a
+        // hash, and the recovery this would erase is exactly what that response
+        // would be confirmed against.
+        journal_vote_attempt_with_hash(&db, 2, "attempting", None);
+
+        let error = db
+            .set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("journaled chain submission attempt"),
+            "{error}"
+        );
         assert!(stored_vote_recovery(&db).is_some());
     }
 

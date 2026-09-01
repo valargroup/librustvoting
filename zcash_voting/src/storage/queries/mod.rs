@@ -2784,13 +2784,23 @@ pub fn delete_bundles_from(
     // journal row survives. A transaction that later commits could then be
     // neither rebuilt nor confirmed, even though the evidence that it may exist
     // is still on disk.
+    // Delegation attempts bar pruning whatever their evidence: pruning cascades
+    // away `van_comm_rand`, which no retry can resample, so an attempt that may
+    // have spent the bundle's governance nullifiers is reason enough. Vote
+    // attempts protect a confirmation that needs a transaction hash, so one that
+    // can no longer learn a hash protects nothing and must not bar pruning
+    // forever; see `chain_submission::CAN_STILL_LEARN_A_HASH`.
     let attempted: bool = tx
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM chain_submission_attempts
-                  WHERE round_id = :round_id AND wallet_id = :wallet_id
-                    AND bundle_index >= :from_index AND state <> 'rejected'
-             )",
+            &format!(
+                "SELECT EXISTS(
+                     SELECT 1 FROM chain_submission_attempts
+                      WHERE round_id = :round_id AND wallet_id = :wallet_id
+                        AND bundle_index >= :from_index AND state <> 'rejected'
+                        AND (kind = 'delegation' OR {})
+                 )",
+                crate::chain_submission::CAN_STILL_LEARN_A_HASH
+            ),
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
@@ -2808,9 +2818,10 @@ pub fn delete_bundles_from(
             ),
         });
     }
-    // Attempts for pruned bundles are all definitively rejected by this point.
-    // Remove them with the bundles they describe rather than leaving journal
-    // rows that outlive their subject.
+    // Every attempt still standing here is either rejected or a hashless vote
+    // attempt this SDK can never identify or confirm. Remove them with the
+    // bundles they describe rather than leaving journal rows that outlive their
+    // subject.
     tx.execute(
         "DELETE FROM chain_submission_attempts
           WHERE round_id = :round_id AND wallet_id = :wallet_id

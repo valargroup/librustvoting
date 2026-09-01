@@ -1283,6 +1283,56 @@ fn known_hashes(
     Ok(hashes)
 }
 
+/// The attempts whose transaction this SDK could still identify.
+///
+/// Coverage exists to protect confirmation, and confirmation needs a chain
+/// transaction hash: [`known_hashes`] is the only way an attempt ever reaches
+/// [`ChainClient::transaction_status`], and this SDK deliberately cannot predict
+/// a hash or locate a transaction from its commitment. So an attempt that has no
+/// hash and can no longer be given one protects nothing — while freezing the
+/// recovery generation, ballot intent, and bundle pruning of its row forever,
+/// because nothing ever retires a hashless attempt.
+///
+/// `attempting` is the one hashless state that may still learn a hash: a POST
+/// dispatched by this process can still return one, and the guarded rows are
+/// exactly what that response would be applied to. Leftovers from an interrupted
+/// process are not in-flight, so [`mark_interrupted_attempts_unknown`] moves them
+/// to `outcome_unknown` when the database is opened.
+///
+/// Dropping coverage for a hashless `outcome_unknown` attempt cannot produce the
+/// mismatch the guards exist to prevent: attaching a transaction's hash and
+/// event positions to a generation it did not witness needs that hash, and there
+/// is none. The transaction may still have committed; that is reported as
+/// ambiguity by [`has_live_attempt`], which is unchanged, and as
+/// `AlreadySpentUnresolved` if a replacement is later refused on chain.
+pub(crate) const CAN_STILL_LEARN_A_HASH: &str = "(chain_tx_hash IS NOT NULL OR state='attempting')";
+
+/// Downgrades reservations left behind by an interrupted process.
+///
+/// An `attempting` row means "a POST is in flight and its response may still
+/// name a transaction hash". A process that is only now opening the database has
+/// no such request: any `attempting` row it finds belongs to a process that died
+/// between [`reserve_attempt`] and [`mark_attempt`], and no response will ever
+/// arrive for it. Recording that makes the state model's "a process interruption
+/// leaves it outcome-unknown" durable instead of merely descriptive, and stops
+/// the reservation from conferring [`CAN_STILL_LEARN_A_HASH`] coverage forever.
+///
+/// Evidence is unchanged: both states mean the same thing to
+/// [`has_live_attempt`], [`known_hashes`], and every candidate query.
+pub(crate) fn mark_interrupted_attempts_unknown(
+    conn: &rusqlite::Connection,
+) -> Result<(), VotingError> {
+    let now = now_seconds()?;
+    conn.execute(
+        "UPDATE chain_submission_attempts
+            SET state='outcome_unknown', updated_at=?1
+          WHERE state='attempting'",
+        rusqlite::params![now],
+    )
+    .map(|_| ())
+    .map_err(internal("downgrade interrupted chain attempt reservations"))
+}
+
 /// Vote rows still covered by a journaled chain submission attempt.
 ///
 /// A row is covered when a singleton attempt names its proposal, or when a
@@ -1293,6 +1343,9 @@ fn known_hashes(
 /// `rejected` attempts are excluded. A rejection is definite for its own
 /// attempt, and nothing ever deletes those rows, so treating them as coverage
 /// would freeze a proposal's recovery state permanently with no recovery path.
+///
+/// So are attempts that can no longer learn a chain transaction hash; see
+/// [`CAN_STILL_LEARN_A_HASH`].
 ///
 /// Rows whose recovery JSON cannot be parsed are covered conservatively when
 /// their bundle has any batch attempt: an unreadable row may still be a member,
@@ -1306,12 +1359,13 @@ pub(crate) fn attempt_protected_vote_rows(
     let mut batch_digests: BTreeMap<u32, BTreeSet<[u8; 32]>> = BTreeMap::new();
     {
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT kind, bundle_index, proposal_id, batch_digest
-                   FROM chain_submission_attempts
-                  WHERE round_id=:round_id AND wallet_id=:wallet_id
-                    AND state<>'rejected' AND kind IN ('vote','vote_batch')",
-            )
+                       FROM chain_submission_attempts
+                      WHERE round_id=:round_id AND wallet_id=:wallet_id
+                        AND state<>'rejected' AND kind IN ('vote','vote_batch')
+                        AND {CAN_STILL_LEARN_A_HASH}"
+            ))
             .map_err(internal("prepare attempted vote coverage query"))?;
         let rows = stmt
             .query_map(
@@ -2950,5 +3004,96 @@ mod tests {
         assert_eq!(batch.proposal_id(), None);
         assert_eq!(batch.batch_digest(), Some([9; 32]));
         assert_eq!(batch.require_batch_digest().unwrap(), [9; 32]);
+    }
+
+    #[tokio::test]
+    async fn a_hashless_unknown_attempt_stops_covering_its_vote_row() {
+        let db = test_db();
+        {
+            let conn = db.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+        }
+        let transport = Arc::new(MockTransport::default());
+        // A timeout, then a definite rejection of the byte-identical payload.
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Err(ChainTransportError::Timeout));
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            422,
+            r#"{"tx_hash":"","code":7,"log":"invalid proof"}"#,
+        )));
+        let client = ChainClient::with_config(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            ChainClientConfig::default()
+                .with_retry_delays(vec![Duration::from_millis(1)])
+                .unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::vote(ROUND_ID, 0, 3);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                identity.clone(),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // The first attempt may still commit, so the call stays ambiguous and
+        // `has_live_attempt` keeps saying so across later calls.
+        assert!(matches!(
+            outcome,
+            ChainLifecycleOutcome::OutcomeUnknown { .. }
+        ));
+        assert!(has_live_attempt(&db, WALLET, &identity).unwrap());
+
+        // But it never learned a transaction hash and never can, so it cannot
+        // be looked up or confirmed. Covering the row would only freeze this
+        // proposal's recovery generation, ballot intent, and bundle pruning for
+        // the life of the round, because nothing ever retires such an attempt.
+        let protected = {
+            let conn = db.conn();
+            attempt_protected_vote_rows(&conn, ROUND_ID, WALLET).unwrap()
+        };
+        assert!(protected.is_empty(), "{protected:?}");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_hash_still_covers_its_vote_row() {
+        let db = test_db();
+        {
+            let conn = db.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+        }
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            &format!(r#"{{"tx_hash":"{TX_HASH}","code":0,"log":""}}"#),
+        )));
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::vote(ROUND_ID, 0, 3);
+
+        lifecycle
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false)
+            .await
+            .unwrap();
+
+        // This one can be looked up, so the recovery it would be confirmed
+        // against must survive.
+        let protected = {
+            let conn = db.conn();
+            attempt_protected_vote_rows(&conn, ROUND_ID, WALLET).unwrap()
+        };
+        assert!(protected.contains(&(0, 3)), "{protected:?}");
     }
 }

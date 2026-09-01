@@ -6215,9 +6215,9 @@ mod tests {
         conn.execute(
             "INSERT INTO chain_submission_attempts
              (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
-              payload_digest, state, created_at, updated_at)
-             VALUES (?1, ?2, 'vote', 0, 1, X'', ?3, 'outcome_unknown', 1, 1)",
-            rusqlite::params![ROUND_ID, W, vec![0xDD_u8; 32]],
+              payload_digest, chain_tx_hash, state, created_at, updated_at)
+             VALUES (?1, ?2, 'vote', 0, 1, X'', ?3, ?4, 'outcome_unknown', 1, 1)",
+            rusqlite::params![ROUND_ID, W, vec![0xDD_u8; 32], "a".repeat(64)],
         )
         .unwrap();
         drop(conn);
@@ -6235,6 +6235,88 @@ mod tests {
             .unwrap();
         assert_eq!(retained.0.as_deref(), Some("legacy-hash"));
         assert_eq!(retained.1.as_deref(), Some(r#"{"generation":"exact"}"#));
+    }
+
+    #[test]
+    fn a_hashless_unknown_vote_attempt_does_not_freeze_recovery_state() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        queries::store_vote(&db.conn(), ROUND_ID, W, 0, 1, 0, &[0xAB; 32]).unwrap();
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json=?1
+             WHERE round_id=?2 AND wallet_id=?3 AND bundle_index=0 AND proposal_id=1",
+            rusqlite::params![r#"{"generation":"exact"}"#, ROUND_ID, W],
+        )
+        .unwrap();
+        // No transaction hash was ever learned, so this attempt can never reach
+        // the transaction-status endpoint and can never be confirmed. Freezing
+        // the row protects nothing and nothing would ever thaw it.
+        conn.execute(
+            "INSERT INTO chain_submission_attempts
+             (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+              payload_digest, state, created_at, updated_at)
+             VALUES (?1, ?2, 'vote', 0, 1, X'', ?3, 'outcome_unknown', 1, 1)",
+            rusqlite::params![ROUND_ID, W, vec![0xDD_u8; 32]],
+        )
+        .unwrap();
+        drop(conn);
+
+        db.clear_recovery_state(ROUND_ID).unwrap();
+
+        let recovery: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT commitment_bundle_json FROM votes
+                 WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=1",
+                rusqlite::params![ROUND_ID, W],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovery, None);
+    }
+
+    #[test]
+    fn opening_the_database_downgrades_an_interrupted_reservation() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_interrupted_attempt_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = VotingDb::open(path.to_str().unwrap()).unwrap();
+        db.set_wallet_id(W);
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, 1, X'', ?3, 'attempting', 1, 1)",
+                rusqlite::params![ROUND_ID, W, vec![0xDD_u8; 32]],
+            )
+            .unwrap();
+        drop(db);
+
+        // The process that reserved this row is gone, so no response will ever
+        // arrive for it. Its evidence is unchanged; only the claim that a POST
+        // is still in flight is retired.
+        let db = VotingDb::open(path.to_str().unwrap()).unwrap();
+        db.set_wallet_id(W);
+        let state: String = db
+            .conn()
+            .query_row("SELECT state FROM chain_submission_attempts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "outcome_unknown");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 
     fn batch_recovery_json(bundle_index: u32, proposal_id: u32, digest: [u8; 32]) -> String {
@@ -6290,9 +6372,16 @@ mod tests {
             .execute(
                 "INSERT INTO chain_submission_attempts
                  (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
-                  payload_digest, state, created_at, updated_at)
-                 VALUES (?1, ?2, 'vote_batch', 0, -1, ?3, ?4, ?5, 1, 1)",
-                rusqlite::params![ROUND_ID, W, digest.as_slice(), vec![0xCC_u8; 32], state],
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote_batch', 0, -1, ?3, ?4, ?5, ?6, 1, 1)",
+                rusqlite::params![
+                    ROUND_ID,
+                    W,
+                    digest.as_slice(),
+                    vec![0xCC_u8; 32],
+                    "a".repeat(64),
+                    state
+                ],
             )
             .unwrap();
     }

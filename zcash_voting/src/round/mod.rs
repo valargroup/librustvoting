@@ -1316,6 +1316,64 @@ mod tests {
     }
 
     #[test]
+    fn delete_skipped_bundles_still_refuses_a_hashless_delegation_attempt() {
+        let db = test_db("wallet-prune-hashless-delegation");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::new(1).unwrap())
+            .unwrap();
+        journal_delegation_attempt(&db, 1, "outcome_unknown");
+
+        // A delegation attempt bars pruning whatever its evidence: pruning
+        // cascades away `van_comm_rand`, which no retry can resample, and the
+        // attempt may already have spent the bundle's governance nullifiers.
+        let error = db.delete_skipped_bundles(ROUND_ID, 1).unwrap_err();
+
+        assert!(
+            error.to_string().contains("chain submission attempt"),
+            "{error}"
+        );
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 2);
+    }
+
+    #[test]
+    fn delete_skipped_bundles_prunes_past_a_hashless_vote_attempt() {
+        let db = test_db("wallet-prune-hashless-vote");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::new(1).unwrap())
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 1, 4, X'', ?3, 'outcome_unknown', 1, 1)",
+                rusqlite::params![ROUND_ID, db.wallet_id(), vec![0xCC_u8; 32]],
+            )
+            .unwrap();
+
+        // A vote attempt bars pruning so its transaction can still be confirmed,
+        // which needs a hash this one never learned and can never be given.
+        db.delete_skipped_bundles(ROUND_ID, 1).unwrap();
+
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 1);
+        let remaining: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chain_submission_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
     fn delete_skipped_bundles_prunes_past_a_rejected_attempt_and_its_journal_row() {
         let db = test_db("wallet-prune-rejected");
         let notes = vec![

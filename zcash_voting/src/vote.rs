@@ -4099,13 +4099,14 @@ mod tests {
             .execute(
                 "INSERT INTO chain_submission_attempts
                  (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
-                  payload_digest, state, created_at, updated_at)
-                 VALUES (?1, ?2, 'vote', 0, ?3, X'', ?4, 'outcome_unknown', 1, 1)",
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, ?3, X'', ?4, ?5, 'outcome_unknown', 1, 1)",
                 rusqlite::params![
                     ROUND_ID,
                     WALLET_ID,
                     recovery.proposal_id as i64,
-                    vec![0xCC_u8; 32]
+                    vec![0xCC_u8; 32],
+                    "a".repeat(64)
                 ],
             )
             .unwrap();

@@ -22,11 +22,21 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   boundary, including in `mark_delegation_submitted`, `mark_vote_submitted`,
   and confirmation. The schema-18 migration lowercases existing 64-character
   hexadecimal hashes; other stored identifiers are untouched.
-- A ballot-intent change is refused while a non-rejected chain submission
-  attempt still covers that vote or its batch, and recovery cleanup now scopes
-  attempt protection to the attempted proposal or batch digest rather than the
-  whole bundle. `delete_skipped_bundles` likewise refuses to prune a bundle
-  range that still holds a non-rejected attempt.
+- A ballot-intent change is refused while a chain submission attempt that can
+  still be confirmed covers that vote or its batch, and recovery cleanup now
+  scopes attempt protection to the attempted proposal or batch digest rather
+  than the whole bundle. `delete_skipped_bundles` likewise refuses to prune a
+  bundle range that still holds such an attempt, and refuses it for any
+  non-rejected delegation attempt.
+- Vote and vote-batch attempts that never learned a chain transaction hash, and
+  can no longer learn one, no longer freeze the recovery generation, ballot
+  intent, or bundle pruning of the rows they name. Confirmation needs a hash, so
+  such an attempt protects nothing, and nothing ever retires one; their
+  ambiguity is still reported as `OutcomeUnknown`. Delegation attempts keep
+  protecting `van_comm_rand` unconditionally.
+- Opening the database records any `attempting` reservation left behind by an
+  interrupted process as `outcome_unknown`, making the documented interruption
+  transition durable without changing what the attempt is evidence of.
 - `normalize_tx_hash` no longer trims surrounding whitespace, so the client and
   the storage boundary share one exact definition of a transaction hash.
 - A recovered vote payload, singleton or atomic-batch member, is now validated
