@@ -686,15 +686,18 @@ hosts do not parse the log.
    dispatch, retry, failover, backoff, and confirmation application, and again
    as soon as each transaction-status request returns, after the state reads on
    the no-candidate path, which has no lookup loop behind it to check again, and
-   both before and after failed candidates are retired, because that retirement is a durable mutation
-   of its own and its wait on SQLite widens the gap before the submission is
-   classified. The entry check covers
-   the no-candidate fast path, so a cancelled operation is never reported to the
-   host as actively pending; the post-request check covers every result variant,
-   not only a committed success, because classifying a 404 or an error reports an
-   outcome and classifying a committed failure retires evidence. A cancelled
-   operation does neither: the candidate stays journaled, so the next
-   reconciliation re-derives whatever this one was about to conclude.
+   both before and after failed candidates are retired, because that retirement
+   is a durable mutation of its own and its wait on SQLite widens the gap before
+   the submission is classified. The entry check covers the no-candidate fast
+   path, so a cancelled operation is never reported to the host as actively
+   pending. The check that follows the lookups covers the candidate-set rebuild
+   and the live-attempt read together — both read state the classifications
+   below them consume — so no classification is preceded by a database wait of
+   its own. The post-request check covers every result variant, not only a
+   committed success, because classifying a 404 or an error reports an outcome
+   and classifying a committed failure retires evidence. A cancelled operation
+   does neither: the candidate stays journaled, so the next reconciliation
+   re-derives whatever this one was about to conclude.
 8. No failure inside a submission call is reported as that call's result while
    the call already knows the transaction may commit. Every step there is
    fallible — a lookup, a journal write, a reservation, the cleanup of an unsent
