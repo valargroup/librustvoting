@@ -86,6 +86,15 @@ impl SharePhase {
 }
 
 impl DelegationPhase {
+    /// Returns whether this phase requires a successful persisted ZKP #1.
+    ///
+    /// Wallet integrations should use this method instead of matching phase
+    /// variants themselves so future lifecycle phases retain crate-owned proof
+    /// semantics.
+    pub fn has_persisted_proof(self) -> bool {
+        matches!(self, Self::Proved | Self::Submitted | Self::Confirmed)
+    }
+
     /// Returns the stable string used by FFI layers and UI state machines.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -150,11 +159,36 @@ impl VotingDb {
         round_id: &str,
         bundle_index: u32,
     ) -> Result<DelegationPhase, VotingError> {
+        self.delegation_phase_if_present(round_id, bundle_index)?
+            .ok_or_else(|| VotingError::InvalidInput {
+                message: format!("bundle not found for round {round_id} index {bundle_index}"),
+            })
+    }
+
+    /// Returns whether one bundle has a successful persisted ZKP #1.
+    ///
+    /// A bundle that has not been prepared yet returns `false`. This makes the
+    /// query suitable for deciding whether a caller needs to connect to PIR
+    /// before bundle preparation begins.
+    pub fn has_persisted_delegation_proof(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<bool, VotingError> {
+        Ok(self
+            .delegation_phase_if_present(round_id, bundle_index)?
+            .is_some_and(DelegationPhase::has_persisted_proof))
+    }
+
+    fn delegation_phase_if_present(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<Option<DelegationPhase>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let phase = conn
-            .query_row(
-                "SELECT b.pczt_sighash IS NOT NULL OR b.rk IS NOT NULL,
+        conn.query_row(
+            "SELECT b.pczt_sighash IS NOT NULL OR b.rk IS NOT NULL,
                         EXISTS(
                             SELECT 1 FROM proofs p
                             WHERE p.round_id = b.round_id
@@ -168,27 +202,23 @@ impl VotingDb {
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
                    AND b.bundle_index = :bundle_index",
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":bundle_index": bundle_index as i64,
-                },
-                |row| {
-                    Ok(phase_from_columns(
-                        row.get::<_, i64>(0)? != 0,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)? != 0,
-                        row.get::<_, i64>(3)? != 0,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to load delegation phase: {e}"),
-            })?;
-
-        phase.ok_or_else(|| VotingError::InvalidInput {
-            message: format!("bundle not found for round {round_id} index {bundle_index}"),
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+            },
+            |row| {
+                Ok(phase_from_columns(
+                    row.get::<_, i64>(0)? != 0,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to load delegation phase: {e}"),
         })
     }
 
@@ -494,10 +524,12 @@ mod tests {
     #[test]
     fn delegation_phase_advances_from_persisted_artifacts() {
         let db = db_with_bundle();
+        assert!(!db.has_persisted_delegation_proof(ROUND_ID, 99).unwrap());
         assert_eq!(
             db.delegation_phase(ROUND_ID, 0).unwrap(),
             DelegationPhase::Prepared
         );
+        assert!(!db.has_persisted_delegation_proof(ROUND_ID, 0).unwrap());
 
         db.conn()
             .execute(
@@ -510,6 +542,7 @@ mod tests {
             db.delegation_phase(ROUND_ID, 0).unwrap(),
             DelegationPhase::PcztBuilt
         );
+        assert!(!db.has_persisted_delegation_proof(ROUND_ID, 0).unwrap());
 
         crate::storage::queries::store_proof(&db.conn(), ROUND_ID, WALLET_ID, 0, &[0xAB; 96])
             .unwrap();
@@ -517,18 +550,21 @@ mod tests {
             db.delegation_phase(ROUND_ID, 0).unwrap(),
             DelegationPhase::Proved
         );
+        assert!(db.has_persisted_delegation_proof(ROUND_ID, 0).unwrap());
 
         db.store_delegation_tx_hash(ROUND_ID, 0, "tx").unwrap();
         assert_eq!(
             db.delegation_phase(ROUND_ID, 0).unwrap(),
             DelegationPhase::Submitted
         );
+        assert!(db.has_persisted_delegation_proof(ROUND_ID, 0).unwrap());
 
         db.store_van_position(ROUND_ID, 0, 42).unwrap();
         assert_eq!(
             db.delegation_phase(ROUND_ID, 0).unwrap(),
             DelegationPhase::Confirmed
         );
+        assert!(db.has_persisted_delegation_proof(ROUND_ID, 0).unwrap());
     }
 
     #[test]

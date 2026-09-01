@@ -12,11 +12,12 @@ use zcash_voting::prelude::{
     export_delegation_capability, gather_delegation_lwd_inputs, import_delegation_capability,
     prepare_delegation_bundle as prepare_bundle_state,
     prepare_delegation_bundle_for_target as prepare_target_bundle_state, spend_auth_signature,
-    DelegationAccountKeys, DelegationCapabilityDigest, DelegationKeys, DelegationSigningRequest,
-    DelegationSubmission, ExportedDelegationCapability, ImportDelegationCapabilityParams,
-    KeystoneSigningRequest, Network, NoopProgressReporter, PrepareDelegationBundleForTargetParams,
-    PrepareDelegationBundleParams, PreparedDelegationBundle, PreparedDelegationReport,
-    PreparedSigner, RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey, VotingHotkeyTargetV1,
+    DelegationAccountKeys, DelegationCapabilityDigest, DelegationKeys, DelegationProofOutcome,
+    DelegationSigningRequest, DelegationSubmission, ExportedDelegationCapability,
+    ImportDelegationCapabilityParams, KeystoneSigningRequest, Network, NoopProgressReporter,
+    PrepareDelegationBundleForTargetParams, PrepareDelegationBundleParams,
+    PreparedDelegationBundle, PreparedDelegationReport, PreparedSigner,
+    RoundBoundVotingHotkeyTarget, VotingDb, VotingHotkey, VotingHotkeyTargetV1,
 };
 use zcash_voting::wire::PirLayout;
 use zcash_voting::{
@@ -372,42 +373,55 @@ pub fn precompute_snapshot_bundles(
     .context("precompute snapshot bundles")
 }
 
-/// Proves one precomputed delegation bundle and signs it in wallet-owned code.
+/// Ensures one delegation proof and signs it in wallet-owned code.
 ///
 /// The returned `DelegationSubmission` contains the chain-ready fields for the
-/// selected bundle. The function expects the target bundle's witnesses,
-/// padded-note secrets, and PIR rows to have been warmed by
-/// `precompute_delegation_bundle`.
+/// selected bundle. Persisted witnesses, padded-note secrets, setup, PIR rows,
+/// and proof are reused across retries.
 ///
 /// # Errors
 ///
 /// Returns an error if setup/proof generation fails, PIR access fails, signing
 /// fails, or submission fields cannot be assembled.
-pub fn prove_and_submit_delegation_bundle(
+pub fn prove_and_submit_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
+    wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
     prepared: &PreparedDelegationBundle,
     pir_layout: PirLayout,
     pir_server_url: &str,
     seed: &[u8],
-) -> Result<DelegationSubmission> {
+) -> Result<DelegationSubmission>
+where
+    C: std::borrow::Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
     let progress = NoopProgressReporter;
-    let delegation_setup = prepared
-        .setup(voting_db, &progress)
-        .context("setup delegation bundle")?;
+    let pczt_bytes = if voting_db
+        .has_persisted_delegation_proof(&prepared.round_id, prepared.bundle_index)
+        .context("check persisted delegation proof")?
+    {
+        Vec::new()
+    } else {
+        let pir_client = connect_pir(pir_layout, pir_server_url)?;
+        match prepared
+            .ensure_proof(voting_db, wallet_db, &pir_client, &progress)
+            .context("ensure delegation proof")?
+        {
+            DelegationProofOutcome::Generated { setup, .. } => {
+                setup.map(|setup| setup.pczt_bytes).unwrap_or_default()
+            }
+            DelegationProofOutcome::Reused => Vec::new(),
+        }
+    };
     let signing_request = prepared
         .signing_request(voting_db)
         .context("load delegation signing request")?;
     let (sig, sighash) = example_sign_delegation_request(seed, signing_request)?;
 
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    prepared
-        .prove(voting_db, &pir_client, &progress)
-        .context("prove delegation bundle")?;
-
     prepared
         .signed_bundle(
             voting_db,
-            delegation_setup.pczt_bytes,
+            pczt_bytes,
             PreparedSigner::signature(sig, sighash),
         )
         .map(|bundle| bundle.submission)
