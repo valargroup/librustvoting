@@ -722,15 +722,31 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                         mark_attempt(self.db, wallet_id, attempt_id, "rejected", tx_hash).err();
                     if is_spent_nullifier_log(&result.log) {
                         let reconciled = self.reconcile_locked(wallet_id, identity, cancel).await?;
-                        // Either confirmed outcome is proof of success. Another
-                        // process may have applied the confirmation between this
-                        // call's preflight and this response.
-                        if matches!(
-                            reconciled,
-                            ChainLifecycleOutcome::Confirmed { .. }
-                                | ChainLifecycleOutcome::AlreadyConfirmed { .. }
-                        ) {
-                            return Ok(reconciled);
+                        match reconciled {
+                            // Either confirmed outcome is proof of success.
+                            // Another process may have applied the confirmation
+                            // between this call's preflight and this response.
+                            outcome @ (ChainLifecycleOutcome::Confirmed { .. }
+                            | ChainLifecycleOutcome::AlreadyConfirmed { .. }) => {
+                                return Ok(outcome)
+                            }
+                            // `AlreadySpentUnresolved` asserts that the known
+                            // candidates were checked and none had succeeded. A
+                            // reconciliation that settled nothing checked
+                            // nothing, so reporting it would state as fact
+                            // something this call never established, and would
+                            // bury the ambiguity underneath it.
+                            ChainLifecycleOutcome::Cancelled => {
+                                return Ok(self.cancelled_outcome(
+                                    wallet_id,
+                                    identity,
+                                    last_unknown,
+                                )?)
+                            }
+                            outcome @ ChainLifecycleOutcome::OutcomeUnknown { .. } => {
+                                return Ok(outcome)
+                            }
+                            _ => {}
                         }
                         return Ok(ChainLifecycleOutcome::AlreadySpentUnresolved {
                             known_tx_hashes: known_hashes(self.db, wallet_id, identity)?,
@@ -5228,5 +5244,105 @@ mod tests {
         assert!(lifecycle
             .outstanding_ambiguity(WALLET, &identity, &None, "storage failed")
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_spent_nullifier_with_an_unsettled_lookup_stays_unknown() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_spent_unsettled_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        {
+            let conn = db.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+        }
+        let inner = MockTransport::default();
+        inner.responses.lock().unwrap().extend([
+            Ok(response(
+                422,
+                r#"{"tx_hash":"","code":9,"log":"nullifier already spent: abcd"}"#,
+            )),
+            // The candidate's own lookup cannot be read, so nothing is settled.
+            Ok(response(200, "not json at all")),
+        ]);
+        let client = ChainClient::new(
+            Arc::new(RacingTransport {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                raced: Mutex::new(false),
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::vote(ROUND_ID, 0, 3),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // `AlreadySpentUnresolved` asserts the known candidates were checked and
+        // none had succeeded. This lookup checked nothing, so saying so would
+        // state as fact something the call never established.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
+                if known_tx_hashes == &vec![TX_HASH_2.to_string()]),
+            "got {outcome:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_spent_nullifier_cancelled_mid_lookup_is_not_reported_unresolved() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_spent_cancel_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        let inner = MockTransport::default();
+        inner.responses.lock().unwrap().extend([
+            Ok(response(
+                422,
+                r#"{"tx_hash":"","code":9,"log":"nullifier already spent: abcd"}"#,
+            )),
+            Ok(response(404, r#"{"detail":"not found"}"#)),
+        ]);
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = ChainClient::new(
+            Arc::new(RacingThenCancelTransport {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                cancelled: Arc::clone(&cancelled),
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let cancel = || cancelled.load(std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        // Nothing was dispatched that may still commit and the candidates were
+        // never checked, so the honest answer is that the operation stopped.
+        assert_eq!(outcome, ChainLifecycleOutcome::Cancelled);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -57,6 +57,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   different transaction.
 - `ChainClient::transaction_status` observes cancellation as soon as each
   endpoint request returns, before classifying the response.
+- A spent-nullifier response no longer reports `AlreadySpentUnresolved` when its
+  reconciliation settled nothing. That outcome asserts the known candidates were
+  checked and none succeeded, so a cancelled or unreadable lookup is now
+  reported as it stands.
 - No failure inside a submission call — a lookup, a journal write, a
   reservation, or the cleanup of an unsent one — is reported as that call's
   result while a completed ambiguous broadcast, a known candidate, or a live

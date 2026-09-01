@@ -458,7 +458,11 @@ hosts do not parse the log.
    reported only when no candidate succeeded. Either confirmed outcome —
    freshly parsed or durable — is proof of success on this path.
 4. No successful known candidate returns `AlreadySpentUnresolved` and
-   preserves all attempts and recovery material.
+   preserves all attempts and recovery material. That outcome asserts the known
+   candidates were checked and none had succeeded, so a reconciliation that
+   settled nothing — cancelled, or unable to read its answers — is reported as
+   it stands instead. Claiming otherwise would state as fact something the call
+   never established, and bury the ambiguity underneath it.
 5. More than one committed successful candidate is an invariant violation and
    produces no partial domain mutation.
 6. A rejected duplicate's hash is not evidence that it identifies the earlier
@@ -772,6 +776,8 @@ state transitions.
 - Are retries byte-identical within one live call?
 - Is the software-delegation crash recovery gap still explicit?
 - Can a spent-nullifier response discard known hashes or recovery material?
+- Can `AlreadySpentUnresolved` be reported when the candidate lookups never
+  settled?
 - Can an unresolved nullifier be reported as success?
 - Can weaker evidence overwrite accepted or confirmed evidence?
 - Can a later attempt's rejection hide an earlier attempt that may still commit?
@@ -930,6 +936,10 @@ state transitions.
   `adopting_a_success_still_retires_the_failed_candidates`, and
   `a_spent_nullifier_response_accepts_a_durable_confirmation` cover the
   reconciliation precedence and retirement rules.
+- `chain_submission::tests::a_spent_nullifier_with_an_unsettled_lookup_stays_unknown`
+  and `a_spent_nullifier_cancelled_mid_lookup_is_not_reported_unresolved` cover
+  the spent-nullifier path reporting a reconciliation that settled nothing as it
+  stands.
 - `chain_submission::tests::a_recovery_row_identity_mismatch_is_refused_before_dispatch`
   covers binding a recovered payload to its storage row.
 - `round::tests::delete_skipped_bundles_refuses_to_prune_an_attempted_bundle`,
