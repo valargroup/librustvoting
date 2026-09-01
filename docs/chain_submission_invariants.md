@@ -101,8 +101,8 @@ Ambiguity is durable too. An `attempting` or `outcome_unknown` attempt means a
 request may have reached the chain, and that holds whether or not a hash was
 learned: a timeout, an unusable accepted response, or a process interruption all
 leave one behind with no hash. Such an attempt keeps the submission
-`OutcomeUnknown` across calls, so a later call's rejection cannot be reported as
-terminal. A definitely pre-dispatch failure creates no such evidence, because
+`OutcomeUnknown` across calls, so neither a later call's rejection nor a known
+candidate's committed failure can be reported as terminal while it remains. A definitely pre-dispatch failure creates no such evidence, because
 its reservation is removed, and neither does a rejected attempt.
 
 ## Typed identity and payload invariants
@@ -174,7 +174,9 @@ its reservation is removed, and neither does a rejected attempt.
    lookup report it as pending and block the replacement payload forever. An
    attempt whose transaction is later found to have committed with a nonzero
    code is transitioned to rejected for the same reason, and so is the legacy
-   domain hash it came from, which is also a reconciliation source. Clearing a
+   domain hash it came from, which is also a reconciliation source. Every failed
+   candidate a lookup discovers is retired, not only the one whose rejection is
+   reported, or the remainder would keep blocking a replacement. Clearing a
    domain hash is scoped to an exact match on a row with no recorded
    confirmation position, so retirement can only remove a hash this
    reconciliation just proved failed.
@@ -186,16 +188,23 @@ its reservation is removed, and neither does a rejected attempt.
    conservatively while its bundle has any batch attempt. `rejected` attempts
    confer no coverage; nothing deletes those rows, so treating them as coverage
    would freeze a proposal's recovery state permanently.
-9. A ballot-intent change that would erase material covered by a non-rejected
-   attempt is refused. CheckTx acceptance deliberately leaves the legacy vote
+9. Replacing a vote's recovery generation while a non-rejected attempt covers
+    its row is refused inside the vote persistence transaction. Re-preparing the
+    same choice with different parameters does not go through ballot intent, so
+    that guard alone cannot see it; without this the lifecycle could dispatch
+    stale bytes and a later confirmation could attach the stale transaction's
+    hash and positions to the replacement. Rewriting the identical generation
+    stays idempotent.
+10. A ballot-intent change that would erase material covered by a non-rejected
+    attempt is refused. CheckTx acceptance deliberately leaves the legacy vote
    column null, so the attempt journal is the only evidence that a dispatched
    vote may still commit. Re-selecting the same choice is never refused.
-10. Partial bundle deletion is refused while any bundle in the pruned range has
+11. Partial bundle deletion is refused while any bundle in the pruned range has
     a non-rejected attempt. An attempt references its round, not its bundle, so
     pruning would cascade away the bundle, vote, proof, and recovery rows a
     transaction that later commits needs, while leaving its journal evidence
     behind. Attempts for pruned bundles are removed with them.
-11. CheckTx acceptance alone never updates the legacy delegation or vote
+12. CheckTx acceptance alone never updates the legacy delegation or vote
     submission columns. This prevents a later DeliverTx failure from pinning a
     domain row to a transaction that did not commit successfully.
 
@@ -305,7 +314,11 @@ hosts do not parse the log.
    operation.
 2. The lifecycle queries every previously learned chain hash for the submission
    identity across the configured endpoint set.
-3. Exactly one committed successful candidate is adopted and confirmed.
+3. Exactly one committed successful candidate is adopted and confirmed. A
+   terminal lookup error on an unrelated candidate is retained rather than
+   returned, so it cannot discard a candidate that already committed; it is
+   reported only when no candidate succeeded. Either confirmed outcome —
+   freshly parsed or durable — is proof of success on this path.
 4. No successful known candidate returns `AlreadySpentUnresolved` and
    preserves all attempts and recovery material.
 5. More than one committed successful candidate is an invariant violation and
@@ -328,7 +341,9 @@ hosts do not parse the log.
    content-type rules as any other response; an unusable one is evidence of
    nothing. Lookup gives each configured endpoint one attempt; it does not
    retry the same endpoint.
-4. A structured HTTP 422 transaction result is committed failure.
+4. A structured HTTP 422 transaction result is committed failure. A 422 body
+   reporting a success code contradicts its own status and is unusable, so an
+   error response can never mutate confirmed voting state.
 5. Invalid content type, oversized body, malformed JSON, or missing required
    fields is an unusable response, not confirmation, and failover continues to
    the remaining endpoints. One malformed endpoint therefore cannot hide a
@@ -475,7 +490,12 @@ state transitions.
 - Can an unresolved nullifier be reported as success?
 - Can weaker evidence overwrite accepted or confirmed evidence?
 - Can a later attempt's rejection hide an earlier attempt that may still commit?
-- Can a durable confirmation be downgraded by a later lookup?
+- Can a durable confirmation be downgraded by a later lookup, or missed by the
+  spent-nullifier path?
+- Can a terminal lookup error on one candidate discard another that committed?
+- Is every failed candidate retired, or only the reported one?
+- Can a vote's recovery generation be replaced while an attempt covers it?
+- Can an HTTP 422 body claiming success be applied as confirmation?
 - Is any event-derived value synthesized from a shared mutable pointer?
 - Does a hashless dispatched attempt survive as ambiguity across calls?
 - Is a definitely pre-dispatch failure ever recorded as ambiguity?
@@ -556,6 +576,15 @@ state transitions.
   covers the between-retry dispatch gate.
 - `vote::tests::batch_recovery_is_bound_to_the_row_that_supplied_it` covers
   per-member row binding for atomic batches.
+- `vote::tests::recovery_replacement_is_refused_while_an_attempt_covers_the_row`
+  covers the persistence-transaction guard and its idempotent rewrite.
+- `chain::tests::a_422_lookup_claiming_success_is_unusable` covers the
+  status/body contradiction.
+- `chain_submission::tests::a_committed_failure_does_not_override_hashless_ambiguity`,
+  `every_committed_failure_candidate_is_retired`,
+  `a_successful_candidate_survives_a_terminal_lookup_error`, and
+  `a_spent_nullifier_response_accepts_a_durable_confirmation` cover the
+  reconciliation precedence and retirement rules.
 - `chain_submission::tests::a_recovery_row_identity_mismatch_is_refused_before_dispatch`
   covers binding a recovered payload to its storage row.
 - `round::tests::delete_skipped_bundles_refuses_to_prune_an_attempted_bundle` and

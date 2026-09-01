@@ -32,6 +32,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - A recovered vote payload, singleton or atomic-batch member, is now validated
   against the storage row it was loaded from before it can be serialized or
   dispatched.
+- Replacing a vote's recovery generation is refused while a non-rejected chain
+  submission attempt covers its row.
 - `ChainLifecycleOutcome::AlreadyConfirmed` reports a submission confirmed by an
   earlier call. It carries only the transaction hash, because an earlier
   transaction's VAN position is not recoverable from the bundle's shared

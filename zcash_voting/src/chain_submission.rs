@@ -315,12 +315,16 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     ),
                 })?
         };
-        let recovered = delegate::submission(
-            self.db,
-            round_id,
-            bundle_index,
-            DelegationSigner::signature(signature, sighash),
-        )?;
+        let recovered = {
+            let conn = self.db.conn();
+            delegate::submission_with_conn(
+                &conn,
+                &wallet_id,
+                round_id,
+                bundle_index,
+                DelegationSigner::signature(signature, sighash),
+            )?
+        };
         let expected = DelegationSubmissionWire::try_from(&recovered)?;
         if expected != *wire {
             return Err(VotingError::InvalidInput {
@@ -488,7 +492,14 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     if is_spent_nullifier_log(&result.log) {
                         let reconciled =
                             self.reconcile_locked(wallet_id, &identity, cancel).await?;
-                        if matches!(reconciled, ChainLifecycleOutcome::Confirmed { .. }) {
+                        // Either confirmed outcome is proof of success. Another
+                        // process may have applied the confirmation between this
+                        // call's preflight and this response.
+                        if matches!(
+                            reconciled,
+                            ChainLifecycleOutcome::Confirmed { .. }
+                                | ChainLifecycleOutcome::AlreadyConfirmed { .. }
+                        ) {
                             return Ok(reconciled);
                         }
                         return Ok(ChainLifecycleOutcome::AlreadySpentUnresolved {
@@ -623,6 +634,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         let mut successful = Vec::new();
         let mut any_pending = false;
         let mut unresolved = None;
+        let mut terminal_error = None;
         let mut committed_failures = Vec::new();
         for hash in &hashes {
             if cancel() {
@@ -644,7 +656,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 Err(error) if error.is_retryable() || error.is_ambiguous() => {
                     unresolved.get_or_insert(error.to_string());
                 }
-                Err(error) => return Err(error.into()),
+                // Retained rather than returned: an earlier candidate may
+                // already have committed successfully, and discarding that
+                // would leave a transaction that definitely landed unapplied
+                // for as long as this per-hash error persists.
+                Err(error) => {
+                    terminal_error.get_or_insert(error);
+                }
             }
         }
         if successful.len() > 1 {
@@ -670,6 +688,9 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 reconciled: true,
             });
         }
+        if let Some(error) = terminal_error {
+            return Err(error.into());
+        }
         if let Some(message) = unresolved {
             return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                 known_tx_hashes: hashes,
@@ -681,13 +702,26 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 known_tx_hashes: hashes,
             });
         }
-        if let Some((hash, failure)) = committed_failures.into_iter().next() {
-            // The candidate's transaction definitively failed at commit, so its
-            // journal row must stop being live evidence. Leaving it `accepted`
+        if !committed_failures.is_empty() {
+            // Each failed candidate's transaction definitively failed at commit,
+            // so none of them may stay live evidence. Leaving one `accepted`
             // would make every later submission rediscover it and exit before
             // dispatch, and would keep ballot-intent changes and recovery
-            // cleanup pinned to a generation that can never confirm.
-            retire_failed_candidate(self.db, wallet_id, identity, &hash)?;
+            // cleanup pinned to a generation that can never confirm. Retire all
+            // of them, not just the one whose rejection is reported.
+            for (hash, _) in &committed_failures {
+                retire_failed_candidate(self.db, wallet_id, identity, hash)?;
+            }
+            // A hashless attempt that may still commit outranks these
+            // rejections, which are definite only for the candidates they name.
+            if has_live_attempt(self.db, wallet_id, identity)? {
+                return Ok(ChainLifecycleOutcome::OutcomeUnknown {
+                    known_tx_hashes: known_hashes(self.db, wallet_id, identity)?,
+                    message: "an earlier attempt was dispatched without a usable response"
+                        .to_string(),
+                });
+            }
+            let (_, failure) = committed_failures.remove(0);
             return Ok(ChainLifecycleOutcome::Rejected {
                 code: failure.code,
                 log: failure.log,
@@ -1461,6 +1495,7 @@ mod tests {
     const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const TX_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const WALLET: &str = "wallet-1";
+    const TX_HASH_2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[derive(Default)]
     struct MockTransport {
@@ -2591,6 +2626,175 @@ mod tests {
             *transport.posts.lock().unwrap(),
             1,
             "a known candidate that may still commit stops further broadcasts"
+        );
+    }
+
+    fn delegate_vote_events(leaf_index: &str) -> Vec<crate::confirmation::TxEvent> {
+        vec![crate::confirmation::TxEvent {
+            event_type: "delegate_vote".to_string(),
+            attributes: vec![
+                crate::confirmation::TxEventAttribute {
+                    key: "vote_round_id".to_string(),
+                    value: ROUND_ID.to_string(),
+                },
+                crate::confirmation::TxEventAttribute {
+                    key: "leaf_index".to_string(),
+                    value: leaf_index.to_string(),
+                },
+            ],
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_committed_failure_does_not_override_hashless_ambiguity() {
+        let db = test_db();
+        // An earlier dispatch left no hash, and a later one did.
+        journal_attempt(&db, "outcome_unknown", None);
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            r#"{"height":42,"code":7,"log":"deliver failed","events":[]}"#,
+        )));
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // The rejection is definite only for the candidate it names; the
+        // hashless attempt may still commit, so the host must keep polling.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            attempt_states(&db),
+            vec!["outcome_unknown".to_string(), "rejected".to_string()],
+            "the failed candidate is still retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_committed_failure_candidate_is_retired() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        journal_attempt(&db, "accepted", Some(TX_HASH_2));
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            Ok(response(
+                200,
+                r#"{"height":42,"code":7,"log":"deliver failed","events":[]}"#,
+            )),
+            Ok(response(
+                200,
+                r#"{"height":43,"code":9,"log":"deliver failed","events":[]}"#,
+            )),
+        ]);
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ChainLifecycleOutcome::Rejected { code: 7, .. }
+        ));
+        // Retiring only the reported one would leave the other blocking a
+        // replacement until the host reconciled again per failed candidate.
+        assert_eq!(
+            attempt_states(&db),
+            vec!["rejected".to_string(), "rejected".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_candidate_survives_a_terminal_lookup_error() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        journal_attempt(&db, "accepted", Some(TX_HASH_2));
+        let transport = Arc::new(MockTransport::default());
+        let events = serde_json::to_string(&delegate_vote_events("5")).unwrap();
+        transport.responses.lock().unwrap().extend([
+            Ok(response(
+                200,
+                &format!(r#"{{"height":42,"code":0,"log":"","events":{events}}}"#),
+            )),
+            // A stable per-hash failure on an unrelated candidate.
+            Ok(response(401, r#"{"message":"unauthorized"}"#)),
+        ]);
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // Returning the error immediately would leave a transaction that
+        // definitely committed unapplied for as long as the error persisted.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::Confirmed { tx_hash, .. }
+                if tx_hash == TX_HASH),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            db.get_delegation_tx_hash(ROUND_ID, 0).unwrap().as_deref(),
+            Some(TX_HASH)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spent_nullifier_response_accepts_a_durable_confirmation() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            r#"{"tx_hash":"","code":9,"log":"nullifier already spent: ab"}"#,
+        )));
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        // Another process applies the confirmation after this call's preflight
+        // but before its POST is answered.
+        let applied = Mutex::new(false);
+        let confirm_after_post = || {
+            let mut applied = applied.lock().unwrap();
+            if !*applied && *transport.posts.lock().unwrap() == 1 {
+                db.conn()
+                    .execute(
+                        "UPDATE bundles SET delegation_tx_hash=?1, van_leaf_position=5
+                          WHERE round_id=?2 AND bundle_index=0",
+                        rusqlite::params![TX_HASH, ROUND_ID],
+                    )
+                    .unwrap();
+                *applied = true;
+            }
+            false
+        };
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &confirm_after_post,
+            )
+            .await
+            .unwrap();
+
+        // Durable proof of success outranks the spent-nullifier ambiguity.
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::AlreadyConfirmed {
+                tx_hash: TX_HASH.to_string()
+            }
         );
     }
 

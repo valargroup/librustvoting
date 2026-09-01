@@ -2995,6 +2995,24 @@ fn store_recovery_json_for_vote_with_conn(
         choice,
         commitment,
     } = identity;
+    // Replacing the recovery generation while a chain submission attempt still
+    // covers this row would let the lifecycle dispatch stale bytes and let a
+    // later confirmation attach the stale transaction's hash and positions to
+    // the replacement. Re-preparing the same choice with different parameters
+    // never reaches the ballot-intent guard, so the check belongs here, inside
+    // the persistence transaction. An identical rewrite stays idempotent.
+    let stored_json =
+        recovery_json_with_conn(conn, wallet_id, round_id, bundle_index, proposal_id)?;
+    if stored_json.as_deref() != Some(json)
+        && crate::chain_submission::attempt_protected_vote_rows(conn, round_id, wallet_id)?
+            .contains(&(bundle_index, proposal_id))
+    {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} bundle {bundle_index} has a journaled chain submission attempt covering proposal {proposal_id}; recover the current vote instead of replacing its recovery material"
+            ),
+        });
+    }
     let rows = conn
         .execute(
             "UPDATE votes SET commitment_bundle_json = :json
@@ -4048,6 +4066,84 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not match its record contents"));
+    }
+
+    #[test]
+    fn recovery_replacement_is_refused_while_an_attempt_covers_the_row() {
+        let db = db_with_vote();
+        let mut recovery = two_action_recovery_batch().1.remove(0);
+        recovery.batch = None;
+        let commitment = stored_vote_commitment_bytes(&recovery).unwrap();
+        queries::store_vote(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            0,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &commitment,
+        )
+        .unwrap();
+        let original = serialize_recovery(&recovery).unwrap();
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            0,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &original,
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, ?3, X'', ?4, 'outcome_unknown', 1, 1)",
+                rusqlite::params![
+                    ROUND_ID,
+                    WALLET_ID,
+                    recovery.proposal_id as i64,
+                    vec![0xCC_u8; 32]
+                ],
+            )
+            .unwrap();
+
+        // Re-preparing the same choice with different parameters never reaches
+        // the ballot-intent guard, so the persistence transaction has to refuse
+        // it: the lifecycle could otherwise dispatch stale bytes and a later
+        // confirmation could attach that transaction to the replacement.
+        let mut replacement = recovery.clone();
+        replacement.r_vpk = [0x99; 32];
+        let error = store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            0,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &serialize_recovery(&replacement).unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("journaled chain submission attempt"),
+            "{error}"
+        );
+
+        // Rewriting the identical generation stays idempotent.
+        store_recovery_json_for_vote(
+            &db,
+            ROUND_ID,
+            0,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            Some(&commitment),
+            &original,
+        )
+        .unwrap();
     }
 
     #[test]

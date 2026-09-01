@@ -243,9 +243,23 @@ impl ChainClient {
                     }
                 }
                 Ok(response) if response.status() == 200 || response.status() == 422 => {
+                    let status = response.status();
                     match validate_json_response(&response)
                         .and_then(|()| parse_confirmation(response))
-                    {
+                        .and_then(|confirmation| {
+                            // The protocol defines 422 as committed failure. A
+                            // 422 body claiming success contradicts its own
+                            // status, and an error response must never be able
+                            // to mutate confirmed voting state.
+                            if status == 422 && confirmation.code == 0 {
+                                Err(ChainError::Decode(
+                                    "HTTP 422 transaction result reported a success code"
+                                        .to_string(),
+                                ))
+                            } else {
+                                Ok(confirmation)
+                            }
+                        }) {
                         Ok(confirmation) => return Ok(ChainTxStatus::Committed(confirmation)),
                         // An unusable response is not confirmation, and it is not
                         // a reason to stop looking. Keep failing over so one
@@ -699,6 +713,29 @@ mod tests {
         // A reverse proxy's wrong-route page is not the chain saying "not yet
         // committed"; treating it as one would make a broken endpoint look
         // indefinitely uncommitted.
+        assert!(matches!(error, ChainError::Decode(_)), "got {error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_422_lookup_claiming_success_is_unusable() {
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            422,
+            r#"{"height":9,"code":0,"log":"","events":[]}"#,
+        )));
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://one.example".to_string()]).unwrap(),
+        );
+
+        let error = client
+            .transaction_status(LOOKUP_HASH, &|| false)
+            .await
+            .unwrap_err();
+
+        // 422 is committed failure by protocol. A body claiming success
+        // contradicts its own status, and an error response must never be able
+        // to mutate confirmed voting state.
         assert!(matches!(error, ChainError::Decode(_)), "got {error:?}");
     }
 
