@@ -214,6 +214,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- An atomic batch can no longer adopt a transaction hash already recorded for a
+  singleton submission of one of its own proposals.
+- A chain submission reservation whose timestamp lies in the future, as one made
+  before a backward clock correction does, no longer counts as fresh. It was
+  previously treated as in flight until the clock caught up and the grace period
+  ran again, freezing recovery replacement, ballot-intent changes, and pruning
+  for as long as the correction was large.
 - One transaction hash can no longer be recorded as both a delegation and a vote
   in the same bundle. They are two different transactions, and the confirmation
   parser rejecting the mismatch came too late to stop the hash becoming a
@@ -224,8 +231,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   no longer each find it free before either writes. The attempt keeps its
   ambiguity without a hash instead, so a stale or misbehaving endpoint can no
   longer permanently block a payload with a hash confirmation would refuse.
-- Confirmation writes now re-check cancellation after acquiring the database
-  connection and before opening their transaction, so a session invalidated
+- Confirmation writes now re-check cancellation after their immediate
+  transaction has taken SQLite's write lock and before any mutation, so a session invalidated
   while that acquisition waited can no longer have transaction hashes and tree
   positions persisted underneath it.
 - `store_delegation_tx_hash` now performs its hash-ownership check and its write

@@ -3123,6 +3123,17 @@ fn ensure_tx_hash_belongs_to_submission(
         if kind == "vote" && *carrier_proposal != i64::from(proposal_id) {
             return conflict("another proposal in this bundle");
         }
+        // A singleton's transaction is not a batch's, even for the proposal they
+        // share. `own_digest` is what says which this submission is: a batch
+        // member's recovery carries the digest, a singleton's does not, and a
+        // batch member can never be submitted as a singleton. Without this, a
+        // batch would adopt a singleton's hash for one of its own proposals, and
+        // reconciliation would then refuse the singleton `cast_vote` event as
+        // not describing the batch — with the hash already a candidate nothing
+        // retires.
+        if kind == "vote" && own_digest.is_some() {
+            return conflict("a singleton vote in this bundle");
+        }
         if kind == "vote_batch" {
             let carrier_digest = <[u8; 32]>::try_from(carrier_digest.as_slice()).ok();
             if own_digest.is_none() || own_digest != carrier_digest {

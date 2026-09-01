@@ -59,14 +59,20 @@ fn uncancellable<T>(confirmation: Option<T>) -> Result<T, VotingError> {
     })
 }
 
-/// Whether a durable confirmation write must be abandoned before it opens.
+/// Whether a durable confirmation write must be abandoned before it mutates.
 ///
-/// Called with the database connection already held and the transaction not yet
-/// opened. That is the only point where the answer is still both current and
-/// free: the caller's check ran before the connection was acquired, and
-/// acquiring it can block for as long as another writer holds it. An account
-/// switch or session invalidation arriving in that window must not have
-/// transaction hashes and tree positions persisted underneath it.
+/// Called with the immediate transaction already open and nothing written yet.
+/// That is the last point where the answer is both current and free, and there
+/// are two blocking acquisitions in front of it: this handle's connection mutex,
+/// held for as long as another writer on this handle holds it, and then SQLite's
+/// write lock, which `BEGIN IMMEDIATE` waits up to the busy timeout for when
+/// another connection to the same database holds it. A caller's check cannot
+/// cover either, so an account switch or session invalidation arriving during
+/// them would otherwise have transaction hashes and tree positions persisted
+/// underneath it.
+///
+/// Abandoning here costs nothing: the transaction has written nothing, so
+/// dropping it releases the lock with no rollback of consequence.
 fn cancelled_before_writing(cancel: &dyn Fn() -> bool) -> bool {
     cancel()
 }
@@ -153,14 +159,14 @@ fn record_delegation_confirmation(
 ) -> Result<bool, VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let mut conn = db.conn();
-    if cancelled_before_writing(cancel) {
-        return Ok(false);
-    }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::Internal {
             message: format!("delegation confirmation transaction failed: {e}"),
         })?;
+    if cancelled_before_writing(cancel) {
+        return Ok(false);
+    }
 
     if conflict == StoredHashConflict::ClearUnconfirmed {
         clear_unconfirmed_delegation_hash(
@@ -358,14 +364,14 @@ fn record_vote_batch_confirmation(
         VAN_NULLIFIERS_ATTRIBUTE,
     )?)?;
     let mut conn = db.conn();
-    if cancelled_before_writing(cancel) {
-        return Ok(false);
-    }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::Internal {
             message: format!("vote batch confirmation transaction failed: {e}"),
         })?;
+    if cancelled_before_writing(cancel) {
+        return Ok(false);
+    }
     let recoveries = crate::vote::load_vote_batch_recoveries_with_conn(
         &tx,
         wallet_id,
@@ -443,14 +449,14 @@ fn record_vote_confirmation(
 ) -> Result<bool, VotingError> {
     require_tx_hash(&confirmation.tx_hash)?;
     let mut conn = db.conn();
-    if cancelled_before_writing(cancel) {
-        return Ok(false);
-    }
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| VotingError::Internal {
             message: format!("vote confirmation transaction failed: {e}"),
         })?;
+    if cancelled_before_writing(cancel) {
+        return Ok(false);
+    }
 
     crate::vote::ensure_singleton_vote_update_with_conn(
         &tx,
@@ -1642,16 +1648,37 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmation_checks_cancellation_behind_the_connection_it_waits_for() {
-        let db = test_db();
+    fn a_confirmation_checks_cancellation_behind_every_lock_it_waits_for() {
+        // A file-backed database, because one of the two waits is for SQLite's
+        // write lock, which only another connection can hold.
+        let path = std::env::temp_dir().join(format!(
+            "zv-confirm-cancel-{}-{:?}.sqlite",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+        let db = VotingDb::open(&path_string).unwrap();
+        db.set_wallet_id(WALLET_ID);
+        db.create_round(crate::Network::Testnet, &round_params(), None)
+            .unwrap();
         insert_bundle(&db, 0);
-        let held = std::sync::atomic::AtomicBool::new(false);
-        // Runs where the real callback runs. The caller's own check is long
-        // past by now, and the connection this write needs is already held —
-        // `try_conn` returning `None` is that fact. Had the check stayed in
-        // front of the acquisition, the connection would still be free here.
+        let behind_both = std::sync::atomic::AtomicBool::new(false);
+        // Runs where the real callback runs. Both waits are already over by
+        // then: this handle's connection mutex is held, so `try_conn` finds
+        // nothing, and the immediate transaction holds SQLite's write lock, so a
+        // separate connection cannot take it either. A check in front of either
+        // acquisition would see both free.
         let cancel = || {
-            held.store(db.try_conn().is_none(), std::sync::atomic::Ordering::SeqCst);
+            let write_lock_held = {
+                let probe = rusqlite::Connection::open(&path).unwrap();
+                probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+                probe.execute_batch("BEGIN IMMEDIATE").is_err()
+            };
+            behind_both.store(
+                db.try_conn().is_none() && write_lock_held,
+                std::sync::atomic::Ordering::SeqCst,
+            );
             true
         };
 
@@ -1675,12 +1702,11 @@ mod tests {
             "a cancelled write reports no confirmation"
         );
         assert!(
-            held.load(std::sync::atomic::Ordering::SeqCst),
-            "the check must run behind the connection acquisition, not in front of it"
+            behind_both.load(std::sync::atomic::Ordering::SeqCst),
+            "the check must run behind both acquisitions, not in front of either"
         );
-        // Waiting for that connection can take as long as another writer holds
-        // it. Nothing may be persisted for an operation cancelled in the
-        // meantime.
+        // Either wait can last as long as another writer chooses. Nothing may be
+        // persisted for an operation cancelled in the meantime.
         let stored: Option<String> = db
             .conn()
             .query_row(
@@ -1691,6 +1717,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, None);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
     }
 
     #[test]

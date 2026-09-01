@@ -193,7 +193,17 @@ that cap a host could configure the distinction away.
 
 This test still reads the wall clock, and the heartbeat bounds rather than closes
 the window a clock step opens for a reader in another process. It is the weaker
-of the two, which is why it is never the only one. Note also what the SDK does
+of the two, which is why it is never the only one.
+
+The window is bounded above as well as below, because the clock can step
+backward. Every writer stamps from this machine's clock, so a stamp ahead of now
+is not a fresher reservation but one made before a correction; believed as a
+lower bound alone it would stay "fresh" until the clock caught up to it and then
+ran the whole grace period again — hours rather than the documented bound, with
+no in-memory registry to help once the process that made it has exited. A stamp
+more than one heartbeat ahead is therefore evidence of nothing. The duplicate
+POST that may follow is the bounded case this design already accepts: consensus
+nullifiers let at most one semantic action succeed, and the loser is retired. Note also what the SDK does
 *not* claim here: the lock that serializes one submission identity is
 process-wide, not machine-wide, so two processes running the lifecycle for the
 same identity are not serialized against each other at all, and a host that does
@@ -278,6 +288,10 @@ none. The transaction may still have committed; that stays visible as
    in autocommit they are two, and under WAL a check made outside the write lock
    reads a snapshot another writer has already moved past, so two writers
    recording the same hash for different bundles could both find no carrier. An
+   A singleton's transaction is not a batch's either, even for the proposal they
+   share: a batch adopting a singleton's hash would have reconciliation refuse
+   the singleton `cast_vote` event as not describing the batch, with the hash
+   already a candidate nothing retires.
    A delegation and a vote in one bundle are two different transactions, so
    sharing a hash is a contradiction whichever way round it is; that was once
    left to the confirmation parser, which refuses a `delegate_vote` event for a
@@ -749,13 +763,18 @@ hosts do not parse the log.
    pending. The check that follows the lookups covers the candidate-set rebuild
    and the live-attempt read together — both read state the classifications
    below them consume — so no classification is preceded by a database wait of
-   its own. The confirmation write checks once more itself, after it holds the
-   database connection and before it opens its transaction: the caller's check
+   its own. The confirmation write checks once more itself, after its immediate
+   transaction has taken SQLite's write lock and before it mutates anything.
+   There are two blocking acquisitions in front of that point — this handle's
+   connection mutex, and then the write lock, which `BEGIN IMMEDIATE` waits up
+   to the busy timeout for when another connection holds it — and the caller's
+   check covers neither: the caller's check
    necessarily runs before that acquisition, and acquiring the connection waits
    for however long another writer holds it. A session invalidated in that
    window must not have transaction hashes and tree positions persisted
    underneath it; the candidate stays journaled, so the next reconciliation
-   re-derives the confirmation this one declined to apply. The post-request check covers every result variant, not only a
+   re-derives the confirmation this one declined to apply. Abandoning there is
+   free: the transaction has written nothing. The post-request check covers every result variant, not only a
    committed success, because classifying a 404 or an error reports an outcome
    and classifying a committed failure retires evidence. A cancelled operation
    does neither: the candidate stays journaled, so the next reconciliation
@@ -1036,7 +1055,7 @@ state transitions.
   and `chain_submission::tests::reservation_accepts_the_matching_durable_generation`
   cover the in-transaction payload rebuild, including that a mismatch dispatches
   nothing and journals nothing.
-- `confirmation::tests::a_confirmation_checks_cancellation_behind_the_connection_it_waits_for`
+- `confirmation::tests::a_confirmation_checks_cancellation_behind_every_lock_it_waits_for`
   and `chain_submission::tests::cancellation_arriving_during_the_confirmation_wait_writes_nothing`
   cover the check inside the confirmation write, including that it runs behind
   the connection acquisition rather than in front of it.
@@ -1155,7 +1174,12 @@ state transitions.
   `the_accepted_hash_ownership_check_holds_the_write_lock` covers that check and
   the journaling sharing one transaction.
 - `storage::operations::tests::one_transaction_cannot_be_both_a_delegation_and_a_vote_in_one_bundle`
-  covers cross-kind reuse inside a bundle, in both directions.
+  covers cross-kind reuse inside a bundle, in both directions, and
+  `a_batch_cannot_adopt_a_singleton_hash_for_a_proposal_it_contains` covers
+  singleton-versus-batch reuse of one proposal's hash.
+- `chain_submission::tests::a_reservation_stamped_after_a_backward_clock_step_stops_covering`
+  covers the upper bound on a reservation's freshness, and
+  `a_reservation_this_process_awaits_survives_a_wall_clock_jump` the lower one.
 - `chain_submission::tests::a_committed_failure_does_not_override_hashless_ambiguity`,
   `every_committed_failure_candidate_is_retired`,
   `a_successful_candidate_survives_a_terminal_lookup_error`,

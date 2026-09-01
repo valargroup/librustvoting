@@ -2058,25 +2058,45 @@ fn known_hashes_with_conn(
 /// ambiguity by [`has_live_attempt`], which is unchanged, and as
 /// `AlreadySpentUnresolved` if a replacement is later refused on chain.
 pub(crate) fn can_still_learn_a_hash() -> Result<String, VotingError> {
+    let (floor, ceiling) = fresh_attempt_window()?;
     Ok(format!(
-        "(chain_tx_hash IS NOT NULL OR (state='attempting' AND updated_at >= {}))",
-        fresh_attempt_cutoff()?
+        "(chain_tx_hash IS NOT NULL \
+          OR (state='attempting' AND updated_at >= {floor} AND updated_at <= {ceiling}))"
     ))
 }
 
-/// The `:fresh_cutoff` bound [`can_still_learn_a_hash`] expects, as of now.
+/// The window of stamps [`can_still_learn_a_hash`] believes, as of now.
 ///
-/// A reservation touched at or after this instant may still be in flight; an
-/// older one cannot be, because no configurable request deadline reaches back
-/// this far. Every caller of the predicate must bind it.
+/// A reservation touched at or after the floor may still be in flight; an older
+/// one cannot be, because no configurable request deadline reaches back that far.
 ///
-/// This reads the wall clock, which can step. A forward jump larger than the
-/// grace period would age out a POST that is genuinely in flight, which is why
-/// it is the weaker of the two tests and never the only one: a reservation this
-/// process is waiting on is named by [`in_flight_attempt_ids`] and stays covered
-/// whatever the clock does.
-pub(crate) fn fresh_attempt_cutoff() -> Result<i64, VotingError> {
-    Ok(now_seconds()?.saturating_sub(INTERRUPTED_RESERVATION_GRACE_SECS))
+/// The ceiling is the other half of the same claim, and it exists because the
+/// clock can step backward. Every writer stamps from this machine's clock, so a
+/// stamp ahead of now is not a fresher reservation — it is a stamp made before
+/// the clock moved back. Believed as a lower bound alone, such a row stays
+/// "fresh" until the clock catches up to it and then runs the whole grace period
+/// again, which for a large correction is hours rather than the documented ten
+/// minutes, and the in-memory registry cannot rescue a process that has already
+/// exited. Freezing recovery replacement, ballot-intent changes, and pruning for
+/// that long is the worse outcome: a stamp outside the window is treated as
+/// evidence of nothing, and the duplicate POST that may follow is the bounded
+/// case this design already accepts, since consensus nullifiers let at most one
+/// semantic action succeed and the loser is retired.
+///
+/// One heartbeat of tolerance absorbs second-granularity rounding between the
+/// stamp and this read. Nothing legitimate stamps further ahead than that.
+///
+/// This reads the wall clock, which can also step forward. A forward jump larger
+/// than the grace period would age out a POST that is genuinely in flight, which
+/// is why this is the weaker of the two tests and never the only one: a
+/// reservation this process is waiting on is named by [`in_flight_attempt_ids`]
+/// and stays covered whatever the clock does.
+pub(crate) fn fresh_attempt_window() -> Result<(i64, i64), VotingError> {
+    let now = now_seconds()?;
+    Ok((
+        now.saturating_sub(INTERRUPTED_RESERVATION_GRACE_SECS),
+        now.saturating_add(FUTURE_STAMP_TOLERANCE_SECS),
+    ))
 }
 
 /// One submission this process has an outstanding POST for.
@@ -2201,6 +2221,13 @@ impl Drop for InFlightAttempt {
 /// the life of the round.
 const INTERRUPTED_RESERVATION_GRACE_SECS: i64 =
     2 * crate::chain::MAX_REQUEST_TIMEOUT.as_secs() as i64;
+
+/// How far ahead of now a reservation's stamp may be and still be believed.
+///
+/// Only enough to absorb second-granularity rounding between the stamp and the
+/// read. Anything further ahead is a clock that stepped backward, not a
+/// reservation from the future.
+const FUTURE_STAMP_TOLERANCE_SECS: i64 = RESERVATION_HEARTBEAT.as_secs() as i64;
 
 #[cfg(test)]
 pub(crate) fn interrupted_reservation_grace_secs() -> i64 {
@@ -4660,6 +4687,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored.as_deref(), Some(TX_HASH_2));
+    }
+
+    #[test]
+    fn a_reservation_stamped_after_a_backward_clock_step_stops_covering() {
+        let db = test_db();
+        {
+            let conn = db.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 4243, 1, &[0xCC; 32]).unwrap();
+        }
+        // A stamp far in the future, which is what a reservation made before the
+        // clock stepped backward looks like. A proposal id no other test uses:
+        // the in-flight registry is process-global.
+        let far_ahead = now_seconds().unwrap() + 6 * 3600;
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, 4243, X'', ?3, 'attempting', ?4, ?4)",
+                rusqlite::params![ROUND_ID, WALLET, vec![0xCC_u8; 32], far_ahead],
+            )
+            .unwrap();
+
+        let covered = {
+            let conn = db.conn();
+            attempt_protected_vote_rows(&conn, ROUND_ID, WALLET).unwrap()
+        };
+
+        // Believed as a lower bound alone, this row stays "fresh" until the
+        // clock catches up to it and then runs the whole grace period again —
+        // hours of frozen recovery replacement, ballot-intent changes, and
+        // pruning, with no in-memory registry to rescue it once the process that
+        // made it has exited. A stamp nothing legitimate could have written is
+        // evidence of nothing.
+        assert!(!covered.contains(&(0, 4243)), "{covered:?}");
     }
 
     #[test]

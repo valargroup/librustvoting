@@ -6890,6 +6890,44 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_cannot_adopt_a_singleton_hash_for_a_proposal_it_contains() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        let hash = "a".repeat(64);
+        // Proposal 1 has a singleton attempt carrying the hash, and also belongs
+        // to a batch. Ownership is asked on the batch's behalf.
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, 1, X'', ?3, ?4, 'accepted', 1, 1)",
+                rusqlite::params![ROUND_ID, W, vec![0xCC_u8; 32], hash],
+            )
+            .unwrap();
+        set_vote_recovery_json(&db, 1, &batch_recovery_json(0, 1, [0xD1; 32]));
+
+        let error =
+            queries::record_vote_submission(&db.conn(), ROUND_ID, W, 0, 1, &hash).unwrap_err();
+
+        // The singleton's transaction is not the batch's, even for the proposal
+        // they share. Adopting it would have reconciliation refuse the singleton
+        // `cast_vote` event as not describing the batch, with the hash already a
+        // candidate nothing retires.
+        assert!(
+            error
+                .to_string()
+                .contains("a singleton vote in this bundle"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn one_transaction_cannot_be_both_a_delegation_and_a_vote_in_one_bundle() {
         let db = test_db();
         db.init_round(Network::Testnet, &test_params(), None)
