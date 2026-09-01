@@ -132,16 +132,27 @@ system clock can make a live POST look abandoned and let cleanup erase the
 material its response is about to be confirmed against.
 
 A reservation this registry cannot know about — another process's, or one no
-registry will ever hold because its process is gone — falls back to age. A
-reservation is `attempting` only between its journaling and the classification
-that follows its POST, so it cannot outlive that call's request deadline by more
-than scheduling slop; one untouched for longer than any configurable deadline
-cannot be in flight. The grace period is derived from the largest deadline a host
+registry will ever hold because its process is gone — falls back to age. For that
+to mean anything, `updated_at` has to record that the *owner was alive*, not
+merely when the reservation was made: the two diverge exactly when the wall clock
+steps forward. So an outstanding reservation refreshes it on a heartbeat far
+shorter than the grace period, and only while it is still `attempting` and only
+under the wallet that reserved it. A reservation is `attempting` only between its
+journaling and the classification that follows its POST, so it cannot outlive
+that call's request deadline by more than scheduling slop; one untouched for
+longer than any configurable deadline, by an owner that would have refreshed it,
+is not in flight. The grace period is derived from the largest deadline a host
 may configure rather than chosen independently, and the client refuses a longer
 one: the coverage query cannot see a per-call client configuration, so without
-that cap a host could configure the distinction away. This test reads the wall
-clock and is therefore the weaker of the two, which is why it is never the only
-one.
+that cap a host could configure the distinction away.
+
+This test still reads the wall clock, and the heartbeat bounds rather than closes
+the window a clock step opens for a reader in another process. It is the weaker
+of the two, which is why it is never the only one. Note also what the SDK does
+*not* claim here: the lock that serializes one submission identity is
+process-wide, not machine-wide, so two processes running the lifecycle for the
+same identity are not serialized against each other at all, and a host that does
+that owns the mutual exclusion.
 
 Checking at query time rather than rewriting the row once is what makes the bound
 hold. A downgrade pass performed when the database is opened would leave a
@@ -426,9 +437,17 @@ hosts do not parse the log.
    error response can never mutate confirmed voting state. The same rule applies
    to broadcast responses: a 422 claiming success must not journal an accepted
    attempt or stop retries for a transaction that was not accepted.
-5. Invalid content type, oversized body, malformed JSON, or missing required
-   fields is an unusable response, not confirmation, and failover continues to
-   the remaining endpoints. One malformed endpoint therefore cannot hide a
+5. Invalid content type, oversized body, malformed JSON, missing required
+   fields, or a committed success whose events do not bind to the submission
+   being reconciled is an unusable response, not confirmation, and failover
+   continues to the remaining endpoints. Binding is checked inside the lookup so
+   it participates in failover: judging it only afterwards would let the first
+   endpoint to answer about the wrong transaction end the search, and stable
+   endpoint ordering would repeat that on every later call while another
+   configured endpoint could serve the real confirmation. Only successes are
+   judged this way — a nonzero code is definite evidence whatever its events say.
+   The checks that compare against persisted recovery stay in the confirmation
+   transaction, where they roll back with it. One malformed endpoint therefore cannot hide a
    committed result another endpoint can still serve. If no endpoint returns a
    usable transaction response, the unusable-response error is reported rather
    than `Pending`: an endpoint that answered about the transaction is stronger
@@ -590,6 +609,10 @@ state transitions.
 - Can a confirmation that fails validation still have destroyed a competing
   candidate's hash?
 - Can a wall-clock adjustment expire a reservation whose POST is still in flight?
+- Does an outstanding reservation keep proving its owner is alive, rather than
+  only recording when it was made?
+- Can one endpoint's confirmation for the wrong submission end a lookup that
+  another endpoint could still answer?
 - Is cancellation observed after a lookup returns, for every result variant and
   not only a committed success?
 - Can an accepted transaction hash be lost when journaling it fails?
@@ -654,6 +677,8 @@ state transitions.
   endpoint identity validation.
 - `chain::tests::spent_nullifier_classifier_is_narrow_and_case_insensitive`
   covers the compatibility classifier boundary.
+- `chain_submission::tests::an_unrelated_confirmation_fails_over_to_the_next_endpoint`
+  covers submission-specific event binding participating in endpoint failover.
 - `chain::tests::unusable_lookup_response_fails_over_to_next_endpoint` and
   `chain::tests::unusable_lookup_response_is_not_reported_as_pending` cover
   lookup failover past an unusable response and the refusal to downgrade one to
@@ -777,6 +802,9 @@ state transitions.
   `chain_submission::tests::a_reservation_this_process_awaits_survives_a_wall_clock_jump`
   covers the in-memory registry taking precedence over that bound, and its
   release afterwards.
+  `chain_submission::tests::a_heartbeat_marks_only_an_outstanding_reservation_as_still_owned`
+  covers the refresh that makes `updated_at` mean "the owner was alive", its
+  state and wallet scoping, and its margin against the grace period.
   `session::tests::a_stale_reservation_does_not_refuse_a_ballot_intent_change`
   covers the same bound at the ballot-intent guard.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`

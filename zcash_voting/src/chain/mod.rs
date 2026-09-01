@@ -242,6 +242,31 @@ impl ChainClient {
         tx_hash: &str,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainTxStatus, ChainError> {
+        self.transaction_status_where(tx_hash, cancel, &|_| true)
+            .await
+    }
+
+    /// [`transaction_status`](Self::transaction_status) with a caller-supplied
+    /// check on a committed result.
+    ///
+    /// A committed response that parses is still only a candidate answer: its
+    /// events may describe some other submission entirely, which a caller that
+    /// knows the submission can tell and this client cannot. Rejecting one here
+    /// rather than after the lookup keeps that judgement inside endpoint
+    /// failover — otherwise the first endpoint to return a structurally valid
+    /// but unrelated confirmation ends the search, and stable endpoint ordering
+    /// repeats that outcome on every later call while another configured
+    /// endpoint could have served the real one.
+    ///
+    /// `accepts` sees committed failures too, and should generally admit them:
+    /// a nonzero code is definite evidence about the transaction whatever its
+    /// events say.
+    pub async fn transaction_status_where(
+        &self,
+        tx_hash: &str,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+        accepts: &(dyn Fn(&ChainTxConfirmation) -> bool + Send + Sync),
+    ) -> Result<ChainTxStatus, ChainError> {
         let tx_hash = normalize_tx_hash(tx_hash)?;
         let mut saw_pending = false;
         let mut unusable_commit = None;
@@ -275,6 +300,11 @@ impl ChainClient {
                             if status == 422 && confirmation.code == 0 {
                                 Err(ChainError::Decode(
                                     "HTTP 422 transaction result reported a success code"
+                                        .to_string(),
+                                ))
+                            } else if !accepts(&confirmation) {
+                                Err(ChainError::Decode(
+                                    "transaction result does not describe this submission"
                                         .to_string(),
                                 ))
                             } else {

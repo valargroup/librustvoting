@@ -39,6 +39,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   persistence error. The transaction may commit and the hash is the only way to
   locate it, so returning the storage error alone discarded it. Hosts matching
   on `ChainLifecycleError` exhaustively must handle the new variant.
+- A committed transaction result whose events do not bind to the submission
+  being reconciled is treated as an unusable response, so endpoint failover
+  continues instead of ending the lookup. One endpoint answering about the wrong
+  transaction previously stopped the search, and stable endpoint ordering
+  repeated that on every later call.
+- An outstanding attempt reservation refreshes its `updated_at` on a heartbeat
+  while its POST is in flight, so the column records that its owner is alive
+  rather than only when it was reserved. This is what the coverage age test
+  reads, and the two diverge when the wall clock steps forward.
 - Cancellation is now observed as soon as each transaction-status request
   returns, for every result variant. A 404, a lookup error, or a committed
   failure arriving after cancellation was previously still classified, which

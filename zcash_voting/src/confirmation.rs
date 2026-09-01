@@ -498,6 +498,32 @@ fn require_vote_recovery_json(
     }
 }
 
+/// Whether a committed transaction's events bind it to this delegation.
+///
+/// The identity-only half of confirmation validation: it needs no database, so a
+/// lookup can apply it while it still has other endpoints to try. The remaining
+/// checks — the ones that compare against persisted recovery — stay in the
+/// confirmation transaction.
+pub(crate) fn delegation_events_bind(tx_hash: &str, round_id: &str, events: &[TxEvent]) -> bool {
+    parse_delegation_confirmation_for_round(tx_hash, round_id, events).is_ok()
+}
+
+/// Whether a committed transaction's events bind it to this singleton vote.
+pub(crate) fn vote_events_bind(tx_hash: &str, round_id: &str, events: &[TxEvent]) -> bool {
+    parse_vote_confirmation_for_round(tx_hash, round_id, events).is_ok()
+}
+
+/// Whether a committed transaction's events bind it to this atomic batch.
+pub(crate) fn vote_batch_events_bind(
+    tx_hash: &str,
+    round_id: &str,
+    events: &[TxEvent],
+    expected_batch_digest: &[u8; 32],
+) -> bool {
+    parse_vote_batch_confirmation_for_round(tx_hash, round_id, events)
+        .is_ok_and(|confirmation| confirmation.batch_digest.as_slice() == expected_batch_digest)
+}
+
 fn parse_delegation_confirmation_for_round(
     tx_hash: &str,
     round_id: &str,

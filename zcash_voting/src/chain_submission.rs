@@ -518,10 +518,27 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 return Ok(self.cancelled_outcome(wallet_id, &identity, &last_unknown)?);
             }
 
-            let result = self
-                .client
-                .post_once(attempt_index, identity.kind.endpoint(), body.clone())
-                .await;
+            let result = {
+                // While the POST is outstanding, refresh the reservation's
+                // `updated_at`. Without this the column means "when this was
+                // reserved", and the age test downstream would be reading it as
+                // "the owner was alive at this time" — the two diverge exactly
+                // when the wall clock steps forward, and a reader in another
+                // process, which cannot see this process's in-memory registry,
+                // has nothing else to go on.
+                let post =
+                    self.client
+                        .post_once(attempt_index, identity.kind.endpoint(), body.clone());
+                tokio::pin!(post);
+                loop {
+                    tokio::select! {
+                        outcome = &mut post => break outcome,
+                        _ = tokio::time::sleep(RESERVATION_HEARTBEAT) => {
+                            touch_attempt(self.db, wallet_id, attempt_id);
+                        }
+                    }
+                }
+            };
             match result {
                 Ok(ChainBroadcastOutcome::Accepted(result)) => {
                     // The hash must not go down with a storage failure: it is
@@ -719,7 +736,17 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             if cancel() {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
-            let status = self.client.transaction_status(hash, cancel).await;
+            // A committed response that parses may still describe some other
+            // submission. Judging that inside the lookup keeps it part of
+            // endpoint failover, so one endpoint answering about the wrong
+            // transaction cannot end the search for a confirmation another
+            // endpoint can still serve.
+            let binds =
+                |confirmation: &ChainTxConfirmation| events_bind_to(identity, hash, confirmation);
+            let status = self
+                .client
+                .transaction_status_where(hash, cancel, &binds)
+                .await;
             // Cancellation can arrive while a status request is in flight. Every
             // branch below either classifies the submission or retires failure
             // evidence, and a cancelled operation must do neither: the candidate
@@ -1096,6 +1123,32 @@ fn reserve_attempt(
     Ok(id)
 }
 
+/// How often an outstanding reservation refreshes its `updated_at`.
+///
+/// Far below [`INTERRUPTED_RESERVATION_GRACE_SECS`], so a reservation whose
+/// owner is alive stays comfortably inside the grace period however the wall
+/// clock moves, and far above the cost of the write, which most calls never
+/// perform at all: the default request deadline is ten seconds.
+const RESERVATION_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Marks an outstanding reservation as still owned, best effort.
+///
+/// Deliberately infallible. This is a liveness hint for readers that cannot see
+/// this process's in-memory registry; failing a submission because the hint
+/// could not be written would trade a real transaction for a bookkeeping error.
+/// A missed refresh only costs the reservation its cross-process coverage once
+/// the grace period elapses, and only if the clock has moved that far.
+fn touch_attempt(db: &VotingDb, wallet_id: &str, attempt_id: i64) {
+    let Ok(now) = now_seconds() else {
+        return;
+    };
+    let _ = db.conn().execute(
+        "UPDATE chain_submission_attempts SET updated_at=:now
+          WHERE id=:id AND wallet_id=:wallet_id AND state='attempting'",
+        named_params! { ":now": now, ":id": attempt_id, ":wallet_id": wallet_id },
+    );
+}
+
 /// Records one attempt's classified outcome.
 ///
 /// Scoped by the wallet captured when the attempt was reserved, not by the
@@ -1237,6 +1290,45 @@ fn retire_failed_candidate(
     }
     tx.commit()
         .map_err(internal("commit failed candidate retirement"))
+}
+
+/// Whether a committed transaction's events describe this submission.
+///
+/// Only successes are judged. A nonzero code is definite evidence about the
+/// transaction whatever its events say, and a committed failure carries none of
+/// the bindings this checks, so rejecting one would turn proven failure into an
+/// unusable response and keep the candidate blocking a replacement forever.
+///
+/// This is the identity-only half of confirmation validation, which is all a
+/// lookup can apply: the checks that compare against persisted recovery belong
+/// in the confirmation transaction, where they roll back with it.
+fn events_bind_to(
+    identity: &ChainSubmissionIdentity,
+    tx_hash: &str,
+    confirmation: &ChainTxConfirmation,
+) -> bool {
+    if confirmation.code != 0 {
+        return true;
+    }
+    match identity.kind {
+        ChainSubmissionKind::Delegation => crate::confirmation::delegation_events_bind(
+            tx_hash,
+            &identity.round_id,
+            &confirmation.events,
+        ),
+        ChainSubmissionKind::Vote => {
+            crate::confirmation::vote_events_bind(tx_hash, &identity.round_id, &confirmation.events)
+        }
+        ChainSubmissionKind::VoteBatch => match identity.batch_digest {
+            Some(digest) => crate::confirmation::vote_batch_events_bind(
+                tx_hash,
+                &identity.round_id,
+                &confirmation.events,
+                &digest,
+            ),
+            None => false,
+        },
+    }
 }
 
 /// Every chain transaction hash that could identify this submission.
@@ -2200,6 +2292,18 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    fn journal_vote_attempt(db: &VotingDb, state: &str, tx_hash: Option<&str>) {
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 0, 3, X'', ?3, ?4, ?5, 1, 1)",
+                rusqlite::params![ROUND_ID, WALLET, vec![0xCC_u8; 32], tx_hash, state],
+            )
+            .unwrap();
     }
 
     fn attempt_states(db: &VotingDb) -> Vec<String> {
@@ -3401,37 +3505,39 @@ mod tests {
     #[tokio::test]
     async fn a_confirmation_that_fails_validation_keeps_the_competing_hash() {
         let db = test_db();
-        // A valid candidate hash a legacy recording call wrote. It is a real
-        // reconciliation source, so losing it would lose the only record of a
-        // transaction that may yet commit.
-        db.conn()
-            .execute(
-                "UPDATE bundles SET delegation_tx_hash=?3
-                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+        // A vote row carrying a competing unconfirmed hash a legacy recording
+        // call wrote, and no recovery JSON — so confirmation gets past the
+        // event checks and then fails inside its own transaction, which is where
+        // the validation that needs durable state lives.
+        {
+            let conn = db.conn();
+            queries::store_vote(&conn, ROUND_ID, WALLET, 0, 3, 1, &[0xCC; 32]).unwrap();
+            conn.execute(
+                "UPDATE votes SET tx_hash=?3
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=3",
                 rusqlite::params![ROUND_ID, WALLET, TX_HASH_2],
             )
             .unwrap();
-        journal_attempt(&db, "accepted", Some(TX_HASH));
+        }
+        journal_vote_attempt(&db, "accepted", Some(TX_HASH));
         let transport = Arc::new(MockTransport::default());
-        // A faulty endpoint reports success for our candidate but returns events
-        // that bind to a different round, so confirmation must refuse them.
         let events = serde_json::to_string(&vec![crate::confirmation::TxEvent {
-            event_type: "delegate_vote".to_string(),
+            event_type: "cast_vote".to_string(),
             attributes: vec![
                 crate::confirmation::TxEventAttribute {
                     key: "vote_round_id".to_string(),
-                    value: "9".repeat(64),
+                    value: ROUND_ID.to_string(),
                 },
                 crate::confirmation::TxEventAttribute {
                     key: "leaf_index".to_string(),
-                    value: "5".to_string(),
+                    value: "5,7".to_string(),
                 },
             ],
         }])
         .unwrap();
         // `known_hashes` reads the domain column before the journal, so the
         // competing candidate is queried first and is still pending; the
-        // journaled candidate is the one that comes back committed.
+        // journaled candidate comes back committed.
         transport.responses.lock().unwrap().extend([
             Ok(response(404, r#"{"detail":"not found"}"#)),
             Ok(response(
@@ -3443,18 +3549,19 @@ mod tests {
         let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
 
         let result = lifecycle
-            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .reconcile(&ChainSubmissionIdentity::vote(ROUND_ID, 0, 3), &|| false)
             .await;
 
         assert!(result.is_err(), "got {result:?}");
         // Clearing happens inside the confirmation transaction and after the
-        // event validation, so a confirmation that turns out not to bind to this
-        // submission takes the clearing back with it.
+        // checks that can still reject it, so a confirmation that cannot be
+        // applied takes the clearing back with it and leaves the competing
+        // candidate available to the next reconciliation.
         let stored: Option<String> = db
             .conn()
             .query_row(
-                "SELECT delegation_tx_hash FROM bundles
-                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                "SELECT tx_hash FROM votes
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0 AND proposal_id=3",
                 rusqlite::params![ROUND_ID, WALLET],
                 |row| row.get(0),
             )
@@ -3604,5 +3711,99 @@ mod tests {
         // The candidate is still journaled, so the next reconciliation
         // re-derives what this one was about to conclude.
         assert_eq!(attempt_states(&db), vec!["accepted".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_confirmation_fails_over_to_the_next_endpoint() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let transport = Arc::new(MockTransport::default());
+        // The first endpoint answers about this hash with a structurally valid
+        // committed success whose events belong to a different round.
+        let wrong = serde_json::to_string(&vec![crate::confirmation::TxEvent {
+            event_type: "delegate_vote".to_string(),
+            attributes: vec![
+                crate::confirmation::TxEventAttribute {
+                    key: "vote_round_id".to_string(),
+                    value: "9".repeat(64),
+                },
+                crate::confirmation::TxEventAttribute {
+                    key: "leaf_index".to_string(),
+                    value: "5".to_string(),
+                },
+            ],
+        }])
+        .unwrap();
+        let right = serde_json::to_string(&delegate_vote_events("5")).unwrap();
+        transport.responses.lock().unwrap().extend([
+            Ok(response(
+                200,
+                &format!(r#"{{"height":42,"code":0,"log":"","events":{wrong}}}"#),
+            )),
+            Ok(response(
+                200,
+                &format!(r#"{{"height":42,"code":0,"log":"","events":{right}}}"#),
+            )),
+        ]);
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&[
+                "https://one.example".to_string(),
+                "https://two.example".to_string(),
+            ])
+            .unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // Whether a committed result describes this submission is part of
+        // endpoint failover. Returning on the first structurally valid answer
+        // would let one endpoint's wrong events end the search, and stable
+        // endpoint ordering would repeat that on every later call while the
+        // second endpoint could serve the real confirmation all along.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::Confirmed { tx_hash, .. }
+                if tx_hash == TX_HASH),
+            "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_marks_only_an_outstanding_reservation_as_still_owned() {
+        let db = test_db();
+        let outstanding = journal_attempt(&db, "attempting", None);
+        let settled = journal_attempt(&db, "outcome_unknown", None);
+        db.conn()
+            .execute("UPDATE chain_submission_attempts SET updated_at=1", [])
+            .unwrap();
+
+        touch_attempt(&db, WALLET, outstanding);
+        touch_attempt(&db, WALLET, settled);
+        // A different account must not be able to refresh this reservation.
+        touch_attempt(&db, "someone-else", outstanding);
+
+        let stamps: Vec<i64> = db
+            .conn()
+            .prepare("SELECT updated_at FROM chain_submission_attempts ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // Only a reservation still awaiting its response is refreshed: the
+        // column has to mean "the owner was alive at this time", which is what
+        // the age test downstream reads it as.
+        assert!(stamps[0] > 1, "{stamps:?}");
+        assert_eq!(stamps[1], 1, "{stamps:?}");
+        // The refresh has to be frequent enough that a live reservation stays
+        // well inside the window the age test allows.
+        assert!(
+            RESERVATION_HEARTBEAT.as_secs() as i64 * 4 < INTERRUPTED_RESERVATION_GRACE_SECS,
+            "heartbeat must be far below the grace period"
+        );
     }
 }
