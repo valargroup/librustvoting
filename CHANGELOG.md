@@ -19,6 +19,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 - Session cleanup now preserves delegation setup fields for bundles with a
   successful proof so wallets can resume signing without regenerating ZKP1.
+  Existing databases whose released cleanup already erased those fields retain
+  the old proof bytes but rebuild setup and ZKP1 instead of reusing a proof that
+  can no longer be signed.
 
 ## v3.1.0-rc.15
 

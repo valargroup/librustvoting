@@ -8,6 +8,34 @@ use rusqlite::{named_params, OptionalExtension};
 
 use crate::{storage::VotingDb, types::VotingError};
 
+/// Correlated SQL expression for a successful ZKP #1 whose persisted setup can
+/// still be signed, submitted, and used by the later vote proof.
+const REUSABLE_DELEGATION_PROOF_SQL: &str = "EXISTS(
+    SELECT 1 FROM proofs p
+    WHERE p.round_id = b.round_id
+      AND p.wallet_id = b.wallet_id
+      AND p.bundle_index = b.bundle_index
+      AND p.success = 1
+      AND p.proof IS NOT NULL
+      AND b.van_comm_rand IS NOT NULL
+      AND b.dummy_nullifiers IS NOT NULL
+      AND b.rho_signed IS NOT NULL
+      AND b.padded_note_data IS NOT NULL
+      AND b.nf_signed IS NOT NULL
+      AND b.cmx_new IS NOT NULL
+      AND b.alpha IS NOT NULL
+      AND b.rseed_signed IS NOT NULL
+      AND b.rseed_output IS NOT NULL
+      AND b.gov_comm IS NOT NULL
+      AND b.total_note_value IS NOT NULL
+      AND b.address_index IS NOT NULL
+      AND b.rk IS NOT NULL
+      AND b.gov_nullifiers_blob IS NOT NULL
+      AND b.padded_note_secrets IS NOT NULL
+      AND b.pczt_sighash IS NOT NULL
+      AND b.tx1_effects IS NOT NULL
+)";
+
 /// Delegation lifecycle for one bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -86,7 +114,7 @@ impl SharePhase {
 }
 
 impl DelegationPhase {
-    /// Returns whether this phase requires a successful persisted ZKP #1.
+    /// Returns whether this phase can skip local ZKP #1 generation.
     ///
     /// Wallet integrations should use this method instead of matching phase
     /// variants themselves so future lifecycle phases retain crate-owned proof
@@ -165,11 +193,14 @@ impl VotingDb {
             })
     }
 
-    /// Returns whether one bundle has a successful persisted ZKP #1.
+    /// Returns whether one bundle can skip ZKP #1 generation.
     ///
-    /// A bundle that has not been prepared yet returns `false`. This makes the
-    /// query suitable for deciding whether a caller needs to connect to PIR
-    /// before bundle preparation begins.
+    /// A successful proof is reusable only while the persisted setup required
+    /// for signing, submission, and voting remains complete. Submitted and
+    /// confirmed bundles also return `true` because they no longer need local
+    /// proof generation. A bundle that has not been prepared yet returns
+    /// `false`, making this query suitable for deciding whether a caller needs
+    /// to connect to PIR before bundle preparation begins.
     pub fn has_persisted_delegation_proof(
         &self,
         round_id: &str,
@@ -187,21 +218,18 @@ impl VotingDb {
     ) -> Result<Option<DelegationPhase>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        conn.query_row(
+        let query = format!(
             "SELECT b.pczt_sighash IS NOT NULL OR b.rk IS NOT NULL,
-                        EXISTS(
-                            SELECT 1 FROM proofs p
-                            WHERE p.round_id = b.round_id
-                              AND p.wallet_id = b.wallet_id
-                              AND p.bundle_index = b.bundle_index
-                              AND p.success = 1
-                        ),
-                        b.delegation_tx_hash IS NOT NULL,
-                        b.van_leaf_position IS NOT NULL
-                 FROM bundles b
-                 WHERE b.round_id = :round_id
-                   AND b.wallet_id = :wallet_id
-                   AND b.bundle_index = :bundle_index",
+                    {REUSABLE_DELEGATION_PROOF_SQL},
+                    b.delegation_tx_hash IS NOT NULL,
+                    b.van_leaf_position IS NOT NULL
+             FROM bundles b
+             WHERE b.round_id = :round_id
+               AND b.wallet_id = :wallet_id
+               AND b.bundle_index = :bundle_index"
+        );
+        conn.query_row(
+            &query,
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
@@ -231,27 +259,20 @@ impl VotingDb {
     ) -> Result<Vec<(u32, DelegationPhase)>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let mut stmt = conn
-            .prepare(
-                "SELECT b.bundle_index,
-                        b.pczt_sighash IS NOT NULL OR b.rk IS NOT NULL,
-                        EXISTS(
-                            SELECT 1 FROM proofs p
-                            WHERE p.round_id = b.round_id
-                              AND p.wallet_id = b.wallet_id
-                              AND p.bundle_index = b.bundle_index
-                              AND p.success = 1
-                        ),
-                        b.delegation_tx_hash IS NOT NULL,
-                        b.van_leaf_position IS NOT NULL
-                 FROM bundles b
-                 WHERE b.round_id = :round_id
-                   AND b.wallet_id = :wallet_id
-                 ORDER BY b.bundle_index",
-            )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to prepare delegation phases query: {e}"),
-            })?;
+        let query = format!(
+            "SELECT b.bundle_index,
+                    b.pczt_sighash IS NOT NULL OR b.rk IS NOT NULL,
+                    {REUSABLE_DELEGATION_PROOF_SQL},
+                    b.delegation_tx_hash IS NOT NULL,
+                    b.van_leaf_position IS NOT NULL
+             FROM bundles b
+             WHERE b.round_id = :round_id
+               AND b.wallet_id = :wallet_id
+             ORDER BY b.bundle_index"
+        );
+        let mut stmt = conn.prepare(&query).map_err(|e| VotingError::Internal {
+            message: format!("failed to prepare delegation phases query: {e}"),
+        })?;
 
         let rows = stmt
             .query_map(
@@ -472,6 +493,34 @@ mod tests {
         db
     }
 
+    fn store_complete_delegation_setup(db: &VotingDb, bundle_index: u32) {
+        let gov_nullifiers = vec![vec![0x0B; 32]; crate::governance::BUNDLE_NOTE_SLOTS];
+        crate::storage::queries::store_delegation_data_with_pczt_fields(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            bundle_index,
+            &[0x01; 32],
+            &[],
+            &[0x02; 32],
+            &[],
+            &[0x03; 32],
+            &[0x04; 32],
+            &[0x05; 32],
+            &[0x06; 32],
+            &[0x07; 32],
+            &[0x08; 32],
+            1,
+            0,
+            &[],
+            &[0x09; 32],
+            &crate::tx1::placeholder_tx1_effects(),
+            &[0x0A; 32],
+            &gov_nullifiers,
+        )
+        .unwrap();
+    }
+
     fn store_vote_recovery_fixture(
         db: &VotingDb,
         bundle_index: u32,
@@ -531,13 +580,7 @@ mod tests {
         );
         assert!(!db.has_persisted_delegation_proof(ROUND_ID, 0).unwrap());
 
-        db.conn()
-            .execute(
-                "UPDATE bundles SET pczt_sighash = X'01', rk = X'02'
-                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
-                rusqlite::params![ROUND_ID, WALLET_ID],
-            )
-            .unwrap();
+        store_complete_delegation_setup(&db, 0);
         assert_eq!(
             db.delegation_phase(ROUND_ID, 0).unwrap(),
             DelegationPhase::PcztBuilt
@@ -565,6 +608,23 @@ mod tests {
             DelegationPhase::Confirmed
         );
         assert!(db.has_persisted_delegation_proof(ROUND_ID, 0).unwrap());
+    }
+
+    #[test]
+    fn incomplete_successful_proof_is_not_reusable() {
+        let db = db_with_bundle();
+        crate::storage::queries::store_proof(&db.conn(), ROUND_ID, WALLET_ID, 0, &[0xAB; 96])
+            .unwrap();
+
+        assert_eq!(
+            db.delegation_phase(ROUND_ID, 0).unwrap(),
+            DelegationPhase::Prepared
+        );
+        assert!(!db.has_persisted_delegation_proof(ROUND_ID, 0).unwrap());
+        assert_eq!(
+            db.delegation_phases(ROUND_ID).unwrap(),
+            vec![(0, DelegationPhase::Prepared)]
+        );
     }
 
     #[test]
