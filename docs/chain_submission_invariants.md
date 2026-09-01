@@ -176,7 +176,9 @@ its reservation is removed, and neither does a rejected attempt.
    code is transitioned to rejected for the same reason, and so is the legacy
    domain hash it came from, which is also a reconciliation source. Every failed
    candidate a lookup discovers is retired, not only the one whose rejection is
-   reported, or the remainder would keep blocking a replacement. Clearing a
+   reported, or the remainder would keep blocking a replacement. That holds when
+   the lookup also finds a success: adopting it must not leave a duplicate's
+   proven failure live. Clearing a
    domain hash is scoped to an exact match on a row with no recorded
    confirmation position, so retirement can only remove a hash this
    reconciliation just proved failed.
@@ -497,7 +499,8 @@ state transitions.
 - Can a durable confirmation be downgraded by a later lookup, or missed by the
   spent-nullifier path?
 - Can a terminal lookup error on one candidate discard another that committed?
-- Is every failed candidate retired, or only the reported one?
+- Is every failed candidate retired, including when a success is adopted in the
+  same lookup?
 - Can a vote's recovery generation be replaced while an attempt covers it?
 - Can an HTTP 422 body claiming success be applied as confirmation, or journaled
   as an accepted broadcast?
@@ -592,7 +595,8 @@ state transitions.
   boundary between the two cancellation outcomes.
 - `chain_submission::tests::a_committed_failure_does_not_override_hashless_ambiguity`,
   `every_committed_failure_candidate_is_retired`,
-  `a_successful_candidate_survives_a_terminal_lookup_error`, and
+  `a_successful_candidate_survives_a_terminal_lookup_error`,
+  `adopting_a_success_still_retires_the_failed_candidates`, and
   `a_spent_nullifier_response_accepts_a_durable_confirmation` cover the
   reconciliation precedence and retirement rules.
 - `chain_submission::tests::a_recovery_row_identity_mismatch_is_refused_before_dispatch`

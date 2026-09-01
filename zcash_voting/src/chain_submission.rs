@@ -706,6 +706,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             if cancel() {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
+            // Duplicate attempts can produce one success and one or more
+            // failures. Adopting the success must not leave the failures live:
+            // they would keep protecting recovery rows and blocking bundle
+            // pruning even though this lookup proved they failed.
+            for (failed_hash, _) in &committed_failures {
+                retire_failed_candidate(self.db, wallet_id, identity, failed_hash)?;
+            }
             let confirmation = apply_confirmation(self.db, wallet_id, identity, &hash, &response)?;
             return Ok(ChainLifecycleOutcome::Confirmed {
                 tx_hash: hash,
@@ -2884,6 +2891,44 @@ mod tests {
 
         assert_eq!(outcome, ChainLifecycleOutcome::Cancelled);
         assert_eq!(*transport.posts.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn adopting_a_success_still_retires_the_failed_candidates() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        journal_attempt(&db, "accepted", Some(TX_HASH_2));
+        let transport = Arc::new(MockTransport::default());
+        let events = serde_json::to_string(&delegate_vote_events("5")).unwrap();
+        transport.responses.lock().unwrap().extend([
+            Ok(response(
+                200,
+                &format!(r#"{{"height":42,"code":0,"log":"","events":{events}}}"#),
+            )),
+            Ok(response(
+                200,
+                r#"{"height":43,"code":9,"log":"deliver failed","events":[]}"#,
+            )),
+        ]);
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::Confirmed { tx_hash, .. }
+                if tx_hash == TX_HASH),
+            "got {outcome:?}"
+        );
+        // The duplicate that failed must not stay live: it would keep
+        // protecting recovery rows and blocking bundle pruning.
+        assert_eq!(
+            attempt_states(&db),
+            vec!["accepted".to_string(), "rejected".to_string()]
+        );
     }
 
     #[test]
