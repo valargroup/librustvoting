@@ -1866,55 +1866,134 @@ pub(crate) fn attempt_protected_vote_rows(
     attempt_vote_rows(conn, round_id, wallet_id, &can_still_learn_a_hash()?)
 }
 
-/// Vote rows for which this SDK knows a chain transaction that may still commit.
+/// The journaled chain transaction for each vote row that has one.
 ///
-/// Narrower than coverage: it names only attempts that actually carry a hash, so
-/// something can be looked up. Restart planning uses it to send the host to
-/// reconciliation instead of telling it to submit a vote whose transaction is
-/// already pending.
-pub(crate) fn vote_rows_with_chain_candidate(
+/// The same evidence that decides a row has a pending candidate also yields the
+/// hash to poll, so restart planning cannot report one and then fail to find the
+/// other. Later attempts win, matching the order `known_hashes` returns them in.
+pub(crate) fn vote_candidate_hashes(
     conn: &rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
-) -> Result<BTreeSet<(u32, u32)>, VotingError> {
-    attempt_vote_rows(conn, round_id, wallet_id, "chain_tx_hash IS NOT NULL")
-}
-
-/// Bundles whose delegation has a journaled chain transaction that may still
-/// commit.
-///
-/// CheckTx acceptance deliberately leaves `bundles.delegation_tx_hash` null, so
-/// the journal is the only place this shows up. Restart planning that read the
-/// domain column alone reported such a bundle as still needing to be delegated,
-/// and for a software signer that means signing again: a second signature over
-/// the same setup is a different transaction, whose hash the first one's may be
-/// lost behind.
-pub(crate) fn delegation_bundles_with_chain_candidate(
-    conn: &rusqlite::Connection,
-    round_id: &str,
-    wallet_id: &str,
-) -> Result<BTreeSet<u32>, VotingError> {
+) -> Result<BTreeMap<(u32, u32), String>, VotingError> {
+    let mut hashes = BTreeMap::new();
+    let mut batch_hashes: BTreeMap<(u32, [u8; 32]), String> = BTreeMap::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, bundle_index, proposal_id, batch_digest, chain_tx_hash
+                   FROM chain_submission_attempts
+                  WHERE round_id=:round_id AND wallet_id=:wallet_id
+                    AND state<>'rejected' AND kind IN ('vote','vote_batch')
+                    AND chain_tx_hash IS NOT NULL
+                  ORDER BY id",
+            )
+            .map_err(internal("prepare vote candidate hash query"))?;
+        let rows = stmt
+            .query_map(
+                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(internal("query vote candidate hashes"))?;
+        for row in rows {
+            let (kind, bundle_index, proposal_id, digest, hash) =
+                row.map_err(internal("read vote candidate hash row"))?;
+            let Ok(bundle_index) = u32::try_from(bundle_index) else {
+                continue;
+            };
+            if kind == ChainSubmissionKind::Vote.as_str() {
+                if let Ok(proposal_id) = u32::try_from(proposal_id) {
+                    hashes.insert((bundle_index, proposal_id), hash);
+                }
+            } else if let Ok(digest) = <[u8; 32]>::try_from(digest.as_slice()) {
+                batch_hashes.insert((bundle_index, digest), hash);
+            }
+        }
+    }
+    if batch_hashes.is_empty() {
+        return Ok(hashes);
+    }
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT bundle_index FROM chain_submission_attempts
+            "SELECT bundle_index, proposal_id, commitment_bundle_json
+               FROM votes
               WHERE round_id=:round_id AND wallet_id=:wallet_id
-                AND kind='delegation' AND state<>'rejected'
-                AND chain_tx_hash IS NOT NULL",
+                AND commitment_bundle_json IS NOT NULL",
         )
-        .map_err(internal("prepare delegation candidate bundles query"))?;
+        .map_err(internal("prepare batch candidate membership query"))?;
     let rows = stmt
         .query_map(
             named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-            |row| row.get::<_, i64>(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
-        .map_err(internal("query delegation candidate bundles"))?;
-    let mut bundles = BTreeSet::new();
+        .map_err(internal("query batch candidate membership"))?;
     for row in rows {
-        if let Ok(bundle_index) = u32::try_from(row.map_err(internal("read candidate bundle"))?) {
-            bundles.insert(bundle_index);
+        let (bundle_index, proposal_id, json) =
+            row.map_err(internal("read batch candidate membership row"))?;
+        let (Ok(bundle_index), Ok(proposal_id)) =
+            (u32::try_from(bundle_index), u32::try_from(proposal_id))
+        else {
+            continue;
+        };
+        let Ok(recovery) = vote::parse_recovery(&json) else {
+            continue;
+        };
+        let Some(batch) = recovery.batch.as_ref() else {
+            continue;
+        };
+        if let Some(hash) = batch_hashes.get(&(bundle_index, batch.digest)) {
+            hashes
+                .entry((bundle_index, proposal_id))
+                .or_insert_with(|| hash.clone());
         }
     }
-    Ok(bundles)
+    Ok(hashes)
+}
+
+/// The journaled chain transaction for each bundle's delegation, where there is
+/// one. Paired with [`vote_candidate_hashes`]; see its note on sourcing.
+pub(crate) fn delegation_candidate_hashes(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+) -> Result<BTreeMap<u32, String>, VotingError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT bundle_index, chain_tx_hash FROM chain_submission_attempts
+              WHERE round_id=:round_id AND wallet_id=:wallet_id
+                AND kind='delegation' AND state<>'rejected'
+                AND chain_tx_hash IS NOT NULL
+              ORDER BY id",
+        )
+        .map_err(internal("prepare delegation candidate hash query"))?;
+    let rows = stmt
+        .query_map(
+            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(internal("query delegation candidate hashes"))?;
+    let mut hashes = BTreeMap::new();
+    for row in rows {
+        let (bundle_index, hash) = row.map_err(internal("read delegation candidate hash"))?;
+        if let Ok(bundle_index) = u32::try_from(bundle_index) {
+            hashes.insert(bundle_index, hash);
+        }
+    }
+    Ok(hashes)
 }
 
 fn attempt_vote_rows(

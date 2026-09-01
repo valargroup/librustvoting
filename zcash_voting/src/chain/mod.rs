@@ -276,7 +276,17 @@ impl ChainClient {
                 return Err(ChainError::Cancelled);
             }
             let url = join_url(endpoint, &["tx", &tx_hash])?;
-            match self.get(&url).await {
+            let response = self.get(&url).await;
+            // Cancellation can arrive while the request is in flight. Every
+            // branch below classifies the transaction, and a cancelled caller
+            // must not be handed a `Committed`, `Pending`, or endpoint error it
+            // asked to stop waiting for. Checked here rather than only in the
+            // lifecycle, because this client is a supported API in its own
+            // right.
+            if cancel() {
+                return Err(ChainError::Cancelled);
+            }
+            match response {
                 // A 404 is protocol evidence that the transaction is not yet
                 // committed, so it has to meet the same body-size and
                 // content-type rules as any other response. A reverse proxy's
@@ -683,6 +693,32 @@ mod tests {
             i64::try_from(MAX_REQUEST_TIMEOUT.as_secs()).unwrap()
                 < crate::chain_submission::interrupted_reservation_grace_secs(),
         );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_cancelled_in_flight_reports_cancelled() {
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            r#"{"height":42,"code":0,"log":"","events":[]}"#,
+        )));
+        let client = ChainClient::new(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        // Not cancelled when the request starts; cancelled by the time it
+        // returns.
+        let cancel = || cancelled.swap(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = client
+            .transaction_status(&"a".repeat(64), &cancel)
+            .await
+            .unwrap_err();
+
+        // This client is a supported API in its own right, so a caller that
+        // asked to stop waiting must not be handed the answer anyway.
+        assert!(matches!(error, ChainError::Cancelled), "{error}");
     }
 
     #[test]

@@ -174,7 +174,7 @@ impl VotingDb {
                     ":bundle_index": bundle_index as i64,
                 },
                 |row| {
-                    Ok(phase_from_columns(
+                    Ok((
                         row.get::<_, i64>(0)? != 0,
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
@@ -187,9 +187,21 @@ impl VotingDb {
                 message: format!("failed to load delegation phase: {e}"),
             })?;
 
-        phase.ok_or_else(|| VotingError::InvalidInput {
-            message: format!("bundle not found for round {round_id} index {bundle_index}"),
-        })
+        let (pczt, proved, has_hash, confirmed) =
+            phase.ok_or_else(|| VotingError::InvalidInput {
+                message: format!("bundle not found for round {round_id} index {bundle_index}"),
+            })?;
+        // The singular and plural getters must agree: a caller using this one
+        // would otherwise be told to sign or submit again for a bundle whose
+        // transaction is already pending.
+        let journaled =
+            crate::chain_submission::delegation_candidate_hashes(&conn, round_id, &wallet_id)?;
+        Ok(phase_from_columns(
+            pczt,
+            proved,
+            has_hash || journaled.contains_key(&bundle_index),
+            confirmed,
+        ))
     }
 
     /// Lists canonical delegation phases for all bundles in one round.
@@ -249,9 +261,8 @@ impl VotingDb {
         // already pending. Without this a restart plans `Delegate` for it, and
         // a software signer asked to sign again produces a different
         // transaction whose predecessor's hash may then be lost.
-        let submitted = crate::chain_submission::delegation_bundles_with_chain_candidate(
-            &conn, round_id, &wallet_id,
-        )?;
+        let submitted =
+            crate::chain_submission::delegation_candidate_hashes(&conn, round_id, &wallet_id)?;
         Ok(rows
             .into_iter()
             .map(|(bundle_index, pczt, proved, has_hash, confirmed)| {
@@ -260,7 +271,7 @@ impl VotingDb {
                     phase_from_columns(
                         pczt,
                         proved,
-                        has_hash || submitted.contains(&bundle_index),
+                        has_hash || submitted.contains_key(&bundle_index),
                         confirmed,
                     ),
                 )
@@ -293,7 +304,7 @@ impl VotingDb {
                     ":proposal_id": proposal_id as i64,
                 },
                 |row| {
-                    Ok(vote_phase_from_columns(
+                    Ok((
                         row.get::<_, i64>(0)? != 0,
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
@@ -303,7 +314,21 @@ impl VotingDb {
             .optional()
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to load vote phase: {e}"),
-            })?;
+            })?
+            .map(
+                |(has_hash, confirmed, prepared)| -> Result<_, VotingError> {
+                    // As above: the singular getter must agree with the plural one.
+                    let journaled = crate::chain_submission::vote_candidate_hashes(
+                        &conn, round_id, &wallet_id,
+                    )?;
+                    Ok(vote_phase_from_columns(
+                        has_hash || journaled.contains_key(&(bundle_index, proposal_id)),
+                        confirmed,
+                        prepared,
+                    ))
+                },
+            )
+            .transpose()?;
 
         phase.ok_or_else(|| VotingError::InvalidInput {
             message: format!(
@@ -351,7 +376,7 @@ impl VotingDb {
         // As for delegation: a vote whose transaction is already pending must
         // not be planned as one still to submit.
         let submitted =
-            crate::chain_submission::vote_rows_with_chain_candidate(&conn, round_id, &wallet_id)?;
+            crate::chain_submission::vote_candidate_hashes(&conn, round_id, &wallet_id)?;
         Ok(rows
             .into_iter()
             .map(
@@ -360,7 +385,7 @@ impl VotingDb {
                         bundle_index,
                         proposal_id,
                         vote_phase_from_columns(
-                            has_hash || submitted.contains(&(bundle_index, proposal_id)),
+                            has_hash || submitted.contains_key(&(bundle_index, proposal_id)),
                             confirmed,
                             prepared,
                         ),
@@ -605,6 +630,31 @@ mod tests {
         // A rejected attempt names a transaction that never entered the mempool,
         // so it must not stop the host from submitting.
         assert_ne!(
+            db.delegation_phases(ROUND_ID).unwrap(),
+            vec![(0, DelegationPhase::Submitted)]
+        );
+    }
+
+    #[test]
+    fn the_singular_getter_agrees_with_the_plural_one() {
+        let db = db_with_bundle();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                rusqlite::params![ROUND_ID, db.wallet_id(), vec![0xCC_u8; 32], "a".repeat(64)],
+            )
+            .unwrap();
+
+        // A caller using the singular API would otherwise be told to sign again
+        // for a bundle whose transaction is already pending.
+        assert_eq!(
+            db.delegation_phase(ROUND_ID, 0).unwrap(),
+            DelegationPhase::Submitted
+        );
+        assert_eq!(
             db.delegation_phases(ROUND_ID).unwrap(),
             vec![(0, DelegationPhase::Submitted)]
         );

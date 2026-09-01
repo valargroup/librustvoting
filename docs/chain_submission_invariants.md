@@ -363,8 +363,12 @@ created by the confirmed delegation.
    column null. Reading that column alone planned the delegation as still to be
    made, and a software signer asked to sign again produces a different
    transaction whose predecessor's hash may then be lost. Votes are planned the
-   same way. A rejected attempt names a transaction that never entered the
-   mempool, so it does not report submitted.
+   same way, and the singular phase getters agree with the plural ones, so a
+   host using either is told the same thing. A rejected attempt names a
+   transaction that never entered the mempool, so it does not report submitted.
+   The phase and the hash to poll come from one lookup: deriving the phase from
+   the journal while requiring the hash from the domain column turns the very
+   state this recovers into a planning failure.
 
 The crash guarantee differs by signer and transaction type:
 
@@ -470,17 +474,21 @@ hosts do not parse the log.
    two committed candidates.
 2. HTTP 200 is a committed transaction response and parses height, code, log,
    and events.
-3. HTTP 404 means not yet committed and may fail over to another endpoint. A
+3. Cancellation is observed as soon as each endpoint request returns, before
+   the response is classified. `ChainClient` is a supported API in its own
+   right, so this holds for a caller using it directly and not only for the
+   lifecycle wrapped around it.
+4. HTTP 404 means not yet committed and may fail over to another endpoint. A
    404 is protocol evidence, so it must satisfy the same body-size and
    content-type rules as any other response; an unusable one is evidence of
    nothing. Lookup gives each configured endpoint one attempt; it does not
    retry the same endpoint.
-4. A structured HTTP 422 transaction result is committed failure. A 422 body
+5. A structured HTTP 422 transaction result is committed failure. A 422 body
    reporting a success code contradicts its own status and is unusable, so an
    error response can never mutate confirmed voting state. The same rule applies
    to broadcast responses: a 422 claiming success must not journal an accepted
    attempt or stop retries for a transaction that was not accepted.
-5. Invalid content type, oversized body, malformed JSON, missing required
+6. Invalid content type, oversized body, malformed JSON, missing required
    fields, or a committed success whose events do not bind to the submission
    being reconciled is an unusable response, not confirmation, and failover
    continues to the remaining endpoints. Binding is checked inside the lookup so
@@ -495,21 +503,21 @@ hosts do not parse the log.
    usable transaction response, the unusable-response error is reported rather
    than `Pending`: an endpoint that answered about the transaction is stronger
    evidence than another endpoint's 404.
-6. Delegation confirmation uses `confirm_delegation_submission`; singleton vote
+7. Delegation confirmation uses `confirm_delegation_submission`; singleton vote
    uses `confirm_vote_submission`; atomic batch uses
    `confirm_vote_batch_submission`.
-7. A candidate whose status could not be read is reported as
+8. A candidate whose status could not be read is reported as
    `OutcomeUnknown`, never as `Pending`. A broken or incompatible endpoint must
    stay distinguishable from a genuine 404, and an unresolved candidate blocks
    rebroadcast exactly as a pending one does, because it may still commit.
-8. A confirmation another writer applies while these lookups are in flight
+9. A confirmation another writer applies while these lookups are in flight
    outranks every weaker answer. The entry shortcut runs before them, so the
    durable state is read again before reporting a terminal error, ambiguity,
    pending, or rejection: a lagging 404 would otherwise report `Pending`, and a
    different candidate's committed failure would report `Rejected`, for a
    submission that is now durably confirmed. Candidates proved failed are still
    retired on that path.
-9. Adopting a candidate this lookup proved committed clears any *different*
+10. Adopting a candidate this lookup proved committed clears any *different*
    unconfirmed hash in the domain column for that submission, inside the
    confirmation transaction and after the event validation. The domain writers
    refuse to overwrite a stored hash with a different one, so an opaque
@@ -527,12 +535,12 @@ hosts do not parse the log.
    record of a competing candidate. The standalone recording APIs keep refusing a
    contradicting stored hash, because a host passing one is reporting a
    contradiction it should see.
-10. The winning hash and event-derived positions are committed together by the
+11. The winning hash and event-derived positions are committed together by the
    existing confirmation transaction. Attempt evidence is retained separately;
    a crash on either side is recoverable because the attempt hash and the
    domain record are both idempotent and neither overwrites conflicting state.
-11. Atomic-batch members advance together or not at all.
-12. Event round, bundle, proposal order, batch digest, and nullifier bindings
+12. Atomic-batch members advance together or not at all.
+13. Event round, bundle, proposal order, batch digest, and nullifier bindings
     are validated by the existing confirmation parser before writes.
 
 ## Concurrency and cancellation invariants
@@ -721,6 +729,11 @@ state transitions.
 - Does in-memory ambiguity survive a database that has become unreadable?
 - Does restart planning see a journaled accepted transaction, or only the domain
   columns CheckTx acceptance leaves null?
+- Do the singular and plural phase getters agree about it?
+- Does a step that says "poll" always have a hash to poll, from the same lookup
+  that decided the phase?
+- Is cancellation observed by the public lookup client, not just by the
+  lifecycle?
 - Can a confirmed atomic-batch member be reported as a singleton confirmation?
 - Do an atomic batch's persisted proposal and nullifier bindings participate in
   endpoint failover?
@@ -837,9 +850,15 @@ state transitions.
   the cancellation check that follows it.
 - `chain_submission::tests::in_memory_ambiguity_survives_an_unreadable_database`
   covers ambiguity held in memory outliving the storage reads that describe it.
-- `phases::tests::an_accepted_journal_attempt_reports_a_submitted_phase` and
-  `a_rejected_journal_attempt_does_not_report_submitted` cover restart planning
-  reading the attempt journal, and its rejected-attempt boundary.
+- `phases::tests::an_accepted_journal_attempt_reports_a_submitted_phase`,
+  `a_rejected_journal_attempt_does_not_report_submitted`, and
+  `the_singular_getter_agrees_with_the_plural_one` cover restart planning
+  reading the attempt journal, its rejected-attempt boundary, and the two phase
+  APIs agreeing.
+- `session::tests::a_journal_only_acceptance_plans_polling_with_its_hash` covers
+  a polling step finding the hash the phase was derived from.
+- `chain::tests::a_lookup_cancelled_in_flight_reports_cancelled` covers the
+  public lookup client observing cancellation before it classifies a response.
 - `chain_submission::tests::a_retry_reconciliation_error_preserves_earlier_ambiguity`,
   `a_rejection_that_cannot_be_journaled_stays_unknown`,
   `a_rejection_path_lookup_error_preserves_earlier_ambiguity`, and

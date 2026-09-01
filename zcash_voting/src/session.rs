@@ -566,6 +566,15 @@ fn recovered_delegation_work_from_steps(
     delegation: &BTreeMap<u32, DelegationPhase>,
     steps: &[NextStep],
 ) -> Result<Vec<DelegationRecoveryWork>, VotingError> {
+    // CheckTx acceptance leaves the domain column null on purpose, so a bundle
+    // can reach the polling step with its only transaction hash in the attempt
+    // journal. Sourced from the same place the phase overlay reads, so a step
+    // that says "poll" always has something to poll.
+    let journaled = crate::chain_submission::delegation_candidate_hashes(
+        &db.conn(),
+        round_id,
+        &db.wallet_id(),
+    )?;
     let mut work = Vec::<DelegationRecoveryWork>::new();
     for step in steps {
         match *step {
@@ -590,6 +599,7 @@ fn recovered_delegation_work_from_steps(
                 })?;
                 let tx_hash = db
                     .get_delegation_tx_hash(round_id, bundle_index)?
+                    .or_else(|| journaled.get(&bundle_index).cloned())
                     .ok_or_else(|| {
                         missing_recovery_field(format!(
                             "poll delegation step missing tx_hash for round={round_id}, bundle={bundle_index}"
@@ -615,6 +625,11 @@ fn recovered_vote_work_from_steps(
     active_vote_batches: &BTreeMap<(u32, u32), ActiveVoteBatch>,
     steps: &[NextStep],
 ) -> Result<Vec<VoteRecoveryWork>, VotingError> {
+    // As for delegation: a vote can reach the polling step with its only
+    // transaction hash in the attempt journal, and the phase overlay that put it
+    // there reads the same map.
+    let journaled =
+        crate::chain_submission::vote_candidate_hashes(&db.conn(), round_id, &db.wallet_id())?;
     let mut work = Vec::<VoteRecoveryWork>::new();
     let mut pending_vote_confirmation_keys = BTreeSet::new();
     for step in steps {
@@ -679,6 +694,7 @@ fn recovered_vote_work_from_steps(
             } => {
                 let tx_hash = db
                     .get_vote_tx_hash(round_id, bundle_index, proposal_id)?
+                    .or_else(|| journaled.get(&(bundle_index, proposal_id)).cloned())
                     .ok_or_else(|| {
                         missing_recovery_field(format!(
                             "poll vote step missing tx_hash for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
@@ -699,6 +715,7 @@ fn recovered_vote_work_from_steps(
             } => {
                 let tx_hash = db
                     .get_vote_tx_hash(round_id, bundle_index, proposal_id)?
+                    .or_else(|| journaled.get(&(bundle_index, proposal_id)).cloned())
                     .ok_or_else(|| {
                         missing_recovery_field(format!(
                             "poll vote batch step missing tx_hash for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
@@ -1724,6 +1741,36 @@ mod tests {
                 },
             )
             .is_err());
+    }
+
+    #[test]
+    fn a_journal_only_acceptance_plans_polling_with_its_hash() {
+        let db = db_with_bundle();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                rusqlite::params![ROUND, W, vec![0xCC_u8; 32], "a".repeat(64)],
+            )
+            .unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[1]).unwrap();
+
+        // The phase overlay and the polling hash have to come from the same
+        // evidence. Reading the phase from the journal while requiring the hash
+        // from the domain column turns the state this is meant to recover into
+        // a hard planning failure.
+        assert_eq!(
+            plan.recovered_delegation_work,
+            vec![DelegationRecoveryWork {
+                kind: DelegationRecoveryWorkKind::PollDelegation,
+                bundle_index: 0,
+                phase: DelegationPhase::Submitted,
+                tx_hash: Some("a".repeat(64)),
+            }]
+        );
     }
 
     #[test]
