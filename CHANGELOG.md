@@ -29,8 +29,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   range that still holds a non-rejected attempt.
 - `normalize_tx_hash` no longer trims surrounding whitespace, so the client and
   the storage boundary share one exact definition of a transaction hash.
-- A recovered singleton vote payload is now validated against the storage row
-  it was loaded from before it can be serialized or dispatched.
+- A recovered vote payload, singleton or atomic-batch member, is now validated
+  against the storage row it was loaded from before it can be serialized or
+  dispatched.
+- `ChainLifecycleOutcome::AlreadyConfirmed` reports a submission confirmed by an
+  earlier call. It carries only the transaction hash, because an earlier
+  transaction's VAN position is not recoverable from the bundle's shared
+  pointer.
 
 ### Fixed
 

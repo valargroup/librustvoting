@@ -179,6 +179,17 @@ pub enum ChainLifecycleOutcome {
         confirmation: ChainConfirmation,
         reconciled: bool,
     },
+    /// This submission was confirmed by an earlier call, and its event-derived
+    /// positions are already recorded in the voting database.
+    ///
+    /// Distinct from [`ChainLifecycleOutcome::Confirmed`], which carries the
+    /// confirmation this call just parsed. The exact per-transaction VAN
+    /// position is not recoverable afterwards — `bundles.van_leaf_position` is a
+    /// single pointer that later confirmations on the same bundle advance — so
+    /// this variant reports the settled fact without inventing event data.
+    AlreadyConfirmed {
+        tx_hash: String,
+    },
     Pending {
         known_tx_hashes: Vec<String>,
     },
@@ -422,17 +433,8 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
         let existing = self.reconcile_locked(wallet_id, &identity, cancel).await?;
-        match &existing {
-            ChainLifecycleOutcome::Confirmed { .. }
-            | ChainLifecycleOutcome::Rejected { .. }
-            | ChainLifecycleOutcome::Cancelled => return Ok(existing),
-            // A known candidate that is pending, or whose status could not be
-            // read, must not be rebroadcast: it may still commit.
-            ChainLifecycleOutcome::Pending { known_tx_hashes }
-            | ChainLifecycleOutcome::OutcomeUnknown {
-                known_tx_hashes, ..
-            } if !known_tx_hashes.is_empty() => return Ok(existing),
-            _ => {}
+        if blocks_further_dispatch(&existing) {
+            return Ok(existing);
         }
 
         let digest: [u8; 32] = Sha256::digest(&body).into();
@@ -443,8 +445,12 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
             if attempt_index > 0 {
+                // Another process, or a concurrent legacy recording call, can
+                // record a candidate while this call is between attempts. Apply
+                // the same rule as the preflight below: a known candidate that
+                // may still commit stops this call from broadcasting again.
                 let reconciled = self.reconcile_locked(wallet_id, &identity, cancel).await?;
-                if matches!(reconciled, ChainLifecycleOutcome::Confirmed { .. }) {
+                if blocks_further_dispatch(&reconciled) {
                     return Ok(reconciled);
                 }
             }
@@ -494,7 +500,11 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     // received it. If an earlier attempt in this call may still
                     // commit, reporting a terminal rejection would let the host
                     // conclude the vote cannot land when it still can.
-                    if let Some(earlier) = last_unknown {
+                    // This attempt is already journaled as rejected, so any
+                    // remaining live attempt is an earlier one — from this call
+                    // or a previous one — that may still commit.
+                    if last_unknown.is_some() || has_live_attempt(self.db, wallet_id, &identity)? {
+                        let earlier = last_unknown.as_deref().unwrap_or("dispatched, no response");
                         return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                             known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
                             message: format!(
@@ -533,7 +543,10 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     if !error.is_retryable() || attempt_index + 1 == attempts {
                         // As above: a definite failure here cannot disprove an
                         // earlier attempt that may still commit.
-                        if error.is_ambiguous() || last_unknown.is_some() {
+                        if error.is_ambiguous()
+                            || last_unknown.is_some()
+                            || has_live_attempt(self.db, wallet_id, &identity)?
+                        {
                             let message = match &last_unknown {
                                 Some(earlier) => format!(
                                     "an earlier attempt's outcome is unknown ({earlier}); a later attempt failed: {error}"
@@ -547,7 +560,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                         }
                         return Err(error.into());
                     }
-                    last_unknown = Some(error.to_string());
+                    // A retryable failure is not automatically an ambiguous one.
+                    // A pre-dispatch transport failure had its reservation
+                    // deleted above, and HTTP 429 is journaled as rejected;
+                    // neither leaves a transaction that might commit.
+                    if error.is_ambiguous() {
+                        last_unknown = Some(error.to_string());
+                    }
                 }
             }
 
@@ -580,15 +599,23 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         // evidence there is, and it is durable. Re-querying the network could
         // only weaken it: a lagging or pruned endpoint answering 404 would
         // report a completed submission as indefinitely uncommitted.
-        if let Some((tx_hash, confirmation)) = durable_confirmation(self.db, wallet_id, identity)? {
-            return Ok(ChainLifecycleOutcome::Confirmed {
-                tx_hash,
-                confirmation,
-                reconciled: true,
-            });
+        if let Some(tx_hash) = durable_confirmation_hash(self.db, wallet_id, identity)? {
+            return Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash });
         }
         let hashes = known_hashes(self.db, wallet_id, identity)?;
         if hashes.is_empty() {
+            // A timeout or an unusable accepted response leaves an
+            // `outcome_unknown` attempt with no hash, and an interruption leaves
+            // an `attempting` one. Both mean a transaction may still commit, and
+            // that evidence has to survive across calls: reporting `Pending`
+            // would let a later call return a terminal rejection.
+            if has_live_attempt(self.db, wallet_id, identity)? {
+                return Ok(ChainLifecycleOutcome::OutcomeUnknown {
+                    known_tx_hashes: hashes,
+                    message: "an earlier attempt was dispatched without a usable response"
+                        .to_string(),
+                });
+            }
             return Ok(ChainLifecycleOutcome::Pending {
                 known_tx_hashes: hashes,
             });
@@ -672,17 +699,22 @@ impl<'a> ChainSubmissionLifecycle<'a> {
     }
 }
 
-/// The confirmation already recorded for this identity, if there is one.
+/// The transaction hash of a confirmation this lifecycle already applied.
 ///
-/// Reads only durable domain state: the transaction hash and the event-derived
-/// tree positions that the confirmation transaction commits together. A partial
-/// row means confirmation has not happened, so this returns `None` and normal
+/// Reads only durable domain state: a hash plus the event-derived tree position
+/// that the confirmation transaction commits alongside it. A partial row means
+/// confirmation has not happened, so this returns `None` and normal
 /// reconciliation continues.
-fn durable_confirmation(
+///
+/// Deliberately returns only the hash. `bundles.van_leaf_position` is a single
+/// mutable pointer that a later vote or batch on the same bundle advances, so an
+/// earlier transaction's own position is not recoverable from storage and must
+/// not be synthesized from it.
+fn durable_confirmation_hash(
     db: &VotingDb,
     wallet_id: &str,
     identity: &ChainSubmissionIdentity,
-) -> Result<Option<(String, ChainConfirmation)>, VotingError> {
+) -> Result<Option<String>, VotingError> {
     let conn = db.conn();
     let bundle: Option<(Option<String>, Option<i64>)> = conn
         .query_row(
@@ -700,23 +732,11 @@ fn durable_confirmation(
     let Some((delegation_tx_hash, van_leaf_position)) = bundle else {
         return Ok(None);
     };
-    let Some(van_leaf_position) = van_leaf_position.and_then(|value| u32::try_from(value).ok())
-    else {
+    if van_leaf_position.is_none() {
         return Ok(None);
-    };
+    }
     match identity.kind {
-        ChainSubmissionKind::Delegation => {
-            let Some(tx_hash) = delegation_tx_hash else {
-                return Ok(None);
-            };
-            Ok(Some((
-                tx_hash.clone(),
-                ChainConfirmation::Delegation(DelegationConfirmation {
-                    tx_hash,
-                    van_leaf_position,
-                }),
-            )))
-        }
+        ChainSubmissionKind::Delegation => Ok(delegation_tx_hash),
         ChainSubmissionKind::Vote => {
             let proposal_id = identity.require_proposal_id()?;
             let Some(state) = queries::load_vote_row_state(
@@ -729,21 +749,10 @@ fn durable_confirmation(
             else {
                 return Ok(None);
             };
-            let (Some(tx_hash), Some(vc_tree_position)) = (state.tx_hash, state.vc_tree_position)
-            else {
-                return Ok(None);
-            };
-            let Ok(vc_tree_position) = u64::try_from(vc_tree_position) else {
-                return Ok(None);
-            };
-            Ok(Some((
-                tx_hash.clone(),
-                ChainConfirmation::Vote(VoteConfirmation {
-                    tx_hash,
-                    van_leaf_position,
-                    vc_tree_position,
-                }),
-            )))
+            Ok(match (state.tx_hash, state.vc_tree_position) {
+                (Some(tx_hash), Some(_)) => Some(tx_hash),
+                _ => None,
+            })
         }
         ChainSubmissionKind::VoteBatch => {
             let batch_digest = identity.require_batch_digest()?;
@@ -761,8 +770,6 @@ fn durable_confirmation(
                 Err(error) => return Err(error),
             };
             let mut tx_hash: Option<String> = None;
-            let mut proposal_ids = Vec::with_capacity(recoveries.len());
-            let mut vc_tree_positions = Vec::with_capacity(recoveries.len());
             for recovery in &recoveries {
                 let Some(state) = queries::load_vote_row_state(
                     &conn,
@@ -774,11 +781,7 @@ fn durable_confirmation(
                 else {
                     return Ok(None);
                 };
-                let (Some(member_hash), Some(position)) = (state.tx_hash, state.vc_tree_position)
-                else {
-                    return Ok(None);
-                };
-                let Ok(position) = u64::try_from(position) else {
+                let (Some(member_hash), Some(_)) = (state.tx_hash, state.vc_tree_position) else {
                     return Ok(None);
                 };
                 // A batch advances together or not at all, so members that
@@ -786,22 +789,8 @@ fn durable_confirmation(
                 if tx_hash.get_or_insert_with(|| member_hash.clone()) != &member_hash {
                     return Ok(None);
                 }
-                proposal_ids.push(recovery.proposal_id);
-                vc_tree_positions.push(position);
             }
-            let Some(tx_hash) = tx_hash else {
-                return Ok(None);
-            };
-            Ok(Some((
-                tx_hash.clone(),
-                ChainConfirmation::VoteBatch(VoteBatchConfirmation {
-                    tx_hash,
-                    batch_digest: batch_digest.to_vec(),
-                    van_leaf_position,
-                    proposal_ids,
-                    vc_tree_positions,
-                }),
-            )))
+            Ok(tx_hash)
         }
     }
 }
@@ -1335,6 +1324,58 @@ pub(crate) fn attempt_protected_vote_rows(
         }
     }
     Ok(protected)
+}
+
+/// Whether an outcome means this call must not broadcast again.
+///
+/// A settled result speaks for itself, and a known candidate that is pending or
+/// unresolved may still commit. Used by both the preflight and the between-retry
+/// reconciliation so the two cannot drift apart.
+fn blocks_further_dispatch(outcome: &ChainLifecycleOutcome) -> bool {
+    match outcome {
+        ChainLifecycleOutcome::Confirmed { .. }
+        | ChainLifecycleOutcome::AlreadyConfirmed { .. }
+        | ChainLifecycleOutcome::Rejected { .. }
+        | ChainLifecycleOutcome::AlreadySpentUnresolved { .. }
+        | ChainLifecycleOutcome::Cancelled => true,
+        ChainLifecycleOutcome::Pending { known_tx_hashes }
+        | ChainLifecycleOutcome::OutcomeUnknown {
+            known_tx_hashes, ..
+        } => !known_tx_hashes.is_empty(),
+        ChainLifecycleOutcome::Accepted { .. } => true,
+    }
+}
+
+/// Whether a dispatched attempt may still commit.
+///
+/// `attempting` and `outcome_unknown` are exactly the states that mean "a
+/// request may have reached the chain without producing a usable response",
+/// including the hashless case a timeout or an interruption leaves behind.
+fn has_live_attempt(
+    db: &VotingDb,
+    wallet_id: &str,
+    identity: &ChainSubmissionIdentity,
+) -> Result<bool, VotingError> {
+    db.conn()
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM chain_submission_attempts
+                  WHERE round_id=:round_id AND wallet_id=:wallet_id
+                    AND kind=:kind AND bundle_index=:bundle_index
+                    AND proposal_id=:proposal_id AND batch_digest=:batch_digest
+                    AND state IN ('attempting','outcome_unknown')
+             )",
+            named_params! {
+                ":round_id": identity.round_id,
+                ":wallet_id": wallet_id,
+                ":kind": identity.kind.as_str(),
+                ":bundle_index": i64::from(identity.bundle_index),
+                ":proposal_id": identity.proposal_key(),
+                ":batch_digest": identity.batch_key(),
+            },
+            |row| row.get(0),
+        )
+        .map_err(internal("query live chain attempts"))
 }
 
 fn now_seconds() -> Result<i64, VotingError> {
@@ -2222,15 +2263,13 @@ mod tests {
         // The applied confirmation is durable and is the strongest evidence
         // there is; a later lookup must not be able to weaken it back to
         // "pending" after a restart or an endpoint switch.
+        // Reported without synthesizing event data: the per-transaction VAN
+        // position is not recoverable, because `bundles.van_leaf_position` is a
+        // single pointer that later confirmations on the bundle advance.
         assert_eq!(
             outcome,
-            ChainLifecycleOutcome::Confirmed {
+            ChainLifecycleOutcome::AlreadyConfirmed {
                 tx_hash: TX_HASH.to_string(),
-                confirmation: ChainConfirmation::Delegation(crate::wire::DelegationConfirmation {
-                    tx_hash: TX_HASH.to_string(),
-                    van_leaf_position: 5,
-                }),
-                reconciled: true,
             }
         );
         assert_eq!(*transport.gets.lock().unwrap(), 0, "no lookup is needed");
@@ -2413,6 +2452,146 @@ mod tests {
             "got {outcome:?}"
         );
         assert_eq!(*transport.posts.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_hashless_unknown_attempt_survives_across_calls() {
+        let db = test_db();
+        // A timeout or unusable accepted response leaves this behind.
+        journal_attempt(&db, "outcome_unknown", None);
+        let transport = Arc::new(MockTransport::default());
+        let client = accepted_client(transport.clone());
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+
+        let reconciled = lifecycle.reconcile(&identity, &|| false).await.unwrap();
+
+        // There is no hash to look up, but the attempt may still commit, so the
+        // durable evidence must not be reported as a plain pending submission.
+        assert!(
+            matches!(&reconciled, ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
+                if known_tx_hashes.is_empty()),
+            "got {reconciled:?}"
+        );
+
+        // A later call may retry, but a rejection of that retry cannot be
+        // terminal while the earlier attempt is still unresolved.
+        transport.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            r#"{"tx_hash":"","code":5,"log":"bad nonce"}"#,
+        )));
+        let outcome = lifecycle
+            .submit_body_locked(WALLET, identity, b"{}".to_vec(), &echo_rebuild, &|| false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
+                if message.contains("earlier attempt")),
+            "got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definite_pre_dispatch_failure_is_not_recorded_as_ambiguity() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            // Definitely never dispatched: its reservation is deleted.
+            Err(ChainTransportError::Transport("connection refused".into())),
+            Ok(response(
+                200,
+                r#"{"tx_hash":"","code":5,"log":"bad nonce"}"#,
+            )),
+        ]);
+        let config = ChainClientConfig::default()
+            .with_retry_delays(vec![Duration::from_millis(1)])
+            .unwrap();
+        let client = ChainClient::with_config(
+            transport.clone(),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            config,
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // Nothing was ever dispatched by the first attempt, so the rejection is
+        // the whole truth and must stay terminal.
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::Rejected {
+                code: 5,
+                log: "bad nonce".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_candidate_recorded_between_attempts_stops_further_dispatch() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            // First POST is ambiguous, so the call retries.
+            Ok(response(503, r#"{"message":"busy"}"#)),
+            // The between-attempt reconciliation finds a candidate another
+            // writer recorded, and its lookup says it is still pending.
+            Ok(response(404, r#"{"message":"not indexed"}"#)),
+        ]);
+        let config = ChainClientConfig::default()
+            .with_retry_delays(vec![Duration::from_millis(1)])
+            .unwrap();
+        let client = ChainClient::with_config(
+            transport.clone(),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            config,
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+
+        // Stand in for another process recording the hash while this call is
+        // between attempts: the cancellation hook is the only callback the
+        // lifecycle invokes mid-call, and it always reports "not cancelled".
+        let recorded = Mutex::new(false);
+        let record_after_first_post = || {
+            let mut recorded = recorded.lock().unwrap();
+            if !*recorded && *transport.posts.lock().unwrap() == 1 {
+                journal_attempt(&db, "accepted", Some(TX_HASH));
+                *recorded = true;
+            }
+            false
+        };
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                identity,
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &record_after_first_post,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::Pending {
+                known_tx_hashes: vec![TX_HASH.to_string()]
+            }
+        );
+        assert_eq!(
+            *transport.posts.lock().unwrap(),
+            1,
+            "a known candidate that may still commit stops further broadcasts"
+        );
     }
 
     #[test]

@@ -88,9 +88,22 @@ disprove an earlier attempt in the same call whose outcome is unknown, so the
 call reports `OutcomeUnknown` rather than a terminal result.
 
 A confirmation this lifecycle has already applied is durable, and it outranks
-any later network answer. Reconciliation reports it directly instead of
-re-deriving it from a lookup, so a lagging or pruned endpoint cannot downgrade
-a completed submission to "not yet committed" after a restart.
+any later network answer. Reconciliation reports it as `AlreadyConfirmed`
+instead of re-deriving it from a lookup, so a lagging or pruned endpoint cannot
+downgrade a completed submission to "not yet committed" after a restart. That
+outcome carries only the transaction hash: `bundles.van_leaf_position` is a
+single pointer that a later vote or batch on the same bundle advances, so an
+earlier transaction's own VAN position is not recoverable from storage and is
+never synthesized from it. `Confirmed` remains the outcome that carries the
+event data this call actually parsed.
+
+Ambiguity is durable too. An `attempting` or `outcome_unknown` attempt means a
+request may have reached the chain, and that holds whether or not a hash was
+learned: a timeout, an unusable accepted response, or a process interruption all
+leave one behind with no hash. Such an attempt keeps the submission
+`OutcomeUnknown` across calls, so a later call's rejection cannot be reported as
+terminal. A definitely pre-dispatch failure creates no such evidence, because
+its reservation is removed, and neither does a rejected attempt.
 
 ## Typed identity and payload invariants
 
@@ -110,7 +123,9 @@ a completed submission to "not yet committed" after a restart.
    the caller named, because the payload is serialized from the embedded
    identity while the attempt is journaled under the requested one. The
    reservation rebuild reproduces the same recovery, so it cannot catch this by
-   itself.
+   itself. Every atomic-batch member is bound the same way: the batch digest,
+   size, and ordering are all embedded in the same JSON, so they cannot witness
+   a row that disagrees with the recovery stored on it.
 4. Delegation accepts `SignedDelegationBundle`; singleton vote accepts a
    recovered `CommittedVote`; atomic vote accepts a recovered
    `SignedVoteBatch`. The SDK derives network fields from these types. A member
@@ -146,7 +161,10 @@ a completed submission to "not yet committed" after a restart.
    the fresh, definitely-unsent reservation.
 4. Timeout, failure after dispatch, response-body failure, unusable success,
    or process interruption preserves the attempt as outcome-unknown.
-5. The response classification is persisted before another attempt begins.
+5. The response classification is persisted before another attempt begins, and
+   the reconciliation between attempts applies the same dispatch gate as the
+   preflight. A candidate that another writer records mid-call therefore stops
+   further broadcasts, not only a confirmation.
 6. Repeated byte-identical attempts share a payload digest but remain distinct
    ordered attempts. A re-signed payload has a different digest.
 7. Accepted chain hashes and all earlier unknown attempts remain available for
@@ -458,6 +476,10 @@ state transitions.
 - Can weaker evidence overwrite accepted or confirmed evidence?
 - Can a later attempt's rejection hide an earlier attempt that may still commit?
 - Can a durable confirmation be downgraded by a later lookup?
+- Is any event-derived value synthesized from a shared mutable pointer?
+- Does a hashless dispatched attempt survive as ambiguity across calls?
+- Is a definitely pre-dispatch failure ever recorded as ambiguity?
+- Does a candidate recorded mid-call stop the remaining retries?
 - Can an unusable 404 be accepted as protocol evidence?
 - Is a recovered payload bound to the storage row it was journaled against?
 - Can late cancellation replace a completed request result?
@@ -525,7 +547,15 @@ state transitions.
 - `chain_submission::tests::an_earlier_unknown_attempt_survives_a_later_rejection`
   covers evidence precedence across attempts within one call.
 - `chain_submission::tests::a_durable_confirmation_is_not_downgraded_by_a_lagging_endpoint`
-  covers the durable-confirmation short circuit.
+  covers the durable-confirmation short circuit and its hash-only outcome.
+- `chain_submission::tests::a_hashless_unknown_attempt_survives_across_calls`
+  covers durable ambiguity with no learned hash.
+- `chain_submission::tests::a_definite_pre_dispatch_failure_is_not_recorded_as_ambiguity`
+  covers the boundary that keeps a definite rejection terminal.
+- `chain_submission::tests::a_candidate_recorded_between_attempts_stops_further_dispatch`
+  covers the between-retry dispatch gate.
+- `vote::tests::batch_recovery_is_bound_to_the_row_that_supplied_it` covers
+  per-member row binding for atomic batches.
 - `chain_submission::tests::a_recovery_row_identity_mismatch_is_refused_before_dispatch`
   covers binding a recovered payload to its storage row.
 - `round::tests::delete_skipped_bundles_refuses_to_prune_an_attempted_bundle` and

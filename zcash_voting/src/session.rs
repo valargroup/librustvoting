@@ -1454,13 +1454,18 @@ mod tests {
         let conn = db.conn();
         let rows = conn
             .execute(
-                "UPDATE votes SET commitment_bundle_json = :json, vc_tree_position = :pos
+                // `commitment` is written alongside the recovery JSON, the way
+                // the vote lifecycle writes them, so the row and its recovery
+                // stay bound to each other.
+                "UPDATE votes SET commitment_bundle_json = :json, commitment = :commitment,
+                        vc_tree_position = :pos
                  WHERE round_id = :round_id
                    AND wallet_id = :wallet_id
                    AND bundle_index = :bundle_index
                    AND proposal_id = :proposal_id",
                 named_params! {
-                    ":json": crate::vote::serialize_recovery(&recovery).unwrap(),
+                    ":json": crate::vote::serialize_recovery(recovery).unwrap(),
+                    ":commitment": crate::vote::stored_vote_commitment_bytes(recovery).unwrap(),
                     ":pos": vc_tree_position.map(|position| position as i64),
                     ":round_id": ROUND,
                     ":wallet_id": W,

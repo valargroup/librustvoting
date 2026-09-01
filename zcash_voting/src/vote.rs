@@ -2210,7 +2210,7 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
 ) -> Result<Vec<VoteRecoveryBundle>, VotingError> {
     let mut stmt = conn
         .prepare(
-            "SELECT commitment_bundle_json FROM votes
+            "SELECT proposal_id, choice, commitment, commitment_bundle_json FROM votes
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND commitment_bundle_json IS NOT NULL",
         )
@@ -2224,23 +2224,49 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
         )
         .map_err(|e| VotingError::Internal {
             message: format!("query vote batch recovery rows failed: {e}"),
         })?;
     let mut recoveries = Vec::new();
     for row in rows {
-        let recovery = parse_recovery(&row.map_err(|e| VotingError::Internal {
-            message: format!("read vote batch recovery row failed: {e}"),
-        })?)?;
+        let (row_proposal_id, row_choice, row_commitment, json) =
+            row.map_err(|e| VotingError::Internal {
+                message: format!("read vote batch recovery row failed: {e}"),
+            })?;
+        let recovery = parse_recovery(&json)?;
         if recovery
             .batch
             .as_ref()
-            .is_some_and(|batch| batch.digest == batch_digest)
+            .is_none_or(|batch| batch.digest != batch_digest)
         {
-            recoveries.push(recovery);
+            continue;
         }
+        let row_proposal_id =
+            u32::try_from(row_proposal_id).map_err(|_| VotingError::Internal {
+                message: format!("stored proposal_id must be non-negative, got {row_proposal_id}"),
+            })?;
+        // The batch's digest, size, and ordering are checked below, but they
+        // are all embedded in the same JSON. Bind each member to the row that
+        // supplied it as well, so a migrated or inconsistent row cannot make the
+        // batch dispatch one set of actions while confirmation updates another.
+        validate_recovery_matches_stored_vote(
+            &recovery,
+            round_id,
+            bundle_index,
+            row_proposal_id,
+            row_choice,
+            row_commitment.as_deref(),
+        )?;
+        recoveries.push(recovery);
     }
     recoveries.sort_by_key(|recovery| recovery.batch.as_ref().map(|batch| batch.index));
     let expected_size = recoveries
@@ -3858,18 +3884,29 @@ mod tests {
 
     fn db_with_two_action_recovery_batch() -> (VotingDb, [u8; 32]) {
         let db = db_with_vote();
-        queries::store_vote(&db.conn(), ROUND_ID, WALLET_ID, 0, 2, 1, &[0xCB; 32]).unwrap();
         let (digest, recoveries) = two_action_recovery_batch();
-        for (recovery, stored_commitment) in
-            recoveries.iter().zip([&[0xCA; 32][..], &[0xCB; 32][..]])
-        {
+        for recovery in recoveries.iter() {
+            // Each row carries the choice and derived commitment of the recovery
+            // stored on it, the way the vote lifecycle writes them, so members
+            // stay bound to their rows.
+            let commitment = stored_vote_commitment_bytes(recovery).unwrap();
+            queries::store_vote(
+                &db.conn(),
+                ROUND_ID,
+                WALLET_ID,
+                0,
+                recovery.proposal_id,
+                recovery.vote_decision,
+                &commitment,
+            )
+            .unwrap();
             store_recovery_json_for_vote(
                 &db,
                 ROUND_ID,
                 0,
                 recovery.proposal_id,
                 recovery.vote_decision,
-                Some(stored_commitment),
+                Some(&commitment),
                 &serialize_recovery(recovery).unwrap(),
             )
             .unwrap();
@@ -4011,6 +4048,32 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not match its record contents"));
+    }
+
+    #[test]
+    fn batch_recovery_is_bound_to_the_row_that_supplied_it() {
+        let (db, digest) = db_with_two_action_recovery_batch();
+        // A migrated or inconsistent row whose recovery JSON belongs to a
+        // different proposal. The digest, size, and ordering still agree,
+        // because they are embedded in the same JSON.
+        db.conn()
+            .execute(
+                "UPDATE votes SET commitment_bundle_json =
+                     (SELECT commitment_bundle_json FROM votes v2
+                       WHERE v2.round_id = votes.round_id AND v2.wallet_id = votes.wallet_id
+                         AND v2.bundle_index = votes.bundle_index AND v2.proposal_id = 2)
+                  WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0 AND proposal_id = 1",
+                rusqlite::params![ROUND_ID, WALLET_ID],
+            )
+            .unwrap();
+
+        let error =
+            load_vote_batch_recoveries_with_conn(&db.conn(), WALLET_ID, ROUND_ID, 0, digest)
+                .unwrap_err();
+
+        // Otherwise the batch would dispatch one set of actions while
+        // confirmation updated another.
+        assert!(error.to_string().contains("mismatch"), "{error}");
     }
 
     #[test]
