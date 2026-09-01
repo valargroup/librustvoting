@@ -1374,6 +1374,30 @@ mod tests {
     }
 
     #[test]
+    fn delete_skipped_bundles_refuses_even_a_rejected_delegation_attempt() {
+        let db = test_db("wallet-prune-rejected-delegation");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::new(1).unwrap())
+            .unwrap();
+        journal_delegation_attempt(&db, 1, "rejected");
+
+        let error = db.delete_skipped_bundles(ROUND_ID, 1).unwrap_err();
+
+        // Pruning cascades away `van_comm_rand`, which no retry can resample.
+        // A rejection is evidence about the one POST that received it, not proof
+        // that nothing this bundle dispatched ever reached the chain, so
+        // delegation setup leaves only through round or account deletion.
+        assert!(
+            error.to_string().contains("chain submission attempt"),
+            "{error}"
+        );
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 2);
+    }
+
+    #[test]
     fn delete_skipped_bundles_refuses_a_legacy_domain_candidate() {
         let db = test_db("wallet-prune-legacy-hash");
         let notes = vec![
@@ -1436,7 +1460,17 @@ mod tests {
         ];
         db.ensure_bundles_with_policy(ROUND_ID, &notes, BundlePolicy::new(1).unwrap())
             .unwrap();
-        journal_delegation_attempt(&db, 1, "rejected");
+        // A vote attempt: its rejection is definite for the transaction it
+        // names, and nothing about a vote is unrecoverable if the bundle goes.
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'vote', 1, 4, X'', ?3, 'rejected', 1, 1)",
+                rusqlite::params![ROUND_ID, db.wallet_id(), vec![0xCC_u8; 32]],
+            )
+            .unwrap();
 
         db.delete_skipped_bundles(ROUND_ID, 1).unwrap();
 

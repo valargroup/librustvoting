@@ -64,7 +64,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   on a transaction that never commits while the other does. `tx_hash` keeps its
   existing meaning, including opaque legacy identifiers the candidate set omits.
 - Reconciliation no longer reports a committed failure as terminal while a
-  candidate journaled during the lookup may still commit.
+  candidate journaled during the lookup may still commit, and the candidate list
+  it reports is rebuilt after retirement so a transaction just proven failed is
+  not handed back as pending.
+- `delete_skipped_bundles` refuses a bundle range holding a delegation attempt
+  of any kind, rejected included. Pruning cascades away `van_comm_rand`, which
+  no retry can resample, and a rejection is evidence about one POST rather than
+  proof that nothing the bundle dispatched reached the chain. Vote and batch
+  attempts keep their rejected-attempt boundary.
 - A spent-nullifier response no longer reports `AlreadySpentUnresolved` when its
   reconciliation settled nothing. That outcome asserts the known candidates were
   checked and none succeeded, so a cancelled or unreadable lookup is now

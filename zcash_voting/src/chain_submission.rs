@@ -1031,6 +1031,15 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 return Ok(ChainLifecycleOutcome::Cancelled);
             }
         }
+        // Retirement above just marked the proven failures `rejected`, so the
+        // set read before the lookup now names transactions the journal no
+        // longer treats as candidates. Reporting those back would have the host
+        // keep polling one this call proved had failed.
+        let hashes = if committed_failures.is_empty() {
+            hashes
+        } else {
+            known_hashes(self.db, wallet_id, identity)?
+        };
         if let Some((hash, response)) = successful.pop() {
             // The status request may have taken arbitrarily long. An account or
             // session invalidated while it was in flight must not have voting
@@ -1077,10 +1086,9 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // so anything `known_hashes` still returns is a transaction nobody
             // has disproved. `has_live_attempt` cannot see it, because a
             // candidate arrives `accepted`.
-            let remaining = known_hashes(self.db, wallet_id, identity)?;
-            if !remaining.is_empty() || has_live_attempt(self.db, wallet_id, identity)? {
+            if !hashes.is_empty() || has_live_attempt(self.db, wallet_id, identity)? {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                    known_tx_hashes: remaining,
+                    known_tx_hashes: hashes,
                     message: "another candidate for this submission may still commit".to_string(),
                 });
             }
@@ -5461,5 +5469,43 @@ mod tests {
         );
         drop(db);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_retired_candidate_is_not_reported_as_pending() {
+        let db = test_db();
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        journal_attempt(&db, "accepted", Some(TX_HASH_2));
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            // One candidate is proven to have failed at commit...
+            Ok(response(
+                422,
+                r#"{"height":42,"code":7,"log":"invalid proof","events":[]}"#,
+            )),
+            // ...while the other is genuinely not yet committed.
+            Ok(response(404, r#"{"detail":"not found"}"#)),
+        ]);
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // The retired candidate is no longer one the journal will offer, so
+        // handing it back would have the host keep polling a transaction this
+        // call just proved had failed.
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::Pending {
+                known_tx_hashes: vec![TX_HASH_2.to_string()],
+            }
+        );
+        assert_eq!(
+            attempt_states(&db),
+            vec!["rejected".to_string(), "accepted".to_string()]
+        );
     }
 }

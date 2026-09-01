@@ -2784,20 +2784,26 @@ pub fn delete_bundles_from(
     // journal row survives. A transaction that later commits could then be
     // neither rebuilt nor confirmed, even though the evidence that it may exist
     // is still on disk.
-    // Delegation attempts bar pruning whatever their evidence: pruning cascades
-    // away `van_comm_rand`, which no retry can resample, so an attempt that may
-    // have spent the bundle's governance nullifiers is reason enough. Vote
-    // attempts protect a confirmation that needs a transaction hash, so one that
-    // can no longer learn a hash protects nothing and must not bar pruning
-    // forever; see `chain_submission::can_still_learn_a_hash`.
+    // Delegation attempts bar pruning whatever their evidence, rejection
+    // included: pruning cascades away `van_comm_rand`, which no retry can
+    // resample, and a rejection is evidence about the one POST that received it
+    // rather than proof that nothing this bundle dispatched ever reached the
+    // chain. Explicit round or account deletion stays the one supported way to
+    // remove attempted delegation setup. Vote attempts instead protect a
+    // confirmation that needs a transaction hash, so one that can no longer
+    // learn a hash protects nothing and must not bar pruning forever; see
+    // `chain_submission::can_still_learn_a_hash`.
     let attempted: bool = tx
         .query_row(
             &format!(
                 "SELECT EXISTS(
                      SELECT 1 FROM chain_submission_attempts
                       WHERE round_id = :round_id AND wallet_id = :wallet_id
-                        AND bundle_index >= :from_index AND state <> 'rejected'
-                        AND (kind = 'delegation' OR {})
+                        AND bundle_index >= :from_index
+                        AND (
+                            kind = 'delegation'
+                            OR (state <> 'rejected' AND {})
+                        )
                  )",
                 crate::chain_submission::can_still_learn_a_hash()?
             ),

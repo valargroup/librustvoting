@@ -300,9 +300,14 @@ none. The transaction may still have committed; that stays visible as
    column null, so the attempt journal is the only evidence that a dispatched
    vote may still commit. Re-selecting the same choice is never refused.
 11. Partial bundle deletion is refused while any bundle in the pruned range has a
-    non-rejected delegation attempt, a vote or batch attempt that can still be
+    delegation attempt of any kind, a vote or batch attempt that can still be
     confirmed, or an unconfirmed domain hash that is itself a reconciliation
-    candidate. That last has no journal row behind it, so the attempt checks
+    candidate. A delegation attempt bars pruning even when it is rejected: that
+    rejection is evidence about the one POST that received it, not proof that
+    nothing this bundle dispatched ever reached the chain, and pruning cascades
+    away a `van_comm_rand` no retry can resample. Round or account deletion
+    stays the one supported way to remove attempted delegation setup, as the
+    delegation invariants require. That last has no journal row behind it, so the attempt checks
     cannot see it, and deleting the bundle would take both the candidate and the
     recovery a committed response needs; as in cleanup, only a real chain hash
     counts and a candidate proved failed is retired, which reopens pruning.
@@ -782,6 +787,10 @@ state transitions.
 - Can a member of an atomic batch be dispatched as a singleton vote?
 - Can a rejected or committed-failure candidate block a replacement payload
   forever?
+- Does a rejected delegation attempt still bar partial pruning, as the
+  delegation invariants require?
+- Are candidates retired during a lookup still reported back to the host as
+  pending?
 - Can bundle pruning delete the state a possibly-committed transaction needs?
 - Can an account switch mid-flight lose an accepted hash or write to the wrong
   wallet, including between a wallet check and the write it guards?
@@ -882,7 +891,9 @@ state transitions.
   phase was derived from, and `two_different_candidates_are_both_exposed` covers
   a status carrying both when the two sources disagree.
 - `chain_submission::tests::a_committed_failure_yields_to_a_candidate_journaled_during_the_lookup`
-  covers a rejection deferring to a candidate that arrived mid-lookup.
+  covers a rejection deferring to a candidate that arrived mid-lookup, and
+  `a_retired_candidate_is_not_reported_as_pending` covers the reported candidate
+  list being rebuilt after retirement.
 - `chain::tests::a_lookup_cancelled_in_flight_reports_cancelled` covers the
   public lookup client observing cancellation before it classifies a response.
 - `chain_submission::tests::a_retry_reconciliation_error_preserves_earlier_ambiguity`,
@@ -966,8 +977,9 @@ state transitions.
   `delete_skipped_bundles_prunes_past_a_rejected_attempt_and_its_journal_row`,
   `delete_skipped_bundles_still_refuses_a_hashless_delegation_attempt`,
   `delete_skipped_bundles_prunes_past_a_hashless_vote_attempt`,
-  `delete_skipped_bundles_refuses_a_legacy_domain_candidate`, and
-  `delete_skipped_bundles_prunes_past_an_opaque_legacy_identifier` cover the
+  `delete_skipped_bundles_refuses_a_legacy_domain_candidate`,
+  `delete_skipped_bundles_prunes_past_an_opaque_legacy_identifier`, and
+  `delete_skipped_bundles_refuses_even_a_rejected_delegation_attempt` cover the
   bundle-pruning guard, its rejected-attempt boundary, and the split between
   delegation's unconditional bar and a vote attempt that can never be confirmed.
 - `session::tests::ballot_intent_change_is_refused_while_a_vote_attempt_is_live`,
