@@ -117,12 +117,19 @@ intent, and bundle pruning for the life of the round.
 
 `attempting` is the one hashless state that may still learn a hash, because a
 POST dispatched by this process can still return one, and the covered rows are
-exactly what that response would be applied to. A reservation found in that state
-when the database is opened belongs to a process that died between the
-reservation and its response, so opening the database records it as
-`outcome_unknown`: this makes "a process interruption leaves it outcome-unknown"
-durable rather than merely descriptive. Evidence is unchanged by that downgrade —
-both states mean the same thing to every candidate and live-attempt query.
+exactly what that response would be applied to. That is a fact about a live
+process rather than about the database, so opening a database records as
+`outcome_unknown` exactly those `attempting` rows that predate this process's
+first open: no reservation this process could still be waiting on can be older
+than that, and one that is belongs to a process that died between its
+reservation and its response. This makes "a process interruption leaves it
+outcome-unknown" durable rather than merely descriptive. The downgrade is scoped
+that way rather than applied to every `attempting` row because opening a
+database is not the same as being the only handle on it — a second handle opened
+on the same file while a POST is in flight must not strip that POST's coverage,
+or its response could attach a hash and event positions to a generation replaced
+in the window the downgrade opened. Evidence is unchanged either way: both states
+mean the same thing to every candidate and live-attempt query.
 
 Dropping coverage cannot produce the mismatch the cleanup guards exist to
 prevent. Attaching a transaction's hash and event-derived positions to a
@@ -460,12 +467,15 @@ Schema version 18 adds `chain_submission_attempts`. Launch-version databases
 migrate in place and retain all existing round, delegation, vote, and helper
 state. A newer unsupported schema remains rejected.
 
-Opening the database records any leftover `attempting` reservation as
-`outcome_unknown`. The opening process has dispatched nothing, so such a row
-belongs to a process that died between its reservation and its response, and no
-response will ever arrive for it. This preserves its evidence and retires only
-the claim that a POST is still in flight, which is what distinguishes a hashless
-attempt that may still learn a transaction hash from one that cannot.
+Opening the database records as `outcome_unknown` any `attempting` reservation
+journaled before this process first opened one. No reservation this process could
+still be waiting on is that old, so such a row belongs to a process that died
+between its reservation and its response, and no response will ever arrive for
+it. A reservation this process could have made is left alone, so a second handle
+opened on the same file cannot strip an in-flight POST's coverage. Either way the
+attempt's evidence is preserved and only the claim that a POST is still in flight
+is retired, which is what distinguishes a hashless attempt that may still learn a
+transaction hash from one that cannot.
 
 Each attempt stores wallet, round, kind, bundle, proposal sentinel or batch
 digest, ordered attempt number, local payload digest, optional server chain
@@ -518,6 +528,7 @@ state transitions.
   recovery state, ballot intent, or bundle pruning?
 - Is a reservation left behind by an interrupted process still treated as a POST
   that may return a transaction hash?
+- Can opening a second database handle strip an in-flight POST's coverage?
 - Does dropping coverage for a hashless attempt still report its ambiguity?
 - Is attempt-based cleanup protection scoped to the attempted proposal or batch
   digest, rather than the whole bundle?
@@ -677,8 +688,9 @@ state transitions.
   for.
 - `storage::operations::tests::a_hashless_unknown_vote_attempt_does_not_freeze_recovery_state`
   covers the same rule at the recovery-cleanup boundary, and
-  `opening_the_database_downgrades_an_interrupted_reservation` covers the
-  interrupted-reservation downgrade.
+  `opening_the_database_downgrades_an_interrupted_reservation` and
+  `opening_a_second_handle_keeps_this_process_reservation_in_flight` cover the
+  interrupted-reservation downgrade and its live-process boundary.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
   covers storage-boundary hash canonicalization and idempotent replay.
 - storage migration tests cover version 18 fresh and in-place schemas, including

@@ -1307,17 +1307,40 @@ fn known_hashes(
 /// `AlreadySpentUnresolved` if a replacement is later refused on chain.
 pub(crate) const CAN_STILL_LEARN_A_HASH: &str = "(chain_tx_hash IS NOT NULL OR state='attempting')";
 
+/// When this process first opened a voting database.
+///
+/// Every reservation this process could still be waiting on was journaled after
+/// this instant, because [`reserve_attempt`] needs an open database. So the
+/// timestamp separates "a POST that may still return a transaction hash" from "a
+/// reservation whose process is gone" without a durable owner column.
+fn process_open_epoch() -> Result<i64, VotingError> {
+    static EPOCH: OnceLock<i64> = OnceLock::new();
+    if let Some(epoch) = EPOCH.get() {
+        return Ok(*epoch);
+    }
+    let now = now_seconds()?;
+    Ok(*EPOCH.get_or_init(|| now))
+}
+
 /// Downgrades reservations left behind by an interrupted process.
 ///
 /// An `attempting` row means "a POST is in flight and its response may still
-/// name a transaction hash". A process that is only now opening the database has
-/// no such request: any `attempting` row it finds belongs to a process that died
-/// between [`reserve_attempt`] and [`mark_attempt`], and no response will ever
-/// arrive for it. Recording that makes the state model's "a process interruption
-/// leaves it outcome-unknown" durable instead of merely descriptive, and stops
-/// the reservation from conferring [`CAN_STILL_LEARN_A_HASH`] coverage forever.
+/// name a transaction hash", which is a fact about a live process rather than
+/// about the database. A row that predates this process cannot be one: it was
+/// journaled by a process that died between [`reserve_attempt`] and
+/// [`mark_attempt`], and no response will ever arrive for it. Recording that
+/// makes the state model's "a process interruption leaves it outcome-unknown"
+/// durable instead of merely descriptive, and stops the reservation from
+/// conferring [`CAN_STILL_LEARN_A_HASH`] coverage forever.
 ///
-/// Evidence is unchanged: both states mean the same thing to
+/// Scoped to [`process_open_epoch`] rather than to every `attempting` row,
+/// because opening a database is not the same as being the only handle on it. A
+/// host that opens a second [`VotingDb`] on the same file while a POST is in
+/// flight would otherwise strip that POST's coverage, and the response could
+/// then attach its hash and event positions to a generation replaced in the
+/// window it opened.
+///
+/// Evidence is unchanged by the downgrade: both states mean the same thing to
 /// [`has_live_attempt`], [`known_hashes`], and every candidate query.
 pub(crate) fn mark_interrupted_attempts_unknown(
     conn: &rusqlite::Connection,
@@ -1325,9 +1348,9 @@ pub(crate) fn mark_interrupted_attempts_unknown(
     let now = now_seconds()?;
     conn.execute(
         "UPDATE chain_submission_attempts
-            SET state='outcome_unknown', updated_at=?1
-          WHERE state='attempting'",
-        rusqlite::params![now],
+            SET state='outcome_unknown', updated_at=:now
+          WHERE state='attempting' AND created_at < :epoch",
+        named_params! { ":now": now, ":epoch": process_open_epoch()? },
     )
     .map(|_| ())
     .map_err(internal("downgrade interrupted chain attempt reservations"))

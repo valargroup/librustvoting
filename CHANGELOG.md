@@ -34,9 +34,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   such an attempt protects nothing, and nothing ever retires one; their
   ambiguity is still reported as `OutcomeUnknown`. Delegation attempts keep
   protecting `van_comm_rand` unconditionally.
-- Opening the database records any `attempting` reservation left behind by an
-  interrupted process as `outcome_unknown`, making the documented interruption
-  transition durable without changing what the attempt is evidence of.
+- Opening the database records as `outcome_unknown` any `attempting` reservation
+  journaled before this process first opened one, making the documented
+  interruption transition durable without changing what the attempt is evidence
+  of. Reservations this process could still be waiting on are left alone, so a
+  second handle on the same file cannot strip an in-flight POST's coverage.
 - `normalize_tx_hash` no longer trims surrounding whitespace, so the client and
   the storage boundary share one exact definition of a transaction hash.
 - A recovered vote payload, singleton or atomic-batch member, is now validated
