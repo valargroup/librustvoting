@@ -216,6 +216,20 @@ blinding and a Merkle witness for that position, not `rho_signed` or the
 padding-note secrets. Public target delegation has no local hotkey secret and
 continues to sample a fresh VAN blinding.
 
+Wallets can construct a `DelegationRecoveryClient` from their route-aware GET
+transport and vote-chain endpoint list, then call
+`recover_confirmed_delegations` after an ordinary delegation submission reports
+that its governance nullifier was already spent and transaction-hash
+reconciliation finds no known transaction. The function reconstructs each
+canonical VAN, scans the existing paginated commitment-tree endpoint, checks
+that the pagination covers one consistent leaf sequence, and atomically stores
+the positions of exact matches. This scan is discovery only.
+The normal vote-tree sync still validates the complete tree and verifies each
+recovered VAN at its stored position before producing a ZKP #2 witness. Recovery
+doesn't add a happy-path query, a chain index, or a recovery table, and it
+doesn't reconstruct a transaction hash. It recovers only the initial VAN
+created by ZKP #1; it doesn't discover a successor VAN created by ZKP #2.
+
 ### How the signed note is made
 
 After deriving `rho_signed`, the wallet:

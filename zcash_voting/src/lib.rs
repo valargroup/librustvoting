@@ -21,6 +21,7 @@ pub mod config;
 pub mod confirmation;
 pub mod delegate;
 pub mod delegation_capability;
+pub mod delegation_recovery;
 pub mod error;
 pub mod governance;
 pub mod helper;
@@ -75,6 +76,10 @@ pub use delegation_capability::{
     DelegationCapabilityDigest, DelegationCapabilityV1, ExportedDelegationCapability,
     ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
+};
+pub use delegation_recovery::{
+    recover_confirmed_delegations, DelegationRecoveryClient, DelegationVanRecoveryError,
+    VoteTreeQueryFuture, VoteTreeQueryTransport,
 };
 pub use governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use note_bundling::{

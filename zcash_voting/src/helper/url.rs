@@ -18,23 +18,30 @@ use crate::types::VotingError;
 /// [`VotingError::InvalidInput`]. Validate helper configuration with it
 /// before submitting shares over the network.
 pub fn canonicalize_helper_base_url(value: &str) -> Result<String, VotingError> {
+    canonicalize_server_base_url(value, "helper")
+}
+
+pub(crate) fn canonicalize_server_base_url(
+    value: &str,
+    service: &str,
+) -> Result<String, VotingError> {
     let trimmed = value.trim();
     let mut url = Url::parse(trimmed).map_err(|error| VotingError::InvalidInput {
-        message: format!("invalid helper server url {trimmed:?}: {error}"),
+        message: format!("invalid {service} server url {trimmed:?}: {error}"),
     })?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(VotingError::InvalidInput {
-            message: format!("helper server url must be http or https, got {trimmed}"),
+            message: format!("{service} server url must be http or https, got {trimmed}"),
         });
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(VotingError::InvalidInput {
-            message: "helper server url must not contain credentials".to_string(),
+            message: format!("{service} server url must not contain credentials"),
         });
     }
     if url.query().is_some() || url.fragment().is_some() {
         return Err(VotingError::InvalidInput {
-            message: "helper server url must not contain a query or fragment".to_string(),
+            message: format!("{service} server url must not contain a query or fragment"),
         });
     }
 
@@ -43,7 +50,7 @@ pub fn canonicalize_helper_base_url(value: &str) -> Result<String, VotingError> 
             let domain = domain.to_string();
             url.set_host(Some(&domain))
                 .map_err(|error| VotingError::InvalidInput {
-                    message: format!("invalid helper server host in {trimmed}: {error}"),
+                    message: format!("invalid {service} server host in {trimmed}: {error}"),
                 })?;
         }
     }
@@ -55,12 +62,12 @@ pub fn canonicalize_helper_base_url(value: &str) -> Result<String, VotingError> 
     };
     if url.port() == default_port {
         url.set_port(None).map_err(|_| VotingError::InvalidInput {
-            message: format!("invalid helper server port in {trimmed}"),
+            message: format!("invalid {service} server port in {trimmed}"),
         })?;
     }
 
     let path = normalize_percent_escapes(url.path()).map_err(|_| VotingError::InvalidInput {
-        message: format!("invalid percent escape in helper server path {trimmed:?}"),
+        message: format!("invalid percent escape in {service} server path {trimmed:?}"),
     })?;
     url.set_path(&path);
 

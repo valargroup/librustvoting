@@ -37,6 +37,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the stored hotkey secret and exact round and bundle identity. Restoring that
   secret and using `recoverable_bundle_policy_v1()` reconstructs the same VAN
   after voting database loss without new authority-root or recovery tables.
+  `DelegationRecoveryClient` can then discover matching positions through the
+  existing public vote-tree query and a host-routed GET transport, without a
+  dedicated chain index or the vote-chain submission client. Normal vote-tree
+  sync validates each recovered position before ZKP #2.
 - Helper-share planning, persistence, submission, and recovery are now
   authoritative SDK responsibilities. Hosts provide authenticated helper
   configuration, round timing, transport, and cancellation.
