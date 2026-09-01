@@ -1070,13 +1070,18 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             });
         }
         if !committed_failures.is_empty() {
-            // A hashless attempt that may still commit outranks these
-            // rejections, which are definite only for the candidates they name.
-            if has_live_attempt(self.db, wallet_id, identity)? {
+            // These rejections are definite only for the candidates they name.
+            // A hashless attempt that may still commit outranks them, and so
+            // does a candidate another writer journaled while this lookup was
+            // running: retirement above marked the proven failures `rejected`,
+            // so anything `known_hashes` still returns is a transaction nobody
+            // has disproved. `has_live_attempt` cannot see it, because a
+            // candidate arrives `accepted`.
+            let remaining = known_hashes(self.db, wallet_id, identity)?;
+            if !remaining.is_empty() || has_live_attempt(self.db, wallet_id, identity)? {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                    known_tx_hashes: known_hashes(self.db, wallet_id, identity)?,
-                    message: "an earlier attempt was dispatched without a usable response"
-                        .to_string(),
+                    known_tx_hashes: remaining,
+                    message: "another candidate for this submission may still commit".to_string(),
                 });
             }
             let (_, failure) = committed_failures.remove(0);
@@ -1975,6 +1980,40 @@ pub(crate) fn vote_candidate_hashes(
             hashes
                 .entry((bundle_index, proposal_id))
                 .or_insert_with(|| hash.clone());
+        }
+    }
+    Ok(hashes)
+}
+
+/// Every chain transaction that could identify one bundle's delegation.
+///
+/// The union `known_hashes` reconciles: the legacy domain column and the attempt
+/// journal, canonicalized and deduplicated. A legacy writer recording one hash
+/// while a lifecycle POST journals another leaves two live candidates, and a
+/// caller shown only one of them can wait on a transaction that never commits
+/// while the other does.
+pub(crate) fn delegation_candidates(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Vec<String>, VotingError> {
+    let mut candidates = Vec::new();
+    if let Some(hash) = queries::get_delegation_tx_hash(conn, round_id, wallet_id, bundle_index)? {
+        candidates.push(hash);
+    }
+    if let Some(hash) =
+        delegation_candidate_hashes(conn, round_id, wallet_id)?.remove(&bundle_index)
+    {
+        candidates.push(hash);
+    }
+    let mut hashes: Vec<String> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Ok(canonical) = crate::chain::normalize_tx_hash(&candidate) else {
+            continue;
+        };
+        if !hashes.contains(&canonical) {
+            hashes.push(canonical);
         }
     }
     Ok(hashes)
@@ -5342,6 +5381,84 @@ mod tests {
         // Nothing was dispatched that may still commit and the candidates were
         // never checked, so the honest answer is that the operation stopped.
         assert_eq!(outcome, ChainLifecycleOutcome::Cancelled);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_committed_failure_yields_to_a_candidate_journaled_during_the_lookup() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_failure_race_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+
+        /// Journals a second candidate while the first one is being looked up.
+        struct JournalDuringLookup {
+            inner: MockTransport,
+            db_path: String,
+            done: Mutex<bool>,
+        }
+        impl ChainTransport for JournalDuringLookup {
+            fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
+                {
+                    let mut done = self.done.lock().unwrap();
+                    if !*done {
+                        *done = true;
+                        let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+                        conn.execute(
+                            "INSERT INTO chain_submission_attempts
+                             (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                              payload_digest, chain_tx_hash, state, created_at, updated_at)
+                             VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                            rusqlite::params![ROUND_ID, WALLET, vec![0xEE_u8; 32], TX_HASH_2],
+                        )
+                        .unwrap();
+                    }
+                }
+                self.inner.get(url, timeout)
+            }
+            fn post_json<'a>(
+                &'a self,
+                url: &'a str,
+                body: Vec<u8>,
+                timeout: Duration,
+            ) -> ChainFuture<'a> {
+                self.inner.post_json(url, body, timeout)
+            }
+        }
+
+        let inner = MockTransport::default();
+        inner.responses.lock().unwrap().push_back(Ok(response(
+            422,
+            r#"{"height":42,"code":7,"log":"invalid proof","events":[]}"#,
+        )));
+        let client = ChainClient::new(
+            Arc::new(JournalDuringLookup {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                done: Mutex::new(false),
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // The failure is definite only for the candidate it names. Retirement
+        // marked that one `rejected`, so what `known_hashes` still returns is a
+        // transaction nobody has disproved — and it arrives `accepted`, which
+        // the live-attempt query does not match.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
+                if known_tx_hashes == &vec![TX_HASH_2.to_string()]),
+            "got {outcome:?}"
+        );
         drop(db);
         let _ = std::fs::remove_file(&path);
     }

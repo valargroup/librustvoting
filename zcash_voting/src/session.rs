@@ -387,7 +387,18 @@ pub struct DelegationRecoveryWork {
 pub struct DelegationStatus {
     pub bundle_index: u32,
     pub phase: DelegationPhase,
+    /// One transaction that could identify this delegation, for compatibility.
+    ///
+    /// There can be more than one: a legacy writer may record a hash while a
+    /// lifecycle POST journals another. Prefer `candidate_tx_hashes`, and prefer
+    /// `ChainSubmissionLifecycle::reconcile` over polling either by hand — it
+    /// checks every candidate, applies the winner, and retires the rest.
     pub tx_hash: Option<String>,
+    /// Every transaction that could identify this delegation.
+    ///
+    /// The same set reconciliation uses. Waiting on one candidate while another
+    /// commits is how a confirmed delegation goes unnoticed.
+    pub candidate_tx_hashes: Vec<String>,
 }
 
 /// Kind of vote recovery work grouped from `NextStep`s.
@@ -551,20 +562,28 @@ fn delegation_statuses(
     // The phase this reports can come from the attempt journal, so its hash has
     // to as well. Reading only the domain column left one `RoundPlan` describing
     // the same bundle two ways: submitted, with no transaction to point at.
-    let journaled = crate::chain_submission::delegation_candidate_hashes(
-        &db.conn(),
-        round_id,
-        &db.wallet_id(),
-    )?;
+    let wallet_id = db.wallet_id();
+    let journaled =
+        crate::chain_submission::delegation_candidate_hashes(&db.conn(), round_id, &wallet_id)?;
     delegation
         .iter()
         .map(|(&bundle_index, &phase)| {
             Ok(DelegationStatus {
                 bundle_index,
                 phase,
+                // Keeps its own meaning: whatever is recorded, including an
+                // opaque identifier a pre-lifecycle host wrote, which
+                // `candidate_tx_hashes` deliberately excludes because nothing
+                // can look it up.
                 tx_hash: db
                     .get_delegation_tx_hash(round_id, bundle_index)?
                     .or_else(|| journaled.get(&bundle_index).cloned()),
+                candidate_tx_hashes: crate::chain_submission::delegation_candidates(
+                    &db.conn(),
+                    round_id,
+                    &wallet_id,
+                    bundle_index,
+                )?,
             })
         })
         .collect()
@@ -1796,7 +1815,43 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Submitted,
                 tx_hash: Some("a".repeat(64)),
+                candidate_tx_hashes: vec!["a".repeat(64)],
             }]
+        );
+    }
+
+    #[test]
+    fn two_different_candidates_are_both_exposed() {
+        let db = db_with_bundle();
+        // A legacy writer recorded one transaction while a lifecycle POST
+        // journalled another.
+        db.conn()
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash=?3
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+                rusqlite::params![ROUND, W, "b".repeat(64)],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submission_attempts
+                 (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                  payload_digest, chain_tx_hash, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                rusqlite::params![ROUND, W, vec![0xCC_u8; 32], "a".repeat(64)],
+            )
+            .unwrap();
+
+        let status = resume_plan(&db, ROUND, &[1])
+            .unwrap()
+            .delegation_statuses
+            .remove(0);
+
+        // Showing only one of them lets a host wait on a transaction that never
+        // commits while the other does, and never apply its VAN position.
+        assert_eq!(
+            status.candidate_tx_hashes,
+            vec!["b".repeat(64), "a".repeat(64)]
         );
     }
 
@@ -1823,6 +1878,7 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Prepared,
                 tx_hash: None,
+                candidate_tx_hashes: Vec::new(),
             }]
         );
         assert!(!plan.blocking_recovery);
@@ -2820,6 +2876,7 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Confirmed,
                 tx_hash: Some("dtx".to_string()),
+                candidate_tx_hashes: Vec::new(),
             }]
         );
         assert!(plan.recovered_delegation_work.is_empty());

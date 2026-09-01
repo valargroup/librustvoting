@@ -366,6 +366,14 @@ created by the confirmed delegation.
    same way, and the singular phase getters agree with the plural ones, so a
    host using either is told the same thing. A rejected attempt names a
    transaction that never entered the mempool, so it does not report submitted.
+   A delegation status carries every candidate, not one of them: the domain
+   column and the journal can hold different transactions — a legacy writer
+   recording one while a lifecycle POST journals another — and a host shown a
+   single hash can wait on a transaction that never commits while the other
+   does. `tx_hash` keeps its own meaning as what is recorded, including an
+   opaque identifier nothing can look up, which the candidate set excludes.
+   Reconciliation remains the supported way to resolve them, because it checks
+   all of them, adopts the winner, and retires the rest.
    The phase and the hash it implies come from one lookup, everywhere a plan
    reports either: the recovery work, the canonical delegation statuses, and the
    submitted-batch validation. Deriving the phase from the journal while reading
@@ -741,6 +749,9 @@ state transitions.
   that decided the phase?
 - Does every field of one `RoundPlan` describe a bundle the same way, or can the
   statuses and the recovery work disagree?
+- Does a plan expose every candidate for a submission, or select one of several?
+- Can a committed failure be reported as terminal while a candidate journaled
+  during the lookup may still commit?
 - Is cancellation observed by the public lookup client, not just by the
   lifecycle?
 - Can a confirmed atomic-batch member be reported as a singleton confirmation?
@@ -868,7 +879,10 @@ state transitions.
   APIs agreeing.
 - `session::tests::a_journal_only_acceptance_plans_polling_with_its_hash` covers
   a polling step and the canonical delegation status both finding the hash the
-  phase was derived from.
+  phase was derived from, and `two_different_candidates_are_both_exposed` covers
+  a status carrying both when the two sources disagree.
+- `chain_submission::tests::a_committed_failure_yields_to_a_candidate_journaled_during_the_lookup`
+  covers a rejection deferring to a candidate that arrived mid-lookup.
 - `chain::tests::a_lookup_cancelled_in_flight_reports_cancelled` covers the
   public lookup client observing cancellation before it classifies a response.
 - `chain_submission::tests::a_retry_reconciliation_error_preserves_earlier_ambiguity`,

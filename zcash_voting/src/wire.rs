@@ -370,7 +370,11 @@ pub struct RoundRecoveryStateView {
 pub struct DelegationStatusView {
     pub bundle_index: u32,
     pub phase: String,
+    /// One candidate, for compatibility; see `candidate_tx_hashes`.
     pub tx_hash: Option<String>,
+    /// Every transaction that could identify this delegation.
+    #[serde(default)]
+    pub candidate_tx_hashes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

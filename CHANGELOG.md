@@ -58,6 +58,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   different transaction.
 - `ChainClient::transaction_status` observes cancellation as soon as each
   endpoint request returns, before classifying the response.
+- `DelegationStatus` and its FFI view gain `candidate_tx_hashes`, every
+  transaction that could identify the delegation. The domain column and the
+  attempt journal can hold different hashes, and a host shown only one can wait
+  on a transaction that never commits while the other does. `tx_hash` keeps its
+  existing meaning, including opaque legacy identifiers the candidate set omits.
+- Reconciliation no longer reports a committed failure as terminal while a
+  candidate journaled during the lookup may still commit.
 - A spent-nullifier response no longer reports `AlreadySpentUnresolved` when its
   reconciliation settled nothing. That outcome asserts the known candidates were
   checked and none succeeded, so a cancelled or unreadable lookup is now

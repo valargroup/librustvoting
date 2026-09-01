@@ -711,6 +711,7 @@ impl From<session::DelegationStatus> for DelegationStatusView {
                 .as_str()
                 .to_string(),
             tx_hash: status.tx_hash,
+            candidate_tx_hashes: status.candidate_tx_hashes,
         }
     }
 }
@@ -1737,6 +1738,7 @@ mod tests {
                 bundle_index: 2,
                 phase: crate::phases::DelegationPhase::Submitted,
                 tx_hash: Some("delegation-tx".to_string()),
+                candidate_tx_hashes: vec!["delegation-tx".to_string()],
             }],
             recovered_delegation_work: vec![session::DelegationRecoveryWork {
                 kind: session::DelegationRecoveryWorkKind::PollDelegation,
