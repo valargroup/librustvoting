@@ -6856,7 +6856,11 @@ mod tests {
     #[test]
     fn mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent() {
         const UPPER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // A delegation and a vote are two transactions, so they get two hashes.
+        // Sharing one is refused, and has its own coverage.
+        const VOTE_UPPER: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let lower = UPPER.to_ascii_lowercase();
+        let vote_lower = VOTE_UPPER.to_ascii_lowercase();
         let db = test_db();
         db.init_round(Network::Testnet, &test_params(), None)
             .unwrap();
@@ -6866,7 +6870,7 @@ mod tests {
             .unwrap();
 
         db.mark_delegation_submitted(ROUND_ID, 0, UPPER).unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 1, UPPER).unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, VOTE_UPPER).unwrap();
 
         assert_eq!(
             db.get_delegation_tx_hash(ROUND_ID, 0).unwrap().as_deref(),
@@ -6874,17 +6878,61 @@ mod tests {
         );
         assert_eq!(
             db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
-            Some(lower.as_str())
+            Some(vote_lower.as_str())
         );
         // Re-recording the same transaction in either casing is the same
         // transaction, not a conflict.
         db.mark_delegation_submitted(ROUND_ID, 0, &lower).unwrap();
         db.mark_delegation_submitted(ROUND_ID, 0, UPPER).unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 1, &lower).unwrap();
-        db.mark_vote_submitted(ROUND_ID, 0, 1, UPPER).unwrap();
-
-        // A non-hex legacy identifier keeps its exact stored meaning.
+        db.mark_vote_submitted(ROUND_ID, 0, 1, &vote_lower).unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, VOTE_UPPER).unwrap();
         assert_eq!(queries::canonical_tx_hash("Legacy-Hash"), "Legacy-Hash");
+    }
+
+    #[test]
+    fn one_transaction_cannot_be_both_a_delegation_and_a_vote_in_one_bundle() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        let hash = "a".repeat(64);
+        db.mark_delegation_submitted(ROUND_ID, 0, &hash).unwrap();
+
+        // One transaction carries a `delegate_vote` event or a `cast_vote` one,
+        // never both, so this is a contradiction even inside one bundle. The
+        // confirmation parser would refuse it, but by then the hash is a
+        // candidate no submission can retire, and every later attempt would
+        // rediscover it instead of broadcasting the real payload.
+        let error = db.mark_vote_submitted(ROUND_ID, 0, 1, &hash).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a different transaction kind in this bundle"),
+            "{error}"
+        );
+
+        // And the reverse direction, which used to skip the check entirely.
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
+            .unwrap();
+        db.mark_vote_submitted(ROUND_ID, 0, 1, &hash).unwrap();
+
+        let error = db
+            .mark_delegation_submitted(ROUND_ID, 0, &hash)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a different transaction kind in this bundle"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -266,8 +266,11 @@ none. The transaction may still have committed; that stays visible as
    transaction may be in flight and its hash is not known. Only a proven
    conflict does this. A check that could not be made is no evidence of one, and
    the hash is the only handle on a transaction already in the mempool, so an
-   unreadable database must not cost it. Ownership is judged against the attempt
-   journal as well as the domain columns,
+   unreadable database must not cost it. That check and the journaling it guards
+   share one immediate transaction: read separately they are two, and two
+   submissions handed the same hash could each find it free before either wrote,
+   which is the contradiction the rule exists to prevent. Ownership is judged
+   against the attempt journal as well as the domain columns,
    because CheckTx acceptance deliberately leaves those null and would otherwise
    let reconciliation order decide which identity receives the confirmation. The
    check and the write it guards share one immediate transaction, in the legacy
@@ -275,6 +278,11 @@ none. The transaction may still have committed; that stays visible as
    in autocommit they are two, and under WAL a check made outside the write lock
    reads a snapshot another writer has already moved past, so two writers
    recording the same hash for different bundles could both find no carrier. An
+   A delegation and a vote in one bundle are two different transactions, so
+   sharing a hash is a contradiction whichever way round it is; that was once
+   left to the confirmation parser, which refuses a `delegate_vote` event for a
+   vote identity and the reverse, but the parser answers too late to keep a
+   candidate from being journaled. An
    atomic batch legitimately records one transaction on every member of its own
    bundle, and only such a batch does: within a bundle the hash may be shared
    only by rows whose recovery carries the same batch digest, because a
@@ -1141,9 +1149,13 @@ state transitions.
   and `cancellation_before_any_dispatch_is_reported_as_cancelled` cover the
   boundary between the two cancellation outcomes.
 - `chain_submission::tests::an_accepted_hash_owned_by_another_bundle_does_not_become_a_candidate`
-  covers the ownership check before journaling, and
+  covers the ownership check before journaling,
   `an_accepted_hash_survives_an_unreadable_final_reread` covers a failed check
-  not being treated as a conflict.
+  not being treated as a conflict, and
+  `the_accepted_hash_ownership_check_holds_the_write_lock` covers that check and
+  the journaling sharing one transaction.
+- `storage::operations::tests::one_transaction_cannot_be_both_a_delegation_and_a_vote_in_one_bundle`
+  covers cross-kind reuse inside a bundle, in both directions.
 - `chain_submission::tests::a_committed_failure_does_not_override_hashless_ambiguity`,
   `every_committed_failure_candidate_is_retired`,
   `a_successful_candidate_survives_a_terminal_lookup_error`,

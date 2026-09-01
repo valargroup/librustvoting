@@ -732,37 +732,41 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             match result {
                 Ok(ChainBroadcastOutcome::Accepted(result)) => {
                     // A hash another submission already owns cannot become this
-                    // one's candidate. The POST still happened, so the attempt
-                    // keeps its ambiguity rather than its answer: hashless
-                    // `outcome_unknown` says "a transaction may be in flight and
-                    // its hash is not known", which is exactly true here.
-                    if let Some(conflict) =
-                        accepted_hash_is_foreign(self.db, wallet_id, identity, &result.tx_hash)
-                    {
+                    // one's candidate, and the check and the journaling share
+                    // one transaction: read separately, two submissions handed
+                    // the same hash could each find it free before either wrote.
+                    //
+                    // The hash must not go down with a storage failure either:
+                    // it is the only handle anything will ever have on a
+                    // transaction that is already in the mempool.
+                    let conflict = match journal_accepted_hash(
+                        self.db,
+                        wallet_id,
+                        identity,
+                        attempt_id,
+                        &result.tx_hash,
+                    ) {
+                        Ok(conflict) => conflict,
+                        Err(error) => {
+                            return Err(ChainLifecycleError::AcceptedButUnjournaled {
+                                tx_hash: result.tx_hash,
+                                source: error,
+                            })
+                        }
+                    };
+                    if let Some(conflict) = conflict {
+                        // The POST still happened, so the attempt keeps its
+                        // ambiguity rather than its answer: hashless
+                        // `outcome_unknown` says "a transaction may be in flight
+                        // and its hash is not known", which is exactly true.
                         let message = format!(
                             "vote chain accepted a transaction under a hash that belongs to another submission, so it cannot be a candidate here: {conflict}"
                         );
                         *last_unknown = Some(message.clone());
-                        mark_attempt(self.db, wallet_id, attempt_id, "outcome_unknown", None)?;
                         return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                             known_tx_hashes: known_hashes(self.db, wallet_id, identity)
                                 .unwrap_or_default(),
                             message,
-                        });
-                    }
-                    // The hash must not go down with a storage failure: it is
-                    // the only handle anything will ever have on a transaction
-                    // that is already in the mempool.
-                    if let Err(error) = mark_attempt(
-                        self.db,
-                        wallet_id,
-                        attempt_id,
-                        "accepted",
-                        Some(&result.tx_hash),
-                    ) {
-                        return Err(ChainLifecycleError::AcceptedButUnjournaled {
-                            tx_hash: result.tx_hash,
-                            source: error,
                         });
                     }
                     return Ok(ChainLifecycleOutcome::Accepted {
@@ -1745,7 +1749,7 @@ fn retire_failed_candidate(
 /// and a delegation has none. Any member answers for a batch — they all carry
 /// the same digest, which is what the rule compares — so the first is taken.
 fn ownership_proposal(
-    db: &VotingDb,
+    conn: &rusqlite::Connection,
     wallet_id: &str,
     identity: &ChainSubmissionIdentity,
 ) -> Result<Option<u32>, VotingError> {
@@ -1755,7 +1759,7 @@ fn ownership_proposal(
         ChainSubmissionKind::VoteBatch => {
             let digest = identity.require_batch_digest()?;
             let members = crate::vote::load_vote_batch_recoveries_with_conn(
-                &db.conn(),
+                conn,
                 wallet_id,
                 &identity.round_id,
                 identity.bundle_index,
@@ -1780,14 +1784,14 @@ fn ownership_proposal(
 /// mempool. Refusing it on a failed read would trade a bounded ambiguity for a
 /// permanently lost transaction, which is the worse of the two by far.
 fn accepted_hash_is_foreign(
-    db: &VotingDb,
+    conn: &rusqlite::Connection,
     wallet_id: &str,
     identity: &ChainSubmissionIdentity,
     tx_hash: &str,
 ) -> Option<String> {
-    let proposal_id = ownership_proposal(db, wallet_id, identity).ok()?;
+    let proposal_id = ownership_proposal(conn, wallet_id, identity).ok()?;
     match crate::storage::queries::ensure_tx_hash_free_for_submission(
-        &db.conn(),
+        conn,
         &identity.round_id,
         wallet_id,
         identity.bundle_index,
@@ -1800,6 +1804,61 @@ fn accepted_hash_is_foreign(
         Err(VotingError::InvalidInput { message }) => Some(message),
         Err(_) => None,
     }
+}
+
+/// Journals an accepted hash, or refuses it as another submission's.
+///
+/// The ownership check and the write it guards share one immediate transaction.
+/// Read separately they are two: two submissions handed the same hash could
+/// each find it free before either journaled it, and both would then carry it —
+/// exactly the contradiction the rule exists to prevent, with reconciliation
+/// order left to decide which identity receives the confirmation.
+///
+/// Returns the conflict when there was one, in which case the attempt was
+/// journaled `outcome_unknown` with no hash instead.
+fn journal_accepted_hash(
+    db: &VotingDb,
+    wallet_id: &str,
+    identity: &ChainSubmissionIdentity,
+    attempt_id: i64,
+    tx_hash: &str,
+) -> Result<Option<String>, VotingError> {
+    let now = now_seconds()?;
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(internal("begin accepted hash transaction"))?;
+    let conflict = accepted_hash_is_foreign(&tx, wallet_id, identity, tx_hash);
+    let (state, stored) = match &conflict {
+        // The POST happened, so the ambiguity is real; the hash is not this
+        // submission's, so it is not recorded.
+        Some(_) => ("outcome_unknown", None),
+        None => ("accepted", Some(tx_hash)),
+    };
+    let updated = tx
+        .execute(
+            "UPDATE chain_submission_attempts
+                SET state=:state,
+                    chain_tx_hash=COALESCE(:tx_hash, chain_tx_hash),
+                    updated_at=:now
+              WHERE id=:id AND wallet_id=:wallet_id",
+            named_params! {
+                ":state": state,
+                ":tx_hash": stored,
+                ":now": now,
+                ":id": attempt_id,
+                ":wallet_id": wallet_id,
+            },
+        )
+        .map_err(internal("record accepted chain attempt"))?;
+    if updated != 1 {
+        return Err(VotingError::InvalidInput {
+            message: "chain submission attempt no longer exists".to_string(),
+        });
+    }
+    tx.commit()
+        .map_err(internal("commit accepted chain attempt"))?;
+    Ok(conflict)
 }
 
 /// Whether a committed transaction's events describe this submission.
@@ -3880,6 +3939,78 @@ mod tests {
             attempt_states(&db),
             vec!["rejected".to_string(), "rejected".to_string()]
         );
+    }
+
+    #[test]
+    fn the_accepted_hash_ownership_check_holds_the_write_lock() {
+        // A file-backed database, because the point is two connections.
+        let path = std::env::temp_dir().join(format!(
+            "zv-accepted-carrier-{}-{:?}.sqlite",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+        let db = init_test_db(VotingDb::open(&path_string).unwrap());
+        db.conn()
+            .execute(
+                "INSERT INTO bundles (round_id, wallet_id, bundle_index) VALUES (?1, ?2, 1)",
+                rusqlite::params![ROUND_ID, WALLET],
+            )
+            .unwrap();
+        let attempt_id = journal_attempt(&db, "attempting", None);
+
+        // Another writer takes bundle 1's carrier and has not committed. In WAL
+        // a reader outside the write lock still sees the old snapshot, so an
+        // ownership check made there would find the hash free.
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other
+            .busy_timeout(crate::storage::SQLITE_BUSY_TIMEOUT)
+            .unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        other
+            .execute(
+                "UPDATE bundles SET delegation_tx_hash = ?1
+                 WHERE round_id = ?2 AND wallet_id = ?3 AND bundle_index = 1",
+                rusqlite::params![TX_HASH, ROUND_ID, WALLET],
+            )
+            .unwrap();
+        let commit = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            other.execute_batch("COMMIT").unwrap();
+        });
+
+        let conflict = journal_accepted_hash(
+            &db,
+            WALLET,
+            &ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+            attempt_id,
+            TX_HASH,
+        )
+        .unwrap();
+
+        commit.join().unwrap();
+        // Checked outside the write lock, both writers find the hash free and
+        // both journal it, which is the contradiction the rule exists to
+        // prevent — with reconciliation order left to decide which identity
+        // receives the confirmation.
+        assert!(conflict.is_some(), "the carrier must be seen");
+        assert_eq!(attempt_states(&db), vec!["outcome_unknown".to_string()]);
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM chain_submission_attempts WHERE chain_tx_hash IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
     }
 
     #[tokio::test]

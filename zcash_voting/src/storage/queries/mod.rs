@@ -2983,9 +2983,7 @@ fn ensure_tx_hash_belongs_to_submission(
     };
 
     // The VAN position a transaction commits belongs to one bundle, so a carrier
-    // in any other bundle is a contradiction. Cross-kind reuse inside one bundle
-    // is left to the confirmation parser, which will not accept a `delegate_vote`
-    // event for a vote identity or the reverse.
+    // in any other bundle is a contradiction.
     let foreign: bool = conn
         .query_row(
             "SELECT EXISTS(
@@ -3012,6 +3010,54 @@ fn ensure_tx_hash_belongs_to_submission(
         })?;
     if foreign {
         return conflict("another bundle");
+    }
+
+    // The same cross-kind reuse, recorded in the domain columns with no journal
+    // row behind it. A pre-lifecycle host wrote hashes there directly, and
+    // acceptance journals one without touching them, so neither source alone
+    // sees all of it.
+    let cross_kind: bool = match proposal_id {
+        Some(_) => conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM bundles
+                      WHERE round_id = :round_id AND wallet_id = :wallet_id
+                        AND bundle_index = :bundle_index
+                        AND delegation_tx_hash = :tx_hash
+                 )",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index as i64,
+                    ":tx_hash": tx_hash,
+                },
+                |row| row.get(0),
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to check delegation carrier in this bundle: {e}"),
+            })?,
+        None => conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM votes
+                      WHERE round_id = :round_id AND wallet_id = :wallet_id
+                        AND bundle_index = :bundle_index
+                        AND tx_hash = :tx_hash
+                 )",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index as i64,
+                    ":tx_hash": tx_hash,
+                },
+                |row| row.get(0),
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to check vote carrier in this bundle: {e}"),
+            })?,
+    };
+    if cross_kind {
+        return conflict("a different transaction kind in this bundle");
     }
 
     // CheckTx acceptance deliberately leaves those columns null, so a hash can
@@ -3060,6 +3106,16 @@ fn ensure_tx_hash_belongs_to_submission(
     for (kind, carrier_bundle, carrier_proposal, carrier_digest) in &journaled {
         if *carrier_bundle != i64::from(bundle_index) {
             return conflict("another bundle");
+        }
+        // A delegation and a vote in one bundle are two different transactions,
+        // so sharing a hash is a contradiction whichever way round it is. This
+        // was once left to the confirmation parser, which refuses a
+        // `delegate_vote` event for a vote identity and the reverse. That is too
+        // late now: the hash is judged before it becomes a candidate, and a
+        // candidate the parser will refuse is one no submission can retire, so
+        // every later attempt would rediscover it instead of broadcasting.
+        if (kind == "delegation") != proposal_id.is_none() {
+            return conflict("a different transaction kind in this bundle");
         }
         let Some(proposal_id) = proposal_id else {
             continue;

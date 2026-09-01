@@ -214,8 +214,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- One transaction hash can no longer be recorded as both a delegation and a vote
+  in the same bundle. They are two different transactions, and the confirmation
+  parser rejecting the mismatch came too late to stop the hash becoming a
+  candidate no submission could retire.
 - An accepted transaction hash that another submission already owns is no
-  longer journaled as this submission's candidate. The attempt keeps its
+  longer journaled as this submission's candidate. The check and the journaling
+  share one immediate transaction, so two submissions handed the same hash can
+  no longer each find it free before either writes. The attempt keeps its
   ambiguity without a hash instead, so a stale or misbehaving endpoint can no
   longer permanently block a payload with a hash confirmation would refuse.
 - Confirmation writes now re-check cancellation after acquiring the database
