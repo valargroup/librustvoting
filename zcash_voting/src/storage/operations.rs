@@ -5279,6 +5279,104 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_delegation_setup_persists_one_complete_randomized_context() {
+        fn store_setup(conn: &rusqlite::Connection, marker: u8) -> Result<(), VotingError> {
+            let gov_nullifiers = vec![vec![marker + 11; 32]; crate::governance::BUNDLE_NOTE_SLOTS];
+            queries::store_delegation_data_with_pczt_fields(
+                conn,
+                ROUND_ID,
+                W,
+                0,
+                &[marker + 1; 32],
+                &[],
+                &[marker + 2; 32],
+                &[],
+                &[marker + 3; 32],
+                &[marker + 4; 32],
+                &[marker + 5; 32],
+                &[marker + 6; 32],
+                &[marker + 7; 32],
+                &[marker + 8; 32],
+                1,
+                0,
+                &[],
+                &[marker + 9; 32],
+                &crate::tx1::placeholder_tx1_effects(),
+                &[marker + 12],
+                &[marker + 10; 32],
+                &gov_nullifiers,
+            )
+        }
+
+        let _contention_test_guard = SQLITE_CONTENTION_TEST_LOCK.lock().unwrap();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zcash-voting-delegation-setup-cas-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let db_a = VotingDb::open(&path_string).unwrap();
+        db_a.set_wallet_id(W);
+        db_a.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        queries::insert_bundle(&db_a.conn(), ROUND_ID, W, 0, &[0]).unwrap();
+
+        let db_b = VotingDb::open(&path_string).unwrap();
+        db_b.set_wallet_id(W);
+        db_a.conn().busy_handler(Some(signal_sqlite_busy)).unwrap();
+
+        SQLITE_BUSY_OBSERVED.store(false, Ordering::SeqCst);
+        let mut writer_conn = db_b.conn();
+        let writer_tx = writer_conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = store_setup(&db_a.conn(), 0x10);
+                result_tx.send(result).unwrap();
+            });
+
+            let writer_tx = wait_for_sqlite_contention(writer_tx, &result_rx, "delegation setup");
+            store_setup(&writer_tx, 0x20).unwrap();
+            writer_tx.commit().unwrap();
+
+            let error = result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .expect_err("the later randomized setup must lose the compare-and-swap");
+            assert!(error
+                .to_string()
+                .contains("concurrently persisted delegation setup"));
+        });
+        drop(writer_conn);
+
+        let persisted: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = db_a
+            .conn()
+            .query_row(
+                "SELECT delegation_pczt, alpha, rk, pczt_sighash
+                 FROM bundles
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                rusqlite::params![ROUND_ID, W],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted.0, vec![0x2C]);
+        assert_eq!(persisted.1, vec![0x25; 32]);
+        assert_eq!(persisted.2, vec![0x2A; 32]);
+        assert_eq!(persisted.3, vec![0x29; 32]);
+
+        drop(db_b);
+        drop(db_a);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
+    }
+
+    #[test]
     fn test_public_delegation_store_supports_submission_loading() {
         let db = test_db();
         db.init_round(Network::Testnet, &test_params(), None)

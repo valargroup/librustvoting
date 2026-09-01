@@ -1159,7 +1159,7 @@ fn store_delegation_data_inner(
         }
     }
     if let (Some(existing_delegation_pczt), Some(delegation_pczt)) =
-        (existing_delegation_pczt, delegation_pczt)
+        (existing_delegation_pczt.as_deref(), delegation_pczt)
     {
         if existing_delegation_pczt != delegation_pczt {
             return Err(VotingError::InvalidInput {
@@ -1169,6 +1169,10 @@ fn store_delegation_data_inner(
                 ),
             });
         }
+
+        // The complete setup was already committed. Avoid rewriting any of
+        // its binding fields even when this is an idempotent retry.
+        return Ok(());
     }
 
     let rows = conn
@@ -1184,7 +1188,8 @@ fn store_delegation_data_inner(
              delegation_pczt = COALESCE(delegation_pczt, :delegation_pczt), \
              rk = COALESCE(:rk, rk), \
              gov_nullifiers_blob = COALESCE(:gov_nullifiers_blob, gov_nullifiers_blob) \
-             WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+             WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index \
+               AND (:delegation_pczt IS NULL OR delegation_pczt IS NULL)",
             named_params! {
                 ":rand": van_comm_rand,
                 ":dummies": dummy_blob,
@@ -1213,8 +1218,52 @@ fn store_delegation_data_inner(
             message: format!("failed to store delegation data: {}", e),
         })?;
 
-    // If no rows were updated, the bundle doesn't exist.
+    // A PCZT write is a compare-and-swap on the complete setup. If another
+    // connection won after the read above, accept an identical winner and
+    // reject a different randomized setup without touching any binding field.
     if rows == 0 {
+        if let Some(delegation_pczt) = delegation_pczt {
+            let persisted_pczt: Option<Option<Vec<u8>>> = conn
+                .query_row(
+                    "SELECT delegation_pczt FROM bundles
+                     WHERE round_id = :round_id
+                       AND wallet_id = :wallet_id
+                       AND bundle_index = :bundle_index",
+                    named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": wallet_id,
+                        ":bundle_index": bundle_index as i64,
+                    },
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| VotingError::Internal {
+                    message: format!("failed to reload delegation PCZT after setup race: {e}"),
+                })?;
+
+            match persisted_pczt {
+                Some(Some(persisted_pczt)) if persisted_pczt == delegation_pczt => return Ok(()),
+                Some(Some(_)) => {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "refusing to replace concurrently persisted delegation setup for round={}, bundle={}",
+                            round_id, bundle_index
+                        ),
+                    });
+                }
+                Some(None) => {
+                    return Err(VotingError::Internal {
+                        message: format!(
+                            "failed to claim empty delegation setup for round={}, bundle={}",
+                            round_id, bundle_index
+                        ),
+                    });
+                }
+                None => {}
+            }
+        }
+
+        // No matching row exists.
         return Err(VotingError::InvalidInput {
             message: format!(
                 "bundle not found: round={}, bundle={}",
