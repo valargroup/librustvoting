@@ -163,6 +163,14 @@ Neither wait counts — the handle's own mutex, and SQLite's write lock, which
 another connection or process can hold and which the configured busy timeout
 would otherwise sit on for seconds. A contended refresh is skipped instead.
 
+The refresh stops when the POST is answered, and the classification that follows
+needs the same connection. If a host holds `VotingDb::conn()` for longer than the
+grace, that wait cannot be refreshed around — the refresh needs the very lock
+being waited on — so a reservation can age out before its response is journaled.
+No amount of heartbeating closes that; what closes it is not holding the shared
+connection for minutes. This process is unaffected either way, because its
+in-memory registry covers the whole call.
+
 A reservation's timestamp is taken immediately before its insert, after the
 connection has been acquired and the payload rebuilt. Both of those block, and a
 reservation stamped on entry would arrive already part-spent against the grace
@@ -586,7 +594,11 @@ hosts do not parse the log.
 8. A candidate whose status could not be read is reported as
    `OutcomeUnknown`, never as `Pending`. A broken or incompatible endpoint must
    stay distinguishable from a genuine 404, and an unresolved candidate blocks
-   rebroadcast exactly as a pending one does, because it may still commit.
+   rebroadcast exactly as a pending one does, because it may still commit. Nor is
+   `Pending` reported while a hashless attempt is still live: that attempt may
+   already have committed under a hash nothing can locate, so saying the known
+   candidates merely have not committed yet would overstate what this call
+   established.
 9. A confirmation another writer applies while these lookups are in flight
    outranks every weaker answer. The entry shortcut runs before them, so the
    durable state is read again before reporting a terminal error, ambiguity,
@@ -682,7 +694,10 @@ hosts do not parse the log.
    one — and each failure is definite only for the step that raised it, so the
    rule is applied once where those failures leave the attempt loop rather than
    at each of them. A completed ambiguous broadcast, a known candidate, or a
-   live attempt all outrank it, and the call reports `OutcomeUnknown`. A
+   live attempt all outrank it, and the call reports `OutcomeUnknown`. The
+   durable-confirmation reread on the way out is supplementary in the same sense,
+   so a failure there returns the outcome already established rather than
+   discarding an accepted hash. A
    completed ambiguous broadcast is held in memory and needs no storage read to
    be true, so it is honoured even when the database has become unreadable —
    which is one of the things that gets us here; the candidate list is
@@ -826,6 +841,8 @@ state transitions.
 - Is a reservation stamped before or after the blocking work that precedes it?
 - Is the in-flight guard released once the response is classified, or held
   through the retry backoff?
+- Can `Pending` be reported while a hashless attempt may already have committed?
+- Can a supplementary durable read, failing, discard an accepted hash?
 - Can a committed failure be reported as terminal while a candidate journaled
   during the lookup may still commit?
 - Is cancellation observed by the public lookup client, not just by the
@@ -1123,6 +1140,9 @@ state transitions.
 - `chain_submission::tests::a_reservation_is_stamped_after_its_blocking_validation`
   and `the_in_flight_guard_is_released_before_the_backoff` cover the reservation
   timestamp and the guard's lifetime.
+- `chain_submission::tests::a_hashless_attempt_outranks_a_merely_pending_candidate`
+  and `an_accepted_hash_survives_an_unreadable_final_reread` cover the two
+  precedence rules above.
 - `storage::operations::tests::mixed_case_tx_hashes_are_stored_lowercase_and_replay_stays_idempotent`
   covers storage-boundary hash canonicalization and idempotent replay.
 - storage migration tests cover version 18 fresh and in-place schemas, including

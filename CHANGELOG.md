@@ -84,6 +84,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   and with it the request deadline the heartbeat exists to keep the reservation
   inside; a contended refresh is skipped. It no longer waits on SQLite's write
   lock either, which another connection or process can hold.
+- Reconciliation reports `OutcomeUnknown` rather than `Pending` while a hashless
+  attempt is still live: it may already have committed under a hash nothing can
+  locate.
+- A failure of the supplementary durable-confirmation reread no longer discards
+  the outcome already established, including an accepted transaction hash.
 - An attempt reservation is timestamped immediately before its insert rather
   than on entry, so the blocking connection acquisition and payload rebuild do
   not spend part of its freshness grace before it exists.

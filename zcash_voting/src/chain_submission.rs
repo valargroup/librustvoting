@@ -569,9 +569,14 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                         | ChainLifecycleOutcome::Accepted { .. }
                 ) =>
             {
-                match durable_confirmation_hash(self.db, wallet_id, &identity)? {
-                    Some(tx_hash) => Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash }),
-                    None => Ok(outcome),
+                // Supplementary, like the candidate list in
+                // `outstanding_ambiguity`: this outcome is already established
+                // in memory, so a database that has become unreadable must not
+                // be able to discard an accepted hash or a completed
+                // broadcast's ambiguity on the way out.
+                match durable_confirmation_hash(self.db, wallet_id, &identity) {
+                    Ok(Some(tx_hash)) => Ok(ChainLifecycleOutcome::AlreadyConfirmed { tx_hash }),
+                    Ok(None) | Err(_) => Ok(outcome),
                 }
             }
             Ok(outcome) => Ok(outcome),
@@ -1146,6 +1151,17 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             });
         }
         if any_pending {
+            // A hashless attempt may already have committed under a hash nothing
+            // can locate, so reporting that the known candidates simply have not
+            // committed yet would overstate what this call established — the same
+            // rule the committed-failure and terminal-error branches follow.
+            if has_live_attempt(self.db, wallet_id, identity)? {
+                return Ok(ChainLifecycleOutcome::OutcomeUnknown {
+                    known_tx_hashes: hashes,
+                    message: "an earlier attempt was dispatched without a usable response"
+                        .to_string(),
+                });
+            }
             return Ok(ChainLifecycleOutcome::Pending {
                 known_tx_hashes: hashes,
             });
@@ -1164,7 +1180,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // and it arrives `accepted`, which the live-attempt query does not
             // match either.
             let remaining = known_hashes(self.db, wallet_id, identity)?;
-            if !remaining.is_empty() || has_live_attempt(self.db, wallet_id, identity)? {
+            let live = has_live_attempt(self.db, wallet_id, identity)?;
+            // Those reads wait on the database, and this branch sits past every
+            // earlier check.
+            if cancel() {
+                return Ok(ChainLifecycleOutcome::Cancelled);
+            }
+            if !remaining.is_empty() || live {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                     known_tx_hashes: remaining,
                     message: format!(
@@ -3661,12 +3683,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            outcome,
-            ChainLifecycleOutcome::Pending {
-                known_tx_hashes: vec![TX_HASH.to_string()]
-            }
+        // The first attempt was dispatched ambiguously, so the honest answer
+        // names the candidate while saying the submission is unresolved rather
+        // than merely uncommitted; either way it bars a further broadcast.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
+                if known_tx_hashes == &vec![TX_HASH.to_string()]),
+            "got {outcome:?}"
         );
+        assert!(blocks_further_dispatch(&outcome));
         assert_eq!(
             *transport.posts.lock().unwrap(),
             1,
@@ -6207,5 +6232,112 @@ mod tests {
         // changes, and bundle pruning would all defer to a POST that has already
         // been answered — for a delay the host chooses.
         assert_eq!(during_backoff, 0);
+    }
+
+    #[tokio::test]
+    async fn a_hashless_attempt_outranks_a_merely_pending_candidate() {
+        let db = test_db();
+        journal_attempt(&db, "outcome_unknown", None);
+        journal_attempt(&db, "accepted", Some(TX_HASH));
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(Ok(response(404, r#"{"detail":"not found"}"#)));
+        let client = accepted_client(transport);
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .reconcile(&ChainSubmissionIdentity::delegation(ROUND_ID, 0), &|| false)
+            .await
+            .unwrap();
+
+        // `Pending` would assert the known candidates simply have not committed
+        // yet. The hashless attempt may already have committed under a hash
+        // nothing can locate, which is a different and weaker claim.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { known_tx_hashes, .. }
+                if known_tx_hashes == &vec![TX_HASH.to_string()]),
+            "got {outcome:?}"
+        );
+    }
+
+    /// Makes the durable-state read fail, by removing the table it reads,
+    /// once the POST has been answered.
+    struct BreakDurableReadTransport {
+        inner: MockTransport,
+        db_path: String,
+        done: Mutex<bool>,
+    }
+
+    impl ChainTransport for BreakDurableReadTransport {
+        fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
+            self.inner.get(url, timeout)
+        }
+
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            body: Vec<u8>,
+            timeout: Duration,
+        ) -> ChainFuture<'a> {
+            {
+                let mut done = self.done.lock().unwrap();
+                if !*done {
+                    *done = true;
+                    let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+                    conn.execute_batch("DROP TABLE bundles").unwrap();
+                }
+            }
+            self.inner.post_json(url, body, timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_hash_survives_an_unreadable_final_reread() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_unreadable_reread_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        let inner = MockTransport::default();
+        inner.responses.lock().unwrap().push_back(Ok(response(
+            200,
+            &format!(r#"{{"tx_hash":"{TX_HASH}","code":0,"log":""}}"#),
+        )));
+        let client = ChainClient::new(
+            Arc::new(BreakDurableReadTransport {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                done: Mutex::new(false),
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // The hash is the only handle on a transaction now in the mempool, and
+        // it was established before this supplementary read was attempted. A
+        // database that has become unreadable must not take it away.
+        assert_eq!(
+            outcome,
+            ChainLifecycleOutcome::Accepted {
+                tx_hash: TX_HASH.to_string()
+            }
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }
