@@ -366,9 +366,12 @@ created by the confirmed delegation.
    same way, and the singular phase getters agree with the plural ones, so a
    host using either is told the same thing. A rejected attempt names a
    transaction that never entered the mempool, so it does not report submitted.
-   The phase and the hash to poll come from one lookup: deriving the phase from
-   the journal while requiring the hash from the domain column turns the very
-   state this recovers into a planning failure.
+   The phase and the hash it implies come from one lookup, everywhere a plan
+   reports either: the recovery work, the canonical delegation statuses, and the
+   submitted-batch validation. Deriving the phase from the journal while reading
+   the hash from the domain column turns the very state this recovers into a
+   planning failure, or into one plan describing a bundle two ways — submitted,
+   with no transaction to point at.
 
 The crash guarantee differs by signer and transaction type:
 
@@ -736,6 +739,8 @@ state transitions.
 - Do the singular and plural phase getters agree about it?
 - Does a step that says "poll" always have a hash to poll, from the same lookup
   that decided the phase?
+- Does every field of one `RoundPlan` describe a bundle the same way, or can the
+  statuses and the recovery work disagree?
 - Is cancellation observed by the public lookup client, not just by the
   lifecycle?
 - Can a confirmed atomic-batch member be reported as a singleton confirmation?
@@ -862,7 +867,8 @@ state transitions.
   reading the attempt journal, its rejected-attempt boundary, and the two phase
   APIs agreeing.
 - `session::tests::a_journal_only_acceptance_plans_polling_with_its_hash` covers
-  a polling step finding the hash the phase was derived from.
+  a polling step and the canonical delegation status both finding the hash the
+  phase was derived from.
 - `chain::tests::a_lookup_cancelled_in_flight_reports_cancelled` covers the
   public lookup client observing cancellation before it classifies a response.
 - `chain_submission::tests::a_retry_reconciliation_error_preserves_earlier_ambiguity`,

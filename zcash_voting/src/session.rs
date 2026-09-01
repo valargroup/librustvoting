@@ -548,13 +548,23 @@ fn delegation_statuses(
     round_id: &str,
     delegation: &BTreeMap<u32, DelegationPhase>,
 ) -> Result<Vec<DelegationStatus>, VotingError> {
+    // The phase this reports can come from the attempt journal, so its hash has
+    // to as well. Reading only the domain column left one `RoundPlan` describing
+    // the same bundle two ways: submitted, with no transaction to point at.
+    let journaled = crate::chain_submission::delegation_candidate_hashes(
+        &db.conn(),
+        round_id,
+        &db.wallet_id(),
+    )?;
     delegation
         .iter()
         .map(|(&bundle_index, &phase)| {
             Ok(DelegationStatus {
                 bundle_index,
                 phase,
-                tx_hash: db.get_delegation_tx_hash(round_id, bundle_index)?,
+                tx_hash: db
+                    .get_delegation_tx_hash(round_id, bundle_index)?
+                    .or_else(|| journaled.get(&bundle_index).cloned()),
             })
         })
         .collect()
@@ -895,6 +905,11 @@ fn active_vote_batches_by_vote(
 ) -> Result<BTreeMap<(u32, u32), ActiveVoteBatch>, VotingError> {
     let mut batches_by_vote = BTreeMap::new();
     let wallet_id = db.wallet_id();
+    // As everywhere else here: a `Submitted` phase can rest on the attempt
+    // journal alone, so the hash that phase implies must be looked for there too
+    // rather than reported missing.
+    let journaled =
+        crate::chain_submission::vote_candidate_hashes(&db.conn(), round_id, &wallet_id)?;
 
     for (&(bundle_index, proposal_id), &phase) in votes {
         if !matches!(phase, VotePhase::Committed | VotePhase::Submitted) {
@@ -965,6 +980,7 @@ fn active_vote_batches_by_vote(
             if phase == VotePhase::Submitted {
                 let tx_hash = db
                     .get_vote_tx_hash(round_id, bundle_index, recovery.proposal_id)?
+                    .or_else(|| journaled.get(&(bundle_index, recovery.proposal_id)).cloned())
                     .ok_or_else(|| VotingError::InvalidInput {
                         message: format!(
                             "submitted atomic vote batch is missing a transaction hash for round={round_id}, bundle={bundle_index}, proposal={}",
@@ -1766,6 +1782,17 @@ mod tests {
             plan.recovered_delegation_work,
             vec![DelegationRecoveryWork {
                 kind: DelegationRecoveryWorkKind::PollDelegation,
+                bundle_index: 0,
+                phase: DelegationPhase::Submitted,
+                tx_hash: Some("a".repeat(64)),
+            }]
+        );
+        // The canonical status field describes the same bundle, so it has to
+        // name the same transaction rather than reporting a submitted bundle
+        // with nothing to point at.
+        assert_eq!(
+            plan.delegation_statuses,
+            vec![DelegationStatus {
                 bundle_index: 0,
                 phase: DelegationPhase::Submitted,
                 tx_hash: Some("a".repeat(64)),

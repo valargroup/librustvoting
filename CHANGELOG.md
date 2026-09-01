@@ -50,7 +50,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - `resume_plan`, the delegation/vote phase queries, and their singular
   counterparts report the submitted phase for a bundle or vote with a
   non-rejected journaled attempt carrying a chain transaction hash, and a
-  polling step sources that hash from the same lookup. CheckTx acceptance
+  polling step, the canonical `delegation_statuses`, and the submitted-batch
+  validation all source that hash from the same lookup. CheckTx acceptance
   deliberately leaves the legacy domain column null, so restart planning
   previously directed the host to delegate or submit again despite a pending
   transaction — which for a software signer means a second signature and a
