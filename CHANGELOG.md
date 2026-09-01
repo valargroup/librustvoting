@@ -44,10 +44,16 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - An ambiguous broadcast whose classification cannot be persisted is reported as
   `OutcomeUnknown` rather than as a storage error; its reservation is still
   durably `attempting`.
+- No failure inside a submission call — a lookup, a journal write, a
+  reservation, or the cleanup of an unsent one — is reported as that call's
+  result while a completed ambiguous broadcast, a known candidate, or a live
+  attempt says the transaction may still commit; those report `OutcomeUnknown`.
+  The rule is applied once where failures leave the attempt loop rather than per
+  call site. `AcceptedButUnjournaled` is unaffected, since it already carries
+  the transaction hash.
 - A reconciliation that reports `Cancelled` no longer replaces an earlier
   ambiguous broadcast's result at the between-retry gate, and cancellation is
-  rechecked after failed candidates are retired, immediately before the
-  confirmation transaction.
+  rechecked both before and after failed candidates are retired.
 - `ChainLifecycleError::AcceptedButUnjournaled` reports a CheckTx-accepted
   transaction whose hash could not be journaled, carrying the hash alongside the
   persistence error. The transaction may commit and the hash is the only way to

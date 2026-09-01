@@ -579,20 +579,30 @@ hosts do not parse the log.
    outcome and classifying a committed failure retires evidence. A cancelled
    operation does neither: the candidate stays journaled, so the next
    reconciliation re-derives whatever this one was about to conclude.
-8. A reconciliation that fails to settle does not overwrite what this call
+8. No failure inside a submission call is reported as that call's result while
+   the call already knows the transaction may commit. Every step there is
+   fallible — a lookup, a journal write, a reservation, the cleanup of an unsent
+   one — and each failure is definite only for the step that raised it, so the
+   rule is applied once where those failures leave the attempt loop rather than
+   at each of them. A completed ambiguous broadcast, a known candidate, or a
+   live attempt all outrank it, and the call reports `OutcomeUnknown`. The one
+   exception is a CheckTx acceptance that could not be journaled: it already
+   carries the transaction hash, which is strictly more than the ambiguity it
+   implies.
+9. A reconciliation that fails to settle does not overwrite what this call
    already knows. That covers both a `Cancelled` result, which concluded
    nothing, and a terminal lookup error, which is evidence about someone else's
    candidate rather than about this call's earlier attempt: with a completed
    ambiguous broadcast outstanding, either reports that broadcast's ambiguity
    instead. It applies wherever a reconciliation's result is adopted, including
    the between-retry gate and the rejection path.
-9. Cancellation observed after a broadcast completes does not replace that
+10. Cancellation observed after a broadcast completes does not replace that
    broadcast's result. A call cancelled while a dispatched attempt may still
    commit reports `OutcomeUnknown`; `Cancelled` is reserved for calls with no
    completed ambiguous broadcast.
-10. Cancellation before a fresh reservation dispatches removes the definitely
+11. Cancellation before a fresh reservation dispatches removes the definitely
    unsent reservation. Cancellation after dispatch retains uncertainty.
-11. A deleted or replaced generation cannot receive a delayed transport or
+12. A deleted or replaced generation cannot receive a delayed transport or
    confirmation result. Cancellation is re-checked immediately before the
    confirmation transaction, so a session invalidated while a status request
    was in flight does not have voting state mutated underneath it. This narrows
@@ -695,6 +705,8 @@ state transitions.
   mixed ones where another candidate returns first?
 - Can a terminal lookup error for someone else's candidate replace this call's
   own ambiguity?
+- Is that rule applied to every fallible step in a submission call, or only to
+  the ones a reviewer happened to name?
 - Can a confirmed atomic-batch member be reported as a singleton confirmation?
 - Do an atomic batch's persisted proposal and nullifier bindings participate in
   endpoint failover?
@@ -809,9 +821,12 @@ state transitions.
   covers retirement on a lookup that exits through another candidate's unusable
   response, and `cancellation_after_all_failure_retirement_is_observed` covers
   the cancellation check that follows it.
-- `chain_submission::tests::a_retry_reconciliation_error_preserves_earlier_ambiguity`
-  and `a_rejection_that_cannot_be_journaled_stays_unknown` cover the two
-  remaining paths that could replace a completed ambiguous broadcast's result.
+- `chain_submission::tests::a_retry_reconciliation_error_preserves_earlier_ambiguity`,
+  `a_rejection_that_cannot_be_journaled_stays_unknown`,
+  `a_rejection_path_lookup_error_preserves_earlier_ambiguity`, and
+  `a_failed_unsent_cleanup_preserves_earlier_ambiguity` cover failures at four
+  different steps of a submission call, all reaching the one rule that keeps a
+  completed ambiguous broadcast's result.
 - `chain_submission::tests::one_transaction_recorded_in_two_casings_is_looked_up_once`
   and `chain_submission::tests::a_legacy_opaque_hash_does_not_break_reconciliation`
   cover candidate canonicalization and non-normalizable legacy hashes.

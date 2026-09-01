@@ -514,17 +514,67 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         rebuild: PayloadRebuild<'_>,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
-        let existing = self.reconcile_locked(wallet_id, &identity, cancel).await?;
+        // Every step inside the attempt loop can fail — a lookup, a journal
+        // write, a reservation, the cleanup of an unsent one — and each such
+        // failure is definite only for the step that raised it. Once a broadcast
+        // in this call has completed ambiguously, or a candidate is known, or an
+        // attempt is still live, none of them may be reported as the call's
+        // result: the transaction may still commit, and a host reading a plain
+        // error as a definite failure could replace a generation that is about
+        // to be confirmed. Catching that here rather than at each `?` keeps the
+        // rule from having to be rediscovered every time a new fallible step is
+        // added.
+        let mut last_unknown = None;
+        match self
+            .attempt_submission(
+                wallet_id,
+                &identity,
+                body,
+                rebuild,
+                cancel,
+                &mut last_unknown,
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            // The exception: this one already carries the accepted hash, which
+            // is the only handle on a transaction in the mempool and strictly
+            // more than the ambiguity it implies.
+            Err(error @ ChainLifecycleError::AcceptedButUnjournaled { .. }) => Err(error),
+            Err(error) => {
+                match self.outstanding_ambiguity(
+                    wallet_id,
+                    &identity,
+                    &last_unknown,
+                    &error.to_string(),
+                )? {
+                    Some(outcome) => Ok(outcome),
+                    None => Err(error),
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt_submission(
+        &self,
+        wallet_id: &str,
+        identity: &ChainSubmissionIdentity,
+        body: Vec<u8>,
+        rebuild: PayloadRebuild<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+        last_unknown: &mut Option<String>,
+    ) -> Result<ChainLifecycleOutcome, ChainLifecycleError> {
+        let existing = self.reconcile_locked(wallet_id, identity, cancel).await?;
         if blocks_further_dispatch(&existing) {
             return Ok(existing);
         }
 
         let digest: [u8; 32] = Sha256::digest(&body).into();
         let attempts = self.client.retry_delays().len() + 1;
-        let mut last_unknown = None;
         for attempt_index in 0..attempts {
             if cancel() {
-                return Ok(self.cancelled_outcome(wallet_id, &identity, &last_unknown)?);
+                return Ok(self.cancelled_outcome(wallet_id, identity, last_unknown)?);
             }
             if attempt_index > 0 {
                 // Another process, or a concurrent legacy recording call, can
@@ -535,13 +585,13 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 // evidence about this call's earlier attempt, which may still
                 // commit. Replacing that ambiguity with the unrelated error
                 // would let the host read it as a definite failure.
-                let reconciled = match self.reconcile_locked(wallet_id, &identity, cancel).await {
+                let reconciled = match self.reconcile_locked(wallet_id, identity, cancel).await {
                     Ok(reconciled) => reconciled,
                     Err(error) => {
                         if let Some(outcome) = self.outstanding_ambiguity(
                             wallet_id,
-                            &identity,
-                            &last_unknown,
+                            identity,
+                            last_unknown,
                             &error.to_string(),
                         )? {
                             return Ok(outcome);
@@ -554,7 +604,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 // result. `cancelled_outcome` reports the earlier ambiguity when
                 // there is one and `Cancelled` only when there is not.
                 if matches!(reconciled, ChainLifecycleOutcome::Cancelled) {
-                    return Ok(self.cancelled_outcome(wallet_id, &identity, &last_unknown)?);
+                    return Ok(self.cancelled_outcome(wallet_id, identity, last_unknown)?);
                 }
                 if blocks_further_dispatch(&reconciled) {
                     return Ok(reconciled);
@@ -574,21 +624,20 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // can no longer be confirmed against what is stored. Registering
             // first can only name an identity whose reservation then fails,
             // which over-protects its rows until the guard drops.
-            let _in_flight = InFlightAttempt::register(wallet_id, &identity);
+            let _in_flight = InFlightAttempt::register(wallet_id, identity);
             // A failure here is definite only for this attempt. An earlier one
             // in this call may still commit, and a concurrent change to the
             // now-uncovered generation is exactly what makes this rebuild fail
             // as stale — so reporting the persistence error alone would hide the
             // ambiguity and invite the host to treat the replacement as safe to
             // submit.
-            let attempt_id = match reserve_attempt(self.db, wallet_id, &identity, &digest, rebuild)
-            {
+            let attempt_id = match reserve_attempt(self.db, wallet_id, identity, &digest, rebuild) {
                 Ok(attempt_id) => attempt_id,
                 Err(error) => {
                     if let Some(outcome) = self.outstanding_ambiguity(
                         wallet_id,
-                        &identity,
-                        &last_unknown,
+                        identity,
+                        last_unknown,
                         &error.to_string(),
                     )? {
                         return Ok(outcome);
@@ -600,7 +649,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                 // This reservation is definitely unsent, but an earlier attempt
                 // in this call may still commit.
                 delete_attempt(self.db, wallet_id, attempt_id)?;
-                return Ok(self.cancelled_outcome(wallet_id, &identity, &last_unknown)?);
+                return Ok(self.cancelled_outcome(wallet_id, identity, last_unknown)?);
             }
 
             let result = {
@@ -656,8 +705,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     let journal_error =
                         mark_attempt(self.db, wallet_id, attempt_id, "rejected", tx_hash).err();
                     if is_spent_nullifier_log(&result.log) {
-                        let reconciled =
-                            self.reconcile_locked(wallet_id, &identity, cancel).await?;
+                        let reconciled = self.reconcile_locked(wallet_id, identity, cancel).await?;
                         // Either confirmed outcome is proof of success. Another
                         // process may have applied the confirmation between this
                         // call's preflight and this response.
@@ -669,7 +717,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                             return Ok(reconciled);
                         }
                         return Ok(ChainLifecycleOutcome::AlreadySpentUnresolved {
-                            known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
+                            known_tx_hashes: known_hashes(self.db, wallet_id, identity)?,
                             log: result.log,
                         });
                     }
@@ -679,9 +727,8 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     // `accepted` is neither `attempting` nor `outcome_unknown`.
                     // Settle it on the network before reporting a rejection that
                     // is definite only for this attempt's own payload.
-                    if !known_hashes(self.db, wallet_id, &identity)?.is_empty() {
-                        let reconciled =
-                            self.reconcile_locked(wallet_id, &identity, cancel).await?;
+                    if !known_hashes(self.db, wallet_id, identity)?.is_empty() {
+                        let reconciled = self.reconcile_locked(wallet_id, identity, cancel).await?;
                         // `Cancelled` is excluded deliberately: cancellation
                         // observed after this broadcast completed must not
                         // replace its result, and the checks below still have to
@@ -707,12 +754,12 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     // committed failure there retires its candidates. This also
                     // covers a reconciliation that was cancelled and so reached
                     // no conclusion at all.
-                    let known_tx_hashes = known_hashes(self.db, wallet_id, &identity)?;
+                    let known_tx_hashes = known_hashes(self.db, wallet_id, identity)?;
                     if last_unknown.is_some()
                         || !known_tx_hashes.is_empty()
-                        || has_live_attempt(self.db, wallet_id, &identity)?
+                        || has_live_attempt(self.db, wallet_id, identity)?
                     {
-                        let earlier = match (&last_unknown, &journal_error) {
+                        let earlier = match (&*last_unknown, &journal_error) {
                             (Some(message), _) => message.clone(),
                             (None, Some(error)) => {
                                 format!("this rejection could not be journaled: {error}")
@@ -736,7 +783,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     });
                 }
                 Ok(ChainBroadcastOutcome::OutcomeUnknown { message }) => {
-                    last_unknown = Some(message.clone());
+                    *last_unknown = Some(message.clone());
                     // The request may still commit, and the reservation is still
                     // durably `attempting`, so the ambiguity is real whether or
                     // not this classification lands. Returning the storage error
@@ -746,7 +793,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                         mark_attempt(self.db, wallet_id, attempt_id, "outcome_unknown", None)
                     {
                         return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                            known_tx_hashes: known_hashes(self.db, wallet_id, &identity)
+                            known_tx_hashes: known_hashes(self.db, wallet_id, identity)
                                 .unwrap_or_default(),
                             message: format!(
                                 "{message}; classifying that attempt also failed to persist: {error}"
@@ -775,7 +822,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                             mark_attempt(self.db, wallet_id, attempt_id, "outcome_unknown", None)
                         {
                             return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                                known_tx_hashes: known_hashes(self.db, wallet_id, &identity)
+                                known_tx_hashes: known_hashes(self.db, wallet_id, identity)
                                     .unwrap_or_default(),
                                 message: format!(
                                     "{error}; classifying that attempt also failed to persist: {persist}"
@@ -792,17 +839,17 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                         // `has_live_attempt` cannot see its `accepted` state.
                         if error.is_ambiguous()
                             || last_unknown.is_some()
-                            || has_live_attempt(self.db, wallet_id, &identity)?
-                            || !known_hashes(self.db, wallet_id, &identity)?.is_empty()
+                            || has_live_attempt(self.db, wallet_id, identity)?
+                            || !known_hashes(self.db, wallet_id, identity)?.is_empty()
                         {
-                            let message = match &last_unknown {
+                            let message = match &*last_unknown {
                                 Some(earlier) => format!(
                                     "an earlier attempt's outcome is unknown ({earlier}); a later attempt failed: {error}"
                                 ),
                                 None => error.to_string(),
                             };
                             return Ok(ChainLifecycleOutcome::OutcomeUnknown {
-                                known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
+                                known_tx_hashes: known_hashes(self.db, wallet_id, identity)?,
                                 message,
                             });
                         }
@@ -813,22 +860,24 @@ impl<'a> ChainSubmissionLifecycle<'a> {
                     // deleted above, and HTTP 429 is journaled as rejected;
                     // neither leaves a transaction that might commit.
                     if error.is_ambiguous() {
-                        last_unknown = Some(error.to_string());
+                        *last_unknown = Some(error.to_string());
                     }
                 }
             }
 
             if attempt_index + 1 < attempts {
                 if cancel() {
-                    return Ok(self.cancelled_outcome(wallet_id, &identity, &last_unknown)?);
+                    return Ok(self.cancelled_outcome(wallet_id, identity, last_unknown)?);
                 }
                 tokio::time::sleep(self.client.retry_delays()[attempt_index]).await;
             }
         }
 
         Ok(ChainLifecycleOutcome::OutcomeUnknown {
-            known_tx_hashes: known_hashes(self.db, wallet_id, &identity)?,
-            message: last_unknown.unwrap_or_else(|| "submission outcome is unknown".to_string()),
+            known_tx_hashes: known_hashes(self.db, wallet_id, identity)?,
+            message: last_unknown
+                .clone()
+                .unwrap_or_else(|| "submission outcome is unknown".to_string()),
         })
     }
 
@@ -4841,6 +4890,148 @@ mod tests {
         assert!(
             matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
                 if message.contains("could not be journaled")),
+            "got {outcome:?}"
+        );
+    }
+
+    /// Records a racing candidate on the *second* POST only, so the rejection
+    /// branch is the first place that candidate is reconciled.
+    struct CandidateOnSecondPostTransport {
+        inner: MockTransport,
+        db_path: String,
+        posts: Mutex<usize>,
+    }
+
+    impl ChainTransport for CandidateOnSecondPostTransport {
+        fn get<'a>(&'a self, url: &'a str, timeout: Duration) -> ChainFuture<'a> {
+            self.inner.get(url, timeout)
+        }
+
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            body: Vec<u8>,
+            timeout: Duration,
+        ) -> ChainFuture<'a> {
+            {
+                let mut posts = self.posts.lock().unwrap();
+                *posts += 1;
+                if *posts == 2 {
+                    let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+                    conn.execute(
+                        "INSERT INTO chain_submission_attempts
+                         (round_id, wallet_id, kind, bundle_index, proposal_id, batch_digest,
+                          payload_digest, chain_tx_hash, state, created_at, updated_at)
+                         VALUES (?1, ?2, 'delegation', 0, -1, X'', ?3, ?4, 'accepted', 1, 1)",
+                        rusqlite::params![ROUND_ID, WALLET, vec![0xEE_u8; 32], TX_HASH_2],
+                    )
+                    .unwrap();
+                }
+            }
+            self.inner.post_json(url, body, timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejection_path_lookup_error_preserves_earlier_ambiguity() {
+        let path = std::env::temp_dir().join(format!(
+            "zcash_voting_reject_lookup_err_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = file_test_db(path.to_str().unwrap());
+        let inner = MockTransport::default();
+        inner.responses.lock().unwrap().extend([
+            // Attempt one is ambiguous.
+            Err(ChainTransportError::Timeout),
+            // Attempt two is definitely rejected, and records a candidate.
+            Ok(response(
+                422,
+                r#"{"tx_hash":"","code":7,"log":"invalid proof"}"#,
+            )),
+            // Reconciling that candidate fails terminally.
+            Ok(response(401, r#"{"message":"unauthorized"}"#)),
+        ]);
+        let client = ChainClient::with_config(
+            Arc::new(CandidateOnSecondPostTransport {
+                inner,
+                db_path: path.to_str().unwrap().to_string(),
+                posts: Mutex::new(0),
+            }),
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            ChainClientConfig::default()
+                .with_retry_delays(vec![Duration::from_millis(1)])
+                .unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // The lookup error says nothing about the first attempt, whose
+        // transaction may still commit.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
+                if message.contains("timed out")),
+            "got {outcome:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_failed_unsent_cleanup_preserves_earlier_ambiguity() {
+        let db = test_db();
+        let transport = Arc::new(MockTransport::default());
+        transport.responses.lock().unwrap().extend([
+            // Attempt one is ambiguous.
+            Err(ChainTransportError::Timeout),
+            // Attempt two fails definitely before dispatch, so its reservation
+            // is removed — and that removal cannot be written.
+            Err(ChainTransportError::Transport(
+                "connect refused".to_string(),
+            )),
+        ]);
+        let client = ChainClient::with_config(
+            transport,
+            ChainEndpointSet::new(&["https://vote.example".to_string()]).unwrap(),
+            ChainClientConfig::default()
+                .with_retry_delays(vec![Duration::from_millis(1)])
+                .unwrap(),
+        );
+        let lifecycle = ChainSubmissionLifecycle::new(&db, &client);
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_attempt_delete
+                 BEFORE DELETE ON chain_submission_attempts
+                 BEGIN SELECT RAISE(ABORT, 'storage failure'); END",
+            )
+            .unwrap();
+
+        let outcome = lifecycle
+            .submit_body_locked(
+                WALLET,
+                ChainSubmissionIdentity::delegation(ROUND_ID, 0),
+                b"{}".to_vec(),
+                &echo_rebuild,
+                &|| false,
+            )
+            .await
+            .unwrap();
+
+        // Failing to tidy up a reservation that was never sent says nothing
+        // about the first attempt, which may still commit.
+        assert!(
+            matches!(&outcome, ChainLifecycleOutcome::OutcomeUnknown { message, .. }
+                if message.contains("timed out")),
             "got {outcome:?}"
         );
     }
