@@ -1105,7 +1105,11 @@ impl<'a> ChainSubmissionLifecycle<'a> {
         // holds rather than what it held before the network work.
         drop(hashes);
         let hashes = known_hashes(self.db, wallet_id, identity)?;
-        // That read can wait on SQLite, so cancellation may have arrived since
+        // Whether a dispatched attempt may still commit is asked by three of the
+        // branches below. Read it here, with the candidate set, so no
+        // classification is preceded by a database wait of its own.
+        let live_attempt = has_live_attempt(self.db, wallet_id, identity)?;
+        // Those reads can wait on SQLite, so cancellation may have arrived since
         // the check above, and every classification below is a claim this
         // operation is no longer entitled to make.
         if cancel() {
@@ -1152,12 +1156,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // can locate, so reporting that the known candidates simply have not
             // committed yet would overstate what this call established — the same
             // rule the committed-failure and terminal-error branches follow.
-            let live = has_live_attempt(self.db, wallet_id, identity)?;
-            // That read waits on the database, and it sits past the check above.
-            if cancel() {
-                return Ok(ChainLifecycleOutcome::Cancelled);
-            }
-            if live {
+            if live_attempt {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                     known_tx_hashes: hashes,
                     message: "an earlier attempt was dispatched without a usable response"
@@ -1177,14 +1176,8 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // call's answer. `reconcile` reaches this exit directly, without the
             // submission loop's ambiguity handling around it, so the check
             // belongs here.
-            let live = has_live_attempt(self.db, wallet_id, identity)?;
-            // That read waits on the database, and this branch sits past every
-            // earlier check.
-            if cancel() {
-                return Ok(ChainLifecycleOutcome::Cancelled);
-            }
             let remaining = hashes;
-            if !remaining.is_empty() || live {
+            if !remaining.is_empty() || live_attempt {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                     known_tx_hashes: remaining,
                     message: format!(
@@ -1203,7 +1196,7 @@ impl<'a> ChainSubmissionLifecycle<'a> {
             // so anything `known_hashes` still returns is a transaction nobody
             // has disproved. `has_live_attempt` cannot see it, because a
             // candidate arrives `accepted`.
-            if !hashes.is_empty() || has_live_attempt(self.db, wallet_id, identity)? {
+            if !hashes.is_empty() || live_attempt {
                 return Ok(ChainLifecycleOutcome::OutcomeUnknown {
                     known_tx_hashes: hashes,
                     message: "another candidate for this submission may still commit".to_string(),
@@ -6198,7 +6191,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_in_flight_guard_is_released_before_the_backoff() {
         let db = test_db();
-        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 0);
+        // A bundle index no other test submits for: the in-flight registry is
+        // process-global, so a shared identity would count another test's POST.
+        let identity = ChainSubmissionIdentity::delegation(ROUND_ID, 7788);
         let transport = Arc::new(MockTransport::default());
         // Retryable, and journaled as rejected: once classified, nothing of
         // ours is outstanding.
@@ -6219,7 +6214,7 @@ mod tests {
         // once, so by the time this fires the call is waiting to retry.
         let sampled = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            in_flight_count(WALLET, &ChainSubmissionIdentity::delegation(ROUND_ID, 0))
+            in_flight_count(WALLET, &ChainSubmissionIdentity::delegation(ROUND_ID, 7788))
         };
         let submit =
             lifecycle
