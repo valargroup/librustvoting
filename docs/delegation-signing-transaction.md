@@ -522,8 +522,9 @@ The complete caller-oriented flows are implemented in
 
 - `build_keystone_delegation_request` builds TX1 and returns the full and
   signer-redacted PCZTs;
-- `prove_and_submit_keystone_delegation_bundle` extracts the returned
-  SpendAuth signature and assembles the delegation submission; and
+- `prove_and_submit_keystone_delegation_bundle` reuses or completes ZKP #1,
+  extracts the returned SpendAuth signature, and assembles the delegation
+  submission; and
 - `prove_and_submit_delegation_bundle` demonstrates the equivalent
   wallet-owned software signing path.
 

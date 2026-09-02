@@ -462,21 +462,31 @@ pub fn build_keystone_delegation_request(
 ///
 /// Returns an error if proof generation fails, PIR access fails, the signature
 /// cannot be extracted, or submission fields cannot be assembled.
-pub fn prove_and_submit_keystone_delegation_bundle(
+pub fn prove_and_submit_keystone_delegation_bundle<C, P, CL, R>(
     voting_db: &VotingDb,
+    wallet_db: &zcash_client_sqlite::WalletDb<C, P, CL, R>,
     prepared: &PreparedDelegationBundle,
     pir_layout: PirLayout,
     pir_server_url: &str,
     keystone_request: &KeystoneSigningRequest,
     signed_pczt_bytes: &[u8],
-) -> Result<DelegationSubmission> {
-    // Generate the proof using warmed witnesses and PIR rows, without
-    // rebuilding the PCZT that Keystone already signed.
+) -> Result<DelegationSubmission>
+where
+    C: std::borrow::Borrow<rusqlite::Connection>,
+    P: Parameters,
+{
+    // Reuse a proof completed during warmup without requiring PIR to remain
+    // available after Keystone returns the signed PCZT.
     let progress = NoopProgressReporter;
-    let pir_client = connect_pir(pir_layout, pir_server_url)?;
-    prepared
-        .prove(voting_db, &pir_client, &progress)
-        .context("prove delegation bundle")?;
+    if !voting_db
+        .has_persisted_delegation_proof(&prepared.round_id, prepared.bundle_index)
+        .context("check persisted delegation proof")?
+    {
+        let pir_client = connect_pir(pir_layout, pir_server_url)?;
+        prepared
+            .ensure_proof(voting_db, wallet_db, &pir_client, &progress)
+            .context("ensure delegation proof")?;
+    }
 
     // Pair Keystone's SpendAuth signature with the original setup sighash.
     let action_index = usize::try_from(keystone_request.action_index)
