@@ -1625,8 +1625,8 @@ pub fn load_zkp2_inputs(
 ///
 /// # Errors
 ///
-/// - [`VotingError::InvalidInput`] if the round/bundle is missing, or the VAN
-///   leaf position is unset.
+/// - [`VotingError::InvalidInput`] if the round/bundle is missing, the VAN leaf
+///   position is unset, or the position exceeds the legacy `u32` circuit input.
 /// - [`VotingError::Internal`] on SQL failures loading ballot intent or vote state.
 pub(crate) fn load_vote_preparation_state(
     conn: &Connection,
@@ -1718,11 +1718,25 @@ pub fn store_van_position(
     bundle_index: u32,
     position: u32,
 ) -> Result<(), VotingError> {
+    store_van_position_u64(conn, round_id, wallet_id, bundle_index, u64::from(position))
+}
+
+/// Stores a lifecycle VAN position after checking the SQLite representation.
+pub(crate) fn store_van_position_u64(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    position: u64,
+) -> Result<(), VotingError> {
+    let position = i64::try_from(position).map_err(|_| VotingError::InvalidInput {
+        message: format!("VAN leaf position {position} does not fit in SQLite i64"),
+    })?;
     let rows = conn
         .execute(
             "UPDATE bundles SET van_leaf_position = :position WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
-                ":position": position as i64,
+                ":position": position,
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
@@ -1742,25 +1756,69 @@ pub fn store_van_position(
     Ok(())
 }
 
-/// Load the VAN leaf position for witness generation.
+/// Loads a VAN leaf position that fits the legacy `u32` witness interface.
+///
+/// Returns [`VotingError::InvalidInput`] when the position is missing or lies
+/// outside `u32`; use [`load_van_position_u64`] for lifecycle/recovery state.
 pub fn load_van_position(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
 ) -> Result<u32, VotingError> {
-    conn.query_row(
+    let position = load_van_position_u64(conn, round_id, wallet_id, bundle_index)?;
+    u32::try_from(position).map_err(|_| VotingError::InvalidInput {
+        message: format!(
+            "van_leaf_position {position} for round={round_id}, bundle={bundle_index} does not fit in u32"
+        ),
+    })
+}
+
+/// Loads the complete lifecycle VAN leaf position without narrowing it.
+///
+/// Returns [`VotingError::InvalidInput`] when the position is unset and
+/// [`VotingError::Internal`] when durable storage contains a negative value.
+pub fn load_van_position_u64(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<u64, VotingError> {
+    load_optional_van_position_u64(conn, round_id, wallet_id, bundle_index)?.ok_or_else(|| {
+        VotingError::InvalidInput {
+            message: format!(
+                "van_leaf_position not yet set for round={}, bundle={}",
+                round_id, bundle_index
+            ),
+        }
+    })
+}
+
+/// Loads an optional lifecycle VAN position without hiding malformed storage.
+pub(crate) fn load_optional_van_position_u64(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Option<u64>, VotingError> {
+    let position = conn.query_row(
         "SELECT van_leaf_position FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get::<_, Option<i64>>(0),
     )
     .map_err(|e| VotingError::InvalidInput {
         message: format!("no van_leaf_position for round={}, bundle={} ({})", round_id, bundle_index, e),
-    })?
-    .map(|v| v as u32)
-    .ok_or_else(|| VotingError::InvalidInput {
-        message: format!("van_leaf_position not yet set for round={}, bundle={}", round_id, bundle_index),
-    })
+    })?;
+    let Some(position) = position else {
+        return Ok(None);
+    };
+    u64::try_from(position)
+        .map(Some)
+        .map_err(|_| VotingError::Internal {
+            message: format!(
+                "stored van_leaf_position for round={round_id}, bundle={bundle_index} must be non-negative, got {position}"
+            ),
+        })
 }
 
 /// One confirmed VAN position that must be retained during vote-tree sync.

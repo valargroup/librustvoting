@@ -88,31 +88,14 @@ fn record_delegation_confirmation(
             message: format!("delegation confirmation transaction failed: {e}"),
         })?;
 
-    let (stored_hash, stored_van_position) =
-        load_bundle_confirmation_fields(&tx, round_id, &wallet_id, bundle_index)?;
-    check_text_conflict(
-        stored_hash.as_deref(),
-        &confirmation.tx_hash,
-        "delegation tx_hash",
-    )?;
-    let should_store_van_position =
-        delegation_van_position_should_update(stored_van_position, confirmation.van_leaf_position)?;
-    queries::store_delegation_tx_hash(
+    apply_delegation_confirmation_with_conn(
         &tx,
-        round_id,
         &wallet_id,
+        round_id,
         bundle_index,
-        &confirmation.tx_hash,
+        Some(&confirmation.tx_hash),
+        u64::from(confirmation.van_leaf_position),
     )?;
-    if should_store_van_position {
-        queries::store_van_position(
-            &tx,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            confirmation.van_leaf_position,
-        )?;
-    }
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("commit delegation confirmation transaction failed: {e}"),
     })
@@ -200,66 +183,17 @@ fn record_vote_batch_confirmation(
         .map_err(|e| VotingError::Internal {
             message: format!("vote batch confirmation transaction failed: {e}"),
         })?;
-    let recoveries = crate::vote::load_vote_batch_recoveries_with_conn(
+    apply_vote_batch_confirmation_with_conn(
         &tx,
         &wallet_id,
         round_id,
         bundle_index,
         batch_digest,
-    )?;
-    let expected_proposals = recoveries
-        .iter()
-        .map(|recovery| recovery.proposal_id)
-        .collect::<Vec<_>>();
-    let expected_nullifiers = recoveries
-        .iter()
-        .map(|recovery| hex::encode(recovery.van_nullifier))
-        .collect::<Vec<_>>();
-    if confirmation.proposal_ids != expected_proposals || event_nullifiers != expected_nullifiers {
-        return Err(VotingError::InvalidInput {
-            message: "cast_vote_batch event actions do not match persisted recovery data"
-                .to_string(),
-        });
-    }
-    if confirmation.vc_tree_positions.len() != recoveries.len() {
-        return Err(VotingError::InvalidInput {
-            message: "cast_vote_batch event has the wrong number of VC positions".to_string(),
-        });
-    }
-    for (recovery, vc_tree_position) in recoveries
-        .iter()
-        .zip(confirmation.vc_tree_positions.iter().copied())
-    {
-        queries::record_vote_submission(
-            &tx,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            recovery.proposal_id,
-            &confirmation.tx_hash,
-        )?;
-        require_vote_recovery_json(
-            &tx,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            recovery.proposal_id,
-        )?;
-        crate::vote::record_vc_position_with_conn(
-            &tx,
-            &wallet_id,
-            round_id,
-            bundle_index,
-            recovery.proposal_id,
-            vc_tree_position,
-        )?;
-    }
-    advance_van_position_in_tx(
-        &tx,
-        round_id,
-        &wallet_id,
-        bundle_index,
-        confirmation.van_leaf_position,
+        Some(&confirmation.tx_hash),
+        u64::from(confirmation.van_leaf_position),
+        &confirmation.vc_tree_positions,
+        Some(&confirmation.proposal_ids),
+        Some(&event_nullifiers),
     )?;
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("commit vote batch confirmation transaction failed: {e}"),
@@ -293,42 +227,195 @@ fn record_vote_confirmation(
             message: format!("vote confirmation transaction failed: {e}"),
         })?;
 
-    crate::vote::ensure_singleton_vote_update_with_conn(
+    apply_vote_confirmation_with_conn(
         &tx,
         &wallet_id,
         round_id,
         bundle_index,
         proposal_id,
-    )?;
-
-    queries::record_vote_submission(
-        &tx,
-        round_id,
-        &wallet_id,
-        bundle_index,
-        proposal_id,
-        &confirmation.tx_hash,
-    )?;
-    require_vote_recovery_json(&tx, round_id, &wallet_id, bundle_index, proposal_id)?;
-    advance_van_position_in_tx(
-        &tx,
-        round_id,
-        &wallet_id,
-        bundle_index,
-        confirmation.van_leaf_position,
-    )?;
-    crate::vote::record_vc_position_with_conn(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-        proposal_id,
+        Some(&confirmation.tx_hash),
+        u64::from(confirmation.van_leaf_position),
         confirmation.vc_tree_position,
     )?;
 
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("commit vote confirmation transaction failed: {e}"),
     })
+}
+
+fn require_sqlite_position(position: u64, field: &str) -> Result<(), VotingError> {
+    i64::try_from(position)
+        .map(|_| ())
+        .map_err(|_| VotingError::InvalidInput {
+            message: format!("{field} {position} does not fit in SQLite i64"),
+        })
+}
+
+/// Applies a delegation confirmation using the caller's transaction.
+///
+/// A missing hash represents tree-only evidence. Replays are idempotent;
+/// conflicting hashes or VAN positions are rejected before mutation. The
+/// caller must roll back its transaction on any error.
+pub(crate) fn apply_delegation_confirmation_with_conn(
+    conn: &rusqlite::Transaction<'_>,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    tx_hash: Option<&str>,
+    van_leaf_position: u64,
+) -> Result<(), VotingError> {
+    require_sqlite_position(van_leaf_position, "VAN leaf position")?;
+    let (stored_hash, stored_van_position) =
+        load_bundle_confirmation_fields(conn, round_id, wallet_id, bundle_index)?;
+    if let Some(tx_hash) = tx_hash {
+        require_tx_hash(tx_hash)?;
+        check_text_conflict(stored_hash.as_deref(), tx_hash, "delegation tx_hash")?;
+    }
+    let should_store_van_position =
+        delegation_van_position_should_update(stored_van_position, van_leaf_position)?;
+    if let Some(tx_hash) = tx_hash {
+        queries::store_delegation_tx_hash(conn, round_id, wallet_id, bundle_index, tx_hash)?;
+    }
+    if should_store_van_position {
+        queries::store_van_position_u64(
+            conn,
+            round_id,
+            wallet_id,
+            bundle_index,
+            van_leaf_position,
+        )?;
+    }
+    Ok(())
+}
+
+/// Applies a singleton-vote confirmation using the caller's transaction.
+///
+/// The vote must not be a batch member. A missing hash represents tree-only
+/// evidence. The caller must roll back its transaction on any error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_vote_confirmation_with_conn(
+    conn: &rusqlite::Transaction<'_>,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    tx_hash: Option<&str>,
+    van_leaf_position: u64,
+    vc_tree_position: u64,
+) -> Result<(), VotingError> {
+    require_sqlite_position(van_leaf_position, "VAN leaf position")?;
+    require_sqlite_position(vc_tree_position, "vote commitment tree position")?;
+    crate::vote::ensure_singleton_vote_update_with_conn(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        proposal_id,
+    )?;
+    if let Some(tx_hash) = tx_hash {
+        require_tx_hash(tx_hash)?;
+        queries::record_vote_submission(
+            conn,
+            round_id,
+            wallet_id,
+            bundle_index,
+            proposal_id,
+            tx_hash,
+        )?;
+    }
+    require_vote_recovery_json(conn, round_id, wallet_id, bundle_index, proposal_id)?;
+    advance_van_position_in_tx(conn, round_id, wallet_id, bundle_index, van_leaf_position)?;
+    crate::vote::record_vc_position_with_conn(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        proposal_id,
+        vc_tree_position,
+    )
+}
+
+/// Applies an ordered atomic-batch confirmation using the caller's transaction.
+///
+/// Optional observed IDs and nullifiers, when supplied, must exactly match the
+/// persisted action order. Numeric position conversions are checked before
+/// writes; the caller must roll back its transaction on any error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_vote_batch_confirmation_with_conn(
+    conn: &rusqlite::Transaction<'_>,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    batch_digest: [u8; 32],
+    tx_hash: Option<&str>,
+    van_leaf_position: u64,
+    vc_tree_positions: &[u64],
+    observed_proposal_ids: Option<&[u32]>,
+    observed_nullifiers: Option<&[String]>,
+) -> Result<(), VotingError> {
+    require_sqlite_position(van_leaf_position, "VAN leaf position")?;
+    for &position in vc_tree_positions {
+        require_sqlite_position(position, "vote commitment tree position")?;
+    }
+    if let Some(tx_hash) = tx_hash {
+        require_tx_hash(tx_hash)?;
+    }
+    let recoveries = crate::vote::load_vote_batch_recoveries_with_conn(
+        conn,
+        wallet_id,
+        round_id,
+        bundle_index,
+        batch_digest,
+    )?;
+    let expected_proposals = recoveries
+        .iter()
+        .map(|recovery| recovery.proposal_id)
+        .collect::<Vec<_>>();
+    let expected_nullifiers = recoveries
+        .iter()
+        .map(|recovery| hex::encode(recovery.van_nullifier))
+        .collect::<Vec<_>>();
+    if observed_proposal_ids.is_some_and(|observed| observed != expected_proposals)
+        || observed_nullifiers.is_some_and(|observed| observed != expected_nullifiers)
+    {
+        return Err(VotingError::InvalidInput {
+            message: "cast_vote_batch event actions do not match persisted recovery data"
+                .to_string(),
+        });
+    }
+    if vc_tree_positions.len() != recoveries.len() {
+        return Err(VotingError::InvalidInput {
+            message: "cast_vote_batch event has the wrong number of VC positions".to_string(),
+        });
+    }
+    for (recovery, vc_tree_position) in recoveries.iter().zip(vc_tree_positions.iter().copied()) {
+        if let Some(tx_hash) = tx_hash {
+            queries::record_vote_submission(
+                conn,
+                round_id,
+                wallet_id,
+                bundle_index,
+                recovery.proposal_id,
+                tx_hash,
+            )?;
+        }
+        require_vote_recovery_json(
+            conn,
+            round_id,
+            wallet_id,
+            bundle_index,
+            recovery.proposal_id,
+        )?;
+        crate::vote::record_vc_position_with_conn(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            recovery.proposal_id,
+            vc_tree_position,
+        )?;
+    }
+    advance_van_position_in_tx(conn, round_id, wallet_id, bundle_index, van_leaf_position)
 }
 
 fn require_vote_recovery_json(
@@ -674,9 +761,11 @@ fn load_bundle_confirmation_fields(
 
 fn delegation_van_position_should_update(
     stored_van_position: Option<i64>,
-    van_leaf_position: u32,
+    van_leaf_position: u64,
 ) -> Result<bool, VotingError> {
-    let requested = i64::from(van_leaf_position);
+    let requested = i64::try_from(van_leaf_position).map_err(|_| VotingError::InvalidInput {
+        message: format!("VAN leaf position {van_leaf_position} does not fit in SQLite i64"),
+    })?;
     match stored_van_position {
         None => Ok(true),
         Some(existing) if existing < 0 => Err(VotingError::InvalidInput {
@@ -692,11 +781,11 @@ fn delegation_van_position_should_update(
 }
 
 fn advance_van_position_in_tx(
-    conn: &rusqlite::Connection,
+    conn: &rusqlite::Transaction<'_>,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
-    van_leaf_position: u32,
+    van_leaf_position: u64,
 ) -> Result<(), VotingError> {
     let (_, stored_van_position) =
         load_bundle_confirmation_fields(conn, round_id, wallet_id, bundle_index)?;
@@ -706,11 +795,17 @@ fn advance_van_position_in_tx(
                 message: format!("invalid stored van_leaf_position: {stored_van_position}"),
             });
         }
-        if stored_van_position > i64::from(van_leaf_position) {
+        let requested =
+            i64::try_from(van_leaf_position).map_err(|_| VotingError::InvalidInput {
+                message: format!(
+                    "VAN leaf position {van_leaf_position} does not fit in SQLite i64"
+                ),
+            })?;
+        if stored_van_position > requested {
             return Ok(());
         }
     }
-    queries::store_van_position(conn, round_id, wallet_id, bundle_index, van_leaf_position)
+    queries::store_van_position_u64(conn, round_id, wallet_id, bundle_index, van_leaf_position)
 }
 
 fn check_text_conflict(
@@ -1357,6 +1452,85 @@ mod tests {
     }
 
     #[test]
+    fn typed_confirmation_uses_the_full_sqlite_position_range() {
+        let db = test_db();
+        insert_bundle(&db, 0);
+        let mut conn = db.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        let error = apply_delegation_confirmation_with_conn(
+            &tx,
+            WALLET_ID,
+            ROUND_ID,
+            0,
+            Some("tx-1"),
+            i64::MAX as u64 + 1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not fit"));
+        tx.commit().unwrap();
+        drop(conn);
+
+        assert_eq!(
+            queries::get_delegation_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0).unwrap(),
+            None
+        );
+        assert!(queries::load_van_position(&db.conn(), ROUND_ID, WALLET_ID, 0).is_err());
+
+        let mut conn = db.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let position = u64::from(u32::MAX) + 1;
+        apply_delegation_confirmation_with_conn(&tx, WALLET_ID, ROUND_ID, 0, None, position)
+            .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+        let stored: i64 = db
+            .conn()
+            .query_row(
+                "SELECT van_leaf_position FROM bundles
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                (ROUND_ID, WALLET_ID),
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, position as i64);
+        assert_eq!(
+            queries::load_van_position_u64(&db.conn(), ROUND_ID, WALLET_ID, 0).unwrap(),
+            position
+        );
+        assert_eq!(db.load_van_position_u64(ROUND_ID, 0).unwrap(), position);
+        assert!(queries::load_van_position(&db.conn(), ROUND_ID, WALLET_ID, 0).is_err());
+        assert!(db.load_van_position(ROUND_ID, 0).is_err());
+
+        let snapshot = crate::recovery::round_snapshot(&db, ROUND_ID).unwrap();
+        assert_eq!(snapshot.delegation[0].van_leaf_position, Some(position));
+        let view = crate::wire::RoundRecoveryStateView::from(snapshot);
+        assert_eq!(view.delegation[0].van_leaf_position, Some(position));
+    }
+
+    #[test]
+    fn van_position_readers_reject_negative_durable_storage() {
+        let db = test_db();
+        insert_bundle(&db, 0);
+        db.conn()
+            .execute(
+                "UPDATE bundles SET van_leaf_position = -1
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                (ROUND_ID, WALLET_ID),
+            )
+            .unwrap();
+
+        let error = db.load_van_position_u64(ROUND_ID, 0).unwrap_err();
+        assert!(error.to_string().contains("must be non-negative"));
+        assert!(db.load_van_position(ROUND_ID, 0).is_err());
+        assert!(crate::recovery::round_snapshot(&db, ROUND_ID).is_err());
+    }
+
+    #[test]
     fn delegation_confirmation_rejects_conflicting_position() {
         let db = test_db();
         insert_bundle(&db, 0);
@@ -1633,6 +1807,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(van_position, None);
+    }
+
+    #[test]
+    fn typed_batch_confirmation_rolls_back_when_a_later_member_conflicts() {
+        let db = test_db();
+        insert_bundle(&db, 0);
+        let (digest, recoveries) = store_two_action_batch(&db);
+        db.conn()
+            .execute(
+                "UPDATE votes SET vc_tree_position = 999
+                 WHERE round_id = :round_id AND wallet_id = :wallet_id
+                   AND bundle_index = 0 AND proposal_id = 2",
+                named_params! {
+                    ":round_id": ROUND_ID,
+                    ":wallet_id": WALLET_ID,
+                },
+            )
+            .unwrap();
+
+        {
+            let mut conn = db.conn();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let proposal_ids = recoveries
+                .iter()
+                .map(|recovery| recovery.proposal_id)
+                .collect::<Vec<_>>();
+            let error = apply_vote_batch_confirmation_with_conn(
+                &tx,
+                WALLET_ID,
+                ROUND_ID,
+                0,
+                digest,
+                Some("batch-tx"),
+                10,
+                &[11, 12],
+                Some(&proposal_ids),
+                None,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("vote commitment tree position already recorded"));
+        }
+
+        assert_eq!(
+            queries::get_vote_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0, 1).unwrap(),
+            None
+        );
+        assert_eq!(
+            crate::vote::recovery_bundle(&db, ROUND_ID, 0, 1)
+                .unwrap()
+                .unwrap()
+                .vc_tree_position,
+            0
+        );
     }
 
     #[test]

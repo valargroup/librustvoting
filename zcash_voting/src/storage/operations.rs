@@ -166,7 +166,11 @@ fn pir_cache_nullifier_targets(
     Ok(targets)
 }
 
-fn verify_delegation_spend_auth_signature(
+/// Verifies a RedPallas SpendAuth signature over a delegation sighash.
+///
+/// Malformed stored keys or sighashes are internal errors; malformed or
+/// invalid caller-provided signatures are invalid input.
+pub(crate) fn verify_delegation_spend_auth_signature(
     rk: &[u8],
     sighash: &[u8],
     signature: &[u8],
@@ -1503,11 +1507,39 @@ impl VotingDb {
         queries::store_van_position(&conn, round_id, &wallet_id, bundle_index, position)
     }
 
-    /// Load the VAN leaf position for a bundle.
+    /// Loads a bundle's VAN position when it fits the legacy `u32` interface.
+    ///
+    /// Returns an error when the position is unset or exceeds `u32`; lifecycle
+    /// and recovery callers should use [`Self::load_van_position_u64`].
     pub fn load_van_position(&self, round_id: &str, bundle_index: u32) -> Result<u32, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::load_van_position(&conn, round_id, &wallet_id, bundle_index)
+    }
+
+    /// Loads a bundle's complete lifecycle VAN position as a `u64`.
+    ///
+    /// Returns an error when the position is unset or durable storage contains
+    /// a negative position.
+    pub fn load_van_position_u64(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<u64, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::load_van_position_u64(&conn, round_id, &wallet_id, bundle_index)
+    }
+
+    /// Loads an optional lifecycle VAN position without hiding corrupt values.
+    pub(crate) fn load_optional_van_position_u64(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<Option<u64>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::load_optional_van_position_u64(&conn, round_id, &wallet_id, bundle_index)
     }
 
     /// Reconstruct the delegation TX payload using an externally provided signature.

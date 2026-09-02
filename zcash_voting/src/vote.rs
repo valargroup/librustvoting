@@ -690,6 +690,15 @@ fn signed_commitment_from_parts(
     })
 }
 
+/// Encodes the chain-visible vote request stored in a recovery bundle.
+///
+/// Helper-share recovery material and confirmation positions are not exposed.
+pub(crate) fn wire_submission_from_recovery(
+    recovery: &VoteRecoveryBundle,
+) -> Result<crate::wire::VoteCommitmentWire, VotingError> {
+    crate::wire::VoteCommitmentWire::try_from(&submission_from_recovery(recovery))
+}
+
 /// Inputs for the historical batch-named singleton preparation API.
 ///
 /// `drafts` must contain exactly one item. Use [`AtomicVoteBatch`] for multiple
@@ -2058,18 +2067,25 @@ pub fn submission(
         })
         .and_then(|bundle| {
             ensure_singleton_vote_recovery(&bundle)?;
-            Ok(VoteSubmission {
-                vote_round_id: bundle.vote_round_id,
-                proposal_id: bundle.proposal_id,
-                van_nullifier: bundle.van_nullifier,
-                vote_authority_note_new: bundle.vote_authority_note_new,
-                vote_commitment: bundle.vote_commitment,
-                proof: bundle.proof,
-                r_vpk: bundle.r_vpk,
-                vote_auth_sig: bundle.vote_auth_sig,
-                anchor_height: bundle.anchor_height,
-            })
+            Ok(submission_from_recovery(&bundle))
         })
+}
+
+/// Extracts the chain-visible vote fields from a recovery bundle.
+///
+/// Callers that require singleton semantics must validate the bundle first.
+pub(crate) fn submission_from_recovery(bundle: &VoteRecoveryBundle) -> VoteSubmission {
+    VoteSubmission {
+        vote_round_id: bundle.vote_round_id.clone(),
+        proposal_id: bundle.proposal_id,
+        van_nullifier: bundle.van_nullifier,
+        vote_authority_note_new: bundle.vote_authority_note_new,
+        vote_commitment: bundle.vote_commitment,
+        proof: bundle.proof.clone(),
+        r_vpk: bundle.r_vpk,
+        vote_auth_sig: bundle.vote_auth_sig,
+        anchor_height: bundle.anchor_height,
+    }
 }
 
 /// Records the cast-vote transaction hash and marks a singleton vote submitted.
@@ -2594,7 +2610,10 @@ fn recovery_json_with_conn(
     Ok(json.flatten())
 }
 
-fn ensure_singleton_vote_recovery(recovery: &VoteRecoveryBundle) -> Result<(), VotingError> {
+/// Rejects recovery bundles that belong to an atomic batch.
+pub(crate) fn ensure_singleton_vote_recovery(
+    recovery: &VoteRecoveryBundle,
+) -> Result<(), VotingError> {
     if recovery.batch.is_some() {
         return Err(VotingError::InvalidInput {
             message: "vote belongs to an atomic batch; use the complete batch lifecycle instead of a per-vote API"
@@ -2967,7 +2986,11 @@ fn invalid_stored_choice_error(stored_choice: i64) -> VotingError {
     }
 }
 
-fn validate_recovery_matches_stored_vote(
+/// Validates that recovery identity, choice, and commitment match a vote row.
+///
+/// Returns an error for malformed stored choices or any stale/replaced
+/// recovery material; it performs no durable writes.
+pub(crate) fn validate_recovery_matches_stored_vote(
     recovery: &VoteRecoveryBundle,
     round_id: &str,
     bundle_index: u32,
@@ -3272,7 +3295,12 @@ fn commit_from_recovery(bundle: &VoteRecoveryBundle) -> Result<VoteCommit, Votin
     })
 }
 
-fn stored_vote_commitment_bytes(bundle: &VoteRecoveryBundle) -> Result<Vec<u8>, VotingError> {
+/// Returns the canonical stored commitment bytes derived from recovery state.
+///
+/// Confirmation-only fields and helper delivery state are excluded.
+pub(crate) fn stored_vote_commitment_bytes(
+    bundle: &VoteRecoveryBundle,
+) -> Result<Vec<u8>, VotingError> {
     serde_json::to_vec(&serde_json::json!({
         "van_nullifier": hex::encode(bundle.van_nullifier),
         "vote_authority_note_new": hex::encode(bundle.vote_authority_note_new),

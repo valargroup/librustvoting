@@ -28,7 +28,8 @@ pub struct DelegationRecovery {
     pub bundle_index: u32,
     pub phase: DelegationPhase,
     pub tx_hash: Option<String>,
-    pub van_leaf_position: Option<u32>,
+    /// Confirmed VAN leaf position, preserving the lifecycle's full `u64` range.
+    pub van_leaf_position: Option<u64>,
 }
 
 impl DelegationRecovery {
@@ -184,7 +185,7 @@ pub fn round_snapshot(db: &VotingDb, round_id: &str) -> Result<RoundRecoverySnap
                 bundle_index,
                 phase,
                 tx_hash: db.get_delegation_tx_hash(round_id, bundle_index)?,
-                van_leaf_position: db.load_van_position(round_id, bundle_index).ok(),
+                van_leaf_position: db.load_optional_van_position_u64(round_id, bundle_index)?,
             })
         })
         .collect::<Result<Vec<_>, VotingError>>()?;
