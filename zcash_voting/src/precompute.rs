@@ -1261,10 +1261,10 @@ mod session_reset_tests {
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
-                 (identity_key, round_id, wallet_id, network, vote_chain_id, bundle_index,
+                 (identity_key, round_id, wallet_id, network, bundle_index,
                   kind, proposal_id, generation_digest, state, committed_post_reservations,
                   diagnostic_kind, diagnostic, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', NULL, 0, 'vote', 1, NULL,
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, NULL,
                          'recovering', 0, 'recovery_unavailable',
                          'legacy generation cannot be reconstructed', 10, 10)",
                 rusqlite::params![vec![0x31_u8; 32], ROUND_ID, WALLET_ID],

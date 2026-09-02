@@ -1316,10 +1316,10 @@ mod tests {
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
-                 (identity_key, round_id, wallet_id, network, vote_chain_id, bundle_index,
+                 (identity_key, round_id, wallet_id, network, bundle_index,
                   kind, generation_digest, state, committed_post_reservations,
                   created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', 'chain', 0, 'delegation', ?4,
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', ?4,
                          'submitting', 1, 10, 10)",
                 rusqlite::params![
                     vec![0x61_u8; 32],

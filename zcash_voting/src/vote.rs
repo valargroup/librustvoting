@@ -2267,8 +2267,7 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
                 WHERE submission.round_id=:round_id
                   AND submission.wallet_id=:wallet_id
                   AND submission.kind='vote'
-                  AND submission.vote_chain_id IS NULL
-                  AND submission.state IN ('recovering','legacy_confirmed')
+                  AND submission.generation_digest IS NULL
                   AND submission.proposal_id=:proposal_id
                   AND (:choice IS NULL OR vote.choice != :choice)
              )",

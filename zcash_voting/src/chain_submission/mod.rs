@@ -15,8 +15,8 @@ pub(crate) mod coordination;
 #[allow(dead_code, reason = "inactive lifecycle coordinator")]
 mod coordinator;
 #[allow(dead_code, reason = "internal generation derivation and migration")]
-mod generation;
-mod identity;
+pub(crate) mod generation;
+pub(crate) mod identity;
 #[allow(dead_code, reason = "internal submission protocol")]
 mod protocol;
 mod result;

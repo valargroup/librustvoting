@@ -15,7 +15,8 @@ use crate::chain_submission::{
     confirmation::{apply_confirmed_generation, validate_hash_confirmation},
     coordination::SubmissionCoordination,
     generation::{derive_delegation, derive_vote, derive_vote_batch, DerivedChainSubmission},
-    result::{LegacyProjectionConfirmation, ValidatedChainSubmissionConfirmation},
+    identity::{network_name, submission_identity_key},
+    result::ValidatedChainSubmissionConfirmation,
     state::{
         apply_submission_observation, DigestlessRecoveryGuard, SubmissionObservation,
         SubmissionRecordState,
@@ -135,18 +136,9 @@ mod tests {
     }
 
     fn identity_for(bundle_index: u32, proposal_id: u32) -> ChainSubmissionIdentity {
-        identity_for_chain("vote-chain-1", bundle_index, proposal_id)
-    }
-
-    fn identity_for_chain(
-        vote_chain_id: &str,
-        bundle_index: u32,
-        proposal_id: u32,
-    ) -> ChainSubmissionIdentity {
         ChainSubmissionIdentity::new(
             "wallet",
             crate::Network::Testnet,
-            vote_chain_id,
             [0x11; 32],
             bundle_index,
             ChainSubmissionTarget::Vote { proposal_id },
@@ -220,7 +212,6 @@ mod tests {
         ChainSubmissionIdentity::new(
             "wallet",
             crate::Network::Testnet,
-            "vote-chain-1",
             [0x11; 32],
             0,
             ChainSubmissionTarget::VoteBatch {
@@ -441,31 +432,31 @@ mod tests {
     }
 
     #[test]
-    fn obsolete_migration_delegation_guard_does_not_block_a_confirmed_successor() {
+    fn confirmed_singleton_supersedes_a_bound_delegation_predecessor() {
         let db = open_prepared(":memory:");
         let positions = [vec![1, 0, 0, 0, 1], 8_u64.to_be_bytes().to_vec()].concat();
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
-                   (identity_key, round_id, wallet_id, network, vote_chain_id,
+                   (identity_key, round_id, wallet_id, network,
                     bundle_index, kind, proposal_id, generation_digest, state,
                     committed_post_reservations, diagnostic_kind, diagnostic,
                     created_at, updated_at)
-                 VALUES (?1, ?2, 'wallet', 'testnet', NULL, 0,
-                         'delegation', NULL, NULL, 'recovering', 0,
+                 VALUES (?1, ?2, 'wallet', 'testnet', 0,
+                         'delegation', NULL, ?3, 'recovering', 0,
                          'recovery_unavailable', 'legacy delegation evidence', 9, 9)",
-                rusqlite::params![vec![0x74_u8; 32], ROUND],
+                rusqlite::params![vec![0x74_u8; 32], ROUND, vec![0x73_u8; 32]],
             )
             .unwrap();
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
-                   (identity_key, round_id, wallet_id, network, vote_chain_id,
+                   (identity_key, round_id, wallet_id, network,
                     bundle_index, kind, proposal_id, generation_digest, state,
                     committed_post_reservations, confirmation_source,
                     final_van_position, vote_commitment_positions, created_at, updated_at)
-                 VALUES (?1, ?2, 'wallet', 'testnet', NULL, 0, 'vote', 1, NULL,
-                         'legacy_confirmed', 0, 'legacy_projection', 7, ?3, 9, 9)",
+                 VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 1, NULL,
+                         'confirmed', 0, 'legacy_projection', 7, ?3, 9, 9)",
                 rusqlite::params![vec![0x75_u8; 32], ROUND, positions],
             )
             .unwrap();
@@ -489,16 +480,71 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_batch_supersedes_a_digestless_delegation_predecessor() {
+        let db = open_prepared(":memory:");
+        let digest = store_two_vote_batch(&db);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                   (identity_key, round_id, wallet_id, network,
+                    bundle_index, kind, proposal_id, generation_digest, state,
+                    committed_post_reservations, diagnostic_kind, diagnostic,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, 'wallet', 'testnet', 0,
+                         'delegation', NULL, NULL, 'recovering', 0,
+                         'recovery_unavailable', 'legacy delegation evidence', 9, 9)",
+                rusqlite::params![vec![0x76_u8; 32], ROUND],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                   (identity_key, round_id, wallet_id, network,
+                    bundle_index, kind, proposal_id, ordered_batch_digest,
+                    generation_digest, state, committed_post_reservations,
+                    confirmation_source, final_van_position,
+                    vote_commitment_positions, created_at, updated_at)
+                 VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote_batch', NULL, ?3,
+                         ?4, 'confirmed', 0, 'tree', 9, ?5, 10, 10)",
+                rusqlite::params![
+                    vec![0x77_u8; 32],
+                    ROUND,
+                    digest.to_vec(),
+                    vec![0x78_u8; 32],
+                    vec![1_u8],
+                ],
+            )
+            .unwrap();
+        crate::vote::insert_recovery_fixture(&db, &recovery_for(0, 3)).unwrap();
+        let store = SqliteChainSubmissionStore::new(db);
+
+        assert!(matches!(
+            store
+                .admit(
+                    &StoreAdvancementRequest::vote(identity_for(0, 3)),
+                    true,
+                    1,
+                    11,
+                )
+                .unwrap(),
+            StoreAdmission::Ready {
+                fresh_reservation: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn digestless_predecessor_guard_blocks_unknown_successor_work() {
         let db = open_prepared(":memory:");
         crate::vote::insert_recovery_fixture(&db, &recovery_for(0, 2)).unwrap();
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
-                 (identity_key, round_id, wallet_id, network, vote_chain_id, bundle_index,
+                 (identity_key, round_id, wallet_id, network, bundle_index,
                   kind, proposal_id, generation_digest, state, committed_post_reservations,
                   diagnostic_kind, diagnostic, created_at, updated_at)
-                 VALUES (?1, ?2, 'wallet', 'testnet', NULL, 0, 'vote', 1, NULL,
+                 VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 1, NULL,
                          'recovering', 0, 'recovery_unavailable',
                          'legacy generation cannot be reconstructed', 10, 10)",
                 rusqlite::params![vec![0x31_u8; 32], ROUND],
@@ -525,10 +571,10 @@ mod tests {
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
-                 (identity_key, round_id, wallet_id, network, vote_chain_id, bundle_index,
+                 (identity_key, round_id, wallet_id, network, bundle_index,
                   kind, proposal_id, generation_digest, state, committed_post_reservations,
                   diagnostic_kind, diagnostic, created_at, updated_at)
-                 VALUES (?1, ?2, 'wallet', 'testnet', NULL, 0, 'vote', 3, NULL,
+                 VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 3, NULL,
                          'recovering', 0, 'recovery_unavailable',
                          'unrelated legacy generation', 10, 10)",
                 rusqlite::params![vec![0x39_u8; 32], ROUND],
@@ -550,12 +596,107 @@ mod tests {
         assert!(failure.strongest_state().is_none());
     }
 
+    /// Every diagnostic kind the migration can persist must load back.
+    ///
+    /// A guard row is only useful if the lifecycle can read it. An unmapped
+    /// diagnostic kind makes the whole row undecodable, so the identity reports
+    /// an opaque storage error instead of the permanent guard it actually is.
     #[test]
-    fn active_predecessor_blocks_successor_across_vote_chain_ids() {
+    fn every_migration_diagnostic_kind_loads_as_an_authoritative_guard() {
+        for (index, diagnostic_kind) in [
+            "recovery_unavailable",
+            "generation_derivation_failed",
+            "reconciliation_pending",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let proposal_id = u32::try_from(index + 1).unwrap();
+            let db = open_prepared(":memory:");
+            let identity = identity_for(0, proposal_id);
+            db.conn()
+                .execute(
+                    "INSERT INTO chain_submissions
+                       (identity_key, round_id, wallet_id, network, bundle_index, kind,
+                        proposal_id, generation_digest, state, committed_post_reservations,
+                        diagnostic_kind, diagnostic, created_at, updated_at)
+                     VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', ?3, NULL, 'recovering', 0,
+                             ?4, 'redacted version-17 diagnostic', 9, 9)",
+                    rusqlite::params![
+                        submission_identity_key(&identity),
+                        ROUND,
+                        proposal_id,
+                        diagnostic_kind
+                    ],
+                )
+                .unwrap();
+            let store = SqliteChainSubmissionStore::new(db);
+
+            let admission = store
+                .admit(&StoreAdvancementRequest::vote(identity), true, 1, 10)
+                .unwrap_or_else(|error| panic!("{diagnostic_kind} must load: {}", error.message()));
+            let StoreAdmission::Authoritative(record) = admission else {
+                panic!("{diagnostic_kind} must be authoritative without derivation")
+            };
+            assert!(record.generation_digest().is_none());
+            assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+        }
+    }
+
+    /// A migrated legacy projection is terminal and needs no recovery material.
+    ///
+    /// Its generation was never bound, so admission must return it before
+    /// attempting derivation: this fixture deliberately stores no recovery
+    /// bundle, which would make derivation fail if it were reached.
+    #[test]
+    fn legacy_projection_is_authoritative_before_any_derivation() {
+        let db = open_prepared(":memory:");
+        let identity = identity_for(0, 1);
+        let positions = [vec![1, 0, 0, 0, 1], 8_u64.to_be_bytes().to_vec()].concat();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                   (identity_key, round_id, wallet_id, network, bundle_index, kind,
+                    proposal_id, generation_digest, state, committed_post_reservations,
+                    confirmation_source, final_van_position, vote_commitment_positions,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 1, NULL, 'confirmed', 0,
+                         'legacy_projection', 7, ?3, 9, 9)",
+                rusqlite::params![submission_identity_key(&identity), ROUND, positions],
+            )
+            .unwrap();
+        let store = SqliteChainSubmissionStore::new(db);
+
+        let StoreAdmission::Authoritative(record) = store
+            .admit(&StoreAdvancementRequest::vote(identity), true, 1, 10)
+            .unwrap()
+        else {
+            panic!("a terminal legacy projection is authoritative")
+        };
+        assert_eq!(record.durable_state(), ChainSubmissionState::Confirmed);
+        assert!(record.generation_digest().is_none());
+        assert!(matches!(
+            record.public_result().unwrap(),
+            crate::chain_submission::ChainSubmissionResult::Confirmed(confirmation)
+                if confirmation.source()
+                    == crate::chain_submission::ChainSubmissionConfirmationSource::LegacyProjection
+                    && confirmation.transaction_hash().is_none()
+                    && confirmation.final_van_position() == 7
+        ));
+    }
+
+    /// Bundle causality is a property of the wallet, round, and bundle alone.
+    ///
+    /// Under the required single-ledger-per-network deployment topology, the
+    /// configured vote-chain id is not part of a submission identity, so
+    /// reconfiguring it within that ledger cannot reserve a second generation
+    /// against the same unresolved predecessor VAN.
+    #[test]
+    fn active_predecessor_blocks_the_next_bundle_generation() {
         let db = open_prepared(":memory:");
         crate::vote::insert_recovery_fixture(&db, &recovery_for(0, 2)).unwrap();
         let store = SqliteChainSubmissionStore::new(db);
-        let first = StoreAdvancementRequest::vote(identity_for_chain("vote-chain-1", 0, 1));
+        let first = StoreAdvancementRequest::vote(identity_for(0, 1));
         assert!(matches!(
             store.admit(&first, true, 1, 10).unwrap(),
             StoreAdmission::Ready {
@@ -565,13 +706,13 @@ mod tests {
         ));
 
         let failure = match store.admit(
-            &StoreAdvancementRequest::vote(identity_for_chain("vote-chain-2", 0, 2)),
+            &StoreAdvancementRequest::vote(identity_for(0, 2)),
             true,
             1,
             11,
         ) {
             Err(failure) => failure,
-            Ok(_) => panic!("the bundle predecessor is independent of vote-chain configuration"),
+            Ok(_) => panic!("an unresolved predecessor must block the next bundle generation"),
         };
         assert_eq!(failure.kind(), ChainSubmissionFailureKind::InvalidInput);
     }
@@ -704,42 +845,6 @@ fn possible_dispatch_error(error: ChainSubmissionFailure) -> ChainSubmissionFail
     ChainSubmissionFailure::with_known_possible_dispatch(error.kind(), error.message())
 }
 
-fn network_name(network: crate::Network) -> &'static str {
-    match network {
-        crate::Network::Mainnet => "mainnet",
-        crate::Network::Testnet => "testnet",
-        crate::Network::Regtest => "regtest",
-    }
-}
-
-fn native_identity_key(identity: &ChainSubmissionIdentity) -> Vec<u8> {
-    let mut key = b"zcash_voting.chain_submission.identity.v1\0".to_vec();
-    for value in [
-        identity.wallet_id().as_bytes(),
-        network_name(identity.network()).as_bytes(),
-        identity.vote_chain_id().as_bytes(),
-        identity.vote_round_id(),
-    ] {
-        key.extend_from_slice(&(value.len() as u64).to_be_bytes());
-        key.extend_from_slice(value);
-    }
-    key.extend_from_slice(&identity.bundle_index().to_be_bytes());
-    match identity.target() {
-        ChainSubmissionTarget::Delegation => key.push(0),
-        ChainSubmissionTarget::Vote { proposal_id } => {
-            key.push(1);
-            key.extend_from_slice(&proposal_id.to_be_bytes());
-        }
-        ChainSubmissionTarget::VoteBatch {
-            ordered_batch_digest,
-        } => {
-            key.push(2);
-            key.extend_from_slice(&ordered_batch_digest);
-        }
-    }
-    key
-}
-
 fn derive(
     tx: &Transaction<'_>,
     request: &SubmissionDerivationRequest,
@@ -762,39 +867,8 @@ fn derive(
     .map_err(map_generation_error)
 }
 
-fn load_guard(
-    tx: &Transaction<'_>,
-    identity: &ChainSubmissionIdentity,
-) -> Result<Option<StoredChainSubmission>, ChainSubmissionFailure> {
-    let (kind, proposal): (&str, Option<u32>) = match identity.target() {
-        ChainSubmissionTarget::Delegation => ("delegation", None),
-        ChainSubmissionTarget::Vote { proposal_id } => ("vote", Some(proposal_id)),
-        ChainSubmissionTarget::VoteBatch { .. } => return Ok(None),
-    };
-    load_one(
-        tx,
-        "SELECT identity_key, generation_digest, state, candidate_transaction_hash,
-                committed_post_reservations, tracking_started_at, diagnostic_kind,
-                diagnostic, confirmation_source, confirmed_transaction_hash,
-                final_van_position, vote_commitment_positions, created_at, updated_at
-           FROM chain_submissions
-          WHERE wallet_id = :wallet AND network = :network AND round_id = :round
-            AND bundle_index = :bundle AND kind = :kind
-            AND proposal_id IS :proposal
-            AND vote_chain_id IS NULL",
-        named_params! {
-            ":wallet": identity.wallet_id(),
-            ":network": network_name(identity.network()),
-            ":round": hex::encode(identity.vote_round_id()),
-            ":bundle": identity.bundle_index(),
-            ":proposal": proposal,
-            ":kind": kind,
-        },
-        identity,
-    )
-}
-
-fn load_native(
+/// Loads the single authoritative row for one submission identity.
+fn load_submission(
     tx: &Transaction<'_>,
     identity: &ChainSubmissionIdentity,
 ) -> Result<Option<StoredChainSubmission>, ChainSubmissionFailure> {
@@ -805,7 +879,7 @@ fn load_native(
                 diagnostic, confirmation_source, confirmed_transaction_hash,
                 final_van_position, vote_commitment_positions, created_at, updated_at
            FROM chain_submissions WHERE identity_key = :key",
-        named_params! { ":key": native_identity_key(identity) },
+        named_params! { ":key": submission_identity_key(identity) },
         identity,
     )
 }
@@ -877,21 +951,19 @@ fn load_one<P: rusqlite::Params>(
                     "legacy_import" => ValidatedChainSubmissionConfirmation::from_legacy_import(
                         hash, final_van, positions,
                     ),
+                    "legacy_projection" => {
+                        if positions.len() != 1 || hash.is_some() {
+                            return Err(rusqlite::Error::InvalidQuery);
+                        }
+                        ValidatedChainSubmissionConfirmation::from_legacy_projection(
+                            final_van,
+                            positions[0],
+                        )
+                    }
                     _ => return Err(rusqlite::Error::InvalidQuery),
                 }
                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
                 SubmissionRecordState::Confirmed(value)
-            }
-            "legacy_confirmed" => {
-                let (_, final_van, positions, _) =
-                    confirmation.ok_or(rusqlite::Error::InvalidQuery)?;
-                if positions.len() != 1 {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
-                SubmissionRecordState::LegacyConfirmed(
-                    LegacyProjectionConfirmation::from_positions(final_van, positions[0])
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                )
             }
             "rejected" => SubmissionRecordState::Rejected(
                 diagnostic.clone().ok_or(rusqlite::Error::InvalidQuery)?,
@@ -958,6 +1030,9 @@ fn parse_diagnostic_kind(value: &str) -> rusqlite::Result<ChainSubmissionDiagnos
         "reconciliation_pending" => Ok(ChainSubmissionDiagnosticKind::ReconciliationPending),
         "invalid_protocol_response" => Ok(ChainSubmissionDiagnosticKind::InvalidProtocolResponse),
         "recovery_unavailable" => Ok(ChainSubmissionDiagnosticKind::RecoveryUnavailable),
+        "generation_derivation_failed" => {
+            Ok(ChainSubmissionDiagnosticKind::GenerationDerivationFailed)
+        }
         "storage_failure" => Ok(ChainSubmissionDiagnosticKind::StorageFailure),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
@@ -971,6 +1046,7 @@ fn diagnostic_name(value: ChainSubmissionDiagnosticKind) -> &'static str {
         ChainSubmissionDiagnosticKind::ReconciliationPending => "reconciliation_pending",
         ChainSubmissionDiagnosticKind::InvalidProtocolResponse => "invalid_protocol_response",
         ChainSubmissionDiagnosticKind::RecoveryUnavailable => "recovery_unavailable",
+        ChainSubmissionDiagnosticKind::GenerationDerivationFailed => "generation_derivation_failed",
         ChainSubmissionDiagnosticKind::StorageFailure => "storage_failure",
     }
 }
@@ -989,15 +1065,15 @@ fn insert_fresh(
     };
     tx.execute(
         "INSERT INTO chain_submissions
-         (identity_key, round_id, wallet_id, network, vote_chain_id, bundle_index, kind,
+         (identity_key, round_id, wallet_id, network, bundle_index, kind,
           proposal_id, ordered_batch_digest, generation_digest, state,
           committed_post_reservations, created_at, updated_at)
-         VALUES (:key, :round, :wallet, :network, :chain, :bundle, :kind, :proposal,
+         VALUES (:key, :round, :wallet, :network, :bundle, :kind, :proposal,
                  :batch, :digest, 'submitting', :attempts, :created, :created)",
         named_params! {
-            ":key": native_identity_key(identity), ":round": hex::encode(identity.vote_round_id()),
+            ":key": submission_identity_key(identity), ":round": hex::encode(identity.vote_round_id()),
             ":wallet": identity.wallet_id(), ":network": network_name(identity.network()),
-            ":chain": identity.vote_chain_id(), ":bundle": identity.bundle_index(), ":kind": kind,
+            ":bundle": identity.bundle_index(), ":kind": kind,
             ":proposal": proposal, ":batch": batch,
             ":digest": record.generation_digest().unwrap().as_bytes(),
             ":attempts": record.committed_post_reservations(), ":created": record.created_at(),
@@ -1043,15 +1119,18 @@ fn persist_mutable(
             None,
             Some(value.confirmation()),
         ),
-        SubmissionRecordState::LegacyConfirmed(_) => {
-            return Err(ChainSubmissionFailure::with_durable_state(
-                ChainSubmissionFailureKind::InvariantViolation,
-                ChainSubmissionState::LegacyConfirmed,
-                "legacy confirmations are immutable",
-            ))
-        }
         SubmissionRecordState::Rejected(value) => ("rejected", None, Some(value), None),
     };
+    // A row whose generation was never bound is a migration-only marker. It
+    // carries no derivable generation to validate a mutation against, so no
+    // lifecycle write may touch it.
+    if record.generation_digest().is_none() {
+        return Err(ChainSubmissionFailure::with_durable_state(
+            ChainSubmissionFailureKind::InvariantViolation,
+            record.durable_state(),
+            "migration-only submissions without a bound generation are immutable",
+        ));
+    }
     let (source, confirmed_hash, final_van, positions) =
         confirmation.map_or((None, None, None, None), |value| {
             let source = match value.source() {
@@ -1085,7 +1164,7 @@ fn persist_mutable(
             ":diagnostic": diagnostic.map(ChainSubmissionDiagnostic::message),
             ":source": source, ":confirmed_hash": confirmed_hash.map(|v| v.as_bytes().to_vec()),
             ":final_van": final_van, ":positions": positions, ":updated": record.updated_at(),
-            ":key": native_identity_key(record.identity()),
+            ":key": submission_identity_key(record.identity()),
         },
     ).map_err(storage_error)?;
     Ok(())
@@ -1136,25 +1215,26 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
         request.validate_target()?;
         let mut normalizes_abandoned_reservation = false;
         let result = self.transact(|tx| {
-            if let Some(guard) = load_guard(tx, request.identity())? {
-                return Ok(StoreAdmission::Authoritative(guard));
-            }
-            if !request.is_batch() {
-                for identity in &request.legacy_identities {
-                    if let Some(guard) = load_guard(tx, identity)? {
-                        return Ok(StoreAdmission::Authoritative(guard));
-                    }
+            let existing = load_submission(tx, request.identity())?;
+            // A digestless row is a migration-only marker whose generation was
+            // never bound. It is authoritative and is returned before any
+            // derivation, so missing recovery material cannot turn it into an
+            // error and no network work is scheduled for it.
+            if let Some(record) = &existing {
+                if record.generation_digest().is_none() {
+                    return Ok(StoreAdmission::Authoritative(record.clone()));
                 }
             }
-            let existing = load_native(tx, request.identity())?;
             if request.is_batch() && !work_allowed {
-                for identity in &request.legacy_identities {
-                    if let Some(guard) = load_guard(tx, identity)? {
-                        return Err(ChainSubmissionFailure::with_durable_state(
-                            ChainSubmissionFailureKind::InvalidInput,
-                            guard.durable_state(),
-                            "atomic vote batch overlaps a migration-only singleton guard",
-                        ));
+                for identity in &request.member_identities {
+                    if let Some(guard) = load_submission(tx, identity)? {
+                        if guard.generation_digest().is_none() {
+                            return Err(ChainSubmissionFailure::with_durable_state(
+                                ChainSubmissionFailureKind::InvalidInput,
+                                guard.durable_state(),
+                                "atomic vote batch overlaps a migration-only singleton guard",
+                            ));
+                        }
                     }
                 }
             }
@@ -1191,12 +1271,14 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                     .map_err(|error| preserve_loaded_state(error, existing.as_ref()))?;
                 for proposal_id in derived.ordered_proposal_ids() {
                     let identity = request.singleton_identity(*proposal_id)?;
-                    if let Some(guard) = load_guard(tx, &identity)? {
-                        return Err(ChainSubmissionFailure::with_durable_state(
-                            ChainSubmissionFailureKind::InvalidInput,
-                            guard.durable_state(),
-                            "atomic vote batch overlaps a migration-only singleton guard",
-                        ));
+                    if let Some(guard) = load_submission(tx, &identity)? {
+                        if guard.generation_digest().is_none() {
+                            return Err(ChainSubmissionFailure::with_durable_state(
+                                ChainSubmissionFailureKind::InvalidInput,
+                                guard.durable_state(),
+                                "atomic vote batch overlaps a migration-only singleton guard",
+                            ));
+                        }
                     }
                 }
                 Some(derived)
@@ -1220,15 +1302,14 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                 "SELECT EXISTS(SELECT 1 FROM chain_submissions WHERE wallet_id=:wallet AND network=:network
                   AND round_id=:round AND bundle_index=:bundle
                   AND state IN ('submitting','tracking','recovering')
-                  AND NOT (vote_chain_id IS NULL AND kind='delegation'
+                  AND NOT (kind='delegation'
                            AND EXISTS(SELECT 1 FROM chain_submissions successor
                                        WHERE successor.wallet_id=chain_submissions.wallet_id
                                          AND successor.network=chain_submissions.network
                                          AND successor.round_id=chain_submissions.round_id
                                          AND successor.bundle_index=chain_submissions.bundle_index
-                                         AND successor.vote_chain_id IS NULL
-                                         AND successor.kind='vote'
-                                         AND successor.state='legacy_confirmed'))) ",
+                                         AND successor.kind IN ('vote','vote_batch')
+                                         AND successor.state='confirmed'))) ",
                 named_params! { ":wallet": request.identity().wallet_id(), ":network": network_name(request.identity().network()),
                     ":round": hex::encode(request.identity().vote_round_id()), ":bundle": request.identity().bundle_index() },
                 |row| row.get(0),
@@ -1258,7 +1339,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
         _now: u64,
     ) -> Result<(), ChainSubmissionFailure> {
         self.transact(|tx| {
-            let record = load_native(tx, generation.identity())?.ok_or_else(|| {
+            let record = load_submission(tx, generation.identity())?.ok_or_else(|| {
                 ChainSubmissionFailure::without_state(
                     ChainSubmissionFailureKind::InvariantViolation,
                     "fresh reservation disappeared",
@@ -1274,7 +1355,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
             }
             tx.execute(
                 "DELETE FROM chain_submissions WHERE identity_key=?1",
-                [native_identity_key(generation.identity())],
+                [submission_identity_key(generation.identity())],
             )
             .map_err(storage_error)?;
             Ok(())
@@ -1310,12 +1391,13 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
         now: u64,
     ) -> Result<ConfirmationCommit, ChainSubmissionFailure> {
         self.transact(|tx| {
-            let mut record = load_native(tx, expected_generation.identity())?.ok_or_else(|| {
-                ChainSubmissionFailure::without_state(
-                    ChainSubmissionFailureKind::InvariantViolation,
-                    "submission disappeared before confirmation",
-                )
-            })?;
+            let mut record =
+                load_submission(tx, expected_generation.identity())?.ok_or_else(|| {
+                    ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvariantViolation,
+                        "submission disappeared before confirmation",
+                    )
+                })?;
             ensure_generation(&record, expected_generation)?;
             let derived = derive(tx, request.derivation())
                 .map_err(|error| preserve_loaded_state(error, Some(&record)))?;
@@ -1363,7 +1445,7 @@ impl SqliteChainSubmissionStore {
         now: u64,
     ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
         self.transact(|tx| {
-            let mut record = load_native(tx, generation.identity())?.ok_or_else(|| {
+            let mut record = load_submission(tx, generation.identity())?.ok_or_else(|| {
                 ChainSubmissionFailure::without_state(
                     ChainSubmissionFailureKind::InvariantViolation,
                     "submission disappeared during lifecycle transition",
@@ -1380,7 +1462,7 @@ impl SqliteChainSubmissionStore {
                                 AND (candidate_transaction_hash = :candidate
                                      OR confirmed_transaction_hash = :candidate))",
                             named_params! {
-                                ":key": native_identity_key(generation.identity()),
+                                ":key": submission_identity_key(generation.identity()),
                                 ":candidate": candidate.as_bytes(),
                             },
                             |row| row.get(0),

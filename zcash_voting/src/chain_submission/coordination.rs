@@ -326,15 +326,8 @@ mod tests {
     use crate::chain_submission::ChainSubmissionTarget;
 
     fn identity(target: ChainSubmissionTarget, bundle_index: u32) -> ChainSubmissionIdentity {
-        ChainSubmissionIdentity::new(
-            "wallet",
-            Network::Testnet,
-            "chain",
-            [1; 32],
-            bundle_index,
-            target,
-        )
-        .unwrap()
+        ChainSubmissionIdentity::new("wallet", Network::Testnet, [1; 32], bundle_index, target)
+            .unwrap()
     }
 
     #[tokio::test]

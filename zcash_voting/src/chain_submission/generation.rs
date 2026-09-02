@@ -22,7 +22,7 @@ type PaddedNoteSecret = ([u8; 32], [u8; 32]);
 
 /// Tree leaves expected from a generation, retained in protocol action order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ExpectedTreeLayout {
+pub(crate) enum ExpectedTreeLayout {
     Delegation {
         delegation_van: [u8; 32],
     },
@@ -38,7 +38,7 @@ pub(super) enum ExpectedTreeLayout {
 
 impl ExpectedTreeLayout {
     /// Returns the generation's expected tree leaves in protocol action order.
-    pub(super) fn leaves(&self) -> Vec<[u8; 32]> {
+    pub(crate) fn leaves(&self) -> Vec<[u8; 32]> {
         match self {
             Self::Delegation { delegation_van } => vec![*delegation_van],
             Self::Vote {
@@ -63,13 +63,42 @@ pub(super) enum ChainSubmissionRequest {
     VoteBatch(VoteCommitmentBatchWire),
 }
 
+/// One semantic generation and the confirmation layout it must produce.
+///
+/// This is everything derivation needs to *identify* a submission. It is
+/// deliberately separate from the wire request, which additionally requires a
+/// live delegation signer, so the version-17 migration can bind a generation to
+/// durable recovery inputs without reconstructing a dispatchable request.
+#[derive(Clone)]
+pub(crate) struct BoundGeneration {
+    generation: ChainSubmissionGeneration,
+    expected_layout: ExpectedTreeLayout,
+    ordered_proposal_ids: Vec<u32>,
+}
+
+impl BoundGeneration {
+    /// Returns the identity-bound semantic generation.
+    pub(crate) fn generation(&self) -> &ChainSubmissionGeneration {
+        &self.generation
+    }
+
+    /// Returns the tree layout expected from a successful submission.
+    pub(crate) fn expected_layout(&self) -> &ExpectedTreeLayout {
+        &self.expected_layout
+    }
+
+    /// Returns proposal IDs in the signed batch action order, or an empty slice
+    /// for delegation.
+    pub(crate) fn ordered_proposal_ids(&self) -> &[u32] {
+        &self.ordered_proposal_ids
+    }
+}
+
 /// A semantic generation and its matching wire request and confirmation layout.
 #[derive(Clone)]
 pub(super) struct DerivedChainSubmission {
-    generation: ChainSubmissionGeneration,
+    bound: BoundGeneration,
     request: ChainSubmissionRequest,
-    expected_layout: ExpectedTreeLayout,
-    ordered_proposal_ids: Vec<u32>,
 }
 
 impl DerivedChainSubmission {
@@ -82,16 +111,18 @@ impl DerivedChainSubmission {
         ordered_proposal_ids: Vec<u32>,
     ) -> Self {
         Self {
-            generation,
+            bound: BoundGeneration {
+                generation,
+                expected_layout,
+                ordered_proposal_ids,
+            },
             request,
-            expected_layout,
-            ordered_proposal_ids,
         }
     }
 
     /// Returns the identity-bound semantic generation.
     pub(super) fn generation(&self) -> &ChainSubmissionGeneration {
-        &self.generation
+        self.bound.generation()
     }
 
     /// Returns the closed wire request reconstructed from durable inputs.
@@ -101,13 +132,13 @@ impl DerivedChainSubmission {
 
     /// Returns the tree layout expected from a successful submission.
     pub(super) fn expected_layout(&self) -> &ExpectedTreeLayout {
-        &self.expected_layout
+        self.bound.expected_layout()
     }
 
     /// Returns proposal IDs in the signed batch action order, or an empty slice
     /// for delegation.
     pub(super) fn ordered_proposal_ids(&self) -> &[u32] {
-        &self.ordered_proposal_ids
+        self.bound.ordered_proposal_ids()
     }
 }
 
@@ -174,10 +205,6 @@ fn hash_identity(transcript: &mut GenerationTranscript, identity: &ChainSubmissi
             Network::Testnet => b"testnet",
             Network::Regtest => b"regtest",
         },
-    );
-    transcript.field(
-        "identity.vote_chain_id",
-        identity.vote_chain_id().as_bytes(),
     );
     transcript.bytes32("identity.vote_round_id", identity.vote_round_id());
     transcript.u32("identity.bundle_index", identity.bundle_index());
@@ -308,9 +335,10 @@ fn load_delegation_inputs(
     conn: &rusqlite::Connection,
     identity: &ChainSubmissionIdentity,
     round_id: &str,
-) -> Result<DelegationGenerationInputs, VotingError> {
-    conn.query_row(
-        "SELECT b.note_positions_blob, b.note_identity_hashes_blob,
+) -> Result<Option<DelegationGenerationInputs>, VotingError> {
+    let stored_inputs = conn
+        .query_row(
+            "SELECT b.note_positions_blob, b.note_identity_hashes_blob,
                 b.van_comm_rand, b.dummy_nullifiers, b.rho_signed,
                 b.padded_note_data, b.nf_signed, b.cmx_new, b.alpha,
                 b.rseed_signed, b.rseed_output, b.gov_comm,
@@ -326,48 +354,44 @@ fn load_delegation_inputs(
             AND b.wallet_id = :wallet_id
             AND b.bundle_index = :bundle_index
             AND p.success = 1",
-        named_params! {
-            ":round_id": round_id,
-            ":wallet_id": identity.wallet_id(),
-            ":bundle_index": identity.bundle_index() as i64,
-        },
-        |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, Vec<u8>>(6)?,
-                row.get::<_, Vec<u8>>(7)?,
-                row.get::<_, Vec<u8>>(8)?,
-                row.get::<_, Vec<u8>>(9)?,
-                row.get::<_, Vec<u8>>(10)?,
-                row.get::<_, Vec<u8>>(11)?,
-                row.get::<_, i64>(12)?,
-                row.get::<_, i64>(13)?,
-                row.get::<_, Vec<u8>>(14)?,
-                row.get::<_, Vec<u8>>(15)?,
-                row.get::<_, Vec<u8>>(16)?,
-                row.get::<_, Vec<u8>>(17)?,
-                row.get::<_, Vec<u8>>(18)?,
-                row.get::<_, Vec<u8>>(19)?,
-            ))
-        },
-    )
-    .optional()
-    .map_err(|error| VotingError::Internal {
-        message: format!("failed to load delegation generation inputs: {error}"),
-    })?
-    .ok_or_else(|| VotingError::InvalidInput {
-        message: format!(
-            "complete delegation generation not found for round={round_id}, bundle={}",
-            identity.bundle_index()
-        ),
-    })
-    .and_then(
-        |(
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": identity.wallet_id(),
+                ":bundle_index": identity.bundle_index() as i64,
+            },
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, Vec<u8>>(14)?,
+                    row.get::<_, Vec<u8>>(15)?,
+                    row.get::<_, Vec<u8>>(16)?,
+                    row.get::<_, Vec<u8>>(17)?,
+                    row.get::<_, Vec<u8>>(18)?,
+                    row.get::<_, Vec<u8>>(19)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to load delegation generation inputs: {error}"),
+        })?;
+
+    stored_inputs
+        .map(
+            |(
             note_positions,
             note_identity_hashes,
             van_comm_rand,
@@ -468,8 +492,9 @@ fn load_delegation_inputs(
                 tx1_effects,
                 proof,
             })
-        },
-    )
+            },
+        )
+        .transpose()
 }
 
 fn hash_delegation_inputs(
@@ -551,6 +576,55 @@ fn delegation_generation(
     ChainSubmissionGeneration::new(identity.clone(), transcript.finish())
 }
 
+/// Binds one complete persisted delegation generation without a signer.
+///
+/// The SpendAuth signature is excluded from the generation digest, so a
+/// delegation is fully identified by its durable setup, proof, nullifier, and
+/// VAN-randomizer inputs alone. A restarted software delegation may therefore be
+/// re-signed and still verify against this same generation.
+///
+/// Returns `Ok(None)` only when no successful proof and complete setup row
+/// exists. Malformed or inconsistent persisted inputs remain errors.
+pub(crate) fn complete_generation_for_delegation(
+    conn: &rusqlite::Connection,
+    identity: &ChainSubmissionIdentity,
+) -> Result<Option<BoundGeneration>, VotingError> {
+    if identity.target() != ChainSubmissionTarget::Delegation {
+        return Err(VotingError::InvalidInput {
+            message: "delegation generation requires a delegation identity".to_string(),
+        });
+    }
+    let round_id = validate_identity_context(conn, identity)?;
+    let Some(inputs) = load_delegation_inputs(conn, identity, &round_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(BoundGeneration {
+        generation: delegation_generation(identity, &inputs),
+        expected_layout: ExpectedTreeLayout::Delegation {
+            delegation_van: inputs.gov_comm,
+        },
+        ordered_proposal_ids: vec![],
+    }))
+}
+
+/// Requires one complete persisted delegation generation.
+///
+/// Unlike [`complete_generation_for_delegation`], absence is an error because
+/// runtime derivation cannot construct a request without the durable setup and
+/// successful proof.
+pub(crate) fn generation_for_delegation(
+    conn: &rusqlite::Connection,
+    identity: &ChainSubmissionIdentity,
+) -> Result<BoundGeneration, VotingError> {
+    complete_generation_for_delegation(conn, identity)?.ok_or_else(|| VotingError::InvalidInput {
+        message: format!(
+            "complete delegation generation not found for round={}, bundle={}",
+            hex::encode(identity.vote_round_id()),
+            identity.bundle_index()
+        ),
+    })
+}
+
 /// Reconstructs and hashes one persisted delegation generation.
 ///
 /// The supplied signature must verify against the stored PCZT sighash. This
@@ -560,13 +634,8 @@ pub(super) fn derive_delegation(
     identity: &ChainSubmissionIdentity,
     signer: DelegationSigner,
 ) -> Result<DerivedChainSubmission, VotingError> {
-    if identity.target() != ChainSubmissionTarget::Delegation {
-        return Err(VotingError::InvalidInput {
-            message: "delegation generation requires a delegation identity".to_string(),
-        });
-    }
-    let round_id = validate_identity_context(conn, identity)?;
-    let inputs = load_delegation_inputs(conn, identity, &round_id)?;
+    let bound = generation_for_delegation(conn, identity)?;
+    let round_id = hex::encode(identity.vote_round_id());
     let submission = crate::delegate::submission_with_conn(
         conn,
         identity.wallet_id(),
@@ -576,12 +645,8 @@ pub(super) fn derive_delegation(
     )?;
     let request = DelegationSubmissionWire::try_from(&submission)?;
     Ok(DerivedChainSubmission {
-        generation: delegation_generation(identity, &inputs),
+        bound,
         request: ChainSubmissionRequest::Delegation(request),
-        expected_layout: ExpectedTreeLayout::Delegation {
-            delegation_van: inputs.gov_comm,
-        },
-        ordered_proposal_ids: vec![],
     })
 }
 
@@ -725,6 +790,26 @@ pub(super) fn derive_vote(
     conn: &rusqlite::Connection,
     identity: &ChainSubmissionIdentity,
 ) -> Result<DerivedChainSubmission, VotingError> {
+    let (bound, recovery) = validated_singleton_vote(conn, identity)?;
+    let request = crate::vote::wire_submission_from_recovery(&recovery)?;
+    Ok(DerivedChainSubmission {
+        bound,
+        request: ChainSubmissionRequest::Vote(request),
+    })
+}
+
+/// Binds one persisted singleton-vote generation without building a request.
+pub(crate) fn generation_for_vote(
+    conn: &rusqlite::Connection,
+    identity: &ChainSubmissionIdentity,
+) -> Result<BoundGeneration, VotingError> {
+    validated_singleton_vote(conn, identity).map(|(bound, _)| bound)
+}
+
+fn validated_singleton_vote(
+    conn: &rusqlite::Connection,
+    identity: &ChainSubmissionIdentity,
+) -> Result<(BoundGeneration, VoteRecoveryBundle), VotingError> {
     let ChainSubmissionTarget::Vote { proposal_id } = identity.target() else {
         return Err(VotingError::InvalidInput {
             message: "singleton vote generation requires a vote identity".to_string(),
@@ -733,16 +818,15 @@ pub(super) fn derive_vote(
     let round_id = validate_identity_context(conn, identity)?;
     let recovery = load_validated_vote(conn, identity, &round_id, proposal_id)?;
     crate::vote::ensure_singleton_vote_recovery(&recovery)?;
-    let request = crate::vote::wire_submission_from_recovery(&recovery)?;
-    Ok(DerivedChainSubmission {
+    let bound = BoundGeneration {
         generation: vote_generation(identity, std::slice::from_ref(&recovery)),
-        request: ChainSubmissionRequest::Vote(request),
         expected_layout: ExpectedTreeLayout::Vote {
             successor_van: recovery.vote_authority_note_new,
             vote_commitment: recovery.vote_commitment,
         },
         ordered_proposal_ids: vec![proposal_id],
-    })
+    };
+    Ok((bound, recovery))
 }
 
 /// Reconstructs and hashes a complete persisted atomic vote batch.
@@ -753,6 +837,29 @@ pub(super) fn derive_vote_batch(
     conn: &rusqlite::Connection,
     identity: &ChainSubmissionIdentity,
 ) -> Result<DerivedChainSubmission, VotingError> {
+    let (bound, recoveries) = validated_vote_batch(conn, identity)?;
+    let mut requests = Vec::with_capacity(recoveries.len());
+    for recovery in &recoveries {
+        requests.push(crate::vote::wire_submission_from_recovery(recovery)?);
+    }
+    Ok(DerivedChainSubmission {
+        bound,
+        request: ChainSubmissionRequest::VoteBatch(VoteCommitmentBatchWire { votes: requests }),
+    })
+}
+
+/// Binds a complete persisted atomic vote batch without building requests.
+pub(crate) fn generation_for_vote_batch(
+    conn: &rusqlite::Connection,
+    identity: &ChainSubmissionIdentity,
+) -> Result<BoundGeneration, VotingError> {
+    validated_vote_batch(conn, identity).map(|(bound, _)| bound)
+}
+
+fn validated_vote_batch(
+    conn: &rusqlite::Connection,
+    identity: &ChainSubmissionIdentity,
+) -> Result<(BoundGeneration, Vec<VoteRecoveryBundle>), VotingError> {
     let ChainSubmissionTarget::VoteBatch {
         ordered_batch_digest,
     } = identity.target()
@@ -771,7 +878,6 @@ pub(super) fn derive_vote_batch(
     )?;
     let expected_anchor = recoveries[0].anchor_height;
     let mut proposal_ids = Vec::with_capacity(recoveries.len());
-    let mut requests = Vec::with_capacity(recoveries.len());
     for recovery in &recoveries {
         if recovery.anchor_height != expected_anchor {
             return Err(VotingError::InvalidInput {
@@ -786,7 +892,6 @@ pub(super) fn derive_vote_batch(
             });
         }
         proposal_ids.push(recovery.proposal_id);
-        requests.push(crate::vote::wire_submission_from_recovery(recovery)?);
     }
     if proposal_ids
         .iter()
@@ -806,15 +911,15 @@ pub(super) fn derive_vote_batch(
         .iter()
         .map(|recovery| recovery.vote_commitment)
         .collect();
-    Ok(DerivedChainSubmission {
+    let bound = BoundGeneration {
         generation: vote_generation(identity, &recoveries),
-        request: ChainSubmissionRequest::VoteBatch(VoteCommitmentBatchWire { votes: requests }),
         expected_layout: ExpectedTreeLayout::VoteBatch {
             final_successor_van,
             vote_commitments,
         },
         ordered_proposal_ids: proposal_ids,
-    })
+    };
+    Ok((bound, recoveries))
 }
 
 #[cfg(test)]
@@ -885,15 +990,7 @@ mod tests {
     }
 
     fn identity(target: ChainSubmissionTarget) -> ChainSubmissionIdentity {
-        ChainSubmissionIdentity::new(
-            "wallet-1",
-            Network::Testnet,
-            "vote-chain-1",
-            [1; 32],
-            7,
-            target,
-        )
-        .unwrap()
+        ChainSubmissionIdentity::new("wallet-1", Network::Testnet, [1; 32], 7, target).unwrap()
     }
 
     fn delegation_signature(
@@ -996,7 +1093,6 @@ mod tests {
         let identity = ChainSubmissionIdentity::new(
             "wallet-1",
             Network::Testnet,
-            "vote-chain-1",
             [0x11; 32],
             0,
             ChainSubmissionTarget::Delegation,
@@ -1010,6 +1106,73 @@ mod tests {
         )
     }
 
+    /// Anchors the transcript encoding to an independently written byte
+    /// sequence rather than to whatever the current code happens to emit.
+    ///
+    /// The frozen generation digests below are recorded outputs, so they cannot
+    /// by themselves detect a framing change. This test states the version-1
+    /// framing directly: the ASCII domain and NUL byte, then, per field, a
+    /// big-endian `u16` tag length, the tag, a big-endian `u64` value length,
+    /// and the value. If the framing ever changes, this fails first and says
+    /// exactly which byte moved.
+    #[test]
+    fn generation_transcript_encodes_exact_framing_bytes() {
+        let mut expected = b"zcash_voting.chain_submission.generation.v1\0".to_vec();
+        // field("fixture.bytes", [0, 1, 2, 3])
+        expected.extend_from_slice(&13_u16.to_be_bytes());
+        expected.extend_from_slice(b"fixture.bytes");
+        expected.extend_from_slice(&4_u64.to_be_bytes());
+        expected.extend_from_slice(&[0, 1, 2, 3]);
+        // u64("fixture.number", 0x0102_0304_0506_0708)
+        expected.extend_from_slice(&14_u16.to_be_bytes());
+        expected.extend_from_slice(b"fixture.number");
+        expected.extend_from_slice(&8_u64.to_be_bytes());
+        expected.extend_from_slice(&0x0102_0304_0506_0708_u64.to_be_bytes());
+
+        let mut transcript = GenerationTranscript::new();
+        transcript.field("fixture.bytes", &[0, 1, 2, 3]);
+        transcript.u64("fixture.number", 0x0102_0304_0506_0708);
+
+        assert_eq!(
+            transcript.finish().to_hex(),
+            hex::encode(Sha256::digest(&expected)),
+            "generation transcript framing changed"
+        );
+    }
+
+    /// The identity prefix binds no configured vote-chain id.
+    ///
+    /// A submission identity has no chain-id field to vary, so this asserts the
+    /// stronger structural fact: the complete identity transcript is exactly
+    /// the wallet, network, round, bundle, and target, in that order.
+    #[test]
+    fn identity_transcript_binds_no_vote_chain_id() {
+        let mut expected = b"zcash_voting.chain_submission.generation.v1\0".to_vec();
+        let mut field = |tag: &str, value: &[u8]| {
+            expected.extend_from_slice(&(tag.len() as u16).to_be_bytes());
+            expected.extend_from_slice(tag.as_bytes());
+            expected.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            expected.extend_from_slice(value);
+        };
+        field("identity.wallet_id", b"wallet-1");
+        field("identity.network", b"testnet");
+        field("identity.vote_round_id", &[1; 32]);
+        field("identity.bundle_index", &7_u32.to_be_bytes());
+        field("identity.kind", b"vote");
+        field("identity.proposal_id", &2_u32.to_be_bytes());
+
+        let mut transcript = GenerationTranscript::new();
+        hash_identity(
+            &mut transcript,
+            &identity(ChainSubmissionTarget::Vote { proposal_id: 2 }),
+        );
+
+        assert_eq!(
+            transcript.finish().to_hex(),
+            hex::encode(Sha256::digest(&expected))
+        );
+    }
+
     #[test]
     fn generation_transcript_framing_matches_frozen_vector() {
         let identity = identity(ChainSubmissionTarget::Vote { proposal_id: 2 });
@@ -1020,7 +1183,7 @@ mod tests {
 
         assert_eq!(
             transcript.finish().to_hex(),
-            "652e3c6624a281b3c09a22f3146cba20e0504923045f6e072e742550ce92ca72"
+            "957d976f8656c57b9ef059045d5dccd1beb8e980c74176173010f0dab2606132"
         );
     }
 
@@ -1056,15 +1219,15 @@ mod tests {
 
         assert_eq!(
             delegation.digest().to_hex(),
-            "41b0eecb59da7f911b94c7ae540f1674fb9b399feb2c71233024a297b2df5c63"
+            "e04a9aab05cc403c3e4fd5818c38439a49da4239f22726ba7a8331ac5dcd4145"
         );
         assert_eq!(
             singleton.digest().to_hex(),
-            "bfb3ebc460d3300aa9f3943cf023ee30ccc3bfae5a93ba9b131b4f99fa7706b1"
+            "e69db505c93cb02ab3e20c81322d1101da17e2c826ff167d1ae61a8d59551048"
         );
         assert_eq!(
             batch.digest().to_hex(),
-            "40e3bfefec14a5a21b9c11e6ee0140996fe1f9025140303de97dd7e89bf31b6c"
+            "304c59580189347446783a472ef6489751f3fd100578a8667af97ef73bee7335"
         );
     }
 
@@ -1261,7 +1424,6 @@ mod tests {
         let identity = ChainSubmissionIdentity::new(
             "wallet-1",
             Network::Testnet,
-            "vote-chain-1",
             [0x11; 32],
             0,
             ChainSubmissionTarget::Vote { proposal_id: 1 },

@@ -192,21 +192,23 @@ CREATE TABLE pir_proof_cache (
     PRIMARY KEY (wallet_id, network, root, nullifier)
 );
 
--- Authoritative SDK-owned vote-chain submission lifecycle. Migration-only
--- guards use a NULL vote_chain_id because released v17 databases did not
--- persist that caller-owned value; native rows always bind it.
+-- Authoritative SDK-owned vote-chain submission lifecycle. One identity per
+-- row, shared by natively reserved and version-17 migrated submissions. The
+-- configured vote-chain id is dispatch routing and is deliberately absent: it
+-- binds neither the identity nor the generation digest. A NULL
+-- generation_digest marks a row that could not be bound to durable recovery
+-- inputs, and such a row accepts no lifecycle mutation.
 CREATE TABLE chain_submissions (
     identity_key                 BLOB NOT NULL PRIMARY KEY,
     round_id                     TEXT NOT NULL,
     wallet_id                    TEXT NOT NULL DEFAULT '',
     network                      TEXT NOT NULL CHECK (network IN ('mainnet','testnet','regtest')),
-    vote_chain_id                TEXT,
     bundle_index                 INTEGER NOT NULL CHECK (bundle_index BETWEEN 0 AND 4294967295),
     kind                         TEXT NOT NULL CHECK (kind IN ('delegation','vote','vote_batch')),
     proposal_id                  INTEGER,
     ordered_batch_digest         BLOB,
     generation_digest            BLOB,
-    state                        TEXT NOT NULL CHECK (state IN ('submitting','tracking','recovering','confirmed','legacy_confirmed','rejected')),
+    state                        TEXT NOT NULL CHECK (state IN ('submitting','tracking','recovering','confirmed','rejected')),
     candidate_transaction_hash   BLOB,
     committed_post_reservations  INTEGER NOT NULL DEFAULT 0 CHECK (committed_post_reservations >= 0),
     tracking_started_at          INTEGER,
@@ -220,51 +222,46 @@ CREATE TABLE chain_submissions (
     updated_at                   INTEGER NOT NULL CHECK (updated_at >= created_at),
     FOREIGN KEY (round_id, wallet_id) REFERENCES rounds(round_id, wallet_id) ON DELETE CASCADE,
     CHECK (length(identity_key) >= 32),
-    CHECK (vote_chain_id IS NULL OR length(vote_chain_id) BETWEEN 1 AND 128),
     CHECK ((kind = 'delegation' AND proposal_id IS NULL AND ordered_batch_digest IS NULL)
         OR (kind = 'vote' AND proposal_id BETWEEN 1 AND 15 AND ordered_batch_digest IS NULL)
         OR (kind = 'vote_batch' AND proposal_id IS NULL AND length(ordered_batch_digest) = 32)),
-    CHECK ((vote_chain_id IS NULL AND generation_digest IS NULL
-            AND state IN ('recovering','legacy_confirmed')
+    CHECK ((generation_digest IS NULL
             AND candidate_transaction_hash IS NULL
             AND committed_post_reservations = 0
-            AND tracking_started_at IS NULL)
-        OR (vote_chain_id IS NOT NULL AND length(generation_digest) = 32)),
+            AND tracking_started_at IS NULL
+            AND (state = 'recovering'
+                 OR (state = 'confirmed' AND confirmation_source = 'legacy_projection')))
+        OR length(generation_digest) = 32),
     CHECK (candidate_transaction_hash IS NULL OR length(candidate_transaction_hash) = 32),
     CHECK (confirmed_transaction_hash IS NULL OR length(confirmed_transaction_hash) = 32),
     CHECK ((state = 'submitting' AND candidate_transaction_hash IS NULL AND tracking_started_at IS NULL)
         OR (state = 'tracking' AND candidate_transaction_hash IS NOT NULL AND tracking_started_at IS NOT NULL)
-        OR state IN ('recovering','confirmed','legacy_confirmed','rejected')),
+        OR state IN ('recovering','confirmed','rejected')),
     CHECK ((diagnostic_kind IS NULL) = (diagnostic IS NULL)),
     CHECK (diagnostic IS NULL OR length(CAST(diagnostic AS BLOB)) <= 512),
-    CHECK ((state IN ('confirmed','legacy_confirmed')) = (confirmation_source IS NOT NULL)),
-    CHECK ((state NOT IN ('confirmed','legacy_confirmed'))
+    CHECK ((state = 'confirmed') = (confirmation_source IS NOT NULL)),
+    CHECK (state != 'confirmed'
         OR (final_van_position IS NOT NULL AND vote_commitment_positions IS NOT NULL)),
-    CHECK (state != 'legacy_confirmed' OR
-        (kind = 'vote' AND vote_chain_id IS NULL AND confirmation_source = 'legacy_projection'
+    CHECK (confirmation_source != 'legacy_projection' OR
+        (kind = 'vote' AND state = 'confirmed' AND generation_digest IS NULL
          AND confirmed_transaction_hash IS NULL)),
-    CHECK (state != 'confirmed' OR confirmation_source != 'legacy_projection'),
     CHECK (confirmation_source != 'hash' OR
         (confirmed_transaction_hash IS NOT NULL AND candidate_transaction_hash = confirmed_transaction_hash)),
     CHECK (confirmation_source NOT IN ('tree','legacy_projection') OR confirmed_transaction_hash IS NULL)
 );
 
-CREATE UNIQUE INDEX chain_submissions_native_identity
-    ON chain_submissions(wallet_id, network, vote_chain_id, round_id, kind, bundle_index,
-                         ifnull(proposal_id, -1), ifnull(hex(ordered_batch_digest), ''))
-    WHERE vote_chain_id IS NOT NULL;
+CREATE UNIQUE INDEX chain_submissions_identity
+    ON chain_submissions(wallet_id, network, round_id, kind, bundle_index,
+                         ifnull(proposal_id, -1), ifnull(hex(ordered_batch_digest), ''));
 CREATE UNIQUE INDEX chain_submissions_candidate_owner
     ON chain_submissions(candidate_transaction_hash)
     WHERE candidate_transaction_hash IS NOT NULL;
 CREATE UNIQUE INDEX chain_submissions_confirmation_hash_owner
     ON chain_submissions(confirmed_transaction_hash)
     WHERE confirmed_transaction_hash IS NOT NULL;
-CREATE UNIQUE INDEX chain_submissions_legacy_singleton_guard
-    ON chain_submissions(wallet_id, network, round_id, bundle_index, proposal_id)
-    WHERE vote_chain_id IS NULL AND kind = 'vote';
 
 CREATE TRIGGER chain_submissions_immutable_identity
-BEFORE UPDATE OF identity_key, round_id, wallet_id, network, vote_chain_id,
+BEFORE UPDATE OF identity_key, round_id, wallet_id, network,
                  bundle_index, kind, proposal_id, ordered_batch_digest,
                  generation_digest, created_at ON chain_submissions
 BEGIN
