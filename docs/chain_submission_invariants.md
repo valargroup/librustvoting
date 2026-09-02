@@ -488,8 +488,10 @@ Version-17 state imports as follows:
 - a canonical unconfirmed transaction hash becomes `Tracking`;
 - an unusable, malformed, opaque, or otherwise non-pollable historical hash
   becomes `Recovering` with no candidate hash; and
-- committed recovery material with no submission evidence creates no row and
-  remains eligible for fresh submission.
+- committed recovery material with no transaction hash becomes `Recovering`
+  with no candidate hash. Version 17 cannot distinguish definitely unsent work
+  from a crash after POST dispatch but before hash persistence, so this state
+  must not be imported as fresh.
 
 Migration validates complete unique ownership of canonical hashes across
 wallet, chain/network, round, kind, bundle, and proposal or batch. The only
@@ -592,7 +594,10 @@ Tests cover:
 Tests cover:
 
 - each v17 import class: confirmed, canonical unconfirmed hash, unusable hash,
-  partial confirmation, and never-submitted recovery material;
+  partial confirmation, and hashless committed recovery material;
+- a hashless v17 import remains `Recovering` after a retry receives a definite
+  rejection, leaving exact tree recovery available for a possibly successful
+  pre-upgrade POST;
 - canonical-hash ownership collision rollback and the exact atomic-batch
   exception;
 - fresh and migrated v18 schema equivalence and stale-v18 fingerprint
