@@ -134,6 +134,38 @@ struct ServerState {
     max_active_status: Arc<AtomicUsize>,
 }
 
+struct StatusRequestActivity {
+    active_status: Option<Arc<AtomicUsize>>,
+}
+
+impl StatusRequestActivity {
+    fn begin(state: &ServerState, endpoint: Endpoint) -> Self {
+        if endpoint != Endpoint::ShareStatus {
+            return Self {
+                active_status: None,
+            };
+        }
+
+        let active = state.active_status.fetch_add(1, Ordering::SeqCst) + 1;
+        state.max_active_status.fetch_max(active, Ordering::SeqCst);
+        Self {
+            active_status: Some(Arc::clone(&state.active_status)),
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(active_status) = self.active_status.take() {
+            active_status.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for StatusRequestActivity {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 pub struct HelperServer {
     address: SocketAddr,
     state: Arc<ServerState>,
@@ -305,11 +337,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
         body,
     });
 
-    let tracks_concurrency = endpoint == Endpoint::ShareStatus;
-    if tracks_concurrency {
-        let active = state.active_status.fetch_add(1, Ordering::SeqCst) + 1;
-        state.max_active_status.fetch_max(active, Ordering::SeqCst);
-    }
+    let mut status_request_activity = StatusRequestActivity::begin(&state, endpoint);
 
     let response = state
         .scripts
@@ -319,11 +347,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
         .or_default()
         .pop_front()
         .unwrap_or_else(|| default_response(endpoint));
-    write_response(&mut stream, response);
-
-    if tracks_concurrency {
-        state.active_status.fetch_sub(1, Ordering::SeqCst);
-    }
+    write_response(&mut stream, response, &mut status_request_activity);
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
@@ -385,7 +409,11 @@ fn default_response(endpoint: Endpoint) -> Response {
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: Response) {
+fn write_response(
+    stream: &mut TcpStream,
+    response: Response,
+    status_request_activity: &mut StatusRequestActivity,
+) {
     match response {
         Response::Json {
             status,
@@ -393,6 +421,10 @@ fn write_response(stream: &mut TcpStream, response: Response) {
             delay,
         } => {
             thread::sleep(delay);
+            // Processing has completed once the scripted delay elapses. Mark it
+            // complete before exposing response bytes, because the client can
+            // schedule a replacement as soon as those bytes become visible.
+            status_request_activity.finish();
             let reason = match status {
                 200 => "OK",
                 400 => "Bad Request",
@@ -407,8 +439,14 @@ fn write_response(stream: &mut TcpStream, response: Response) {
             );
             let _ = stream.write_all(response.as_bytes());
         }
-        Response::CloseAfterRequest { delay } => thread::sleep(delay),
-        Response::Stall { duration } => thread::sleep(duration),
+        Response::CloseAfterRequest { delay } => {
+            thread::sleep(delay);
+            status_request_activity.finish();
+        }
+        Response::Stall { duration } => {
+            thread::sleep(duration);
+            status_request_activity.finish();
+        }
         Response::GatedJson { gate, status, body } => {
             gate.wait();
             write_response(
@@ -418,6 +456,7 @@ fn write_response(stream: &mut TcpStream, response: Response) {
                     body,
                     delay: Duration::ZERO,
                 },
+                status_request_activity,
             );
         }
     }
