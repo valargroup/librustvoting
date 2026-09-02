@@ -1030,6 +1030,18 @@ Tests cover:
 
 These tests are the review contract for changes to chain submission behavior.
 
+Phase 6 recovery coverage is anchored by
+`exact_recovery_confirms_unique_layout_without_synthesizing_a_hash`,
+`recovering_candidate_is_polled_before_no_match_retry_reservation`,
+`definitely_unsent_recovery_retry_keeps_reservation_and_requires_a_new_scan`,
+`malformed_tree_after_candidate_first_poll_retains_candidate_and_never_retries`,
+`exact_vote_layout_recovers_adjacent_ordered_positions`,
+`complete_no_match_authorizes_only_the_captured_generation_and_candidate`,
+`duplicate_complete_layout_is_ambiguous_not_confirmation`,
+`incomplete_pagination_produces_no_authorization`,
+`full_tree_capacity_fits_the_fixed_request_and_byte_ceilings`, and
+`tree_confirmation_is_atomic_and_survives_reopen_without_a_hash`.
+
 Generation and confirmation coverage is anchored by
 `generation_transcript_encodes_exact_framing_bytes`,
 `identity_transcript_binds_no_vote_chain_id`,

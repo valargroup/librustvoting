@@ -8,6 +8,7 @@
 //! seam. Persistence and lifecycle entry points remain private so callers use
 //! the SDK-owned coordination boundary.
 
+mod client;
 #[allow(dead_code, reason = "internal confirmation projection")]
 mod confirmation;
 #[allow(dead_code, reason = "inactive lifecycle coordination foundation")]
@@ -19,6 +20,7 @@ mod generation;
 mod identity;
 #[allow(dead_code, reason = "internal submission protocol")]
 mod protocol;
+mod recovery;
 mod result;
 #[allow(dead_code, reason = "internal lifecycle transition validation")]
 mod state;
@@ -31,6 +33,10 @@ pub(crate) use generation::generation_for_vote;
 pub(crate) use generation::generation_for_vote_batch;
 #[cfg(test)]
 pub(crate) use identity::submission_identity_key;
+pub use client::{
+    AdvanceDelegation, AdvanceVote, ChainRecoveryMode, ChainSubmissionClient,
+    ChainSubmissionClientConfig, ChainSubmissionControl,
+};
 pub use identity::{
     CandidateTransactionHash, CandidateTransactionHashError, ChainSubmissionGeneration,
     ChainSubmissionGenerationDigest, ChainSubmissionIdentity, ChainSubmissionIdentityError,
