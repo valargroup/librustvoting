@@ -233,8 +233,8 @@ UPDATE proofs AS p
 /// Clear a legacy local setup only when no proof or signature can indicate a
 /// delegation submission with an outcome that was never recorded locally.
 /// Proof-bearing setup is preserved after demotion so an accepted delegation
-/// cannot lose the inputs needed by ZKP2 during upgrade. An unsigned Keystone
-/// flow can rebuild that setup later when it explicitly requests a PCZT.
+/// cannot lose the inputs needed by ZKP2 during upgrade. Keystone signing stays
+/// blocked until any setup without a durable PCZT has been reconciled.
 const CLEAR_UNBOUND_LEGACY_DELEGATION_SETUP_SQL: &str = "UPDATE bundles
    SET van_comm_rand = NULL,
        dummy_nullifiers = NULL,
@@ -1167,36 +1167,11 @@ mod tests {
         assert_eq!(signatures[0].bundle_index, 2);
         assert_eq!(signatures[0].sig, signed_signature);
 
-        // An explicit unsigned Keystone request can now replace bundle 1's
-        // demoted legacy setup, while signed and submitted bundles stay intact.
-        assert!(
-            queries::clear_demoted_legacy_delegation_setup_for_keystone_request(
-                &conn,
-                "test-round",
-                "wallet",
-                1,
-            )
-            .unwrap()
-        );
-        assert_eq!(setup_presence(1), (false, false, false));
-        assert!(
-            !queries::clear_demoted_legacy_delegation_setup_for_keystone_request(
-                &conn,
-                "test-round",
-                "wallet",
-                2,
-            )
-            .unwrap()
-        );
-        assert!(
-            !queries::clear_demoted_legacy_delegation_setup_for_keystone_request(
-                &conn,
-                "test-round",
-                "wallet",
-                3,
-            )
-            .unwrap()
-        );
+        // Proof-bearing legacy setup remains intact until a separate recovery
+        // flow reconciles whether its delegation reached the chain.
+        assert_eq!(setup_presence(1), (true, true, false));
+        assert_eq!(setup_presence(2), (true, true, false));
+        assert_eq!(setup_presence(3), (true, true, false));
 
         queries::store_proof(&conn, "test-round", "wallet", 2, &[0xB2; 96]).unwrap();
         let reproved =

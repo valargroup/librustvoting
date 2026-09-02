@@ -456,9 +456,11 @@ contract is documented in
 
 Signing state is one-shot. After a restart, the wallet MAY resume through the
 same prepared bundle because the voting database retains the exact full PCZT.
-Legacy unsigned setup that predates durable PCZT storage must be cleared and
-rebuilt as one unit. A wallet MUST NOT combine `alpha`, `rk`, action fields,
-rseeds, a sighash, or a signature from different setup attempts.
+If legacy setup predates durable PCZT storage, the SDK preserves it and returns
+`VotingError::DelegationReconciliationRequired` instead of rebuilding it. The
+wallet must reconcile whether delegation submission reached the chain before
+explicitly abandoning that setup. A wallet MUST NOT combine `alpha`, `rk`,
+action fields, rseeds, a sighash, or a signature from different setup attempts.
 
 ## Rust example
 

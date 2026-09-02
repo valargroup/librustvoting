@@ -20,12 +20,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 ### Fixed
 
 - Schema version 19 preserves proof-bearing legacy delegation setup when
-  submission may have reached the chain, and an explicit unsigned Keystone
-  request can rebuild setup that predates durable PCZT storage. It also removes
-  stale or invalid local Keystone signatures while preserving
-  cryptographically valid signed setup and submitted, confirmed, and imported
-  state. New Keystone signature writes must match the current bundle setup and
-  verify before the atomic batch commits.
+  submission may have reached the chain. Keystone requests now fail with a
+  typed reconciliation error instead of automatically replacing setup that
+  predates durable PCZT storage. The migration also removes stale or invalid
+  local Keystone signatures while preserving cryptographically valid signed
+  setup and submitted, confirmed, and imported state. New Keystone signature
+  writes must match the current bundle setup and verify before the atomic batch
+  commits.
 
 ## v3.1.0-rc.16
 

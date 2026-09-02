@@ -1137,18 +1137,20 @@ impl PreparedDelegationBundle {
     /// Setup persists the serialized PCZT together with its write-once sighash
     /// and randomized key. Repeated calls, including calls after ZKP #1 was
     /// generated in the background, return that same PCZT instead of rebuilding
-    /// randomized signing state. An unsigned legacy setup whose proof was
-    /// demoted during migration is rebuilt here because it predates durable
-    /// PCZT storage; signed or submitted legacy setup is never replaced.
+    /// randomized signing state. Legacy setup that predates durable PCZT
+    /// storage is never rebuilt automatically because its submission outcome
+    /// may be unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::DelegationReconciliationRequired`] when persisted
+    /// setup cannot be safely bound to an exact PCZT. The caller must reconcile
+    /// any possible submission before explicitly abandoning that setup.
     pub fn keystone_request(
         &self,
         voting_db: &VotingDb,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<KeystoneSigningRequest, VotingError> {
-        // Migration retains proof-bearing legacy setup because a delegation
-        // with no locally recorded hash may still have reached the chain. Only
-        // an explicit unsigned Keystone request may replace a demoted setup
-        // that has neither a signature nor submission evidence.
         self.validate_snapshot_branch_id_provider()?;
         let consensus_branch_id = self.branch_id_provider.consensus_branch_id()?;
         voting_db.validate_governance_pczt_context(
@@ -1157,10 +1159,6 @@ impl PreparedDelegationBundle {
             &self.bundle_note_infos,
             &self.delegation_keys,
             consensus_branch_id,
-        )?;
-        voting_db.clear_demoted_legacy_delegation_setup_for_keystone_request(
-            &self.round_id,
-            self.bundle_index,
         )?;
         self.ensure_setup(voting_db, stages)?;
         let (pczt_bytes, stored_sighash, stored_rk) =
@@ -1851,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn keystone_request_explicitly_rebuilds_demoted_legacy_setup() {
+    fn keystone_request_preserves_legacy_setup_that_requires_reconciliation() {
         let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
         prepared
             .setup(&voting_db, &crate::types::NoopProgressReporter)
@@ -1881,26 +1879,70 @@ mod tests {
             .unwrap();
         }
 
+        let legacy_state = || {
+            let conn = voting_db.conn();
+            conn.query_row(
+                "SELECT b.van_comm_rand,
+                        b.dummy_nullifiers,
+                        b.rho_signed,
+                        b.padded_note_data,
+                        b.nf_signed,
+                        b.cmx_new,
+                        b.alpha,
+                        b.rseed_signed,
+                        b.rseed_output,
+                        b.gov_comm,
+                        b.total_note_value,
+                        b.address_index,
+                        b.rk,
+                        b.gov_nullifiers_blob,
+                        b.padded_note_secrets,
+                        b.pczt_sighash,
+                        b.tx1_effects,
+                        b.delegation_pczt,
+                        p.proof,
+                        p.success
+                   FROM bundles b
+                   JOIN proofs p
+                     ON p.round_id = b.round_id
+                    AND p.wallet_id = b.wallet_id
+                    AND p.bundle_index = b.bundle_index
+                  WHERE b.round_id = ?1
+                    AND b.wallet_id = ?2
+                    AND b.bundle_index = ?3",
+                params![&prepared.round_id, &wallet_id, prepared.bundle_index],
+                |row| {
+                    (0..20)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                },
+            )
+            .unwrap()
+        };
+        let before = legacy_state();
+        assert_eq!(before[17], rusqlite::types::Value::Null);
+
         assert_eq!(
             voting_db
                 .delegation_phase(&prepared.round_id, prepared.bundle_index)
                 .unwrap(),
             DelegationPhase::PcztBuilt
         );
-        let request = prepared
+        let err = prepared
             .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
-            .unwrap();
-        assert!(!request.pczt_bytes.is_empty());
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            VotingError::DelegationReconciliationRequired {
+                ref round_id,
+                bundle_index,
+            } if round_id == &prepared.round_id && bundle_index == prepared.bundle_index
+        ));
         assert_eq!(
-            voting_db
-                .get_delegation_pczt_fields(&prepared.round_id, prepared.bundle_index)
-                .unwrap()
-                .0,
-            request.pczt_bytes
+            legacy_state(),
+            before,
+            "Keystone recovery must not mutate proof-bearing legacy setup"
         );
-        assert!(!voting_db
-            .has_persisted_delegation_proof(&prepared.round_id, prepared.bundle_index)
-            .unwrap());
     }
 
     #[test]

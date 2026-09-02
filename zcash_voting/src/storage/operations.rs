@@ -839,23 +839,6 @@ impl VotingDb {
         queries::load_delegation_pczt_fields(&conn, round_id, &wallet_id, bundle_index)
     }
 
-    /// Clear preserved legacy setup only when an unsigned Keystone request
-    /// explicitly needs to replace a demoted proof's missing PCZT.
-    pub(crate) fn clear_demoted_legacy_delegation_setup_for_keystone_request(
-        &self,
-        round_id: &str,
-        bundle_index: u32,
-    ) -> Result<bool, VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::clear_demoted_legacy_delegation_setup_for_keystone_request(
-            &conn,
-            round_id,
-            &wallet_id,
-            bundle_index,
-        )
-    }
-
     /// Cache tree state fetched from lightwalletd by SDK.
     pub fn store_tree_state(&self, round_id: &str, tree_state: &[u8]) -> Result<(), VotingError> {
         let conn = self.conn();
