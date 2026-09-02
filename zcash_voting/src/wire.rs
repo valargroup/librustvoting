@@ -298,7 +298,8 @@ pub struct DelegationRecoveryView {
     pub bundle_index: u32,
     pub phase: String,
     pub tx_hash: Option<String>,
-    pub van_leaf_position: Option<u32>,
+    /// Confirmed VAN leaf position, if delegation has been projected.
+    pub van_leaf_position: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

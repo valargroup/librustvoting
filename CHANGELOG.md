@@ -6,6 +6,25 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+### Changed
+
+- **Breaking:** delegation recovery views now expose VAN positions as `u64`,
+  matching lifecycle confirmation and SQLite's supported non-negative range.
+
+### Fixed
+
+- Session cleanup now preserves delegation setup fields for bundles with a
+  successful proof so wallets can resume signing without regenerating ZKP1.
+- VAN positions above `u32::MAX` are now read losslessly; legacy `u32` readers
+  return a range error instead of wrapping.
+
+### Removed
+
+- Removed the standalone `recovery::clear` and
+  `VotingDb::clear_recovery_state` APIs. Ordinary reset preserves durable
+  submission evidence; explicit round or account deletion remains the
+  destructive cleanup boundary.
+
 ## v3.1.0-rc.16
 
 ### Changed
@@ -14,18 +33,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   the stored hotkey secret and exact round and bundle identity. Restoring that
   secret and using `recoverable_bundle_policy_v1()` reconstructs the same VAN
   after voting database loss without new authority-root or recovery tables.
-
-### Fixed
-
-- Session cleanup now preserves delegation setup fields for bundles with a
-  successful proof so wallets can resume signing without regenerating ZKP1.
-
-### Removed
-
-- Removed the standalone `recovery::clear` and
-  `VotingDb::clear_recovery_state` APIs. Ordinary reset preserves durable
-  submission evidence; explicit round or account deletion remains the
-  destructive cleanup boundary.
 
 ## v3.1.0-rc.15
 

@@ -4,18 +4,19 @@
 //! may make more than one bounded network attempt for that generation, but it
 //! must never reinterpret an attempt as a different vote or delegation.
 //!
-//! This module exposes the additive data model and the host-owned HTTP
-//! transport seam. Persistence and lifecycle entry points are not yet
-//! included. The protocol client and transition reducer remain private so
-//! callers cannot bypass the eventual coordinator.
+//! This module exposes the durable data model and host-owned HTTP transport
+//! seam. Persistence and lifecycle entry points remain private so callers use
+//! the SDK-owned coordination boundary.
 
+#[allow(dead_code, reason = "internal confirmation projection")]
+mod confirmation;
+#[allow(dead_code, reason = "internal generation derivation and migration")]
+mod generation;
 mod identity;
-#[allow(dead_code, reason = "used by the chain submission coordinator")]
+#[allow(dead_code, reason = "internal submission protocol")]
 mod protocol;
 mod result;
-// The reducer lands before the coordinator calls it. Keep the inactive
-// foundation private without producing crate warnings.
-#[allow(dead_code, reason = "used by the chain submission coordinator")]
+#[allow(dead_code, reason = "internal lifecycle transition validation")]
 mod state;
 mod transport;
 

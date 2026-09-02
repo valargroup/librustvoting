@@ -137,6 +137,15 @@ pub(super) enum ValidatedChainSubmissionConfirmation {
 }
 
 impl ValidatedChainSubmissionConfirmation {
+    /// Returns the validated confirmation payload independent of evidence kind.
+    pub(super) fn confirmation(&self) -> &ChainSubmissionConfirmation {
+        match self {
+            Self::Hash(confirmation)
+            | Self::Tree(confirmation)
+            | Self::LegacyImport(confirmation) => confirmation,
+        }
+    }
+
     #[allow(dead_code, reason = "used by chain confirmation")]
     pub(super) fn from_hash(
         transaction_hash: CandidateTransactionHash,

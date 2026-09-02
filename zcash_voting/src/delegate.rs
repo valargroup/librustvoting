@@ -1177,11 +1177,51 @@ pub fn submission(
     bundle_index: u32,
     signer: DelegationSigner,
 ) -> Result<DelegationSubmission, VotingError> {
-    let data = match signer {
-        DelegationSigner::Signature { sig, sighash } => {
-            db.get_delegation_submission_with_signature(round_id, bundle_index, &sig, &sighash)
-        }
-    }?;
+    let wallet_id = db.wallet_id();
+    let conn = db.conn();
+    submission_with_conn(&conn, &wallet_id, round_id, bundle_index, signer)
+}
+
+/// Reconstructs a delegation request from durable state on `conn`.
+///
+/// The supplied signature must verify under the stored randomized key and
+/// stored PCZT sighash. This function performs no signing or durable writes.
+pub(crate) fn submission_with_conn(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    signer: DelegationSigner,
+) -> Result<DelegationSubmission, VotingError> {
+    let (sig, sighash) = match signer {
+        DelegationSigner::Signature { sig, sighash } => (sig, sighash),
+    };
+    let data = crate::storage::queries::load_delegation_submission_data(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+    )?;
+    let stored_sighash =
+        crate::storage::queries::load_pczt_sighash(conn, round_id, wallet_id, bundle_index)?;
+    if stored_sighash.len() != 32 {
+        return Err(VotingError::Internal {
+            message: format!(
+                "pczt_sighash must be 32 bytes, got {}",
+                stored_sighash.len()
+            ),
+        });
+    }
+    if stored_sighash.as_slice() != sighash {
+        return Err(VotingError::InvalidInput {
+            message: "sighash does not match stored PCZT sighash".to_string(),
+        });
+    }
+    crate::storage::operations::verify_delegation_spend_auth_signature(
+        &data.rk,
+        &stored_sighash,
+        &sig,
+    )?;
 
     Ok(DelegationSubmission {
         proof: data.proof,
@@ -1192,8 +1232,8 @@ pub fn submission(
         gov_nullifiers: array32x_bundle_note_slots("gov_nullifiers", data.gov_nullifiers)?,
         alpha: array32("alpha", data.alpha)?,
         vote_round_id: data.vote_round_id,
-        spend_auth_sig: array64("spend_auth_sig", data.spend_auth_sig)?,
-        sighash: array32("sighash", data.sighash)?,
+        spend_auth_sig: sig,
+        sighash,
         tx1_effects: data.tx1_effects,
     })
 }
@@ -1326,14 +1366,6 @@ fn array32(label: &str, value: Vec<u8>) -> Result<[u8; 32], VotingError> {
         .try_into()
         .map_err(|value: Vec<u8>| VotingError::Internal {
             message: format!("{label} must be 32 bytes, got {}", value.len()),
-        })
-}
-
-fn array64(label: &str, value: Vec<u8>) -> Result<[u8; 64], VotingError> {
-    value
-        .try_into()
-        .map_err(|value: Vec<u8>| VotingError::Internal {
-            message: format!("{label} must be 64 bytes, got {}", value.len()),
         })
 }
 

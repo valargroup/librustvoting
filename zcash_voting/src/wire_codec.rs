@@ -23,7 +23,7 @@ use crate::{
         RoundBoundVotingHotkeyTarget, SelectedNotes, SharePayload, VotingError, VotingHotkeyTarget,
         MAX_VOTE_OPTIONS,
     },
-    vote::{SignedVoteBatch, SignedVoteCommitment, SignedVoteCommitments},
+    vote::{SignedVoteBatch, SignedVoteCommitment, SignedVoteCommitments, VoteSubmission},
     wire::{
         CompletedVoteChoiceView, CompletedVoteDisplayView, DelegationPirPrecomputeResultView,
         DelegationRecoveryView, DelegationRecoveryWorkView, DelegationStatusView,
@@ -385,6 +385,25 @@ impl TryFrom<&SignedVoteCommitment> for VoteCommitmentWire {
             anchor_height: commitment.anchor_height,
             r_vpk: b64(commitment.r_vpk),
             vote_auth_sig: b64(commitment.vote_auth_sig),
+        })
+    }
+}
+
+/// Encodes the chain-visible fields of a reconstructed vote submission.
+impl TryFrom<&VoteSubmission> for VoteCommitmentWire {
+    type Error = VotingError;
+
+    fn try_from(submission: &VoteSubmission) -> Result<Self, Self::Error> {
+        Ok(Self {
+            van_nullifier: b64(submission.van_nullifier),
+            vote_authority_note_new: b64(submission.vote_authority_note_new),
+            vote_commitment: b64(submission.vote_commitment),
+            proposal_id: submission.proposal_id,
+            proof: b64(&submission.proof),
+            vote_round_id: b64_hex(&submission.vote_round_id, "vote_round_id")?,
+            anchor_height: submission.anchor_height,
+            r_vpk: b64(submission.r_vpk),
+            vote_auth_sig: b64(submission.vote_auth_sig),
         })
     }
 }

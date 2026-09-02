@@ -97,6 +97,67 @@ software-delegation SpendAuth signature are excluded. A restarted software
 delegation may therefore be re-signed, but the lifecycle must verify the new
 signature against the same locked semantic generation before dispatch.
 
+Generation digest version 1 is SHA-256 over the ASCII domain
+`zcash_voting.chain_submission.generation.v1` followed by a NUL byte and a
+canonical typed transcript. Each transcript field is encoded as a big-endian
+`u16` tag length, the ASCII tag, a big-endian `u64` value length, and the value.
+Integers use fixed-width big-endian encoding, booleans are one byte, and every
+sequence includes a big-endian `u32` count followed by index-tagged elements.
+The transcript hashes parsed typed values, never recovery JSON bytes or a final
+signed request body. Field tags, ordering, and the frozen digest vector are
+part of the durable version-18 compatibility contract.
+
+The common identity field order is `identity.wallet_id`, `identity.network`,
+`identity.vote_chain_id`, `identity.vote_round_id`, `identity.bundle_index`,
+and `identity.kind`, followed by `identity.proposal_id` for a singleton or
+`identity.ordered_batch_digest` for a batch. Delegation fields then appear in
+this order:
+
+```text
+delegation.note_positions
+delegation.note_identity_hashes
+delegation.van_comm_rand
+delegation.dummy_nullifiers
+delegation.rho_signed
+delegation.padded_note_data
+delegation.nf_signed
+delegation.cmx_new
+delegation.alpha
+delegation.rseed_signed
+delegation.rseed_output
+delegation.gov_comm
+delegation.total_note_value
+delegation.address_index
+delegation.rk
+delegation.gov_nullifiers
+delegation.padded_note_secrets
+delegation.pczt_sighash
+delegation.tx1_effects
+delegation.proof
+```
+
+Vote generations contain the `votes` sequence. Each `votes.<index>` member is
+encoded in this order: `vote_round_id`, `bundle_index`, `proposal_id`,
+`vote_decision`, `anchor_height`, `single_share`, `num_options`,
+`van_nullifier`, `vote_authority_note_new`, `vote_commitment`, `proof`,
+`shares_hash`, `r_vpk`, `alpha_v`, `vote_auth_sig`, `encrypted_shares`,
+`share_blinds`, `share_comms`, and `batch`. An encrypted-share member is `c1`,
+`c2`, `share_index`, `plaintext_value`, and `randomness`. A batch member appends
+`batch.digest`, `batch.index`, and `batch.size`; a singleton encodes only the
+literal `singleton` batch value. Every named sequence first emits
+`<tag>.count`, then uses decimal zero-based indexes in its element tags.
+Delegation padded-note-secret elements use `.rho` followed by `.rseed`.
+
+The complete v1 frozen digests are:
+
+- delegation: `41b0eecb59da7f911b94c7ae540f1674fb9b399feb2c71233024a297b2df5c63`;
+- singleton vote: `bfb3ebc460d3300aa9f3943cf023ee30ccc3bfae5a93ba9b131b4f99fa7706b1`;
+- ordered two-vote batch: `40e3bfefec14a5a21b9c11e6ee0140996fe1f9025140303de97dd7e89bf31b6c`.
+
+Their complete typed fixtures are maintained by
+`generation_digest_v1_matches_frozen_vector`; changing a fixture or digest is
+a generation-format version change, not an ordinary refactor.
+
 No final signed request body is persisted. Every request is reconstructed as a
 closed SDK wire type from locked durable inputs. The database stores neither a
 payload digest nor duplicate descriptor JSON. The same derivation code is used
@@ -976,3 +1037,14 @@ Tests cover:
 - removed legacy mutation APIs fail compile-time surface checks.
 
 These tests are the review contract for changes to chain submission behavior.
+
+Generation and confirmation coverage is anchored by
+`generation_digest_v1_matches_frozen_vector`,
+`generation_digest_binds_semantics_and_ignores_confirmation_positions`,
+`batch_generation_digest_and_layout_preserve_action_order`,
+`expected_layouts_follow_signed_action_order`,
+`persisted_vote_generation_survives_confirmation_projection`,
+`typed_confirmation_uses_the_full_sqlite_position_range`,
+`typed_batch_confirmation_rolls_back_when_a_later_member_conflicts`,
+`records_vote_confirmation_atomically`, and
+`records_vote_batch_confirmation_replay_and_helper_positions`.
