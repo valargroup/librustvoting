@@ -372,6 +372,23 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .await
     }
 
+    /// Advances one prepared atomic vote batch through one bounded status-only pass.
+    ///
+    /// The pass validates a non-empty, protocol-bounded, duplicate-free proposal
+    /// roster, then rederives its locked durable roster and ordered digest. It
+    /// may durably reserve before POST, submit the complete batch, poll a
+    /// candidate, and atomically persist confirmation for every batch member.
+    /// It does not scan the commitment tree. A non-cancelled result represents
+    /// the authoritative durable outcome reported by
+    /// [`ChainSubmissionResult::durable_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure for invalid identity, roster, digest, or prepared
+    /// state; invariant or storage failure; transport failure; or invalid
+    /// protocol data. Once dispatch may have occurred, cancellation or failure
+    /// does not erase the strongest state reported by
+    /// [`ChainSubmissionFailure::strongest_state`].
     pub async fn advance_vote_batch(
         &self,
         request: AdvanceVoteBatch,
@@ -381,6 +398,23 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .await
     }
 
+    /// Advances one prepared atomic vote batch through one bounded pass.
+    ///
+    /// This has the same validation, durable and network side effects, and
+    /// result postconditions as [`Self::advance_vote_batch`].
+    /// [`ChainRecoveryMode::StatusOnly`] reconciles only through a known
+    /// transaction hash. [`ChainRecoveryMode::ExactTree`] may, after
+    /// candidate-first reconciliation is inconclusive, scan one fixed complete
+    /// tree snapshot and atomically confirm only the unique exact ordered batch
+    /// layout or authorize one same-generation retry within this call's attempt
+    /// budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure for invalid identity, roster, digest, or prepared
+    /// state; invariant or storage failure; transport failure; or invalid
+    /// protocol or recovery data. Durable or possibly-dispatched state remains
+    /// available through [`ChainSubmissionFailure::strongest_state`].
     pub async fn advance_vote_batch_with_recovery(
         &self,
         request: AdvanceVoteBatch,
