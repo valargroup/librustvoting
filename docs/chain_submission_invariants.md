@@ -233,6 +233,12 @@ authorizes an atomic same-generation retry reservation. Retirement makes no
 claim about the transaction's chain outcome. Legacy guards do not import a
 candidate or confirmed hash; any historical hash remains only in its unchanged
 legacy projection column.
+One canonical candidate or hash-confirmed transaction belongs to at most one
+native semantic generation. If POST acceptance returns a hash already owned by
+another generation, the new reservation becomes hashless `Recovering` with an
+invalid-protocol diagnostic and the lifecycle does not poll or confirm that
+hash for the new generation. Confirmation rechecks ownership in the same
+transaction as the terminal projection.
 Diagnostics are bounded, valid UTF-8, escaped, and redacted before storage.
 Raw response bodies and sensitive cryptographic material are never persisted in
 diagnostics or emitted through ordinary logging.
@@ -344,10 +350,11 @@ marker. Conflicting terminal data is an invariant error and writes nothing.
 
 Before releasing any POST byte, the lifecycle:
 
-1. acquires the round/account gate, bundle lock where applicable, and
-   applicable submission-identity locks in canonical order;
-2. derives the recovery-independent identity, plus every batch member's legacy
-   singleton identity when applicable, and loads their authoritative rows;
+1. derives the recovery-independent identity lock set from the request, then
+   acquires the round/account gate, bundle lock where applicable, and those
+   submission-identity locks in canonical order;
+2. loads the authoritative row plus every batch member's legacy singleton row
+   when applicable;
 3. returns `LegacyConfirmed` for a matching singleton, returns a digestless
    guard as pending with `RecoveryUnavailable`, or rejects an overlapping
    batch without dispatch, before requiring recovery material;
@@ -375,6 +382,10 @@ classification.
 Only transport code can classify a failure as `DefinitelyUnsent`, and only
 before request bytes are released to a network stack that may deliver them.
 Cancellation before that boundary is also definitely unsent.
+The transport exposes that handoff through a one-way dispatch marker. The
+coordinator may remove a fresh reservation on interruption only while the
+marker remains clear; once marked, interruption is possibly dispatched even if
+the request future is then cancelled.
 
 For a first attempt, definitely-unsent failure removes the fresh `Submitting`
 reservation; it does not create chain rejection or ambiguity. For a retry from
@@ -383,6 +394,10 @@ reservation in the monotonic attempt count, and does not restore either the
 retired candidate or the consumed no-match authorization. Another retry
 requires another valid no-match pass. Attempt count is diagnostic and is never
 decremented, refunded, or used as a permanent retry gate.
+When bounded endpoint failover follows a definitely-unsent fresh attempt in
+the same invocation, the next committed reservation carries the next ordinal;
+removing the definitely-unsent row does not cause a later committed
+reservation in that invocation to be counted as attempt one again.
 
 Everything after the dispatch boundary is `PossiblyDispatched`, including:
 
@@ -584,6 +599,10 @@ synthesizes a transaction hash.
 Hash confirmation requires trusted committed success and a supported event
 shape for the exact identity and generation. Tree confirmation requires one
 complete unique layout as defined above.
+The supported hash-confirmation event contains exactly one round attribute
+under either supported alias and exactly one position attribute. Duplicate
+attributes, both round aliases, conflicting values, multiple matching events,
+malformed positions, or positions outside SQLite's range are not evidence.
 
 Immediately before confirmation, the lifecycle reloads and re-derives the
 locked generation. It rejects changed choice, membership, order, nullifier,
@@ -684,6 +703,18 @@ The identity locks serialize lifecycle work for the authoritative row and, for
 a batch, every member's legacy singleton key. The bundle lock prevents two
 proposals from deriving successors from the same VAN. Different bundles remain
 independent.
+For active batch admission, the request's complete ordered roster supplies the
+recovery-independent identity lock set. Under those locks, admission loads the
+persisted roster and requires an exact ordered match before reading any member
+guard or inserting a native row. A missing, truncated, reordered, duplicated,
+or otherwise changed roster fails without touching an identity that was not
+locked. The request rejects rosters above the 15-action protocol maximum before
+allocating lock identities. No persisted roster is read before the operation
+and identity locks.
+The coordination authority is owned by the database authority, so constructing
+multiple coordinators for one store cannot create disjoint lock registries.
+Cleanup and deletion acquire the same round gate exclusively and treat an
+active shared lifecycle lease as busy.
 
 Once a singleton request is possibly dispatched, its proposal and choice are
 locked. Once a batch is possibly dispatched, member proposals, choices, count,
@@ -1048,3 +1079,47 @@ Generation and confirmation coverage is anchored by
 `typed_batch_confirmation_rolls_back_when_a_later_member_conflicts`,
 `records_vote_confirmation_atomically`, and
 `records_vote_batch_confirmation_replay_and_helper_positions`.
+
+Phase 4 private-coordinator coverage is anchored by
+`reservation_commits_before_post_and_accepted_hash_is_tracking`,
+`delegation_uses_the_same_lifecycle_and_atomic_confirmation_path`,
+`reservation_failure_dispatches_nothing_and_writes_nothing`,
+`definitely_unsent_failover_is_bounded_and_ambiguity_stops_it`,
+`possible_dispatch_is_sticky_recovery_and_never_redispatches`,
+`failed_post_classification_reports_known_possible_dispatch`,
+`failed_tracking_reconciliation_reports_the_durable_state`,
+`tracking_deadline_survives_polling_and_coordinator_restart`,
+`committed_failure_rejects_tracking_but_only_clears_recovery_candidate`,
+`hash_confirmation_updates_submission_and_projection_atomically`,
+`failed_confirmation_rolls_back_submission_and_projection`,
+`cancellation_after_confirmation_commit_point_cannot_suppress_persistence`,
+`migration_guards_return_before_derivation_or_network_work`,
+`guarded_batch_is_rejected_before_derivation_or_dispatch`,
+`changed_generation_is_rejected_before_reconciliation`,
+`terminal_state_is_idempotent_only_for_the_same_generation`,
+`same_identity_concurrency_releases_only_one_post`,
+`same_bundle_blocks_a_successor_until_the_predecessor_is_authoritative`,
+`atomically_confirmed_predecessor_allows_the_next_bundle_generation`,
+`independent_bundles_progress_while_another_post_is_blocked`,
+`coordinators_for_one_store_share_the_same_lock_authority`,
+`exclusive_round_access_is_busy_until_lifecycle_work_finishes`,
+`batch_roster_mismatch_never_creates_a_reservation`,
+`batch_request_supplies_its_complete_recovery_independent_lock_set`,
+`batch_request_enforces_protocol_action_bounds`,
+`persisted_batch_roster_mismatch_never_checks_unlocked_members`,
+`exclusive_round_gate_prevents_batch_roster_reads`,
+`active_batch_admission_requires_a_persisted_roster`,
+`omitted_batch_member_fails_before_its_unlocked_legacy_guard_is_read`,
+`request_kind_must_match_the_identity_target`,
+`candidate_hash_reuse_across_generations_fails_closed_without_lookup`,
+`ambiguous_confirmation_attributes_leave_tracking_authoritative`,
+`event_round_requires_exactly_one_supported_attribute`,
+`confirmation_attribute_requires_exactly_one_value`,
+`matching_event_for_round_must_be_unique`,
+`cancelled_entry_normalizes_abandoned_submitting_without_network_work`,
+`cancelled_batch_entry_requires_no_recovery_or_roster_derivation`,
+`cancellation_after_reservation_before_dispatch_removes_fresh_reservation`,
+`failed_cancelled_entry_normalization_reports_possible_dispatch`,
+`failed_active_entry_normalization_reports_possible_dispatch`,
+`cancellation_during_dispatch_persists_recovery`, and
+`operation_epoch_change_during_dispatch_persists_recovery`.

@@ -6,6 +6,16 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+### Added
+
+- Added the inactive private chain-submission lifecycle coordinator and store
+  contract, including durable pre-POST reservation, bounded failover,
+  candidate reconciliation, restart-stable tracking deadlines, sticky
+  recovery, atomic confirmation, canonical lifecycle serialization,
+  store-owned lock authority, causal bundle admission, strict batch-roster and
+  confirmation-event validation, unique candidate ownership, and exact
+  committed-reservation accounting.
+
 ### Changed
 
 - **Breaking:** delegation recovery views now expose VAN positions as `u64`,
@@ -13,6 +23,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Chain-submission cancellation now removes a fresh reservation when transport
+  dispatch has not begun. Batch admission derives its identity locks from the
+  complete request roster, verifies the persisted roster before reading
+  migration guards, and rejects oversized rosters before lock allocation.
 - Session cleanup now preserves delegation setup fields for bundles with a
   successful proof so wallets can resume signing without regenerating ZKP1.
 - VAN positions above `u32::MAX` are now read losslessly; legacy `u32` readers

@@ -12,9 +12,9 @@ use crate::{
 };
 
 use super::{
-    CandidateTransactionHash, ChainHttpRequest, ChainHttpResponse, ChainSubmissionDiagnostic,
-    ChainSubmissionDiagnosticKind, ChainTransport, ChainTransportError, ChainTransportFailureKind,
-    MAX_CHAIN_HTTP_RESPONSE_BYTES,
+    CandidateTransactionHash, ChainHttpRequest, ChainHttpResponse, ChainPostDispatch,
+    ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind, ChainTransport, ChainTransportError,
+    ChainTransportFailureKind, MAX_CHAIN_HTTP_RESPONSE_BYTES,
 };
 
 const API_PREFIX: [&str; 2] = ["shielded-vote", "v1"];
@@ -155,10 +155,30 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         })
     }
 
+    /// Number of distinct canonical mutation endpoints available for failover.
+    pub(super) fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    #[cfg(test)]
     pub(super) async fn submit_delegation(
         &self,
         endpoint_index: usize,
         submission: &DelegationSubmissionWire,
+    ) -> PostAttemptOutcome {
+        self.submit_delegation_with_dispatch(
+            endpoint_index,
+            submission,
+            ChainPostDispatch::default(),
+        )
+        .await
+    }
+
+    pub(super) async fn submit_delegation_with_dispatch(
+        &self,
+        endpoint_index: usize,
+        submission: &DelegationSubmissionWire,
+        dispatch: ChainPostDispatch,
     ) -> PostAttemptOutcome {
         let body = match submission.to_json() {
             Ok(json) => json.into_bytes(),
@@ -168,13 +188,25 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                 )))
             }
         };
-        self.post(endpoint_index, DELEGATION_ENDPOINT, body).await
+        self.post(endpoint_index, DELEGATION_ENDPOINT, body, dispatch)
+            .await
     }
 
+    #[cfg(test)]
     pub(super) async fn submit_vote(
         &self,
         endpoint_index: usize,
         submission: &VoteCommitmentWire,
+    ) -> PostAttemptOutcome {
+        self.submit_vote_with_dispatch(endpoint_index, submission, ChainPostDispatch::default())
+            .await
+    }
+
+    pub(super) async fn submit_vote_with_dispatch(
+        &self,
+        endpoint_index: usize,
+        submission: &VoteCommitmentWire,
+        dispatch: ChainPostDispatch,
     ) -> PostAttemptOutcome {
         let body = match submission.to_json() {
             Ok(json) => json.into_bytes(),
@@ -184,7 +216,8 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                 )))
             }
         };
-        self.post(endpoint_index, VOTE_ENDPOINT, body).await
+        self.post(endpoint_index, VOTE_ENDPOINT, body, dispatch)
+            .await
     }
 
     async fn post(
@@ -192,6 +225,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         endpoint_index: usize,
         endpoint: &str,
         body: Vec<u8>,
+        dispatch: ChainPostDispatch,
     ) -> PostAttemptOutcome {
         if body.len() > MAX_CHAIN_HTTP_REQUEST_BYTES {
             return PostAttemptOutcome::LocalFailure(invalid_protocol(format!(
@@ -211,7 +245,8 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
 
         let response = tokio::time::timeout(
             self.timing.post_timeout,
-            self.transport.chain_post_json(request, body),
+            self.transport
+                .chain_post_json_with_dispatch(request, body, dispatch),
         )
         .await;
         match response {

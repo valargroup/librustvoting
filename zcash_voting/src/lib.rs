@@ -59,7 +59,7 @@ pub mod zkp2;
 
 pub use chain_submission::{
     CandidateTransactionHash, CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse,
-    ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
+    ChainPostDispatch, ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
     ChainSubmissionConfirmationSource, ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind,
     ChainSubmissionFailure, ChainSubmissionFailureKind, ChainSubmissionFailureState,
     ChainSubmissionGeneration, ChainSubmissionGenerationDigest, ChainSubmissionIdentity,

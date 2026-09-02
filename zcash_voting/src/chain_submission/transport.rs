@@ -1,6 +1,14 @@
 //! Host-owned HTTP transport seam for vote-chain requests.
 
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use super::MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES;
 
@@ -189,6 +197,28 @@ impl ChainHttpResponse {
 pub type ChainTransportFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ChainHttpResponse, ChainTransportError>> + Send + 'a>>;
 
+/// Shared marker for the point at which a POST may reach the network.
+///
+/// A transport marks this immediately before handing the request to a network
+/// stack capable of delivering it. Cancellation before the marker is set is
+/// definitely unsent; cancellation after it is conservatively ambiguous.
+#[derive(Clone, Debug, Default)]
+pub struct ChainPostDispatch {
+    possible: Arc<AtomicBool>,
+}
+
+impl ChainPostDispatch {
+    /// Marks that the POST may be delivered even if its future is cancelled.
+    pub fn mark_possible(&self) {
+        self.possible.store(true, Ordering::Release);
+    }
+
+    /// Returns whether the POST crossed the transport handoff boundary.
+    pub fn is_possible(&self) -> bool {
+        self.possible.load(Ordering::Acquire)
+    }
+}
+
 /// Host-supplied HTTP mechanism for vote-chain requests.
 ///
 /// A privacy-routed implementation must fail closed when its route is
@@ -206,6 +236,24 @@ pub trait ChainTransport: Send + Sync {
         request: ChainHttpRequest,
         json: Vec<u8>,
     ) -> ChainTransportFuture<'a>;
+
+    /// Performs a mutation request and reports its dispatch boundary.
+    ///
+    /// Existing transports inherit a conservative implementation that marks
+    /// dispatch as soon as their POST future is polled. Implementations that
+    /// own a more precise handoff point should override this method and mark it
+    /// immediately before releasing the request to their network stack.
+    fn chain_post_json_with_dispatch<'a>(
+        &'a self,
+        request: ChainHttpRequest,
+        json: Vec<u8>,
+        dispatch: ChainPostDispatch,
+    ) -> ChainTransportFuture<'a> {
+        Box::pin(async move {
+            dispatch.mark_possible();
+            self.chain_post_json(request, json).await
+        })
+    }
 }
 
 impl<T: ChainTransport + ?Sized> ChainTransport for std::sync::Arc<T> {
@@ -219,6 +267,15 @@ impl<T: ChainTransport + ?Sized> ChainTransport for std::sync::Arc<T> {
         json: Vec<u8>,
     ) -> ChainTransportFuture<'a> {
         (**self).chain_post_json(request, json)
+    }
+
+    fn chain_post_json_with_dispatch<'a>(
+        &'a self,
+        request: ChainHttpRequest,
+        json: Vec<u8>,
+        dispatch: ChainPostDispatch,
+    ) -> ChainTransportFuture<'a> {
+        (**self).chain_post_json_with_dispatch(request, json, dispatch)
     }
 }
 

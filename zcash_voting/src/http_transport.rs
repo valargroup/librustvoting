@@ -15,7 +15,8 @@ use hyper_util::{
 };
 
 use crate::chain_submission::{
-    ChainHttpRequest, ChainHttpResponse, ChainTransport, ChainTransportError, ChainTransportFuture,
+    ChainHttpRequest, ChainHttpResponse, ChainPostDispatch, ChainTransport, ChainTransportError,
+    ChainTransportFuture,
 };
 use crate::helper::transport::{
     HelperFuture, HelperResponse, HelperTransport, HelperTransportError, MAX_HELPER_RESPONSE_BYTES,
@@ -363,6 +364,7 @@ impl HyperTransport {
         method: Method,
         metadata: ChainHttpRequest,
         body: Vec<u8>,
+        dispatch: Option<ChainPostDispatch>,
     ) -> std::result::Result<ChainHttpResponse, ChainTransportError> {
         let mut builder = Request::builder().method(method).uri(metadata.url());
         for (name, value) in metadata.headers() {
@@ -377,6 +379,9 @@ impl HyperTransport {
             })?;
 
         tokio::time::timeout(metadata.timeout(), async {
+            if let Some(dispatch) = dispatch {
+                dispatch.mark_possible();
+            }
             let response = self.client.request(request).await.map_err(|error| {
                 let message = format!("send vote-chain request failed: {error}");
                 if error.is_connect() {
@@ -421,7 +426,10 @@ impl HyperTransport {
 
 impl ChainTransport for HyperTransport {
     fn chain_get<'a>(&'a self, request: ChainHttpRequest) -> ChainTransportFuture<'a> {
-        Box::pin(async move { self.chain_request(Method::GET, request, Vec::new()).await })
+        Box::pin(async move {
+            self.chain_request(Method::GET, request, Vec::new(), None)
+                .await
+        })
     }
 
     fn chain_post_json<'a>(
@@ -429,7 +437,19 @@ impl ChainTransport for HyperTransport {
         request: ChainHttpRequest,
         json: Vec<u8>,
     ) -> ChainTransportFuture<'a> {
-        Box::pin(async move { self.chain_request(Method::POST, request, json).await })
+        Box::pin(async move { self.chain_request(Method::POST, request, json, None).await })
+    }
+
+    fn chain_post_json_with_dispatch<'a>(
+        &'a self,
+        request: ChainHttpRequest,
+        json: Vec<u8>,
+        dispatch: ChainPostDispatch,
+    ) -> ChainTransportFuture<'a> {
+        Box::pin(async move {
+            self.chain_request(Method::POST, request, json, Some(dispatch))
+                .await
+        })
     }
 }
 
@@ -453,7 +473,7 @@ mod tests {
     use hyper_util::client::legacy::connect::HttpConnector;
     use tower_service::Service;
 
-    use crate::chain_submission::{ChainHttpRequest, ChainTransportFailureKind};
+    use crate::chain_submission::{ChainHttpRequest, ChainPostDispatch, ChainTransportFailureKind};
 
     use super::{
         BlockingRuntime, HelperTransport, HelperTransportError, HyperTransport,
@@ -748,7 +768,8 @@ mod tests {
         });
 
         let transport = HyperTransport::new();
-        let response = crate::chain_submission::ChainTransport::chain_post_json(
+        let dispatch = ChainPostDispatch::default();
+        let response = crate::chain_submission::ChainTransport::chain_post_json_with_dispatch(
             &transport,
             chain_request(
                 format!("http://{address}/shielded-vote/v1/cast-vote"),
@@ -756,10 +777,12 @@ mod tests {
                 1024,
             ),
             br#"{"vote":"yes"}"#.to_vec(),
+            dispatch.clone(),
         )
         .await
         .unwrap();
 
+        assert!(dispatch.is_possible());
         assert_eq!(response.status(), 200);
         assert_eq!(response.body(), b"{}");
         assert_eq!(
@@ -771,6 +794,24 @@ mod tests {
             .iter()
             .any(|(name, value)| name == "x-chain" && value == "vote"));
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn chain_dispatch_marker_stays_clear_when_request_build_fails() {
+        let transport = HyperTransport::new();
+        let dispatch = ChainPostDispatch::default();
+
+        let error = crate::chain_submission::ChainTransport::chain_post_json_with_dispatch(
+            &transport,
+            chain_request("\n".to_string(), Duration::from_secs(1), 1024),
+            b"{}".to_vec(),
+            dispatch.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ChainTransportFailureKind::DefinitelyUnsent);
+        assert!(!dispatch.is_possible());
     }
 
     #[tokio::test]
