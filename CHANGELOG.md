@@ -19,17 +19,27 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Schema version 19 preserves proof-bearing legacy delegation setup when
+  submission may have reached the chain, and an explicit unsigned Keystone
+  request can rebuild setup that predates durable PCZT storage. It also removes
+  stale or invalid local Keystone signatures while preserving
+  cryptographically valid signed setup and submitted, confirmed, and imported
+  state. New Keystone signature writes must match the current bundle setup and
+  verify before the atomic batch commits.
+
+## v3.1.0-rc.16
+
+### Changed
+
+- Local voting-hotkey delegation now derives each bundle's VAN blinding from
+  the stored hotkey secret and exact round and bundle identity. Restoring that
+  secret and using `recoverable_bundle_policy_v1()` reconstructs the same VAN
+  after voting database loss without new authority-root or recovery tables.
+
+### Fixed
+
 - Session cleanup now preserves delegation setup fields for bundles with a
   successful proof so wallets can resume signing without regenerating ZKP1.
-  Existing databases whose released cleanup fully or partially erased those
-  fields retain the old proof bytes but rebuild setup and ZKP1 instead of
-  reusing a proof that can no longer be signed. Schema version 19 preserves
-  proof-bearing legacy setup when submission may have reached the chain, and an
-  explicit unsigned Keystone request can rebuild setup that predates durable
-  PCZT storage. It also removes stale or invalid local Keystone signatures while
-  preserving cryptographically valid signed setup and submitted, confirmed,
-  and imported state. New Keystone signature writes must match the current
-  bundle setup and verify before the atomic batch commits.
 
 ### Removed
 
@@ -76,10 +86,6 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   without exposing encrypted helper payloads to the host.
 
 ### Changed
-- Local voting-hotkey delegation now derives each bundle's VAN blinding from
-  the stored hotkey secret and exact round and bundle identity. Restoring that
-  secret and using `recoverable_bundle_policy_v1()` reconstructs the same VAN
-  after voting database loss without new authority-root or recovery tables.
 - Helper-share planning, persistence, submission, and recovery are now
   authoritative SDK responsibilities. Hosts provide authenticated helper
   configuration, round timing, transport, and cancellation.
