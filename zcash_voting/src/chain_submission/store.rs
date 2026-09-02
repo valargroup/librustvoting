@@ -22,6 +22,9 @@ mod sqlite;
 pub(super) use sqlite::SqliteChainSubmissionStore;
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 use super::{
     confirmation::validate_hash_confirmation,
     coordination::BundleOperationKey,
