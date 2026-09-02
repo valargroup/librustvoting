@@ -457,8 +457,13 @@ pub fn load_round_network(
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
         |row| row.get::<_, String>(0),
     )
-    .map_err(|e| VotingError::InvalidInput {
-        message: format!("round not found: {} ({})", round_id, e),
+    .map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => VotingError::InvalidInput {
+            message: format!("round not found: {round_id}"),
+        },
+        error => VotingError::Storage {
+            message: format!("failed to load round network for {round_id}: {error}"),
+        },
     })
     .and_then(|network| network_from_storage(&network))
 }
@@ -1699,8 +1704,8 @@ pub(crate) fn load_vote_row_state(
         },
     )
     .optional()
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to load vote state before vote preparation: {e}"),
+    .map_err(|error| VotingError::Storage {
+        message: format!("failed to load vote state before vote preparation: {error}"),
     })
 }
 

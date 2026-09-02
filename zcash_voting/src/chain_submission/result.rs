@@ -14,9 +14,6 @@ pub enum ChainSubmissionState {
     Tracking,
     Recovering,
     Confirmed,
-    /// Migration-only confirmation whose generation layout could not be
-    /// re-derived from version-17 recovery data.
-    LegacyConfirmed,
     Rejected,
 }
 
@@ -29,6 +26,12 @@ pub enum ChainSubmissionDiagnosticKind {
     ReconciliationPending,
     InvalidProtocolResponse,
     RecoveryUnavailable,
+    /// Version-17 recovery material exists but does not derive a generation.
+    ///
+    /// Distinct from [`Self::RecoveryUnavailable`], which means no recovery
+    /// inputs were persisted at all. Both leave the row permanently unbound,
+    /// but only this one indicates inputs that are present and unusable.
+    GenerationDerivationFailed,
     StorageFailure,
 }
 
@@ -95,6 +98,11 @@ pub enum ChainSubmissionConfirmationSource {
     LegacyImport,
     /// Version-17 singleton positions preserved without claiming a validated
     /// generation digest or output layout.
+    ///
+    /// The positions record only that version 17 regarded these outputs as
+    /// confirmed at these locations. That is enough for the observed successor
+    /// VAN to feed the next proposal in the bundle, which is what advancement
+    /// needs; it is not a claim that the layout was re-derived or checked.
     LegacyProjection,
 }
 
@@ -134,6 +142,7 @@ pub(super) enum ValidatedChainSubmissionConfirmation {
     Hash(ChainSubmissionConfirmation),
     Tree(ChainSubmissionConfirmation),
     LegacyImport(ChainSubmissionConfirmation),
+    LegacyProjection(ChainSubmissionConfirmation),
 }
 
 impl ValidatedChainSubmissionConfirmation {
@@ -142,8 +151,15 @@ impl ValidatedChainSubmissionConfirmation {
         match self {
             Self::Hash(confirmation)
             | Self::Tree(confirmation)
-            | Self::LegacyImport(confirmation) => confirmation,
+            | Self::LegacyImport(confirmation)
+            | Self::LegacyProjection(confirmation) => confirmation,
         }
+    }
+
+    /// Reports whether this evidence may only be produced by database
+    /// migration, never by a runtime lifecycle observation.
+    pub(super) fn is_migration_only(&self) -> bool {
+        matches!(self, Self::LegacyImport(_) | Self::LegacyProjection(_))
     }
 
     #[allow(dead_code, reason = "used by chain confirmation")]
@@ -191,27 +207,19 @@ impl ValidatedChainSubmissionConfirmation {
     }
 
     #[allow(dead_code, reason = "returned by the chain submission coordinator")]
-    pub(super) fn into_public(self) -> ChainSubmissionConfirmation {
-        match self {
-            Self::Hash(confirmation)
-            | Self::Tree(confirmation)
-            | Self::LegacyImport(confirmation) => confirmation,
-        }
-    }
-}
-
-/// Migration-only positions that lack a validated generation layout.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct LegacyProjectionConfirmation(ChainSubmissionConfirmation);
-
-impl LegacyProjectionConfirmation {
+    /// Preserves version-17 singleton positions without deriving a layout.
+    ///
+    /// This is the terminal representation of a version-17 vote that recorded
+    /// both domain positions but retained no recovery material. The row is
+    /// `Confirmed` because the successor VAN is exactly what the bundle needs
+    /// to advance; `LegacyProjection` keeps the provenance honest.
     #[allow(dead_code, reason = "used by the version-18 migration")]
-    pub(super) fn from_positions(
+    pub(super) fn from_legacy_projection(
         final_van_position: u64,
         vote_commitment_position: u64,
     ) -> Result<Self, ChainSubmissionConfirmationError> {
         validate_sqlite_positions(final_van_position, &[vote_commitment_position])?;
-        Ok(Self(ChainSubmissionConfirmation {
+        Ok(Self::LegacyProjection(ChainSubmissionConfirmation {
             source: ChainSubmissionConfirmationSource::LegacyProjection,
             transaction_hash: None,
             final_van_position,
@@ -219,9 +227,14 @@ impl LegacyProjectionConfirmation {
         }))
     }
 
-    #[allow(dead_code, reason = "returned for migration projections")]
+    #[allow(dead_code, reason = "returned by the chain submission coordinator")]
     pub(super) fn into_public(self) -> ChainSubmissionConfirmation {
-        self.0
+        match self {
+            Self::Hash(confirmation)
+            | Self::Tree(confirmation)
+            | Self::LegacyImport(confirmation)
+            | Self::LegacyProjection(confirmation) => confirmation,
+        }
     }
 }
 
@@ -271,15 +284,11 @@ pub enum ChainSubmissionResult {
 impl ChainSubmissionResult {
     /// Returns the durable state represented by this result.
     ///
-    /// `Cancelled` has no durable state. A migrated legacy projection is
-    /// intentionally distinguished from a generation-validated confirmation.
+    /// `Cancelled` has no durable state. Every confirmation is `Confirmed`
+    /// regardless of provenance; callers that care whether a layout was
+    /// validated read [`ChainSubmissionConfirmation::source`].
     pub fn durable_state(&self) -> Option<ChainSubmissionState> {
         match self {
-            Self::Confirmed(confirmation)
-                if confirmation.source() == ChainSubmissionConfirmationSource::LegacyProjection =>
-            {
-                Some(ChainSubmissionState::LegacyConfirmed)
-            }
             Self::Confirmed(_) => Some(ChainSubmissionState::Confirmed),
             Self::Pending(ChainSubmissionPending::Tracking { .. }) => {
                 Some(ChainSubmissionState::Tracking)
@@ -490,8 +499,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_projection_is_distinct_from_validated_legacy_import() {
-        let legacy_projection = LegacyProjectionConfirmation::from_positions(4, 5)
+    fn every_confirmation_provenance_is_one_confirmed_state() {
+        let legacy_projection = ValidatedChainSubmissionConfirmation::from_legacy_projection(4, 5)
             .unwrap()
             .into_public();
         let legacy_import = ValidatedChainSubmissionConfirmation::from_legacy_import(
@@ -508,17 +517,32 @@ mod tests {
         );
         assert_eq!(legacy_projection.transaction_hash(), None);
         assert_eq!(
-            ChainSubmissionResult::Confirmed(legacy_projection).durable_state(),
-            Some(ChainSubmissionState::LegacyConfirmed)
-        );
-        assert_eq!(
             legacy_import.source(),
             ChainSubmissionConfirmationSource::LegacyImport
         );
-        assert_eq!(
-            ChainSubmissionResult::Confirmed(legacy_import).durable_state(),
-            Some(ChainSubmissionState::Confirmed)
-        );
+        for confirmation in [legacy_projection, legacy_import] {
+            assert_eq!(
+                ChainSubmissionResult::Confirmed(confirmation).durable_state(),
+                Some(ChainSubmissionState::Confirmed)
+            );
+        }
+    }
+
+    #[test]
+    fn only_migration_evidence_is_migration_only() {
+        let candidate = CandidateTransactionHash::from_bytes([7; 32]);
+        for runtime in [
+            ValidatedChainSubmissionConfirmation::from_hash(candidate, 4, vec![5]).unwrap(),
+            ValidatedChainSubmissionConfirmation::from_tree(4, vec![5]).unwrap(),
+        ] {
+            assert!(!runtime.is_migration_only());
+        }
+        for migration in [
+            ValidatedChainSubmissionConfirmation::from_legacy_import(None, 4, vec![5]).unwrap(),
+            ValidatedChainSubmissionConfirmation::from_legacy_projection(4, 5).unwrap(),
+        ] {
+            assert!(migration.is_migration_only());
+        }
     }
 
     #[test]

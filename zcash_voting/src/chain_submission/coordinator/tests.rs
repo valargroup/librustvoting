@@ -200,7 +200,6 @@ fn identity(proposal_id: u32, bundle_index: u32) -> ChainSubmissionIdentity {
     ChainSubmissionIdentity::new(
         "wallet",
         Network::Testnet,
-        "chain",
         [1; 32],
         bundle_index,
         ChainSubmissionTarget::Vote { proposal_id },
@@ -212,7 +211,6 @@ fn batch_identity(bundle_index: u32) -> ChainSubmissionIdentity {
     ChainSubmissionIdentity::new(
         "wallet",
         Network::Testnet,
-        "chain",
         [1; 32],
         bundle_index,
         ChainSubmissionTarget::VoteBatch {
@@ -226,7 +224,6 @@ fn delegation_identity(bundle_index: u32) -> ChainSubmissionIdentity {
     ChainSubmissionIdentity::new(
         "wallet",
         Network::Testnet,
-        "chain",
         [1; 32],
         bundle_index,
         ChainSubmissionTarget::Delegation,
@@ -736,8 +733,8 @@ async fn cancelled_batch_entry_preserves_requested_member_guard_without_roster_r
     let guarded_member = identity(2, 0);
     let cases = [
         (
-            StoredChainSubmission::legacy_confirmed(guarded_member.clone(), 4, 5, 1),
-            ChainSubmissionState::LegacyConfirmed,
+            StoredChainSubmission::legacy_projection_confirmed(guarded_member.clone(), 4, 5, 1),
+            ChainSubmissionState::Confirmed,
         ),
         (
             StoredChainSubmission::digestless_guard(guarded_member, 1),
@@ -771,6 +768,54 @@ async fn cancelled_batch_entry_preserves_requested_member_guard_without_roster_r
         assert!(store.record(&batch).is_none());
         assert!(transport.methods().is_empty());
     }
+}
+
+#[tokio::test]
+async fn cancelled_batch_entry_returns_authoritative_batch_before_stale_member_guard() {
+    let batch = batch_identity(0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_batch(batch.clone(), vec![1, 2]));
+    store.seed_batch_roster(batch.clone(), vec![1, 2]);
+    let initial_request = StoreAdvancementRequest::vote_batch(batch.clone(), vec![1, 2]).unwrap();
+    assert!(matches!(
+        store.admit(&initial_request, true, 1, 1).unwrap(),
+        StoreAdmission::Ready {
+            fresh_reservation: true,
+            ..
+        }
+    ));
+    store.seed_record(StoredChainSubmission::digestless_guard(identity(3, 0), 1));
+    let roster_reads_before_cancellation = store.batch_roster_reads();
+    let transport = Arc::new(ScriptedTransport::default());
+    let control = ManualControl::default();
+    control.cancelled.store(true, Ordering::SeqCst);
+
+    let result = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    )
+    .advance(
+        StoreAdvancementRequest::vote_batch(batch.clone(), vec![1, 3]).unwrap(),
+        &control,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ..
+        })
+    ));
+    assert_eq!(
+        store.record(&batch).unwrap().durable_state(),
+        ChainSubmissionState::Recovering
+    );
+    assert_eq!(store.batch_roster_reads(), roster_reads_before_cancellation);
+    assert!(transport.methods().is_empty());
 }
 
 #[tokio::test]
@@ -825,7 +870,7 @@ async fn migration_guards_return_before_derivation_or_network_work() {
     let legacy_identity = identity(1, 0);
     let digestless_identity = identity(2, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
-    store.seed_record(StoredChainSubmission::legacy_confirmed(
+    store.seed_record(StoredChainSubmission::legacy_projection_confirmed(
         legacy_identity.clone(),
         4,
         5,
@@ -1871,11 +1916,11 @@ async fn atomically_confirmed_predecessor_allows_the_next_bundle_generation() {
 }
 
 #[tokio::test]
-async fn legacy_confirmed_predecessor_allows_the_next_bundle_generation() {
+async fn legacy_projection_predecessor_allows_the_next_bundle_generation() {
     let first_identity = identity(1, 0);
     let second_identity = identity(2, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
-    store.seed_record(StoredChainSubmission::legacy_confirmed(
+    store.seed_record(StoredChainSubmission::legacy_projection_confirmed(
         first_identity,
         4,
         5,

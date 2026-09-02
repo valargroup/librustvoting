@@ -18,21 +18,59 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Changed
 
+- **Breaking:** the configured vote-chain id no longer binds a chain-submission
+  identity or its generation digest. It selects where a request is dispatched,
+  not what the request means, so one identity now covers a wallet's round,
+  bundle, and target across every configured vote chain. The version-1
+  generation digest vectors change accordingly, and `chain_submissions` drops
+  its `vote_chain_id` column, its partial identity indexes, and the separate
+  migration-guard identity namespace in favour of one identity key shared by
+  runtime reservation and migration.
+- **Breaking:** the `LegacyConfirmed` durable lifecycle state is removed.
+  Version-17 votes that recorded both domain positions are now ordinary
+  `Confirmed` rows with confirmation source `legacy_projection`, which keeps
+  their provenance explicit while their observed successor VAN advances the
+  bundle. The public `VotePhase::LegacyConfirmed` workflow phase is unchanged
+  and is now derived from that source.
+- Version-17 evidence backed by recovery material now migrates to a *bound*
+  generation instead of a permanently unbound guard. Such a row confirms as
+  `legacy_import` only when its recorded positions reproduce the derived output
+  layout exactly -- the successor VAN followed by every vote commitment at the
+  immediately following contiguous positions, in signed action order -- and
+  otherwise stays `Recovering` with a real generation digest. A provable atomic
+  batch binds once as one `vote_batch` generation, and public phase views map
+  that row onto its members by re-deriving the batch and matching its
+  generation digest. Delegation evidence binds from its setup material without
+  a signer; absent setup and setup that fails generation derivation become
+  permanent guards with distinct diagnostics instead of blocking the database
+  upgrade.
+- Version-17 evidence with absent or underivable recovery material is
+  permanently unbound. Bound `Recovering` rows are resolvable in principle,
+  but the tree-recovery pass that resolves them is not part of this release, so
+  in practice they still make no progress until it lands; all unresolved
+  migration rows continue to report `SubmissionManaged` and schedule no work.
+- A process killed at any point during the version-17 migration now leaves
+  either the untouched version-17 database or a complete version 18, and a
+  restart after any kill classifies identical rows.
 - **Breaking:** delegation recovery views now expose VAN positions as `u64`,
   matching lifecycle confirmation and SQLite's supported non-negative range.
 
 ### Fixed
 
+- Migration rows carrying the `generation_derivation_failed` diagnostic are no
+  longer undecodable. `ChainSubmissionDiagnosticKind` gained the matching
+  variant, so such a guard loads as an authoritative row instead of failing the
+  whole record with an opaque storage error.
 - Chain-submission cancellation now removes a fresh reservation when transport
   dispatch has not begun. Batch admission derives its identity locks from the
   complete request roster, verifies the persisted roster before reading
   migration guards, and rejects oversized rosters before lock allocation.
 - Recovery snapshots and session plans now report migration-guarded delegation
   and vote evidence as `SubmissionManaged`; legacy submit and poll steps are
-  suppressed while the lifecycle owns that evidence. Terminal
-  `LegacyConfirmed` votes are reported as confirmed without reconstructing
-  unavailable recovery work, and recovery-free migration guards lock their
-  recorded ballot intent.
+  suppressed while the lifecycle owns that evidence. Terminal version-17
+  projections are reported as confirmed without reconstructing unavailable
+  recovery work, and unbound migration rows lock their recorded ballot
+  intent.
 - SQLite chain-submission admission now permits confirmed predecessors to
   advance, classifies reused candidate hashes as hashless recovery, preserves
   monotonic lifecycle timestamps across wall-clock rollback, and retains

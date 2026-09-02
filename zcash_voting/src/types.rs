@@ -44,6 +44,9 @@ pub enum VotingError {
     ProofFailed { message: String },
     #[error("Voting state is busy: {message}")]
     Busy { message: String },
+    /// A durable-state read or write failed before its result could be interpreted.
+    #[error("Storage error: {message}")]
+    Storage { message: String },
     #[error("Internal error: {message}")]
     Internal { message: String },
 }

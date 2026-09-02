@@ -26,6 +26,11 @@ mod state;
 mod store;
 mod transport;
 
+pub(crate) use generation::{
+    complete_generation_for_delegation, generation_for_vote, generation_for_vote_batch,
+    ExpectedTreeLayout,
+};
+pub(crate) use identity::{network_name, submission_identity_key};
 pub use identity::{
     CandidateTransactionHash, CandidateTransactionHashError, ChainSubmissionGeneration,
     ChainSubmissionGenerationDigest, ChainSubmissionIdentity, ChainSubmissionIdentityError,

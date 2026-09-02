@@ -1,5 +1,10 @@
 use rusqlite::{named_params, Connection, Transaction};
 
+use crate::chain_submission::{
+    complete_generation_for_delegation, generation_for_vote, generation_for_vote_batch,
+    network_name, submission_identity_key, ChainSubmissionIdentity, ChainSubmissionIdentityError,
+    ChainSubmissionTarget, ExpectedTreeLayout,
+};
 use crate::VotingError;
 
 const CURRENT_VERSION: u32 = 18;
@@ -294,23 +299,267 @@ fn encode_positions(positions: &[u64]) -> Result<Vec<u8>, VotingError> {
     Ok(encoded)
 }
 
-fn legacy_identity_key(
+fn parse_network(network: &str) -> Result<crate::Network, VotingError> {
+    match network {
+        "mainnet" => Ok(crate::Network::Mainnet),
+        "testnet" => Ok(crate::Network::Testnet),
+        "regtest" => Ok(crate::Network::Regtest),
+        other => Err(VotingError::Internal {
+            message: format!("unsupported version-17 network {other}"),
+        }),
+    }
+}
+
+/// Rebuilds the runtime submission identity for one version-17 row.
+///
+/// Migration and runtime reservation derive the same identity key from this
+/// type, so a migrated row and a natively reserved row for the same submission
+/// collide on the primary key rather than occupying separate namespaces.
+///
+/// Returns `None` when the round id cannot form a canonical lifecycle identity.
+/// Such a round can never be the subject of runtime submission work either, so
+/// there is nothing to guard: the row is left as version-17 domain data, which
+/// keeps the round prunable and explicitly deletable.
+fn v17_identity(
     wallet_id: &str,
     network: &str,
     round_id: &str,
-    kind: &str,
     bundle_index: i64,
-    proposal_id: Option<i64>,
-) -> Vec<u8> {
-    let mut key = b"zcash_voting.chain_submission.legacy_guard.v1\0".to_vec();
-    for value in [wallet_id, network, round_id, kind] {
-        key.extend_from_slice(&(value.len() as u64).to_be_bytes());
-        key.extend_from_slice(value.as_bytes());
+    target: ChainSubmissionTarget,
+) -> Result<Option<ChainSubmissionIdentity>, VotingError> {
+    let Some(round_bytes) = hex::decode(round_id)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        // The stored column must equal what the runtime re-encodes from the
+        // identity, or lookups and the rounds foreign key would disagree.
+        .filter(|bytes| hex::encode(bytes) == round_id)
+    else {
+        return Ok(None);
+    };
+    let bundle_index = u32::try_from(bundle_index).map_err(|_| VotingError::Internal {
+        message: "invalid legacy bundle index".to_string(),
+    })?;
+    match ChainSubmissionIdentity::new(
+        wallet_id,
+        parse_network(network)?,
+        round_bytes,
+        bundle_index,
+        target,
+    ) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(ChainSubmissionIdentityError::InvalidVoteRoundId) => Ok(None),
+        Err(error) => Err(VotingError::Internal {
+            message: format!(
+                "invalid version-17 chain-submission identity for wallet={wallet_id}, \
+                 network={network}, round={round_id}, bundle={bundle_index}: {error}"
+            ),
+        }),
     }
-    key.extend_from_slice(&bundle_index.to_be_bytes());
-    key.extend_from_slice(&proposal_id.unwrap_or(-1).to_be_bytes());
-    key
 }
+
+/// One classified version-18 row derived from version-17 evidence.
+struct V17Import {
+    generation_digest: Option<Vec<u8>>,
+    state: &'static str,
+    confirmation_source: Option<&'static str>,
+    final_van_position: Option<u64>,
+    vote_commitment_positions: Option<Vec<u8>>,
+    diagnostic_kind: Option<&'static str>,
+    diagnostic: Option<&'static str>,
+}
+
+const RECOVERY_UNAVAILABLE_DIAGNOSTIC: &str =
+    "version-17 chain evidence lacks generation recovery material";
+const GENERATION_DERIVATION_FAILED_DIAGNOSTIC: &str =
+    "version-17 recovery material could not derive a generation";
+
+impl V17Import {
+    /// Permanently guards evidence that has no recovery inputs to bind.
+    fn recovery_unavailable_guard() -> Self {
+        Self {
+            generation_digest: None,
+            state: "recovering",
+            confirmation_source: None,
+            final_van_position: None,
+            vote_commitment_positions: None,
+            diagnostic_kind: Some("recovery_unavailable"),
+            diagnostic: Some(RECOVERY_UNAVAILABLE_DIAGNOSTIC),
+        }
+    }
+
+    /// Permanently guards evidence whose persisted recovery inputs do not bind.
+    ///
+    /// The source error is intentionally not persisted because it may expose
+    /// implementation details. The distinct kind preserves the reason this
+    /// identity cannot participate in runtime recovery.
+    fn generation_derivation_failed_guard() -> Self {
+        Self {
+            generation_digest: None,
+            state: "recovering",
+            confirmation_source: None,
+            final_van_position: None,
+            vote_commitment_positions: None,
+            diagnostic_kind: Some("generation_derivation_failed"),
+            diagnostic: Some(GENERATION_DERIVATION_FAILED_DIAGNOSTIC),
+        }
+    }
+
+    fn legacy_projection(
+        final_van_position: u64,
+        vote_commitment_position: u64,
+    ) -> Result<Self, VotingError> {
+        Ok(Self {
+            generation_digest: None,
+            state: "confirmed",
+            confirmation_source: Some("legacy_projection"),
+            final_van_position: Some(final_van_position),
+            vote_commitment_positions: Some(encode_positions(&[vote_commitment_position])?),
+            diagnostic_kind: None,
+            diagnostic: None,
+        })
+    }
+}
+
+/// Confirms a bound version-17 generation whose recorded positions match its
+/// derived layout, and otherwise leaves it bound and `Recovering`.
+///
+/// A bound `Recovering` row is not a dead end: it carries a real generation
+/// digest and expected layout, so ordinary tree recovery can locate its exact
+/// output layout and confirm it. Positions that are incomplete, non-contiguous,
+/// reordered, or outside checked position arithmetic are never accepted as a
+/// confirmation.
+fn legacy_import_or_recovering(
+    generation_digest: Vec<u8>,
+    expected_layout: &ExpectedTreeLayout,
+    final_van_position: Option<u64>,
+    vote_commitment_positions: Vec<u64>,
+) -> Result<V17Import, VotingError> {
+    match final_van_position {
+        Some(final_van_position)
+            if positions_match_expected_layout(
+                expected_layout,
+                final_van_position,
+                &vote_commitment_positions,
+            ) =>
+        {
+            Ok(V17Import {
+                generation_digest: Some(generation_digest),
+                state: "confirmed",
+                confirmation_source: Some("legacy_import"),
+                final_van_position: Some(final_van_position),
+                vote_commitment_positions: Some(encode_positions(&vote_commitment_positions)?),
+                diagnostic_kind: None,
+                diagnostic: None,
+            })
+        }
+        _ => Ok(V17Import {
+            generation_digest: Some(generation_digest),
+            state: "recovering",
+            confirmation_source: None,
+            final_van_position: None,
+            vote_commitment_positions: None,
+            diagnostic_kind: Some("reconciliation_pending"),
+            diagnostic: Some(
+                "version-17 positions do not confirm the bound generation; recovery is pending",
+            ),
+        }),
+    }
+}
+
+/// Checks the protocol layout `[VAN, VC 0, ..., VC N-1]` without wrapping.
+fn positions_match_expected_layout(
+    expected_layout: &ExpectedTreeLayout,
+    final_van_position: u64,
+    vote_commitment_positions: &[u64],
+) -> bool {
+    let expected_commitments = expected_layout.leaves().len() - 1;
+    vote_commitment_positions.len() == expected_commitments
+        && vote_commitment_positions
+            .iter()
+            .enumerate()
+            .all(|(index, recorded_position)| {
+                u64::try_from(index)
+                    .ok()
+                    .and_then(|offset| final_van_position.checked_add(1)?.checked_add(offset))
+                    == Some(*recorded_position)
+            })
+}
+
+/// Claims a validated `legacy_import` VAN in the network-wide output namespace.
+///
+/// Every observed VC has already claimed its position before classification.
+/// A `legacy_projection` VAN is deliberately excluded because migration cannot
+/// validate that it belongs to the projected generation.
+fn register_v17_legacy_import_van(
+    observed_output_positions: &mut std::collections::HashSet<(String, u64)>,
+    network: &str,
+    import: &V17Import,
+) -> Result<(), VotingError> {
+    if import.confirmation_source != Some("legacy_import") {
+        return Ok(());
+    }
+    let position = import
+        .final_van_position
+        .ok_or_else(|| VotingError::Internal {
+            message: "version-17 legacy import is missing its validated VAN position".to_string(),
+        })?;
+    if !observed_output_positions.insert((network.to_string(), position)) {
+        return Err(VotingError::Internal {
+            message: format!(
+                "version-17 {network} validated output position {position} has multiple owners"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Inserts one classified version-17 row under the shared identity key.
+#[allow(clippy::too_many_arguments)]
+fn insert_v17_submission(
+    tx: &Transaction<'_>,
+    identity: &ChainSubmissionIdentity,
+    kind: &str,
+    proposal_id: Option<u32>,
+    ordered_batch_digest: Option<Vec<u8>>,
+    created_at: i64,
+    import: V17Import,
+) -> Result<(), VotingError> {
+    tx.execute(
+        "INSERT INTO chain_submissions
+            (identity_key, round_id, wallet_id, network, bundle_index, kind, proposal_id,
+             ordered_batch_digest, generation_digest, state, committed_post_reservations,
+             diagnostic_kind, diagnostic, confirmation_source, final_van_position,
+             vote_commitment_positions, created_at, updated_at)
+         VALUES (:key, :round, :wallet, :network, :bundle, :kind, :proposal,
+                 :batch, :digest, :state, 0, :diagnostic_kind, :diagnostic,
+                 :confirmation_source, :final_van, :positions, :created, :created)",
+        named_params! {
+            ":key": submission_identity_key(identity),
+            ":round": hex::encode(identity.vote_round_id()),
+            ":wallet": identity.wallet_id(),
+            ":network": network_name(identity.network()),
+            ":bundle": identity.bundle_index(),
+            ":kind": kind,
+            ":proposal": proposal_id,
+            ":batch": ordered_batch_digest,
+            ":digest": import.generation_digest,
+            ":state": import.state,
+            ":diagnostic_kind": import.diagnostic_kind,
+            ":diagnostic": import.diagnostic,
+            ":confirmation_source": import.confirmation_source,
+            ":final_van": import.final_van_position.map(|value| value as i64),
+            ":positions": import.vote_commitment_positions,
+            ":created": created_at.max(0),
+        },
+    )
+    .map_err(|error| VotingError::Internal {
+        message: format!("failed to import version-17 chain evidence: {error}"),
+    })?;
+    Ok(())
+}
+
+/// Scopes one provable atomic batch: wallet, network, round, bundle, digest.
+type V17BatchScope = (String, String, String, i64, [u8; 32]);
 
 type V17VoteEvidenceRow = (
     String,
@@ -462,12 +711,22 @@ fn validate_v17_recovery_batches(rows: &[V17VoteEvidenceRow]) -> Result<(), Voti
     Ok(())
 }
 
-/// Imports only chain evidence that can be classified without inventing the
-/// v17-absent vote-chain identifier. Complete recovery JSON is validated, but
-/// remains guarded until a configured v18 identity can be cryptographically
-/// bound by a later compatibility phase.
+/// Imports every version-17 row that carries chain evidence.
+///
+/// Classification is by what can be *derived*, not by what version 17 happened
+/// to store. Recovery material determines a complete semantic generation on its
+/// own, so a recovery-backed row becomes an ordinary bound submission that can
+/// poll, scan, retry, and confirm. A row with confirmation positions but no
+/// recovery material becomes a terminal `legacy_projection` confirmation: its
+/// observed successor VAN is exactly what the next proposal in the bundle
+/// consumes, which is all advancement needs, and the source keeps the
+/// provenance honest. Evidence without a derivable generation stays a
+/// permanently unbound digestless guard, allowing the database upgrade to
+/// complete without treating corrupt recovery as authoritative.
+///
+/// Any row that cannot be represented without guessing aborts the migration.
 fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> {
-    let mut observed_vote_positions = std::collections::HashSet::new();
+    let mut observed_output_positions = std::collections::HashSet::new();
     let mut statement = tx
         .prepare(
             "SELECT v.round_id, v.wallet_id, r.network, v.bundle_index, v.proposal_id,
@@ -510,6 +769,12 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
     drop(statement);
     validate_v17_recovery_batches(&rows)?;
 
+    // Batch members are bound once, as a single vote_batch generation. A
+    // provable batch has already been validated for completeness, ordering,
+    // anchor, hash agreement, and digest recomputation.
+    let mut provable_batches: std::collections::BTreeMap<V17BatchScope, i64> =
+        std::collections::BTreeMap::new();
+
     for (
         round_id,
         wallet_id,
@@ -526,6 +791,13 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         shared_hash,
     ) in rows
     {
+        let bundle_index = u32::try_from(bundle).map_err(|_| VotingError::Internal {
+            message: "invalid legacy bundle index".to_string(),
+        })?;
+        let proposal_id = u32::try_from(proposal).map_err(|_| VotingError::Internal {
+            message: "invalid legacy proposal id".to_string(),
+        })?;
+        let mut recovery_batch_digest = None;
         if let Some(json) = recovery.as_deref() {
             if !tx
                 .query_row("SELECT json_valid(?1)", [json], |row| row.get::<_, bool>(0))
@@ -537,12 +809,6 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
             }
             // The public recovery loader performs the complete closed-format
             // validation used by runtime generation derivation.
-            let bundle_index = u32::try_from(bundle).map_err(|_| VotingError::Internal {
-                message: "invalid legacy bundle index".to_string(),
-            })?;
-            let proposal_id = u32::try_from(proposal).map_err(|_| VotingError::Internal {
-                message: "invalid legacy proposal id".to_string(),
-            })?;
             let parsed = crate::vote::recovery_bundle_with_conn(
                 tx,
                 &wallet_id,
@@ -573,6 +839,7 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
                     });
                 }
             }
+            recovery_batch_digest = parsed.batch.as_ref().map(|batch| batch.digest);
         }
         let checked_van = van
             .map(|position| {
@@ -589,7 +856,7 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
             })
             .transpose()?;
         if let Some(position) = checked_vc {
-            if !observed_vote_positions.insert((network.clone(), position)) {
+            if !observed_output_positions.insert((network.clone(), position)) {
                 return Err(VotingError::Internal {
                     message: format!(
                         "version-17 {network} vote commitment position {position} has multiple owners"
@@ -601,6 +868,17 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         if !has_evidence {
             continue;
         }
+
+        if let Some(digest) = recovery_batch_digest {
+            // Defer to one bound vote_batch generation for the whole group,
+            // created as early as its earliest member.
+            provable_batches
+                .entry((wallet_id, network, round_id, bundle, digest))
+                .and_modify(|earliest| *earliest = (*earliest).min(created))
+                .or_insert(created);
+            continue;
+        }
+
         let batch_indicated = shared_hash
             || recovery.as_deref().is_some_and(|_| {
                 tx.query_row(
@@ -612,52 +890,130 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
                 )
                 .unwrap_or(true)
             });
-        let legacy_confirmed =
-            recovery.is_none() && !batch_indicated && van.is_some() && vc.is_some();
-        let (state, source, final_van, positions, diagnostic_kind, diagnostic) = if legacy_confirmed
-        {
-            let van = checked_van.unwrap();
-            let vc = checked_vc.unwrap();
-            (
-                "legacy_confirmed",
-                Some("legacy_projection"),
-                Some(van),
-                Some(encode_positions(&[vc])?),
-                None,
-                None,
-            )
-        } else {
-            ("recovering", None, None, None, Some("recovery_unavailable"), Some("version-17 chain evidence cannot be bound without its original vote-chain identifier"))
+        let Some(identity) = v17_identity(
+            &wallet_id,
+            &network,
+            &round_id,
+            bundle,
+            ChainSubmissionTarget::Vote { proposal_id },
+        )?
+        else {
+            continue;
         };
-        tx.execute(
-            "INSERT INTO chain_submissions
-                (identity_key, round_id, wallet_id, network, vote_chain_id, bundle_index,
-                 kind, proposal_id, generation_digest, state, committed_post_reservations,
-                 diagnostic_kind, diagnostic, confirmation_source, final_van_position,
-                 vote_commitment_positions, created_at, updated_at)
-             VALUES (:identity_key, :round_id, :wallet_id, :network, NULL, :bundle_index,
-                     'vote', :proposal_id, NULL, :state, 0, :diagnostic_kind,
-                     :diagnostic, :confirmation_source, :final_van_position,
-                     :positions, :created_at, :created_at)",
-            named_params! {
-                ":identity_key": legacy_identity_key(&wallet_id, &network, &round_id, "vote", bundle, Some(proposal)),
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":network": network,
-                ":bundle_index": bundle,
-                ":proposal_id": proposal,
-                ":state": state,
-                ":diagnostic_kind": diagnostic_kind,
-                ":diagnostic": diagnostic,
-                ":confirmation_source": source,
-                ":final_van_position": final_van.map(|value| value as i64),
-                ":positions": positions,
-                ":created_at": created.max(0),
+
+        let import = if recovery.is_some() && !batch_indicated {
+            // Bind valid recovery, but quarantine an underivable historical
+            // generation instead of blocking the complete database upgrade.
+            match generation_for_vote(tx, &identity) {
+                Ok(bound) => legacy_import_or_recovering(
+                    bound.generation().digest().as_bytes().to_vec(),
+                    bound.expected_layout(),
+                    checked_van,
+                    checked_vc.into_iter().collect(),
+                )?,
+                Err(error @ VotingError::Storage { .. }) => return Err(error),
+                Err(_) => V17Import::generation_derivation_failed_guard(),
+            }
+        } else if !batch_indicated && checked_van.is_some() && checked_vc.is_some() {
+            // Positions without recovery material: version 17 regarded these
+            // outputs as confirmed at these locations, and the observed
+            // successor VAN is what the next proposal consumes.
+            V17Import::legacy_projection(checked_van.unwrap(), checked_vc.unwrap())?
+        } else {
+            V17Import::recovery_unavailable_guard()
+        };
+        register_v17_legacy_import_van(&mut observed_output_positions, &network, &import)?;
+        insert_v17_submission(
+            tx,
+            &identity,
+            "vote",
+            Some(proposal_id),
+            None,
+            created,
+            import,
+        )?;
+    }
+
+    for ((wallet_id, network, round_id, bundle, digest), created) in provable_batches {
+        let Some(identity) = v17_identity(
+            &wallet_id,
+            &network,
+            &round_id,
+            bundle,
+            ChainSubmissionTarget::VoteBatch {
+                ordered_batch_digest: digest,
             },
-        )
-        .map_err(|error| VotingError::Internal {
-            message: format!("failed to import version-17 vote-chain evidence: {error}"),
-        })?;
+        )?
+        else {
+            continue;
+        };
+        let bound = match generation_for_vote_batch(tx, &identity) {
+            Ok(bound) => bound,
+            Err(error @ VotingError::Storage { .. }) => return Err(error),
+            Err(_) => {
+                insert_v17_submission(
+                    tx,
+                    &identity,
+                    "vote_batch",
+                    None,
+                    Some(digest.to_vec()),
+                    created,
+                    V17Import::generation_derivation_failed_guard(),
+                )?;
+                continue;
+            }
+        };
+        let final_van: Option<i64> = tx
+            .query_row(
+                "SELECT van_leaf_position FROM bundles
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3",
+                rusqlite::params![round_id, wallet_id, bundle],
+                |row| row.get(0),
+            )
+            .map_err(migration_error)?;
+        let final_van = final_van
+            .map(|position| {
+                u64::try_from(position).map_err(|_| VotingError::Internal {
+                    message: "negative legacy VAN position".to_string(),
+                })
+            })
+            .transpose()?;
+        // Positions are taken in the batch's signed action order, which is the
+        // order the bound generation's expected layout also uses.
+        let mut positions = Vec::with_capacity(bound.ordered_proposal_ids().len());
+        for proposal_id in bound.ordered_proposal_ids() {
+            let position: Option<i64> = tx
+                .query_row(
+                    "SELECT vc_tree_position FROM votes
+                      WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3 AND proposal_id=?4",
+                    rusqlite::params![round_id, wallet_id, bundle, proposal_id],
+                    |row| row.get(0),
+                )
+                .map_err(migration_error)?;
+            let Some(position) = position else {
+                positions.clear();
+                break;
+            };
+            positions.push(u64::try_from(position).map_err(|_| VotingError::Internal {
+                message: "negative legacy VC position".to_string(),
+            })?);
+        }
+        let import = legacy_import_or_recovering(
+            bound.generation().digest().as_bytes().to_vec(),
+            bound.expected_layout(),
+            final_van,
+            positions,
+        )?;
+        register_v17_legacy_import_van(&mut observed_output_positions, &network, &import)?;
+        insert_v17_submission(
+            tx,
+            &identity,
+            "vote_batch",
+            None,
+            Some(digest.to_vec()),
+            created,
+            import,
+        )?;
     }
 
     let mut bundles = tx
@@ -684,12 +1040,15 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         .map_err(migration_error)?;
     drop(bundles);
     for (round_id, wallet_id, network, bundle, created_at) in delegation_rows {
+        // A confirmed successor vote in the same bundle makes the original
+        // delegation evidence obsolete. Importing a delegation row for it would
+        // permanently block later generations for no gain.
         let has_confirmed_successor: bool = tx
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM chain_submissions
                   WHERE round_id=?1 AND wallet_id=?2 AND network=?3
-                    AND bundle_index=?4 AND vote_chain_id IS NULL
-                    AND kind='vote' AND state='legacy_confirmed')",
+                    AND bundle_index=?4 AND kind IN ('vote','vote_batch')
+                    AND state='confirmed')",
                 rusqlite::params![round_id, wallet_id, network, bundle],
                 |row| row.get(0),
             )
@@ -697,1229 +1056,71 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         if has_confirmed_successor {
             continue;
         }
-        tx.execute(
-            "INSERT INTO chain_submissions
-                (identity_key, round_id, wallet_id, network, vote_chain_id, bundle_index,
-                 kind, proposal_id, generation_digest, state, committed_post_reservations,
-                 diagnostic_kind, diagnostic, created_at, updated_at)
-             VALUES (:key, :round, :wallet, :network, NULL, :bundle, 'delegation', NULL,
-                     NULL, 'recovering', 0, 'recovery_unavailable',
-                     'version-17 delegation evidence cannot be bound without its original vote-chain identifier',
-                     :created, :created)",
-            named_params! {
-                ":key": legacy_identity_key(&wallet_id, &network, &round_id, "delegation", bundle, None),
-                ":round": round_id, ":wallet": wallet_id, ":network": network,
-                ":bundle": bundle, ":created": created_at.max(0),
-            },
-        )
-        .map_err(|error| VotingError::Internal {
-            message: format!("failed to import version-17 delegation evidence: {error}"),
-        })?;
+        let Some(identity) = v17_identity(
+            &wallet_id,
+            &network,
+            &round_id,
+            bundle,
+            ChainSubmissionTarget::Delegation,
+        )?
+        else {
+            continue;
+        };
+        // Delegation setup, proof, nullifiers, and VAN randomizer determine the
+        // generation on their own; the SpendAuth signature is excluded from the
+        // digest and is not needed here.
+        let import = match complete_generation_for_delegation(tx, &identity) {
+            Ok(Some(bound)) => {
+                // The bundle's current VAN position is only the *original*
+                // delegation output while no vote has advanced it. Once a vote
+                // has, the recorded position describes a later generation and
+                // must never be attributed to the delegation.
+                let advanced: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM votes
+                          WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3
+                            AND vc_tree_position IS NOT NULL)",
+                        rusqlite::params![round_id, wallet_id, bundle],
+                        |row| row.get(0),
+                    )
+                    .map_err(migration_error)?;
+                let delegation_van: Option<i64> = if advanced {
+                    None
+                } else {
+                    tx.query_row(
+                        "SELECT van_leaf_position FROM bundles
+                          WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3",
+                        rusqlite::params![round_id, wallet_id, bundle],
+                        |row| row.get(0),
+                    )
+                    .map_err(migration_error)?
+                };
+                let delegation_van = delegation_van
+                    .map(|position| {
+                        u64::try_from(position).map_err(|_| VotingError::Internal {
+                            message: "negative legacy VAN position".to_string(),
+                        })
+                    })
+                    .transpose()?;
+                legacy_import_or_recovering(
+                    bound.generation().digest().as_bytes().to_vec(),
+                    bound.expected_layout(),
+                    delegation_van,
+                    vec![],
+                )?
+            }
+            // Delegation setup material is absent, so no generation exists to
+            // bind. The evidence is preserved as a permanently unbound guard
+            // rather than guessing which generation produced the projection.
+            Ok(None) => V17Import::recovery_unavailable_guard(),
+            Err(error @ VotingError::Storage { .. }) => return Err(error),
+            Err(_) => V17Import::generation_derivation_failed_guard(),
+        };
+        register_v17_legacy_import_van(&mut observed_output_positions, &network, &import)?;
+        insert_v17_submission(tx, &identity, "delegation", None, None, created_at, import)?;
     }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::queries;
-    use crate::VotingRoundParams;
-    use rusqlite::OptionalExtension;
-
-    fn pre_v8_schema() -> String {
-        include_str!("migrations/001_init.sql").replace("    note_identity_hashes_blob BLOB,\n", "")
-    }
-
-    /// Strips the `pir_proof_cache` table (added at version 15) from a schema.
-    fn without_pir_proof_cache(schema: &str) -> String {
-        let start = schema
-            .find("CREATE TABLE pir_proof_cache")
-            .expect("schema must contain the table added at version 15");
-        let end = start
-            + schema[start..]
-                .find(");")
-                .expect("pir_proof_cache DDL must be terminated")
-            + ");".len();
-        format!("{}{}", &schema[..start], &schema[end..])
-    }
-
-    /// Strips helper-delivery columns added at version 16.
-    fn without_durable_ambiguous_deliveries(schema: &str) -> String {
-        schema
-            .replace("    ambiguous_urls  TEXT NOT NULL DEFAULT '[]',\n", "")
-            .replace("    attempting_urls TEXT NOT NULL DEFAULT '[]',\n", "")
-            .replace("    target_count    INTEGER NOT NULL DEFAULT 0,\n", "")
-    }
-
-    /// Strips the helper plan table and trigger added at version 17.
-    fn without_helper_share_plans(schema: &str) -> String {
-        let start = schema
-            .find("CREATE TABLE helper_share_plans")
-            .expect("schema must contain the table added at version 17");
-        let next = schema[start..]
-            .find("CREATE TABLE share_delegations")
-            .expect("helper plan DDL must precede share delegations");
-        format!("{}{}", &schema[..start], &schema[start + next..])
-    }
-
-    /// Strips the authoritative lifecycle table added at version 18.
-    fn without_chain_submissions(schema: &str) -> String {
-        let start = schema
-            .find("-- Authoritative SDK-owned vote-chain submission lifecycle")
-            .expect("schema must contain the table added at version 18");
-        schema[..start].to_string()
-    }
-
-    fn v16_schema() -> String {
-        without_helper_share_plans(&without_chain_submissions(include_str!(
-            "migrations/001_init.sql"
-        )))
-    }
-
-    fn v17_schema() -> String {
-        without_chain_submissions(include_str!("migrations/001_init.sql"))
-    }
-
-    fn v15_schema() -> String {
-        without_durable_ambiguous_deliveries(&v16_schema())
-    }
-
-    /// The bundle-scoped `imt_proofs` table that version 15 replaced with
-    /// `pir_proof_cache`, exactly as `001_init.sql` created it through v14.
-    const V14_IMT_PROOFS_SQL: &str = "CREATE TABLE imt_proofs (
-    round_id       TEXT NOT NULL,
-    wallet_id      TEXT NOT NULL DEFAULT '',
-    bundle_index   INTEGER NOT NULL,
-    nullifier      BLOB NOT NULL,
-    root           BLOB NOT NULL,
-    nf_bounds      BLOB NOT NULL,
-    leaf_pos       INTEGER NOT NULL,
-    path           BLOB NOT NULL,
-    created_at     INTEGER NOT NULL,
-    PRIMARY KEY (round_id, wallet_id, bundle_index, nullifier),
-    FOREIGN KEY (round_id, wallet_id, bundle_index) REFERENCES bundles(round_id, wallet_id, bundle_index) ON DELETE CASCADE
-);";
-
-    /// The version-14 schema: no `pir_proof_cache` yet, `imt_proofs` still present.
-    fn v14_schema() -> String {
-        let v16 = v16_schema();
-        let schema = without_durable_ambiguous_deliveries(&v16);
-        format!(
-            "{}\n{}\n",
-            without_pir_proof_cache(&schema),
-            V14_IMT_PROOFS_SQL
-        )
-    }
-
-    /// The launch schema, before `bundle_policy_json` and `pir_proof_cache` were added.
-    fn launch_schema() -> String {
-        let schema = v14_schema();
-        let stripped = schema.replace("    bundle_policy_json  TEXT,\n", "");
-        assert_ne!(
-            stripped, schema,
-            "launch_schema must actually drop the column added at version 14"
-        );
-        stripped
-    }
-
-    fn test_params() -> VotingRoundParams {
-        VotingRoundParams {
-            vote_round_id: "test-round".to_string(),
-            snapshot_height: 1000,
-            ea_pk: vec![0xEA; 32],
-            nc_root: vec![0xAA; 32],
-            nullifier_imt_root: vec![0xBB; 32],
-        }
-    }
-
-    #[test]
-    fn test_migrate_fresh_database() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-    }
-
-    #[test]
-    fn test_migrate_idempotent() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-    }
-
-    #[test]
-    fn v17_chain_evidence_becomes_chain_independent_guards() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v17_schema()).unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        for bundle in 0..=2 {
-            queries::insert_bundle(&conn, "test-round", "wallet", bundle, &[1]).unwrap();
-        }
-        for proposal in 1..=3 {
-            queries::store_vote(
-                &conn,
-                "test-round",
-                "wallet",
-                proposal - 1,
-                proposal,
-                1,
-                &[proposal as u8; 32],
-            )
-            .unwrap();
-        }
-        conn.execute(
-            "UPDATE bundles SET van_leaf_position=7 WHERE round_id='test-round' AND wallet_id='wallet' AND bundle_index=0",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE votes SET vc_tree_position=8 WHERE round_id='test-round' AND wallet_id='wallet' AND proposal_id=1",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE votes SET tx_hash='NOT-CANONICAL' WHERE round_id='test-round' AND wallet_id='wallet' AND proposal_id=2",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 17).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        type GuardRow = (i64, String, Option<String>, Option<Vec<u8>>, i64);
-        let rows: Vec<GuardRow> = conn
-            .prepare(
-                "SELECT proposal_id, state, confirmation_source, generation_digest,
-                        committed_post_reservations
-                   FROM chain_submissions WHERE kind='vote' ORDER BY proposal_id",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(rows.len(), 2, "the empty vote must not create a guard");
-        assert_eq!(rows[0].0, 1);
-        assert_eq!(rows[0].1, "legacy_confirmed");
-        assert_eq!(rows[0].2.as_deref(), Some("legacy_projection"));
-        assert!(rows[0].3.is_none());
-        assert_eq!(rows[0].4, 0);
-        assert_eq!(rows[1].0, 2);
-        assert_eq!(rows[1].1, "recovering");
-        assert!(rows[1].3.is_none());
-        assert_eq!(rows[1].4, 0);
-        let delegation_guards: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM chain_submissions WHERE kind='delegation'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            delegation_guards, 0,
-            "the terminal vote successor makes the earlier delegation evidence obsolete"
-        );
-    }
-
-    #[test]
-    fn v17_position_ownership_is_scoped_by_network() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v17_schema()).unwrap();
-        for (round_id, network) in [
-            ("mainnet-round", crate::Network::Mainnet),
-            ("testnet-round", crate::Network::Testnet),
-        ] {
-            let mut params = test_params();
-            params.vote_round_id = round_id.to_string();
-            queries::insert_round(&conn, "wallet", network, &params, None).unwrap();
-            queries::insert_bundle(&conn, round_id, "wallet", 0, &[1]).unwrap();
-            queries::store_vote(&conn, round_id, "wallet", 0, 1, 1, &[1; 32]).unwrap();
-            conn.execute(
-                "UPDATE bundles SET van_leaf_position = 7
-                  WHERE round_id = ?1 AND wallet_id = 'wallet' AND bundle_index = 0",
-                [round_id],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE votes SET vc_tree_position = 8
-                  WHERE round_id = ?1 AND wallet_id = 'wallet' AND proposal_id = 1",
-                [round_id],
-            )
-            .unwrap();
-        }
-        conn.pragma_update(None, "user_version", 17).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let guards: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM chain_submissions WHERE state = 'legacy_confirmed'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(guards, 2);
-    }
-
-    #[test]
-    fn v17_recovering_guards_still_validate_every_observed_position() {
-        for (positions, expected) in [
-            (vec![-1], "negative legacy VC position"),
-            (vec![8, 8], "vote commitment position 8 has multiple owners"),
-        ] {
-            let mut conn = Connection::open_in_memory().unwrap();
-            conn.execute_batch(&v17_schema()).unwrap();
-            queries::insert_round(
-                &conn,
-                "wallet",
-                crate::Network::Testnet,
-                &test_params(),
-                None,
-            )
-            .unwrap();
-            queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
-            for (offset, position) in positions.into_iter().enumerate() {
-                let proposal_id = u32::try_from(offset + 1).unwrap();
-                queries::store_vote(
-                    &conn,
-                    "test-round",
-                    "wallet",
-                    0,
-                    proposal_id,
-                    1,
-                    &[proposal_id as u8; 32],
-                )
-                .unwrap();
-                conn.execute(
-                    "UPDATE votes SET vc_tree_position = ?1
-                      WHERE round_id = 'test-round' AND wallet_id = 'wallet'
-                        AND bundle_index = 0 AND proposal_id = ?2",
-                    rusqlite::params![position, proposal_id],
-                )
-                .unwrap();
-            }
-            conn.pragma_update(None, "user_version", 17).unwrap();
-
-            let error = migrate(&mut conn).unwrap_err();
-            assert!(error.to_string().contains(expected), "{error}");
-            assert_eq!(
-                conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-                    .unwrap(),
-                17
-            );
-        }
-    }
-
-    #[test]
-    fn malformed_v17_recovery_rolls_back_without_changing_version() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v17_schema()).unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
-        queries::store_vote(&conn, "test-round", "wallet", 0, 1, 1, &[1; 32]).unwrap();
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json='{broken' WHERE proposal_id=1",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 17).unwrap();
-
-        assert!(migrate(&mut conn).is_err());
-        assert_eq!(
-            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-                .unwrap(),
-            17
-        );
-        assert!(!table_names(&conn).contains(&"chain_submissions".to_string()));
-        assert_eq!(
-            conn.query_row(
-                "SELECT commitment_bundle_json FROM votes WHERE proposal_id=1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-            "{broken"
-        );
-    }
-
-    #[test]
-    fn v17_recovery_must_match_its_owning_vote_row() {
-        const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-        let base = released_singleton_recovery_json(ROUND_ID);
-        let stored_commitment =
-            crate::vote::stored_vote_commitment_bytes(&crate::vote::parse_recovery(&base).unwrap())
-                .unwrap();
-        let mismatches = [
-            (
-                "vote_round_id",
-                serde_json::json!(
-                    "2222222222222222222222222222222222222222222222222222222222222222"
-                ),
-            ),
-            ("bundle_index", serde_json::json!(1)),
-            ("proposal_id", serde_json::json!(2)),
-            ("vote_decision", serde_json::json!(1)),
-            ("vote_commitment", serde_json::json!(vec![0x44_u8; 32])),
-        ];
-        for (field, replacement) in mismatches {
-            let mut value: serde_json::Value = serde_json::from_str(&base).unwrap();
-            value[field] = replacement;
-            let stale = serde_json::to_string(&value).unwrap();
-            let mut conn = Connection::open_in_memory().unwrap();
-            conn.execute_batch(&v17_schema()).unwrap();
-            let mut params = test_params();
-            params.vote_round_id = ROUND_ID.to_string();
-            queries::insert_round(&conn, "wallet", crate::Network::Testnet, &params, None).unwrap();
-            queries::insert_bundle(&conn, ROUND_ID, "wallet", 0, &[1]).unwrap();
-            queries::store_vote(&conn, ROUND_ID, "wallet", 0, 1, 2, &stored_commitment).unwrap();
-            conn.execute(
-                "UPDATE votes SET commitment_bundle_json=?1 WHERE round_id=?2",
-                rusqlite::params![stale, ROUND_ID],
-            )
-            .unwrap();
-            conn.pragma_update(None, "user_version", 17).unwrap();
-
-            let error = migrate(&mut conn).unwrap_err();
-            assert!(error.to_string().contains("mismatch"), "{field}: {error}");
-            assert_eq!(
-                conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-                    .unwrap(),
-                17
-            );
-            assert!(!table_names(&conn).contains(&"chain_submissions".to_string()));
-        }
-
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v17_schema()).unwrap();
-        let mut params = test_params();
-        params.vote_round_id = ROUND_ID.to_string();
-        queries::insert_round(&conn, "wallet", crate::Network::Testnet, &params, None).unwrap();
-        queries::insert_bundle(&conn, ROUND_ID, "wallet", 0, &[1]).unwrap();
-        queries::store_vote(&conn, ROUND_ID, "wallet", 0, 1, 2, &stored_commitment).unwrap();
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json=?1, vc_tree_position=8 WHERE round_id=?2",
-            rusqlite::params![base, ROUND_ID],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 17).unwrap();
-        let error = migrate(&mut conn).unwrap_err();
-        assert!(
-            error.to_string().contains("vc_tree_position mismatch"),
-            "{error}"
-        );
-        assert_eq!(
-            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-                .unwrap(),
-            17
-        );
-    }
-
-    #[test]
-    fn v17_atomic_batches_must_be_complete_and_consistent() {
-        const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-        let (first, second) = released_batch_recovery_json(ROUND_ID);
-        let stored_commitments = [&first, &second].map(|json| {
-            crate::vote::stored_vote_commitment_bytes(&crate::vote::parse_recovery(json).unwrap())
-                .unwrap()
-        });
-
-        let open_batch = |first_json: Option<&str>,
-                          second_json: Option<&str>,
-                          shared_hash: bool| {
-            let conn = Connection::open_in_memory().unwrap();
-            conn.execute_batch(&v17_schema()).unwrap();
-            let mut params = test_params();
-            params.vote_round_id = ROUND_ID.to_string();
-            queries::insert_round(&conn, "wallet", crate::Network::Testnet, &params, None).unwrap();
-            queries::insert_bundle(&conn, ROUND_ID, "wallet", 0, &[1]).unwrap();
-            for (proposal, json) in [(1, first_json), (2, second_json)] {
-                queries::store_vote(
-                    &conn,
-                    ROUND_ID,
-                    "wallet",
-                    0,
-                    proposal,
-                    2,
-                    &stored_commitments[proposal as usize - 1],
-                )
-                .unwrap();
-                conn.execute(
-                    "UPDATE votes SET commitment_bundle_json=?1,
-                                      tx_hash=CASE WHEN ?2 THEN 'shared-hash' END
-                      WHERE round_id=?3 AND wallet_id='wallet'
-                        AND bundle_index=0 AND proposal_id=?4",
-                    rusqlite::params![json, shared_hash, ROUND_ID, proposal],
-                )
-                .unwrap();
-            }
-            conn.pragma_update(None, "user_version", 17).unwrap();
-            conn
-        };
-
-        let mut valid = open_batch(Some(&first), Some(&second), true);
-        migrate(&mut valid).unwrap();
-        assert_eq!(
-            valid
-                .query_row(
-                    "SELECT count(*) FROM chain_submissions WHERE kind='vote'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            2
-        );
-
-        let mut corruptions = Vec::new();
-        for (label, field, replacement) in [
-            ("duplicate index", "batch_index", serde_json::json!(0)),
-            ("different size", "batch_size", serde_json::json!(1)),
-            (
-                "different digest",
-                "batch_digest",
-                serde_json::json!(vec![0x44_u8; 32]),
-            ),
-        ] {
-            let mut value: serde_json::Value = serde_json::from_str(&second).unwrap();
-            value[field] = replacement;
-            corruptions.push((label, Some(first.clone()), Some(value.to_string()), false));
-        }
-        corruptions.push(("missing member", Some(first.clone()), None, false));
-        let singleton = released_singleton_recovery_json(ROUND_ID);
-        let mut second_singleton: serde_json::Value = serde_json::from_str(&singleton).unwrap();
-        second_singleton["proposal_id"] = serde_json::json!(2);
-        corruptions.push((
-            "unreconstructable shared hash",
-            Some(singleton),
-            Some(second_singleton.to_string()),
-            true,
-        ));
-
-        for (label, first_json, second_json, shared_hash) in corruptions {
-            let mut conn = open_batch(first_json.as_deref(), second_json.as_deref(), shared_hash);
-            let error = migrate(&mut conn).unwrap_err();
-            assert!(!error.to_string().is_empty(), "{label}");
-            assert_eq!(
-                conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-                    .unwrap(),
-                17,
-                "{label}"
-            );
-            assert!(!table_names(&conn).contains(&"chain_submissions".to_string()));
-        }
-    }
-
-    #[test]
-    fn stale_unreleased_v18_schema_is_rejected() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE chain_submissions (state TEXT NOT NULL)")
-            .unwrap();
-        conn.pragma_update(None, "user_version", 18).unwrap();
-
-        let error = migrate(&mut conn).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("unsupported unreleased version-18"));
-    }
-
-    #[test]
-    fn v18_fingerprint_rejects_missing_columns_indexes_and_triggers() {
-        fn assert_rejected(schema: &str, tamper: Option<&str>) {
-            let mut conn = Connection::open_in_memory().unwrap();
-            conn.execute_batch(schema).unwrap();
-            if let Some(tamper) = tamper {
-                conn.execute_batch(tamper).unwrap();
-            }
-            conn.pragma_update(None, "user_version", 18).unwrap();
-            let error = migrate(&mut conn).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("unsupported unreleased version-18"),
-                "{error}"
-            );
-        }
-
-        let without_diagnostic_kind = include_str!("migrations/002_chain_submissions.sql")
-            .replacen("    diagnostic_kind TEXT,\n", "", 1)
-            .replacen(
-                "    CHECK ((diagnostic_kind IS NULL) = (diagnostic IS NULL)),\n",
-                "",
-                1,
-            );
-        assert_rejected(&without_diagnostic_kind, None);
-        assert_rejected(
-            include_str!("migrations/002_chain_submissions.sql"),
-            Some("DROP INDEX chain_submissions_candidate_owner"),
-        );
-        assert_rejected(
-            include_str!("migrations/002_chain_submissions.sql"),
-            Some("DROP TRIGGER chain_submissions_immutable_identity"),
-        );
-    }
-
-    #[test]
-    fn test_migrate_from_prelaunch_version_resets_existing_state() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("migrations/001_init.sql"))
-            .unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
-        conn.pragma_update(None, "user_version", 8).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-
-        let round_count: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM rounds WHERE round_id = 'test-round'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(round_count, 0);
-    }
-
-    #[test]
-    fn migrate_from_launch_version_preserves_delegation_state() {
-        // The case this migration exists for: a wallet that already submitted a
-        // delegation upgrades before voting. `van_comm_rand` is sampled randomly
-        // and its governance nullifiers are spent on chain, so losing the row
-        // would cost that round's voting weight permanently.
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&launch_schema()).unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
-        conn.execute(
-            "UPDATE bundles SET van_comm_rand = ?1, gov_comm = ?2
-             WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 0",
-            rusqlite::params![vec![0xAB_u8; 32], vec![0xCD_u8; 32]],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO share_delegations
-             (round_id, wallet_id, bundle_index, proposal_id, share_index, sent_to_urls, nullifier, confirmed, submit_at, created_at)
-             VALUES ('test-round', 'wallet', 0, 1, 0, '[\"https://helper.example\"]', X'01', 0, 100, 90)",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", LAUNCH_VERSION)
-            .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-
-        let (van_comm_rand, gov_comm): (Vec<u8>, Vec<u8>) = conn
-            .query_row(
-                "SELECT van_comm_rand, gov_comm FROM bundles
-                 WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 0",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(van_comm_rand, vec![0xAB; 32]);
-        assert_eq!(gov_comm, vec![0xCD; 32]);
-
-        // The round survives and gains the new column, unset.
-        let stored_policy: Option<String> = conn
-            .query_row(
-                "SELECT bundle_policy_json FROM rounds WHERE round_id = 'test-round'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(stored_policy.is_none());
-
-        let delivery: (String, String, String, u32) = conn
-            .query_row(
-                "SELECT sent_to_urls, ambiguous_urls, attempting_urls, target_count
-                 FROM share_delegations WHERE round_id = 'test-round' AND wallet_id = 'wallet'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(delivery.0, "[\"https://helper.example\"]");
-        assert_eq!(delivery.1, "[]");
-        assert_eq!(delivery.2, "[]");
-        assert_eq!(delivery.3, 0);
-    }
-
-    #[test]
-    fn migrate_from_launch_version_matches_a_fresh_schema() {
-        // A migrated database and a fresh one must be indistinguishable,
-        // otherwise later queries work on only one of them.
-        let mut migrated = Connection::open_in_memory().unwrap();
-        migrated.execute_batch(&launch_schema()).unwrap();
-        migrated
-            .pragma_update(None, "user_version", LAUNCH_VERSION)
-            .unwrap();
-        migrate(&mut migrated).unwrap();
-
-        let mut fresh = Connection::open_in_memory().unwrap();
-        migrate(&mut fresh).unwrap();
-
-        for table in [
-            "rounds",
-            "bundles",
-            "votes",
-            "helper_share_plans",
-            "share_delegations",
-            "pir_proof_cache",
-            "chain_submissions",
-        ] {
-            assert_eq!(
-                table_columns(&migrated, table),
-                table_columns(&fresh, table),
-                "column mismatch in {table}"
-            );
-        }
-        assert_eq!(
-            schema_sql(
-                &migrated,
-                "trigger",
-                "clear_helper_share_plan_on_vote_generation_change"
-            ),
-            schema_sql(
-                &fresh,
-                "trigger",
-                "clear_helper_share_plan_on_vote_generation_change"
-            ),
-            "migrated and fresh schemas must install the same plan lifecycle trigger"
-        );
-    }
-
-    #[test]
-    fn migrate_v16_to_v17_installs_plan_lifecycle_invariants() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v16_schema()).unwrap();
-        conn.pragma_update(None, "user_version", 16).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-                .unwrap(),
-            CURRENT_VERSION
-        );
-        assert_helper_plan_lifecycle(&conn);
-    }
-
-    #[test]
-    fn migrate_v15_recovery_json_preserves_plan_only_through_confirmation() {
-        const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v15_schema()).unwrap();
-        let mut params = test_params();
-        params.vote_round_id = ROUND_ID.to_string();
-        queries::insert_round(&conn, "wallet", crate::Network::Testnet, &params, None).unwrap();
-        queries::insert_bundle(&conn, ROUND_ID, "wallet", 0, &[1]).unwrap();
-        let stored_commitment = crate::vote::stored_vote_commitment_bytes(
-            &crate::vote::parse_recovery(&released_singleton_recovery_json(ROUND_ID)).unwrap(),
-        )
-        .unwrap();
-        queries::store_vote(&conn, ROUND_ID, "wallet", 0, 1, 2, &stored_commitment).unwrap();
-        queries::store_vote(&conn, ROUND_ID, "wallet", 0, 2, 1, &[0xCB; 32]).unwrap();
-
-        let released_json = released_singleton_recovery_json(ROUND_ID);
-        assert!(!released_json.contains("\"batch_digest\""));
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json = ?1
-             WHERE round_id = ?2 AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            rusqlite::params![released_json, ROUND_ID],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 15).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let normalized =
-            crate::vote::serialize_recovery(&crate::vote::parse_recovery(&released_json).unwrap())
-                .unwrap();
-        let stored: String = conn
-            .query_row(
-                "SELECT commitment_bundle_json FROM votes
-                 WHERE round_id = ?1 AND wallet_id = 'wallet'
-                   AND bundle_index = 0 AND proposal_id = 1",
-                [ROUND_ID],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored, normalized);
-        assert!(stored.contains("\"batch_digest\":null"));
-        insert_helper_plan_for_round(&conn, ROUND_ID, &stored);
-
-        let mut confirmed =
-            crate::vote::parse_recovery(&stored).expect("normalized recovery must remain valid");
-        confirmed.vc_tree_position = 789;
-        let confirmed_json = crate::vote::serialize_recovery(&confirmed).unwrap();
-        conn.execute(
-            "UPDATE votes
-                SET commitment_bundle_json = ?1, vc_tree_position = 789
-              WHERE round_id = ?2 AND wallet_id = 'wallet'
-                AND bundle_index = 0 AND proposal_id = 1",
-            rusqlite::params![confirmed_json, ROUND_ID],
-        )
-        .unwrap();
-        assert_eq!(
-            stored_plan_snapshot_for_round(&conn, ROUND_ID).as_deref(),
-            Some(confirmed_json.as_str())
-        );
-
-        let replacement_json =
-            confirmed_json.replacen("\"vote_decision\":2", "\"vote_decision\":1", 1);
-        assert_ne!(replacement_json, confirmed_json);
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json = ?1
-             WHERE round_id = ?2 AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            rusqlite::params![replacement_json, ROUND_ID],
-        )
-        .unwrap();
-        assert_eq!(stored_plan_snapshot_for_round(&conn, ROUND_ID), None);
-    }
-
-    #[test]
-    fn fresh_schema_enforces_plan_lifecycle_invariants() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-
-        assert_helper_plan_lifecycle(&conn);
-    }
-
-    #[test]
-    fn migrate_from_v14_creates_pir_proof_cache_and_preserves_state() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&v14_schema()).unwrap();
-        queries::insert_round(
-            &conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
-        // A cached proof from the old bundle-scoped table; v15 must carry it
-        // over so an upgrade mid-round does not refetch from the PIR server.
-        conn.execute(
-            "INSERT INTO imt_proofs (round_id, wallet_id, bundle_index, nullifier, root, nf_bounds, leaf_pos, path, created_at)
-             VALUES ('test-round', 'wallet', 0, X'01', X'02', X'03', 7, X'04', 42)",
-            [],
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 14).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-
-        let round_count: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM rounds WHERE round_id = 'test-round'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(round_count, 1);
-
-        // The old proof row was migrated, keyed by the round's network, with
-        // updated_at seeded from created_at.
-        let migrated_row: (String, Vec<u8>, i64, i64, i64) = conn
-            .query_row(
-                "SELECT network, root, leaf_pos, created_at, updated_at
-                 FROM pir_proof_cache WHERE wallet_id = 'wallet' AND nullifier = X'01'",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(migrated_row, ("testnet".to_string(), vec![0x02], 7, 42, 42));
-
-        // The old table is gone...
-        assert!(!table_names(&conn).contains(&"imt_proofs".to_string()));
-
-        // ...and the new one is usable.
-        conn.execute(
-            "INSERT INTO pir_proof_cache (wallet_id, network, nullifier, root, nf_bounds, leaf_pos, path, created_at, updated_at)
-             VALUES ('wallet', 'testnet', X'05', X'02', X'03', 0, X'04', 0, 0)",
-            [],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn incremental_migrations_form_an_unbroken_chain_to_current() {
-        let mut expected = LAUNCH_VERSION;
-        for (from, _) in INCREMENTAL_MIGRATIONS {
-            assert_eq!(
-                *from, expected,
-                "incremental migrations must be ordered and contiguous"
-            );
-            expected = from + 1;
-        }
-        assert_eq!(
-            expected, CURRENT_VERSION,
-            "every version from LAUNCH_VERSION to CURRENT_VERSION needs a migration step"
-        );
-    }
-
-    #[test]
-    fn test_migrate_from_pre_v8_schema_recreates_current_schema() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&pre_v8_schema()).unwrap();
-        conn.pragma_update(None, "user_version", 7).unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let columns = table_columns(&conn, "bundles");
-        assert!(columns.contains(&"note_identity_hashes_blob".to_string()));
-        assert!(columns.contains(&"tx1_effects".to_string()));
-    }
-
-    #[test]
-    fn test_migrate_rejects_newer_database_version() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", CURRENT_VERSION + 1)
-            .unwrap();
-
-        let err = migrate(&mut conn).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unsupported newer database version"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn test_tables_created() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-
-        let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-
-        assert!(tables.contains(&"rounds".to_string()));
-        assert!(tables.contains(&"bundles".to_string()));
-        assert!(tables.contains(&"cached_tree_state".to_string()));
-        assert!(tables.contains(&"proofs".to_string()));
-        assert!(tables.contains(&"votes".to_string()));
-        // Replaced by pir_proof_cache at v15.
-        assert!(!tables.contains(&"imt_proofs".to_string()));
-        assert!(tables.contains(&"share_delegations".to_string()));
-        assert!(tables.contains(&"helper_share_plans".to_string()));
-        assert!(tables.contains(&"keystone_signatures".to_string()));
-        assert!(tables.contains(&"ballot_intent".to_string()));
-        assert!(tables.contains(&"pir_proof_cache".to_string()));
-
-        let round_columns = table_columns(&conn, "rounds");
-        assert!(round_columns.contains(&"network".to_string()));
-    }
-
-    /// Verify that the bundles table columns exist after migration and can round-trip BLOB data.
-    #[test]
-    fn test_bundle_data_columns_exist() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-
-        // Insert a round first
-        conn.execute(
-            "INSERT INTO rounds (round_id, wallet_id, network, snapshot_height, ea_pk, nc_root, nullifier_imt_root, phase, created_at) VALUES ('test', 'w1', 'testnet', 1, X'00', X'00', X'00', 0, 0)",
-            [],
-        ).unwrap();
-
-        // Insert a bundle row using the delegation BLOB columns.
-        conn.execute(
-            "INSERT INTO bundles (round_id, wallet_id, bundle_index, van_comm_rand, dummy_nullifiers, rho_signed, padded_note_data, nf_signed, cmx_new, alpha, rseed_signed, rseed_output, tx1_effects) VALUES ('test', 'w1', 0, X'AA', X'BB', X'CC', X'DD', X'EE', X'FF', X'11', X'22', X'33', X'44')",
-            [],
-        ).unwrap();
-
-        // Verify van_comm_rand round-trips (the VAN blinding factor)
-        let rand: Vec<u8> = conn
-            .query_row(
-                "SELECT van_comm_rand FROM bundles WHERE round_id = 'test' AND bundle_index = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(rand, vec![0xAA]);
-
-        // Verify dummy_nullifiers round-trips
-        let dummies: Vec<u8> = conn
-            .query_row(
-                "SELECT dummy_nullifiers FROM bundles WHERE round_id = 'test' AND bundle_index = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(dummies, vec![0xBB]);
-
-        let tx1_effects: Vec<u8> = conn
-            .query_row(
-                "SELECT tx1_effects FROM bundles WHERE round_id = 'test' AND bundle_index = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(tx1_effects, vec![0x44]);
-    }
-
-    fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
-        conn.prepare(&format!("PRAGMA table_info({table})"))
-            .unwrap()
-            .query_map([], |row| row.get(1))
-            .unwrap()
-            .collect::<Result<Vec<String>, _>>()
-            .unwrap()
-    }
-
-    fn table_names(conn: &Connection) -> Vec<String> {
-        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<Vec<String>, _>>()
-            .unwrap()
-    }
-
-    fn schema_sql(conn: &Connection, object_type: &str, name: &str) -> String {
-        conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
-            rusqlite::params![object_type, name],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    fn assert_helper_plan_lifecycle(conn: &Connection) {
-        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        queries::insert_round(
-            conn,
-            "wallet",
-            crate::Network::Testnet,
-            &test_params(),
-            None,
-        )
-        .unwrap();
-        queries::insert_bundle(conn, "test-round", "wallet", 0, &[1]).unwrap();
-        queries::store_vote(conn, "test-round", "wallet", 0, 1, 0, &[0xCA; 32]).unwrap();
-        let before = r#"{"vc_tree_position":0,"marker":"same"}"#;
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json = ?1
-             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            [before],
-        )
-        .unwrap();
-        insert_helper_plan(conn, before);
-
-        let confirmed = r#"{"vc_tree_position":7,"marker":"same"}"#;
-        conn.execute(
-            "UPDATE votes
-                SET commitment_bundle_json = ?1, vc_tree_position = 7
-              WHERE round_id = 'test-round' AND wallet_id = 'wallet'
-                AND bundle_index = 0 AND proposal_id = 1",
-            [confirmed],
-        )
-        .unwrap();
-        assert_eq!(stored_plan_snapshot(conn).as_deref(), Some(confirmed));
-
-        // A non-confirmation recovery-material change is a new generation,
-        // even when it retains the already-confirmed VC position.
-        let replacement = r#"{"vc_tree_position":7,"marker":"replacement"}"#;
-        conn.execute(
-            "UPDATE votes SET commitment_bundle_json = ?1
-             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            [replacement],
-        )
-        .unwrap();
-        assert_eq!(stored_plan_snapshot(conn), None);
-
-        insert_helper_plan(conn, replacement);
-        conn.execute(
-            "DELETE FROM votes
-             WHERE round_id = 'test-round' AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            [],
-        )
-        .unwrap();
-        assert_eq!(stored_plan_snapshot(conn), None);
-    }
-
-    fn insert_helper_plan(conn: &Connection, snapshot: &str) {
-        insert_helper_plan_for_round(conn, "test-round", snapshot);
-    }
-
-    fn insert_helper_plan_for_round(conn: &Connection, round_id: &str, snapshot: &str) {
-        conn.execute(
-            "INSERT INTO helper_share_plans
-             (round_id, wallet_id, bundle_index, proposal_id,
-              commitment_bundle_json, configured_server_urls_json,
-              share_plans_json, format_version, placement_guarantee, created_at)
-             VALUES (?1, 'wallet', 0, 1, ?2, '[\"https://helper.example\"]',
-                     '[]', 1, 'strict', 1)",
-            rusqlite::params![round_id, snapshot],
-        )
-        .unwrap();
-    }
-
-    fn released_singleton_recovery_json(round_id: &str) -> String {
-        let released_shape = serde_json::to_string(&serde_json::json!({
-            "format": "zcash_voting_vote_recovery_v1",
-            "vote_round_id": round_id,
-            "bundle_index": 0,
-            "proposal_id": 1,
-            "vote_decision": 2,
-            "anchor_height": 100,
-            "vc_tree_position": 0,
-            "single_share": false,
-            "num_options": 3,
-            "van_nullifier": vec![0x31_u8; 32],
-            "vote_authority_note_new": vec![0x32_u8; 32],
-            "vote_commitment": vec![0x33_u8; 32],
-            "proof": vec![0x34_u8; 8],
-            "shares_hash": vec![0x35_u8; 32],
-            "r_vpk": vec![0x36_u8; 32],
-            "alpha_v": vec![0x37_u8; 32],
-            "vote_auth_sig": vec![0x38_u8; 64],
-            "encrypted_shares": [],
-            "share_blinds": [],
-            "share_comms": [],
-        }))
-        .unwrap();
-        let canonical_with_batch_nulls =
-            crate::vote::serialize_recovery(&crate::vote::parse_recovery(&released_shape).unwrap())
-                .unwrap();
-        canonical_with_batch_nulls
-            .strip_suffix(",\"batch_digest\":null,\"batch_index\":null,\"batch_size\":null}")
-            .map(|prefix| format!("{prefix}}}"))
-            .expect("current singleton recovery must append nullable batch metadata")
-    }
-
-    fn released_batch_recovery_json(round_id: &str) -> (String, String) {
-        let mut first =
-            crate::vote::parse_recovery(&released_singleton_recovery_json(round_id)).unwrap();
-        let mut second = first.clone();
-        second.proposal_id = 2;
-        second.vc_tree_position = 1;
-        second.van_nullifier = [0x41; 32];
-        second.vote_authority_note_new = [0x42; 32];
-        second.vote_commitment = [0x43; 32];
-        second.r_vpk = [0x44; 32];
-        let actions = [&first, &second]
-            .into_iter()
-            .map(
-                |recovery| crate::vote_commitment::CastVoteBatchSighashAction {
-                    r_vpk: &recovery.r_vpk,
-                    van_nullifier: &recovery.van_nullifier,
-                    vote_authority_note_new: &recovery.vote_authority_note_new,
-                    vote_commitment: &recovery.vote_commitment,
-                    proposal_id: recovery.proposal_id,
-                },
-            )
-            .collect::<Vec<_>>();
-        let digest = crate::vote_commitment::cast_vote_batch_sighash(
-            round_id,
-            u64::from(first.anchor_height),
-            &actions,
-        )
-        .unwrap();
-        first.batch = Some(crate::vote::VoteBatchRecovery {
-            digest,
-            index: 0,
-            size: 2,
-        });
-        second.batch = Some(crate::vote::VoteBatchRecovery {
-            digest,
-            index: 1,
-            size: 2,
-        });
-        (
-            crate::vote::serialize_recovery(&first).unwrap(),
-            crate::vote::serialize_recovery(&second).unwrap(),
-        )
-    }
-
-    fn stored_plan_snapshot(conn: &Connection) -> Option<String> {
-        stored_plan_snapshot_for_round(conn, "test-round")
-    }
-
-    fn stored_plan_snapshot_for_round(conn: &Connection, round_id: &str) -> Option<String> {
-        conn.query_row(
-            "SELECT commitment_bundle_json FROM helper_share_plans
-             WHERE round_id = ?1 AND wallet_id = 'wallet'
-               AND bundle_index = 0 AND proposal_id = 1",
-            [round_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap()
-    }
-}
+mod tests;

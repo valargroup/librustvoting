@@ -335,11 +335,11 @@ mod tests {
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
-                 (identity_key, round_id, wallet_id, network, vote_chain_id,
+                 (identity_key, round_id, wallet_id, network,
                   bundle_index, kind, proposal_id, generation_digest, state,
                   committed_post_reservations, diagnostic_kind, diagnostic,
                   created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', NULL, 0, 'vote', 1, NULL,
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, NULL,
                          'recovering', 0, 'recovery_unavailable',
                          'version-17 vote-chain evidence is lifecycle-owned', 9, 9)",
                 rusqlite::params![vec![0x72_u8; 32], ROUND_ID, WALLET_ID],
@@ -348,11 +348,11 @@ mod tests {
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
-                 (identity_key, round_id, wallet_id, network, vote_chain_id,
+                 (identity_key, round_id, wallet_id, network,
                   bundle_index, kind, proposal_id, generation_digest, state,
                   committed_post_reservations, diagnostic_kind, diagnostic,
                   created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', NULL, 0, 'delegation', NULL,
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', NULL,
                          NULL, 'recovering', 0, 'recovery_unavailable',
                          'version-17 delegation evidence is lifecycle-owned', 9, 9)",
                 rusqlite::params![vec![0x74_u8; 32], ROUND_ID, WALLET_ID],
@@ -382,12 +382,12 @@ mod tests {
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
-                 (identity_key, round_id, wallet_id, network, vote_chain_id,
+                 (identity_key, round_id, wallet_id, network,
                   bundle_index, kind, proposal_id, generation_digest, state,
                   committed_post_reservations, confirmation_source,
                   final_van_position, vote_commitment_positions, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', NULL, 0, 'vote', 1, NULL,
-                         'legacy_confirmed', 0, 'legacy_projection', 7, ?4, 9, 9)",
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, NULL,
+                         'confirmed', 0, 'legacy_projection', 7, ?4, 9, 9)",
                 rusqlite::params![vec![0x75_u8; 32], ROUND_ID, WALLET_ID, positions],
             )
             .unwrap();

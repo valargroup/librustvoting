@@ -4,9 +4,15 @@
 //! different pace, so the stable API reports delegation status per bundle
 //! instead of maintaining one lossy round-level phase.
 
-use rusqlite::{named_params, OptionalExtension};
+use std::collections::BTreeMap;
 
-use crate::{storage::VotingDb, types::VotingError};
+use rusqlite::{named_params, Connection, OptionalExtension};
+
+use crate::{
+    chain_submission::{generation_for_vote_batch, ChainSubmissionIdentity, ChainSubmissionTarget},
+    storage::{queries, VotingDb},
+    types::VotingError,
+};
 
 /// Delegation lifecycle for one bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,15 +188,14 @@ impl VotingDb {
                         EXISTS(SELECT 1 FROM chain_submissions s
                                 WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
                                   AND s.bundle_index=b.bundle_index AND s.kind='delegation'
-                                  AND s.vote_chain_id IS NULL AND s.state='recovering'
+                                  AND s.state IN ('submitting','tracking','recovering','rejected')
                                   AND NOT EXISTS(SELECT 1 FROM chain_submissions successor
                                                    WHERE successor.round_id=s.round_id
                                                      AND successor.wallet_id=s.wallet_id
                                                      AND successor.network=s.network
                                                      AND successor.bundle_index=s.bundle_index
-                                                     AND successor.vote_chain_id IS NULL
-                                                     AND successor.kind='vote'
-                                                     AND successor.state='legacy_confirmed'))
+                                                     AND successor.kind IN ('vote','vote_batch')
+                                                     AND successor.state='confirmed'))
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -245,15 +250,14 @@ impl VotingDb {
                         EXISTS(SELECT 1 FROM chain_submissions s
                                 WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
                                   AND s.bundle_index=b.bundle_index AND s.kind='delegation'
-                                  AND s.vote_chain_id IS NULL AND s.state='recovering'
+                                  AND s.state IN ('submitting','tracking','recovering','rejected')
                                   AND NOT EXISTS(SELECT 1 FROM chain_submissions successor
                                                    WHERE successor.round_id=s.round_id
                                                      AND successor.wallet_id=s.wallet_id
                                                      AND successor.network=s.network
                                                      AND successor.bundle_index=s.bundle_index
-                                                     AND successor.vote_chain_id IS NULL
-                                                     AND successor.kind='vote'
-                                                     AND successor.state='legacy_confirmed'))
+                                                     AND successor.kind IN ('vote','vote_batch')
+                                                     AND successor.state='confirmed'))
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -299,45 +303,16 @@ impl VotingDb {
     ) -> Result<VotePhase, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let phase = conn
-            .query_row(
-                "SELECT v.tx_hash IS NOT NULL, v.vc_tree_position IS NOT NULL,
-                        v.commitment_bundle_json IS NOT NULL,
-                        EXISTS(SELECT 1 FROM chain_submissions s
-                                WHERE s.round_id=v.round_id AND s.wallet_id=v.wallet_id
-                                  AND s.bundle_index=v.bundle_index AND s.kind='vote'
-                                  AND s.proposal_id=v.proposal_id
-                                  AND s.vote_chain_id IS NULL AND s.state='recovering'),
-                        EXISTS(SELECT 1 FROM chain_submissions s
-                                WHERE s.round_id=v.round_id AND s.wallet_id=v.wallet_id
-                                  AND s.bundle_index=v.bundle_index AND s.kind='vote'
-                                  AND s.proposal_id=v.proposal_id
-                                  AND s.vote_chain_id IS NULL AND s.state='legacy_confirmed')
-                 FROM votes v
-                 WHERE round_id = :round_id
-                   AND wallet_id = :wallet_id
-                   AND bundle_index = :bundle_index
-                   AND proposal_id = :proposal_id",
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":bundle_index": bundle_index as i64,
-                    ":proposal_id": proposal_id as i64,
-                },
-                |row| {
-                    Ok(vote_phase_from_columns(
-                        row.get::<_, i64>(0)? != 0,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)? != 0,
-                        row.get::<_, i64>(3)? != 0,
-                        row.get::<_, i64>(4)? != 0,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to load vote phase: {e}"),
-            })?;
+        let phase = load_vote_phases(
+            &conn,
+            &wallet_id,
+            round_id,
+            Some(bundle_index),
+            Some(proposal_id),
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, _, phase)| phase);
 
         phase.ok_or_else(|| VotingError::InvalidInput {
             message: format!(
@@ -350,53 +325,7 @@ impl VotingDb {
     pub fn vote_phases(&self, round_id: &str) -> Result<Vec<(u32, u32, VotePhase)>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let mut stmt = conn
-            .prepare(
-                "SELECT v.bundle_index, v.proposal_id, v.tx_hash IS NOT NULL,
-                        v.vc_tree_position IS NOT NULL, v.commitment_bundle_json IS NOT NULL,
-                        EXISTS(SELECT 1 FROM chain_submissions s
-                                WHERE s.round_id=v.round_id AND s.wallet_id=v.wallet_id
-                                  AND s.bundle_index=v.bundle_index AND s.kind='vote'
-                                  AND s.proposal_id=v.proposal_id
-                                  AND s.vote_chain_id IS NULL AND s.state='recovering'),
-                        EXISTS(SELECT 1 FROM chain_submissions s
-                                WHERE s.round_id=v.round_id AND s.wallet_id=v.wallet_id
-                                  AND s.bundle_index=v.bundle_index AND s.kind='vote'
-                                  AND s.proposal_id=v.proposal_id
-                                  AND s.vote_chain_id IS NULL AND s.state='legacy_confirmed')
-                 FROM votes v
-                 WHERE round_id = :round_id AND wallet_id = :wallet_id
-                 ORDER BY bundle_index, proposal_id",
-            )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to prepare vote phases query: {e}"),
-            })?;
-
-        let rows = stmt
-            .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u32,
-                        row.get::<_, i64>(1)? as u32,
-                        vote_phase_from_columns(
-                            row.get::<_, i64>(2)? != 0,
-                            row.get::<_, i64>(3)? != 0,
-                            row.get::<_, i64>(4)? != 0,
-                            row.get::<_, i64>(5)? != 0,
-                            row.get::<_, i64>(6)? != 0,
-                        ),
-                    ))
-                },
-            )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to query vote phases: {e}"),
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to read vote phase row: {e}"),
-            })?;
-        Ok(rows)
+        load_vote_phases(&conn, &wallet_id, round_id, None, None)
     }
 
     /// Loads the canonical helper-share phase for one share record.
@@ -487,6 +416,241 @@ impl VotingDb {
                 message: format!("failed to read share phase row: {e}"),
             })?;
         Ok(rows)
+    }
+}
+
+struct VotePhaseEvidence {
+    bundle_index: u32,
+    proposal_id: u32,
+    has_tx_hash: bool,
+    has_vc_position: bool,
+    has_recovery_bundle: bool,
+    singleton_submission_state: Option<String>,
+    singleton_confirmation_source: Option<String>,
+}
+
+/// Projects vote rows through their authoritative singleton or atomic-batch
+/// submission. Batch membership is accepted only after the persisted signed
+/// batch and its complete generation digest have been re-derived.
+fn load_vote_phases(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: Option<u32>,
+    proposal_id: Option<u32>,
+) -> Result<Vec<(u32, u32, VotePhase)>, VotingError> {
+    let vote_evidence = {
+        let mut statement = conn
+            .prepare(
+                "SELECT v.bundle_index, v.proposal_id, v.tx_hash IS NOT NULL,
+                        v.vc_tree_position IS NOT NULL,
+                        v.commitment_bundle_json IS NOT NULL,
+                        singleton.state, singleton.confirmation_source
+                   FROM votes v
+                   LEFT JOIN chain_submissions singleton
+                     ON singleton.round_id=v.round_id
+                    AND singleton.wallet_id=v.wallet_id
+                    AND singleton.bundle_index=v.bundle_index
+                    AND singleton.kind='vote'
+                    AND singleton.proposal_id=v.proposal_id
+                  WHERE v.round_id=:round_id AND v.wallet_id=:wallet_id
+                    AND (:bundle_index IS NULL OR v.bundle_index=:bundle_index)
+                    AND (:proposal_id IS NULL OR v.proposal_id=:proposal_id)
+                  ORDER BY v.bundle_index, v.proposal_id",
+            )
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to prepare vote phases query: {error}"),
+            })?;
+        let evidence = statement
+            .query_map(
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index.map(i64::from),
+                    ":proposal_id": proposal_id.map(i64::from),
+                },
+                |row| {
+                    Ok(VotePhaseEvidence {
+                        bundle_index: row.get::<_, i64>(0)? as u32,
+                        proposal_id: row.get::<_, i64>(1)? as u32,
+                        has_tx_hash: row.get::<_, i64>(2)? != 0,
+                        has_vc_position: row.get::<_, i64>(3)? != 0,
+                        has_recovery_bundle: row.get::<_, i64>(4)? != 0,
+                        singleton_submission_state: row.get(5)?,
+                        singleton_confirmation_source: row.get(6)?,
+                    })
+                },
+            )
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to query vote phases: {error}"),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to read vote phase row: {error}"),
+            })?;
+        evidence
+    };
+
+    let batch_phases = load_authoritative_batch_phases(conn, wallet_id, round_id, bundle_index)?;
+    vote_evidence
+        .into_iter()
+        .map(|evidence| {
+            let singleton_phase = authoritative_submission_phase(
+                evidence.singleton_submission_state.as_deref(),
+                evidence.singleton_confirmation_source.as_deref(),
+            );
+            let batch_phase = batch_phases
+                .get(&(evidence.bundle_index, evidence.proposal_id))
+                .copied();
+            if singleton_phase.is_some() && batch_phase.is_some() {
+                return Err(VotingError::Internal {
+                    message: format!(
+                        "vote has overlapping authoritative singleton and batch submissions for round={round_id}, bundle={}, proposal={}",
+                        evidence.bundle_index, evidence.proposal_id
+                    ),
+                });
+            }
+            let phase = singleton_phase.or(batch_phase).unwrap_or_else(|| {
+                vote_phase_from_columns(
+                    evidence.has_tx_hash,
+                    evidence.has_vc_position,
+                    evidence.has_recovery_bundle,
+                    false,
+                    false,
+                    false,
+                )
+            });
+            Ok((evidence.bundle_index, evidence.proposal_id, phase))
+        })
+        .collect()
+}
+
+fn load_authoritative_batch_phases(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: Option<u32>,
+) -> Result<BTreeMap<(u32, u32), VotePhase>, VotingError> {
+    let batch_rows = {
+        let mut statement = conn
+            .prepare(
+                "SELECT bundle_index, ordered_batch_digest, generation_digest,
+                        state, confirmation_source
+                   FROM chain_submissions
+                  WHERE round_id=:round_id AND wallet_id=:wallet_id
+                    AND kind='vote_batch'
+                    AND (:bundle_index IS NULL OR bundle_index=:bundle_index)",
+            )
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to prepare authoritative vote batch query: {error}"),
+            })?;
+        let rows = statement
+            .query_map(
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index.map(i64::from),
+                },
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to query authoritative vote batches: {error}"),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to read authoritative vote batch: {error}"),
+            })?;
+        rows
+    };
+    if batch_rows.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let round_bytes: [u8; 32] = hex::decode(round_id)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| VotingError::Internal {
+            message: format!("authoritative vote batch has noncanonical round id {round_id}"),
+        })?;
+    let network = queries::load_round_network(conn, round_id, wallet_id)?;
+    let mut phases_by_member = BTreeMap::new();
+
+    for (stored_bundle_index, ordered_digest, generation_digest, state, source) in batch_rows {
+        let Some(phase) = authoritative_submission_phase(Some(&state), source.as_deref()) else {
+            continue;
+        };
+        let stored_bundle_index =
+            u32::try_from(stored_bundle_index).map_err(|_| VotingError::Internal {
+                message: format!(
+                    "authoritative vote batch has invalid bundle index {stored_bundle_index}"
+                ),
+            })?;
+        let ordered_batch_digest: [u8; 32] =
+            ordered_digest
+                .try_into()
+                .map_err(|digest: Vec<u8>| VotingError::Internal {
+                    message: format!(
+                        "authoritative vote batch digest must be 32 bytes, got {}",
+                        digest.len()
+                    ),
+                })?;
+        let identity = ChainSubmissionIdentity::new(
+            wallet_id,
+            network,
+            round_bytes,
+            stored_bundle_index,
+            ChainSubmissionTarget::VoteBatch {
+                ordered_batch_digest,
+            },
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!("invalid authoritative vote batch identity: {error}"),
+        })?;
+        let bound_generation = generation_for_vote_batch(conn, &identity)?;
+        let expected_generation_digest = bound_generation.generation().digest();
+        if generation_digest.as_deref() != Some(expected_generation_digest.as_bytes()) {
+            return Err(VotingError::Internal {
+                message: format!(
+                    "authoritative vote batch generation digest does not match persisted members for round={round_id}, bundle={stored_bundle_index}"
+                ),
+            });
+        }
+        for &member_proposal_id in bound_generation.ordered_proposal_ids() {
+            if phases_by_member
+                .insert((stored_bundle_index, member_proposal_id), phase)
+                .is_some()
+            {
+                return Err(VotingError::Internal {
+                    message: format!(
+                        "vote belongs to multiple authoritative batches for round={round_id}, bundle={stored_bundle_index}, proposal={member_proposal_id}"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(phases_by_member)
+}
+
+fn authoritative_submission_phase(
+    state: Option<&str>,
+    confirmation_source: Option<&str>,
+) -> Option<VotePhase> {
+    match (state, confirmation_source) {
+        (Some("submitting" | "tracking" | "recovering" | "rejected"), _) => {
+            Some(VotePhase::SubmissionManaged)
+        }
+        (Some("confirmed"), Some("legacy_projection")) => Some(VotePhase::LegacyConfirmed),
+        (Some("confirmed"), _) => Some(VotePhase::Confirmed),
+        _ => None,
     }
 }
 
@@ -593,6 +757,52 @@ mod tests {
         assert_eq!(
             db.delegation_phase(ROUND_ID, 0).unwrap(),
             DelegationPhase::Confirmed
+        );
+    }
+
+    #[test]
+    fn confirmed_batch_supersedes_delegation_in_phase_queries() {
+        let db = db_with_bundle();
+        db.store_van_position(ROUND_ID, 0, 42).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                   (identity_key, round_id, wallet_id, network, bundle_index,
+                    kind, generation_digest, state, committed_post_reservations,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', ?4,
+                         'recovering', 0, 1, 1)",
+                rusqlite::params![vec![0x71_u8; 32], ROUND_ID, WALLET_ID, vec![0x72_u8; 32],],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                   (identity_key, round_id, wallet_id, network, bundle_index,
+                    kind, ordered_batch_digest, generation_digest, state,
+                    committed_post_reservations, confirmation_source,
+                    final_van_position, vote_commitment_positions,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote_batch', ?4, ?5,
+                         'confirmed', 0, 'tree', 42, ?6, 2, 2)",
+                rusqlite::params![
+                    vec![0x73_u8; 32],
+                    ROUND_ID,
+                    WALLET_ID,
+                    vec![0x74_u8; 32],
+                    vec![0x75_u8; 32],
+                    vec![1_u8],
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            db.delegation_phase(ROUND_ID, 0).unwrap(),
+            DelegationPhase::Confirmed
+        );
+        assert_eq!(
+            db.delegation_phases(ROUND_ID).unwrap(),
+            vec![(0, DelegationPhase::Confirmed)]
         );
     }
 
@@ -753,18 +963,26 @@ fn phase_from_columns(
     }
 }
 
+/// Projects one vote's workflow phase.
+///
+/// The authoritative `chain_submissions` row wins whenever one exists: an
+/// unresolved row is lifecycle-owned, and a confirmation is terminal whether it
+/// was validated at runtime, reconstructed during migration, or preserved as a
+/// version-17 projection. Only a vote with no submission row falls back to the
+/// version-17 domain columns.
 fn vote_phase_from_columns(
     has_tx_hash: bool,
     has_vc_position: bool,
     has_recovery_bundle: bool,
     submission_managed: bool,
-    legacy_confirmed: bool,
+    legacy_projection_confirmed: bool,
+    submission_confirmed: bool,
 ) -> VotePhase {
-    if legacy_confirmed {
+    if legacy_projection_confirmed {
         VotePhase::LegacyConfirmed
     } else if submission_managed {
         VotePhase::SubmissionManaged
-    } else if has_tx_hash && has_vc_position && has_recovery_bundle {
+    } else if submission_confirmed || (has_tx_hash && has_vc_position && has_recovery_bundle) {
         VotePhase::Confirmed
     } else if has_tx_hash {
         VotePhase::Submitted
