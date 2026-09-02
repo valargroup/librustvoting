@@ -1238,7 +1238,10 @@ placement updates, and
 chain-generation preservation is covered by
 `active_singleton_generation_locks_intent_and_recovery_material` and
 `active_batch_generation_locks_every_member_intent`; both reject the intent
-change before vote recovery or helper-delivery rows can be cleared.
+change before vote recovery or helper-delivery rows can be cleared. A rejected
+atomic batch retains the same protection because its authoritative member
+roster still depends on those recovery rows; this is covered by
+`rejected_vote_batch_never_reschedules_its_members`.
 
 ### Configuration and migration
 

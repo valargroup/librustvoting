@@ -2188,6 +2188,8 @@ mod tests {
         db.store_van_position(ROUND, 0, 7).unwrap();
         let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
         align_stored_commitments_with_recovery(&db, &[1, 2]);
+        record_confirmed_share_fixture(&db, 0, 1, 0);
+        record_confirmed_share_fixture(&db, 0, 2, 1);
         let target = ChainSubmissionTarget::VoteBatch {
             ordered_batch_digest,
         };
@@ -2202,6 +2204,45 @@ mod tests {
         };
         record_rejected_submission_fixture(&db, target, generation_digest);
 
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        for (proposal_id, decision) in [(1, Decision::Choice(2)), (2, Decision::Skipped)] {
+            let error = db
+                .set_ballot_intent(ROUND, proposal_id, decision, 3)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("lifecycle-owned vote recovery"),
+                "unexpected error for proposal {proposal_id}: {error}"
+            );
+        }
+
+        assert_eq!(
+            db.ballot_intents(ROUND).unwrap(),
+            vec![(1, Decision::Choice(0)), (2, Decision::Choice(1))]
+        );
+        for proposal_id in [1, 2] {
+            assert!(crate::vote::recovery_bundle(&db, ROUND, 0, proposal_id)
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                db.vote_phase(ROUND, 0, proposal_id).unwrap(),
+                VotePhase::SubmissionManaged
+            );
+        }
+        let shares = db.get_share_delegations(ROUND).unwrap();
+        assert_eq!(shares.len(), 2);
+        assert!(shares.iter().any(|share| {
+            share.bundle_index == 0 && share.proposal_id == 1 && share.share_index == 0
+        }));
+        assert!(shares.iter().any(|share| {
+            share.bundle_index == 0 && share.proposal_id == 2 && share.share_index == 1
+        }));
+
+        let snapshot = crate::recovery::round_snapshot(&db, ROUND).unwrap();
+        assert_eq!(snapshot.votes.len(), 2);
+        assert!(snapshot.votes.iter().all(|vote| {
+            vote.phase == VotePhase::SubmissionManaged && vote.has_commitment_bundle
+        }));
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
         assert_eq!(
@@ -2646,7 +2687,7 @@ mod tests {
             .set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap_err();
         assert!(
-            error.to_string().contains("active chain submission"),
+            error.to_string().contains("lifecycle-owned vote recovery"),
             "{error}"
         );
         assert!(crate::vote::recovery_bundle(&db, ROUND, 0, 2)
@@ -2691,7 +2732,7 @@ mod tests {
             .set_ballot_intent(ROUND, 2, Decision::Skipped, 3)
             .unwrap_err();
         assert!(
-            error.to_string().contains("active chain submission"),
+            error.to_string().contains("lifecycle-owned vote recovery"),
             "{error}"
         );
         for proposal_id in [1, 2] {

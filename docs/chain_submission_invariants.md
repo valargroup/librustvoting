@@ -797,6 +797,13 @@ order, and batch digest are locked. Delegation setup, nullifiers, proof inputs,
 and VAN randomizer are likewise locked. Re-selecting the same generation is
 idempotent; changing it is rejected.
 
+Terminal rejection does not release an atomic batch's member locks. The
+rejected row still projects its phase through the signed recovery rows that
+define its ordered roster, so a conflicting ballot-intent change must fail
+before clearing vote recovery or helper-delivery records. A rejected singleton
+does not depend on a recovery-derived roster and is not additionally locked by
+this batch-roster rule.
+
 Confirmation does not release those locks. A vote that a generation has already
 placed on chain cannot have its ballot intent changed, whatever the confirmation
 source. Two independent conditions enforce this, and a migrated atomic batch
@@ -1011,13 +1018,14 @@ A vote's authoritative row is its own singleton row or the `vote_batch` row that
 contains it. Because a batch binds once and owns no per-member rows, membership
 is not read from a stored roster: the projection re-derives the batch
 generation from the persisted signed members and requires the persisted
-generation digest to match before applying the batch's phase to any member. A
-mismatch, a noncanonical round id, or a vote claimed by two batches is an
-invariant error rather than a silently different phase. Only a vote with
-neither kind of row falls back to the version-17
-domain columns. Session plans emit no submit, poll, or reconstruction step for
-a lifecycle-owned or terminal row. Every unbound row locks the recorded ballot
-choice even when no recovery bundle exists.
+generation digest to match before applying the batch's phase to any member.
+Those signed members remain immutable while any authoritative batch row,
+including a rejected row, still relies on them. A mismatch, a noncanonical
+round id, or a vote claimed by two batches is an invariant error rather than a
+silently different phase. Only a vote with neither kind of row falls back to
+the version-17 domain columns. Session plans emit no submit, poll, or
+reconstruction step for a lifecycle-owned or terminal row. Every unbound row
+locks the recorded ballot choice even when no recovery bundle exists.
 
 ## Removed legacy APIs
 
@@ -1186,7 +1194,8 @@ Tests cover:
   generation derivation fails;
 - a migrated atomic batch projects its phase onto every member by re-deriving
   the batch generation and matching the persisted generation digest, and a
-  member of a confirmed batch cannot change its ballot intent;
+  member of a confirmed or rejected batch cannot clear the recovery material
+  that supplies its authoritative roster;
 - a process killed at any point during migration leaves the untouched
   version-17 source or a complete version 18, never a partial table, and a
   restart classifies identical rows;
