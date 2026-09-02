@@ -53,8 +53,8 @@ The specification covers:
 - retries, endpoint failover, and cancellation;
 - transaction-hash reconciliation;
 - structured spent-nullifier handling;
-- bounded-memory, per-request-bounded, cancellable commitment-tree recovery
-  after spent evidence when positions are missing;
+- bounded-memory, per-request- and per-call-bounded, cancellable
+  commitment-tree recovery after spent evidence when positions are missing;
 - confirmation and position persistence;
 - restart planning and per-bundle causal ordering;
 - recovery cleanup and partial pruning; and
@@ -77,9 +77,10 @@ The principal implementation surfaces are:
 ### Trusted endpoints
 
 Vote API and commitment-tree endpoints are trusted by design. The SDK validates
-response syntax, internal consistency, and binding to local recovery material,
-but it does not independently verify consensus proofs, transaction inclusion
-proofs, or a quorum between endpoint operators.
+response syntax and internal consistency, plus the exact local binding required
+for spent evidence and tree recovery, but it does not independently verify
+consensus proofs, transaction inclusion proofs, event-referenced leaves, or a
+quorum between endpoint operators.
 
 Trusted endpoints are authoritative for:
 
@@ -122,8 +123,9 @@ The design assumes:
 
 A spent-nullifier response proves that the named input was consumed by a
 committed transaction. It does not alone prove which valid transaction consumed
-it. The SDK confirms the local generation only after a known hash's events bind
-to it or its complete expected output layout is found in the tree.
+it. The SDK confirms the local generation after a known owned hash receives a
+trusted committed-success response with a supported event shape, or after its
+complete expected output layout is found in the tree.
 
 ### Existing round authentication
 
@@ -519,17 +521,19 @@ snapshot and by stronger in-memory evidence from the current call.
 
 | Priority | Predicate | Outcome |
 | ---: | --- | --- |
-| 1 | A bound hash-event confirmation is durable at the final snapshot. | `Confirmed` if this call committed it; otherwise `AlreadyConfirmed { source: hash_events }` |
+| 1 | A trusted hash-event confirmation for the owned candidate is durable at the final snapshot. | `Confirmed` if this call committed it; otherwise `AlreadyConfirmed { source: hash_events }` |
 | 2 | A tree-recovery receipt is durable at the final snapshot and no hash-event confirmation wins above. | `RecoveredByTree` if this call committed it; otherwise `AlreadyConfirmed { source: commitment_tree }` |
-| 3 | Exact spent-nullifier evidence exists without a durable position result. | `SpentPositionPending` |
-| 4 | A fresh accepted hash could not be journaled and there is no independent unsettled candidate or hashless ambiguity. | `AcceptedButUnjournaled` |
-| 5 | Any hashless possibly dispatched attempt, unreadable or contradictory candidate, unjournaled accepted hash accompanied by independent unsettled evidence, or other evidence that commitment remains unknown exists. | `OutcomeUnknown` |
-| 6 | At least one live candidate has a usable pending lookup result and no stronger row matches. | `Pending` |
-| 7 | The current POST produced a journaled accepted hash, no other candidate is pending or unknown, and no stronger row matches. | `Accepted` |
-| 8 | At least one attempt is definitely rejected and every other attempt is definitely rejected, definitely unsent, or proven committed-failed in this pass. | `Rejected` |
-| 9 | Cancellation occurred before possible dispatch and no stronger row matches. | `Cancelled` |
+| 3 | This call validated a trusted hash confirmation, but its non-cancellable atomic persistence failed. | `ConfirmedButUnapplied` |
+| 4 | This call found one trusted complete tree layout, but its non-cancellable atomic persistence failed. | `RecoveredButUnapplied` |
+| 5 | Exact spent-nullifier evidence exists without a durable position result. | `SpentPositionPending` |
+| 6 | A fresh accepted hash could not be journaled and there is no independent unsettled candidate or hashless ambiguity. | `AcceptedButUnjournaled` |
+| 7 | Any hashless possibly dispatched attempt, unreadable or contradictory candidate, unjournaled accepted hash accompanied by independent unsettled evidence, or other evidence that commitment remains unknown exists. | `OutcomeUnknown` |
+| 8 | At least one live candidate has a usable pending lookup result and no stronger row matches. | `Pending` |
+| 9 | The current POST produced a journaled accepted hash, no other candidate is pending or unknown, and no stronger row matches. | `Accepted` |
+| 10 | At least one attempt or domain-only candidate is definitely rejected or proven committed-failed in this pass, and every other attempt is definitely rejected, definitely unsent, or proven committed-failed in this pass. | `Rejected` |
+| 11 | Cancellation occurred before possible dispatch and no stronger row matches. | `Cancelled` |
 
-An unjournaled accepted hash in priority 5 is included in
+An unjournaled accepted hash in priority 7 is included in
 `OutcomeUnknown.known_tx_hashes`; its bounded storage error is included in the
 message. Thus combining it with older ambiguity does not hide either item of
 evidence. If both durable confirmation sources exist, priority 1 makes
@@ -545,9 +549,22 @@ earlier `outcome_unknown` attempt. Its public `code` and `reason` come from the
 qualifying rejected attempt with the lowest journal `id`. Every rejection
 learned during the current pass is associated with its reserved attempt ID
 before aggregation. Definitely-unsent attempts contribute no rejection
-provenance and cannot displace that lowest-ID rejection. If no attempt supplies
-a structured rejection, priority 8 does not match. This rule is independent of
-endpoint, candidate, and attempt iteration order.
+provenance and cannot displace that lowest-ID rejection.
+
+A domain-only committed failure can select priority 10 without an attempt row.
+Its deterministic provenance is the lexicographically lowest failed canonical
+hash from the current pass; the outcome carries that hash's committed code and
+the stable reason `committed_failure`. Attempt-backed structured rejection
+wins provenance by lowest journal ID. This rule is independent of endpoint,
+candidate, and attempt iteration order.
+
+`ConfirmedButUnapplied` carries the transaction hash, trusted parsed
+confirmation, and bounded storage error. `RecoveredButUnapplied` carries the
+complete tree-recovery result and bounded storage error. They assert chain
+success while making clear that domain positions, recovery JSON, or helper
+advancement may still be absent. They are never produced by cancellation:
+after validation reaches the confirmation commit point, persistence is
+non-cancellable.
 
 `Cancelled` is selected only when cancellation occurred before possible
 dispatch and no stronger durable evidence exists.
@@ -587,8 +604,9 @@ outcome with bounded diagnostic context.
 
 ### Final classification snapshot
 
-After network work and every durable retirement it was allowed to complete,
-reconciliation takes one final read-transaction snapshot of:
+After network work, every durable retirement it was allowed to complete, and
+any validated confirmation persistence, reconciliation takes one final
+read-transaction snapshot of:
 
 - durable event or tree confirmation;
 - the complete canonical candidate set;
@@ -604,8 +622,16 @@ snapshot and does not report the failed hash as live, while durable mutation
 guards continue treating the unretired row as covering until a later
 reconciliation persists the retirement. Candidates or confirmation written by
 another task during lookup are included. Cancellation is sampled after the
-snapshot; it can suppress new work or writes but cannot demote the evidence the
+snapshot; it can suppress other new work or writes but cannot suppress
+confirmation persistence after its commit point or demote the evidence the
 snapshot contains.
+
+Validation of a trusted hash confirmation or one complete tree layout is the
+confirmation commit point. Before crossing it, cancellation may stop the
+operation. After crossing it, the corresponding atomic persistence runs to
+completion without consulting cancellation. Successful persistence therefore
+precedes the final snapshot. If persistence fails, the in-memory validated
+confirmation selects `ConfirmedButUnapplied` or `RecoveredButUnapplied`.
 
 The snapshot is the call's classification linearization point. Evidence
 committed after its read transaction begins is observed by the next call.
@@ -615,8 +641,12 @@ re-reads current evidence after taking its write lock.
 
 No classification branch performs another blocking database read after that
 cancellation sample. If the final snapshot itself cannot be read, the call
-still preserves all stronger evidence already held in memory and reports the
-read failure as diagnostic context rather than manufacturing a weaker result.
+returns `OutcomeUnknown` with every in-memory hash and the bounded read
+diagnostic; absence-dependent `Accepted`, `Rejected`, and `Cancelled` outcomes
+are forbidden. The only stronger exceptions are a confirmation this call knows
+it durably committed, a durable confirmation observed earlier in the call, or
+validated confirmation evidence carried by `ConfirmedButUnapplied` or
+`RecoveredButUnapplied`.
 
 ### Existing domain rows remain operational
 
@@ -666,8 +696,8 @@ nothing.
 
 ### No durable scan workflow
 
-Tree scanning is bounded in memory and per request, cancellable, and ephemeral,
-but intentionally not bounded in total valid work. The database does not store:
+Tree scanning is bounded in memory, per request, and per reconciliation call,
+cancellable, and ephemeral. The database does not store:
 
 - scan epochs;
 - page cursors;
@@ -675,9 +705,9 @@ but intentionally not bounded in total valid work. The database does not store:
 - endpoint scan histories; or
 - a separate normalized recovery-state table.
 
-If a scan is interrupted, unavailable, malformed, or hits an individual request
-bound, the next reconciliation starts a fresh scan. Partial results are never
-evidence.
+If a scan is interrupted, unavailable, malformed, or hits an individual or
+whole-scan bound, the next reconciliation starts a fresh scan. Partial results
+are never evidence.
 
 ## Reservation-before-POST
 
@@ -939,19 +969,18 @@ interpreted; an HTML rate-limit or gateway body does not manufacture decode
 ambiguity.
 
 Each configured endpoint receives one lookup attempt per pass. Syntactic
-decoding and, for committed success, semantic event binding both occur inside
-endpoint failover. A valid committed answer outranks 404. Unusable or
-semantically unrelated success responses fail over. A committed failure is
-definite for that hash and does not require its events to describe the local
-submission. If no endpoint provides usable evidence, lookup returns unknown,
-not pending.
+decoding and, for committed success, supported event-shape validation both occur
+inside endpoint failover. A valid committed answer outranks 404. Unusable
+responses or a success with the wrong event kind or round fail over. A committed
+failure is definite for that hash and does not require its events to describe
+the local submission. If no endpoint provides usable evidence, lookup returns
+unknown, not pending.
 
 Usable committed answers for one hash must agree on success or failure.
-Semantically bound success answers must also agree on the event-derived
-positions. Contradictory committed answers produce `OutcomeUnknown` with the
-candidate preserved and an invariant diagnostic; they neither confirm nor
-retire it. A previously durable confirmation still outranks that network
-contradiction.
+Trusted success answers must also agree on the parsed event-derived positions.
+Contradictory committed answers produce `OutcomeUnknown` with the candidate
+preserved and an invariant diagnostic; they neither confirm nor retire it. A
+previously durable confirmation still outranks that network contradiction.
 
 Endpoint and candidate results are aggregated by evidence, not loop order. A
 terminal endpoint error such as 401 is inability to inspect that candidate; it
@@ -959,20 +988,24 @@ cannot outrank committed success, a valid pending response, an unusable response
 that leaves commitment unsettled, a live ambiguous attempt, or another
 independently sourced candidate. No error about one candidate settles another.
 
-### Event binding
+### Trusted event confirmation
 
-A committed-success hash is applied only after its events and referenced tree
-positions bind to the recovery descriptor:
+The owned candidate hash binds the transaction to the local submission
+identity. For a committed-success response, the trusted endpoint's events are
+authoritative for positions. The SDK requires:
 
-- Delegation verifies the reported VAN position contains the expected
-  `van_cmx`.
-- Singleton verifies the reported successor VAN and VC positions contain the
-  expected commitments.
-- Batch verifies digest, size, ordered proposals, ordered nullifiers, final VAN
-  position, and every ordered VC position.
+- exactly one supported event of the identity's delegation, singleton, or batch
+  kind;
+- the captured round ID;
+- canonical, in-range VAN and VC position fields; and
+- for a batch, exactly one VC position per persisted member in action order.
 
-The chain does not know the wallet-local bundle index. Exact nullifiers,
-commitments, proposal data, and batch digest bind the event to the local bundle.
+The SDK does not fetch tree leaves or compare event-referenced positions with
+locally derived commitments, nullifiers, proposals, or batch digests. Those
+checks would duplicate the trusted chain's execution result and are not part of
+hash confirmation. Malformed structure, wrong kind or round, duplicate required
+events, invalid positions, or the wrong batch position count remains unusable
+and participates in endpoint failover.
 
 ### Reconciliation result
 
@@ -1163,28 +1196,59 @@ Each individual tree request uses:
 | Limit | Default |
 | --- | ---: |
 | One HTTP request | 10 seconds |
-| One interpreted response body (`latest` or page) | 1 MiB |
+| One interpreted response body (`latest` or page) | 16 MiB |
 
-There is no whole-scan page, byte, or elapsed-time cap. A valid large tree must
-remain recoverable, so the scanner continues page by page until the snapshotted
-tree is complete, an endpoint fails, or cancellation is observed. Memory use is
-bounded by streaming one page plus the small set of expected commitments and
-candidate positions.
+One complete reconciliation scan uses these deliberately relaxed mobile
+ceilings:
+
+| Limit | Hard ceiling |
+| --- | ---: |
+| Snapshot leaves | 2,000,000 |
+| HTTP requests across all endpoints | 1,024 |
+| Interpreted response bytes across all endpoints | 256 MiB |
+| Wall-clock scan time | 60 minutes |
+
+The first reached ceiling stops the scan. Partial matches are discarded and the
+generation remains `SpentPositionPending` with a stable
+`scan_limit_exceeded` diagnostic. These ceilings target a typical one-month
+round on a mobile device with substantial headroom: two million leaves represent
+hundreds of thousands of singleton voters even when delegation and successor
+VAN outputs are counted separately. Raising a hard ceiling requires a
+specification and conformance update; hosts may configure lower limits.
+
+A `latest.next_index` above the leaf ceiling is a limit result, not malformed
+protocol evidence. That endpoint is skipped for the current call so another
+valid snapshot within the ceiling can run. If every valid snapshot exceeds the
+ceiling, the call returns `SpentPositionPending` without requesting pages.
+
+The 16 MiB per-response ceiling accommodates a complete legal 5 MiB consensus
+block after Base64 and JSON expansion. The vote-sdk contract must keep every
+legal `latest` and leaves response within that ceiling.
+
+Memory use is bounded by streaming one response plus the small set of expected
+commitments, candidate positions, and per-endpoint scan cursors.
 
 Every request is independently bounded and cancellable, including while waiting
 for response bytes. Pagination must make progress, so a malicious or broken
 endpoint cannot create an infinite zero-progress loop.
 
-The scan is not persisted page by page. If every endpoint fails or cancellation
-occurs, the current call returns `SpentPositionPending`. A later reconciliation
-fetches fresh endpoint tips and starts over.
+The scan is not persisted page by page. If every endpoint fails, cancellation
+occurs before confirmation validation, or a whole-scan ceiling is reached, the
+current call returns `SpentPositionPending`. A later reconciliation fetches
+fresh endpoint tips and starts over.
 
 Before scanning pages, the SDK fetches `latest` from every reachable configured
 endpoint. It orders valid snapshots by descending height and then descending
-`next_index`, and scans the freshest first. Two snapshots at the same height
+`next_index`, and starts with the freshest. Two snapshots at the same height
 with different size or root are contradictory endpoint responses and are not
-used for recovery in that call. If the freshest endpoint fails during scanning,
-failover starts a new complete scan against the next-freshest snapshot.
+used for recovery in that call.
+
+One endpoint may consume at most 128 requests, 32 MiB, or 10 minutes before the
+scanner gives the next valid endpoint a turn. Its cursor, root accumulator, and
+match state remain in memory and may resume after every other endpoint has had
+the same opportunity. A failed or malformed endpoint loses its partial state.
+This rotation prevents a huge but responsive freshest endpoint from starving a
+smaller healthy snapshot while preserving freshest-first preference.
 
 ### Page validation
 
@@ -1225,13 +1289,14 @@ the complete layout.
 
 ### Results
 
-One unique complete match produces exact absolute positions and proceeds to
-atomic position confirmation.
+One unique complete match produces exact absolute positions, crosses the
+confirmation commit point, and proceeds to non-cancellable atomic position
+confirmation.
 
 No complete match, delayed indexing, partial match, duplicate match, malformed
-response, cancellation, or endpoint exhaustion leaves the generation
-`SpentPositionPending`. The result carries a retryable diagnostic but does not
-create a permanent conflict state.
+response, cancellation before that commit point, or endpoint exhaustion leaves
+the generation `SpentPositionPending`. The result carries a retryable diagnostic
+but does not create a permanent conflict state.
 
 Because endpoints are trusted, a valid unique complete match is sufficient; no
 cross-endpoint quorum is required.
@@ -1245,12 +1310,15 @@ Tree recovery never invents or populates a transaction hash.
 Hash-based confirmation atomically records:
 
 - validated transaction hash;
-- delegation VAN position, or singleton/batch VC positions;
-- the successor VAN position;
+- trusted event-reported delegation VAN position, or singleton/batch VC
+  positions;
+- the trusted event-reported successor VAN position;
 - exact recovery JSON updates; and
 - helper-plan advancement tied to the same recovery generation.
 
-CheckTx acceptance alone records none of these domain fields.
+CheckTx acceptance alone records none of these domain fields. Hash confirmation
+does not read the commitment tree or independently verify the commitments at
+the event-reported positions.
 
 ### Tree-based delegation confirmation
 
@@ -1293,6 +1361,20 @@ One immediate transaction:
 
 Every member succeeds or none does.
 
+### Non-cancellable confirmation persistence
+
+Hash and tree confirmation share one boundary: cancellation is checked after
+all required inputs have been read but immediately before validation is
+finalized. Finalizing successful validation crosses the confirmation commit
+point, after which persistence is non-cancellable. It either commits all domain
+updates or returns
+`ConfirmedButUnapplied` or `RecoveredButUnapplied` with the evidence and storage
+error needed to report the truth and retry recovery.
+
+The host does not replay the vote. A later reconciliation uses the still-durable
+candidate hash or spent evidence to repeat validation and the idempotent
+confirmation transaction.
+
 ### Idempotency
 
 Reapplying identical hash events or an identical tree receipt is a no-op success.
@@ -1317,6 +1399,8 @@ ChainLifecycleResult {
 
 - `Accepted { tx_hash }`;
 - `AcceptedButUnjournaled { tx_hash, storage_error }`;
+- `ConfirmedButUnapplied { tx_hash, confirmation, storage_error }`;
+- `RecoveredButUnapplied { tree_recovery, storage_error }`;
 - `Pending { known_tx_hashes }`;
 - `OutcomeUnknown { known_tx_hashes, message }`;
 - `SpentPositionPending { known_tx_hashes, message }`;
@@ -1325,6 +1409,55 @@ ChainLifecycleResult {
 - `AlreadyConfirmed { tx_hash: Option<String>, source, tree_recovery: Option<TreeRecoveryReceipt> }`;
 - `Rejected { code, reason }`; or
 - `Cancelled`.
+
+These outcomes are classifications of the strongest chain evidence visible at
+the final snapshot, not successive states through which every submission must
+pass:
+
+- `Accepted` means the current POST returned CheckTx success with a canonical
+  transaction hash and that hash was durably journaled. Acceptance does not
+  prove commitment or update domain positions.
+- `AcceptedButUnjournaled` means the current POST returned CheckTx success with
+  a canonical transaction hash, but persisting that hash in the attempt journal
+  failed. The returned hash remains a recovery handle and must not be discarded
+  or treated as confirmation.
+- `Pending` means at least one known candidate hash has a usable pending lookup
+  result and no stronger evidence exists. `known_tx_hashes` contains the
+  complete known candidate set, not only the candidate that was polled last.
+- `OutcomeUnknown` means possible dispatch or commitment cannot be settled
+  safely. Examples include a hashless possibly dispatched attempt, an
+  unreadable or contradictory candidate, or an accepted-but-unjournaled hash
+  accompanied by independent unsettled evidence. It is recoverable and does not
+  authorize replay with a different generation.
+- `SpentPositionPending` means an exact expected nullifier is proven spent, so
+  mutation replay is forbidden, but no event confirmation or complete
+  tree-recovery receipt has yet made the generation's positions durable.
+  Reconciliation may continue polling independent hashes or retry a bounded
+  commitment-tree scan.
+- `Confirmed` means this call validated trusted event confirmation for a bound
+  transaction hash and atomically persisted all corresponding domain updates.
+- `ConfirmedButUnapplied` means this call validated that same trusted event
+  confirmation, proving chain success, but the non-cancellable atomic
+  persistence of domain updates failed. The host must reconcile later and must
+  not replay the vote.
+- `RecoveredByTree` means this call found one trusted complete commitment-tree
+  layout for the generation and atomically persisted its positions and recovery
+  receipt. This proves semantic completion even when no transaction hash is
+  known.
+- `RecoveredButUnapplied` means this call found that complete tree layout,
+  proving semantic completion, but the non-cancellable atomic persistence of
+  the recovered positions and receipt failed. The host must reconcile later and
+  must not replay the vote.
+- `AlreadyConfirmed` means matching durable confirmation existed before this
+  call's confirmation work. `source` identifies whether the durable evidence is
+  bound hash events or a commitment-tree receipt.
+- `Rejected` means every attempt and domain-only candidate is definitely
+  rejected, definitely unsent, or proven committed-failed in the current pass,
+  and no older ambiguity, live candidate, spent evidence, or confirmation
+  remains. `code` and `reason` use the deterministic provenance rules above.
+- `Cancelled` means cancellation occurred before possible dispatch and no
+  stronger durable or in-memory evidence exists. Cancellation never hides a
+  candidate, ambiguity, spent result, or confirmation.
 
 All wire/FFI discriminants use stable snake-case names. Within confirmed
 outcomes, a hash is optional only for tree-confirmed outcomes.
@@ -1388,14 +1521,18 @@ Cancellation is checked:
 - before transaction lookup classification;
 - before each scan page and scan retry;
 - before candidate retirement; and
-- after the final classification snapshot; and
-- inside the confirmation transaction, after both the database handle and
-  SQLite write lock are acquired but before the first write.
+- immediately before the hash or tree confirmation commit point; and
+- after the final classification snapshot.
 
 Cancellation before dispatch removes the unsent reservation. Cancellation after
 possible dispatch preserves `OutcomeUnknown`. Cancellation after spent evidence
-preserves `SpentPositionPending`. Cancellation after a tree match but before its
-write causes the next call to rescan.
+but before a complete tree match preserves `SpentPositionPending`.
+
+Once trusted hash confirmation or one complete tree layout has been validated,
+the operation crosses its confirmation commit point. Cancellation after that
+point is ignored until the corresponding atomic persistence either commits or
+fails. This is safe under the captured wallet, identity, generation, and lock
+set; it prevents cancellation from discarding known confirmation evidence.
 
 No cancellation result hides a known unsettled hash, possible dispatch, spent
 evidence, or confirmed positions. If cancellation is already true on entry, the
@@ -1711,8 +1848,8 @@ The SDK owns:
 - bounded retry and failover;
 - structured spent-nullifier parsing;
 - known-hash reconciliation;
-- bounded-memory, per-request-bounded, cancellable tree scanning after spent
-  evidence;
+- bounded-memory, per-request- and per-call-bounded, cancellable tree scanning
+  after spent evidence;
 - event and position validation;
 - atomic confirmation;
 - bundle-local planning; and
@@ -1763,7 +1900,8 @@ The host protects the voting database and backups at rest.
 - Can a pending hash be mistaken for committed failure?
 - Is hash ownership checked across every round and submission kind for the
   captured wallet and chain/network and written atomically with the candidate?
-- Do malformed 404 and semantically unrelated committed responses fail over?
+- Do malformed 404 and committed responses with unsupported event kind, round,
+  or position shape fail over?
 - Does final classification use one post-retirement durable snapshot without
   later blocking reads?
 
@@ -1782,8 +1920,8 @@ The host protects the voting database and backups at rest.
 ### Tree recovery
 
 - Does scanning start at round creation height or safe height zero?
-- Is every request and page bounded and cancellable without imposing a
-  whole-scan cap?
+- Are per-request, per-endpoint-turn, and whole-scan limits enforced with
+  cancellable endpoint rotation?
 - Does pagination have a strict progress requirement?
 - Are pagination, indexes, roots, and canonical leaves validated?
 - Is the full tree scanned after a match?
@@ -1800,6 +1938,9 @@ The host protects the voting database and backups at rest.
 - Can idempotent replay change state?
 - Can an old confirmation rewind the VAN?
 - Must a late hash agree with the immutable receipt?
+- Can cancellation suppress persistence after trusted confirmation validation?
+- Does hash confirmation trust supported event positions without requiring a
+  commitment-tree read?
 - Can hash-based `AlreadyConfirmed` invent positions no immutable receipt
   preserves?
 
@@ -1876,14 +2017,22 @@ In `zcash_voting/src/chain_submission/tests/cancellation_concurrency.rs`:
   failure after every fallible persistence boundary in the attempt loop.
 - `final_snapshot_read_failure_preserves_in_memory_evidence` covers an accepted
   hash, hashless ambiguity, spent evidence, and a committed failure learned by
-  the current pass.
+  the current pass, requiring `OutcomeUnknown` for every absence-dependent
+  result.
+- `final_snapshot_failure_preserves_confirmed_evidence` covers confirmation
+  durably committed by this call, previously observed durable confirmation, and
+  both unapplied-confirmation outcomes.
 - `cancellation_at_each_wait_preserves_stronger_evidence` covers POST, lookup,
-  retirement, final snapshot, retry backoff, and tree scan.
+  retirement, final snapshot, retry backoff, and tree scan before the
+  confirmation commit point.
 - `cancellation_before_retirement_defers_write_and_keeps_storage_guard` proves
   the current result reflects the failure while replacement remains blocked
   until a later pass persists retirement.
-- `confirmation_cancellation_check_runs_behind_both_write_locks` cancels after
-  the database mutex and after `BEGIN IMMEDIATE`; neither case writes.
+- `validated_hash_confirmation_is_non_cancellable_through_persistence` cancels
+  while the confirmation transaction waits for the database and SQLite locks
+  and still commits.
+- `validated_tree_recovery_is_non_cancellable_through_persistence` applies the
+  same boundary after one complete trusted layout.
 - `final_snapshot_excludes_retired_and_includes_racing_candidates` proves both
   directions of candidate-set freshness.
 - `evidence_committed_after_snapshot_is_seen_by_every_mutation_gate` races a
@@ -1898,10 +2047,13 @@ In `zcash_voting/src/chain_submission/tests/reconciliation.rs`:
   success+failure, failure+pending, failure+unreadable, two failures, and a
   concurrent new candidate.
 - `aggregate_outcome_matrix_is_independent_of_iteration_order` permutes
-  accepted, pending, unknown, and unjournaled-accepted evidence and verifies the
-  complete priority table and sorted candidate set.
+  durable confirmation, unapplied confirmation, spent, accepted, pending,
+  unknown, and unjournaled-accepted evidence and verifies the complete priority
+  table and sorted candidate set.
 - `rejected_outcome_uses_lowest_attempt_id_provenance` permutes multiple
   rejection codes and reasons and requires the same oldest journaled rejection.
+- `domain_only_failure_has_deterministic_rejected_provenance` covers one and
+  multiple compatibility hashes without attempt rows.
 - `later_rejection_and_cancellation_never_erase_older_ambiguity` covers every
   retry gate and fallible exit.
 - `terminal_lookup_error_is_below_every_positive_evidence_class` covers
@@ -1919,9 +2071,12 @@ In `zcash_voting/src/chain/mod.rs`:
   malformed JSON, and a wrong error value with `application/json`.
 - `status_body_contradiction_is_unusable` covers 200 with nonzero code and 422
   with zero code.
-- `syntactic_and_semantic_lookup_failures_both_fail_over` includes wrong round,
-  kind, proposal set, batch order, nullifier, and commitment events on
-  committed-success responses.
+- `syntactic_and_supported_event_shape_failures_both_fail_over` includes wrong
+  round or kind, duplicate required events, invalid positions, and a wrong
+  batch position count on committed-success responses.
+- `trusted_hash_confirmation_uses_event_positions_without_tree_reads` proves
+  no commitment, nullifier, proposal, or batch-digest comparison is required
+  after the known owned hash receives a supported trusted confirmation.
 - `contradictory_committed_endpoint_answers_write_nothing` covers
   success/failure disagreement and different event-derived positions for one
   hash, returning `OutcomeUnknown` with that candidate preserved.
@@ -2008,15 +2163,20 @@ In `zcash_voting/src/vote_commitment_tree_client/tests.rs`:
 - `invalid_page_matrix_fails_over` covers range, height, start index, cursor,
   absolute index, canonical field, final size, and final root failures.
 - `latest_and_page_response_body_limits_are_independently_enforced` applies the
-  1 MiB interpreted-body limit to both endpoints.
+  16 MiB interpreted-body limit to both endpoints.
 - `pagination_must_make_strict_progress` rejects cursor and index stalls.
 - `freshest_consistent_snapshot_is_scanned_first` covers ordering and
   same-height root contradictions.
-- `valid_scan_larger_than_128_pages_completes` proves there is no hidden total
-  page cap.
-- `very_large_valid_snapshot_is_constant_memory_and_cancellable` checks
-  streaming memory behavior, per-request timeout, and prompt cancellation for
-  an enormous finite `next_index`.
+- `mobile_month_scale_scan_completes_within_hard_ceilings` covers two million
+  leaves under the request, byte, and virtual-time limits.
+- `whole_scan_limit_matrix_returns_pending_without_partial_writes` crosses the
+  leaf, request, byte, and elapsed-time ceilings independently.
+- `endpoint_turn_rotation_prevents_freshest_snapshot_starvation` suspends and
+  resumes per-endpoint cursors at each 128-request, 32-MiB, and 10-minute turn.
+- `maximum_legal_block_response_fits_the_16_mib_body_limit` pins the live
+  vote-sdk/consensus feasibility boundary.
+- `large_valid_snapshot_is_constant_memory_and_cancellable` checks streaming
+  memory behavior, per-request timeout, and prompt cancellation.
 - `complete_scan_continues_after_match` detects duplicate complete layouts and
   does not expose match position through request count.
 - `partial_duplicate_or_independent_leaves_do_not_confirm` covers every output
@@ -2033,6 +2193,12 @@ In `zcash_voting/src/confirmation.rs`:
 - `identical_hash_or_receipt_replay_is_idempotent`.
 - `conflicting_hash_or_receipt_writes_nothing`.
 - `old_confirmation_cannot_rewind_later_van`.
+- `hash_confirmation_storage_failure_returns_confirmed_but_unapplied` preserves
+  the trusted hash and parsed confirmation with no partial domain write.
+- `tree_confirmation_storage_failure_returns_recovered_but_unapplied` preserves
+  the complete recovery result with no partial domain write.
+- `successful_confirmation_persistence_precedes_the_final_snapshot` covers both
+  confirmation sources.
 - `hash_already_confirmed_does_not_invent_historical_positions` advances the
   bundle VAN after confirmation and requires a hash-only result.
 - `tree_already_confirmed_returns_positions_from_immutable_receipt` performs the
@@ -2050,6 +2216,8 @@ In `zcash_voting/src/chain_submission/tests/public_contract.rs`:
   domain and journal candidates and rejects preferred-hash selection.
 - `submitted_projection_never_omits_poll_or_recovery_evidence` covers
   journal-only delegation, singleton, and batch acceptance.
+- `unapplied_confirmation_outcomes_round_trip_through_wire_and_ffi` covers
+  stable discriminants, evidence payloads, and bounded storage diagnostics.
 - `outcome_unknown_plans_exact_generation_retry`.
 - `restarted_software_delegation_plans_signing_before_retry`.
 - `spent_recoverable_generation_plans_tree_recovery`.
@@ -2101,6 +2269,7 @@ Vizor integration coverage uses these stable scenario IDs:
 - `chain_spent_missing_private_material_advances_other_bundles`;
 - `chain_timeout_or_unusable_response_retries_same_generation`;
 - `chain_delayed_tree_indexing_remains_recoverable`;
-- `chain_account_or_session_cancellation_suppresses_stale_writes`;
+- `chain_cancellation_before_confirmation_commit_point_suppresses_stale_writes`;
+- `chain_cancellation_after_confirmation_commit_point_does_not_suppress_persistence`;
 - `chain_journal_only_acceptance_restores_every_public_projection`; and
 - `chain_unresolved_bundle_does_not_stop_independent_work`.
