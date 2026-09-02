@@ -234,6 +234,32 @@ Recovering -> Recovering     candidate, retry, no match, or interruption
 Recovering -> Confirmed      candidate success or exact tree layout
 ```
 
+The same lifecycle is shown as a text state machine below:
+
+```text
+new
+ `-- reserve before POST --> Submitting
+                              |-- usable success hash --> Tracking
+                              |                           |-- pending --> Tracking
+                              |                           |-- window expires --> Recovering
+                              |                           |-- committed success --> Confirmed
+                              |                           `-- committed failure --> Rejected
+                              |-- possibly dispatched --> Recovering
+                              |                           |-- candidate, scan, or retry --> Recovering
+                              |                           `-- candidate success or exact tree layout
+                              |                               --> Confirmed
+                              |-- definite rejection --> Rejected
+                              `-- definitely unsent first attempt --> no row
+
+abandoned Submitting on restart -- normalize --> Recovering
+unresolved legacy evidence ------ migrate ----> Recovering
+complete legacy projection ------ migrate ----> LegacyConfirmed
+```
+
+The absence of `Recovering -> Tracking` and `Recovering -> Rejected` edges is
+intentional. Once recovery ambiguity exists, only confirmation or explicit
+deletion can resolve or remove it.
+
 `Recovering` does not transition to `Tracking` or `Rejected`. In particular, a
 later hash, rejection, committed-failure candidate, cancellation, or empty scan
 cannot erase the original ambiguity. A pending or unreadable candidate is never
