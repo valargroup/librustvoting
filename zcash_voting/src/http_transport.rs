@@ -14,6 +14,9 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 
+use crate::chain_submission::{
+    ChainHttpRequest, ChainHttpResponse, ChainTransport, ChainTransportError, ChainTransportFuture,
+};
 use crate::helper::transport::{
     HelperFuture, HelperResponse, HelperTransport, HelperTransportError, MAX_HELPER_RESPONSE_BYTES,
 };
@@ -61,11 +64,11 @@ struct HyperResponse {
 
 /// Hyper HTTP transport for client-side network requests.
 ///
-/// `zcash_voting` keeps PIR and tree-sync fetching behind small transport
-/// traits, and includes this adapter for consumers that want pooled HTTP
-/// traffic without implementing those protocol transports. [`Self::new`]
-/// uses direct HTTP/HTTPS; hosts can instead inject a connector for proxies,
-/// custom DNS, or route-lifecycle enforcement.
+/// `zcash_voting` keeps PIR, tree-sync, helper, and vote-chain traffic behind
+/// small transport traits, and includes this adapter for consumers that want
+/// pooled HTTP traffic without implementing those protocol transports.
+/// [`Self::new`] uses direct HTTP/HTTPS; hosts can instead inject a connector
+/// for proxies, custom DNS, or route-lifecycle enforcement.
 pub struct HyperTransport {
     client: Box<dyn HyperRequestClient>,
     runtime: BlockingRuntime,
@@ -109,9 +112,9 @@ impl HyperTransport {
     ///
     /// Unlike [`Self::with_http_connector`], this does not add TLS or install a
     /// Rustls crypto provider. The caller owns all scheme, TLS, trust-root, and
-    /// routing behavior supplied by the connector. Helper request deadlines,
+    /// routing behavior supplied by the connector. Request deadlines,
     /// response limits, response metadata, and ambiguous-outcome
-    /// classification remain enforced by this transport and `HelperClient`.
+    /// classification remain enforced for helper and vote-chain traffic.
     pub fn with_connector<C>(connector: C) -> Self
     where
         C: Connect + Clone + Send + Sync + 'static,
@@ -354,6 +357,82 @@ impl HelperTransport for HyperTransport {
     }
 }
 
+impl HyperTransport {
+    async fn chain_request(
+        &self,
+        method: Method,
+        metadata: ChainHttpRequest,
+        body: Vec<u8>,
+    ) -> std::result::Result<ChainHttpResponse, ChainTransportError> {
+        let mut builder = Request::builder().method(method).uri(metadata.url());
+        for (name, value) in metadata.headers() {
+            builder = builder.header(name, value);
+        }
+        let request = builder
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|error| {
+                ChainTransportError::definitely_unsent(format!(
+                    "build vote-chain request failed: {error}"
+                ))
+            })?;
+
+        tokio::time::timeout(metadata.timeout(), async {
+            let response = self.client.request(request).await.map_err(|error| {
+                let message = format!("send vote-chain request failed: {error}");
+                if error.is_connect() {
+                    ChainTransportError::definitely_unsent(message)
+                } else {
+                    ChainTransportError::possibly_dispatched(message)
+                }
+            })?;
+            let status = response.status().as_u16();
+            let content_type = response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let headers = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .collect();
+            let body = Limited::new(response.into_body(), metadata.max_response_bytes())
+                .collect()
+                .await
+                .map_err(|error| {
+                    ChainTransportError::possibly_dispatched(format!(
+                        "read vote-chain response body (limit {} bytes) failed: {error}",
+                        metadata.max_response_bytes()
+                    ))
+                })?
+                .to_bytes()
+                .to_vec();
+            Ok(ChainHttpResponse::new(status, body, content_type, headers))
+        })
+        .await
+        .map_err(|_| ChainTransportError::possibly_dispatched("vote-chain request timed out"))?
+    }
+}
+
+impl ChainTransport for HyperTransport {
+    fn chain_get<'a>(&'a self, request: ChainHttpRequest) -> ChainTransportFuture<'a> {
+        Box::pin(async move { self.chain_request(Method::GET, request, Vec::new()).await })
+    }
+
+    fn chain_post_json<'a>(
+        &'a self,
+        request: ChainHttpRequest,
+        json: Vec<u8>,
+    ) -> ChainTransportFuture<'a> {
+        Box::pin(async move { self.chain_request(Method::POST, request, json).await })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -374,6 +453,8 @@ mod tests {
     use hyper_util::client::legacy::connect::HttpConnector;
     use tower_service::Service;
 
+    use crate::chain_submission::{ChainHttpRequest, ChainTransportFailureKind};
+
     use super::{
         BlockingRuntime, HelperTransport, HelperTransportError, HyperTransport,
         MAX_HELPER_RESPONSE_BYTES,
@@ -382,6 +463,11 @@ mod tests {
     #[derive(Clone)]
     struct ObservedConnector {
         inner: HttpConnector,
+        called: Arc<AtomicBool>,
+    }
+
+    #[derive(Clone)]
+    struct BlockedConnector {
         called: Arc<AtomicBool>,
     }
 
@@ -398,6 +484,27 @@ mod tests {
         fn call(&mut self, uri: Uri) -> Self::Future {
             self.called.store(true, Ordering::Release);
             Box::pin(Service::call(&mut self.inner, uri))
+        }
+    }
+
+    impl Service<Uri> for BlockedConnector {
+        type Response = <HttpConnector as Service<Uri>>::Response;
+        type Error = std::io::Error;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _uri: Uri) -> Self::Future {
+            self.called.store(true, Ordering::Release);
+            Box::pin(async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "privacy route unavailable",
+                ))
+            })
         }
     }
 
@@ -605,6 +712,235 @@ mod tests {
             Some("application/json; charset=utf-8")
         );
         server.join().unwrap();
+    }
+
+    fn chain_request(
+        url: String,
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> ChainHttpRequest {
+        ChainHttpRequest::new(
+            url,
+            vec![
+                ("accept".to_string(), "application/json".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+            timeout,
+            max_response_bytes,
+        )
+    }
+
+    #[tokio::test]
+    async fn chain_transport_applies_sdk_metadata_and_preserves_response_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request_headers(&mut stream).to_ascii_lowercase();
+            assert!(request.starts_with("post /shielded-vote/v1/cast-vote "));
+            assert!(request.contains("accept: application/json\r\n"));
+            assert!(request.contains("content-type: application/json\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nX-Chain: vote\r\nContent-Length: 2\r\n\r\n{}",
+                )
+                .unwrap();
+        });
+
+        let transport = HyperTransport::new();
+        let response = crate::chain_submission::ChainTransport::chain_post_json(
+            &transport,
+            chain_request(
+                format!("http://{address}/shielded-vote/v1/cast-vote"),
+                Duration::from_secs(1),
+                1024,
+            ),
+            br#"{"vote":"yes"}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), b"{}");
+        assert_eq!(
+            response.content_type(),
+            Some("application/json; charset=utf-8")
+        );
+        assert!(response
+            .headers()
+            .iter()
+            .any(|(name, value)| name == "x-chain" && value == "vote"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn chain_refused_connection_is_definitely_unsent() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let transport = HyperTransport::new();
+
+        let error = crate::chain_submission::ChainTransport::chain_post_json(
+            &transport,
+            chain_request(
+                format!("http://{address}/shielded-vote/v1/delegate-vote"),
+                Duration::from_secs(1),
+                1024,
+            ),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ChainTransportFailureKind::DefinitelyUnsent);
+    }
+
+    #[tokio::test]
+    async fn chain_timeout_and_response_limit_are_possibly_dispatched() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let timeout_server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request_headers(&mut stream);
+            thread::sleep(Duration::from_millis(100));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            );
+        });
+        let transport = HyperTransport::new();
+        let timeout = crate::chain_submission::ChainTransport::chain_post_json(
+            &transport,
+            chain_request(
+                format!("http://{address}/shielded-vote/v1/delegate-vote"),
+                Duration::from_millis(25),
+                1024,
+            ),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            timeout.kind(),
+            ChainTransportFailureKind::PossiblyDispatched
+        );
+        timeout_server.join().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let limit_server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request_headers(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 3\r\n\r\n{}x",
+                )
+                .unwrap();
+        });
+        let limit = crate::chain_submission::ChainTransport::chain_post_json(
+            &transport,
+            chain_request(
+                format!("http://{address}/shielded-vote/v1/delegate-vote"),
+                Duration::from_secs(1),
+                2,
+            ),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(limit.kind(), ChainTransportFailureKind::PossiblyDispatched);
+        limit_server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_chain_response_is_possibly_dispatched() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request_headers(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n{}",
+                )
+                .unwrap();
+        });
+        let transport = HyperTransport::new();
+
+        let error = crate::chain_submission::ChainTransport::chain_post_json(
+            &transport,
+            chain_request(
+                format!("http://{address}/shielded-vote/v1/delegate-vote"),
+                Duration::from_secs(1),
+                1024,
+            ),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ChainTransportFailureKind::PossiblyDispatched);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn chain_transport_returns_redirect_without_following_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request_headers(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/leak\r\nContent-Length: 0\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let transport = HyperTransport::new();
+
+        let response = crate::chain_submission::ChainTransport::chain_post_json(
+            &transport,
+            chain_request(
+                format!("http://{address}/shielded-vote/v1/delegate-vote"),
+                Duration::from_secs(1),
+                1024,
+            ),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), 307);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failing_injected_privacy_connector_never_falls_back_to_direct_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let transport = HyperTransport::with_http_connector(BlockedConnector {
+            called: called.clone(),
+        });
+
+        let error = crate::chain_submission::ChainTransport::chain_post_json(
+            &transport,
+            chain_request(
+                format!("http://{address}/shielded-vote/v1/delegate-vote"),
+                Duration::from_secs(1),
+                1024,
+            ),
+            b"{}".to_vec(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(called.load(Ordering::Acquire));
+        assert_eq!(error.kind(), ChainTransportFailureKind::DefinitelyUnsent);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]

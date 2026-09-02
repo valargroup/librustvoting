@@ -5,13 +5,15 @@
 //! needed by mobile SDK boundaries without exposing proof-circuit internals.
 
 pub use crate::chain_submission::{
-    CandidateTransactionHash, CandidateTransactionHashError, ChainSubmissionConfirmation,
-    ChainSubmissionConfirmationError, ChainSubmissionConfirmationSource, ChainSubmissionDiagnostic,
-    ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,
-    ChainSubmissionFailureState, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
-    ChainSubmissionIdentity, ChainSubmissionIdentityError, ChainSubmissionPending,
-    ChainSubmissionResult, ChainSubmissionState, ChainSubmissionStateEvidence,
-    ChainSubmissionTarget, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse,
+    ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
+    ChainSubmissionConfirmationSource, ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind,
+    ChainSubmissionFailure, ChainSubmissionFailureKind, ChainSubmissionFailureState,
+    ChainSubmissionGeneration, ChainSubmissionGenerationDigest, ChainSubmissionIdentity,
+    ChainSubmissionIdentityError, ChainSubmissionPending, ChainSubmissionResult,
+    ChainSubmissionState, ChainSubmissionStateEvidence, ChainSubmissionTarget, ChainTransport,
+    ChainTransportError, ChainTransportFailureKind, ChainTransportFuture,
+    MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
 
 pub use crate::confirmation::{
