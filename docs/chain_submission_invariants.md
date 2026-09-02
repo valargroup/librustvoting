@@ -630,10 +630,28 @@ synthesizes a transaction hash.
 Hash confirmation requires trusted committed success and a supported event
 shape for the exact identity and generation. Tree confirmation requires one
 complete unique layout as defined above.
-The supported hash-confirmation event contains exactly one round attribute
-under either supported alias and exactly one position attribute. Duplicate
-attributes, both round aliases, conflicting values, multiple matching events,
-malformed positions, or positions outside SQLite's range are not evidence.
+Every supported hash-confirmation event contains exactly one round attribute
+under either supported alias, and exactly one event of the expected type may
+match that round. Delegation and singleton vote events contain exactly one
+`leaf_index` position attribute; the singleton value contains the final VAN
+position followed by its vote-commitment position.
+
+An atomic batch confirms by hash only from one round-matching
+`cast_vote_batch` event containing exactly one each of `batch_digest`,
+`batch_size`, `final_van_leaf_index`, `vote_commitment_leaf_indices`,
+`proposal_ids`, and `van_nullifiers`. The digest must be canonical lowercase
+32-byte hex and equal the locked ordered batch digest. The size must be within
+the protocol range and equal the locked action count. Proposal IDs must equal
+the locked proposal roster in signed action order. VAN nullifiers must each be
+canonical lowercase 32-byte hex and equal the locked nullifiers in that same
+order. The vote-commitment position list must contain exactly the declared
+number of entries, and entry `i` must equal
+`final_van_leaf_index + 1 + i`; overflow is not evidence.
+
+Duplicate required attributes, both round aliases, conflicting values,
+multiple matching events, malformed values, incomplete or reordered batch
+lists, nonadjacent positions, or positions outside SQLite's range are not
+evidence.
 
 Immediately before confirmation, the lifecycle reloads and re-derives the
 locked generation. It rejects changed choice, membership, order, nullifier,
