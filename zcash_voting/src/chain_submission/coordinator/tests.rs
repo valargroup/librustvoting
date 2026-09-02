@@ -84,6 +84,44 @@ async fn exact_recovery_confirms_without_a_hash_and_clamps_timestamp() {
 }
 
 #[tokio::test]
+async fn failed_tree_confirmation_reports_durable_recovery_and_rolls_back_projection() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    store.fail_next_confirmation();
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    for response in tree_responses(&[[8; 32], [3; 32], [4; 32], [7; 32]]) {
+        transport.queue(Ok(response));
+    }
+
+    let failure = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    )
+    .advance_with_recovery(
+        StoreAdvancementRequest::vote(identity.clone()),
+        ChainRecoveryMode::ExactTree,
+        &ManualControl::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Storage);
+    assert_eq!(
+        failure.strongest_state().unwrap().state(),
+        ChainSubmissionState::Recovering
+    );
+    assert_eq!(
+        store.record(&identity).unwrap().durable_state(),
+        ChainSubmissionState::Recovering
+    );
+    assert!(store.projection(&identity).is_none());
+}
+
+#[tokio::test]
 async fn fresh_ambiguous_post_exhausts_one_attempt_before_no_match_recovery() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());

@@ -904,14 +904,28 @@ where
                 error.message(),
             )
         })?;
-        match self.store.confirm_tree(
-            request,
-            derived.generation(),
-            final_van_position,
-            vote_commitment_positions,
-            &allowed,
-            now,
-        )? {
+        let committed = self
+            .store
+            .confirm_tree(
+                request,
+                derived.generation(),
+                final_van_position,
+                vote_commitment_positions,
+                &allowed,
+                now,
+            )
+            .map_err(|error| {
+                if error.strongest_state().is_some() {
+                    error
+                } else {
+                    ChainSubmissionFailure::with_durable_state(
+                        error.kind(),
+                        ChainSubmissionState::Recovering,
+                        error.message(),
+                    )
+                }
+            })?;
+        match committed {
             ConfirmationCommit::Interrupted(record) | ConfirmationCommit::Confirmed(record) => {
                 record.public_result()
             }

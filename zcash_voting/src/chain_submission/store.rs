@@ -1051,9 +1051,8 @@ pub(super) mod memory {
                     hook();
                 }
                 if self.fail_confirmation.swap(false, Ordering::SeqCst) {
-                    return Err(ChainSubmissionFailure::with_durable_state(
+                    return Err(ChainSubmissionFailure::without_state(
                         ChainSubmissionFailureKind::Storage,
-                        record.durable_state(),
                         "injected atomic confirmation failure",
                     ));
                 }
@@ -1126,6 +1125,12 @@ pub(super) mod memory {
                         error.to_string(),
                     )
                 })?;
+                if self.fail_confirmation.swap(false, Ordering::SeqCst) {
+                    return Err(ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::Storage,
+                        "injected atomic confirmation failure",
+                    ));
+                }
                 let previous = record.durable_state();
                 let mut confirmed = record;
                 confirmed.state = apply_submission_observation(
