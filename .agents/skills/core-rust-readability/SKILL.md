@@ -3,18 +3,18 @@ name: core-rust-readability
 description: >-
   Keep core Rust code semantically named, discoverable, cohesive, and
   understandable as a black box. Prefer facade modules with private children
-  over overloaded files. For key Rust crates (zakura-chain, zakura-consensus,
-  zakura-header-chain, zakura-network, zakura-rpc, zakura-script, zakura-state),
-  confirm with the user during planning before applying; do not auto-apply
-  mid-implementation. Also use when the user asks for readability, naming,
-  module decomposition, or facade-package refactors in those crates.
+  over overloaded files. Apply automatically whenever writing or editing Rust in
+  this workspace (zcash_voting, vote-commitment-tree, vote-commitment-tree-client,
+  wallet-example). Also use when the user asks for readability, naming, module
+  decomposition, or facade-package refactors.
 ---
 
 # Human-Readable Core Rust
 
-Apply this skill when editing the key Rust crates listed in the description.
+Apply this skill to all Rust in this workspace: `zcash_voting`,
+`vote-commitment-tree`, `vote-commitment-tree-client`, and `wallet-example`.
 
-Confirm application with user during planning process instead of auto-applying. If already implementing the plan, do not auto-apply and do not interrupt the plan.
+Apply it by default while writing code. It does not need confirmation.
 
 Write for a human reviewer who should understand the architecture and each API
 without asking an AI to reconstruct intent.
@@ -50,7 +50,21 @@ Do not grow overloaded multi-responsibility files. When a module mixes a high-le
 - Prefer behavior-grouped tests with shared fixtures over source-layout guards that break when files move.
 - Pure module moves should preserve the external API; visibility tightening is a separate change.
 
-Reference: `crates/zakura-header-chain/src/transition/{planner,types,recovery}`.
+Reference the two modules in this repository that already implement this
+pattern, and match their shape:
+
+- `zcash_voting/src/share_policy/` — a 190-line facade `mod.rs` holding only the
+  child `mod` declarations, the shared DTOs, and a re-export block; mechanism
+  lives in the phase children `initial_placement.rs`, `server_order.rs`,
+  `submission_schedule.rs`, and `timing.rs`.
+- `zcash_voting/src/share_tracking/` — the same shape, with children declared
+  privately and only `pub(crate) use` leakage, and a module-level doc comment
+  stating where the module sits in the pipeline and what it guarantees.
+
+Both keep behavior-grouped tests in a `tests/` sibling directory with a shared
+`fixtures.rs`, rather than an inline `#[cfg(test)] mod tests` appended to the
+production file. New code should follow that layout; large files that still
+carry inline test modules are legacy, not the standard.
 
 ## Production and Test Boundaries
 

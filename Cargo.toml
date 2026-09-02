@@ -27,3 +27,14 @@ opt-level = 3
 
 [profile.test.package.valar-spiral-rs]
 opt-level = 3
+
+# Debug info dominates link time across the ~900-test suite and is the main
+# reason `target/` grows without bound. Line tables preserve backtraces and
+# panic locations; full DWARF for third-party crates buys nothing locally.
+# CI achieves the same for one job via CARGO_PROFILE_TEST_DEBUG=0.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
