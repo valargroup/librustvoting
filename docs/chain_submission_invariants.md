@@ -10,7 +10,8 @@ The design has one authoritative `chain_submissions` row for each semantic
 generation, plus migration-only legacy guards for v17 chain evidence whose
 generation cannot be reconstructed. A complete legacy confirmation uses
 `LegacyConfirmed`; incomplete evidence uses a digestless `Recovering` guard.
-It does not use an attempt journal or a durable scan workflow.
+Digestless guards remain permanently unbound. The design does not use an
+attempt journal or a durable scan workflow.
 
 The normal path is:
 
@@ -147,9 +148,8 @@ Position zero is valid. Schema checks require a digest for every native row.
 They require `LegacyConfirmed` to have source `legacy_projection`, both
 observed positions, no candidate hash, attempts, or tracking-start timestamp,
 and no recovery transitions. A digestless `Recovering` guard likewise has no
-candidate, attempts, or tracking-start timestamp and cannot scan, retry, or
-confirm unless complete recovery inputs first permit the same generation to be
-derived and atomically bound to the row.
+candidate, attempts, or tracking-start timestamp. It can never acquire a
+generation digest or candidate and cannot scan, retry, or confirm.
 
 The row does not store:
 
@@ -201,8 +201,9 @@ Their meanings are:
   or the bounded tracking window expired inconclusively. An optional candidate
   hash is polled before tree recovery. Migration may also create a digestless
   guard when v17 contains incomplete chain evidence without derivation inputs;
-  that guard performs no network work while unbound. The state is sticky until
-  confirmation or explicit deletion.
+  that guard remains permanently unbound and performs no network work. An
+  ordinary generation-bound state is sticky until confirmation or explicit
+  deletion; a digestless guard remains until explicit deletion.
 - `Confirmed`: chain success and all required local confirmation updates are
   durable. New confirmations record `hash` or `tree` as their source and record
   the exact generation positions. Fully reconstructable migrated version-17
@@ -257,8 +258,7 @@ Before releasing any POST byte, the lifecycle:
    submission-identity lock;
 2. derives the recovery-independent identity and loads its authoritative row;
 3. returns `LegacyConfirmed`, or returns a digestless `Recovering` guard as
-   pending when complete inputs cannot bind it, before requiring recovery
-   material;
+   pending with `RecoveryUnavailable`, before requiring recovery material;
 4. loads and locks the generation inputs and derives the generation digest and
    expected layout;
 5. creates the `Submitting` row, or validates the existing same-generation
@@ -272,9 +272,9 @@ pass. They clear any inconclusive candidate and increment the attempt count in
 the same immediate transaction. There is no standalone candidate-retirement
 mutation and an empty candidate slot is not retry authorization.
 
-Guard lookup, optional binding of a digestless `Recovering` guard, and native
-row insertion share the same identity lock and immediate transaction, so a
-concurrent call cannot bypass the guard.
+Guard lookup and native row insertion share the same identity lock and
+immediate transaction, so a concurrent call cannot bypass or replace the
+guard.
 
 If reservation fails, dispatch does not occur. A process-local in-flight guard
 prevents cleanup, replacement, or deletion from racing response
@@ -548,7 +548,7 @@ atomic retirement-and-reservation or committed-failure clearing, without
 implying that a retired transaction failed or that another retry is already
 authorized. For an unbound legacy guard it also carries no candidate, uses the
 stable `RecoveryUnavailable` diagnostic, authorizes no network recovery, and
-must not be automatically rescheduled until derivation inputs change.
+is never automatically rescheduled.
 `Rejected` means the durable row is terminally rejected.
 
 `LegacyConfirmed` is returned publicly as `Confirmed` with source
@@ -694,8 +694,8 @@ Migration classifies version-17 rows in this order:
    without a candidate.
 5. Incomplete singleton chain evidence with absent recovery JSON becomes a
    digestless `Recovering` guard with no candidate. Its original columns remain
-   intact, but it performs no polling, scanning, retry, or confirmation until
-   complete inputs can atomically bind it to a derived generation.
+   intact, but it remains permanently unbound and performs no polling,
+   scanning, retry, or confirmation.
 6. Any remaining shape, including an unprovable batch or delegation that
    cannot be represented without guessing, aborts migration atomically.
 
@@ -711,6 +711,14 @@ delegation output. A reconstructable delegation with that shape follows the
 `Tracking` or `Recovering` rules above; a shape that cannot be represented
 without guessing aborts migration atomically and preserves the version-17
 database.
+
+Permanently guarding an affected legacy identity can block that identity and
+dependent work even if its pre-upgrade transaction actually committed. This
+availability risk is accepted because the required combination of incomplete
+version-17 chain evidence and absent recovery JSON is expected to occur with
+low probability. Later recovery inputs are not accepted as proof of the
+original generation: without a durable cryptographic anchor, they may describe
+a different input nullifier or output layout.
 
 Migration validates complete unique ownership of canonical hashes imported
 into authoritative candidate or confirmation fields across wallet,
@@ -888,13 +896,13 @@ Tests cover:
   complete recorded VAN and VC positions migrate to `LegacyConfirmed`, expose
   source `legacy_projection`, no confirmed hash or validated layout, block
   dispatch, and survive cleanup;
-- digestless `Recovering` guards preserve incomplete v17 evidence, cannot
-  dispatch or reconcile without first binding complete derivation inputs, and
-  survive cleanup;
+- digestless `Recovering` guards preserve incomplete v17 evidence, remain
+  permanently unbound, cannot dispatch or reconcile, reject every runtime
+  transition, and survive cleanup;
 - an empty v17 vote row creates no submission row or guard;
 - unbound `Pending(Recovering)` reports `RecoveryUnavailable`, authorizes and
   schedules no network work across restart, and atomically excludes a competing
-  native row while binding or rolling back;
+  native row or attempted replacement;
 - schema constraints cover digest nullability, legacy sources, zero attempts,
   null candidates and tracking timestamps, required observed positions,
   partial guard uniqueness, and legacy/native identity exclusion;
