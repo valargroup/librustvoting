@@ -30,6 +30,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   signature writes must match the current bundle setup and verify before the
   atomic batch commits.
 
+### Removed
+
+- Removed the standalone `recovery::clear` and
+  `VotingDb::clear_recovery_state` APIs. Ordinary reset preserves durable
+  submission evidence; explicit round or account deletion remains the
+  destructive cleanup boundary.
+
 ## v3.1.0-rc.15
 
 ### Fixed
