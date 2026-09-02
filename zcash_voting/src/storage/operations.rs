@@ -90,14 +90,45 @@ fn validate_network_matches_round(
     Ok(())
 }
 
-/// Persist one proof atomically while treating `DelegationProved` as a minimum
-/// round phase. Another bundle may already have advanced the shared round to a
-/// later phase, which must not prevent this bundle from completing recovery.
+fn require_unchanged_delegation_signing_context(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    expected: &queries::DelegationSigningContext,
+) -> Result<(), VotingError> {
+    let current = queries::load_delegation_signing_context(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+    )
+    .map_err(|_| VotingError::InvalidInput {
+        message: format!(
+            "delegation setup changed or was cleared while generating ZKP1 for round={round_id}, bundle={bundle_index}; retry from the current setup"
+        ),
+    })?;
+    if current != *expected {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "delegation setup changed or was cleared while generating ZKP1 for round={round_id}, bundle={bundle_index}; retry from the current setup"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Persist one proof only if its captured signing context is still current.
+///
+/// The context check, proof write, and minimum `DelegationProved` phase update
+/// share one immediate transaction. A concurrent session reset therefore
+/// either observes the completed proof or wins first and makes this write fail.
 fn persist_delegation_proof_result(
     conn: &mut rusqlite::Connection,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
+    expected_signing_context: &queries::DelegationSigningContext,
     result: &DelegationProofResult,
 ) -> Result<(), VotingError> {
     let tx = conn
@@ -105,6 +136,13 @@ fn persist_delegation_proof_result(
         .map_err(|e| VotingError::Internal {
             message: format!("failed to begin proof result transaction: {e}"),
         })?;
+    require_unchanged_delegation_signing_context(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        expected_signing_context,
+    )?;
     queries::store_proof(&tx, round_id, wallet_id, bundle_index, &result.proof)?;
     queries::store_proof_result_fields_with_van_comm(
         &tx,
@@ -1214,6 +1252,8 @@ impl VotingDb {
             queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
         validate_delegation_keys_for_round(&params, stored_network, keys)?;
         queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
+        let signing_context =
+            queries::load_delegation_signing_context(&conn, round_id, &wallet_id, bundle_index)?;
         let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
         let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, &wallet_id, bundle_index)?;
         let witnesses = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
@@ -1376,7 +1416,14 @@ impl VotingDb {
         // together. The public inputs are checked against the PCZT fields
         // before any partial proof success state is committed.
         let mut conn = self.conn();
-        persist_delegation_proof_result(&mut conn, round_id, &wallet_id, bundle_index, &result)?;
+        persist_delegation_proof_result(
+            &mut conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            &signing_context,
+            &result,
+        )?;
 
         let total_elapsed = total_start.elapsed();
         eprintln!(
@@ -3117,13 +3164,8 @@ mod tests {
         assert!(err.to_string().contains("refusing to regress round phase"));
     }
 
-    #[test]
-    fn test_persist_delegation_proof_keeps_later_round_phase() {
-        let db = test_db();
-        db.init_round(Network::Testnet, &test_params(), None)
-            .unwrap();
-
-        let result = DelegationProofResult {
+    fn delegation_proof_result_fixture() -> DelegationProofResult {
+        DelegationProofResult {
             proof: vec![0xA0; 96],
             public_inputs: Vec::new(),
             nf_signed: vec![0x30; 32],
@@ -3131,42 +3173,57 @@ mod tests {
             gov_nullifiers: vec![vec![0x20; 32]; BUNDLE_NOTE_SLOTS],
             van_comm: vec![0x50; 32],
             rk: vec![0x10; 32],
-        };
-        {
-            let conn = db.conn();
-            queries::insert_bundle(&conn, ROUND_ID, W, 0, &[0]).unwrap();
-            queries::store_delegation_data_with_pczt_fields(
-                &conn,
-                ROUND_ID,
-                W,
-                0,
-                &[0x01; 32],
-                &[],
-                &[0x02; 32],
-                &[],
-                &result.nf_signed,
-                &result.cmx_new,
-                &[0x03; 32],
-                &[0x04; 32],
-                &[0x05; 32],
-                &result.van_comm,
-                1,
-                0,
-                &[],
-                &[0x06; 32],
-                &crate::tx1::placeholder_tx1_effects(),
-                &[0x07],
-                &result.rk,
-                &result.gov_nullifiers,
-            )
-            .unwrap();
         }
+    }
+
+    fn store_delegation_proof_setup_fixture(
+        db: &VotingDb,
+        result: &DelegationProofResult,
+    ) -> queries::DelegationSigningContext {
+        let conn = db.conn();
+        queries::insert_bundle(&conn, ROUND_ID, W, 0, &[0]).unwrap();
+        queries::store_delegation_data_with_pczt_fields(
+            &conn,
+            ROUND_ID,
+            W,
+            0,
+            &[0x01; 32],
+            &[],
+            &[0x02; 32],
+            &[],
+            &result.nf_signed,
+            &result.cmx_new,
+            &[0x03; 32],
+            &[0x04; 32],
+            &[0x05; 32],
+            &result.van_comm,
+            1,
+            0,
+            &[],
+            &[0x06; 32],
+            &crate::tx1::placeholder_tx1_effects(),
+            &[0x07],
+            &result.rk,
+            &result.gov_nullifiers,
+        )
+        .unwrap();
+        queries::load_delegation_signing_context(&conn, ROUND_ID, W, 0).unwrap()
+    }
+
+    #[test]
+    fn test_persist_delegation_proof_keeps_later_round_phase() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        let result = delegation_proof_result_fixture();
+        let signing_context = store_delegation_proof_setup_fixture(&db, &result);
         db.advance_round_phase(ROUND_ID, RoundPhase::VoteReady)
             .unwrap();
 
         {
             let mut conn = db.conn();
-            persist_delegation_proof_result(&mut conn, ROUND_ID, W, 0, &result).unwrap();
+            persist_delegation_proof_result(&mut conn, ROUND_ID, W, 0, &signing_context, &result)
+                .unwrap();
             let stored: (Vec<u8>, i64) = conn
                 .query_row(
                     "SELECT proof, success FROM proofs
@@ -3181,6 +3238,34 @@ mod tests {
             db.get_round_state(ROUND_ID).unwrap().phase,
             RoundPhase::VoteReady
         );
+    }
+
+    #[test]
+    fn test_persist_delegation_proof_rejects_setup_cleared_during_generation() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        let result = delegation_proof_result_fixture();
+        let signing_context = store_delegation_proof_setup_fixture(&db, &result);
+
+        db.clear_unsigned_delegation_setup_fields(ROUND_ID).unwrap();
+
+        let mut conn = db.conn();
+        let error =
+            persist_delegation_proof_result(&mut conn, ROUND_ID, W, 0, &signing_context, &result)
+                .expect_err("a cleared proof setup must reject its in-flight result");
+        assert!(error
+            .to_string()
+            .contains("delegation setup changed or was cleared while generating ZKP1"));
+        let proof_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM proofs
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                rusqlite::params![ROUND_ID, W],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(proof_count, 0);
     }
 
     #[test]

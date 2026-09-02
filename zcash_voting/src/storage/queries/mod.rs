@@ -1469,6 +1469,45 @@ pub fn load_pczt_sighash(
     })
 }
 
+/// Write-once signing fields that identify one prepared delegation setup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DelegationSigningContext {
+    pub pczt_sighash: Vec<u8>,
+    pub rk: Vec<u8>,
+}
+
+/// Load the persisted signing context that proof generation must remain bound to.
+pub(crate) fn load_delegation_signing_context(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<DelegationSigningContext, VotingError> {
+    conn.query_row(
+        "SELECT pczt_sighash, rk FROM bundles
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| {
+            Ok(DelegationSigningContext {
+                pczt_sighash: row.get(0)?,
+                rk: row.get(1)?,
+            })
+        },
+    )
+    .map_err(|e| VotingError::InvalidInput {
+        message: format!(
+            "no complete delegation signing context for round={}, bundle={} ({})",
+            round_id, bundle_index, e
+        ),
+    })
+}
+
 /// Load the exact persisted delegation PCZT and its write-once signing fields.
 pub(crate) fn load_delegation_pczt_fields(
     conn: &Connection,
