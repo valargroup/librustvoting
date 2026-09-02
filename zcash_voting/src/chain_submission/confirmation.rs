@@ -277,41 +277,38 @@ fn parse_compat_u64(raw: &str, field: &str) -> Result<u64, VotingError> {
 }
 
 fn parse_csv_u64(raw: &str) -> Result<Vec<u64>, VotingError> {
-    parse_csv(raw, |value| {
-        parse_compat_u64(value, "cast_vote_batch position")
-    })
+    parse_csv(
+        raw,
+        "cast_vote_batch vote_commitment_leaf_indices",
+        |value| parse_compat_u64(value, "cast_vote_batch position"),
+    )
 }
 
 fn parse_csv_u32(raw: &str) -> Result<Vec<u32>, VotingError> {
-    parse_csv(raw, |value| {
-        let parsed = parse_compat_u64(value, "cast_vote_batch proposal id")?;
-        u32::try_from(parsed).map_err(|_| VotingError::InvalidInput {
+    parse_csv(raw, "cast_vote_batch proposal_ids", |value| {
+        let proposal_id = parse_compat_u64(value, "cast_vote_batch proposal id")?;
+        u32::try_from(proposal_id).map_err(|_| VotingError::InvalidInput {
             message: "cast_vote_batch proposal id does not fit u32".to_string(),
         })
     })
 }
 
 fn parse_csv_strings(raw: &str) -> Result<Vec<String>, VotingError> {
-    let values = raw.split(',').map(str::trim).collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
-        return Err(VotingError::InvalidInput {
-            message: "cast_vote_batch list must be nonempty".to_string(),
-        });
-    }
-    for value in &values {
+    parse_csv(raw, "cast_vote_batch van_nullifiers", |value| {
         parse_canonical_hex32(value, "cast_vote_batch VAN nullifier")?;
-    }
-    Ok(values.into_iter().map(str::to_string).collect())
+        Ok(value.to_string())
+    })
 }
 
 fn parse_csv<T>(
     raw: &str,
+    field: &str,
     mut parse: impl FnMut(&str) -> Result<T, VotingError>,
 ) -> Result<Vec<T>, VotingError> {
     let values = raw.split(',').map(str::trim).collect::<Vec<_>>();
     if values.is_empty() || values.iter().any(|value| value.is_empty()) {
         return Err(VotingError::InvalidInput {
-            message: "cast_vote_batch list must be nonempty".to_string(),
+            message: format!("{field} must be a nonempty comma-separated list"),
         });
     }
     values.into_iter().map(&mut parse).collect()
@@ -417,6 +414,8 @@ pub(super) fn apply_confirmed_generation(
 
 #[cfg(test)]
 mod tests {
+    mod batch_event_diagnostics;
+
     use super::*;
     use crate::confirmation::TxEventAttribute;
 
