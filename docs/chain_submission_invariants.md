@@ -1072,6 +1072,16 @@ Phase 6 recovery coverage is anchored by
 `full_tree_capacity_fits_the_fixed_request_and_byte_ceilings`, and
 `tree_confirmation_is_atomic_clamps_timestamp_and_survives_reopen_without_a_hash`.
 
+Phase 7 batch activation coverage is anchored by
+`constructs_exact_atomic_vote_batch_url_and_json`,
+`atomic_vote_batch_uses_shared_lifecycle_and_confirms_ordered_positions`,
+`atomic_vote_batches_from_one_through_protocol_maximum_confirm`,
+`reordered_batch_confirmation_leaves_tracking_authoritative`,
+`exact_recovery_confirms_complete_ordered_batch_layout`,
+`partial_nonadjacent_batch_tree_members_authorize_retry_without_confirmation`,
+`same_batch_concurrency_releases_only_one_atomic_post`, and
+`atomic_batch_tracking_and_confirmation_survive_reopen`.
+
 Generation and confirmation coverage is anchored by
 `generation_transcript_encodes_exact_framing_bytes`,
 `identity_transcript_binds_no_vote_chain_id`,

@@ -357,11 +357,10 @@ where
                     .submit_vote_with_dispatch(endpoint_index, submission, dispatch)
                     .await
             }
-            ChainSubmissionRequest::VoteBatch(_) => {
-                PostAttemptOutcome::LocalFailure(ChainSubmissionDiagnostic::from_redacted_message(
-                    ChainSubmissionDiagnosticKind::InvalidProtocolResponse,
-                    "atomic vote-batch submission is disabled until phase 7",
-                ))
+            ChainSubmissionRequest::VoteBatch(submission) => {
+                self.protocol
+                    .submit_vote_batch_with_dispatch(endpoint_index, submission, dispatch)
+                    .await
             }
         }
     }

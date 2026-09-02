@@ -20,6 +20,7 @@ use super::{
 const API_PREFIX: [&str; 2] = ["shielded-vote", "v1"];
 const DELEGATION_ENDPOINT: &str = "delegate-vote";
 const VOTE_ENDPOINT: &str = "cast-vote";
+const VOTE_BATCH_ENDPOINT: &str = "cast-vote-batch";
 // CheckTx may use its complete 120-second server budget to verify a proof. The
 // client default leaves time for connection setup and response delivery.
 const MIN_CHAIN_POST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -224,6 +225,24 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             }
         };
         self.post(endpoint_index, VOTE_ENDPOINT, body, dispatch)
+            .await
+    }
+
+    pub(super) async fn submit_vote_batch_with_dispatch(
+        &self,
+        endpoint_index: usize,
+        submission: &crate::wire::VoteCommitmentBatchWire,
+        dispatch: ChainPostDispatch,
+    ) -> PostAttemptOutcome {
+        let body = match submission.to_json() {
+            Ok(json) => json.into_bytes(),
+            Err(error) => {
+                return PostAttemptOutcome::LocalFailure(invalid_protocol(format!(
+                    "serialize vote-batch request failed: {error}"
+                )))
+            }
+        };
+        self.post(endpoint_index, VOTE_BATCH_ENDPOINT, body, dispatch)
             .await
     }
 
@@ -762,6 +781,33 @@ mod tests {
         assert_eq!(
             calls[0].1.url(),
             "https://vote.example/shielded-vote/v1/cast-vote"
+        );
+        assert_eq!(calls[0].2, wire.to_json().unwrap().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn constructs_exact_atomic_vote_batch_url_and_json() {
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.queue(Ok(json(200, format!(r#"{{"tx_hash":"{HASH}","code":0}}"#))));
+        let client = protocol_client(
+            transport.clone(),
+            Network::Testnet,
+            &["https://vote.example"],
+        );
+        let wire = crate::wire::VoteCommitmentBatchWire {
+            votes: vec![vote(), vote()],
+        };
+
+        assert!(matches!(
+            client
+                .submit_vote_batch_with_dispatch(0, &wire, ChainPostDispatch::default())
+                .await,
+            PostAttemptOutcome::Accepted(_)
+        ));
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(
+            calls[0].1.url(),
+            "https://vote.example/shielded-vote/v1/cast-vote-batch"
         );
         assert_eq!(calls[0].2, wire.to_json().unwrap().as_bytes());
     }
