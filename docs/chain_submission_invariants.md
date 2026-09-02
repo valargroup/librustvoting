@@ -388,13 +388,15 @@ means the durable row is terminally rejected.
 
 `Cancelled` is returned only when cancellation occurs before possible dispatch
 and no stronger durable state exists. Cancellation never hides `Tracking`,
-`Recovering`, or `Confirmed`. A call cancelled on entry loads the authoritative
-durable state under the normal lifecycle locks. If it finds an abandoned
-`Submitting` row, it must atomically normalize that row to `Recovering` and
-return `Pending(Recovering)`; the possibly dispatched request is stronger
-evidence than the current call's cancellation. This conservative normalization
-is the only write permitted on a cancelled-entry path. The path starts no POST,
-lookup, scan, retry, or confirmation write.
+`Recovering`, `Confirmed`, or `Rejected`. A call cancelled on entry loads the
+authoritative durable state under the normal lifecycle locks. If it finds an
+abandoned `Submitting` row, it must atomically normalize that row to
+`Recovering` and return `Pending(Recovering)`; the possibly dispatched request
+is stronger evidence than the current call's cancellation. This conservative
+normalization is the only write permitted on a cancelled-entry path. If it
+cannot be persisted, the call returns an operational storage failure that
+preserves the known possibly-dispatched state; it never returns `Cancelled`.
+The path starts no POST, lookup, scan, retry, or confirmation write.
 
 There are no public outcomes for accepted-but-unjournaled hashes, evidence
 precedence, hash provenance, tree receipts, or unapplied confirmation. The
@@ -428,7 +430,7 @@ requests, and the confirmation commit point. It has the following safety
 effects:
 
 - on entry, an abandoned `Submitting` row is durably normalized to
-  `Recovering` before cancellation is reported;
+  `Recovering` before a public result is produced;
 - before dispatch by the current call, no request is released and a fresh
   reservation may be removed;
 - after possible dispatch, the row is or becomes `Recovering`; and
@@ -598,6 +600,8 @@ Tests cover:
   without releasing bytes;
 - entry cancellation with an abandoned `Submitting` row atomically normalizes
   it to `Recovering` and returns `Pending(Recovering)` without network work;
+- failure to persist that normalization reports an operational failure with
+  the known possibly-dispatched state and never returns `Cancelled`;
 - cancellation after dispatch preserves `Recovering`; and
 - cancellation after the confirmation commit point cannot suppress
   persistence.
