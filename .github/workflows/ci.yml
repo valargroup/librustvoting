@@ -53,7 +53,7 @@ jobs:
           tool: cargo-nextest@0.9.138
       - name: Test default Zakura stack with fixtures
         run: |
-          cargo nextest run -p zcash_voting -p zcash-voting-wallet-example \
+          cargo nextest run -P ci -p zcash_voting -p zcash-voting-wallet-example \
             --features test-fixtures \
             --partition count:${{ matrix.partition }}/2 \
             --locked
@@ -78,11 +78,11 @@ jobs:
       # marked #[ignore] for the default suite and run here under --release.
       - name: Run ignored Zakura proof tests
         run: |
-          cargo nextest run --release -p zcash_voting \
+          cargo nextest run -P ci --release -p zcash_voting \
             --locked --run-ignored ignored-only
       - name: Run ignored LRZ proof tests
         run: |
-          cargo nextest run --release -p zcash_voting \
+          cargo nextest run -P ci --release -p zcash_voting \
             --no-default-features --features lrz \
             --locked --run-ignored ignored-only
 
@@ -98,13 +98,13 @@ jobs:
           tool: cargo-nextest@0.9.138
       - name: Test LRZ VCT crates
         run: |
-          cargo nextest run -p vote-commitment-tree -p vote-commitment-tree-client \
+          cargo nextest run -P ci -p vote-commitment-tree -p vote-commitment-tree-client \
             --all-targets --no-default-features \
             --features vote-commitment-tree/lrz,vote-commitment-tree-client/lrz,vote-commitment-tree-client/cli \
             --locked
       - name: Test Zakura VCT crates
         run: |
-          cargo nextest run -p vote-commitment-tree -p vote-commitment-tree-client \
+          cargo nextest run -P ci -p vote-commitment-tree -p vote-commitment-tree-client \
             --all-targets --features vote-commitment-tree-client/cli \
             --locked
       - name: Check backend contracts
@@ -148,7 +148,7 @@ jobs:
       - name: Test LRZ wallet stack
         # The wallet example verifies direct `zcash_voting/lrz` selection.
         run: |
-          cargo nextest run -p zcash_voting -p zcash-voting-wallet-example \
+          cargo nextest run -P ci -p zcash_voting -p zcash-voting-wallet-example \
             --all-targets --no-default-features \
             --features lrz \
             --locked

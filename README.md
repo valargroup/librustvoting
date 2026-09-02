@@ -30,8 +30,14 @@ transport.
 ## Building
 
 ```bash
-cargo check                   # check the default Zakura wallet path
+cargo check                  # check the default Zakura wallet path
 cargo build -p zcash_voting  # build just the core library
+```
+
+Run the default Zakura tests with:
+
+```bash
+cargo test -p zcash_voting --features test-fixtures --locked
 ```
 
 Run the LRZ Ironwood / NU6.3 tests with:
@@ -39,6 +45,12 @@ Run the LRZ Ironwood / NU6.3 tests with:
 ```bash
 cargo test -p zcash_voting --no-default-features --features lrz --locked
 ```
+
+The `zakura` and `lrz` features are mutually exclusive and pull separate crypto
+stacks, so alternating between them in one target directory recompiles the whole
+Halo2 dependency graph each time. Contributors who switch backends often can use
+the `make` targets, which give each feature permutation its own
+`CARGO_TARGET_DIR`; run `make help` for the list.
 
 ## Wallet API Lifecycle
 

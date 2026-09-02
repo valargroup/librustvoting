@@ -28,11 +28,9 @@ PIR_IDENTITY_URL     ?= https://pir.smoke.test
 PRESENT_NF_HEX ?= 0700000000000000000000000000000000000000000000000000000000000000
 ABSENT_NF_HEX  ?= 6400000000000000000000000000000000000000000000000000000000000000
 
-.PHONY: pir-smoke help
-
-help: ## Show smoke-harness targets
-	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+# `help` is defined by the root Makefile, which greps every included file, so
+# the pir-smoke target below is listed there too.
+.PHONY: pir-smoke
 
 pir-smoke: ## Resolve dummy config, serve local PIR, fetch present+absent nullifiers
 	@PIR_REPO="$(PIR_REPO)" \
