@@ -122,6 +122,53 @@ async fn failed_tree_confirmation_reports_durable_recovery_and_rolls_back_projec
 }
 
 #[tokio::test]
+async fn failed_recovery_retry_reservation_reports_durable_recovery_without_redispatch() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    );
+    coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    for response in tree_responses(&[[8; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.fail_recovery_reservation_after_tree_page(Arc::clone(&store));
+    let failure = coordinator
+        .advance_with_recovery(
+            StoreAdvancementRequest::vote(identity.clone()),
+            ChainRecoveryMode::ExactTree,
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Storage);
+    let strongest_state = failure.strongest_state().unwrap();
+    assert_eq!(strongest_state.state(), ChainSubmissionState::Recovering);
+    assert_eq!(
+        strongest_state.evidence(),
+        ChainSubmissionStateEvidence::Durable
+    );
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+    assert_eq!(record.committed_post_reservations(), 1);
+    assert_eq!(transport.methods(), vec!["POST", "GET", "GET"]);
+}
+
+#[tokio::test]
 async fn fresh_ambiguous_post_exhausts_one_attempt_before_no_match_recovery() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
@@ -485,6 +532,7 @@ struct ScriptedTransport {
     post_gate: Mutex<Option<PostGate>>,
     fail_classification_store: Mutex<Option<Arc<InMemoryChainSubmissionStore>>>,
     fail_reconciliation_store: Mutex<Option<Arc<InMemoryChainSubmissionStore>>>,
+    fail_recovery_reservation_store: Mutex<Option<Arc<InMemoryChainSubmissionStore>>>,
 }
 
 impl ScriptedTransport {
@@ -537,6 +585,10 @@ impl ScriptedTransport {
         *self.fail_reconciliation_store.lock().unwrap() = Some(store);
     }
 
+    fn fail_recovery_reservation_after_tree_page(&self, store: Arc<InMemoryChainSubmissionStore>) {
+        *self.fail_recovery_reservation_store.lock().unwrap() = Some(store);
+    }
+
     fn begin_request(&self, method: &'static str) {
         if method == "POST" {
             if let Some((store, identity)) = self.reservation_probe.lock().unwrap().as_ref() {
@@ -570,7 +622,7 @@ impl ScriptedTransport {
 }
 
 impl ChainTransport for ScriptedTransport {
-    fn chain_get<'a>(&'a self, _request: ChainHttpRequest) -> ChainTransportFuture<'a> {
+    fn chain_get<'a>(&'a self, request: ChainHttpRequest) -> ChainTransportFuture<'a> {
         Box::pin(async move {
             self.begin_request("GET");
             if let Some((clock, now)) = self.next_get_clock_update.lock().unwrap().take() {
@@ -578,6 +630,11 @@ impl ChainTransport for ScriptedTransport {
             }
             if let Some(store) = self.fail_reconciliation_store.lock().unwrap().take() {
                 store.fail_next_commit();
+            }
+            if request.url().contains("/leaves") {
+                if let Some(store) = self.fail_recovery_reservation_store.lock().unwrap().take() {
+                    store.fail_next_commit_without_state();
+                }
             }
             self.take_reply()
         })

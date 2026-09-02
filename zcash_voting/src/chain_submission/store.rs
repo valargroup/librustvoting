@@ -470,6 +470,7 @@ pub(super) mod memory {
         batch_rosters: HashMap<ChainSubmissionIdentity, Vec<u32>>,
         projections: HashMap<ChainSubmissionIdentity, super::super::ChainSubmissionConfirmation>,
         fail_before_commit: bool,
+        fail_before_commit_without_state: bool,
     }
 
     pub(in crate::chain_submission) struct InMemoryChainSubmissionStore {
@@ -565,6 +566,10 @@ pub(super) mod memory {
             self.state.lock().unwrap().fail_before_commit = true;
         }
 
+        pub(in crate::chain_submission) fn fail_next_commit_without_state(&self) {
+            self.state.lock().unwrap().fail_before_commit_without_state = true;
+        }
+
         pub(in crate::chain_submission) fn fail_next_confirmation(&self) {
             self.fail_confirmation.store(true, Ordering::SeqCst);
         }
@@ -589,6 +594,13 @@ pub(super) mod memory {
             })?;
             let mut staged = state.clone();
             let result = operation(&mut staged)?;
+            if state.fail_before_commit_without_state {
+                state.fail_before_commit_without_state = false;
+                return Err(ChainSubmissionFailure::without_state(
+                    ChainSubmissionFailureKind::Storage,
+                    "injected stateless submission transaction commit failure",
+                ));
+            }
             if state.fail_before_commit {
                 state.fail_before_commit = false;
                 let message = "injected submission transaction commit failure";

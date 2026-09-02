@@ -750,7 +750,18 @@ where
                 })?;
                 let reserved = self
                     .store
-                    .reserve_recovery_retry(request, authorization, now)?;
+                    .reserve_recovery_retry(request, authorization, now)
+                    .map_err(|error| {
+                        if error.strongest_state().is_some() {
+                            error
+                        } else {
+                            ChainSubmissionFailure::with_durable_state(
+                                error.kind(),
+                                record.durable_state(),
+                                error.message(),
+                            )
+                        }
+                    })?;
                 self.submit_recovery_retry(operation, derived, reserved, control)
                     .await
             }
