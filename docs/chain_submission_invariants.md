@@ -504,6 +504,10 @@ Restart plans are derived from the authoritative row:
   `LegacyConfirmed` or digestless `Recovering` guard exists, including for
   every member of a proposed batch.
 
+The observed successor VAN of a `LegacyConfirmed` singleton permits a different
+singleton proposal in the same bundle to advance. The marker still blocks its
+own resubmission and any atomic batch that overlaps its proposal identity.
+
 An unresolved generation or legacy guard blocks only later work that consumes
 its unknown successor VAN. Independent bundles remain schedulable.
 
@@ -1100,6 +1104,7 @@ Phase 4 private-coordinator coverage is anchored by
 `same_identity_concurrency_releases_only_one_post`,
 `same_bundle_blocks_a_successor_until_the_predecessor_is_authoritative`,
 `atomically_confirmed_predecessor_allows_the_next_bundle_generation`,
+`legacy_confirmed_predecessor_allows_the_next_bundle_generation`,
 `independent_bundles_progress_while_another_post_is_blocked`,
 `coordinators_for_one_store_share_the_same_lock_authority`,
 `exclusive_round_access_is_busy_until_lifecycle_work_finishes`,

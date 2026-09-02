@@ -1871,6 +1871,37 @@ async fn atomically_confirmed_predecessor_allows_the_next_bundle_generation() {
 }
 
 #[tokio::test]
+async fn legacy_confirmed_predecessor_allows_the_next_bundle_generation() {
+    let first_identity = identity(1, 0);
+    let second_identity = identity(2, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_record(StoredChainSubmission::legacy_confirmed(
+        first_identity,
+        4,
+        5,
+        1,
+    ));
+    store.seed_derivation(derived(second_identity.clone(), 2));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Ok(accepted()));
+    transport.queue(Ok(pending()));
+
+    let result = coordinator(Arc::clone(&transport), store, ManualClock::new(100), 10)
+        .advance(
+            StoreAdvancementRequest::vote(second_identity),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Tracking { .. })
+    ));
+    assert_eq!(transport.methods(), vec!["POST", "GET"]);
+}
+
+#[tokio::test]
 async fn cancellation_during_dispatch_persists_recovery() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());

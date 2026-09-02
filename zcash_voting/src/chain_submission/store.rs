@@ -674,15 +674,15 @@ pub(super) mod memory {
                     && BundleOperationKey::from_identity(record.identity())
                         == BundleOperationKey::from_identity(requested)
                     && match record.state() {
-                        SubmissionRecordState::Rejected(_) => false,
+                        SubmissionRecordState::Rejected(_)
+                        | SubmissionRecordState::LegacyConfirmed(_) => false,
                         SubmissionRecordState::Confirmed(_) => {
                             !state.projections.contains_key(record.identity())
                         }
                         SubmissionRecordState::Submitting
                         | SubmissionRecordState::Tracking { .. }
                         | SubmissionRecordState::Recovering { .. }
-                        | SubmissionRecordState::DigestlessRecoveryGuard(_)
-                        | SubmissionRecordState::LegacyConfirmed(_) => true,
+                        | SubmissionRecordState::DigestlessRecoveryGuard(_) => true,
                     }
             })
         }
