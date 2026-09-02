@@ -78,7 +78,9 @@ pub struct KeystoneSignatureInput {
 /// Counts from an idempotent atomic Keystone signature batch write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeystoneSignatureBatchResult {
+    /// Rows newly inserted or repaired after validating the persisted value.
     pub inserted: u32,
+    /// Existing valid rows retained for an equivalent signing context.
     pub already_present: u32,
 }
 
@@ -173,7 +175,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
     }
 
     #[test]

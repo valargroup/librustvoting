@@ -956,7 +956,8 @@ pub fn require_bundle_notes(
 /// Persist all delegation action data and finalized TX1 effects in a single
 /// UPDATE on the bundles table. The effects are required by
 /// [`load_delegation_submission_data`].
-pub fn store_delegation_data(
+#[cfg(test)]
+pub(crate) fn store_delegation_data(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -999,11 +1000,13 @@ pub fn store_delegation_data(
         Some(tx1_effects),
         None,
         None,
+        None,
     )
 }
 
-/// Persist delegation action data, the finalized TX1 effects, and PCZT-derived
-/// public inputs that the later delegation proof must reproduce.
+/// Persist delegation action data, the exact TX1 PCZT, finalized TX1 effects,
+/// and PCZT-derived public inputs that later signing and proof generation must
+/// reproduce.
 pub(crate) fn store_delegation_data_with_pczt_fields(
     conn: &Connection,
     round_id: &str,
@@ -1024,6 +1027,7 @@ pub(crate) fn store_delegation_data_with_pczt_fields(
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     pczt_sighash: &[u8],
     tx1_effects: &[u8],
+    delegation_pczt: &[u8],
     rk: &[u8],
     gov_nullifiers: &[Vec<u8>],
 ) -> Result<(), VotingError> {
@@ -1048,6 +1052,7 @@ pub(crate) fn store_delegation_data_with_pczt_fields(
         padded_note_secrets,
         pczt_sighash,
         Some(tx1_effects),
+        Some(delegation_pczt),
         Some(rk),
         Some(gov_nullifiers_blob.as_slice()),
     )
@@ -1073,6 +1078,7 @@ fn store_delegation_data_inner(
     padded_note_secrets: &[(Vec<u8>, Vec<u8>)],
     pczt_sighash: &[u8],
     tx1_effects: Option<&[u8]>,
+    delegation_pczt: Option<&[u8]>,
     rk: Option<&[u8]>,
     gov_nullifiers_blob: Option<&[u8]>,
 ) -> Result<(), VotingError> {
@@ -1093,22 +1099,29 @@ fn store_delegation_data_inner(
     // Serialize padded_note_secrets as flat blob: N * 64 bytes (rho[32] || rseed[32] per entry).
     let secrets_blob = encode_padded_note_secrets(padded_note_secrets);
 
-    let existing: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+    let existing: Option<(
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    )> = conn
         .query_row(
-            "SELECT padded_note_secrets, pczt_sighash, tx1_effects FROM bundles \
+            "SELECT padded_note_secrets, pczt_sighash, tx1_effects, delegation_pczt FROM bundles \
              WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
             },
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| VotingError::Internal {
             message: format!("failed to load existing delegation data: {}", e),
         })?;
-    let Some((existing_secrets, existing_sighash, existing_tx1_effects)) = existing else {
+    let Some((existing_secrets, existing_sighash, existing_tx1_effects, existing_delegation_pczt)) =
+        existing
+    else {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "bundle not found: round={}, bundle={}",
@@ -1146,6 +1159,22 @@ fn store_delegation_data_inner(
             });
         }
     }
+    if let (Some(existing_delegation_pczt), Some(delegation_pczt)) =
+        (existing_delegation_pczt.as_deref(), delegation_pczt)
+    {
+        if existing_delegation_pczt != delegation_pczt {
+            return Err(VotingError::InvalidInput {
+                message: format!(
+                    "refusing to overwrite delegation_pczt for round={}, bundle={}",
+                    round_id, bundle_index
+                ),
+            });
+        }
+
+        // The complete setup was already committed. Avoid rewriting any of
+        // its binding fields even when this is an idempotent retry.
+        return Ok(());
+    }
 
     let rows = conn
         .execute(
@@ -1157,9 +1186,11 @@ fn store_delegation_data_inner(
              padded_note_secrets = COALESCE(padded_note_secrets, :secrets), \
              pczt_sighash = COALESCE(pczt_sighash, :sighash), \
              tx1_effects = COALESCE(tx1_effects, :tx1_effects), \
+             delegation_pczt = COALESCE(delegation_pczt, :delegation_pczt), \
              rk = COALESCE(:rk, rk), \
              gov_nullifiers_blob = COALESCE(:gov_nullifiers_blob, gov_nullifiers_blob) \
-             WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
+             WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index \
+               AND (:delegation_pczt IS NULL OR delegation_pczt IS NULL)",
             named_params! {
                 ":rand": van_comm_rand,
                 ":dummies": dummy_blob,
@@ -1176,6 +1207,7 @@ fn store_delegation_data_inner(
                 ":secrets": secrets_blob,
                 ":sighash": pczt_sighash,
                 ":tx1_effects": tx1_effects,
+                ":delegation_pczt": delegation_pczt,
                 ":rk": rk,
                 ":gov_nullifiers_blob": gov_nullifiers_blob,
                 ":round_id": round_id,
@@ -1187,8 +1219,52 @@ fn store_delegation_data_inner(
             message: format!("failed to store delegation data: {}", e),
         })?;
 
-    // If no rows were updated, the bundle doesn't exist.
+    // A PCZT write is a compare-and-swap on the complete setup. If another
+    // connection won after the read above, accept an identical winner and
+    // reject a different randomized setup without touching any binding field.
     if rows == 0 {
+        if let Some(delegation_pczt) = delegation_pczt {
+            let persisted_pczt: Option<Option<Vec<u8>>> = conn
+                .query_row(
+                    "SELECT delegation_pczt FROM bundles
+                     WHERE round_id = :round_id
+                       AND wallet_id = :wallet_id
+                       AND bundle_index = :bundle_index",
+                    named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": wallet_id,
+                        ":bundle_index": bundle_index as i64,
+                    },
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| VotingError::Internal {
+                    message: format!("failed to reload delegation PCZT after setup race: {e}"),
+                })?;
+
+            match persisted_pczt {
+                Some(Some(persisted_pczt)) if persisted_pczt == delegation_pczt => return Ok(()),
+                Some(Some(_)) => {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "refusing to replace concurrently persisted delegation setup for round={}, bundle={}",
+                            round_id, bundle_index
+                        ),
+                    });
+                }
+                Some(None) => {
+                    return Err(VotingError::Internal {
+                        message: format!(
+                            "failed to claim empty delegation setup for round={}, bundle={}",
+                            round_id, bundle_index
+                        ),
+                    });
+                }
+                None => {}
+            }
+        }
+
+        // No matching row exists.
         return Err(VotingError::InvalidInput {
             message: format!(
                 "bundle not found: round={}, bundle={}",
@@ -1392,6 +1468,93 @@ pub fn load_pczt_sighash(
     .map_err(|e| VotingError::InvalidInput {
         message: format!("no pczt_sighash for round={}, bundle={} ({})", round_id, bundle_index, e),
     })
+}
+
+/// Write-once signing fields that identify one prepared delegation setup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DelegationSigningContext {
+    pub pczt_sighash: Vec<u8>,
+    pub rk: Vec<u8>,
+}
+
+/// Load the persisted signing context that proof generation must remain bound to.
+pub(crate) fn load_delegation_signing_context(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<DelegationSigningContext, VotingError> {
+    conn.query_row(
+        "SELECT pczt_sighash, rk FROM bundles
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+        |row| {
+            Ok(DelegationSigningContext {
+                pczt_sighash: row.get(0)?,
+                rk: row.get(1)?,
+            })
+        },
+    )
+    .map_err(|e| VotingError::InvalidInput {
+        message: format!(
+            "no complete delegation signing context for round={}, bundle={} ({})",
+            round_id, bundle_index, e
+        ),
+    })
+}
+
+/// Load the exact persisted delegation PCZT and its write-once signing fields.
+///
+/// A bundle row with incomplete fields represents legacy or damaged signing
+/// state whose possible submission must be reconciled before it can be safely
+/// replaced.
+pub(crate) fn load_delegation_pczt_fields(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), VotingError> {
+    let fields: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT delegation_pczt, pczt_sighash, rk FROM bundles
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| VotingError::Internal {
+            message: format!(
+                "failed to load delegation PCZT for round={}, bundle={} ({})",
+                round_id, bundle_index, e
+            ),
+        })?;
+    let Some((pczt, sighash, rk)) = fields else {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "no persisted delegation PCZT for round={}, bundle={}",
+                round_id, bundle_index
+            ),
+        });
+    };
+    match (pczt, sighash, rk) {
+        (Some(pczt), Some(sighash), Some(rk)) => Ok((pczt, sighash, rk)),
+        _ => Err(VotingError::DelegationReconciliationRequired {
+            round_id: round_id.to_string(),
+            bundle_index,
+        }),
+    }
 }
 
 /// Load the versioned Ironwood TX1 effecting data persisted at PCZT setup.
@@ -1869,7 +2032,8 @@ fn require_matching_stored_field(
 
 /// Persist public inputs from DelegationProofResult after proof generation.
 /// If PCZT-derived values already exist, the proof result must reproduce them.
-pub fn store_proof_result_fields(
+#[cfg(test)]
+pub(crate) fn store_proof_result_fields(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -2545,7 +2709,7 @@ pub fn list_pir_cache_roots(
 
 // --- Proofs ---
 
-pub fn store_proof(
+pub(crate) fn store_proof(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -3108,7 +3272,8 @@ pub(crate) fn get_commitment_bundle_recovery(
 
 // --- Keystone signatures ---
 
-pub fn store_keystone_signature(
+#[cfg(test)]
+pub(crate) fn store_keystone_signature(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -3205,7 +3370,8 @@ pub fn clear_unsigned_delegation_setup_fields(
              gov_nullifiers_blob = NULL,
              padded_note_secrets = NULL,
              pczt_sighash = NULL,
-             tx1_effects = NULL
+             tx1_effects = NULL,
+             delegation_pczt = NULL
          WHERE round_id = :round_id
            AND wallet_id = :wallet_id
            AND note_positions_blob IS NOT NULL

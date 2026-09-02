@@ -15,8 +15,9 @@ pub use crate::delegate::{
     record_van_position, setup as setup_delegation, signing_request as delegation_signing_request,
     spend_auth_signature, submission as delegation_submission, BranchIdProvider,
     DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProgress, DelegationProof,
-    DelegationSetup, DelegationSigner, DelegationSigningRequest, DelegationSubmission,
-    KeystoneSigningRequest, PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
+    DelegationProofOutcome, DelegationSetup, DelegationSetupOutcome, DelegationSigner,
+    DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
+    PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
 };
 pub use crate::delegate::{
     prepare_delegation_bundle, prepare_delegation_bundle_for_target,

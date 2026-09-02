@@ -386,6 +386,14 @@ derive the account SpendAuth key locally, randomize it with `alpha`, sign the
 sighash, and call `delegation_submission` with `DelegationSigner::signature`.
 The crate no longer accepts root wallet seed material for delegation signing.
 
+Wallet integrations should also leave delegation proof lifecycle decisions in
+this crate. Use `VotingDb::has_persisted_delegation_proof` before opening a PIR
+connection. A wallet that overlaps local work with that connection can call
+`PreparedDelegationBundle::ensure_setup`, then call `ensure_proof` with each
+chosen PIR client. These methods reuse persisted setup, own witness and PIR
+precompute, and skip proving when ZKP1 is already durable. The wallet keeps
+ownership of endpoint selection, retries, signing, and progress presentation.
+
 ## Dependency notes
 
 This crate contains the canonical implementation and retains mutually
@@ -440,6 +448,10 @@ boundary, so production builds should not enable this feature.
 - Prefer `VotingDb::create_round`, `VotingDb::ensure_bundles`, and
   `VotingDb::delegation_phases` over direct `storage::queries` calls. Pass the
   round's wallet/voting `Network` when creating or ensuring a round.
+- Use `VotingDb::has_persisted_delegation_proof` plus
+  `PreparedDelegationBundle::{ensure_setup, ensure_proof}` instead of matching
+  delegation phases or rebuilding PCZT setup in wallet code. The wallet still
+  owns PIR endpoint selection and transport retries.
 - Use `BundlePolicy` plus the `*_with_policy` APIs when an integration needs
   fewer real notes per bundle. Omit the policy for the default circuit-slot
   behavior.

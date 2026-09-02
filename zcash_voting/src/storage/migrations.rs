@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 17;
+const CURRENT_VERSION: u32 = 18;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -117,6 +117,7 @@ BEGIN
        AND commitment_bundle_json IS NOT NEW.commitment_bundle_json;
 END;",
     ),
+    (17, "ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;"),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
@@ -247,8 +248,18 @@ mod tests {
         format!("{}{}", &schema[..start], &schema[start + next..])
     }
 
+    fn v17_schema() -> String {
+        let schema = include_str!("migrations/001_init.sql");
+        let stripped = schema.replace("    delegation_pczt     BLOB,\n", "");
+        assert_ne!(
+            stripped, schema,
+            "v17_schema must drop the column added at version 18"
+        );
+        stripped
+    }
+
     fn v16_schema() -> String {
-        without_helper_share_plans(include_str!("migrations/001_init.sql"))
+        without_helper_share_plans(&v17_schema())
     }
 
     fn v15_schema() -> String {
@@ -491,6 +502,64 @@ mod tests {
             CURRENT_VERSION
         );
         assert_helper_plan_lifecycle(&conn);
+    }
+
+    #[test]
+    fn migrate_v17_adds_delegation_pczt_without_mutating_existing_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&v17_schema()).unwrap();
+        queries::insert_round(
+            &conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        queries::insert_bundle(&conn, "test-round", "wallet", 0, &[1]).unwrap();
+        conn.execute(
+            "UPDATE bundles
+             SET van_comm_rand = X'AA', pczt_sighash = X'BB', rk = X'CC'
+             WHERE round_id = 'test-round' AND wallet_id = 'wallet' AND bundle_index = 0",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO proofs
+                 (round_id, wallet_id, bundle_index, proof, success, created_at)
+             VALUES ('test-round', 'wallet', 0, X'DD', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 17).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert!(table_columns(&conn, "bundles").contains(&"delegation_pczt".to_string()));
+        let preserved_setup: (Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT van_comm_rand, pczt_sighash, rk, delegation_pczt
+                 FROM bundles
+                 WHERE round_id = 'test-round'
+                   AND wallet_id = 'wallet'
+                   AND bundle_index = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved_setup, (vec![0xAA], vec![0xBB], vec![0xCC], None));
+        let preserved_proof: (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT proof, success
+                 FROM proofs
+                 WHERE round_id = 'test-round'
+                   AND wallet_id = 'wallet'
+                   AND bundle_index = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved_proof, (vec![0xDD], 1));
     }
 
     #[test]

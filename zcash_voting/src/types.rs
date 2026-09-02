@@ -40,6 +40,12 @@ pub enum VotingError {
     InvalidInput { message: String },
     #[error("Keystone signature conflict for bundle {bundle_index}")]
     KeystoneSignatureConflict { bundle_index: u32 },
+    /// Persisted delegation signing state cannot be rebuilt until its possible
+    /// on-chain submission has been reconciled.
+    #[error(
+        "Delegation state requires reconciliation before Keystone signing for round {round_id}, bundle {bundle_index}"
+    )]
+    DelegationReconciliationRequired { round_id: String, bundle_index: u32 },
     #[error("Proof generation failed: {message}")]
     ProofFailed { message: String },
     #[error("Internal error: {message}")]

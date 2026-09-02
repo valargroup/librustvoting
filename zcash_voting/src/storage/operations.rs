@@ -90,6 +90,80 @@ fn validate_network_matches_round(
     Ok(())
 }
 
+fn require_unchanged_delegation_signing_context(
+    conn: &rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    expected: &queries::DelegationSigningContext,
+) -> Result<(), VotingError> {
+    let current = queries::load_delegation_signing_context(
+        conn,
+        round_id,
+        wallet_id,
+        bundle_index,
+    )
+    .map_err(|_| VotingError::InvalidInput {
+        message: format!(
+            "delegation setup changed or was cleared while generating ZKP1 for round={round_id}, bundle={bundle_index}; retry from the current setup"
+        ),
+    })?;
+    if current != *expected {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "delegation setup changed or was cleared while generating ZKP1 for round={round_id}, bundle={bundle_index}; retry from the current setup"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Persist one proof only if its captured signing context is still current.
+///
+/// The context check, proof write, and minimum `DelegationProved` phase update
+/// share one immediate transaction. A concurrent session reset therefore
+/// either observes the completed proof or wins first and makes this write fail.
+fn persist_delegation_proof_result(
+    conn: &mut rusqlite::Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    expected_signing_context: &queries::DelegationSigningContext,
+    result: &DelegationProofResult,
+) -> Result<(), VotingError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to begin proof result transaction: {e}"),
+        })?;
+    require_unchanged_delegation_signing_context(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        expected_signing_context,
+    )?;
+    queries::store_proof(&tx, round_id, wallet_id, bundle_index, &result.proof)?;
+    queries::store_proof_result_fields_with_van_comm(
+        &tx,
+        round_id,
+        wallet_id,
+        bundle_index,
+        &result.rk,
+        &result.gov_nullifiers,
+        &result.nf_signed,
+        &result.cmx_new,
+        &result.van_comm,
+    )?;
+    let current_phase = queries::get_round_state(&tx, round_id, wallet_id)?.phase;
+    if (current_phase as i32) < RoundPhase::DelegationProved as i32 {
+        queries::advance_round_phase(&tx, round_id, wallet_id, RoundPhase::DelegationProved)?;
+    }
+    tx.commit().map_err(|e| VotingError::Internal {
+        message: format!("failed to commit proof result transaction: {e}"),
+    })
+}
+
 fn delegation_nullifier_targets(
     notes: &[NoteInfo],
     dummy_nullifiers: &[Vec<u8>],
@@ -166,7 +240,7 @@ fn pir_cache_nullifier_targets(
     Ok(targets)
 }
 
-fn verify_delegation_spend_auth_signature(
+pub(super) fn verify_delegation_spend_auth_signature(
     rk: &[u8],
     sighash: &[u8],
     signature: &[u8],
@@ -660,6 +734,25 @@ impl VotingDb {
         })
     }
 
+    /// Validate the stored round, bundle notes, keys, and branch before a PCZT
+    /// setup may be created or replaced.
+    pub(crate) fn validate_governance_pczt_context(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        notes: &[NoteInfo],
+        keys: &DelegationKeys,
+        consensus_branch_id: u32,
+    ) -> Result<(crate::VotingRoundParams, Network), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let (params, stored_network) =
+            queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
+        validate_consensus_branch_id_for_round(&params, stored_network, keys, consensus_branch_id)?;
+        queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
+        Ok((params, stored_network))
+    }
+
     /// Build a governance-specific PCZT for Keystone signing.
     /// Loads round params from db. Notes come from caller.
     /// Computes governance values and builds a PCZT whose governance action
@@ -676,19 +769,13 @@ impl VotingDb {
         consensus_branch_id: u32,
     ) -> Result<GovernancePczt, VotingError> {
         let wallet_id = self.wallet_id();
-        let (params, stored_network) = {
-            let conn = self.conn();
-            let (params, stored_network) =
-                queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
-            validate_consensus_branch_id_for_round(
-                &params,
-                stored_network,
-                keys,
-                consensus_branch_id,
-            )?;
-            queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
-            (params, stored_network)
-        };
+        let (params, stored_network) = self.validate_governance_pczt_context(
+            round_id,
+            bundle_index,
+            notes,
+            keys,
+            consensus_branch_id,
+        )?;
         let padded_note_secrets = self.ensure_padded_secrets(round_id, bundle_index, notes)?;
         let van_blinding = keys.van_blinding_for_bundle(&params, bundle_index, notes)?;
         let result = crate::action::build_governance_pczt(
@@ -734,10 +821,22 @@ impl VotingDb {
             &result.padded_note_secrets,
             &result.pczt_sighash,
             &result.tx1_effects,
+            &result.pczt_bytes,
             &result.rk,
             &result.gov_nullifiers,
         )?;
         Ok(result)
+    }
+
+    /// Load the exact delegation PCZT and signing fields persisted by setup.
+    pub(crate) fn get_delegation_pczt_fields(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::load_delegation_pczt_fields(&conn, round_id, &wallet_id, bundle_index)
     }
 
     /// Cache tree state fetched from lightwalletd by SDK.
@@ -1145,7 +1244,8 @@ impl VotingDb {
     /// Fetches IMT exclusion proofs from the PIR server for each note's nullifier.
     /// For padded notes (< 5 real notes), the prover fetches proofs internally via PIR.
     ///
-    /// Stores the proof result and advances phase to `DelegationProved`.
+    /// Stores the proof result and advances the round to at least
+    /// `DelegationProved`.
     pub fn build_and_prove_delegation(
         &self,
         round_id: &str,
@@ -1169,6 +1269,8 @@ impl VotingDb {
         let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, &wallet_id, bundle_index)?;
         let witnesses = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
         validate_witnesses_for_round(&witnesses, &params)?;
+        let signing_context =
+            queries::load_delegation_signing_context(&conn, round_id, &wallet_id, bundle_index)?;
 
         // Load Phase 1 randomness for ZCA-74 fix: ensures Phase 2 produces
         // the same nf_signed/cmx_new that Phase 1 committed to in the PCZT.
@@ -1323,31 +1425,18 @@ impl VotingDb {
             prove_elapsed.as_secs_f64()
         );
 
-        // Persist proof bytes, public inputs, and phase together. The public
-        // inputs are checked against the PCZT fields before any partial proof
-        // success state is committed.
+        // Persist proof bytes, public inputs, and the minimum round phase
+        // together. The public inputs are checked against the PCZT fields
+        // before any partial proof success state is committed.
         let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to begin proof result transaction: {e}"),
-            })?;
-        queries::store_proof(&tx, round_id, &wallet_id, bundle_index, &result.proof)?;
-        queries::store_proof_result_fields_with_van_comm(
-            &tx,
+        persist_delegation_proof_result(
+            &mut conn,
             round_id,
             &wallet_id,
             bundle_index,
-            &result.rk,
-            &result.gov_nullifiers,
-            &result.nf_signed,
-            &result.cmx_new,
-            &result.van_comm,
+            &signing_context,
+            &result,
         )?;
-        queries::advance_round_phase(&tx, round_id, &wallet_id, RoundPhase::DelegationProved)?;
-        tx.commit().map_err(|e| VotingError::Internal {
-            message: format!("failed to commit proof result transaction: {e}"),
-        })?;
 
         let total_elapsed = total_start.elapsed();
         eprintln!(
@@ -1791,6 +1880,7 @@ impl VotingDb {
         )
     }
 
+    /// Validate and store one Keystone signature against the persisted setup.
     pub fn store_keystone_signature(
         &self,
         round_id: &str,
@@ -1811,12 +1901,14 @@ impl VotingDb {
         .map(|_| ())
     }
 
-    /// Atomically store a batch of Keystone delegation signatures.
+    /// Atomically validate and store a batch of Keystone delegation signatures.
     ///
-    /// Replaying a tuple with the same sighash and randomized key is
-    /// idempotent even if the signature bytes differ. Reusing a bundle index
-    /// for a different signing context returns a typed conflict and rolls the
-    /// complete batch back.
+    /// Every tuple must match the bundle's persisted sighash and randomized key
+    /// and pass SpendAuth verification before any write commits. Replaying an
+    /// existing valid signing context is idempotent even if the signature bytes
+    /// differ. A verified current-context signature repairs a stale or invalid
+    /// legacy row. A tuple for another signing context returns a typed conflict
+    /// and rolls the complete batch back.
     pub fn store_keystone_signatures_batch(
         &self,
         round_id: &str,
@@ -1860,9 +1952,28 @@ impl VotingDb {
         let mut already_present = 0u32;
 
         for signature in signatures {
+            let signing_context = queries::load_delegation_signing_context(
+                &tx,
+                round_id,
+                &wallet_id,
+                signature.bundle_index,
+            )?;
+            if signing_context.pczt_sighash != signature.sighash
+                || signing_context.rk != signature.rk
+            {
+                return Err(VotingError::KeystoneSignatureConflict {
+                    bundle_index: signature.bundle_index,
+                });
+            }
+            verify_delegation_spend_auth_signature(
+                &signing_context.rk,
+                &signing_context.pczt_sighash,
+                &signature.sig,
+            )?;
+
             let existing = tx
                 .query_row(
-                    "SELECT sighash, rk FROM keystone_signatures
+                    "SELECT sig, sighash, rk FROM keystone_signatures
                      WHERE round_id = :round_id AND wallet_id = :wallet_id
                        AND bundle_index = :bundle_index",
                     rusqlite::named_params! {
@@ -1870,21 +1981,58 @@ impl VotingDb {
                         ":wallet_id": &wallet_id,
                         ":bundle_index": signature.bundle_index as i64,
                     },
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|e| VotingError::Internal {
                     message: format!("failed to read existing Keystone signature: {e}"),
                 })?;
 
-            if let Some((sighash, rk)) = existing {
-                if sighash == signature.sighash && rk == signature.rk {
+            if let Some((sig, sighash, rk)) = existing {
+                let existing_matches_current =
+                    sighash == signing_context.pczt_sighash && rk == signing_context.rk;
+                let existing_is_valid = existing_matches_current
+                    && (sig == signature.sig
+                        || verify_delegation_spend_auth_signature(
+                            &signing_context.rk,
+                            &signing_context.pczt_sighash,
+                            &sig,
+                        )
+                        .is_ok());
+                if existing_is_valid {
                     already_present += 1;
                     continue;
                 }
-                return Err(VotingError::KeystoneSignatureConflict {
-                    bundle_index: signature.bundle_index,
-                });
+
+                tx.execute(
+                    "UPDATE keystone_signatures
+                     SET sig = :sig, sighash = :sighash, rk = :rk, created_at = :created_at
+                     WHERE round_id = :round_id AND wallet_id = :wallet_id
+                       AND bundle_index = :bundle_index",
+                    rusqlite::named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": &wallet_id,
+                        ":bundle_index": signature.bundle_index as i64,
+                        ":sig": &signature.sig,
+                        ":sighash": &signature.sighash,
+                        ":rk": &signature.rk,
+                        ":created_at": created_at,
+                    },
+                )
+                .map_err(|e| VotingError::Internal {
+                    message: format!(
+                        "failed to repair Keystone signature for bundle {}: {e}",
+                        signature.bundle_index
+                    ),
+                })?;
+                inserted += 1;
+                continue;
             }
 
             tx.execute(
@@ -2634,8 +2782,7 @@ mod tests {
         let ask = SpendAuthorizingKey::from(&sk);
         let rsk = ask.randomize(alpha);
         let rk: [u8; 32] = (&VerificationKey::<SpendAuth>::from(&rsk)).into();
-        let mut rng = voting_crypto_deps::rand::rngs::OsRng;
-        let sig = rsk.sign(&mut rng, sighash);
+        let sig = rsk.sign(voting_crypto_deps::rand::rngs::OsRng, sighash);
 
         (rk, (&sig).into())
     }
@@ -2656,8 +2803,7 @@ mod tests {
         let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(request.alpha))
             .expect("test stores a valid alpha scalar");
         let rsk = ask.randomize(&alpha);
-        let mut rng = voting_crypto_deps::rand::rngs::OsRng;
-        let sig = rsk.sign(&mut rng, &request.sighash);
+        let sig = rsk.sign(voting_crypto_deps::rand::rngs::OsRng, &request.sighash);
 
         (&sig).into()
     }
@@ -3078,6 +3224,110 @@ mod tests {
         assert!(err.to_string().contains("refusing to regress round phase"));
     }
 
+    fn delegation_proof_result_fixture() -> DelegationProofResult {
+        DelegationProofResult {
+            proof: vec![0xA0; 96],
+            public_inputs: Vec::new(),
+            nf_signed: vec![0x30; 32],
+            cmx_new: vec![0x40; 32],
+            gov_nullifiers: vec![vec![0x20; 32]; BUNDLE_NOTE_SLOTS],
+            van_comm: vec![0x50; 32],
+            rk: vec![0x10; 32],
+        }
+    }
+
+    fn store_delegation_proof_setup_fixture(
+        db: &VotingDb,
+        result: &DelegationProofResult,
+    ) -> queries::DelegationSigningContext {
+        let conn = db.conn();
+        queries::insert_bundle(&conn, ROUND_ID, W, 0, &[0]).unwrap();
+        queries::store_delegation_data_with_pczt_fields(
+            &conn,
+            ROUND_ID,
+            W,
+            0,
+            &[0x01; 32],
+            &[],
+            &[0x02; 32],
+            &[],
+            &result.nf_signed,
+            &result.cmx_new,
+            &[0x03; 32],
+            &[0x04; 32],
+            &[0x05; 32],
+            &result.van_comm,
+            1,
+            0,
+            &[],
+            &[0x06; 32],
+            &crate::tx1::placeholder_tx1_effects(),
+            &[0x07],
+            &result.rk,
+            &result.gov_nullifiers,
+        )
+        .unwrap();
+        queries::load_delegation_signing_context(&conn, ROUND_ID, W, 0).unwrap()
+    }
+
+    #[test]
+    fn test_persist_delegation_proof_keeps_later_round_phase() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        let result = delegation_proof_result_fixture();
+        let signing_context = store_delegation_proof_setup_fixture(&db, &result);
+        db.advance_round_phase(ROUND_ID, RoundPhase::VoteReady)
+            .unwrap();
+
+        {
+            let mut conn = db.conn();
+            persist_delegation_proof_result(&mut conn, ROUND_ID, W, 0, &signing_context, &result)
+                .unwrap();
+            let stored: (Vec<u8>, i64) = conn
+                .query_row(
+                    "SELECT proof, success FROM proofs
+                     WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                    rusqlite::params![ROUND_ID, W],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, (result.proof, 1));
+        }
+        assert_eq!(
+            db.get_round_state(ROUND_ID).unwrap().phase,
+            RoundPhase::VoteReady
+        );
+    }
+
+    #[test]
+    fn test_persist_delegation_proof_rejects_setup_cleared_during_generation() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        let result = delegation_proof_result_fixture();
+        let signing_context = store_delegation_proof_setup_fixture(&db, &result);
+
+        db.clear_unsigned_delegation_setup_fields(ROUND_ID).unwrap();
+
+        let mut conn = db.conn();
+        let error =
+            persist_delegation_proof_result(&mut conn, ROUND_ID, W, 0, &signing_context, &result)
+                .expect_err("a cleared proof setup must reject its in-flight result");
+        assert!(error
+            .to_string()
+            .contains("delegation setup changed or was cleared while generating ZKP1"));
+        let proof_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM proofs
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                rusqlite::params![ROUND_ID, W],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(proof_count, 0);
+    }
+
     #[test]
     fn test_has_round_is_scoped_to_wallet() {
         let db = test_db();
@@ -3151,8 +3401,46 @@ mod tests {
         assert_eq!(other_cache_count, 1);
     }
 
+    fn keystone_signature_fixture(
+        bundle_index: u32,
+        seed_byte: u8,
+        sighash_byte: u8,
+    ) -> KeystoneSignatureInput {
+        let sighash = [sighash_byte; 32];
+        let (rk, sig) = test_randomized_spendauth_signature(
+            &[seed_byte; 64],
+            0,
+            &pallas::Scalar::from(u64::from(bundle_index) + 1),
+            &sighash,
+        );
+        KeystoneSignatureInput {
+            bundle_index,
+            sig: sig.to_vec(),
+            sighash: sighash.to_vec(),
+            rk: rk.to_vec(),
+        }
+    }
+
+    fn store_keystone_signing_context_fixture(db: &VotingDb, signature: &KeystoneSignatureInput) {
+        let rows = db
+            .conn()
+            .execute(
+                "UPDATE bundles SET pczt_sighash = ?1, rk = ?2
+                 WHERE round_id = ?3 AND wallet_id = ?4 AND bundle_index = ?5",
+                rusqlite::params![
+                    &signature.sighash,
+                    &signature.rk,
+                    ROUND_ID,
+                    W,
+                    signature.bundle_index,
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
     #[test]
-    fn keystone_signature_batch_is_atomic_idempotent_and_reports_typed_conflicts() {
+    fn keystone_signature_batch_verifies_context_and_is_atomic_and_idempotent() {
         let db = test_db();
         db.init_round(Network::Testnet, &test_params(), None)
             .unwrap();
@@ -3166,12 +3454,11 @@ mod tests {
             &[identity_note_with_position(8)],
         )
         .unwrap();
-        let signature = KeystoneSignatureInput {
-            bundle_index: 0,
-            sig: vec![0x11; 64],
-            sighash: vec![0x22; 32],
-            rk: vec![0x33; 32],
-        };
+        let signature = keystone_signature_fixture(0, 0x41, 0x21);
+        let alternate_valid_signature = keystone_signature_fixture(0, 0x41, 0x21);
+        let second_signature = keystone_signature_fixture(1, 0x42, 0x22);
+        store_keystone_signing_context_fixture(&db, &signature);
+        store_keystone_signing_context_fixture(&db, &second_signature);
 
         let inserted = db
             .store_keystone_signatures_batch(ROUND_ID, std::slice::from_ref(&signature))
@@ -3186,10 +3473,7 @@ mod tests {
         let replayed = db
             .store_keystone_signatures_batch(
                 ROUND_ID,
-                &[KeystoneSignatureInput {
-                    sig: vec![0x44; 64],
-                    ..signature.clone()
-                }],
+                std::slice::from_ref(&alternate_valid_signature),
             )
             .unwrap();
         assert_eq!(
@@ -3199,19 +3483,29 @@ mod tests {
                 already_present: 1,
             }
         );
+        let stored = db.get_keystone_signatures(ROUND_ID).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].sig, signature.sig);
+
+        let invalid_signature = KeystoneSignatureInput {
+            sig: vec![0; 64],
+            ..signature.clone()
+        };
+        let error = db
+            .store_keystone_signatures_batch(ROUND_ID, &[invalid_signature])
+            .expect_err("an invalid SpendAuth signature must be rejected");
+        assert!(error
+            .to_string()
+            .contains("signature does not verify against stored delegation rk and sighash"));
 
         let error = db
             .store_keystone_signatures_batch(
                 ROUND_ID,
                 &[
-                    KeystoneSignatureInput {
-                        bundle_index: 1,
-                        ..signature.clone()
-                    },
+                    second_signature.clone(),
                     KeystoneSignatureInput {
                         bundle_index: 0,
-                        sighash: vec![0x55; 32],
-                        ..signature
+                        ..second_signature
                     },
                 ],
             )
@@ -3222,7 +3516,43 @@ mod tests {
         ));
         let stored = db.get_keystone_signatures(ROUND_ID).unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].sig, vec![0x11; 64]);
+        assert_eq!(stored[0].sig, signature.sig);
+    }
+
+    #[test]
+    fn keystone_signature_batch_repairs_invalid_legacy_row() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        let signature = keystone_signature_fixture(0, 0x41, 0x21);
+        store_keystone_signing_context_fixture(&db, &signature);
+        queries::store_keystone_signature(
+            &db.conn(),
+            ROUND_ID,
+            W,
+            0,
+            &[0; 64],
+            &signature.sighash,
+            &signature.rk,
+        )
+        .unwrap();
+
+        let repaired = db
+            .store_keystone_signatures_batch(ROUND_ID, std::slice::from_ref(&signature))
+            .unwrap();
+
+        assert_eq!(
+            repaired,
+            KeystoneSignatureBatchResult {
+                inserted: 1,
+                already_present: 0,
+            }
+        );
+        let stored = db.get_keystone_signatures(ROUND_ID).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].sig, signature.sig);
     }
 
     #[test]
@@ -5089,6 +5419,7 @@ mod tests {
                 &[],
                 &[0x09; 32],
                 tx1_effects,
+                &[0x0C],
                 &[0x0A; 32],
                 &gov_nullifiers,
             )
@@ -5112,6 +5443,162 @@ mod tests {
             queries::load_tx1_effects(&conn, ROUND_ID, W, 0).unwrap(),
             effects
         );
+    }
+
+    #[test]
+    fn test_delegation_pczt_is_persisted_write_once() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        let conn = db.conn();
+        queries::insert_bundle(&conn, ROUND_ID, W, 0, &[0]).unwrap();
+        let gov_nullifiers = vec![vec![0x0B; 32]; BUNDLE_NOTE_SLOTS];
+
+        let store = |delegation_pczt: &[u8]| {
+            queries::store_delegation_data_with_pczt_fields(
+                &conn,
+                ROUND_ID,
+                W,
+                0,
+                &[0x01; 32],
+                &[],
+                &[0x02; 32],
+                &[],
+                &[0x03; 32],
+                &[0x04; 32],
+                &[0x05; 32],
+                &[0x06; 32],
+                &[0x07; 32],
+                &[0x08; 32],
+                1,
+                0,
+                &[],
+                &[0x09; 32],
+                &crate::tx1::placeholder_tx1_effects(),
+                delegation_pczt,
+                &[0x0A; 32],
+                &gov_nullifiers,
+            )
+        };
+
+        let pczt = vec![0xAA, 0xBB];
+        store(&pczt).unwrap();
+        store(&pczt).unwrap();
+        assert_eq!(
+            queries::load_delegation_pczt_fields(&conn, ROUND_ID, W, 0)
+                .unwrap()
+                .0,
+            pczt
+        );
+
+        let err = store(&[0xCC]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("refusing to overwrite delegation_pczt"));
+        assert_eq!(
+            queries::load_delegation_pczt_fields(&conn, ROUND_ID, W, 0)
+                .unwrap()
+                .0,
+            vec![0xAA, 0xBB]
+        );
+    }
+
+    #[test]
+    fn concurrent_delegation_setup_persists_one_complete_randomized_context() {
+        fn store_setup(conn: &rusqlite::Connection, marker: u8) -> Result<(), VotingError> {
+            let gov_nullifiers = vec![vec![marker + 11; 32]; crate::governance::BUNDLE_NOTE_SLOTS];
+            queries::store_delegation_data_with_pczt_fields(
+                conn,
+                ROUND_ID,
+                W,
+                0,
+                &[marker + 1; 32],
+                &[],
+                &[marker + 2; 32],
+                &[],
+                &[marker + 3; 32],
+                &[marker + 4; 32],
+                &[marker + 5; 32],
+                &[marker + 6; 32],
+                &[marker + 7; 32],
+                &[marker + 8; 32],
+                1,
+                0,
+                &[],
+                &[marker + 9; 32],
+                &crate::tx1::placeholder_tx1_effects(),
+                &[marker + 12],
+                &[marker + 10; 32],
+                &gov_nullifiers,
+            )
+        }
+
+        let _contention_test_guard = SQLITE_CONTENTION_TEST_LOCK.lock().unwrap();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "zcash-voting-delegation-setup-cas-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        let db_a = VotingDb::open(&path_string).unwrap();
+        db_a.set_wallet_id(W);
+        db_a.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        queries::insert_bundle(&db_a.conn(), ROUND_ID, W, 0, &[0]).unwrap();
+
+        let db_b = VotingDb::open(&path_string).unwrap();
+        db_b.set_wallet_id(W);
+        db_a.conn().busy_handler(Some(signal_sqlite_busy)).unwrap();
+
+        SQLITE_BUSY_OBSERVED.store(false, Ordering::SeqCst);
+        let mut writer_conn = db_b.conn();
+        let writer_tx = writer_conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let result = store_setup(&db_a.conn(), 0x10);
+                result_tx.send(result).unwrap();
+            });
+
+            let writer_tx = wait_for_sqlite_contention(writer_tx, &result_rx, "delegation setup");
+            store_setup(&writer_tx, 0x20).unwrap();
+            writer_tx.commit().unwrap();
+
+            let error = result_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .expect_err("the later randomized setup must lose the compare-and-swap");
+            assert!(error
+                .to_string()
+                .contains("concurrently persisted delegation setup"));
+        });
+        drop(writer_conn);
+
+        let persisted: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = db_a
+            .conn()
+            .query_row(
+                "SELECT delegation_pczt, alpha, rk, pczt_sighash
+                 FROM bundles
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = 0",
+                rusqlite::params![ROUND_ID, W],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted.0, vec![0x2C]);
+        assert_eq!(persisted.1, vec![0x25; 32]);
+        assert_eq!(persisted.2, vec![0x2A; 32]);
+        assert_eq!(persisted.3, vec![0x29; 32]);
+
+        drop(db_b);
+        drop(db_a);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_string}-shm"));
+        let _ = std::fs::remove_file(format!("{path_string}-wal"));
     }
 
     #[test]
@@ -5204,6 +5691,7 @@ mod tests {
             &[],
             &[0x06; 32],
             &crate::tx1::placeholder_tx1_effects(),
+            &[0x07],
             &rk,
             &gov_nullifiers,
         )
@@ -6209,6 +6697,7 @@ mod tests {
                 &[],
                 &stored_sighash,
                 &crate::tx1::placeholder_tx1_effects(),
+                &[0x90],
                 &rk,
                 &[vec![0x89; 32]],
             )

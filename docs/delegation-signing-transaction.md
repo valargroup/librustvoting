@@ -347,13 +347,14 @@ After the bundle is built, the wallet MUST:
 4. serialize the full PCZT;
 5. compute `Signer::shielded_sighash()` from the finalized PCZT;
 6. encode the finalized Ironwood action's effecting data; and
-7. persist the effecting data, sighash, `rk`, `alpha`, `nf_signed`, `cmx_new`,
-   both rseeds, and proof inputs before requesting a signature, while retaining
-   the action index with the active signing request.
+7. persist the exact full PCZT, effecting data, sighash, `rk`, `alpha`,
+   `nf_signed`, `cmx_new`, both rseeds, and proof inputs before requesting a
+   signature.
 
-The caller MUST retain the exact full PCZT for the active signing session.
-The current voting database persists the binding fields, but not the full PCZT
-bytes.
+The voting database retains the exact full PCZT with its write-once binding
+fields. Reopening the same prepared bundle therefore reconstructs the same
+signer request and action index after background proving or process restart;
+it does not resample setup randomness.
 
 The sighash is the 32-byte ZIP-244 shielded signature digest. It is not a
 custom voting hash.
@@ -418,7 +419,7 @@ boundary.
 
 For a PCZT signer such as Keystone, the wallet MUST:
 
-1. redact the full PCZT for the Signer role;
+1. load the exact full PCZT from durable setup and redact it for the Signer role;
 2. send only the redacted PCZT to the signer;
 3. receive a structurally parseable signed PCZT;
 4. extract the SpendAuth signature from the persisted action index; and
@@ -453,11 +454,13 @@ controller retains its account keys. The delivery receipt and validation
 contract is documented in
 [delegation capability handoff](exporting-to-external-software.md).
 
-Signing state is one-shot. After a restart, the wallet MAY resume only if it
-retained the exact signing request, including the full PCZT. Otherwise it MUST
-clear the unsigned setup and build a fresh one. It MUST NOT combine `alpha`,
-`rk`, action fields, rseeds, a sighash, or a signature from different setup
-attempts.
+Signing state is one-shot. After a restart, the wallet MAY resume through the
+same prepared bundle because the voting database retains the exact full PCZT.
+If legacy setup predates durable PCZT storage, the SDK preserves it and returns
+`VotingError::DelegationReconciliationRequired` instead of rebuilding it. The
+wallet must reconcile whether delegation submission reached the chain before
+explicitly abandoning that setup. A wallet MUST NOT combine `alpha`, `rk`,
+action fields, rseeds, a sighash, or a signature from different setup attempts.
 
 ## Rust example
 
@@ -478,7 +481,7 @@ fn build_tx1(
     let progress = NoopProgressReporter;
     let request = prepared
         .keystone_request(voting_db, &progress)
-        .context("build TX1 and persist its binding fields")?;
+        .context("build or reload TX1 and its binding fields")?;
 
     let recomputed = pczt_sighash(&request.pczt_bytes)?;
     ensure!(
@@ -521,8 +524,9 @@ The complete caller-oriented flows are implemented in
 
 - `build_keystone_delegation_request` builds TX1 and returns the full and
   signer-redacted PCZTs;
-- `prove_and_submit_keystone_delegation_bundle` extracts the returned
-  SpendAuth signature and assembles the delegation submission; and
+- `prove_and_submit_keystone_delegation_bundle` reuses or completes ZKP #1,
+  extracts the returned SpendAuth signature, and assembles the delegation
+  submission; and
 - `prove_and_submit_delegation_bundle` demonstrates the equivalent
   wallet-owned software signing path.
 
