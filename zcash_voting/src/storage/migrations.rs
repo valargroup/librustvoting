@@ -923,11 +923,16 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         } else if recovery.is_some() && !batch_indicated {
             // Bind valid recovery, but quarantine an underivable historical
             // generation instead of blocking the complete database upgrade.
+            // A singleton's layout is [VAN, VC], so its own historical VAN is
+            // immediately before its vote-scoped VC. The bundle VAN is only
+            // the latest successor after every sequential singleton.
+            let singleton_van_position = checked_vc
+                .and_then(|vote_commitment_position| vote_commitment_position.checked_sub(1));
             match generation_for_vote(tx, &identity) {
                 Ok(bound) => legacy_import_or_recovering(
                     bound.generation().digest().as_bytes().to_vec(),
                     bound.expected_layout(),
-                    checked_van,
+                    singleton_van_position,
                     checked_vc.into_iter().collect(),
                 )?,
                 Err(error @ VotingError::Storage { .. }) => return Err(error),
@@ -987,21 +992,6 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
                 continue;
             }
         };
-        let final_van: Option<i64> = tx
-            .query_row(
-                "SELECT van_leaf_position FROM bundles
-                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3",
-                rusqlite::params![round_id, wallet_id, bundle],
-                |row| row.get(0),
-            )
-            .map_err(migration_error)?;
-        let final_van = final_van
-            .map(|position| {
-                u64::try_from(position).map_err(|_| VotingError::Internal {
-                    message: "negative legacy VAN position".to_string(),
-                })
-            })
-            .transpose()?;
         // Positions are taken in the batch's signed action order, which is the
         // order the bound generation's expected layout also uses.
         let mut positions = Vec::with_capacity(bound.ordered_proposal_ids().len());
@@ -1022,10 +1012,16 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
                 message: "negative legacy VC position".to_string(),
             })?);
         }
+        // A batch's layout is [VAN, VC 0, ..., VC N-1]. Derive its historical
+        // VAN from its first signed member because the bundle VAN may already
+        // point at a later singleton's successor.
+        let batch_van_position = positions
+            .first()
+            .and_then(|first_vote_commitment| first_vote_commitment.checked_sub(1));
         let import = legacy_import_or_recovering(
             bound.generation().digest().as_bytes().to_vec(),
             bound.expected_layout(),
-            final_van,
+            batch_van_position,
             positions,
         )?;
         register_v17_legacy_import_van(

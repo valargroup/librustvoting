@@ -100,7 +100,10 @@ pub(super) fn apply_submission_observation(
             }))
         }
         (Some(State::Submitting), Observation::DefiniteRejection(diagnostic)) => {
-            Ok(Some(State::Rejected(diagnostic)))
+            Ok(Some(State::Recovering {
+                candidate_transaction_hash: None,
+                ambiguity_diagnostic: diagnostic,
+            }))
         }
 
         (Some(state @ State::Tracking { .. }), Observation::CandidatePending) => Ok(Some(state)),
@@ -118,7 +121,10 @@ pub(super) fn apply_submission_observation(
                 candidate_transaction_hash: _,
             }),
             Observation::CandidateCommittedFailure(diagnostic),
-        ) => Ok(Some(State::Rejected(diagnostic))),
+        ) => Ok(Some(State::Recovering {
+            candidate_transaction_hash: None,
+            ambiguity_diagnostic: diagnostic,
+        })),
         (
             Some(State::Tracking {
                 candidate_transaction_hash,
@@ -403,17 +409,20 @@ mod tests {
     }
 
     #[test]
-    fn committed_failure_rejects_tracking_but_not_recovery() {
-        let rejected = diagnostic("transaction committed unsuccessfully");
+    fn committed_failure_moves_tracking_to_recovery_and_clears_recovery_candidates() {
+        let committed_failure = diagnostic("transaction committed unsuccessfully");
         let tracking = Some(SubmissionRecordState::Tracking {
             candidate_transaction_hash: candidate(4),
         });
         assert_eq!(
             apply(
                 tracking,
-                SubmissionObservation::CandidateCommittedFailure(rejected.clone())
+                SubmissionObservation::CandidateCommittedFailure(committed_failure.clone())
             ),
-            Some(SubmissionRecordState::Rejected(rejected.clone()))
+            Some(SubmissionRecordState::Recovering {
+                candidate_transaction_hash: None,
+                ambiguity_diagnostic: committed_failure.clone(),
+            })
         );
 
         let recovering = Some(SubmissionRecordState::Recovering {
@@ -424,7 +433,7 @@ mod tests {
         assert_eq!(
             apply(
                 recovering,
-                SubmissionObservation::CandidateCommittedFailure(rejected)
+                SubmissionObservation::CandidateCommittedFailure(committed_failure)
             ),
             Some(SubmissionRecordState::Recovering {
                 candidate_transaction_hash: None,

@@ -339,6 +339,128 @@ fn v17_recovery_backed_vote_with_matching_positions_confirms_as_legacy_import() 
     assert_eq!(positions, encode_positions(&[8]).unwrap());
 }
 
+#[test]
+fn v17_sequential_recovery_backed_singletons_use_their_own_van_positions() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&v17_schema()).unwrap();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    queries::insert_bundle(&conn, ROUND, "wallet", 0, &[1, 2]).unwrap();
+
+    let mut first = crate::vote::parse_recovery(&released_singleton_recovery_json(ROUND)).unwrap();
+    first.vc_tree_position = 8;
+    let mut second = first.clone();
+    second.proposal_id = 2;
+    second.vote_decision = 1;
+    second.vc_tree_position = 10;
+    second.van_nullifier = [0x41; 32];
+    second.vote_authority_note_new = [0x42; 32];
+    second.vote_commitment = [0x43; 32];
+    second.r_vpk = [0x44; 32];
+
+    for (recovery, transaction_hash) in [(&first, "first-singleton"), (&second, "second-singleton")]
+    {
+        let stored_commitment = crate::vote::stored_vote_commitment_bytes(recovery).unwrap();
+        queries::store_vote(
+            &conn,
+            ROUND,
+            "wallet",
+            0,
+            recovery.proposal_id,
+            recovery.vote_decision,
+            &stored_commitment,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE votes
+                SET commitment_bundle_json=?1, vc_tree_position=?2, tx_hash=?3
+              WHERE round_id=?4 AND wallet_id='wallet'
+                AND bundle_index=0 AND proposal_id=?5",
+            rusqlite::params![
+                crate::vote::serialize_recovery(recovery).unwrap(),
+                i64::try_from(recovery.vc_tree_position).unwrap(),
+                transaction_hash,
+                ROUND,
+                i64::from(recovery.proposal_id),
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE bundles SET van_leaf_position=9
+          WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+        [ROUND],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 17).unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    type ImportedVote = (i64, String, String, Vec<u8>, i64, Vec<u8>);
+    let imported: Vec<ImportedVote> = conn
+        .prepare(
+            "SELECT proposal_id, state, confirmation_source, generation_digest,
+                    final_van_position, vote_commitment_positions
+               FROM chain_submissions
+              WHERE kind='vote'
+              ORDER BY proposal_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert_eq!(imported.len(), 2);
+    for vote in &imported {
+        assert_eq!(vote.1, "confirmed");
+        assert_eq!(vote.2, "legacy_import");
+        assert_eq!(vote.3.len(), 32);
+    }
+    assert_ne!(imported[0].3, imported[1].3);
+    assert_eq!(imported[0].4, 7);
+    assert_eq!(imported[0].5, encode_positions(&[8]).unwrap());
+    assert_eq!(imported[1].4, 9);
+    assert_eq!(imported[1].5, encode_positions(&[10]).unwrap());
+
+    let bundle_van: i64 = conn
+        .query_row(
+            "SELECT van_leaf_position FROM bundles
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+            [ROUND],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bundle_van, 9);
+    let vote_positions: Vec<i64> = conn
+        .prepare(
+            "SELECT vc_tree_position FROM votes
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0
+              ORDER BY proposal_id",
+        )
+        .unwrap()
+        .query_map([ROUND], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(vote_positions, vec![8, 10]);
+}
+
 /// Complete but non-adjacent positions cannot confirm a bound generation.
 #[test]
 fn v17_recovery_backed_vote_with_mismatched_layout_stays_recovering() {
@@ -379,9 +501,9 @@ fn legacy_import_layout_requires_contiguous_ordered_positions() {
     assert!(!positions_match_expected_layout(&vote, u64::MAX, &[0]));
 }
 
-/// A partially recorded position set is never accepted as a confirmation.
+/// Position zero cannot have a preceding singleton VAN and never wraps.
 #[test]
-fn v17_recovery_backed_vote_without_a_van_stays_bound_and_recovering() {
+fn v17_singleton_vc_at_zero_stays_bound_and_recovering() {
     let mut conn = v17_recovery_backed_singleton(None);
     conn.execute(
         "UPDATE votes SET vc_tree_position=0
@@ -395,6 +517,15 @@ fn v17_recovery_backed_vote_without_a_van_stays_bound_and_recovering() {
     assert_eq!(state, "recovering");
     assert_eq!(source, None);
     assert!(has_digest);
+    let positions: (Option<i64>, Option<Vec<u8>>) = conn
+        .query_row(
+            "SELECT final_van_position, vote_commitment_positions
+               FROM chain_submissions WHERE kind='vote'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(positions, (None, None));
 }
 
 /// A round id that cannot form a canonical identity creates no row.
@@ -957,6 +1088,97 @@ fn build_confirmed_batch(conn: &Connection) {
         [ROUND],
     )
     .unwrap();
+}
+
+#[test]
+fn v17_batch_followed_by_singleton_uses_the_batch_first_vc_for_its_van() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&v17_schema()).unwrap();
+    build_confirmed_batch(&conn);
+
+    let mut later_singleton =
+        crate::vote::parse_recovery(&released_singleton_recovery_json(ROUND)).unwrap();
+    later_singleton.proposal_id = 3;
+    later_singleton.vote_decision = 1;
+    later_singleton.vc_tree_position = 11;
+    later_singleton.van_nullifier = [0x51; 32];
+    later_singleton.vote_authority_note_new = [0x52; 32];
+    later_singleton.vote_commitment = [0x53; 32];
+    later_singleton.r_vpk = [0x54; 32];
+    let stored_commitment = crate::vote::stored_vote_commitment_bytes(&later_singleton).unwrap();
+    queries::store_vote(&conn, ROUND, "wallet", 0, 3, 1, &stored_commitment).unwrap();
+    conn.execute(
+        "UPDATE votes
+            SET commitment_bundle_json=?1, tx_hash='later-singleton',
+                vc_tree_position=11
+          WHERE round_id=?2 AND wallet_id='wallet'
+            AND bundle_index=0 AND proposal_id=3",
+        rusqlite::params![
+            crate::vote::serialize_recovery(&later_singleton).unwrap(),
+            ROUND,
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE bundles SET van_leaf_position=10
+          WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+        [ROUND],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 17).unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    let batch: (String, String, i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT state, confirmation_source, final_van_position,
+                    vote_commitment_positions
+               FROM chain_submissions WHERE kind='vote_batch'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(batch.0, "confirmed");
+    assert_eq!(batch.1, "legacy_import");
+    assert_eq!(batch.2, 7);
+    assert_eq!(batch.3, encode_positions(&[8, 9]).unwrap());
+
+    let singleton: (String, String, i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT state, confirmation_source, final_van_position,
+                    vote_commitment_positions
+               FROM chain_submissions
+              WHERE kind='vote' AND proposal_id=3",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(singleton.0, "confirmed");
+    assert_eq!(singleton.1, "legacy_import");
+    assert_eq!(singleton.2, 10);
+    assert_eq!(singleton.3, encode_positions(&[11]).unwrap());
+
+    let bundle_van: i64 = conn
+        .query_row(
+            "SELECT van_leaf_position FROM bundles
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+            [ROUND],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bundle_van, 10);
+    let vote_positions: Vec<i64> = conn
+        .prepare(
+            "SELECT vc_tree_position FROM votes
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0
+              ORDER BY proposal_id",
+        )
+        .unwrap()
+        .query_map([ROUND], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(vote_positions, vec![8, 9, 11]);
 }
 
 /// A confirmed atomic batch binds one row, and its members stay locked.

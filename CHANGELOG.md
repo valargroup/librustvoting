@@ -46,9 +46,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   upgrade.
 - Version-17 evidence with absent or underivable recovery material is
   permanently unbound. Bound `Recovering` rows are resolvable in principle,
-  but the tree-recovery pass that resolves them is not part of this release, so
-  in practice they still make no progress until it lands; all unresolved
-  migration rows continue to report `SubmissionManaged` and schedule no work.
+  but the tree-recovery pass that resolves them is not present in this
+  intermediate staging change. This state must not be released independently:
+  the complete Phase 6 exact-tree recovery and authorized same-generation retry
+  lifecycle must land first, together with a defined resolution for a
+  proven-absent rejected generation that cannot succeed unchanged. Until then,
+  all unresolved migration or rejection rows report `SubmissionManaged`, block
+  dependent work in their bundle, and schedule no work.
 - A process killed at any point during the version-17 migration now leaves
   either the untouched version-17 database or a complete version 18, and a
   restart after any kill classifies identical rows.

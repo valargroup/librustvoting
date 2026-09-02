@@ -908,14 +908,20 @@ async fn migration_guards_return_before_derivation_or_network_work() {
 }
 
 #[tokio::test]
-async fn deterministic_rejection_is_terminal_and_redacted() {
+async fn chain_rejection_preserves_bound_recovery_and_redacts_diagnostics() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived(identity.clone(), 1));
     let transport = Arc::new(ScriptedTransport::default());
     transport.queue(Ok(rejected()));
 
-    let result = coordinator(transport, Arc::clone(&store), ManualClock::new(100), 10)
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    );
+    let result = coordinator
         .advance(
             StoreAdvancementRequest::vote(identity.clone()),
             &ManualControl::default(),
@@ -924,11 +930,34 @@ async fn deterministic_rejection_is_terminal_and_redacted() {
         .unwrap();
 
     assert!(
-        matches!(result, ChainSubmissionResult::Rejected(ref diagnostic) if !diagnostic.message().contains("sensitive"))
+        matches!(result, ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ref diagnostic,
+        }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::ChainRejected
+            && !diagnostic.message().contains("sensitive"))
     );
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+    assert!(record.generation_digest().is_some());
+
+    let replay = coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ..
+        })
+    ));
     assert_eq!(
-        store.record(&identity).unwrap().durable_state(),
-        ChainSubmissionState::Rejected
+        transport.methods(),
+        vec!["POST"],
+        "staged hashless recovery must not redispatch without a tree pass"
     );
 }
 
@@ -967,7 +996,7 @@ async fn changed_generation_is_rejected_before_reconciliation() {
 }
 
 #[tokio::test]
-async fn terminal_state_is_idempotent_only_for_the_same_generation() {
+async fn rejected_recovery_accepts_only_the_same_generation() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived(identity.clone(), 1));
@@ -994,7 +1023,13 @@ async fn terminal_state_is_idempotent_only_for_the_same_generation() {
         )
         .await
         .unwrap();
-    assert!(matches!(replay, ChainSubmissionResult::Rejected(_)));
+    assert!(matches!(
+        replay,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ..
+        })
+    ));
 
     store.seed_derivation(derived(identity.clone(), 2));
     let failure = coordinator
@@ -1408,7 +1443,7 @@ fn request_kind_must_match_the_identity_target() {
 }
 
 #[tokio::test]
-async fn committed_failure_rejects_tracking_but_only_clears_recovery_candidate() {
+async fn committed_failure_moves_tracking_to_recovery_and_clears_recovery_candidate() {
     let tracking_identity = identity(1, 0);
     let tracking_store = Arc::new(InMemoryChainSubmissionStore::default());
     tracking_store.seed_derivation(derived(tracking_identity.clone(), 1));
@@ -1447,8 +1482,18 @@ async fn committed_failure_rejects_tracking_but_only_clears_recovery_candidate()
     .unwrap();
     assert!(matches!(
         tracking_result,
-        ChainSubmissionResult::Rejected(_)
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ref diagnostic,
+        }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::ChainRejected
     ));
+    assert_eq!(
+        tracking_store
+            .record(&tracking_identity)
+            .unwrap()
+            .durable_state(),
+        ChainSubmissionState::Recovering
+    );
 
     let recovering_identity = identity(2, 1);
     let recovering_store = Arc::new(InMemoryChainSubmissionStore::default());

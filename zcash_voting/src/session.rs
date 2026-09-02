@@ -2146,6 +2146,51 @@ mod tests {
     }
 
     #[test]
+    fn bound_hashless_recovery_is_contained_until_tree_recovery_lands() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+        align_stored_commitments_with_recovery(&db, &[2]);
+
+        let identity = submission_identity_fixture(ChainSubmissionTarget::Vote { proposal_id: 2 });
+        let generation = generation_for_vote(&db.conn(), &identity).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, ?4,
+                         'recovering', 0, 'reconciliation_pending',
+                         'version-17 positions require exact tree recovery', 9, 9)",
+                rusqlite::params![
+                    submission_identity_key(&identity),
+                    ROUND,
+                    W,
+                    generation.generation().digest().as_bytes().to_vec(),
+                ],
+            )
+            .unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert!(plan.next_steps.is_empty());
+        assert!(plan.recovered_vote_work.is_empty());
+        assert!(plan.pending_recovery);
+        assert!(plan.blocking_recovery);
+        assert_eq!(plan.primary_action, RoundPlanAction::Idle);
+        assert_eq!(
+            db.vote_phase(ROUND, 0, 2).unwrap(),
+            VotePhase::SubmissionManaged
+        );
+    }
+
+    #[test]
     fn rejected_singleton_vote_never_yields_submit_or_poll_work() {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)

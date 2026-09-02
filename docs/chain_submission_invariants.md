@@ -53,6 +53,11 @@ An implementation phase that cannot yet perform the complete candidate-first
 recovery, fixed-snapshot tree scan, and authorized same-generation retry keeps
 its submission entry points private. A partial public lifecycle that can enter
 `Recovering` without advancing it is not conformant.
+An implementation is not releasable unless it provides the complete recovery
+lifecycle described by this specification and explicitly resolves a
+proven-absent rejected generation that cannot succeed unchanged. A conformant
+resolution may allow a replacement generation after a valid no-match pass or
+may rely on a versioned chain contract that proves replacement is unnecessary.
 
 Vote API and commitment-tree endpoints are trusted for chain status, events,
 and validated snapshots. A malformed, incomplete, contradictory, or
@@ -345,8 +350,10 @@ Their meanings are:
   that version 17 regarded those outputs as confirmed at those locations, which
   is what the next proposal in the bundle needs to advance. It permits no
   submission, reconciliation, or recovery.
-- `Rejected`: the generation received a definite chain rejection, or its sole
-  tracked hash is committed unsuccessfully.
+- `Rejected`: a compatibility-only terminal row retained for previously
+  persisted lifecycle data. Current runtime rejection codes are diagnostic
+  because they may depend on node state or chain time; new runtime work does
+  not enter this state.
 
 The normal transitions are:
 
@@ -354,11 +361,11 @@ The normal transitions are:
 new -> Submitting
 Submitting -> Tracking       usable success hash
 Submitting -> Recovering     possible dispatch without usable hash
-Submitting -> Rejected       definite chain rejection
+Submitting -> Recovering     chain rejection code
 Tracking -> Tracking         hash still pending
 Tracking -> Recovering       bounded tracking window expires inconclusively
 Tracking -> Confirmed        committed success and atomic persistence
-Tracking -> Rejected         committed failure
+Tracking -> Recovering       committed failure, failed candidate cleared
 Recovering -> Recovering     candidate, retry, no match, or interruption
 Recovering -> Confirmed      candidate success or exact tree layout
 ```
@@ -376,12 +383,12 @@ new
                               |                           |-- pending --> Tracking
                               |                           |-- window expires --> Recovering
                               |                           |-- committed success --> Confirmed
-                              |                           `-- committed failure --> Rejected
+                              |                           `-- committed failure --> Recovering
                               |-- possibly dispatched --> Recovering
                               |                           |-- candidate, scan, or retry --> Recovering
                               |                           `-- candidate success or exact tree layout
                               |                               --> Confirmed
-                              |-- definite rejection --> Rejected
+                              |-- chain rejection code --> Recovering
                               `-- definitely unsent first attempt --> no row
 
 abandoned Submitting on restart -- normalize --> Recovering
@@ -488,13 +495,16 @@ A canonical success hash transitions the first attempt to `Tracking`. If the
 row was already `Recovering`, the hash becomes its candidate and the state
 remains `Recovering`.
 
-A definite chain rejection transitions `Submitting` to `Rejected`. A rejection
-while already `Recovering` cannot settle the earlier possible dispatch. Its
-code and log are diagnostic; if it also contains a canonical hash, that hash
-may fill an absent recovery-candidate slot and is polled before the next tree
-scan. It never overwrites a pending or unreadable candidate. Because the
-protocol does not specify that an error hash identifies an earlier accepted
-transaction, the hash is only a recovery handle.
+A chain rejection code transitions `Submitting` to bound hashless
+`Recovering`. Numeric rejection codes are diagnostic rather than proof that a
+generation can never succeed: validation can depend on the receiving node's
+local anchor state or on chain time. A rejection while already `Recovering`
+likewise cannot settle the earlier possible dispatch. Because the protocol does
+not specify that an error hash identifies an earlier accepted transaction, a
+hash in an error response is not confirmation evidence.
+Until the release prerequisite above is implemented, this row blocks later
+submissions that consume its unknown successor VAN. Same-generation retry alone
+does not resolve a generation whose anchor has become permanently stale.
 
 Within each lifecycle invocation, POST attempts, endpoints, body sizes, request
 durations, and backoffs are bounded by configuration with safe finite maxima.
@@ -518,16 +528,17 @@ Reconciliation is state-driven:
   not confirm, the lifecycle may perform one bounded tree recovery pass.
 - a digestless, unbound `Recovering` guard performs no network work and returns
   pending with its persisted migration diagnostic.
-- `Confirmed` and `Rejected` perform no network mutation, whatever the
-  confirmation source.
+- `Confirmed` and compatibility `Rejected` rows perform no network mutation,
+  whatever the confirmation source.
 
 A pending or temporarily unreadable candidate remains available for later
 polling. In `Recovering`, it does not disable tree recovery and prohibits
 another POST until it is either committed unsuccessfully or retired after a
 completed valid no-match tree pass. A committed-success candidate proceeds to
 confirmation. A `Tracking` candidate that is committed unsuccessfully becomes
-`Rejected`; a `Recovering` candidate that is committed unsuccessfully is
-atomically cleared while the row remains `Recovering`.
+hashless `Recovering` with the committed-failure diagnostic; a `Recovering`
+candidate that is committed unsuccessfully is atomically cleared while the row
+remains `Recovering`.
 
 After candidate polling and a bounded no-match tree pass, the lifecycle
 receives one private process-local authorization for the captured identity,
@@ -571,7 +582,7 @@ Restart plans are derived from the authoritative row:
 - a `legacy_projection` confirmation satisfies the chain-confirmation
   dependency and blocks resubmission, but missing helper inputs are not
   invented or scheduled;
-- `Rejected` schedules no reconciliation; and
+- a compatibility `Rejected` row schedules no reconciliation; and
 - absent rows permit fresh work if bundle causality allows it and no unbound
   row exists for that identity, including for every member of a proposed batch.
 
@@ -738,7 +749,9 @@ authorized. For a digestless guard it also carries no candidate, preserves the
 stable migration diagnostic distinguishing unavailable recovery from failed
 generation derivation, authorizes no network recovery, and is never
 automatically rescheduled.
-`Rejected` means the durable row is terminally rejected.
+`Rejected` means a compatibility row is terminally rejected. New HTTP 422 and
+committed-failure observations return `Pending(Recovering)` instead, preserving
+the bound generation for exact-tree recovery and same-generation retry.
 
 A `legacy_projection` confirmation is returned publicly as `Confirmed` with
 that source and no transaction hash. Its positions are explicitly legacy domain
@@ -804,12 +817,12 @@ order, and batch digest are locked. Delegation setup, nullifiers, proof inputs,
 and VAN randomizer are likewise locked. Re-selecting the same generation is
 idempotent; changing it is rejected.
 
-Terminal rejection does not release an atomic batch's member locks. The
-rejected row still projects its phase through the signed recovery rows that
-define its ordered roster, so a conflicting ballot-intent change must fail
-before clearing vote recovery or helper-delivery records. A rejected singleton
-does not depend on a recovery-derived roster and is not additionally locked by
-this batch-roster rule.
+A compatibility terminal rejection does not release an atomic batch's member
+locks. The rejected row still projects its phase through the signed recovery
+rows that define its ordered roster, so a conflicting ballot-intent change must
+fail before clearing vote recovery or helper-delivery records. A rejected
+singleton does not depend on a recovery-derived roster and is not additionally
+locked by this batch-roster rule.
 
 Confirmation does not release those locks. A vote that a generation has already
 placed on chain cannot have its ballot intent changed, whatever the confirmation
@@ -864,10 +877,10 @@ Hashless `Recovering` is exactly the case that requires preservation. Bundle
 indexes are never renumbered, and imported capability bundle sets remain
 indivisible.
 
-Rejected generations may release their exact unused recovery material only when
-no earlier unresolved generation or later dependent generation needs it.
-Cleanup must not infer safety from legacy domain hashes independently of the
-authoritative row.
+Compatibility `Rejected` generations may release their exact unused recovery
+material only when no earlier unresolved generation or later dependent
+generation needs it. Cleanup must not infer safety from legacy domain hashes
+independently of the authoritative row.
 
 Explicit round or account deletion is the destructive escape hatch. It closes
 the matching operation gate before checking active work, prevents new entrants,
@@ -922,7 +935,12 @@ Migration classifies version-17 rows in this order:
    match, because `legacy_import` asserts a validated layout and its recorded
    VAN becomes the bundle's successor. A gap, a reordering, a wrong count, or a
    position arithmetic overflow leaves a bound `Recovering` row that ordinary
-   tree recovery can resolve.
+   tree recovery can resolve. For a historical singleton, migration reconstructs
+   that vote's own successor VAN as `vc_tree_position - 1`. For an atomic batch,
+   it reconstructs the batch VAN from the first signed member's VC position in
+   the same way. Both use checked arithmetic. The bundle-scoped VAN records only
+   the newest successor after later confirmations and is not attributed to an
+   older singleton or batch.
 3. A vote with complete VAN and VC domain positions, no batch markers, and
    absent recovery JSON becomes `Confirmed` with source `legacy_projection`.
    Migration records the checked observed positions, preserves the original
@@ -983,7 +1001,8 @@ nullifier or output layout.
 
 Every legacy-observed VC position must fit the allowed range and belong to only
 one output, and every output position validated by a `legacy_import` -- including
-delegation and successor VANs -- must be unique within its network and round.
+delegation and inferred singleton or batch successor VANs -- must be unique
+within its network and round.
 Duplicate or cross-kind ownership in the same round aborts migration. Reusing
 the same numeric position in another round is valid because each round has an
 independent commitment tree. A bundle VAN observed for a
@@ -1078,7 +1097,9 @@ Tests cover:
 - polling, diagnostics, and restart do not reset the durable tracking window;
 - promotion alone does not retire the candidate or permit redispatch;
 - hash polling produces atomic `Confirmed`;
-- definite rejection produces `Rejected`;
+- a chain rejection code produces bound hashless `Recovering` with a redacted
+  diagnostic;
+- committed failure clears the tracked candidate into bound `Recovering`;
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class produces `Recovering`;
 - restart from `Submitting` produces `Recovering`;
@@ -1292,7 +1313,7 @@ Generation and confirmation coverage is anchored by
 `records_vote_confirmation_atomically`, and
 `records_vote_batch_confirmation_replay_and_helper_positions`.
 
-Phase 4 private-coordinator coverage is anchored by
+Private-coordinator lifecycle coverage is anchored by
 `reservation_commits_before_post_and_accepted_hash_is_tracking`,
 `delegation_uses_the_same_lifecycle_and_atomic_confirmation_path`,
 `reservation_failure_dispatches_nothing_and_writes_nothing`,
@@ -1301,14 +1322,15 @@ Phase 4 private-coordinator coverage is anchored by
 `failed_post_classification_reports_known_possible_dispatch`,
 `failed_tracking_reconciliation_reports_the_durable_state`,
 `tracking_deadline_survives_polling_and_coordinator_restart`,
-`committed_failure_rejects_tracking_but_only_clears_recovery_candidate`,
+`chain_rejection_preserves_bound_recovery_and_redacts_diagnostics`,
+`committed_failure_moves_tracking_to_recovery_and_clears_recovery_candidate`,
 `hash_confirmation_updates_submission_and_projection_atomically`,
 `failed_confirmation_rolls_back_submission_and_projection`,
 `cancellation_after_confirmation_commit_point_cannot_suppress_persistence`,
 `migration_guards_return_before_derivation_or_network_work`,
 `guarded_batch_is_rejected_before_derivation_or_dispatch`,
 `changed_generation_is_rejected_before_reconciliation`,
-`terminal_state_is_idempotent_only_for_the_same_generation`,
+`rejected_recovery_accepts_only_the_same_generation`,
 `same_identity_concurrency_releases_only_one_post`,
 `same_bundle_blocks_a_successor_until_the_predecessor_is_authoritative`,
 `active_predecessor_blocks_the_next_bundle_generation`,
@@ -1356,7 +1378,9 @@ Phase 4 private-coordinator coverage is anchored by
 `v17_recovery_free_vote_evidence_is_classified_by_completeness`,
 `v17_recovery_backed_vote_migrates_to_a_bound_generation`,
 `v17_recovery_backed_vote_with_matching_positions_confirms_as_legacy_import`,
-`v17_recovery_backed_vote_without_a_van_stays_bound_and_recovering`,
+`v17_sequential_recovery_backed_singletons_use_their_own_van_positions`,
+`v17_singleton_vc_at_zero_stays_bound_and_recovering`,
+`v17_batch_followed_by_singleton_uses_the_batch_first_vc_for_its_van`,
 `v17_delegation_without_setup_material_remains_a_digestless_guard`,
 `v17_complete_delegation_setup_binds_without_a_signer`,
 `v17_corrupt_delegation_setup_becomes_a_derivation_failure_guard`,
@@ -1378,6 +1402,7 @@ Phase 4 private-coordinator coverage is anchored by
 `reset_voting_session_state_scopes_submission_protection_to_its_bundle`,
 `noncanonical_legacy_round_ids_remain_deletable`,
 `lifecycle_owned_legacy_vote_never_yields_submit_or_poll_work`,
+`bound_hashless_recovery_is_contained_until_tree_recovery_lands`,
 `rejected_singleton_vote_never_yields_submit_or_poll_work`,
 `rejected_vote_batch_never_reschedules_its_members`,
 `rejected_delegation_never_yields_delegate_work`,
