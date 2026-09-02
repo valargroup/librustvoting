@@ -13,6 +13,13 @@ use super::{
     ChainSubmissionTarget,
 };
 
+mod sqlite;
+#[allow(
+    unused_imports,
+    reason = "SQLite lifecycle authority is activated by a later public phase"
+)]
+pub(super) use sqlite::SqliteChainSubmissionStore;
+
 #[cfg(test)]
 use super::{
     confirmation::validate_hash_confirmation,
@@ -139,7 +146,6 @@ impl StoreAdvancementRequest {
         self.legacy_identities
             .iter()
             .cloned()
-            .into_iter()
             .chain(std::iter::once(self.identity().clone()))
             .collect()
     }
@@ -428,14 +434,14 @@ pub(super) trait ChainSubmissionStore: Send + Sync {
     ) -> Result<ConfirmationCommit, ChainSubmissionFailure>;
 }
 
-fn abandoned_diagnostic() -> ChainSubmissionDiagnostic {
+pub(super) fn abandoned_diagnostic() -> ChainSubmissionDiagnostic {
     ChainSubmissionDiagnostic::from_redacted_message(
         ChainSubmissionDiagnosticKind::AmbiguousDispatch,
         "an unclassified submission reservation survived process interruption",
     )
 }
 
-fn ensure_generation(
+pub(super) fn ensure_generation(
     record: &StoredChainSubmission,
     generation: &ChainSubmissionGeneration,
 ) -> Result<(), ChainSubmissionFailure> {
@@ -451,7 +457,7 @@ fn ensure_generation(
     Ok(())
 }
 
-fn transition_failure(
+pub(super) fn transition_failure(
     state: ChainSubmissionState,
     error: impl std::fmt::Display,
 ) -> ChainSubmissionFailure {
@@ -462,7 +468,7 @@ fn transition_failure(
     )
 }
 
-fn preserve_loaded_state(
+pub(super) fn preserve_loaded_state(
     error: ChainSubmissionFailure,
     record: Option<&StoredChainSubmission>,
 ) -> ChainSubmissionFailure {
@@ -476,8 +482,7 @@ fn preserve_loaded_state(
     }
 }
 
-#[allow(dead_code, reason = "used by the phase-5 SQLite store")]
-fn map_generation_error(error: VotingError) -> ChainSubmissionFailure {
+pub(super) fn map_generation_error(error: VotingError) -> ChainSubmissionFailure {
     ChainSubmissionFailure::without_state(
         match error {
             VotingError::InvalidInput { .. } => ChainSubmissionFailureKind::InvalidInput,

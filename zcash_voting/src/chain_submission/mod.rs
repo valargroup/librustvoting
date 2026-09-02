@@ -11,7 +11,7 @@
 #[allow(dead_code, reason = "internal confirmation projection")]
 mod confirmation;
 #[allow(dead_code, reason = "inactive lifecycle coordination foundation")]
-mod coordination;
+pub(crate) mod coordination;
 #[allow(dead_code, reason = "inactive lifecycle coordinator")]
 mod coordinator;
 #[allow(dead_code, reason = "internal generation derivation and migration")]

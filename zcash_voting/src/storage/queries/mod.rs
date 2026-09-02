@@ -2838,6 +2838,28 @@ pub fn delete_bundles_from(
         });
     }
 
+    let protected: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM chain_submissions
+              WHERE round_id = :round_id
+                AND wallet_id = :wallet_id
+                AND bundle_index >= :from_index)",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":from_index": from_index as i64,
+            },
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to check chain-submission prune guard: {error}"),
+        })?;
+    if protected {
+        return Err(VotingError::Busy {
+            message: "cannot prune bundles protected by chain-submission evidence".to_string(),
+        });
+    }
+
     let rows = tx
         .execute(
             "DELETE FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index >= :from_index",
@@ -3280,6 +3302,13 @@ pub fn clear_unsigned_delegation_setup_fields(
                SELECT bundle_index
                FROM keystone_signatures
                WHERE round_id = :round_id AND wallet_id = :wallet_id
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM chain_submissions submission
+                WHERE submission.round_id = bundles.round_id
+                  AND submission.wallet_id = bundles.wallet_id
+                  AND submission.bundle_index = bundles.bundle_index
            )",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )

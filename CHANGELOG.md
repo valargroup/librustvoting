@@ -27,6 +27,28 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   dispatch has not begun. Batch admission derives its identity locks from the
   complete request roster, verifies the persisted roster before reading
   migration guards, and rejects oversized rosters before lock allocation.
+- Recovery snapshots and session plans now report migration-guarded delegation
+  and vote evidence as `SubmissionManaged`; legacy submit and poll steps are
+  suppressed while the lifecycle owns that evidence. Terminal
+  `LegacyConfirmed` votes are reported as confirmed without reconstructing
+  unavailable recovery work, and recovery-free migration guards lock their
+  recorded ballot intent.
+- SQLite chain-submission admission now permits confirmed predecessors to
+  advance, classifies reused candidate hashes as hashless recovery, preserves
+  monotonic lifecycle timestamps across wall-clock rollback, and retains
+  possible-dispatch evidence when restart normalization cannot be persisted.
+- Ballot-intent changes and bundle pruning now preserve every active semantic
+  generation and its helper-delivery material under the lifecycle round gate.
+  Version-17 vote-position collision checks are scoped to each independent
+  network tree. Migration validates recovery identity and vote semantics
+  against the owning row, validates complete atomic recovery-batch groups, and
+  omits obsolete delegation guards when a terminal legacy vote already proves
+  the bundle successor completed.
+- Lifecycle ownership checks now serialize with every compatibility projection
+  write, unresolved bundle predecessors remain blocked across vote-chain id
+  changes, and tracking diagnostics survive database reopen. Migration validates
+  every observed legacy position and the complete unreleased-v18 schema;
+  session reset and deletion retain bundle-scoped and legacy-round progress.
 - Session cleanup now preserves delegation setup fields for bundles with a
   successful proof so wallets can resume signing without regenerating ZKP1.
 - VAN positions above `u32::MAX` are now read losslessly; legacy `u32` readers

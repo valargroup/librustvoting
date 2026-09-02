@@ -1234,7 +1234,11 @@ the embedded recovery proposal to the durable key,
 `share_tracking/tests/initial_delivery.rs` for identity-bound confirmation and
 placement updates, and
 `changed_choice_ignores_stale_share_confirmations` and
-`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
+`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`. Active
+chain-generation preservation is covered by
+`active_singleton_generation_locks_intent_and_recovery_material` and
+`active_batch_generation_locks_every_member_intent`; both reject the intent
+change before vote recovery or helper-delivery rows can be cleared.
 
 ### Configuration and migration
 

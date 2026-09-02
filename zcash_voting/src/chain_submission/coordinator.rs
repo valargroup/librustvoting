@@ -81,7 +81,7 @@ impl ChainSubmissionClock for SystemChainSubmissionClock {
 }
 
 /// Host cancellation and operation-epoch authority sampled at every boundary.
-pub(super) trait ChainSubmissionControl: Send + Sync {
+pub(super) trait SubmissionControl: Send + Sync {
     fn is_cancelled(&self) -> bool;
     fn operation_epoch(&self) -> u64;
 }
@@ -101,7 +101,7 @@ struct ConfirmationContext<'a> {
     candidate: super::CandidateTransactionHash,
     committed: &'a super::protocol::CommittedTransaction,
     durable_state: ChainSubmissionState,
-    control: &'a dyn ChainSubmissionControl,
+    control: &'a dyn SubmissionControl,
 }
 
 impl<T, S, C> ChainSubmissionCoordinator<T, S, C>
@@ -134,7 +134,7 @@ where
     pub(super) async fn advance(
         &self,
         request: StoreAdvancementRequest,
-        control: &dyn ChainSubmissionControl,
+        control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         let operation =
             CapturedSubmissionOperation::new(request.identity().clone(), control.operation_epoch());
@@ -184,7 +184,7 @@ where
         request: StoreAdvancementRequest,
         operation: CapturedSubmissionOperation,
         mut derived: DerivedChainSubmission,
-        control: &dyn ChainSubmissionControl,
+        control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         for attempt_index in 0..self.policy.maximum_post_attempts {
             if let Some(reason) = interruption(&operation, control) {
@@ -401,7 +401,7 @@ where
         operation: &CapturedSubmissionOperation,
         derived: DerivedChainSubmission,
         record: StoredChainSubmission,
-        control: &dyn ChainSubmissionControl,
+        control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         match record.state() {
             SubmissionRecordState::Tracking {
@@ -632,7 +632,7 @@ where
         &self,
         operation: &CapturedSubmissionOperation,
         candidate: super::CandidateTransactionHash,
-        control: &dyn ChainSubmissionControl,
+        control: &dyn SubmissionControl,
     ) -> LookupProgress {
         let lookup = self.protocol.transaction_status(candidate);
         tokio::pin!(lookup);
@@ -650,7 +650,7 @@ where
         &self,
         delay: Duration,
         operation: &CapturedSubmissionOperation,
-        control: &dyn ChainSubmissionControl,
+        control: &dyn SubmissionControl,
     ) -> Option<Interruption> {
         tokio::select! {
             biased;
@@ -683,7 +683,7 @@ impl Interruption {
 
 fn interruption(
     operation: &CapturedSubmissionOperation,
-    control: &dyn ChainSubmissionControl,
+    control: &dyn SubmissionControl,
 ) -> Option<Interruption> {
     if control.is_cancelled() {
         Some(Interruption::Cancelled)
@@ -696,7 +696,7 @@ fn interruption(
 
 async fn wait_for_interruption(
     operation: &CapturedSubmissionOperation,
-    control: &dyn ChainSubmissionControl,
+    control: &dyn SubmissionControl,
 ) -> Interruption {
     loop {
         if let Some(reason) = interruption(operation, control) {

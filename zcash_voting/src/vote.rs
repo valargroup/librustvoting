@@ -2128,6 +2128,12 @@ pub fn record_batch_submission(
         .map_err(|e| VotingError::Internal {
             message: format!("begin vote batch submission transaction failed: {e}"),
         })?;
+    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+    )?;
     let recoveries = load_vote_batch_recoveries_with_conn(
         &tx,
         &wallet_id,
@@ -2249,6 +2255,44 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
     proposal_id: u32,
     choice: Option<u32>,
 ) -> Result<(), VotingError> {
+    let migration_guard_conflict: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM chain_submissions submission
+                 JOIN votes vote
+                   ON vote.round_id=submission.round_id
+                  AND vote.wallet_id=submission.wallet_id
+                  AND vote.bundle_index=submission.bundle_index
+                  AND vote.proposal_id=submission.proposal_id
+                WHERE submission.round_id=:round_id
+                  AND submission.wallet_id=:wallet_id
+                  AND submission.kind='vote'
+                  AND submission.vote_chain_id IS NULL
+                  AND submission.state IN ('recovering','legacy_confirmed')
+                  AND submission.proposal_id=:proposal_id
+                  AND (:choice IS NULL OR vote.choice != :choice)
+             )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":proposal_id": proposal_id as i64,
+                ":choice": choice.map(i64::from),
+            },
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!(
+                "failed to check migration guard before changing ballot intent: {error}"
+            ),
+        })?;
+    if migration_guard_conflict {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} proposal {proposal_id} has lifecycle-owned legacy evidence and its ballot intent is locked"
+            ),
+        });
+    }
+
     let mut stmt = conn
         .prepare(
             "SELECT bundle_index, choice, commitment_bundle_json
@@ -2313,6 +2357,14 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
 
     let mut batches = Vec::with_capacity(batch_keys.len());
     for (bundle_index, digest) in batch_keys {
+        ensure_no_active_chain_submission_for_vote_intent(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            proposal_id,
+            Some(&digest),
+        )?;
         let recoveries =
             load_vote_batch_recoveries_with_conn(conn, wallet_id, round_id, bundle_index, digest)?;
         for recovery in &recoveries {
@@ -2341,6 +2393,14 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
     }
 
     for &(bundle_index, singleton_proposal_id) in &singleton_keys {
+        ensure_no_active_chain_submission_for_vote_intent(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            singleton_proposal_id,
+            None,
+        )?;
         let state = crate::storage::queries::load_vote_row_state(
             conn,
             round_id,
@@ -2383,6 +2443,49 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
         )?;
     }
 
+    Ok(())
+}
+
+fn ensure_no_active_chain_submission_for_vote_intent(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    batch_digest: Option<&[u8; 32]>,
+) -> Result<(), VotingError> {
+    let active: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM chain_submissions
+                  WHERE round_id = :round_id
+                    AND wallet_id = :wallet_id
+                    AND bundle_index = :bundle_index
+                    AND state IN ('submitting','tracking','recovering')
+                    AND ((kind = 'vote' AND proposal_id = :proposal_id)
+                         OR (kind = 'vote_batch' AND ordered_batch_digest = :batch_digest))
+             )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+                ":batch_digest": batch_digest.map(|digest| digest.as_slice()),
+            },
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!(
+                "failed to check active chain submission before changing ballot intent: {error}"
+            ),
+        })?;
+    if active {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} bundle {bundle_index} proposal {proposal_id} belongs to an active chain submission and its ballot intent is locked"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -2458,6 +2561,12 @@ pub fn record_vc_position(
         .map_err(|e| VotingError::Internal {
             message: format!("begin vote VC position transaction failed: {e}"),
         })?;
+    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+    )?;
     ensure_singleton_vote_update_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?;
     record_vc_position_with_conn(
         &tx,

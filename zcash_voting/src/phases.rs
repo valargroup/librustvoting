@@ -20,6 +20,8 @@ pub enum DelegationPhase {
     Proved,
     /// A delegation transaction hash has been recorded.
     Submitted,
+    /// Submission or reconciliation is owned by the chain lifecycle facade.
+    SubmissionManaged,
     /// The vote authority note leaf position has been recovered from chain.
     Confirmed,
 }
@@ -36,6 +38,8 @@ pub enum WorkflowPhase {
     SubmittedDelegation,
     SubmittedVote,
     SubmittedShare,
+    /// Submission or reconciliation is owned by the chain lifecycle facade.
+    SubmissionManaged,
     Confirmed,
 }
 
@@ -49,6 +53,10 @@ pub enum VotePhase {
     Committed,
     /// A cast-vote transaction hash has been recorded.
     Submitted,
+    /// Submission or reconciliation is owned by the chain lifecycle facade.
+    SubmissionManaged,
+    /// A migration-only authoritative marker proves the legacy vote completed.
+    LegacyConfirmed,
     /// The vote commitment tree position has been recorded.
     Confirmed,
 }
@@ -60,6 +68,8 @@ impl VotePhase {
             Self::Prepared => "prepared",
             Self::Committed => "committed",
             Self::Submitted => "submitted",
+            Self::SubmissionManaged => "submission_managed",
+            Self::LegacyConfirmed => "legacy_confirmed",
             Self::Confirmed => "confirmed",
         }
     }
@@ -93,6 +103,7 @@ impl DelegationPhase {
             Self::PcztBuilt => "pczt_built",
             Self::Proved => "proved",
             Self::Submitted => "submitted",
+            Self::SubmissionManaged => "submission_managed",
             Self::Confirmed => "confirmed",
         }
     }
@@ -107,6 +118,7 @@ impl WorkflowPhase {
             Self::SubmittedDelegation => "submitted_delegation",
             Self::SubmittedVote => "submitted_vote",
             Self::SubmittedShare => "submitted_share",
+            Self::SubmissionManaged => "submission_managed",
             Self::Confirmed => "confirmed",
         }
     }
@@ -117,6 +129,7 @@ impl WorkflowPhase {
             DelegationPhase::Prepared => Self::Prepared,
             DelegationPhase::PcztBuilt | DelegationPhase::Proved => Self::Signed,
             DelegationPhase::Submitted => Self::SubmittedDelegation,
+            DelegationPhase::SubmissionManaged => Self::SubmissionManaged,
             DelegationPhase::Confirmed => Self::Confirmed,
         }
     }
@@ -127,6 +140,8 @@ impl WorkflowPhase {
             VotePhase::Prepared => Self::Prepared,
             VotePhase::Committed => Self::Signed,
             VotePhase::Submitted => Self::SubmittedVote,
+            VotePhase::SubmissionManaged => Self::SubmissionManaged,
+            VotePhase::LegacyConfirmed => Self::Confirmed,
             VotePhase::Confirmed => Self::Confirmed,
         }
     }
@@ -163,7 +178,19 @@ impl VotingDb {
                               AND p.success = 1
                         ),
                         b.delegation_tx_hash IS NOT NULL,
-                        b.van_leaf_position IS NOT NULL
+                        b.van_leaf_position IS NOT NULL,
+                        EXISTS(SELECT 1 FROM chain_submissions s
+                                WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
+                                  AND s.bundle_index=b.bundle_index AND s.kind='delegation'
+                                  AND s.vote_chain_id IS NULL AND s.state='recovering'
+                                  AND NOT EXISTS(SELECT 1 FROM chain_submissions successor
+                                                   WHERE successor.round_id=s.round_id
+                                                     AND successor.wallet_id=s.wallet_id
+                                                     AND successor.network=s.network
+                                                     AND successor.bundle_index=s.bundle_index
+                                                     AND successor.vote_chain_id IS NULL
+                                                     AND successor.kind='vote'
+                                                     AND successor.state='legacy_confirmed'))
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -179,6 +206,7 @@ impl VotingDb {
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
                         row.get::<_, i64>(3)? != 0,
+                        row.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
@@ -213,7 +241,19 @@ impl VotingDb {
                               AND p.success = 1
                         ),
                         b.delegation_tx_hash IS NOT NULL,
-                        b.van_leaf_position IS NOT NULL
+                        b.van_leaf_position IS NOT NULL,
+                        EXISTS(SELECT 1 FROM chain_submissions s
+                                WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
+                                  AND s.bundle_index=b.bundle_index AND s.kind='delegation'
+                                  AND s.vote_chain_id IS NULL AND s.state='recovering'
+                                  AND NOT EXISTS(SELECT 1 FROM chain_submissions successor
+                                                   WHERE successor.round_id=s.round_id
+                                                     AND successor.wallet_id=s.wallet_id
+                                                     AND successor.network=s.network
+                                                     AND successor.bundle_index=s.bundle_index
+                                                     AND successor.vote_chain_id IS NULL
+                                                     AND successor.kind='vote'
+                                                     AND successor.state='legacy_confirmed'))
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -234,6 +274,7 @@ impl VotingDb {
                             row.get::<_, i64>(2)? != 0,
                             row.get::<_, i64>(3)? != 0,
                             row.get::<_, i64>(4)? != 0,
+                            row.get::<_, i64>(5)? != 0,
                         ),
                     ))
                 },
@@ -260,9 +301,19 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         let phase = conn
             .query_row(
-                "SELECT tx_hash IS NOT NULL, vc_tree_position IS NOT NULL,
-                        commitment_bundle_json IS NOT NULL
-                 FROM votes
+                "SELECT v.tx_hash IS NOT NULL, v.vc_tree_position IS NOT NULL,
+                        v.commitment_bundle_json IS NOT NULL,
+                        EXISTS(SELECT 1 FROM chain_submissions s
+                                WHERE s.round_id=v.round_id AND s.wallet_id=v.wallet_id
+                                  AND s.bundle_index=v.bundle_index AND s.kind='vote'
+                                  AND s.proposal_id=v.proposal_id
+                                  AND s.vote_chain_id IS NULL AND s.state='recovering'),
+                        EXISTS(SELECT 1 FROM chain_submissions s
+                                WHERE s.round_id=v.round_id AND s.wallet_id=v.wallet_id
+                                  AND s.bundle_index=v.bundle_index AND s.kind='vote'
+                                  AND s.proposal_id=v.proposal_id
+                                  AND s.vote_chain_id IS NULL AND s.state='legacy_confirmed')
+                 FROM votes v
                  WHERE round_id = :round_id
                    AND wallet_id = :wallet_id
                    AND bundle_index = :bundle_index
@@ -278,6 +329,8 @@ impl VotingDb {
                         row.get::<_, i64>(0)? != 0,
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
+                        row.get::<_, i64>(3)? != 0,
+                        row.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
@@ -299,9 +352,19 @@ impl VotingDb {
         let wallet_id = self.wallet_id();
         let mut stmt = conn
             .prepare(
-                "SELECT bundle_index, proposal_id, tx_hash IS NOT NULL,
-                        vc_tree_position IS NOT NULL, commitment_bundle_json IS NOT NULL
-                 FROM votes
+                "SELECT v.bundle_index, v.proposal_id, v.tx_hash IS NOT NULL,
+                        v.vc_tree_position IS NOT NULL, v.commitment_bundle_json IS NOT NULL,
+                        EXISTS(SELECT 1 FROM chain_submissions s
+                                WHERE s.round_id=v.round_id AND s.wallet_id=v.wallet_id
+                                  AND s.bundle_index=v.bundle_index AND s.kind='vote'
+                                  AND s.proposal_id=v.proposal_id
+                                  AND s.vote_chain_id IS NULL AND s.state='recovering'),
+                        EXISTS(SELECT 1 FROM chain_submissions s
+                                WHERE s.round_id=v.round_id AND s.wallet_id=v.wallet_id
+                                  AND s.bundle_index=v.bundle_index AND s.kind='vote'
+                                  AND s.proposal_id=v.proposal_id
+                                  AND s.vote_chain_id IS NULL AND s.state='legacy_confirmed')
+                 FROM votes v
                  WHERE round_id = :round_id AND wallet_id = :wallet_id
                  ORDER BY bundle_index, proposal_id",
             )
@@ -320,6 +383,8 @@ impl VotingDb {
                             row.get::<_, i64>(2)? != 0,
                             row.get::<_, i64>(3)? != 0,
                             row.get::<_, i64>(4)? != 0,
+                            row.get::<_, i64>(5)? != 0,
+                            row.get::<_, i64>(6)? != 0,
                         ),
                     ))
                 },
@@ -618,6 +683,10 @@ mod tests {
             "signed"
         );
         assert_eq!(
+            WorkflowPhase::for_delegation(DelegationPhase::SubmissionManaged).as_str(),
+            "submission_managed"
+        );
+        assert_eq!(
             WorkflowPhase::for_delegation(DelegationPhase::Submitted).as_str(),
             "submitted_delegation"
         );
@@ -637,6 +706,14 @@ mod tests {
         assert_eq!(
             WorkflowPhase::for_vote(VotePhase::Submitted).as_str(),
             "submitted_vote"
+        );
+        assert_eq!(
+            WorkflowPhase::for_vote(VotePhase::SubmissionManaged).as_str(),
+            "submission_managed"
+        );
+        assert_eq!(
+            WorkflowPhase::for_vote(VotePhase::LegacyConfirmed).as_str(),
+            "confirmed"
         );
         assert_eq!(
             WorkflowPhase::for_vote(VotePhase::Confirmed).as_str(),
@@ -659,8 +736,11 @@ fn phase_from_columns(
     has_proof: bool,
     has_tx_hash: bool,
     has_van_position: bool,
+    submission_managed: bool,
 ) -> DelegationPhase {
-    if has_van_position {
+    if submission_managed {
+        DelegationPhase::SubmissionManaged
+    } else if has_van_position {
         DelegationPhase::Confirmed
     } else if has_tx_hash {
         DelegationPhase::Submitted
@@ -677,8 +757,14 @@ fn vote_phase_from_columns(
     has_tx_hash: bool,
     has_vc_position: bool,
     has_recovery_bundle: bool,
+    submission_managed: bool,
+    legacy_confirmed: bool,
 ) -> VotePhase {
-    if has_tx_hash && has_vc_position && has_recovery_bundle {
+    if legacy_confirmed {
+        VotePhase::LegacyConfirmed
+    } else if submission_managed {
+        VotePhase::SubmissionManaged
+    } else if has_tx_hash && has_vc_position && has_recovery_bundle {
         VotePhase::Confirmed
     } else if has_tx_hash {
         VotePhase::Submitted

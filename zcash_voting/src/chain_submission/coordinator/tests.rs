@@ -53,7 +53,7 @@ struct ManualControl {
     epoch: AtomicU64,
 }
 
-impl ChainSubmissionControl for ManualControl {
+impl SubmissionControl for ManualControl {
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
@@ -77,7 +77,7 @@ impl CancelOnCheck {
     }
 }
 
-impl ChainSubmissionControl for CancelOnCheck {
+impl SubmissionControl for CancelOnCheck {
     fn is_cancelled(&self) -> bool {
         self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.cancel_at
     }

@@ -1091,15 +1091,26 @@ pub fn resume_plan(
         .iter()
         .filter(|(key, phase)| {
             !stale_vote_keys.contains(key)
-                && matches!(phase, VotePhase::Committed | VotePhase::Submitted)
+                && matches!(
+                    phase,
+                    VotePhase::Committed | VotePhase::Submitted | VotePhase::SubmissionManaged
+                )
         })
         .map(|(&(bundle_index, _), _)| bundle_index)
+        .chain(delegation.iter().filter_map(|(&bundle_index, phase)| {
+            (*phase == DelegationPhase::SubmissionManaged).then_some(bundle_index)
+        }))
         .collect::<BTreeSet<_>>();
 
     for &(bundle_index, proposal_id) in &stale_vote_keys {
         if matches!(
             votes.get(&(bundle_index, proposal_id)),
-            Some(VotePhase::Submitted | VotePhase::Confirmed)
+            Some(
+                VotePhase::Submitted
+                    | VotePhase::SubmissionManaged
+                    | VotePhase::LegacyConfirmed
+                    | VotePhase::Confirmed
+            )
         ) {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -1187,6 +1198,12 @@ pub fn resume_plan(
                         });
                     }
                 }
+                // The chain-submission lifecycle owns every network action for
+                // this persisted generation, including migration-only guards.
+                Some(VotePhase::SubmissionManaged) => {}
+                // The v17 projection proves completion but cannot safely
+                // reconstruct helper material or any network operation.
+                Some(VotePhase::LegacyConfirmed) => {}
                 // Prepared or no row yet -> still needs casting.
                 _ => {
                     if bundles_with_pending_vote_chains.contains(&b) {
@@ -1211,6 +1228,7 @@ pub fn resume_plan(
             Some(DelegationPhase::Submitted) => {
                 steps.push(NextStep::PollDelegation { bundle_index: b });
             }
+            Some(DelegationPhase::SubmissionManaged) => {}
             // Prepared / PcztBuilt / Proved: still needs the delegate flow.
             _ => {
                 if bundles_needing_delegation.contains(&b) {
@@ -1264,14 +1282,21 @@ pub fn resume_plan(
         .map(|share| (share.bundle_index, share.proposal_id, share.share_index))
         .collect::<BTreeSet<_>>();
     let blocking_share_work = !blocking_confirm_share_keys.is_empty();
-    let blocking_recovery = steps.iter().any(|step| match step {
-        NextStep::ConfirmShare {
-            bundle_index,
-            proposal_id,
-            share_index,
-        } => blocking_confirm_share_keys.contains(&(*bundle_index, *proposal_id, *share_index)),
-        _ => true,
-    });
+    let submission_managed = delegation
+        .values()
+        .any(|phase| *phase == DelegationPhase::SubmissionManaged)
+        || votes
+            .values()
+            .any(|phase| *phase == VotePhase::SubmissionManaged);
+    let blocking_recovery = submission_managed
+        || steps.iter().any(|step| match step {
+            NextStep::ConfirmShare {
+                bundle_index,
+                proposal_id,
+                share_index,
+            } => blocking_confirm_share_keys.contains(&(*bundle_index, *proposal_id, *share_index)),
+            _ => true,
+        });
 
     let delegation_statuses = delegation_statuses(db, round_id, &delegation)?;
     let hotkey_bound = delegation
@@ -1286,7 +1311,10 @@ pub fn resume_plan(
                 && bundles.iter().all(|&b| {
                     let vote_key = (b, pid);
                     vote_choices.get(&vote_key) == Some(choice)
-                        && votes.get(&vote_key) == Some(&VotePhase::Confirmed)
+                        && matches!(
+                            votes.get(&vote_key),
+                            Some(VotePhase::Confirmed | VotePhase::LegacyConfirmed)
+                        )
                 })
         }
         None => false,
@@ -1322,7 +1350,7 @@ pub fn resume_plan(
             voted_at,
         )
     });
-    let pending_recovery = !steps.is_empty();
+    let pending_recovery = submission_managed || !steps.is_empty();
     let needs_draft_setup = !blocking_recovery && !all_decided && !open_proposals.is_empty();
     let primary_action = select_primary_action(
         &steps,
@@ -1994,6 +2022,142 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_owned_legacy_vote_never_yields_submit_or_poll_work() {
+        for tx_hash in [None, Some("legacy-vtx")] {
+            let db = db_with_bundle();
+            db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+                .unwrap();
+            db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+            db.store_van_position(ROUND, 0, 7).unwrap();
+            crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16])
+                .unwrap();
+            store_vote_recovery_fixture(&db, 0, 2, 1, None);
+            if let Some(tx_hash) = tx_hash {
+                db.record_vote_submission(ROUND, 0, 2, tx_hash).unwrap();
+            }
+            db.conn()
+                .execute(
+                    "INSERT INTO chain_submissions
+                     (identity_key, round_id, wallet_id, network, vote_chain_id,
+                      bundle_index, kind, proposal_id, generation_digest, state,
+                      committed_post_reservations, diagnostic_kind, diagnostic,
+                      created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'testnet', NULL, 0, 'vote', 2, NULL,
+                             'recovering', 0, 'recovery_unavailable',
+                             'version-17 vote-chain evidence is lifecycle-owned', 9, 9)",
+                    rusqlite::params![vec![0x71_u8; 32], ROUND, W],
+                )
+                .unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO chain_submissions
+                     (identity_key, round_id, wallet_id, network, vote_chain_id,
+                      bundle_index, kind, proposal_id, generation_digest, state,
+                      committed_post_reservations, diagnostic_kind, diagnostic,
+                      created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'testnet', NULL, 0, 'delegation', NULL,
+                             NULL, 'recovering', 0, 'recovery_unavailable',
+                             'version-17 delegation evidence is lifecycle-owned', 9, 9)",
+                    rusqlite::params![vec![0x73_u8; 32], ROUND, W],
+                )
+                .unwrap();
+
+            let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+            assert!(plan.next_steps.is_empty());
+            assert!(plan.recovered_vote_work.is_empty());
+            assert!(plan.pending_recovery);
+            assert!(plan.blocking_recovery);
+            assert_eq!(plan.primary_action, RoundPlanAction::Idle);
+            assert_eq!(
+                db.delegation_phase(ROUND, 0).unwrap(),
+                DelegationPhase::SubmissionManaged
+            );
+            assert_eq!(
+                db.vote_phase(ROUND, 0, 2).unwrap(),
+                VotePhase::SubmissionManaged
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_confirmed_vote_is_terminal_without_recovery_work() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, vote_chain_id,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, confirmation_source,
+                  final_van_position, vote_commitment_positions, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', NULL, 0, 'vote', 2, NULL,
+                         'legacy_confirmed', 0, 'legacy_projection', 7, ?4, 9, 9)",
+                rusqlite::params![
+                    vec![0x75_u8; 32],
+                    ROUND,
+                    W,
+                    [vec![1, 0, 0, 0, 1], 8_u64.to_be_bytes().to_vec()].concat()
+                ],
+            )
+            .unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[2]).unwrap();
+
+        assert_eq!(
+            db.vote_phase(ROUND, 0, 2).unwrap(),
+            VotePhase::LegacyConfirmed
+        );
+        assert!(plan.next_steps.is_empty());
+        assert!(plan.recovered_vote_work.is_empty());
+        assert!(!plan.pending_recovery);
+        assert!(plan.all_decided);
+        assert!(plan.completed_for_display);
+    }
+
+    #[test]
+    fn recovery_free_migration_guards_lock_conflicting_intent() {
+        for state in ["recovering", "legacy_confirmed"] {
+            let db = db_with_bundle();
+            db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+                .unwrap();
+            crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16])
+                .unwrap();
+            let positions = [vec![1, 0, 0, 0, 1], 8_u64.to_be_bytes().to_vec()].concat();
+            db.conn()
+                .execute(
+                    "INSERT INTO chain_submissions
+                     (identity_key, round_id, wallet_id, network, vote_chain_id,
+                      bundle_index, kind, proposal_id, generation_digest, state,
+                      committed_post_reservations, diagnostic_kind, diagnostic,
+                      confirmation_source, final_van_position,
+                      vote_commitment_positions, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'testnet', NULL, 0, 'vote', 2, NULL,
+                             ?4, 0,
+                             CASE WHEN ?4='recovering' THEN 'recovery_unavailable' END,
+                             CASE WHEN ?4='recovering' THEN 'legacy evidence is incomplete' END,
+                             CASE WHEN ?4='legacy_confirmed' THEN 'legacy_projection' END,
+                             CASE WHEN ?4='legacy_confirmed' THEN 7 END,
+                             CASE WHEN ?4='legacy_confirmed' THEN ?5 END, 9, 9)",
+                    rusqlite::params![vec![state.as_bytes()[0]; 32], ROUND, W, state, positions],
+                )
+                .unwrap();
+
+            for decision in [Decision::Choice(1), Decision::Skipped] {
+                let error = db.set_ballot_intent(ROUND, 2, decision, 3).unwrap_err();
+                assert!(
+                    error.to_string().contains("ballot intent is locked"),
+                    "{error}"
+                );
+            }
+            db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn committed_batch_yields_one_batch_submit_step() {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
@@ -2297,6 +2461,91 @@ mod tests {
             assert!(shares.iter().all(|share| {
                 share.bundle_index == 0 && share.proposal_id == 2 && share.confirmed
             }));
+        }
+    }
+
+    #[test]
+    fn active_singleton_generation_locks_intent_and_recovery_material() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 0, None);
+        record_submitted_share_fixture(&db, 0, 2, 0, &["https://helper.example".to_string()]);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, vote_chain_id, bundle_index,
+                  kind, proposal_id, generation_digest, state, candidate_transaction_hash,
+                  committed_post_reservations, tracking_started_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 'chain', 0, 'vote', 2, ?4,
+                         'tracking', ?5, 1, 10, 9, 10)",
+                rusqlite::params![
+                    vec![0x41_u8; 32],
+                    ROUND,
+                    W,
+                    vec![0x42_u8; 32],
+                    vec![0x43_u8; 32]
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("active chain submission"),
+            "{error}"
+        );
+        assert!(crate::vote::recovery_bundle(&db, ROUND, 0, 2)
+            .unwrap()
+            .is_some());
+        assert_eq!(db.get_share_delegations(ROUND).unwrap().len(), 1);
+        assert_eq!(
+            db.ballot_intents(ROUND).unwrap(),
+            vec![(2, Decision::Choice(0))]
+        );
+    }
+
+    #[test]
+    fn active_batch_generation_locks_every_member_intent() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        let digest = store_two_action_batch_recovery_fixture(&db);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, vote_chain_id, bundle_index,
+                  kind, ordered_batch_digest, generation_digest, state,
+                  candidate_transaction_hash, committed_post_reservations,
+                  tracking_started_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 'chain', 0, 'vote_batch', ?4, ?5,
+                         'tracking', ?6, 1, 10, 9, 10)",
+                rusqlite::params![
+                    vec![0x51_u8; 32],
+                    ROUND,
+                    W,
+                    digest.as_slice(),
+                    vec![0x52_u8; 32],
+                    vec![0x53_u8; 32]
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .set_ballot_intent(ROUND, 2, Decision::Skipped, 3)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("active chain submission"),
+            "{error}"
+        );
+        for proposal_id in [1, 2] {
+            assert!(crate::vote::recovery_bundle(&db, ROUND, 0, proposal_id)
+                .unwrap()
+                .is_some());
         }
     }
 

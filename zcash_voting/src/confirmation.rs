@@ -87,6 +87,12 @@ fn record_delegation_confirmation(
         .map_err(|e| VotingError::Internal {
             message: format!("delegation confirmation transaction failed: {e}"),
         })?;
+    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+    )?;
 
     apply_delegation_confirmation_with_conn(
         &tx,
@@ -183,6 +189,12 @@ fn record_vote_batch_confirmation(
         .map_err(|e| VotingError::Internal {
             message: format!("vote batch confirmation transaction failed: {e}"),
         })?;
+    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+    )?;
     apply_vote_batch_confirmation_with_conn(
         &tx,
         &wallet_id,
@@ -226,6 +238,12 @@ fn record_vote_confirmation(
         .map_err(|e| VotingError::Internal {
             message: format!("vote confirmation transaction failed: {e}"),
         })?;
+    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+    )?;
 
     apply_vote_confirmation_with_conn(
         &tx,

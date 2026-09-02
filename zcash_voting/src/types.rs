@@ -42,6 +42,8 @@ pub enum VotingError {
     KeystoneSignatureConflict { bundle_index: u32 },
     #[error("Proof generation failed: {message}")]
     ProofFailed { message: String },
+    #[error("Voting state is busy: {message}")]
+    Busy { message: String },
     #[error("Internal error: {message}")]
     Internal { message: String },
 }
