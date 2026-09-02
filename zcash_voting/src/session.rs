@@ -1450,8 +1450,7 @@ fn missing_share_indexes_for_confirmed_vote(
 mod tests {
     use super::*;
     use crate::chain_submission::{
-        generation::{generation_for_vote, generation_for_vote_batch},
-        identity::submission_identity_key,
+        generation_for_vote, generation_for_vote_batch, submission_identity_key,
         ChainSubmissionIdentity, ChainSubmissionTarget,
     };
     use crate::round::RoundParams;

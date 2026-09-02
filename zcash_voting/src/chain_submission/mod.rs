@@ -15,8 +15,8 @@ pub(crate) mod coordination;
 #[allow(dead_code, reason = "inactive lifecycle coordinator")]
 mod coordinator;
 #[allow(dead_code, reason = "internal generation derivation and migration")]
-pub(crate) mod generation;
-pub(crate) mod identity;
+mod generation;
+mod identity;
 #[allow(dead_code, reason = "internal submission protocol")]
 mod protocol;
 mod result;
@@ -26,6 +26,11 @@ mod state;
 mod store;
 mod transport;
 
+pub(crate) use generation::{
+    complete_generation_for_delegation, generation_for_vote, generation_for_vote_batch,
+    ExpectedTreeLayout,
+};
+pub(crate) use identity::{network_name, submission_identity_key};
 pub use identity::{
     CandidateTransactionHash, CandidateTransactionHashError, ChainSubmissionGeneration,
     ChainSubmissionGenerationDigest, ChainSubmissionIdentity, ChainSubmissionIdentityError,

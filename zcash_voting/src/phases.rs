@@ -9,9 +9,7 @@ use std::collections::BTreeMap;
 use rusqlite::{named_params, Connection, OptionalExtension};
 
 use crate::{
-    chain_submission::{
-        generation::generation_for_vote_batch, ChainSubmissionIdentity, ChainSubmissionTarget,
-    },
+    chain_submission::{generation_for_vote_batch, ChainSubmissionIdentity, ChainSubmissionTarget},
     storage::{queries, VotingDb},
     types::VotingError,
 };
