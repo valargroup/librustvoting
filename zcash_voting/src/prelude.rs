@@ -4,6 +4,16 @@
 //! prelude intentionally contains the setup, precompute, and delegation types
 //! needed by mobile SDK boundaries without exposing proof-circuit internals.
 
+pub use crate::chain_submission::{
+    CandidateTransactionHash, CandidateTransactionHashError, ChainSubmissionConfirmation,
+    ChainSubmissionConfirmationError, ChainSubmissionConfirmationSource, ChainSubmissionDiagnostic,
+    ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,
+    ChainSubmissionFailureState, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
+    ChainSubmissionIdentity, ChainSubmissionIdentityError, ChainSubmissionPending,
+    ChainSubmissionResult, ChainSubmissionState, ChainSubmissionStateEvidence,
+    ChainSubmissionTarget, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
+};
+
 pub use crate::confirmation::{
     confirm_delegation_submission, confirm_vote_batch_submission, confirm_vote_submission,
     DelegationConfirmation, TxEvent, TxEventAttribute, VoteBatchConfirmation, VoteConfirmation,

@@ -17,6 +17,7 @@ compile_error!("enable exactly one of the `lrz` or `zakura` features");
 
 pub mod action;
 pub mod backend;
+pub mod chain_submission;
 pub mod config;
 pub mod confirmation;
 pub mod delegate;
@@ -56,6 +57,15 @@ pub mod witness;
 pub mod zkp1;
 pub mod zkp2;
 
+pub use chain_submission::{
+    CandidateTransactionHash, CandidateTransactionHashError, ChainSubmissionConfirmation,
+    ChainSubmissionConfirmationError, ChainSubmissionConfirmationSource, ChainSubmissionDiagnostic,
+    ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,
+    ChainSubmissionFailureState, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
+    ChainSubmissionIdentity, ChainSubmissionIdentityError, ChainSubmissionPending,
+    ChainSubmissionResult, ChainSubmissionState, ChainSubmissionStateEvidence,
+    ChainSubmissionTarget, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
+};
 pub use helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,
     ShareSubmissionStatus,
