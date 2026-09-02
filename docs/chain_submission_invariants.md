@@ -39,7 +39,7 @@ submit
 Simplicity is an explicit requirement. The implementation uses one durable
 attempt journal plus the existing bundle and vote rows. It does not introduce a
 general workflow engine, scan epochs, durable scan cursors, a second normalized
-recovery state machine, or several tables representing the same evidence.
+recovery state machine, or a second table for historical hash ownership.
 
 Changes to this design must update this document and the conformance tests in
 the same pull request.
@@ -58,7 +58,7 @@ The specification covers:
 - confirmation and position persistence;
 - restart planning and per-bundle causal ordering;
 - recovery cleanup and partial pruning; and
-- schema version 17 rollout from version 16.
+- schema version 18 rollout from version 17.
 
 The principal implementation surfaces are:
 
@@ -297,7 +297,7 @@ and are not appended to the global tree.
 
 ### One attempt journal
 
-Version 17 uses `chain_submission_attempts` as the only new lifecycle table.
+Version 18 uses `chain_submission_attempts` as its only new lifecycle table.
 Its normative definition is:
 
 ```sql
@@ -318,6 +318,10 @@ CREATE TABLE chain_submission_attempts (
                                      AND length(
                                          CAST(recovery_descriptor_json AS BLOB)
                                      ) <= 65536
+                                     AND json_type(
+                                         recovery_descriptor_json,
+                                         '$.format'
+                                     ) = 'text'
                                      AND json_extract(
                                          recovery_descriptor_json,
                                          '$.format'
@@ -353,6 +357,10 @@ CREATE TABLE chain_submission_attempts (
                                      tree_recovery_json IS NULL
                                      OR (
                                          json_valid(tree_recovery_json)
+                                         AND json_type(
+                                             tree_recovery_json,
+                                             '$.format'
+                                         ) = 'text'
                                          AND json_extract(
                                              tree_recovery_json,
                                              '$.format'
@@ -465,6 +473,12 @@ values. These cross-field and range rules are enforced in the same immediate
 transaction; SQL's shape checks are corruption guards, not the primary
 validator.
 
+The SQL format checks are deliberately two-part. `json_type(..., '$.format') =
+'text'` rejects a missing, JSON-null, or non-text tag before exact value
+comparison. This is required because SQLite accepts a `CHECK` expression whose
+result is null; `json_extract(..., '$.format') = ...` alone would therefore
+accept an object with no `format` member.
+
 Each row represents one POST attempt and stores:
 
 - existing identity columns;
@@ -498,22 +512,42 @@ delegation signatures.
 ### Derived outcome precedence
 
 The lifecycle derives one chain-evidence result from all attempts and domain
-rows for the generation:
+rows for the generation. Classification applies the following rows from top to
+bottom; the first matching row is the result. `known_tx_hashes` is the complete
+normalized, deduplicated, lexicographically sorted set established by the final
+snapshot and by stronger in-memory evidence from the current call.
 
-```text
-Confirmed or RecoveredByTree
-    > SpentPositionPending
-    > AcceptedButUnjournaled or OutcomeUnknown
-    > Accepted or Pending
-    > Rejected
-    > Cancelled
-```
+| Priority | Predicate | Outcome |
+| ---: | --- | --- |
+| 1 | A bound hash-event confirmation is durable at the final snapshot. | `Confirmed` if this call committed it; otherwise `AlreadyConfirmed { source: hash_events }` |
+| 2 | A tree-recovery receipt is durable at the final snapshot and no hash-event confirmation wins above. | `RecoveredByTree` if this call committed it; otherwise `AlreadyConfirmed { source: commitment_tree }` |
+| 3 | Exact spent-nullifier evidence exists without a durable position result. | `SpentPositionPending` |
+| 4 | A fresh accepted hash could not be journaled and there is no independent unsettled candidate or hashless ambiguity. | `AcceptedButUnjournaled` |
+| 5 | Any hashless possibly dispatched attempt, unreadable or contradictory candidate, unjournaled accepted hash accompanied by independent unsettled evidence, or other evidence that commitment remains unknown exists. | `OutcomeUnknown` |
+| 6 | At least one live candidate has a usable pending lookup result and no stronger row matches. | `Pending` |
+| 7 | The current POST produced a journaled accepted hash, no other candidate is pending or unknown, and no stronger row matches. | `Accepted` |
+| 8 | At least one attempt is definitely rejected and every other attempt is definitely rejected, definitely unsent, or proven committed-failed in this pass. | `Rejected` |
+| 9 | Cancellation occurred before possible dispatch and no stronger row matches. | `Cancelled` |
+
+An unjournaled accepted hash in priority 5 is included in
+`OutcomeUnknown.known_tx_hashes`; its bounded storage error is included in the
+message. Thus combining it with older ambiguity does not hide either item of
+evidence. If both durable confirmation sources exist, priority 1 makes
+`hash_events` deterministic. `Pending` outranks `Accepted` because it reports
+the complete candidate set rather than selecting the most recently accepted
+hash.
 
 `Rejected` is selected only when every attempt is definitely rejected,
 definitely unsent, or proven committed-failed in the current pass and there is
 no older ambiguity, unsettled candidate hash, spent evidence, confirmed
 position, or tree receipt. A later rejection can therefore never hide an
-earlier `outcome_unknown` attempt.
+earlier `outcome_unknown` attempt. Its public `code` and `reason` come from the
+qualifying rejected attempt with the lowest journal `id`. Every rejection
+learned during the current pass is associated with its reserved attempt ID
+before aggregation. Definitely-unsent attempts contribute no rejection
+provenance and cannot displace that lowest-ID rejection. If no attempt supplies
+a structured rejection, priority 8 does not match. This rule is independent of
+endpoint, candidate, and attempt iteration order.
 
 `Cancelled` is selected only when cancellation occurred before possible
 dispatch and no stronger durable evidence exists.
@@ -840,20 +874,34 @@ Candidate hashes come from:
 All candidates are normalized, deduplicated, and queried. The lifecycle never
 chooses only the latest hash.
 
-A chain transaction hash may identify only one semantic submission identity
-across every round for the captured wallet and configured chain/network. An
-atomic batch is the sole exception: every member row for that one batch may
-share its hash when all carry the same batch digest. The exception does not
-permit reuse by a singleton member, another batch, delegation, or another
-round.
+A live candidate or confirmed chain transaction hash may identify only one
+semantic submission identity across every retained round for the captured wallet
+and configured chain/network. An atomic batch is the sole exception: every
+member row for that one batch may share its hash when all carry the same batch
+digest. The exception does not permit reuse by a singleton member, another
+batch, delegation, or another round.
 
 Ownership discovery covers both the attempt journal and compatibility domain
 hash columns. Checking ownership and journaling an accepted candidate occur in
-one immediate transaction. Compatibility recording APIs perform their
-ownership check and write under the same rule and transaction boundary. A hash
-that is proven foreign is never made a live candidate for the current identity;
-because the current POST was nevertheless dispatched, its attempt remains
-hashless `outcome_unknown`.
+one immediate transaction. Compatibility recording APIs perform their ownership
+check and write under the same rule and transaction boundary.
+
+A hash that is proven foreign is never made a live candidate for the current
+identity. Because the current POST was nevertheless dispatched, its attempt
+remains hashless `outcome_unknown`.
+
+A hash proven to have committed unsuccessfully has no continuing ownership
+role. Retirement removes it from candidate storage rather than keeping a
+historical ownership record. If the same value later reappears through a
+compatibility write or endpoint response, it is a fresh candidate and is
+reconciled on the spot like every other candidate. The committed result for one
+hash is immutable, so a usable failure retires it again, reopens the dispatch
+gate in that same non-cancelled reconciliation, and cannot confirm any identity.
+
+This deliberately relies on the trusted endpoint contract. An endpoint that
+repeatedly attributes an old failed hash to unrelated new POSTs can force
+repeated lookup and retirement; without retained historical ownership the SDK
+does not claim to detect that behavior across calls.
 
 ### Lookup
 
@@ -942,15 +990,22 @@ confirmation impossible. Retirement of an independently proven failure is not
 confirmation state and remains valid despite the successful-candidate
 conflict.
 
-Retirement is durable and atomic. Every accepted attempt carrying the exact
-hash becomes `rejected`, clears `chain_tx_hash`, stores the committed nonzero
-code as `rejection_code`, stores the stable reason `committed_failure` as
-`rejection_reason`, and stores the bounded redacted endpoint log only as
-diagnostic text. An exact matching unconfirmed domain hash is cleared only when
-its row has no confirmed position. A hashless `outcome_unknown` attempt is not
-retired by evidence about some other hash. Restart candidate discovery
-therefore cannot rediscover a hash already proven to have failed and cannot
-erase unrelated ambiguity.
+Retirement is durable and atomic. Every accepted attempt for that exact identity
+carrying the hash becomes `rejected`, clears `chain_tx_hash`, stores the
+committed nonzero code as `rejection_code`, stores the stable reason
+`committed_failure` as `rejection_reason`, and stores the bounded redacted
+endpoint log only as diagnostic text.
+
+For delegation or singleton, the exact matching unconfirmed domain hash is
+cleared only when its row has no confirmed position. For an atomic batch, the
+same transaction clears the hash from every unconfirmed member carrying the
+exact batch digest and from no row outside that batch. A hashless
+`outcome_unknown` attempt is not retired by evidence about some other hash.
+Restart candidate discovery therefore cannot rediscover the hash from the
+carriers this retirement settled, and retirement cannot erase unrelated
+ambiguity. A later writer may present the same value again; the next
+reconciliation settles it from its immutable chain status instead of relying on
+historical local ownership.
 
 Cancellation before retirement performs none of those writes. The current
 result still reflects the committed failure in memory, but every storage
@@ -1596,30 +1651,30 @@ The SDK checks its process-local submission, bundle, and scan registries and
 returns `Busy` while matching work remains. The host retries deletion only after
 the cancellation drain completes.
 
-## Schema version 17
+## Schema version 18
 
-Version 16 is the released migration source. Version 17 is unreleased and its
+Version 17 is the released migration source. Version 18 is unreleased and its
 unreleased definition is replaced in place.
 
 Implementation:
 
 - folds the final `chain_submission_attempts` definition into the existing
-  `16 -> 17` migration;
+  `17 -> 18` migration;
 - includes the same definition in `001_init.sql`;
-- keeps `CURRENT_VERSION = 17`; and
-- removes the separate `17 -> 18` migration.
+- sets `CURRENT_VERSION = 18`; and
+- does not add a separate `18 -> 19` migration.
 
-The version-16 source has no chain-submission attempt rows, so no attempt
+The version-17 source has no chain-submission attempt rows, so no attempt
 backfill or evidence reinterpretation is required. Existing round, bundle, vote,
 helper, hash, and position state is preserved.
 
-During `16 -> 17`, existing domain hash values that are exactly 64 hexadecimal
+During `17 -> 18`, existing domain hash values that are exactly 64 hexadecimal
 characters are normalized to lowercase. Other values remain byte-for-byte
 unchanged as opaque compatibility identifiers and are not transaction-status
 candidates.
 
-Development databases created with an earlier version-17 schema are disposable
-and must be recreated. No migration between unreleased version-17 shapes is
+Development databases created with an earlier version-18 schema are disposable
+and must be recreated. No migration between unreleased version-18 shapes is
 required.
 
 ## Existing recording APIs
@@ -1627,7 +1682,8 @@ required.
 Public functions that directly record a hash remain compatibility surfaces.
 They cannot insert spent evidence or tree receipts, and their hashes remain
 candidates until reconciliation settles them as confirmed or committed
-failure.
+failure. A failed value recorded again is reconciled and retired again before
+it can permanently block later submission.
 
 Caller-supplied positions cannot create tree confirmation. The high-level
 lifecycle is the only supported boundary for SDK-owned network submission and
@@ -1700,6 +1756,10 @@ The host protects the voting database and backups at rest.
 - Does accepted-without-hash remain ambiguous?
 - Can a later rejection erase older ambiguity?
 - Are failed candidates retired without erasing stronger evidence?
+- Does retirement atomically clear every matching attempt and exact domain
+  carrier, including every member of one batch?
+- Is a failed hash that appears again reconciled and retired again without
+  permanently blocking dispatch?
 - Can a pending hash be mistaken for committed failure?
 - Is hash ownership checked across every round and submission kind for the
   captured wallet and chain/network and written atomically with the candidate?
@@ -1837,6 +1897,11 @@ In `zcash_voting/src/chain_submission/tests/reconciliation.rs`:
 - `mixed_candidate_result_matrix_retires_every_failure` covers
   success+failure, failure+pending, failure+unreadable, two failures, and a
   concurrent new candidate.
+- `aggregate_outcome_matrix_is_independent_of_iteration_order` permutes
+  accepted, pending, unknown, and unjournaled-accepted evidence and verifies the
+  complete priority table and sorted candidate set.
+- `rejected_outcome_uses_lowest_attempt_id_provenance` permutes multiple
+  rejection codes and reasons and requires the same oldest journaled rejection.
 - `later_rejection_and_cancellation_never_erase_older_ambiguity` covers every
   retry gate and fallible exit.
 - `terminal_lookup_error_is_below_every_positive_evidence_class` covers
@@ -1878,6 +1943,8 @@ In `zcash_voting/src/chain_submission/tests/reconciliation.rs`:
 - `committed_failure_retirement_writes_canonical_evidence` verifies the
   nonzero code, `committed_failure` reason, redacted diagnostic, cleared attempt
   hash, and exact unconfirmed domain-hash clearing.
+- `failed_batch_retirement_clears_every_exact_member` verifies one atomic write
+  across all members and no row outside the batch.
 - `exactly_one_success_confirms_and_two_successes_write_no_confirmation` proves
   both branches and still retires an independently failed third candidate.
 - `durable_confirmation_outranks_every_network_answer` covers confirmation
@@ -1889,8 +1956,9 @@ In `zcash_voting/src/chain_submission/tests/candidate_ownership.rs`:
 
 - `hash_ownership_scope_matrix` covers cross-round, cross-kind, cross-bundle,
   singleton-to-singleton, singleton-to-batch, batch-to-batch, and both
-  journal/domain carrier directions, while permitting an otherwise identical
-  hash on a different configured chain/network.
+  journal/domain carrier directions for live and confirmed hashes, while
+  permitting an otherwise identical hash on a different configured
+  chain/network.
 - `one_atomic_batch_may_share_exactly_one_hash` proves the sole ownership
   exception and rejects nonmembers.
 - `ownership_check_and_accepted_insert_are_one_transaction` races two
@@ -1899,6 +1967,10 @@ In `zcash_voting/src/chain_submission/tests/candidate_ownership.rs`:
   direct-recording writers.
 - `foreign_post_hash_preserves_hashless_ambiguity` proves the dispatched
   attempt is not mislabeled definitely rejected.
+- `reappearing_committed_failure_is_retired_again_in_the_same_pass` covers both
+  lifecycle and compatibility candidate sources and then permits dispatch.
+- `reappearing_committed_failure_never_confirms_another_identity` covers round,
+  kind, bundle, singleton, and batch identities.
 
 ### Structured spent evidence
 
@@ -2004,10 +2076,12 @@ In `zcash_voting/src/chain_submission/tests/recovery_coverage.rs`:
 
 In `zcash_voting/src/storage/migrations.rs`:
 
-- `version_16_to_17_creates_final_attempt_schema_without_inventing_evidence`.
-- `fresh_and_migrated_version_17_schemas_match`.
-- `current_version_is_17_and_no_version_18_migration_remains`.
+- `version_17_to_18_creates_final_attempt_schema_without_inventing_evidence`.
+- `fresh_and_migrated_version_18_schemas_match`.
+- `current_version_is_18_and_no_version_19_migration_remains`.
 - `sql_checks_enforce_representable_kind_state_and_nullability_shapes`.
+- `sql_json_format_checks_reject_missing_null_and_non_text_tags` covers both
+  `recovery_descriptor_json` and non-null `tree_recovery_json`.
 - `typed_storage_rejects_cross_field_descriptor_receipt_and_range_mismatch`
   proves the rules SQL alone cannot express.
 - `one_tree_receipt_carrier_exists_per_generation`.
