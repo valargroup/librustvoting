@@ -23,12 +23,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   successful proof so wallets can resume signing without regenerating ZKP1.
   Existing databases whose released cleanup fully or partially erased those
   fields retain the old proof bytes but rebuild setup and ZKP1 instead of
-  reusing a proof that can no longer be signed. Schema version 19 also rebuilds
-  unsigned legacy setup that predates durable PCZT storage and removes stale or
-  invalid local Keystone signatures, while preserving cryptographically valid
-  signed setup and submitted, confirmed, and imported state. New Keystone
-  signature writes must match the current bundle setup and verify before the
-  atomic batch commits.
+  reusing a proof that can no longer be signed. Schema version 19 preserves
+  proof-bearing legacy setup when submission may have reached the chain, and an
+  explicit unsigned Keystone request can rebuild setup that predates durable
+  PCZT storage. It also removes stale or invalid local Keystone signatures while
+  preserving cryptographically valid signed setup and submitted, confirmed,
+  and imported state. New Keystone signature writes must match the current
+  bundle setup and verify before the atomic batch commits.
 
 ### Removed
 

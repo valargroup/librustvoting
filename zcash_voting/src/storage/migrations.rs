@@ -230,9 +230,11 @@ UPDATE proofs AS p
     ),
 ];
 
-/// Clear a legacy local setup after proof demotion and signature validation
-/// leave it with no usable proof or signature. Submitted, confirmed, and
-/// imported bundles remain untouched.
+/// Clear a legacy local setup only when no proof or signature can indicate a
+/// delegation submission with an outcome that was never recorded locally.
+/// Proof-bearing setup is preserved after demotion so an accepted delegation
+/// cannot lose the inputs needed by ZKP2 during upgrade. An unsigned Keystone
+/// flow can rebuild that setup later when it explicitly requests a PCZT.
 const CLEAR_UNBOUND_LEGACY_DELEGATION_SETUP_SQL: &str = "UPDATE bundles
    SET van_comm_rand = NULL,
        dummy_nullifiers = NULL,
@@ -260,7 +262,7 @@ const CLEAR_UNBOUND_LEGACY_DELEGATION_SETUP_SQL: &str = "UPDATE bundles
          FROM proofs
         WHERE round_id = bundles.round_id
           AND wallet_id = bundles.wallet_id
-          AND success = 1
+          AND proof IS NOT NULL
    )
    AND bundle_index NOT IN (
        SELECT bundle_index
@@ -559,8 +561,7 @@ mod tests {
         let ask = SpendAuthorizingKey::from(&sk);
         let randomized_signing_key = ask.randomize(&pallas::Scalar::from(7));
         let rk: [u8; 32] = (&VerificationKey::<SpendAuth>::from(&randomized_signing_key)).into();
-        let signature =
-            randomized_signing_key.sign(voting_crypto_deps::rand::rngs::OsRng, sighash);
+        let signature = randomized_signing_key.sign(voting_crypto_deps::rand::rngs::OsRng, sighash);
         (rk, (&signature).into())
     }
 
@@ -1004,6 +1005,9 @@ mod tests {
 
         let signatures = queries::get_keystone_signatures(&conn, "test-round", "wallet").unwrap();
         assert!(signatures.is_empty());
+        // The invalid signature is removed, but proof-bearing setup remains
+        // available in case submission reached the chain before the local
+        // transaction hash was recorded.
         let stale_setup_presence: (i64, i64) = conn
             .query_row(
                 "SELECT pczt_sighash IS NOT NULL, rk IS NOT NULL
@@ -1015,7 +1019,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(stale_setup_presence, (0, 0));
+        assert_eq!(stale_setup_presence, (1, 1));
         let proofless_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM proofs
@@ -1068,6 +1072,9 @@ mod tests {
             &[0x0A; 32],
         )
         .unwrap();
+        // A proof without a locally recorded hash may still belong to a
+        // delegation whose POST outcome was lost. Migration must demote the
+        // proof without destroying the setup later ZKP2 recovery needs.
         queries::store_proof(&conn, "test-round", "wallet", 1, &[0xA1; 96]).unwrap();
         // Represent a released database where proof A survived a reset before
         // setup B and its Keystone signature were persisted. Without the exact
@@ -1127,7 +1134,7 @@ mod tests {
             .unwrap()
         };
         assert_eq!(setup_presence(0), (false, false, false));
-        assert_eq!(setup_presence(1), (false, false, false));
+        assert_eq!(setup_presence(1), (true, true, false));
         assert_eq!(setup_presence(2), (true, true, false));
         assert_eq!(setup_presence(3), (true, true, false));
 
@@ -1159,6 +1166,37 @@ mod tests {
         assert_eq!(signatures.len(), 1);
         assert_eq!(signatures[0].bundle_index, 2);
         assert_eq!(signatures[0].sig, signed_signature);
+
+        // An explicit unsigned Keystone request can now replace bundle 1's
+        // demoted legacy setup, while signed and submitted bundles stay intact.
+        assert!(
+            queries::clear_demoted_legacy_delegation_setup_for_keystone_request(
+                &conn,
+                "test-round",
+                "wallet",
+                1,
+            )
+            .unwrap()
+        );
+        assert_eq!(setup_presence(1), (false, false, false));
+        assert!(
+            !queries::clear_demoted_legacy_delegation_setup_for_keystone_request(
+                &conn,
+                "test-round",
+                "wallet",
+                2,
+            )
+            .unwrap()
+        );
+        assert!(
+            !queries::clear_demoted_legacy_delegation_setup_for_keystone_request(
+                &conn,
+                "test-round",
+                "wallet",
+                3,
+            )
+            .unwrap()
+        );
 
         queries::store_proof(&conn, "test-round", "wallet", 2, &[0xB2; 96]).unwrap();
         let reproved =

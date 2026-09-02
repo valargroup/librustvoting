@@ -734,6 +734,25 @@ impl VotingDb {
         })
     }
 
+    /// Validate the stored round, bundle notes, keys, and branch before a PCZT
+    /// setup may be created or replaced.
+    pub(crate) fn validate_governance_pczt_context(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+        notes: &[NoteInfo],
+        keys: &DelegationKeys,
+        consensus_branch_id: u32,
+    ) -> Result<(crate::VotingRoundParams, Network), VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let (params, stored_network) =
+            queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
+        validate_consensus_branch_id_for_round(&params, stored_network, keys, consensus_branch_id)?;
+        queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
+        Ok((params, stored_network))
+    }
+
     /// Build a governance-specific PCZT for Keystone signing.
     /// Loads round params from db. Notes come from caller.
     /// Computes governance values and builds a PCZT whose governance action
@@ -750,19 +769,13 @@ impl VotingDb {
         consensus_branch_id: u32,
     ) -> Result<GovernancePczt, VotingError> {
         let wallet_id = self.wallet_id();
-        let (params, stored_network) = {
-            let conn = self.conn();
-            let (params, stored_network) =
-                queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
-            validate_consensus_branch_id_for_round(
-                &params,
-                stored_network,
-                keys,
-                consensus_branch_id,
-            )?;
-            queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
-            (params, stored_network)
-        };
+        let (params, stored_network) = self.validate_governance_pczt_context(
+            round_id,
+            bundle_index,
+            notes,
+            keys,
+            consensus_branch_id,
+        )?;
         let padded_note_secrets = self.ensure_padded_secrets(round_id, bundle_index, notes)?;
         let van_blinding = keys.van_blinding_for_bundle(&params, bundle_index, notes)?;
         let result = crate::action::build_governance_pczt(
@@ -824,6 +837,23 @@ impl VotingDb {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::load_delegation_pczt_fields(&conn, round_id, &wallet_id, bundle_index)
+    }
+
+    /// Clear preserved legacy setup only when an unsigned Keystone request
+    /// explicitly needs to replace a demoted proof's missing PCZT.
+    pub(crate) fn clear_demoted_legacy_delegation_setup_for_keystone_request(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<bool, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::clear_demoted_legacy_delegation_setup_for_keystone_request(
+            &conn,
+            round_id,
+            &wallet_id,
+            bundle_index,
+        )
     }
 
     /// Cache tree state fetched from lightwalletd by SDK.

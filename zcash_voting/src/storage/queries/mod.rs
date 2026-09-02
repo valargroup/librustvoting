@@ -2011,7 +2011,8 @@ fn require_matching_stored_field(
 
 /// Persist public inputs from DelegationProofResult after proof generation.
 /// If PCZT-derived values already exist, the proof result must reproduce them.
-pub fn store_proof_result_fields(
+#[cfg(test)]
+pub(crate) fn store_proof_result_fields(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -2687,7 +2688,7 @@ pub fn list_pir_cache_roots(
 
 // --- Proofs ---
 
-pub fn store_proof(
+pub(crate) fn store_proof(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -3373,6 +3374,76 @@ pub fn clear_unsigned_delegation_setup_fields(
         message: format!("failed to clear unsigned delegation setup fields: {e}"),
     })?;
     Ok(())
+}
+
+/// Clear one demoted proof's legacy setup when an unsigned Keystone flow
+/// explicitly needs to build a durable PCZT.
+///
+/// Migration preserves proof-bearing setup because a missing local transaction
+/// hash does not prove that delegation submission never reached the chain. This
+/// narrower recovery is safe to attempt only while the proof is demoted and no
+/// signature, submission hash, or confirmation has been persisted.
+pub(crate) fn clear_demoted_legacy_delegation_setup_for_keystone_request(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<bool, VotingError> {
+    conn.execute(
+        "UPDATE bundles
+         SET van_comm_rand = NULL,
+             dummy_nullifiers = NULL,
+             rho_signed = NULL,
+             padded_note_data = NULL,
+             nf_signed = NULL,
+             cmx_new = NULL,
+             alpha = NULL,
+             rseed_signed = NULL,
+             rseed_output = NULL,
+             gov_comm = NULL,
+             total_note_value = NULL,
+             address_index = NULL,
+             rk = NULL,
+             gov_nullifiers_blob = NULL,
+             padded_note_secrets = NULL,
+             pczt_sighash = NULL,
+             tx1_effects = NULL,
+             delegation_pczt = NULL
+         WHERE round_id = :round_id
+           AND wallet_id = :wallet_id
+           AND bundle_index = :bundle_index
+           AND delegation_pczt IS NULL
+           AND note_positions_blob IS NOT NULL
+           AND delegation_tx_hash IS NULL
+           AND van_leaf_position IS NULL
+           AND EXISTS (
+               SELECT 1
+                 FROM proofs
+                WHERE round_id = :round_id
+                  AND wallet_id = :wallet_id
+                  AND bundle_index = :bundle_index
+                  AND success = 0
+                  AND proof IS NOT NULL
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM keystone_signatures
+                WHERE round_id = :round_id
+                  AND wallet_id = :wallet_id
+                  AND bundle_index = :bundle_index
+           )",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index as i64,
+        },
+    )
+    .map(|rows| rows != 0)
+    .map_err(|e| VotingError::Internal {
+        message: format!(
+            "failed to clear demoted legacy delegation setup for bundle {bundle_index}: {e}"
+        ),
+    })
 }
 
 fn ensure_vote_submission_matches_ballot_intent(

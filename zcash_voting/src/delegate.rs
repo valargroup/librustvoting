@@ -1137,12 +1137,31 @@ impl PreparedDelegationBundle {
     /// Setup persists the serialized PCZT together with its write-once sighash
     /// and randomized key. Repeated calls, including calls after ZKP #1 was
     /// generated in the background, return that same PCZT instead of rebuilding
-    /// randomized signing state.
+    /// randomized signing state. An unsigned legacy setup whose proof was
+    /// demoted during migration is rebuilt here because it predates durable
+    /// PCZT storage; signed or submitted legacy setup is never replaced.
     pub fn keystone_request(
         &self,
         voting_db: &VotingDb,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<KeystoneSigningRequest, VotingError> {
+        // Migration retains proof-bearing legacy setup because a delegation
+        // with no locally recorded hash may still have reached the chain. Only
+        // an explicit unsigned Keystone request may replace a demoted setup
+        // that has neither a signature nor submission evidence.
+        self.validate_snapshot_branch_id_provider()?;
+        let consensus_branch_id = self.branch_id_provider.consensus_branch_id()?;
+        voting_db.validate_governance_pczt_context(
+            &self.round_id,
+            self.bundle_index,
+            &self.bundle_note_infos,
+            &self.delegation_keys,
+            consensus_branch_id,
+        )?;
+        voting_db.clear_demoted_legacy_delegation_setup_for_keystone_request(
+            &self.round_id,
+            self.bundle_index,
+        )?;
         self.ensure_setup(voting_db, stages)?;
         let (pczt_bytes, stored_sighash, stored_rk) =
             voting_db.get_delegation_pczt_fields(&self.round_id, self.bundle_index)?;
@@ -1829,6 +1848,59 @@ mod tests {
             .unwrap();
         assert_eq!(retried, first);
         assert!(!first.pczt_bytes.is_empty());
+    }
+
+    #[test]
+    fn keystone_request_explicitly_rebuilds_demoted_legacy_setup() {
+        let (voting_db, _round_params, _hotkey, prepared) = prepared_wallet_delegation_fixture();
+        prepared
+            .setup(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        let wallet_id = voting_db.wallet_id();
+        {
+            let conn = voting_db.conn();
+            crate::storage::queries::store_proof(
+                &conn,
+                &prepared.round_id,
+                &wallet_id,
+                prepared.bundle_index,
+                &[0xAB; 96],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE proofs SET success = 0
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3",
+                params![&prepared.round_id, &wallet_id, prepared.bundle_index],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE bundles SET delegation_pczt = NULL
+                 WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3",
+                params![&prepared.round_id, &wallet_id, prepared.bundle_index],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            voting_db
+                .delegation_phase(&prepared.round_id, prepared.bundle_index)
+                .unwrap(),
+            DelegationPhase::PcztBuilt
+        );
+        let request = prepared
+            .keystone_request(&voting_db, &crate::types::NoopProgressReporter)
+            .unwrap();
+        assert!(!request.pczt_bytes.is_empty());
+        assert_eq!(
+            voting_db
+                .get_delegation_pczt_fields(&prepared.round_id, prepared.bundle_index)
+                .unwrap()
+                .0,
+            request.pczt_bytes
+        );
+        assert!(!voting_db
+            .has_persisted_delegation_proof(&prepared.round_id, prepared.bundle_index)
+            .unwrap());
     }
 
     #[test]
