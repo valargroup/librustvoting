@@ -121,11 +121,14 @@ database uniqueness constraint covers its full identity and generation digest.
 Creation and every durable state or field mutation occur in immediate
 transactions. Migration-only legacy guards are instead keyed by the available
 legacy identity, have no invented generation digest, and permanently block a
-fresh submission for that identity. A partial unique index permits at most one
-digestless guard per legacy identity, and reservation checks for that guard
-under the submission-identity lock before deriving or inserting a generation.
-The same transaction prohibits any digestless guard and native generation row
-from coexisting for one submission identity.
+fresh singleton submission for that identity. They also block any batch that
+contains the guarded `(bundle, proposal)` member; changing `kind` from `vote`
+to `vote_batch` cannot bypass a legacy guard. A partial unique index permits at
+most one digestless guard per legacy identity, and reservation checks every
+applicable singleton or batch-member legacy identity under canonically ordered
+submission-identity locks before deriving or inserting a generation. The same
+transaction prohibits a legacy guard from coexisting with a native singleton
+row or overlapping batch row.
 
 The row stores only:
 
@@ -255,10 +258,12 @@ marker. Conflicting terminal data is an invariant error and writes nothing.
 Before releasing any POST byte, the lifecycle:
 
 1. acquires the round/account gate, bundle lock where applicable, and
-   submission-identity lock;
-2. derives the recovery-independent identity and loads its authoritative row;
-3. returns `LegacyConfirmed`, or returns a digestless `Recovering` guard as
-   pending with `RecoveryUnavailable`, before requiring recovery material;
+   applicable submission-identity locks in canonical order;
+2. derives the recovery-independent identity, plus every batch member's legacy
+   singleton identity when applicable, and loads their authoritative rows;
+3. returns `LegacyConfirmed` for a matching singleton, returns a digestless
+   guard as pending with `RecoveryUnavailable`, or rejects an overlapping
+   batch without dispatch, before requiring recovery material;
 4. loads and locks the generation inputs and derives the generation digest and
    expected layout;
 5. creates the `Submitting` row, or validates the existing same-generation
@@ -272,9 +277,9 @@ pass. They clear any inconclusive candidate and increment the attempt count in
 the same immediate transaction. There is no standalone candidate-retirement
 mutation and an empty candidate slot is not retry authorization.
 
-Guard lookup and native row insertion share the same identity lock and
-immediate transaction, so a concurrent call cannot bypass or replace the
-guard.
+Guard lookup and native row insertion share the same canonically ordered
+identity locks and immediate transaction, so a concurrent singleton or batch
+call cannot bypass or replace the guard.
 
 If reservation fails, dispatch does not occur. A process-local in-flight guard
 prevents cleanup, replacement, or deletion from racing response
@@ -394,7 +399,8 @@ Restart plans are derived from the authoritative row:
   resubmission, but missing helper inputs are not invented or scheduled;
 - `Rejected` schedules no reconciliation; and
 - absent rows permit fresh work if bundle causality allows it and no matching
-  `LegacyConfirmed` identity exists.
+  `LegacyConfirmed` or digestless `Recovering` guard exists, including for
+  every member of a proposed batch.
 
 An unresolved generation or legacy guard blocks only later work that consumes
 its unknown successor VAN. Independent bundles remain schedulable.
@@ -583,13 +589,14 @@ The lock order is:
 
 1. account/round operation gate;
 2. bundle lock when a VAN is consumed or advanced;
-3. submission-identity lock;
+3. applicable submission-identity locks in canonical identity order;
 4. database handle; and
 5. immediate SQLite transaction.
 
-The identity lock serializes lifecycle work for one row. The bundle lock
-prevents two proposals from deriving successors from the same VAN. Different
-bundles remain independent.
+The identity locks serialize lifecycle work for the authoritative row and, for
+a batch, every member's legacy singleton key. The bundle lock prevents two
+proposals from deriving successors from the same VAN. Different bundles remain
+independent.
 
 Once a singleton request is possibly dispatched, its proposal and choice are
 locked. Once a batch is possibly dispatched, member proposals, choices, count,
@@ -632,13 +639,10 @@ recovery material nor creates, regenerates, or advances a generation-bound
 helper plan. A digestless `Recovering` guard likewise preserves its original
 evidence and any independently durable records.
 
-There is no standalone recovery-clear operation. The destructive
-`clear_recovery_state` primitive may remove recovery material, helper plans,
-and all helper-delivery history, but it is private to explicit account
-deletion. Account deletion invokes it only after closing the account operation
-gate, preventing new entrants, draining active work, and retaining exclusive
-access through deletion. Ordinary cleanup, reset, and round deletion never
-invoke this primitive.
+There is no standalone recovery-clear operation or
+`clear_recovery_state` primitive. Ordinary cleanup and reset preserve recovery
+material, helper plans, and all helper-delivery history while the owning round
+remains live.
 
 An unresolved row cannot be pruned merely because it has no candidate hash.
 Hashless `Recovering` is exactly the case that requires preservation. Bundle
@@ -655,8 +659,9 @@ the matching operation gate before checking active work, prevents new entrants,
 drains shared holders, and retains exclusive access through deletion. It
 returns `Busy` while work remains. Deletion removes local evidence but cannot
 undo a transaction that may already be on chain. Round deletion removes the
-gated round directly; only account deletion may invoke
-`clear_recovery_state`.
+gated round directly, and account deletion removes every gated round for the
+account. Their foreign-key cascades remove the owned recovery and helper
+records; neither operation selectively clears those records from a live round.
 
 ## Version 17 to version 18
 
@@ -713,12 +718,15 @@ without guessing aborts migration atomically and preserves the version-17
 database.
 
 Permanently guarding an affected legacy identity can block that identity and
-dependent work even if its pre-upgrade transaction actually committed. This
-availability risk is accepted because the required combination of incomplete
-version-17 chain evidence and absent recovery JSON is expected to occur with
-low probability. Later recovery inputs are not accepted as proof of the
-original generation: without a durable cryptographic anchor, they may describe
-a different input nullifier or output layout.
+dependent work whether its pre-upgrade transaction committed, failed, was
+never dispatched, or never committed. Progress then requires explicit
+destructive round or account deletion. This availability risk is accepted as a
+product decision because the required combination of independently persisted
+incomplete version-17 chain evidence and absent recovery JSON is expected to
+occur with low probability; that expectation is not based on measured
+telemetry. Later recovery inputs are not accepted as proof of the original
+generation: without a durable cryptographic anchor, they may describe a
+different input nullifier or output layout.
 
 Migration validates complete unique ownership of canonical hashes imported
 into authoritative candidate or confirmation fields across wallet,
@@ -899,10 +907,18 @@ Tests cover:
 - digestless `Recovering` guards preserve incomplete v17 evidence, remain
   permanently unbound, cannot dispatch or reconcile, reject every runtime
   transition, and survive cleanup;
+- after migrating a digestless guard, adding complete recovery inputs and
+  invoking planning or advancement leaves every guard field unchanged,
+  including its null digest, null candidate, and zero attempts; inserts no
+  native row; and performs no network call;
 - an empty v17 vote row creates no submission row or guard;
 - unbound `Pending(Recovering)` reports `RecoveryUnavailable`, authorizes and
   schedules no network work across restart, and atomically excludes a competing
   native row or attempted replacement;
+- singleton planning and batch planning both check every applicable legacy
+  identity, and a batch containing a `LegacyConfirmed` or digestless guarded
+  `(bundle, proposal)` member dispatches nothing and cannot insert an
+  overlapping native batch row;
 - schema constraints cover digest nullability, legacy sources, zero attempts,
   null candidates and tracking timestamps, required observed positions,
   partial guard uniqueness, and legacy/native identity exclusion;
@@ -926,8 +942,8 @@ Tests cover:
   rejection;
 - ordinary cleanup and reset preserve every unresolved generation, its
   retry/recovery data, helper plan, and complete delivery history;
-- standalone recovery clearing is not public or used by round cleanup, and the
-  destructive primitive runs only under exclusive account deletion;
+- no standalone recovery-clear API or storage primitive exists, and only
+  exclusive round or account deletion removes owned recovery and helper rows;
 - partial pruning refuses protected ranges without renumbering bundles;
 - deletion gates block new work and wait for active work;
 - planners and recovery snapshots derive from the authoritative row; and
