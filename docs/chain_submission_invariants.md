@@ -916,7 +916,11 @@ becomes an ordinary bound submission.
 
 Migration classifies version-17 rows in this order:
 
-1. Audit non-null recovery JSON and group every provable atomic batch. Missing
+1. Exclude an empty-wallet namespace or a round id that cannot form the exact
+   canonical native lifecycle identity. Its legacy rows remain untouched and
+   explicitly deletable; malformed recovery and position values in that
+   namespace do not participate in audit or same-tree ownership checks.
+2. Audit non-null recovery JSON and group every provable atomic batch. Missing
    JSON is absence, not corruption. Malformed or internally inconsistent JSON,
    or recovery whose round, bundle, proposal, choice, commitment, or recorded
    VC position does not match its owning vote row, marks that member invalid.
@@ -925,7 +929,7 @@ Migration classifies version-17 rows in this order:
    from the complete ordered action list. A shared historical hash across vote
    rows must identify exactly one such reconstructable batch. Failure marks
    every persisted member of the affected group invalid.
-2. Every derivable recovery-backed generation binds its real generation digest
+3. Every derivable recovery-backed generation binds its real generation digest
    and expected output layout. A provable atomic batch binds once, as one
    `vote_batch` generation, not as one row per member. The row becomes
    `Confirmed` with source `legacy_import` only when the recorded version-17
@@ -941,20 +945,25 @@ Migration classifies version-17 rows in this order:
    the same way. Both use checked arithmetic. The bundle-scoped VAN records only
    the newest successor after later confirmations and is not attributed to an
    older singleton or batch.
-3. A vote with complete VAN and VC domain positions, no batch markers, and
+   A bound `Recovering` generation retains its recovery material, but migration
+   removes its unvalidated VC domain projections. Its bundle VAN is reset to
+   the latest confirmed migrated successor, or cleared if no confirmed
+   generation owns one, so exact-tree recovery can use the ordinary strict
+   confirmation path.
+4. A vote with complete VAN and VC domain positions, no batch markers, and
    absent recovery JSON becomes `Confirmed` with source `legacy_projection`.
    Migration records the checked observed positions, preserves the original
    projection columns, and leaves its digest and candidate hash absent. A
    delegation, marked batch, or shared-hash group cannot enter this class.
-4. Chain evidence with absent recovery material, recovery inputs that fail
-   generation derivation, or evidence marked invalid by rule 1 becomes a
+5. Chain evidence with absent recovery material, recovery inputs that fail
+   generation derivation, or evidence marked invalid by rule 2 becomes a
    digestless `Recovering` guard with no candidate. Invalid atomic groups create
    one singleton guard per persisted member, which also blocks overlapping
    future batch admission. Original columns remain intact, and the guard
    performs no polling, scanning, retry, or confirmation. Distinct diagnostics
    preserve whether recovery was unavailable, derivation failed, or legacy
    evidence was invalid. This quarantine lets unrelated version-17 data upgrade.
-5. A genuine same-tree output-ownership collision, an invalid identity that
+6. A genuine same-tree output-ownership collision, an invalid identity that
    cannot name a guard, or an operational SQLite/storage failure still aborts
    migration atomically.
 
@@ -978,6 +987,11 @@ A row has chain evidence when at least one transaction hash or confirmation
 position is present, or when committed recovery material exists. An ordinary
 vote row with none of those creates no submission row, except when an invalid
 atomic group identifies it as a missing persisted member that must be guarded.
+A successful delegation proof by itself is prepared local work, not evidence
+that a POST was attempted: with no hash or VAN position it creates no migration
+row and remains eligible for its first submission. Session cleanup preserves
+the complete proved setup, so restart cannot regenerate its nullifiers or
+`van_comm_rand`.
 
 Migration safety note: in version 17, a missing hash is not evidence that no
 POST was dispatched. A canonical historical hash is never imported as a
@@ -1008,11 +1022,17 @@ the same numeric position in another round is valid because each round has an
 independent commitment tree. A bundle VAN observed for a
 `legacy_projection` confirmation is an unvalidated current-domain observation,
 so it is range-checked but excluded from output-ownership collision checks.
+Because that observation snapshots the bundle's current VAN rather than proving
+which historical generation produced it, projection normalization may preserve
+a later recovering generation's VAN through an older `legacy_projection` row.
+The later exact-tree confirmation writes the same bundle value, so this
+attribution is conservative and idempotent.
 Out-of-range positions and ambiguous same-tree ownership abort the whole
 migration; migration does not guess, merge, or silently normalize ownership.
 Malformed or internally inconsistent recovery metadata becomes a member guard.
-Auditing occurs before classification, so partial and recovery-backed evidence
-cannot bypass range or ownership checks.
+Lifecycle namespace eligibility is established before auditing. Among eligible
+rows, auditing occurs before classification or projection cleanup, so partial
+and recovery-backed evidence cannot bypass range or ownership checks.
 
 An invalid round id or empty wallet id may be skipped because neither can name
 a native lifecycle holder and the legacy data remains explicitly deletable.
@@ -1378,10 +1398,14 @@ Private-coordinator lifecycle coverage is anchored by
 `v17_recovery_free_vote_evidence_is_classified_by_completeness`,
 `v17_recovery_backed_vote_migrates_to_a_bound_generation`,
 `v17_recovery_backed_vote_with_matching_positions_confirms_as_legacy_import`,
+`v17_recovery_backed_vote_with_mismatched_layout_stays_recovering`,
 `v17_sequential_recovery_backed_singletons_use_their_own_van_positions`,
 `v17_singleton_vc_at_zero_stays_bound_and_recovering`,
+`v17_recovery_backed_batch_with_mismatched_layout_clears_domain_positions`,
+`v17_recovering_generation_preserves_latest_confirmed_van`,
 `v17_batch_followed_by_singleton_uses_the_batch_first_vc_for_its_van`,
 `v17_delegation_without_setup_material_remains_a_digestless_guard`,
+`v17_projectionless_proved_delegation_remains_fresh_work`,
 `v17_complete_delegation_setup_binds_without_a_signer`,
 `v17_corrupt_delegation_setup_becomes_a_derivation_failure_guard`,
 `legacy_import_layout_requires_contiguous_ordered_positions`,
@@ -1390,6 +1414,7 @@ Private-coordinator lifecycle coverage is anchored by
 `reopening_a_migrated_database_is_a_no_op`,
 `confirmed_successor_suppresses_the_obsolete_delegation_guard`,
 `noncanonical_v17_round_ids_create_no_submission`,
+`impossible_v17_namespaces_cannot_poison_canonical_evidence_audit`,
 `invalid_v17_proposal_identities_abort_atomically`,
 `empty_wallet_namespace_is_skipped_without_blocking_open`,
 `v17_identity_key_matches_the_runtime_store`,
@@ -1400,6 +1425,7 @@ Private-coordinator lifecycle coverage is anchored by
 `migrated_batch_members_use_the_authoritative_batch_phase`,
 `v18_fingerprint_rejects_missing_columns_indexes_and_triggers`,
 `reset_voting_session_state_scopes_submission_protection_to_its_bundle`,
+`reset_voting_session_state_preserves_proved_bundle_setup_fields`,
 `noncanonical_legacy_round_ids_remain_deletable`,
 `lifecycle_owned_legacy_vote_never_yields_submit_or_poll_work`,
 `bound_hashless_recovery_is_contained_until_tree_recovery_lands`,

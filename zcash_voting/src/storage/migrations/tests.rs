@@ -481,6 +481,47 @@ fn v17_recovery_backed_vote_with_mismatched_layout_stays_recovering() {
         )
         .unwrap();
     assert_eq!(positions, (None, None));
+    let domain_positions: (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT b.van_leaf_position, v.vc_tree_position
+               FROM bundles b
+               JOIN votes v USING (round_id, wallet_id, bundle_index)
+              WHERE b.round_id=?1 AND b.wallet_id='wallet'
+                AND b.bundle_index=0 AND v.proposal_id=1",
+            [ROUND],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        domain_positions,
+        (None, None),
+        "bound recovery must not retain unvalidated domain projections"
+    );
+
+    let tx = conn.transaction().unwrap();
+    crate::confirmation::apply_vote_confirmation_with_conn(&tx, "wallet", ROUND, 0, 1, None, 7, 8)
+        .unwrap();
+    tx.commit().unwrap();
+
+    let corrected: (i64, i64, String) = conn
+        .query_row(
+            "SELECT b.van_leaf_position, v.vc_tree_position,
+                    v.commitment_bundle_json
+               FROM bundles b
+               JOIN votes v USING (round_id, wallet_id, bundle_index)
+              WHERE b.round_id=?1 AND b.wallet_id='wallet'
+                AND b.bundle_index=0 AND v.proposal_id=1",
+            [ROUND],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((corrected.0, corrected.1), (7, 8));
+    assert_eq!(
+        crate::vote::parse_recovery(&corrected.2)
+            .unwrap()
+            .vc_tree_position,
+        8
+    );
 }
 
 #[test]
@@ -574,6 +615,112 @@ fn noncanonical_v17_round_ids_create_no_submission() {
             7,
             "version-17 domain evidence is left untouched for {round_id}"
         );
+    }
+}
+
+#[test]
+fn impossible_v17_namespaces_cannot_poison_canonical_evidence_audit() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&v17_schema()).unwrap();
+
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    queries::insert_bundle(&conn, ROUND, "wallet", 0, &[1]).unwrap();
+    queries::store_vote(&conn, ROUND, "wallet", 0, 1, 1, &[1; 32]).unwrap();
+    conn.execute(
+        "UPDATE bundles SET van_leaf_position=7
+          WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+        [ROUND],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE votes SET vc_tree_position=8
+          WHERE round_id=?1 AND wallet_id='wallet'
+            AND bundle_index=0 AND proposal_id=1",
+        [ROUND],
+    )
+    .unwrap();
+
+    for (round_id, wallet_id) in [(ROUND, ""), ("legacy-round", "legacy-wallet")] {
+        let mut params = test_params();
+        params.vote_round_id = round_id.to_string();
+        queries::insert_round(&conn, wallet_id, crate::Network::Testnet, &params, None).unwrap();
+        queries::insert_bundle(&conn, round_id, wallet_id, 0, &[1, 2]).unwrap();
+        for proposal_id in [1, 2] {
+            queries::store_vote(
+                &conn,
+                round_id,
+                wallet_id,
+                0,
+                proposal_id,
+                1,
+                &[proposal_id as u8; 32],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE bundles SET van_leaf_position=-2
+              WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=0",
+            rusqlite::params![round_id, wallet_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json='{malformed',
+                              vc_tree_position=8
+              WHERE round_id=?1 AND wallet_id=?2
+                AND bundle_index=0 AND proposal_id=1",
+            rusqlite::params![round_id, wallet_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE votes SET vc_tree_position=-1
+              WHERE round_id=?1 AND wallet_id=?2
+                AND bundle_index=0 AND proposal_id=2",
+            rusqlite::params![round_id, wallet_id],
+        )
+        .unwrap();
+    }
+    conn.pragma_update(None, "user_version", 17).unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    let imported: Vec<(String, String, String)> = conn
+        .prepare(
+            "SELECT wallet_id, round_id, state FROM chain_submissions
+              ORDER BY wallet_id, round_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        imported,
+        vec![(
+            "wallet".to_string(),
+            ROUND.to_string(),
+            "confirmed".to_string()
+        )]
+    );
+    for (round_id, wallet_id) in [(ROUND, ""), ("legacy-round", "legacy-wallet")] {
+        let positions: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT b.van_leaf_position,
+                        min(v.vc_tree_position), max(v.vc_tree_position)
+                   FROM bundles b
+                   JOIN votes v USING (round_id, wallet_id, bundle_index)
+                  WHERE b.round_id=?1 AND b.wallet_id=?2 AND b.bundle_index=0",
+                rusqlite::params![round_id, wallet_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(positions, (-2, -1, 8));
     }
 }
 
@@ -785,6 +932,48 @@ fn v17_delegation_with_complete_setup() -> Connection {
     insert_v17_delegation_with_complete_setup(&conn, ROUND, "wallet", 0, None);
     conn.pragma_update(None, "user_version", 17).unwrap();
     conn
+}
+
+#[test]
+fn v17_projectionless_proved_delegation_remains_fresh_work() {
+    let temp = v17_file(|conn| {
+        queries::insert_round(
+            conn,
+            "wallet",
+            crate::Network::Testnet,
+            &test_params(),
+            None,
+        )
+        .unwrap();
+        insert_v17_delegation_with_complete_setup(conn, ROUND, "wallet", 0, None);
+        conn.execute(
+            "UPDATE bundles SET delegation_tx_hash=NULL
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+            [ROUND],
+        )
+        .unwrap();
+    });
+    let db = crate::storage::VotingDb::open(temp.path()).unwrap();
+    db.set_wallet_id("wallet");
+    db.set_ballot_intent(ROUND, 1, crate::session::Decision::Choice(1), 2)
+        .unwrap();
+
+    assert_eq!(
+        db.conn()
+            .query_row("SELECT count(*) FROM chain_submissions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.delegation_phase(ROUND, 0).unwrap(),
+        crate::phases::DelegationPhase::Proved
+    );
+    let plan = crate::session::resume_plan(&db, ROUND, &[1]).unwrap();
+    assert!(plan
+        .next_steps
+        .contains(&crate::session::NextStep::Delegate { bundle_index: 0 }));
 }
 
 /// Complete delegation setup binds its real generation without requiring a
@@ -1088,6 +1277,117 @@ fn build_confirmed_batch(conn: &Connection) {
         [ROUND],
     )
     .unwrap();
+}
+
+#[test]
+fn v17_recovery_backed_batch_with_mismatched_layout_clears_domain_positions() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&v17_schema()).unwrap();
+    build_confirmed_batch(&conn);
+    let second_json: String = conn
+        .query_row(
+            "SELECT commitment_bundle_json FROM votes
+              WHERE round_id=?1 AND wallet_id='wallet'
+                AND bundle_index=0 AND proposal_id=2",
+            [ROUND],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE votes
+            SET commitment_bundle_json=?1, vc_tree_position=10
+          WHERE round_id=?2 AND wallet_id='wallet'
+            AND bundle_index=0 AND proposal_id=2",
+        rusqlite::params![recovery_json_with_tree_position(&second_json, 10), ROUND],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 17).unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    let state: (String, bool) = conn
+        .query_row(
+            "SELECT state, generation_digest IS NOT NULL
+               FROM chain_submissions WHERE kind='vote_batch'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("recovering".to_string(), true));
+    let bundle_van: Option<i64> = conn
+        .query_row(
+            "SELECT van_leaf_position FROM bundles
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+            [ROUND],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bundle_van, None);
+    let vote_positions: Vec<Option<i64>> = conn
+        .prepare(
+            "SELECT vc_tree_position FROM votes
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0
+              ORDER BY proposal_id",
+        )
+        .unwrap()
+        .query_map([ROUND], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(vote_positions, vec![None, None]);
+}
+
+#[test]
+fn v17_recovering_generation_preserves_latest_confirmed_van() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&v17_schema()).unwrap();
+    build_confirmed_batch(&conn);
+
+    let mut unresolved =
+        crate::vote::parse_recovery(&released_singleton_recovery_json(ROUND)).unwrap();
+    unresolved.proposal_id = 3;
+    unresolved.vote_decision = 1;
+    unresolved.vc_tree_position = 0;
+    unresolved.van_nullifier = [0x61; 32];
+    unresolved.vote_authority_note_new = [0x62; 32];
+    unresolved.vote_commitment = [0x63; 32];
+    unresolved.r_vpk = [0x64; 32];
+    let stored_commitment = crate::vote::stored_vote_commitment_bytes(&unresolved).unwrap();
+    queries::store_vote(&conn, ROUND, "wallet", 0, 3, 1, &stored_commitment).unwrap();
+    conn.execute(
+        "UPDATE votes
+            SET commitment_bundle_json=?1, tx_hash='unresolved-singleton',
+                vc_tree_position=0
+          WHERE round_id=?2 AND wallet_id='wallet'
+            AND bundle_index=0 AND proposal_id=3",
+        rusqlite::params![crate::vote::serialize_recovery(&unresolved).unwrap(), ROUND],
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 17).unwrap();
+
+    migrate(&mut conn).unwrap();
+
+    let bundle_van: i64 = conn
+        .query_row(
+            "SELECT van_leaf_position FROM bundles
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+            [ROUND],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bundle_van, 7);
+    let vote_positions: Vec<Option<i64>> = conn
+        .prepare(
+            "SELECT vc_tree_position FROM votes
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0
+              ORDER BY proposal_id",
+        )
+        .unwrap()
+        .query_map([ROUND], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(vote_positions, vec![Some(8), Some(9), None]);
 }
 
 #[test]

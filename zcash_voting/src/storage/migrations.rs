@@ -310,6 +310,22 @@ fn parse_network(network: &str) -> Result<crate::Network, VotingError> {
     }
 }
 
+/// Decodes the version-17 namespace shared by every native lifecycle identity.
+///
+/// Empty-wallet and noncanonical-round namespaces cannot name an authoritative
+/// lifecycle holder. Migration leaves their legacy rows untouched and excludes
+/// them from recovery auditing and output-ownership validation.
+fn v17_lifecycle_namespace(wallet_id: &str, round_id: &str) -> Option<[u8; 32]> {
+    if wallet_id.is_empty() {
+        return None;
+    }
+    hex::decode(round_id)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .filter(|bytes| hex::encode(bytes) == round_id)
+        .filter(|bytes| crate::types::validate_vote_round_id_bytes(bytes).is_ok())
+}
+
 /// Rebuilds the runtime submission identity for one version-17 row.
 ///
 /// Migration and runtime reservation derive the same identity key from this
@@ -328,13 +344,7 @@ fn v17_identity(
     bundle_index: i64,
     target: ChainSubmissionTarget,
 ) -> Result<Option<ChainSubmissionIdentity>, VotingError> {
-    let Some(round_bytes) = hex::decode(round_id)
-        .ok()
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        // The stored column must equal what the runtime re-encodes from the
-        // identity, or lookups and the rounds foreign key would disagree.
-        .filter(|bytes| hex::encode(bytes) == round_id)
-    else {
+    let Some(round_bytes) = v17_lifecycle_namespace(wallet_id, round_id) else {
         return Ok(None);
     };
     let bundle_index = u32::try_from(bundle_index).map_err(|_| VotingError::Internal {
@@ -380,6 +390,10 @@ const LEGACY_EVIDENCE_INVALID_DIAGNOSTIC: &str =
     "version-17 recovery evidence is malformed or internally inconsistent";
 
 impl V17Import {
+    fn is_bound_recovering(&self) -> bool {
+        self.state == "recovering" && self.generation_digest.is_some()
+    }
+
     /// Permanently guards evidence that has no recovery inputs to bind.
     fn recovery_unavailable_guard() -> Self {
         Self {
@@ -581,6 +595,8 @@ fn insert_v17_submission(
 /// Scopes one provable atomic batch: wallet, network, round, bundle, digest.
 type V17BatchScope = (String, String, String, i64, [u8; 32]);
 type V17VoteMemberScope = (String, String, String, i64, i64);
+type V17BundleProjectionScope = (String, String, i64);
+type V17VoteProjectionScope = (String, String, i64, i64);
 
 type V17VoteEvidenceRow = (
     String,
@@ -753,6 +769,48 @@ fn audit_v17_recovery_evidence(
     invalid_members
 }
 
+/// Removes only domain positions that migration classified as unvalidated.
+///
+/// Recovery JSON remains intact so a later exact-tree confirmation can rewrite
+/// its embedded VC position atomically with the domain projection. Because the
+/// VAN is bundle-scoped, an affected bundle is reset to its latest confirmed
+/// migrated successor rather than cleared unconditionally.
+fn clear_v17_bound_recovering_projections(
+    tx: &Transaction<'_>,
+    vote_positions: &std::collections::BTreeSet<V17VoteProjectionScope>,
+    bundle_positions: &std::collections::BTreeSet<V17BundleProjectionScope>,
+) -> Result<(), VotingError> {
+    for (round_id, wallet_id, bundle_index, proposal_id) in vote_positions {
+        tx.execute(
+            "UPDATE votes SET vc_tree_position=NULL
+              WHERE round_id=?1 AND wallet_id=?2
+                AND bundle_index=?3 AND proposal_id=?4",
+            rusqlite::params![round_id, wallet_id, bundle_index, proposal_id],
+        )
+        .map_err(migration_error)?;
+    }
+
+    for (round_id, wallet_id, bundle_index) in bundle_positions {
+        let latest_confirmed_van: Option<i64> = tx
+            .query_row(
+                "SELECT max(final_van_position)
+                   FROM chain_submissions
+                  WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3
+                    AND state='confirmed'",
+                rusqlite::params![round_id, wallet_id, bundle_index],
+                |row| row.get(0),
+            )
+            .map_err(migration_error)?;
+        tx.execute(
+            "UPDATE bundles SET van_leaf_position=?1
+              WHERE round_id=?2 AND wallet_id=?3 AND bundle_index=?4",
+            rusqlite::params![latest_confirmed_van, round_id, wallet_id, bundle_index],
+        )
+        .map_err(migration_error)?;
+    }
+    Ok(())
+}
+
 /// Imports every version-17 row that carries chain evidence.
 ///
 /// Classification is by what can be *derived*, not by what version 17 happened
@@ -771,6 +829,8 @@ fn audit_v17_recovery_evidence(
 /// and operational storage failures still abort the migration.
 fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> {
     let mut observed_output_positions = std::collections::HashSet::new();
+    let mut bound_recovering_vote_positions = std::collections::BTreeSet::new();
+    let mut bound_recovering_bundle_positions = std::collections::BTreeSet::new();
     let mut statement = tx
         .prepare(
             "SELECT v.round_id, v.wallet_id, r.network, v.bundle_index, v.proposal_id,
@@ -789,7 +849,7 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
               ORDER BY v.wallet_id, v.round_id, v.bundle_index, v.proposal_id",
         )
         .map_err(migration_error)?;
-    let rows = statement
+    let mut rows = statement
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -811,6 +871,7 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         .collect::<Result<Vec<_>, _>>()
         .map_err(migration_error)?;
     drop(statement);
+    rows.retain(|row| v17_lifecycle_namespace(&row.1, &row.0).is_some());
     let invalid_vote_members = audit_v17_recovery_evidence(&rows);
 
     // Batch members are bound once, as a single vote_batch generation. A
@@ -952,6 +1013,15 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
             &round_id,
             &import,
         )?;
+        if import.is_bound_recovering() {
+            bound_recovering_vote_positions.insert((
+                round_id.clone(),
+                wallet_id.clone(),
+                bundle,
+                proposal,
+            ));
+            bound_recovering_bundle_positions.insert((round_id.clone(), wallet_id.clone(), bundle));
+        }
         insert_v17_submission(
             tx,
             &identity,
@@ -1030,6 +1100,17 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
             &round_id,
             &import,
         )?;
+        if import.is_bound_recovering() {
+            for proposal_id in bound.ordered_proposal_ids() {
+                bound_recovering_vote_positions.insert((
+                    round_id.clone(),
+                    wallet_id.clone(),
+                    bundle,
+                    i64::from(*proposal_id),
+                ));
+            }
+            bound_recovering_bundle_positions.insert((round_id.clone(), wallet_id.clone(), bundle));
+        }
         insert_v17_submission(
             tx,
             &identity,
@@ -1065,6 +1146,9 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         .map_err(migration_error)?;
     drop(bundles);
     for (round_id, wallet_id, network, bundle, created_at) in delegation_rows {
+        if v17_lifecycle_namespace(&wallet_id, &round_id).is_none() {
+            continue;
+        }
         // A confirmed successor vote in the same bundle makes the original
         // delegation evidence obsolete. Importing a delegation row for it would
         // permanently block later generations for no gain.
@@ -1149,6 +1233,11 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         )?;
         insert_v17_submission(tx, &identity, "delegation", None, None, created_at, import)?;
     }
+    clear_v17_bound_recovering_projections(
+        tx,
+        &bound_recovering_vote_positions,
+        &bound_recovering_bundle_positions,
+    )?;
     Ok(())
 }
 

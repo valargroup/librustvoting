@@ -61,6 +61,13 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Bound version-17 recovery imports no longer retain unvalidated VAN or vote
+  commitment positions that could conflict with later exact-tree recovery.
+  Migration preserves the latest confirmed bundle successor while clearing
+  only unresolved projections.
+- Empty-wallet and noncanonical-round version-17 rows are excluded before
+  recovery and position auditing, so malformed evidence outside the native
+  lifecycle namespace cannot prevent a valid database from opening.
 - Migration rows carrying the `generation_derivation_failed` diagnostic are no
   longer undecodable. `ChainSubmissionDiagnosticKind` gained the matching
   variant, so such a guard loads as an authoritative row instead of failing the
