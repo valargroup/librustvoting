@@ -447,7 +447,15 @@ Within each lifecycle invocation, POST attempts, endpoints, body sizes, request
 durations, and backoffs are bounded by configuration with safe finite maxima.
 Redirects are not followed. A later invocation may reconcile and retry after
 another valid no-match pass regardless of the monotonic historical attempt
-count. Retries are allowed only for the same semantic generation.
+count. A no-match recovery retry shares the current invocation's POST-attempt
+budget: if an earlier POST in that invocation consumed the last attempt, the
+scan leaves the row `Recovering` without another reservation or POST. If
+another attempt remains, the coordinator waits the configured backoff for the
+preceding invocation-local attempt before consuming the recovery authorization
+and reserving the retry. A pre-existing `Recovering` row begins a later
+invocation with a fresh bounded budget and needs no backoff before that
+invocation's first POST. Retries are allowed only for the same semantic
+generation.
 
 ## Reconciliation and retry
 
@@ -931,7 +939,8 @@ Tests cover:
 - attempt count never decreases, is diagnostic rather than a permanent retry
   gate, and cannot underflow or be reopened by callback ordering;
 - each lifecycle invocation enforces independent finite attempt and backoff
-  limits even though later invocations may reconcile and retry;
+  limits even when a fresh ambiguous POST immediately proceeds through a
+  no-match tree scan; later invocations may independently reconcile and retry;
 - restart after the combined transaction conservatively requires a new
   completed valid no-match pass before retry;
 - an originally hashless `Recovering` row likewise cannot POST before a

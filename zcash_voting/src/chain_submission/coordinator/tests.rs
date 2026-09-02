@@ -91,6 +91,126 @@ async fn exact_recovery_confirms_unique_layout_without_synthesizing_a_hash() {
 }
 
 #[tokio::test]
+async fn fresh_ambiguous_post_exhausts_one_attempt_before_no_match_recovery() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    for response in tree_responses(&[[8; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.queue(Ok(accepted()));
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    );
+
+    let result = coordinator
+        .advance_with_recovery(
+            StoreAdvancementRequest::vote(identity.clone()),
+            ChainRecoveryMode::ExactTree,
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ..
+        })
+    ));
+    assert_eq!(transport.methods(), vec!["POST", "GET", "GET"]);
+    assert_eq!(
+        store
+            .record(&identity)
+            .unwrap()
+            .committed_post_reservations(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_ambiguous_post_waits_for_backoff_before_no_match_recovery() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    for response in tree_responses(&[[8; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.queue(Ok(accepted()));
+    let protocol = ChainProtocolClient::new(
+        Arc::clone(&transport),
+        Network::Testnet,
+        &[
+            "https://one.example".to_string(),
+            "https://two.example".to_string(),
+        ],
+    )
+    .unwrap();
+    let coordinator = Arc::new(
+        ChainSubmissionCoordinator::new(
+            protocol,
+            Arc::clone(&store),
+            ManualClock::new(100),
+            CoordinatorPolicy::new(Duration::from_secs(10), 2, vec![Duration::from_secs(5)])
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+    let task = {
+        let coordinator = Arc::clone(&coordinator);
+        let identity = identity.clone();
+        tokio::spawn(async move {
+            coordinator
+                .advance_with_recovery(
+                    StoreAdvancementRequest::vote(identity),
+                    ChainRecoveryMode::ExactTree,
+                    &ManualControl::default(),
+                )
+                .await
+        })
+    };
+
+    for _ in 0..100 {
+        if transport.methods().len() == 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(transport.methods(), vec!["POST", "GET", "GET"]);
+    assert!(!task.is_finished());
+
+    tokio::time::advance(Duration::from_secs(4)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(transport.methods(), vec!["POST", "GET", "GET"]);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let result = task.await.unwrap().unwrap();
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: Some(_),
+            ..
+        })
+    ));
+    assert_eq!(transport.methods(), vec!["POST", "GET", "GET", "POST"]);
+    assert_eq!(
+        store
+            .record(&identity)
+            .unwrap()
+            .committed_post_reservations(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn recovering_candidate_is_polled_before_no_match_retry_reservation() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());

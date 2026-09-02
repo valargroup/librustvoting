@@ -186,7 +186,7 @@ where
                 derived, record, ..
             } => {
                 self.reconcile_existing(
-                    &request, &operation, &lease, *derived, record, recovery, control,
+                    &request, &operation, &lease, *derived, record, recovery, 0, control,
                 )
                 .await
             }
@@ -248,7 +248,14 @@ where
                     )?;
                     return self
                         .reconcile_existing(
-                            &request, &operation, lease, derived, record, recovery, control,
+                            &request,
+                            &operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            attempt_index + 1,
+                            control,
                         )
                         .await;
                 }
@@ -266,7 +273,14 @@ where
                     )?;
                     return self
                         .reconcile_existing(
-                            &request, &operation, lease, derived, record, recovery, control,
+                            &request,
+                            &operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            attempt_index + 1,
+                            control,
                         )
                         .await;
                 }
@@ -429,6 +443,7 @@ where
         derived: DerivedChainSubmission,
         record: StoredChainSubmission,
         recovery: ChainRecoveryMode,
+        post_attempts_used: usize,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         match record.state() {
@@ -447,7 +462,14 @@ where
                     LookupProgress::Observed(TransactionStatusObservation::Pending) => {
                         let record = self.finish_inconclusive_tracking(&derived, record, None)?;
                         self.recover_if_enabled(
-                            request, operation, lease, derived, record, recovery, control,
+                            request,
+                            operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            post_attempts_used,
+                            control,
                         )
                         .await
                     }
@@ -459,7 +481,14 @@ where
                                 Some(lookup_diagnostic(&failure)),
                             )?;
                             self.recover_if_enabled(
-                                request, operation, lease, derived, record, recovery, control,
+                                request,
+                                operation,
+                                lease,
+                                derived,
+                                record,
+                                recovery,
+                                post_attempts_used,
+                                control,
                             )
                             .await
                         } else {
@@ -503,7 +532,14 @@ where
                 ..
             } => {
                 self.recover_if_enabled(
-                    request, operation, lease, derived, record, recovery, control,
+                    request,
+                    operation,
+                    lease,
+                    derived,
+                    record,
+                    recovery,
+                    post_attempts_used,
+                    control,
                 )
                 .await
             }
@@ -544,7 +580,14 @@ where
                             ChainSubmissionState::Recovering,
                         )?;
                         self.recover_if_enabled(
-                            request, operation, lease, derived, record, recovery, control,
+                            request,
+                            operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            post_attempts_used,
+                            control,
                         )
                         .await
                     }
@@ -556,7 +599,14 @@ where
                             ChainSubmissionState::Recovering,
                         )?;
                         self.recover_if_enabled(
-                            request, operation, lease, derived, record, recovery, control,
+                            request,
+                            operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            post_attempts_used,
+                            control,
                         )
                         .await
                     }
@@ -568,7 +618,14 @@ where
                             ChainSubmissionState::Recovering,
                         )?;
                         self.recover_if_enabled(
-                            request, operation, lease, derived, record, recovery, control,
+                            request,
+                            operation,
+                            lease,
+                            derived,
+                            record,
+                            recovery,
+                            post_attempts_used,
+                            control,
                         )
                         .await
                     }
@@ -623,6 +680,7 @@ where
         derived: DerivedChainSubmission,
         record: StoredChainSubmission,
         recovery: ChainRecoveryMode,
+        post_attempts_used: usize,
         control: &dyn SubmissionControl,
     ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
         if recovery == ChainRecoveryMode::StatusOnly
@@ -662,6 +720,24 @@ where
                 control,
             ),
             Ok(RecoveryScanOutcome::NoMatch(authorization)) => {
+                if post_attempts_used >= self.policy.maximum_post_attempts {
+                    return record.public_result();
+                }
+                if interruption(operation, control).is_some() {
+                    return record.public_result();
+                }
+                if post_attempts_used > 0
+                    && self
+                        .wait_backoff_or_interruption(
+                            self.policy.retry_backoffs[post_attempts_used - 1],
+                            operation,
+                            control,
+                        )
+                        .await
+                        .is_some()
+                {
+                    return record.public_result();
+                }
                 if interruption(operation, control).is_some() {
                     return record.public_result();
                 }
