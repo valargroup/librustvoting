@@ -237,6 +237,11 @@ The row stores only:
 - final VAN and vote-commitment positions in generation order; and
 - creation and update timestamps.
 
+The creation timestamp is fixed. Every lifecycle mutation clamps the update
+timestamp against its durable value, including exact-tree confirmation and the
+combined candidate-retirement-and-retry reservation, so wall-clock rollback
+cannot make `updated_at` decrease.
+
 The latest bounded lookup diagnostic for `Tracking` is durable operational
 context. A reopen must return the same diagnostic until a later observation or
 terminal transition replaces it; persistence cannot silently discard it.
@@ -1040,7 +1045,8 @@ Tests cover:
 These tests are the review contract for changes to chain submission behavior.
 
 Phase 6 recovery coverage is anchored by
-`exact_recovery_confirms_unique_layout_without_synthesizing_a_hash`,
+`exact_recovery_confirms_without_a_hash_and_clamps_timestamp`,
+`no_match_recovery_waits_for_backoff_and_clamps_reservation_timestamp`,
 `recovering_candidate_is_polled_before_no_match_retry_reservation`,
 `definitely_unsent_recovery_retry_keeps_reservation_and_requires_a_new_scan`,
 `malformed_tree_after_candidate_first_poll_retains_candidate_and_never_retries`,
@@ -1049,7 +1055,7 @@ Phase 6 recovery coverage is anchored by
 `duplicate_complete_layout_is_ambiguous_not_confirmation`,
 `incomplete_pagination_produces_no_authorization`,
 `full_tree_capacity_fits_the_fixed_request_and_byte_ceilings`, and
-`tree_confirmation_is_atomic_and_survives_reopen_without_a_hash`.
+`tree_confirmation_is_atomic_clamps_timestamp_and_survives_reopen_without_a_hash`.
 
 Generation and confirmation coverage is anchored by
 `generation_transcript_encodes_exact_framing_bytes`,

@@ -45,7 +45,7 @@ impl ManualClock {
 }
 
 #[tokio::test]
-async fn exact_recovery_confirms_unique_layout_without_synthesizing_a_hash() {
+async fn exact_recovery_confirms_without_a_hash_and_clamps_timestamp() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived(identity.clone(), 1));
@@ -54,12 +54,9 @@ async fn exact_recovery_confirms_unique_layout_without_synthesizing_a_hash() {
     for response in tree_responses(&[[8; 32], [3; 32], [4; 32], [7; 32]]) {
         transport.queue(Ok(response));
     }
-    let coordinator = coordinator(
-        Arc::clone(&transport),
-        Arc::clone(&store),
-        ManualClock::new(100),
-        10,
-    );
+    let clock = ManualClock::new(100);
+    transport.move_clock_on_next_get(clock.clone(), 90);
+    let coordinator = coordinator(Arc::clone(&transport), Arc::clone(&store), clock, 10);
 
     let result = coordinator
         .advance_with_recovery(
@@ -81,13 +78,9 @@ async fn exact_recovery_confirms_unique_layout_without_synthesizing_a_hash() {
     assert_eq!(confirmation.final_van_position(), 1);
     assert_eq!(confirmation.vote_commitment_positions(), &[2]);
     assert_eq!(transport.methods(), vec!["POST", "GET", "GET"]);
-    assert_eq!(
-        store
-            .record(&identity)
-            .unwrap()
-            .committed_post_reservations(),
-        1
-    );
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.committed_post_reservations(), 1);
+    assert_eq!(record.updated_at(), 100);
 }
 
 #[tokio::test]
@@ -135,7 +128,7 @@ async fn fresh_ambiguous_post_exhausts_one_attempt_before_no_match_recovery() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn fresh_ambiguous_post_waits_for_backoff_before_no_match_recovery() {
+async fn no_match_recovery_waits_for_backoff_and_clamps_reservation_timestamp() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived(identity.clone(), 1));
@@ -145,6 +138,9 @@ async fn fresh_ambiguous_post_waits_for_backoff_before_no_match_recovery() {
         transport.queue(Ok(response));
     }
     transport.queue(Ok(accepted()));
+    let clock = ManualClock::new(100);
+    transport.move_clock_on_next_get(clock.clone(), 90);
+    transport.require_recovery_reservation_timestamp(Arc::clone(&store), identity.clone(), 100);
     let protocol = ChainProtocolClient::new(
         Arc::clone(&transport),
         Network::Testnet,
@@ -158,7 +154,7 @@ async fn fresh_ambiguous_post_waits_for_backoff_before_no_match_recovery() {
         ChainSubmissionCoordinator::new(
             protocol,
             Arc::clone(&store),
-            ManualClock::new(100),
+            clock,
             CoordinatorPolicy::new(Duration::from_secs(10), 2, vec![Duration::from_secs(5)])
                 .unwrap(),
         )
@@ -428,6 +424,11 @@ impl SubmissionControl for CancelOnCheck {
 }
 
 type TransportReply = Result<ChainHttpResponse, ChainTransportError>;
+type RecoveryReservationTimestampProbe = (
+    Arc<InMemoryChainSubmissionStore>,
+    ChainSubmissionIdentity,
+    u64,
+);
 
 #[derive(Clone)]
 struct PostGate {
@@ -441,6 +442,8 @@ struct ScriptedTransport {
     replies: Mutex<VecDeque<TransportReply>>,
     methods: Mutex<Vec<&'static str>>,
     reservation_probe: Mutex<Option<(Arc<InMemoryChainSubmissionStore>, ChainSubmissionIdentity)>>,
+    recovery_reservation_timestamp_probe: Mutex<Option<RecoveryReservationTimestampProbe>>,
+    next_get_clock_update: Mutex<Option<(ManualClock, u64)>>,
     post_gate: Mutex<Option<PostGate>>,
     fail_classification_store: Mutex<Option<Arc<InMemoryChainSubmissionStore>>>,
     fail_reconciliation_store: Mutex<Option<Arc<InMemoryChainSubmissionStore>>>,
@@ -461,6 +464,20 @@ impl ScriptedTransport {
         identity: ChainSubmissionIdentity,
     ) {
         *self.reservation_probe.lock().unwrap() = Some((store, identity));
+    }
+
+    fn require_recovery_reservation_timestamp(
+        &self,
+        store: Arc<InMemoryChainSubmissionStore>,
+        identity: ChainSubmissionIdentity,
+        expected_updated_at: u64,
+    ) {
+        *self.recovery_reservation_timestamp_probe.lock().unwrap() =
+            Some((store, identity, expected_updated_at));
+    }
+
+    fn move_clock_on_next_get(&self, clock: ManualClock, now: u64) {
+        *self.next_get_clock_update.lock().unwrap() = Some((clock, now));
     }
 
     fn gate_first_post(&self) -> (Arc<Notify>, Arc<Notify>) {
@@ -490,6 +507,17 @@ impl ScriptedTransport {
                     SubmissionRecordState::Submitting
                 ));
             }
+            if let Some((store, identity, expected_updated_at)) = self
+                .recovery_reservation_timestamp_probe
+                .lock()
+                .unwrap()
+                .as_ref()
+            {
+                let record = store.record(identity).unwrap();
+                if record.committed_post_reservations() == 2 {
+                    assert_eq!(record.updated_at(), *expected_updated_at);
+                }
+            }
         }
         self.methods.lock().unwrap().push(method);
     }
@@ -507,6 +535,9 @@ impl ChainTransport for ScriptedTransport {
     fn chain_get<'a>(&'a self, _request: ChainHttpRequest) -> ChainTransportFuture<'a> {
         Box::pin(async move {
             self.begin_request("GET");
+            if let Some((clock, now)) = self.next_get_clock_update.lock().unwrap().take() {
+                clock.set(now);
+            }
             if let Some(store) = self.fail_reconciliation_store.lock().unwrap().take() {
                 store.fail_next_commit();
             }

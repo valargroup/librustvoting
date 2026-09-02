@@ -623,7 +623,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
             .map_err(|error| transition_failure(previous, error))?
             .expect("tree confirmation remains durable");
             record.diagnostic = None;
-            record.updated_at = now;
+            record.updated_at = now.max(record.updated_at);
             apply_confirmed_generation(tx, &derived, &confirmation)
                 .map_err(map_generation_error)?;
             persist_mutable(tx, &record)?;
@@ -695,7 +695,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
             {
                 *candidate_transaction_hash = None;
             }
-            record.updated_at = now;
+            record.updated_at = now.max(record.updated_at);
             persist_mutable(tx, &record)?;
             Ok(record)
         })

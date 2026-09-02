@@ -1135,7 +1135,7 @@ pub(super) mod memory {
                 .map_err(|error| transition_failure(previous, error))?
                 .expect("tree confirmation remains durable");
                 confirmed.diagnostic = None;
-                confirmed.updated_at = now;
+                confirmed.updated_at = now.max(confirmed.updated_at);
                 state.projections.insert(
                     expected_generation.identity().clone(),
                     confirmation.confirmation().clone(),
@@ -1211,7 +1211,7 @@ pub(super) mod memory {
                 {
                     *candidate_transaction_hash = None;
                 }
-                record.updated_at = now;
+                record.updated_at = now.max(record.updated_at);
                 state.records.insert(identity.clone(), record.clone());
                 Ok(record)
             })
