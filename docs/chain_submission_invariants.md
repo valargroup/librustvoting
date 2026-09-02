@@ -24,7 +24,10 @@ usable hash, or the bounded `Tracking` window expired inconclusively. Recovery
 polls a candidate hash first when one exists, then may search the commitment
 tree for the generation's exact output layout. `Recovering` is sticky: later
 responses and retries may add a candidate hash, but they do not erase the
-durable recovery ambiguity. Tree recovery never runs for ordinary `Tracking`.
+durable recovery ambiguity. A completed valid recovery pass may authorize one
+atomic candidate-retirement and same-generation retry reservation; retirement
+is not evidence that the candidate failed or was never dispatched. Tree
+recovery never runs for ordinary `Tracking`.
 
 ## Scope and authority
 
@@ -130,7 +133,7 @@ The row stores only:
   digestless `Recovering` guards;
 - durable state;
 - one optional canonical candidate transaction hash;
-- attempt count;
+- monotonic count of committed POST reservations;
 - an optional immutable tracking-start timestamp;
 - a bounded redacted diagnostic;
 - final confirmation source;
@@ -160,9 +163,12 @@ The row does not store:
 - a second recovery state machine.
 
 Candidate hashes are canonical lowercase 32-byte hashes. A candidate is only a
-handle to poll; it is not confirmation and has no durable provenance class.
-Legacy guards do not import a candidate or confirmed hash; any historical hash
-remains only in its unchanged legacy projection column.
+current handle to poll; it is not confirmation, has no durable provenance
+class, and need not be retained when a completed valid recovery pass directly
+authorizes an atomic same-generation retry reservation. Retirement makes no
+claim about the transaction's chain outcome. Legacy guards do not import a
+candidate or confirmed hash; any historical hash remains only in its unchanged
+legacy projection column.
 Diagnostics are bounded, valid UTF-8, escaped, and redacted before storage.
 Raw response bodies and sensitive cryptographic material are never persisted in
 diagnostics or emitted through ordinary logging.
@@ -227,9 +233,14 @@ Recovering -> Confirmed      candidate success or exact tree layout
 `Recovering` does not transition to `Tracking` or `Rejected`. In particular, a
 later hash, rejection, committed-failure candidate, cancellation, or empty scan
 cannot erase the original ambiguity. A pending or unreadable candidate is never
-overwritten and blocks another POST. A definitively committed-failure candidate
-is atomically cleared before a later same-generation retry may be reserved; the
-row remains `Recovering` and tree recovery remains available.
+overwritten and normally blocks another POST. It may be atomically retired only
+as part of the retry reservation directly authorized by candidate-first
+reconciliation completing a valid full-tree pass with no complete match. A
+definitively committed-failure candidate is atomically cleared without
+requiring that pass, but another valid no-match pass is still required before
+retry reservation. Either operation clears only the polling handle: the row
+remains `Recovering`, the original ambiguity remains durable, and tree recovery
+remains available.
 
 Terminal rows are immutable except for idempotent replay of identical
 confirmation data and explicit round or account deletion. `LegacyConfirmed` is
@@ -255,6 +266,12 @@ Before releasing any POST byte, the lifecycle:
 6. increments the attempt count for the request; and
 7. commits the reservation.
 
+For a recovery retry, steps 5 through 7 additionally consume the private
+single-use authorization produced by the immediately preceding valid no-match
+pass. They clear any inconclusive candidate and increment the attempt count in
+the same immediate transaction. There is no standalone candidate-retirement
+mutation and an empty candidate slot is not retry authorization.
+
 Guard lookup, optional binding of a digestless `Recovering` guard, and native
 row insertion share the same identity lock and immediate transaction, so a
 concurrent call cannot bypass the guard.
@@ -269,7 +286,11 @@ Cancellation before that boundary is also definitely unsent.
 
 For a first attempt, definitely-unsent failure removes the fresh `Submitting`
 reservation; it does not create chain rejection or ambiguity. For a retry from
-`Recovering`, it leaves the row `Recovering`.
+`Recovering`, it leaves the row hashless and `Recovering`, retains the
+reservation in the monotonic attempt count, and does not restore either the
+retired candidate or the consumed no-match authorization. Another retry
+requires another valid no-match pass. Attempt count is diagnostic and is never
+decremented, refunded, or used as a permanent retry gate.
 
 Everything after the dispatch boundary is `PossiblyDispatched`, including:
 
@@ -298,9 +319,11 @@ scan. It never overwrites a pending or unreadable candidate. Because the
 protocol does not specify that an error hash identifies an earlier accepted
 transaction, the hash is only a recovery handle.
 
-POST attempts, endpoints, body sizes, request durations, and backoffs are
-bounded by configuration with safe finite maxima. Redirects are not followed.
-Retries are allowed only for the same semantic generation.
+Within each lifecycle invocation, POST attempts, endpoints, body sizes, request
+durations, and backoffs are bounded by configuration with safe finite maxima.
+Redirects are not followed. A later invocation may reconcile and retry after
+another valid no-match pass regardless of the monotonic historical attempt
+count. Retries are allowed only for the same semantic generation.
 
 ## Reconciliation and retry
 
@@ -321,21 +344,39 @@ Reconciliation is state-driven:
 - `Confirmed`, `LegacyConfirmed`, and `Rejected` perform no network mutation.
 
 A pending or temporarily unreadable candidate remains available for later
-polling. In `Recovering`, it does not permanently disable tree recovery, but it
-does prohibit another POST. A committed-success candidate proceeds to
+polling. In `Recovering`, it does not disable tree recovery and prohibits
+another POST until it is either committed unsuccessfully or retired after a
+completed valid no-match tree pass. A committed-success candidate proceeds to
 confirmation. A `Tracking` candidate that is committed unsuccessfully becomes
 `Rejected`; a `Recovering` candidate that is committed unsuccessfully is
 atomically cleared while the row remains `Recovering`.
 
-After candidate polling and a bounded no-match tree pass, a bound `Recovering`
-row may retry POST only for the same generation and only when its candidate
-slot is empty. The retry reservation increments the row's attempt count while
-preserving `Recovering`. A later usable hash fills the empty candidate slot,
+After candidate polling and a bounded no-match tree pass, the lifecycle
+receives one private process-local authorization for the captured identity,
+generation, host operation epoch, and continuously held round, bundle, and
+identity locks. The authorization is not persisted, cloned, returned, or
+reconstructed from a hashless row. It is consumed only by one immediate
+transaction that validates the same bound `Recovering` row, atomically clears
+any remaining inconclusive candidate, and increments the attempt count to
+reserve one same-generation retry. The transaction consumes the no-match
+authorization. The authorization expires on cancellation, error, return, lock
+release, or process exit. A later usable hash fills the empty candidate slot,
 but sticky recovery remains in force. An unbound guard is never eligible.
 
 A pending or unreadable candidate is never treated as committed failure.
-Endpoint disagreement, malformed responses, and temporary lookup failure
-remain retryable diagnostics rather than terminal evidence.
+Retirement during the authorized retry reservation likewise does not classify
+the candidate as failed, absent, or definitely unsent. Endpoint disagreement,
+malformed responses, and temporary lookup failure remain retryable diagnostics
+rather than terminal evidence.
+
+Same-generation redispatch after retirement is safe even if the retired
+transaction later commits: every reconstruction is checked against the same
+generation digest and consumes the same input nullifiers, so competing
+transactions cannot both commit, and whichever transaction commits produces
+the same exact expected output layout. Sticky tree recovery can therefore
+confirm a retired transaction without retaining its hash. Retirement never
+permits a different generation, does not bypass attempt or backoff bounds, and
+does not authorize overwriting an occupied candidate slot.
 
 The tracking window begins when the row first enters `Tracking`. Its start is
 stored durably and never changes; candidate polling, diagnostics, restarts, and
@@ -361,8 +402,9 @@ its unknown successor VAN. Independent bundles remain schedulable.
 ## Sticky recovery and tree matching
 
 Tree recovery is authorized only by a bound durable `Recovering` row. It never
-runs for a digestless guard, ordinary `Tracking`, merely pending hashes, or
-fresh unsubmitted work.
+runs for a digestless guard, ordinary `Tracking` even when its hash is pending,
+or fresh unsubmitted work. A pending candidate carried by a bound `Recovering`
+row is polled first and does not prevent the subsequent tree pass.
 
 Before scanning, the lifecycle re-derives the generation digest and complete
 expected layout from locked durable recovery rows. Missing or corrupt private
@@ -375,8 +417,19 @@ Each recovery pass:
 2. selects one fixed, complete, internally consistent tree snapshot whose
    validated metadata declares its final size;
 3. scans that snapshot under per-request and whole-pass bounds;
-4. compares leaves locally without transmitting expected commitments; and
-5. accepts only one complete unique ordered layout.
+4. compares leaves locally without transmitting expected commitments;
+5. confirms only one complete unique ordered layout; and
+6. if the valid complete scan instead finds no complete layout, produces one
+   private authorization that may be consumed immediately to atomically retire
+   the inconclusive candidate, if any, and reserve a same-generation retry.
+
+A no-match authorization requires successful traversal of the entire selected
+snapshot. Timeout, cancellation, malformed or incomplete pagination,
+contradictory snapshot metadata, endpoint exhaustion, or multiple complete
+matches produce no authorization and do not retire a candidate. Partial,
+reordered, nonadjacent, or otherwise incomplete occurrences are not
+confirmation and do not prevent authorization after the otherwise valid
+complete scan.
 
 The scanner validates snapshot identity, heights, roots, ranges, absolute
 indexes, pagination progress, final size, canonical field encodings, and
@@ -407,11 +460,28 @@ every vote commitment in signed action order. Partial, reordered, overlapping,
 or independently located members do not confirm.
 
 The entire selected snapshot is checked even after a match, so a second
-complete match rejects the result. Duplicate or partial matches, malformed
-pages, delayed indexing, cancellation, endpoint exhaustion, and transport
-interruption leave the row `Recovering` with no partial position write. A
-responsive endpoint serving a supported snapshot cannot repeatedly stop at a
-local whole-pass budget: its complete traversal fits by construction.
+complete match rejects the result and retains any candidate. Partial,
+reordered, nonadjacent, or otherwise incomplete occurrences leave the row
+`Recovering` with no partial position write but permit the private authorization
+after the valid complete scan. Malformed pages, cancellation, endpoint
+exhaustion, and transport interruption do not complete a pass, produce no
+authorization, and retain the candidate. Delayed indexing may produce a valid
+no-match pass and therefore permits the combined retirement-and-reservation;
+the same-generation and nullifier rules make a later commit safe. A responsive
+endpoint serving a supported snapshot cannot repeatedly stop at a local
+whole-pass budget: its complete traversal fits by construction.
+
+Candidate retirement, its diagnostic update, and retry reservation are one
+immediate transaction. If that transaction fails, the candidate remains
+authoritative and the attempt count does not advance; for an already hashless
+row, the attempt count likewise does not advance. Redispatch remains
+prohibited. If cancellation or failure occurs after the transaction commits
+but before dispatch, the normal definitely-unsent retry rule leaves the row
+hashless and `Recovering` and retains the committed reservation count. A crash
+at that boundary has the same durable shape. In either case, because no scan
+authorization is durable, the next invocation must complete another valid
+no-match pass before reserving a retry. The row never becomes fresh unsubmitted
+work.
 
 Scanning is ephemeral. The next pass starts fresh. Tree recovery never
 synthesizes a transaction hash.
@@ -473,10 +543,13 @@ only when confirmation source is `hash`; a candidate retained by tree
 confirmation is never presented as the confirming transaction.
 `Pending(Tracking)` always carries the candidate hash needed to continue.
 For a bound row, `Pending(Recovering)` may carry a candidate hash and preserves
-that tree recovery remains authorized. For an unbound legacy guard it carries
-no candidate, uses the stable `RecoveryUnavailable` diagnostic, authorizes no
-network recovery, and must not be automatically rescheduled until derivation
-inputs change. `Rejected` means the durable row is terminally rejected.
+that tree recovery remains authorized. It may carry no candidate after an
+atomic retirement-and-reservation or committed-failure clearing, without
+implying that a retired transaction failed or that another retry is already
+authorized. For an unbound legacy guard it also carries no candidate, uses the
+stable `RecoveryUnavailable` diagnostic, authorizes no network recovery, and
+must not be automatically rescheduled until derivation inputs change.
+`Rejected` means the durable row is terminally rejected.
 
 `LegacyConfirmed` is returned publicly as `Confirmed` with source
 `legacy_projection` and no transaction hash. This source is distinct from the
@@ -708,12 +781,13 @@ Tests cover:
 - inconclusive hash polling has a bounded promotion to candidate-preserving
   `Recovering`;
 - polling, diagnostics, and restart do not reset the durable tracking window;
+- promotion alone does not retire the candidate or permit redispatch;
 - hash polling produces atomic `Confirmed`;
 - definite rejection produces `Rejected`;
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class produces `Recovering`;
 - restart from `Submitting` produces `Recovering`;
-- retry limits and endpoint failover are globally bounded; and
+- retry limits and endpoint failover are bounded per lifecycle invocation; and
 - retries cannot change semantic generation.
 
 ### Recovery
@@ -724,12 +798,47 @@ Tests cover:
 - `Recovering` polls its candidate before scanning;
 - a later candidate hash does not remove sticky recovery;
 - a pending or unreadable candidate blocks redispatch and cannot be
-  overwritten;
+  overwritten before a completed valid no-match pass;
+- a completed valid no-match pass produces one private single-use
+  authorization bound to the identity, generation, operation epoch, and
+  continuously held locks;
+- one immediate transaction consumes that authorization, atomically retires an
+  inconclusive candidate without classifying it as failed, and reserves only a
+  same-generation retry;
+- there is no standalone retirement mutation, and a hashless `Recovering` row
+  cannot itself authorize retry;
+- cancellation, error, return, lock release, and process exit invalidate an
+  unconsumed authorization;
+- timeout, cancellation, malformed or incomplete pagination, endpoint
+  exhaustion, contradictory snapshot metadata, and multiple complete matches
+  produce no authorization and do not retire the candidate;
+- partial, reordered, nonadjacent, and otherwise incomplete occurrences do not
+  confirm but permit authorization after the valid complete scan;
+- failed retirement-and-reservation persistence leaves the candidate
+  authoritative, does not increment the attempt count, and blocks redispatch;
+- cancellation or definitely-unsent failure after the combined transaction
+  leaves the monotonic reservation count unchanged, leaves hashless sticky
+  recovery, and requires a new completed valid no-match pass before retry;
+- attempt count never decreases, is diagnostic rather than a permanent retry
+  gate, and cannot underflow or be reopened by callback ordering;
+- each lifecycle invocation enforces independent finite attempt and backoff
+  limits even though later invocations may reconcile and retry;
+- restart after the combined transaction conservatively requires a new
+  completed valid no-match pass before retry;
+- an originally hashless bound `Recovering` row likewise cannot POST before a
+  completed valid no-match pass, so retry permission never depends on
+  non-durable scan history;
+- a retired transaction that later commits is confirmed by its exact tree
+  layout, while nullifier conflict prevents both it and its same-generation
+  retry from committing;
 - a committed-failure recovery candidate is cleared before a later
   same-generation POST may be reserved;
 - committed failure of a recovery candidate still permits tree recovery;
 - no match, delayed indexing, malformed pages, cancellation, and exhausted
   bounds remain `Recovering`;
+- candidate-less `Pending(Recovering)` after retirement-and-reservation or
+  committed-failure clearing neither claims failure nor authorizes retry and
+  remains distinct from an unbound guard's `RecoveryUnavailable`;
 - delegation, singleton, and batch exact layouts recover positions;
 - partial, reordered, nonadjacent, and duplicate layouts do not confirm;
 - scans use one validated fixed complete snapshot;
