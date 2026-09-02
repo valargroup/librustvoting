@@ -2169,8 +2169,8 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND commitment_bundle_json IS NOT NULL",
         )
-        .map_err(|e| VotingError::Internal {
-            message: format!("prepare vote batch recovery query failed: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("prepare vote batch recovery query failed: {error}"),
         })?;
     let rows = stmt
         .query_map(
@@ -2181,13 +2181,13 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
             },
             |row| row.get::<_, String>(0),
         )
-        .map_err(|e| VotingError::Internal {
-            message: format!("query vote batch recovery rows failed: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("query vote batch recovery rows failed: {error}"),
         })?;
     let mut recoveries = Vec::new();
     for row in rows {
-        let recovery = parse_recovery(&row.map_err(|e| VotingError::Internal {
-            message: format!("read vote batch recovery row failed: {e}"),
+        let recovery = parse_recovery(&row.map_err(|error| VotingError::Storage {
+            message: format!("read vote batch recovery row failed: {error}"),
         })?)?;
         if recovery
             .batch
@@ -2712,8 +2712,8 @@ fn recovery_json_with_conn(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to load vote recovery bundle: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("failed to load vote recovery bundle: {error}"),
         })?;
     Ok(json.flatten())
 }

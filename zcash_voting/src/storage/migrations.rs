@@ -911,6 +911,7 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
                     checked_van,
                     checked_vc.into_iter().collect(),
                 )?,
+                Err(error @ VotingError::Storage { .. }) => return Err(error),
                 Err(_) => V17Import::generation_derivation_failed_guard(),
             }
         } else if !batch_indicated && checked_van.is_some() && checked_vc.is_some() {
@@ -948,6 +949,7 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         };
         let bound = match generation_for_vote_batch(tx, &identity) {
             Ok(bound) => bound,
+            Err(error @ VotingError::Storage { .. }) => return Err(error),
             Err(_) => {
                 insert_v17_submission(
                     tx,
@@ -1111,6 +1113,7 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
             // bind. The evidence is preserved as a permanently unbound guard
             // rather than guessing which generation produced the projection.
             Ok(None) => V17Import::recovery_unavailable_guard(),
+            Err(error @ VotingError::Storage { .. }) => return Err(error),
             Err(_) => V17Import::generation_derivation_failed_guard(),
         };
         register_v17_legacy_import_van(&mut observed_output_positions, &network, &import)?;

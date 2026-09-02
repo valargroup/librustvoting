@@ -385,7 +385,7 @@ fn load_delegation_inputs(
             },
         )
         .optional()
-        .map_err(|error| VotingError::Internal {
+        .map_err(|error| VotingError::Storage {
             message: format!("failed to load delegation generation inputs: {error}"),
         })?;
 
