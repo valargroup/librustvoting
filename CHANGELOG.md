@@ -24,6 +24,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   reconciliation error instead of replacing setup that lacks an exact PCZT.
   New Keystone signature writes must match the current bundle setup and verify
   before the atomic batch commits.
+- Schema version 19 reconciles released local delegation state. It demotes
+  proofs that cannot be bound to an exact PCZT, removes stale or invalid local
+  Keystone signatures, and preserves proof-bearing, validly signed, submitted,
+  confirmed, and imported state that may still be needed for recovery.
 
 ## v3.1.0-rc.16
 
