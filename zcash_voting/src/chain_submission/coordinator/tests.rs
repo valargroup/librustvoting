@@ -480,7 +480,7 @@ async fn reordered_batch_confirmation_leaves_tracking_authoritative() {
     assert!(store.projection(&identity).is_none());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn partial_nonadjacent_batch_tree_members_authorize_retry_without_confirmation() {
     let identity = batch_identity(0);
     let proposals = vec![1, 2, 5];
@@ -493,19 +493,31 @@ async fn partial_nonadjacent_batch_tree_members_authorize_retry_without_confirma
     }
     transport.queue(Ok(accepted()));
 
-    let result = coordinator(
+    let protocol = ChainProtocolClient::new(
         Arc::clone(&transport),
+        Network::Testnet,
+        &[
+            "https://one.example".to_string(),
+            "https://two.example".to_string(),
+        ],
+    )
+    .unwrap();
+    let coordinator = ChainSubmissionCoordinator::new(
+        protocol,
         Arc::clone(&store),
         ManualClock::new(100),
-        10,
+        CoordinatorPolicy::new(Duration::from_secs(10), 2, vec![Duration::from_secs(1)]).unwrap(),
     )
-    .advance_with_recovery(
-        StoreAdvancementRequest::vote_batch(identity.clone(), proposals).unwrap(),
-        ChainRecoveryMode::ExactTree,
-        &ManualControl::default(),
-    )
-    .await
     .unwrap();
+
+    let result = coordinator
+        .advance_with_recovery(
+            StoreAdvancementRequest::vote_batch(identity.clone(), proposals).unwrap(),
+            ChainRecoveryMode::ExactTree,
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
 
     assert!(matches!(
         result,
