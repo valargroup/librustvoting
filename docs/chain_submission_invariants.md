@@ -226,9 +226,10 @@ Recovering -> Confirmed      candidate success or exact tree layout
 
 `Recovering` does not transition to `Tracking` or `Rejected`. In particular, a
 later hash, rejection, committed-failure candidate, cancellation, or empty scan
-cannot erase the original ambiguity. A failed candidate is cleared or replaced
-only under the same-generation recovery rules; the row remains `Recovering`
-and tree recovery remains available.
+cannot erase the original ambiguity. A pending or unreadable candidate is never
+overwritten and blocks another POST. A definitively committed-failure candidate
+is atomically cleared before a later same-generation retry may be reserved; the
+row remains `Recovering` and tree recovery remains available.
 
 Terminal rows are immutable except for idempotent replay of identical
 confirmation data and explicit round or account deletion. `LegacyConfirmed` is
@@ -292,9 +293,10 @@ remains `Recovering`.
 A definite chain rejection transitions `Submitting` to `Rejected`. A rejection
 while already `Recovering` cannot settle the earlier possible dispatch. Its
 code and log are diagnostic; if it also contains a canonical hash, that hash
-may replace an absent or already-failed recovery candidate and is polled before
-the next tree scan. Because the protocol does not specify that an error hash
-identifies an earlier accepted transaction, the hash is only a recovery handle.
+may fill an absent recovery-candidate slot and is polled before the next tree
+scan. It never overwrites a pending or unreadable candidate. Because the
+protocol does not specify that an error hash identifies an earlier accepted
+transaction, the hash is only a recovery handle.
 
 POST attempts, endpoints, body sizes, request durations, and backoffs are
 bounded by configuration with safe finite maxima. Redirects are not followed.
@@ -319,16 +321,17 @@ Reconciliation is state-driven:
 - `Confirmed`, `LegacyConfirmed`, and `Rejected` perform no network mutation.
 
 A pending or temporarily unreadable candidate remains available for later
-polling. In `Recovering`, it does not permanently disable tree recovery. A
-committed-success candidate proceeds to confirmation. A `Tracking` candidate
-that is committed unsuccessfully becomes `Rejected`; a `Recovering` candidate
-that is committed unsuccessfully leaves the row `Recovering`.
+polling. In `Recovering`, it does not permanently disable tree recovery, but it
+does prohibit another POST. A committed-success candidate proceeds to
+confirmation. A `Tracking` candidate that is committed unsuccessfully becomes
+`Rejected`; a `Recovering` candidate that is committed unsuccessfully is
+atomically cleared while the row remains `Recovering`.
 
 After candidate polling and a bounded no-match tree pass, a bound `Recovering`
-row may retry POST only for the same generation. The retry reservation
-increments the row's attempt count while preserving `Recovering`. A later
-usable hash is stored as the candidate, but sticky recovery remains in force.
-An unbound guard is never eligible.
+row may retry POST only for the same generation and only when its candidate
+slot is empty. The retry reservation increments the row's attempt count while
+preserving `Recovering`. A later usable hash fills the empty candidate slot,
+but sticky recovery remains in force. An unbound guard is never eligible.
 
 A pending or unreadable candidate is never treated as committed failure.
 Endpoint disagreement, malformed responses, and temporary lookup failure
@@ -369,16 +372,27 @@ diagnostic, and does not turn uncertainty into rejection.
 Each recovery pass:
 
 1. polls the current candidate hash, if any;
-2. selects one fixed, complete, internally consistent tree snapshot;
+2. selects one fixed, complete, internally consistent tree snapshot whose
+   validated metadata declares its final size;
 3. scans that snapshot under per-request and whole-pass bounds;
 4. compares leaves locally without transmitting expected commitments; and
 5. accepts only one complete unique ordered layout.
 
 The scanner validates snapshot identity, heights, roots, ranges, absolute
 indexes, pagination progress, final size, canonical field encodings, and
-response bounds. It has finite limits for request count, bytes, leaves, elapsed
-time, and memory. Cancellation is checked between requests and before the
-confirmation commit point.
+response bounds. It has finite protocol ceilings for request count, bytes,
+leaves, elapsed time, and memory. Those ceilings cover the maximum valid
+snapshot size for every supported network. Configuration may lower per-request
+limits only when the resulting page count still permits a complete traversal;
+an invalid combination is rejected before chain submission or recovery is
+enabled. Before reading leaves, validated snapshot metadata and page limits
+must show that a complete traversal fits the ceilings. There is no independent
+whole-pass budget that can repeatedly truncate a supported snapshot. The
+whole-pass elapsed ceiling is derived from the maximum request count and
+per-request timeout; it is not a shorter restart budget. Metadata beyond a
+protocol ceiling is an unsupported response and no leaf scan starts.
+Cancellation is checked between requests and before the confirmation commit
+point.
 
 Finding one member is insufficient. Singleton outputs must be adjacent and in
 order. A batch must contain the final successor VAN followed immediately by
@@ -387,8 +401,10 @@ or independently located members do not confirm.
 
 The entire selected snapshot is checked even after a match, so a second
 complete match rejects the result. Duplicate or partial matches, malformed
-pages, delayed indexing, cancellation, endpoint exhaustion, and any bound being
-reached leave the row `Recovering` with no partial position write.
+pages, delayed indexing, cancellation, endpoint exhaustion, and transport
+interruption leave the row `Recovering` with no partial position write. A
+responsive endpoint serving a supported snapshot cannot repeatedly stop at a
+local whole-pass budget: its complete traversal fits by construction.
 
 Scanning is ephemeral. The next pass starts fresh. Tree recovery never
 synthesizes a transaction hash.
@@ -607,7 +623,11 @@ vote row with none of those creates no submission row or guard.
 Migration safety note: in version 17, a missing hash is not evidence that no
 POST was dispatched. Likewise, a canonical historical hash is not imported as
 a candidate when the generation needed to validate its result cannot be
-derived.
+derived. An advanced current bundle VAN is never attributed to the original
+delegation output. A reconstructable delegation with that shape follows the
+`Tracking` or `Recovering` rules above; a shape that cannot be represented
+without guessing aborts migration atomically and preserves the version-17
+database.
 
 Migration validates complete unique ownership of canonical hashes imported
 into authoritative candidate or confirmation fields across wallet,
@@ -692,13 +712,18 @@ Tests cover:
 - `Tracking` never invokes the tree client;
 - `Recovering` polls its candidate before scanning;
 - a later candidate hash does not remove sticky recovery;
+- a pending or unreadable candidate blocks redispatch and cannot be
+  overwritten;
+- a committed-failure recovery candidate is cleared before a later
+  same-generation POST may be reserved;
 - committed failure of a recovery candidate still permits tree recovery;
 - no match, delayed indexing, malformed pages, cancellation, and exhausted
   bounds remain `Recovering`;
 - delegation, singleton, and batch exact layouts recover positions;
 - partial, reordered, nonadjacent, and duplicate layouts do not confirm;
 - scans use one validated fixed complete snapshot;
-- scans are bounded in requests, bytes, leaves, elapsed time, and memory;
+- supported snapshots fit complete-pass request, byte, leaf, elapsed-time, and
+  memory ceilings by construction, without a smaller restart budget;
 - interrupted scans restart without durable cursors or partial evidence; and
 - tree confirmation never invents a hash.
 
@@ -756,6 +781,8 @@ Tests cover:
   collisions under the exact ownership rules, each batch indicator,
   present-but-null batch fields as non-indicators, singleton/batch ambiguity,
   and unreconstructable delegation;
+- an advanced v17 bundle VAN is never imported as the original delegation
+  output position;
 - rollback/retry and reopen are deterministic and create no duplicate guards;
 - planning, cancellation, cleanup, deletion, and public results perform no
   derivation, network work, helper-plan creation, invented hash, or validated
@@ -768,6 +795,8 @@ Tests cover:
 - fresh and migrated v18 schema equivalence and stale-v18 fingerprint
   rejection;
 - cleanup preserves every unresolved generation and its retry/recovery data;
+- `recovery::clear` preserves each protected generation's helper plan and
+  complete pending, attempting, and ambiguous delivery history;
 - partial pruning refuses protected ranges without renumbering bundles;
 - deletion gates block new work and wait for active work;
 - planners and recovery snapshots derive from the authoritative row; and

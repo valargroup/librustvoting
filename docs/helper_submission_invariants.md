@@ -1307,10 +1307,16 @@ Regression tests: `migrate_from_launch_version_preserves_delegation_state`,
 
 ### Recovery cleanup
 
-Explicit recovery cleanup removes share-delivery rows and retryable,
-unconfirmed vote recovery artifacts. It preserves ballot intent, confirmed
-vote positions, and imported delegation capabilities. Full round deletion is
-a separate operation.
+Explicit recovery cleanup removes only share-delivery rows and retryable,
+unconfirmed vote recovery artifacts that are not protected by an authoritative
+chain-submission row. For `Submitting`, `Tracking`, `Recovering`, `Confirmed`,
+and `LegacyConfirmed`, it preserves the complete helper plan and every
+accepted, attempting, ambiguous, scheduled, or otherwise pending delivery row
+bound to that generation. Preserving only the plan is insufficient because
+forgetting a possibly dispatched helper POST would make later delivery treat it
+as fresh work. Cleanup also preserves ballot intent, confirmed vote positions,
+and imported delegation capabilities. Explicit round or account deletion is
+the separate destructive operation.
 
 Enforcement:
 [`recovery::clear`](../zcash_voting/src/recovery.rs) and
@@ -1321,7 +1327,10 @@ Regression tests:
 `clear_preserves_recorded_positions_and_resets_unconfirmed_votes` and
 `test_clear_recovery_state_resets_vote_recovery`, plus
 `initial_delivery_does_not_recreate_share_after_recovery_cleanup` for cleanup
-racing active helper delivery.
+racing active helper delivery. Those removal cases apply only to unprotected
+state. Coverage must also show that cleanup preserves a protected generation's
+plan and complete delivery history, including attempting and ambiguous POST
+records, until delivery completes or explicit round or account deletion occurs.
 
 ## Helper identity and payload invariants
 
