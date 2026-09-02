@@ -10,6 +10,10 @@
 
 #[allow(dead_code, reason = "internal confirmation projection")]
 mod confirmation;
+#[allow(dead_code, reason = "inactive lifecycle coordination foundation")]
+mod coordination;
+#[allow(dead_code, reason = "inactive lifecycle coordinator")]
+mod coordinator;
 #[allow(dead_code, reason = "internal generation derivation and migration")]
 mod generation;
 mod identity;
@@ -18,6 +22,8 @@ mod protocol;
 mod result;
 #[allow(dead_code, reason = "internal lifecycle transition validation")]
 mod state;
+#[allow(dead_code, reason = "private persistence contract for the lifecycle")]
+mod store;
 mod transport;
 
 pub use identity::{
@@ -33,6 +39,6 @@ pub use result::{
     ChainSubmissionStateEvidence, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
 pub use transport::{
-    ChainHttpRequest, ChainHttpResponse, ChainTransport, ChainTransportError,
+    ChainHttpRequest, ChainHttpResponse, ChainPostDispatch, ChainTransport, ChainTransportError,
     ChainTransportFailureKind, ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES,
 };

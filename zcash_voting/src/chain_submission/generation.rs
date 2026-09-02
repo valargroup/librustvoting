@@ -73,6 +73,22 @@ pub(super) struct DerivedChainSubmission {
 }
 
 impl DerivedChainSubmission {
+    /// Assembles synthetic generation artifacts for lifecycle tests.
+    #[cfg(test)]
+    pub(super) fn new(
+        generation: ChainSubmissionGeneration,
+        request: ChainSubmissionRequest,
+        expected_layout: ExpectedTreeLayout,
+        ordered_proposal_ids: Vec<u32>,
+    ) -> Self {
+        Self {
+            generation,
+            request,
+            expected_layout,
+            ordered_proposal_ids,
+        }
+    }
+
     /// Returns the identity-bound semantic generation.
     pub(super) fn generation(&self) -> &ChainSubmissionGeneration {
         &self.generation
@@ -897,7 +913,7 @@ mod tests {
         let sk: SpendingKey = *usk.orchard();
         let randomized = SpendAuthorizingKey::from(&sk).randomize(alpha);
         let rk: [u8; 32] = (&VerificationKey::<SpendAuth>::from(&randomized)).into();
-        let signature = randomized.sign(&mut voting_crypto_deps::rand::rngs::OsRng, sighash);
+        let signature = randomized.sign(voting_crypto_deps::rand::rngs::OsRng, sighash);
         (rk, (&signature).into())
     }
 
@@ -1170,7 +1186,7 @@ mod tests {
         let mut confirmed = original.clone();
         confirmed.vc_tree_position = i64::MAX as u64;
         assert_eq!(
-            vote_generation(&identity, &[original.clone()])
+            vote_generation(&identity, std::slice::from_ref(&original))
                 .digest()
                 .as_bytes(),
             vote_generation(&identity, &[confirmed]).digest().as_bytes()
