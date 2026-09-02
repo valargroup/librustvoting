@@ -388,9 +388,13 @@ means the durable row is terminally rejected.
 
 `Cancelled` is returned only when cancellation occurs before possible dispatch
 and no stronger durable state exists. Cancellation never hides `Tracking`,
-`Recovering`, or `Confirmed`. A call cancelled on entry may perform the minimum
-read-only state load needed to report the authoritative durable result, but it
-starts no POST, lookup, scan, retry, or confirmation write.
+`Recovering`, or `Confirmed`. A call cancelled on entry loads the authoritative
+durable state under the normal lifecycle locks. If it finds an abandoned
+`Submitting` row, it must atomically normalize that row to `Recovering` and
+return `Pending(Recovering)`; the possibly dispatched request is stronger
+evidence than the current call's cancellation. This conservative normalization
+is the only write permitted on a cancelled-entry path. The path starts no POST,
+lookup, scan, retry, or confirmation write.
 
 There are no public outcomes for accepted-but-unjournaled hashes, evidence
 precedence, hash provenance, tree receipts, or unapplied confirmation. The
@@ -420,10 +424,13 @@ and VAN randomizer are likewise locked. Re-selecting the same generation is
 idempotent; changing it is rejected.
 
 Cancellation is checked before reservation, dispatch, retries, lookups, scan
-requests, and the confirmation commit point. It has only three safety effects:
+requests, and the confirmation commit point. It has the following safety
+effects:
 
-- before dispatch, no request is released and a fresh reservation may be
-  removed;
+- on entry, an abandoned `Submitting` row is durably normalized to
+  `Recovering` before cancellation is reported;
+- before dispatch by the current call, no request is released and a fresh
+  reservation may be removed;
 - after possible dispatch, the row is or becomes `Recovering`; and
 - after the confirmation commit point, cancellation cannot suppress the atomic
   write.
@@ -492,6 +499,9 @@ Version-17 state imports as follows:
   with no candidate hash. Version 17 cannot distinguish definitely unsent work
   from a crash after POST dispatch but before hash persistence, so this state
   must not be imported as fresh.
+
+Migration safety note: in version 17, a missing hash is not evidence that no
+POST was dispatched.
 
 Migration validates complete unique ownership of canonical hashes across
 wallet, chain/network, round, kind, bundle, and proposal or batch. The only
@@ -584,7 +594,10 @@ Tests cover:
 - injected failure at every atomic write point rolls back all updates;
 - identical confirmation replay is idempotent and conflicting replay writes
   nothing;
-- cancellation before dispatch returns `Cancelled` without releasing bytes;
+- entry cancellation with no stronger durable state returns `Cancelled`
+  without releasing bytes;
+- entry cancellation with an abandoned `Submitting` row atomically normalizes
+  it to `Recovering` and returns `Pending(Recovering)` without network work;
 - cancellation after dispatch preserves `Recovering`; and
 - cancellation after the confirmation commit point cannot suppress
   persistence.
