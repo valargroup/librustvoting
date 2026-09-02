@@ -177,6 +177,7 @@ Submitting -> Tracking       usable success hash
 Submitting -> Recovering     possible dispatch without usable hash
 Submitting -> Rejected       definite chain rejection
 Tracking -> Tracking         hash still pending
+Tracking -> Recovering       bounded tracking window expires inconclusively
 Tracking -> Confirmed        committed success and atomic persistence
 Tracking -> Rejected         committed failure
 Recovering -> Recovering     candidate, retry, no match, or interruption
@@ -257,7 +258,9 @@ compose lower-level mutation APIs.
 Reconciliation is state-driven:
 
 - `Submitting` left by a crashed process becomes `Recovering`.
-- `Tracking` polls its candidate hash and never scans the tree.
+- `Tracking` polls its candidate hash and never scans the tree. If a configured
+  finite tracking window expires without a definitive result, it atomically
+  becomes `Recovering` while retaining the candidate hash.
 - `Recovering` polls its candidate hash first. If hash polling does not confirm,
   the lifecycle may perform one bounded tree recovery pass.
 - `Confirmed` and `Rejected` perform no network mutation.
@@ -532,6 +535,8 @@ Tests cover:
 - reservation commits before any POST byte is released;
 - reservation failure dispatches nothing;
 - usable success hash produces `Tracking`;
+- inconclusive hash polling has a bounded promotion to candidate-preserving
+  `Recovering`;
 - hash polling produces atomic `Confirmed`;
 - definite rejection produces `Rejected`;
 - definite pre-dispatch failure does not create ambiguity;
