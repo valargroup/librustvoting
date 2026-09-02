@@ -441,7 +441,14 @@ or apply that generation, including:
 - vote and batch recovery material;
 - locked proposal choices, batch membership, and order;
 - current and generation-specific VAN/VC positions; and
-- helper plans bound to the generation.
+- helper plans and durable helper-delivery rows bound to the generation.
+
+In particular, `recovery::clear` does not remove a protected generation's
+helper plan or its accepted, attempting, ambiguous, scheduled, or otherwise
+pending delivery records. Preserving only the plan is insufficient: forgetting
+a possibly dispatched helper POST could make later delivery treat it as fresh
+work. Helper state remains resumable until it completes or explicit round or
+account deletion removes it.
 
 An unresolved row cannot be pruned merely because it has no candidate hash.
 Hashless `Recovering` is exactly the case that requires preservation. Bundle
