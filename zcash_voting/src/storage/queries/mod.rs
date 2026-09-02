@@ -956,7 +956,8 @@ pub fn require_bundle_notes(
 /// Persist all delegation action data and finalized TX1 effects in a single
 /// UPDATE on the bundles table. The effects are required by
 /// [`load_delegation_submission_data`].
-pub fn store_delegation_data(
+#[cfg(test)]
+pub(crate) fn store_delegation_data(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -3249,7 +3250,8 @@ pub(crate) fn get_commitment_bundle_recovery(
 
 // --- Keystone signatures ---
 
-pub fn store_keystone_signature(
+#[cfg(test)]
+pub(crate) fn store_keystone_signature(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
