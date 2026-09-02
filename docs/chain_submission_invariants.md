@@ -423,9 +423,9 @@ Before releasing any POST byte, the lifecycle:
 2. loads the authoritative row plus every batch member's singleton row when
    applicable;
 3. returns any unbound row as authoritative -- a `legacy_projection`
-   confirmation as `Confirmed`, a digestless guard as pending with
-   `RecoveryUnavailable` -- or rejects an overlapping batch without dispatch,
-   all before requiring recovery material;
+   confirmation as `Confirmed`, a digestless guard as pending with its
+   persisted migration diagnostic -- or rejects an overlapping batch without
+   dispatch, all before requiring recovery material;
 4. loads and locks the generation inputs and derives the generation digest and
    expected layout;
 5. creates the `Submitting` row, or validates the existing same-generation
@@ -515,7 +515,7 @@ Reconciliation is state-driven:
 - a bound `Recovering` row polls its candidate hash first. If hash polling does
   not confirm, the lifecycle may perform one bounded tree recovery pass.
 - a digestless, unbound `Recovering` guard performs no network work and returns
-  pending with `RecoveryUnavailable`.
+  pending with its persisted migration diagnostic.
 - `Confirmed` and `Rejected` perform no network mutation, whatever the
   confirmation source.
 
@@ -563,8 +563,8 @@ Restart plans are derived from the authoritative row:
 - `Tracking` schedules hash polling;
 - bound `Recovering` schedules candidate-first reconciliation and tree
   recovery, then same-generation retry when permitted;
-- unbound `Recovering` schedules no network work and reports
-  `RecoveryUnavailable`;
+- unbound `Recovering` schedules no network work and reports its persisted
+  migration diagnostic;
 - `Confirmed` enables dependent domain and helper work;
 - a `legacy_projection` confirmation satisfies the chain-confirmation
   dependency and blocks resubmission, but missing helper inputs are not
@@ -732,9 +732,10 @@ For a bound row, `Pending(Recovering)` may carry a candidate hash and preserves
 that tree recovery remains authorized. It may carry no candidate after an
 atomic retirement-and-reservation or committed-failure clearing, without
 implying that a retired transaction failed or that another retry is already
-authorized. For a digestless guard it also carries no candidate, uses the
-stable `RecoveryUnavailable` diagnostic, authorizes no network recovery, and
-is never automatically rescheduled.
+authorized. For a digestless guard it also carries no candidate, preserves the
+stable migration diagnostic distinguishing unavailable recovery from failed
+generation derivation, authorizes no network recovery, and is never
+automatically rescheduled.
 `Rejected` means the durable row is terminally rejected.
 
 A `legacy_projection` confirmation is returned publicly as `Confirmed` with
@@ -751,6 +752,10 @@ on entry loads the authoritative durable state under the normal lifecycle
 locks. If it finds an abandoned `Submitting` row, it must atomically normalize
 that row to `Recovering` and return `Pending(Recovering)`; the possibly
 dispatched request is stronger evidence than the current call's cancellation.
+For a batch, an existing authoritative batch row is loaded and returned before
+consulting the caller's possibly stale member roster or any unrelated singleton
+guard. Only when no batch row exists may cancelled admission inspect the
+requested member identities to preserve an overlapping unbound guard.
 This conservative normalization is the only write permitted on a
 cancelled-entry path. If it cannot be persisted, the call returns an
 operational storage failure that preserves the known possibly-dispatched
@@ -1117,7 +1122,7 @@ Tests cover:
   bounds remain `Recovering`;
 - candidate-less `Pending(Recovering)` after retirement-and-reservation or
   committed-failure clearing neither claims failure nor authorizes retry and
-  remains distinct from an unbound guard's `RecoveryUnavailable`;
+  remains distinct from an unbound guard's persisted migration diagnostic;
 - delegation, singleton, and batch exact layouts recover positions;
 - partial, reordered, nonadjacent, and duplicate layouts do not confirm;
 - scans use one validated fixed complete snapshot;
@@ -1147,6 +1152,8 @@ Tests cover:
   without releasing bytes;
 - entry cancellation with an abandoned `Submitting` row atomically normalizes
   it to `Recovering` and returns `Pending(Recovering)` without network work;
+- cancelled batch entry returns an existing authoritative batch before checking
+  a stale caller roster or unrelated requested-member guard;
 - active admission also normalizes an abandoned batch `Submitting` row before
   attempting roster derivation, so missing or corrupt recovery bytes cannot
   strand it in `Submitting`;
@@ -1211,9 +1218,9 @@ Tests cover:
   including its null digest, null candidate, and zero attempts; inserts no
   bound row; and performs no network call;
 - an empty v17 vote row creates no submission row or guard;
-- unbound `Pending(Recovering)` reports `RecoveryUnavailable`, authorizes and
-  schedules no network work across restart, and atomically excludes a competing
-  bound row or attempted replacement;
+- unbound `Pending(Recovering)` preserves its persisted migration diagnostic,
+  authorizes and schedules no network work across restart, and atomically
+  excludes a competing bound row or attempted replacement;
 - singleton planning and batch planning both check every applicable member
   identity, and a batch containing an unbound `(bundle, proposal)` member
   dispatches nothing and cannot insert an overlapping batch row;
@@ -1322,6 +1329,7 @@ Phase 4 private-coordinator coverage is anchored by
 `cancelled_entry_normalizes_abandoned_submitting_without_network_work`,
 `cancelled_batch_entry_requires_no_recovery_or_roster_derivation`,
 `cancelled_batch_entry_preserves_requested_member_guard_without_roster_read`,
+`cancelled_batch_entry_returns_authoritative_batch_before_stale_member_guard`,
 `cancellation_after_reservation_before_dispatch_removes_fresh_reservation`,
 `failed_cancelled_entry_normalization_reports_possible_dispatch`,
 `failed_active_entry_normalization_reports_possible_dispatch`,

@@ -742,6 +742,54 @@ fn v17_corrupt_delegation_setup_becomes_a_derivation_failure_guard() {
     );
 }
 
+/// Missing or wrongly typed values in an otherwise present setup row are
+/// malformed recovery inputs, not failures to read the database.
+#[test]
+fn v17_malformed_delegation_row_becomes_a_derivation_failure_guard() {
+    for (case, mutation) in [
+        (
+            "null setup column",
+            "UPDATE bundles SET van_comm_rand=NULL
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+        ),
+        (
+            "wrong proof type",
+            "UPDATE proofs SET proof='not-a-blob'
+              WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+        ),
+    ] {
+        let mut conn = v17_delegation_with_complete_setup();
+        conn.execute(mutation, [ROUND]).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION, "{case}");
+        let guard: (String, bool, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, generation_digest IS NOT NULL, diagnostic_kind, diagnostic
+                   FROM chain_submissions WHERE kind='delegation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(guard.0, "recovering", "{case}");
+        assert!(!guard.1, "{case}");
+        assert_eq!(
+            guard.2.as_deref(),
+            Some("generation_derivation_failed"),
+            "{case}"
+        );
+        assert_eq!(
+            guard.3.as_deref(),
+            Some(GENERATION_DERIVATION_FAILED_DIAGNOSTIC),
+            "{case}"
+        );
+    }
+}
+
 /// Migration and the runtime store agree on the identity key.
 ///
 /// They must, or a migrated row and a natively reserved row for the same

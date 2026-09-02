@@ -252,13 +252,19 @@ impl StoredChainSubmission {
 
     #[cfg(test)]
     pub(super) fn digestless_guard(identity: ChainSubmissionIdentity, now: u64) -> Self {
+        let diagnostic = ChainSubmissionDiagnostic::from_redacted_message(
+            super::ChainSubmissionDiagnosticKind::RecoveryUnavailable,
+            "version-17 chain evidence lacks generation recovery material",
+        );
         Self {
             identity,
             generation_digest: None,
-            state: SubmissionRecordState::DigestlessRecoveryGuard(DigestlessRecoveryGuard::new()),
+            state: SubmissionRecordState::DigestlessRecoveryGuard(
+                DigestlessRecoveryGuard::from_diagnostic(diagnostic.clone()),
+            ),
             committed_post_reservations: 0,
             tracking_started_at: None,
-            diagnostic: None,
+            diagnostic: Some(diagnostic),
             created_at: now,
             updated_at: now,
         }
@@ -781,25 +787,9 @@ pub(super) mod memory {
                     }
                 }
                 let existing = state.records.get(request.identity()).cloned();
-                if request.is_batch() && !work_allowed {
-                    for member_identity in &request.member_identities {
-                        let Some(guard) = state.records.get(member_identity) else {
-                            continue;
-                        };
-                        if guard.generation_digest().is_none() {
-                            return Err(ChainSubmissionFailure::with_durable_state(
-                                ChainSubmissionFailureKind::InvalidInput,
-                                guard.durable_state(),
-                                "atomic vote batch overlaps a migration-only singleton guard",
-                            ));
-                        }
-                    }
-                }
                 if !work_allowed {
-                    return match existing {
-                        Some(mut record)
-                            if matches!(record.state, SubmissionRecordState::Submitting) =>
-                        {
+                    if let Some(mut record) = existing {
+                        if matches!(record.state, SubmissionRecordState::Submitting) {
                             record.state = apply_submission_observation(
                                 Some(record.state),
                                 SubmissionObservation::AbandonedSubmitting(abandoned_diagnostic()),
@@ -819,11 +809,24 @@ pub(super) mod memory {
                             state
                                 .records
                                 .insert(request.identity().clone(), record.clone());
-                            Ok(StoreAdmission::Authoritative(record))
                         }
-                        Some(record) => Ok(StoreAdmission::Authoritative(record)),
-                        None => Ok(StoreAdmission::NoAuthoritativeState),
-                    };
+                        return Ok(StoreAdmission::Authoritative(record));
+                    }
+                    if request.is_batch() {
+                        for member_identity in &request.member_identities {
+                            let Some(guard) = state.records.get(member_identity) else {
+                                continue;
+                            };
+                            if guard.generation_digest().is_none() {
+                                return Err(ChainSubmissionFailure::with_durable_state(
+                                    ChainSubmissionFailureKind::InvalidInput,
+                                    guard.durable_state(),
+                                    "atomic vote batch overlaps a migration-only singleton guard",
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(StoreAdmission::NoAuthoritativeState);
                 }
 
                 if request.is_batch() {

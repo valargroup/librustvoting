@@ -1,25 +1,20 @@
 use thiserror::Error;
 
 use super::result::ValidatedChainSubmissionConfirmation;
-use super::{
-    CandidateTransactionHash, ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind,
-    ChainSubmissionState,
-};
+#[cfg(test)]
+use super::ChainSubmissionDiagnosticKind;
+use super::{CandidateTransactionHash, ChainSubmissionDiagnostic, ChainSubmissionState};
 
-/// Migration-only guard data with a canonical unavailable-recovery diagnostic.
+/// Migration-only guard data preserving why generation recovery is unavailable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct DigestlessRecoveryGuard {
     diagnostic: ChainSubmissionDiagnostic,
 }
 
 impl DigestlessRecoveryGuard {
-    pub(super) fn new() -> Self {
-        Self {
-            diagnostic: ChainSubmissionDiagnostic::from_redacted_message(
-                ChainSubmissionDiagnosticKind::RecoveryUnavailable,
-                "version-17 chain evidence lacks generation recovery material",
-            ),
-        }
+    /// Retains the migration diagnostic as part of the immutable guard state.
+    pub(super) fn from_diagnostic(diagnostic: ChainSubmissionDiagnostic) -> Self {
+        Self { diagnostic }
     }
 
     pub(super) fn diagnostic(&self) -> &ChainSubmissionDiagnostic {
@@ -497,11 +492,12 @@ mod tests {
 
     #[test]
     fn digestless_guard_rejects_every_runtime_observation() {
-        let guard_data = DigestlessRecoveryGuard::new();
-        assert_eq!(
-            guard_data.diagnostic().kind(),
-            ChainSubmissionDiagnosticKind::RecoveryUnavailable
+        let diagnostic = ChainSubmissionDiagnostic::from_redacted_message(
+            ChainSubmissionDiagnosticKind::GenerationDerivationFailed,
+            "version-17 recovery inputs cannot derive a generation",
         );
+        let guard_data = DigestlessRecoveryGuard::from_diagnostic(diagnostic.clone());
+        assert_eq!(guard_data.diagnostic(), &diagnostic);
         let guard = Some(SubmissionRecordState::DigestlessRecoveryGuard(guard_data));
 
         for observation_kind in ObservationKind::ALL {
@@ -611,9 +607,13 @@ mod tests {
                     candidate_transaction_hash: Some(candidate(1)),
                     ambiguity_diagnostic: diagnostic("ambiguous"),
                 }),
-                Self::DigestlessRecoveryGuard => Some(
-                    SubmissionRecordState::DigestlessRecoveryGuard(DigestlessRecoveryGuard::new()),
-                ),
+                Self::DigestlessRecoveryGuard => {
+                    Some(SubmissionRecordState::DigestlessRecoveryGuard(
+                        DigestlessRecoveryGuard::from_diagnostic(diagnostic(
+                            "generation recovery unavailable",
+                        )),
+                    ))
+                }
                 Self::ConfirmedByHash => Some(SubmissionRecordState::Confirmed(hash_confirmation(
                     candidate(1),
                 ))),

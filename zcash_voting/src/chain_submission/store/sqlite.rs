@@ -55,6 +55,7 @@ impl SqliteChainSubmissionStore {
 mod tests {
     use super::*;
     use crate::{
+        chain_submission::{ChainSubmissionPending, ChainSubmissionResult},
         confirmation::{TxEvent, TxEventAttribute},
         storage::queries,
         types::EncryptedShare,
@@ -298,6 +299,44 @@ mod tests {
         let StoreAdmission::Authoritative(record) = store.admit(&request, true, 1, 20).unwrap()
         else {
             panic!("abandoned batch reservation must normalize without derivation")
+        };
+        assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+        assert_eq!(record.committed_post_reservations(), 1);
+    }
+
+    #[test]
+    fn cancelled_batch_returns_authoritative_state_before_stale_member_guard() {
+        let db = open_prepared(":memory:");
+        let digest = store_two_vote_batch(&db);
+        let store = SqliteChainSubmissionStore::new(Arc::clone(&db));
+        let batch = batch_identity(digest);
+        let initial_request =
+            StoreAdvancementRequest::vote_batch(batch.clone(), vec![1, 2]).unwrap();
+        assert!(matches!(
+            store.admit(&initial_request, true, 1, 10).unwrap(),
+            StoreAdmission::Ready {
+                fresh_reservation: true,
+                ..
+            }
+        ));
+        let stale_member = identity_for(0, 3);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                   (identity_key, round_id, wallet_id, network, bundle_index, kind,
+                    proposal_id, generation_digest, state, committed_post_reservations,
+                    diagnostic_kind, diagnostic, created_at, updated_at)
+                 VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 3, NULL, 'recovering', 0,
+                         'recovery_unavailable', 'version-17 recovery unavailable', 9, 9)",
+                rusqlite::params![submission_identity_key(&stale_member), ROUND],
+            )
+            .unwrap();
+        let stale_request = StoreAdvancementRequest::vote_batch(batch, vec![1, 3]).unwrap();
+
+        let StoreAdmission::Authoritative(record) =
+            store.admit(&stale_request, false, 1, 20).unwrap()
+        else {
+            panic!("cancelled entry must return the authoritative batch")
         };
         assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
         assert_eq!(record.committed_post_reservations(), 1);
@@ -603,10 +642,19 @@ mod tests {
     /// an opaque storage error instead of the permanent guard it actually is.
     #[test]
     fn every_migration_diagnostic_kind_loads_as_an_authoritative_guard() {
-        for (index, diagnostic_kind) in [
-            "recovery_unavailable",
-            "generation_derivation_failed",
-            "reconciliation_pending",
+        for (index, (persisted_kind, expected_kind)) in [
+            (
+                "recovery_unavailable",
+                ChainSubmissionDiagnosticKind::RecoveryUnavailable,
+            ),
+            (
+                "generation_derivation_failed",
+                ChainSubmissionDiagnosticKind::GenerationDerivationFailed,
+            ),
+            (
+                "reconciliation_pending",
+                ChainSubmissionDiagnosticKind::ReconciliationPending,
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -626,7 +674,7 @@ mod tests {
                         submission_identity_key(&identity),
                         ROUND,
                         proposal_id,
-                        diagnostic_kind
+                        persisted_kind
                     ],
                 )
                 .unwrap();
@@ -634,12 +682,22 @@ mod tests {
 
             let admission = store
                 .admit(&StoreAdvancementRequest::vote(identity), true, 1, 10)
-                .unwrap_or_else(|error| panic!("{diagnostic_kind} must load: {}", error.message()));
+                .unwrap_or_else(|error| panic!("{persisted_kind} must load: {}", error.message()));
             let StoreAdmission::Authoritative(record) = admission else {
-                panic!("{diagnostic_kind} must be authoritative without derivation")
+                panic!("{persisted_kind} must be authoritative without derivation")
             };
             assert!(record.generation_digest().is_none());
             assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
+            let ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+                candidate_transaction_hash,
+                diagnostic,
+            }) = record.public_result().unwrap()
+            else {
+                panic!("{persisted_kind} must remain a recovering public result")
+            };
+            assert!(candidate_transaction_hash.is_none());
+            assert_eq!(diagnostic.kind(), expected_kind);
+            assert_eq!(diagnostic.message(), "redacted version-17 diagnostic");
         }
     }
 
@@ -931,9 +989,11 @@ fn load_one<P: rusqlite::Params>(
             "tracking" => SubmissionRecordState::Tracking {
                 candidate_transaction_hash: candidate.ok_or(rusqlite::Error::InvalidQuery)?,
             },
-            "recovering" if digest.is_none() => {
-                SubmissionRecordState::DigestlessRecoveryGuard(DigestlessRecoveryGuard::new())
-            }
+            "recovering" if digest.is_none() => SubmissionRecordState::DigestlessRecoveryGuard(
+                DigestlessRecoveryGuard::from_diagnostic(
+                    diagnostic.clone().ok_or(rusqlite::Error::InvalidQuery)?,
+                ),
+            ),
             "recovering" => SubmissionRecordState::Recovering {
                 candidate_transaction_hash: candidate,
                 ambiguity_diagnostic: diagnostic.clone().ok_or(rusqlite::Error::InvalidQuery)?,
@@ -1225,32 +1285,30 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                     return Ok(StoreAdmission::Authoritative(record.clone()));
                 }
             }
-            if request.is_batch() && !work_allowed {
-                for identity in &request.member_identities {
-                    if let Some(guard) = load_submission(tx, identity)? {
-                        if guard.generation_digest().is_none() {
-                            return Err(ChainSubmissionFailure::with_durable_state(
-                                ChainSubmissionFailureKind::InvalidInput,
-                                guard.durable_state(),
-                                "atomic vote batch overlaps a migration-only singleton guard",
-                            ));
+            if !work_allowed {
+                if let Some(record) = existing {
+                    if matches!(record.state(), SubmissionRecordState::Submitting) {
+                        normalizes_abandoned_reservation = true;
+                        return Ok(StoreAdmission::Authoritative(normalize_abandoned(
+                            tx, record, now,
+                        )?));
+                    }
+                    return Ok(StoreAdmission::Authoritative(record));
+                }
+                if request.is_batch() {
+                    for identity in &request.member_identities {
+                        if let Some(guard) = load_submission(tx, identity)? {
+                            if guard.generation_digest().is_none() {
+                                return Err(ChainSubmissionFailure::with_durable_state(
+                                    ChainSubmissionFailureKind::InvalidInput,
+                                    guard.durable_state(),
+                                    "atomic vote batch overlaps a migration-only singleton guard",
+                                ));
+                            }
                         }
                     }
                 }
-            }
-            if !work_allowed {
-                return match existing {
-                    Some(record)
-                        if matches!(record.state(), SubmissionRecordState::Submitting) =>
-                    {
-                        normalizes_abandoned_reservation = true;
-                        Ok(StoreAdmission::Authoritative(normalize_abandoned(
-                            tx, record, now,
-                        )?))
-                    }
-                    Some(record) => Ok(StoreAdmission::Authoritative(record)),
-                    None => Ok(StoreAdmission::NoAuthoritativeState),
-                };
+                return Ok(StoreAdmission::NoAuthoritativeState);
             }
             if existing
                 .as_ref()

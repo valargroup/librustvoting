@@ -1,6 +1,6 @@
 //! Semantic generation derivation from durable delegation and vote inputs.
 
-use rusqlite::{named_params, OptionalExtension};
+use rusqlite::named_params;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -336,8 +336,8 @@ fn load_delegation_inputs(
     identity: &ChainSubmissionIdentity,
     round_id: &str,
 ) -> Result<Option<DelegationGenerationInputs>, VotingError> {
-    let stored_inputs = conn
-        .query_row(
+    let mut statement = conn
+        .prepare(
             "SELECT b.note_positions_blob, b.note_identity_hashes_blob,
                 b.van_comm_rand, b.dummy_nullifiers, b.rho_signed,
                 b.padded_note_data, b.nf_signed, b.cmx_new, b.alpha,
@@ -354,13 +354,25 @@ fn load_delegation_inputs(
             AND b.wallet_id = :wallet_id
             AND b.bundle_index = :bundle_index
             AND p.success = 1",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": identity.wallet_id(),
-                ":bundle_index": identity.bundle_index() as i64,
-            },
-            |row| {
-                Ok((
+        )
+        .map_err(|error| VotingError::Storage {
+            message: format!("failed to prepare delegation generation inputs: {error}"),
+        })?;
+    let mut rows = statement
+        .query(named_params! {
+            ":round_id": round_id,
+            ":wallet_id": identity.wallet_id(),
+            ":bundle_index": identity.bundle_index() as i64,
+        })
+        .map_err(|error| VotingError::Storage {
+            message: format!("failed to query delegation generation inputs: {error}"),
+        })?;
+    let stored_inputs = match rows.next().map_err(|error| VotingError::Storage {
+        message: format!("failed to read delegation generation inputs: {error}"),
+    })? {
+        Some(row) => Some(
+            (|| {
+                Ok::<_, rusqlite::Error>((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
@@ -382,12 +394,13 @@ fn load_delegation_inputs(
                     row.get::<_, Vec<u8>>(18)?,
                     row.get::<_, Vec<u8>>(19)?,
                 ))
-            },
-        )
-        .optional()
-        .map_err(|error| VotingError::Storage {
-            message: format!("failed to load delegation generation inputs: {error}"),
-        })?;
+            })()
+            .map_err(|error| VotingError::Internal {
+                message: format!("malformed stored delegation generation inputs: {error}"),
+            })?,
+        ),
+        None => None,
+    };
 
     stored_inputs
         .map(

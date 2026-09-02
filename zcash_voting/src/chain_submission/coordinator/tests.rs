@@ -771,6 +771,54 @@ async fn cancelled_batch_entry_preserves_requested_member_guard_without_roster_r
 }
 
 #[tokio::test]
+async fn cancelled_batch_entry_returns_authoritative_batch_before_stale_member_guard() {
+    let batch = batch_identity(0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_batch(batch.clone(), vec![1, 2]));
+    store.seed_batch_roster(batch.clone(), vec![1, 2]);
+    let initial_request = StoreAdvancementRequest::vote_batch(batch.clone(), vec![1, 2]).unwrap();
+    assert!(matches!(
+        store.admit(&initial_request, true, 1, 1).unwrap(),
+        StoreAdmission::Ready {
+            fresh_reservation: true,
+            ..
+        }
+    ));
+    store.seed_record(StoredChainSubmission::digestless_guard(identity(3, 0), 1));
+    let roster_reads_before_cancellation = store.batch_roster_reads();
+    let transport = Arc::new(ScriptedTransport::default());
+    let control = ManualControl::default();
+    control.cancelled.store(true, Ordering::SeqCst);
+
+    let result = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    )
+    .advance(
+        StoreAdvancementRequest::vote_batch(batch.clone(), vec![1, 3]).unwrap(),
+        &control,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ..
+        })
+    ));
+    assert_eq!(
+        store.record(&batch).unwrap().durable_state(),
+        ChainSubmissionState::Recovering
+    );
+    assert_eq!(store.batch_roster_reads(), roster_reads_before_cancellation);
+    assert!(transport.methods().is_empty());
+}
+
+#[tokio::test]
 async fn cancelled_entry_normalizes_abandoned_submitting_without_network_work() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
