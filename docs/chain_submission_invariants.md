@@ -1118,6 +1118,7 @@ Phase 4 private-coordinator coverage is anchored by
 `matching_event_for_round_must_be_unique`,
 `cancelled_entry_normalizes_abandoned_submitting_without_network_work`,
 `cancelled_batch_entry_requires_no_recovery_or_roster_derivation`,
+`cancelled_batch_entry_preserves_requested_member_guard_without_roster_read`,
 `cancellation_after_reservation_before_dispatch_removes_fresh_reservation`,
 `failed_cancelled_entry_normalization_reports_possible_dispatch`,
 `failed_active_entry_normalization_reports_possible_dispatch`,

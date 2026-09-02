@@ -731,6 +731,49 @@ async fn cancelled_batch_entry_requires_no_recovery_or_roster_derivation() {
 }
 
 #[tokio::test]
+async fn cancelled_batch_entry_preserves_requested_member_guard_without_roster_read() {
+    let batch = batch_identity(0);
+    let guarded_member = identity(2, 0);
+    let cases = [
+        (
+            StoredChainSubmission::legacy_confirmed(guarded_member.clone(), 4, 5, 1),
+            ChainSubmissionState::LegacyConfirmed,
+        ),
+        (
+            StoredChainSubmission::digestless_guard(guarded_member, 1),
+            ChainSubmissionState::Recovering,
+        ),
+    ];
+
+    for (guard, expected_state) in cases {
+        let store = Arc::new(InMemoryChainSubmissionStore::default());
+        store.seed_record(guard);
+        let transport = Arc::new(ScriptedTransport::default());
+        let control = ManualControl::default();
+        control.cancelled.store(true, Ordering::SeqCst);
+
+        let failure = coordinator(
+            Arc::clone(&transport),
+            Arc::clone(&store),
+            ManualClock::new(100),
+            10,
+        )
+        .advance(
+            StoreAdvancementRequest::vote_batch(batch.clone(), vec![1, 2]).unwrap(),
+            &control,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.kind(), ChainSubmissionFailureKind::InvalidInput);
+        assert_eq!(failure.strongest_state().unwrap().state(), expected_state);
+        assert_eq!(store.batch_roster_reads(), 0);
+        assert!(store.record(&batch).is_none());
+        assert!(transport.methods().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn cancelled_entry_normalizes_abandoned_submitting_without_network_work() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());

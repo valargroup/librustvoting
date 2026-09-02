@@ -770,6 +770,24 @@ pub(super) mod memory {
                 }
 
                 let existing = state.records.get(request.identity()).cloned();
+                if request.is_batch() && !work_allowed {
+                    for legacy_identity in &request.legacy_identities {
+                        let Some(guard) = state.records.get(legacy_identity) else {
+                            continue;
+                        };
+                        if matches!(
+                            guard.state(),
+                            SubmissionRecordState::LegacyConfirmed(_)
+                                | SubmissionRecordState::DigestlessRecoveryGuard(_)
+                        ) {
+                            return Err(ChainSubmissionFailure::with_durable_state(
+                                ChainSubmissionFailureKind::InvalidInput,
+                                guard.durable_state(),
+                                "atomic vote batch overlaps a migration-only singleton guard",
+                            ));
+                        }
+                    }
+                }
                 if !work_allowed {
                     return match existing {
                         Some(mut record)
