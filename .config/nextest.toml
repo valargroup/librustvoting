@@ -1,0 +1,34 @@
+# Test-runner profiles shared by local development and CI.
+#
+# Select with `cargo nextest run -P <profile>`. The Makefile defaults to
+# `agent`; CI uses `ci`.
+
+[profile.default]
+# `slow-timeout` is the guard against wedged loopback-socket tests
+# (zcash_voting/src/http_transport.rs and tests/support/helper_fleet.rs, which
+# scripts deliberate stall responses). Without it a stuck test hangs forever.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# Reports failures only. The default profile prints a line per passing test,
+# which floods an agent's context on a suite this size.
+[profile.agent]
+status-level = "fail"
+final-status-level = "fail"
+failure-output = "immediate-final"
+success-output = "never"
+fail-fast = true
+slow-timeout = { period = "20s", terminate-after = 4 }
+
+# Runs the whole suite so one failure does not mask the rest.
+[profile.ci]
+status-level = "fail"
+final-status-level = "flaky"
+failure-output = "immediate-final"
+success-output = "never"
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The Halo2 proof tests run keygen plus proving and are slow even in release.
+[[profile.ci.overrides]]
+filter = 'test(/real_delegation_proof|zkp2/)'
+slow-timeout = { period = "300s", terminate-after = 4 }
