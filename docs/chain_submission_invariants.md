@@ -7,7 +7,9 @@ This document is the normative specification for vote-chain submission in
 document and its behavior-oriented conformance tests in the same change.
 
 The design has one authoritative `chain_submissions` row for each semantic
-generation. It does not use an attempt journal or a durable scan workflow.
+generation, plus a migration-only `LegacyConfirmed` representation for a v17
+confirmation whose generation cannot be reconstructed. It does not use an
+attempt journal or a durable scan workflow.
 
 The normal path is:
 
@@ -15,12 +17,13 @@ The normal path is:
 reserve Submitting -> POST -> store hash as Tracking -> poll -> Confirmed
 ```
 
-If a request may have been dispatched but no usable hash is available, the row
-becomes `Recovering`. Recovery polls a candidate hash first when one exists,
-then may search the commitment tree for the generation's exact output layout.
-`Recovering` is sticky: later responses and retries may add a candidate hash,
-but they do not erase the earlier hashless ambiguity. Tree recovery never runs
-for ordinary `Tracking`.
+If ordinary candidate polling can no longer safely determine the outcome, the
+row becomes `Recovering`: either a request may have been dispatched without a
+usable hash, or the bounded `Tracking` window expired inconclusively. Recovery
+polls a candidate hash first when one exists, then may search the commitment
+tree for the generation's exact output layout. `Recovering` is sticky: later
+responses and retries may add a candidate hash, but they do not erase the
+durable recovery ambiguity. Tree recovery never runs for ordinary `Tracking`.
 
 ## Scope and authority
 
@@ -102,7 +105,10 @@ outputs.
 
 There is exactly one `chain_submissions` row for a semantic generation. A
 database uniqueness constraint covers its full identity and generation digest.
-Creation and all transitions occur in immediate transactions.
+Creation and every durable state or field mutation occur in immediate
+transactions. The sole exception is a migration-only `LegacyConfirmed` row: it
+is keyed by the available legacy identity, has no invented generation digest,
+and permanently blocks a fresh submission for that identity.
 
 The row stores only:
 
@@ -111,6 +117,7 @@ The row stores only:
 - durable state;
 - one optional canonical candidate transaction hash;
 - attempt count;
+- an optional immutable tracking-start timestamp;
 - a bounded redacted diagnostic;
 - final confirmation source;
 - final VAN and vote-commitment positions in generation order; and
@@ -150,6 +157,7 @@ Submitting
 Tracking
 Recovering
 Confirmed
+LegacyConfirmed
 Rejected
 ```
 
@@ -159,13 +167,20 @@ Their meanings are:
   been durably classified.
 - `Tracking`: a usable candidate hash is known and no hashless possibly
   dispatched request exists. Reconciliation only polls that hash.
-- `Recovering`: at least one request may have been dispatched without a usable
-  hash. An optional candidate hash is polled before tree recovery. The state is
-  sticky until confirmation or explicit deletion.
+- `Recovering`: ordinary candidate polling is no longer sufficient to resolve
+  the outcome because a request may have been dispatched without a usable hash
+  or the bounded tracking window expired inconclusively. An optional candidate
+  hash is polled before tree recovery. The state is sticky until confirmation
+  or explicit deletion.
 - `Confirmed`: chain success and all required local confirmation updates are
   durable. New confirmations record `hash` or `tree` as their source and record
-  the exact generation positions. Migrated version-17 confirmations record
-  `legacy_import`.
+  the exact generation positions. Fully reconstructable migrated version-17
+  confirmations record `legacy_import`.
+- `LegacyConfirmed`: version 17 recorded the required domain confirmation
+  positions, but lacks the recovery material needed to derive a generation
+  digest or validate the exact output layout. It preserves the known
+  confirmation without claiming either fact and permits no submission,
+  reconciliation, or recovery.
 - `Rejected`: the generation received a definite chain rejection, or its sole
   tracked hash is committed unsuccessfully.
 
@@ -191,8 +206,9 @@ only under the same-generation recovery rules; the row remains `Recovering`
 and tree recovery remains available.
 
 Terminal rows are immutable except for idempotent replay of identical
-confirmation data and explicit round or account deletion. Conflicting terminal
-data is an invariant error and writes nothing.
+confirmation data and explicit round or account deletion. `LegacyConfirmed` is
+terminal and cannot be promoted or replaced by a reconstructed generation.
+Conflicting terminal data is an invariant error and writes nothing.
 
 ## Reservation and transport classification
 
@@ -263,7 +279,7 @@ Reconciliation is state-driven:
   becomes `Recovering` while retaining the candidate hash.
 - `Recovering` polls its candidate hash first. If hash polling does not confirm,
   the lifecycle may perform one bounded tree recovery pass.
-- `Confirmed` and `Rejected` perform no network mutation.
+- `Confirmed`, `LegacyConfirmed`, and `Rejected` perform no network mutation.
 
 A pending or temporarily unreadable candidate remains available for later
 polling. In `Recovering`, it does not permanently disable tree recovery. A
@@ -280,14 +296,21 @@ A pending or unreadable candidate is never treated as committed failure.
 Endpoint disagreement, malformed responses, and temporary lookup failure
 remain retryable diagnostics rather than terminal evidence.
 
+The tracking window begins when the row first enters `Tracking`. Its start is
+stored durably and never changes; candidate polling, diagnostics, restarts, and
+timestamp maintenance cannot reset or extend the window.
+
 Restart plans are derived from the authoritative row:
 
 - `Tracking` schedules hash polling;
 - `Recovering` schedules candidate-first reconciliation and tree recovery, then
   same-generation retry when permitted;
 - `Confirmed` enables dependent domain and helper work;
+- `LegacyConfirmed` enables the same dependent work as a confirmed v17 domain
+  row and blocks resubmission;
 - `Rejected` schedules no reconciliation; and
-- absent rows permit fresh work if bundle causality allows it.
+- absent rows permit fresh work if bundle causality allows it and no matching
+  `LegacyConfirmed` identity exists.
 
 An unresolved generation blocks only later work that consumes its unknown
 successor VAN. Independent bundles remain schedulable.
@@ -381,10 +404,18 @@ Cancelled
 ```
 
 `Confirmed` means the authoritative row and all atomic domain/helper updates
-are durable. `Pending(Tracking)` carries the candidate hash needed to continue.
-`Pending(Recovering)` may carry a candidate hash and a bounded diagnostic, but
-always preserves the fact that tree recovery remains authorized. `Rejected`
-means the durable row is terminally rejected.
+are durable. It exposes a transaction hash as confirmed only when confirmation
+source is `hash`; a candidate retained by tree confirmation is never presented
+as the confirming transaction. `Pending(Tracking)` always carries the
+candidate hash needed to continue. `Pending(Recovering)` may carry a candidate
+hash and a bounded diagnostic, but always preserves the fact that tree
+recovery remains authorized. `Rejected` means the durable row is terminally
+rejected.
+
+`LegacyConfirmed` is returned publicly as `Confirmed` with source
+`legacy_import`, while retaining its explicit durable state so callers cannot
+mistake migration preservation for a re-derived generation or validated
+layout.
 
 `Cancelled` is returned only when cancellation occurs before possible dispatch
 and no stronger durable state exists. Cancellation never hides `Tracking`,
@@ -443,8 +474,8 @@ The captured host operation epoch is checked at the same pre-commit boundaries.
 
 Ordinary cleanup and reset use the authoritative state under the same operation
 and bundle locks. They preserve every `Submitting`, `Tracking`, `Recovering`,
-and `Confirmed` row and all domain material required to reconcile, retry, prove,
-or apply that generation, including:
+`Confirmed`, and `LegacyConfirmed` row and all domain material required to
+reconcile, retry, prove, or apply that generation, including:
 
 - delegation setup, proofs, nullifiers, and VAN randomizer;
 - vote and batch recovery material;
@@ -492,8 +523,15 @@ recovery rows.
 Version-17 state imports as follows:
 
 - a generation with complete, internally consistent confirmed domain positions
-  becomes `Confirmed` with source `legacy_import`, its available hash, and its
-  exact positions;
+  and sufficient recovery material to re-derive its generation and exact
+  layout becomes `Confirmed` with source `legacy_import`, its available
+  canonical hash if one exists, and its exact positions;
+- a vote with complete recorded domain confirmation positions but without the
+  recovery material needed to derive and validate that generation becomes
+  `LegacyConfirmed`; migration records its checked known positions and
+  available canonical hash, preserves the original legacy projection columns,
+  leaves its generation digest absent, and does not infer layout validity from
+  adjacency or legacy domain columns;
 - a canonical unconfirmed transaction hash becomes `Tracking`;
 - an unusable, malformed, opaque, or otherwise non-pollable historical hash
   becomes `Recovering` with no candidate hash; and
@@ -512,8 +550,11 @@ batch. Cross-generation collisions, partial batches, inconsistent positions,
 or malformed recovery metadata abort the whole migration; migration does not
 guess, merge, or silently normalize ownership.
 
-Confirmed imports validate the complete expected singleton or batch layout and
-position ranges. Partial confirmation becomes `Recovering`, not `Confirmed`.
+`Confirmed` imports validate the complete expected singleton or batch layout
+and position ranges. `LegacyConfirmed` is the non-destructive exception for a
+complete v17 domain confirmation that cannot be re-derived; it is never used
+for new confirmations. Partial confirmation becomes `Recovering`, not
+`Confirmed`.
 Canonical imported candidates are normalized to lowercase. Unusable historical
 values may remain byte-for-byte in legacy projection columns for compatibility,
 but runtime lookup never treats them as candidates.
@@ -544,9 +585,9 @@ submission, polling, recovery, and confirmation. Event parsing, tree matching,
 and domain/helper writes are private lifecycle mechanisms. Prelude and storage
 facades must not re-export removed mutation APIs.
 
-## Conformance tests
+## Required conformance coverage
 
-Conformance is demonstrated by behavior, not source-layout assertions,
+Conformance must be demonstrated by behavior, not source-layout assertions,
 descriptor golden files, provenance matrices, or precedence tables.
 
 ### State and transport
@@ -558,6 +599,7 @@ Tests cover:
 - usable success hash produces `Tracking`;
 - inconclusive hash polling has a bounded promotion to candidate-preserving
   `Recovering`;
+- polling, diagnostics, and restart do not reset the durable tracking window;
 - hash polling produces atomic `Confirmed`;
 - definite rejection produces `Rejected`;
 - definite pre-dispatch failure does not create ambiguity;
@@ -600,6 +642,10 @@ Tests cover:
   without releasing bytes;
 - entry cancellation with an abandoned `Submitting` row atomically normalizes
   it to `Recovering` and returns `Pending(Recovering)` without network work;
+- entry cancellation over `Tracking`, `Recovering`, `Confirmed`,
+  `LegacyConfirmed`, or `Rejected` returns the authoritative stronger result;
+- cancellation after reservation but before dispatch releases no bytes and
+  removes only the fresh definitely-unsent reservation;
 - failure to persist that normalization reports an operational failure with
   the known possibly-dispatched state and never returns `Cancelled`;
 - cancellation after dispatch preserves `Recovering`; and
@@ -610,8 +656,9 @@ Tests cover:
 
 Tests cover:
 
-- each v17 import class: confirmed, canonical unconfirmed hash, unusable hash,
-  partial confirmation, and hashless committed recovery material;
+- each v17 import class: confirmed, legacy-confirmed without recovery material,
+  canonical unconfirmed hash, unusable hash, partial confirmation, and hashless
+  committed recovery material;
 - a hashless v17 import remains `Recovering` after a retry receives a definite
   rejection, leaving exact tree recovery available for a possibly successful
   pre-upgrade POST;
