@@ -158,5 +158,6 @@ async fn scan_responses(
     Ok((outcome, urls))
 }
 
+mod http_metadata;
 mod layout;
 mod pagination;

@@ -275,11 +275,15 @@ async fn get_json_with_size<T: ChainTransport, R: for<'de> Deserialize<'de>>(
             ))
         })?
         .map_err(RecoveryScanFailure::Transport)?;
+    let has_json_content_type = response.content_type().is_some_and(|content_type| {
+        content_type
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+    });
     if response.status() != 200
         || response.body().len() > MAX_RECOVERY_RESPONSE_BYTES
-        || response
-            .content_type()
-            .is_none_or(|value| value.split(';').next() != Some("application/json"))
+        || !has_json_content_type
     {
         return Err(RecoveryScanFailure::Invalid(invalid(
             "tree recovery response has invalid HTTP metadata",
