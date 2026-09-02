@@ -1307,24 +1307,21 @@ Regression tests: `migrate_from_launch_version_preserves_delegation_state`,
 
 ### Recovery cleanup
 
-There is no standalone recovery-cleanup operation. Ordinary cleanup, reset,
-and round deletion do not call `clear_recovery_state`; they preserve helper
-plans and delivery history required by unresolved or confirmed chain
-submissions.
-
-`clear_recovery_state` is a private destructive primitive used only by explicit
-account deletion. It may remove every share-delivery row and retryable recovery
-artifact because account deletion removes the owning local account. The account
-operation gate must be closed, new entrants blocked, and active work drained
-before it runs. Exclusive access is retained through deletion.
+Explicit recovery cleanup removes share-delivery rows and retryable,
+unconfirmed vote recovery artifacts. It preserves ballot intent, confirmed
+vote positions, and imported delegation capabilities. Full round deletion is
+a separate operation.
 
 Enforcement:
-the account-deletion path and private `clear_recovery_state` in
+[`recovery::clear`](../zcash_voting/src/recovery.rs) and
+`clear_recovery_state` in
 [`storage/queries/mod.rs`](../zcash_voting/src/storage/queries/mod.rs).
 
-Regression coverage must show that ordinary cleanup, reset, and round deletion
-cannot invoke the primitive; account deletion waits for active helper work and
-then removes delivery rows; and no public recovery-clear API remains.
+Regression tests:
+`clear_preserves_recorded_positions_and_resets_unconfirmed_votes` and
+`test_clear_recovery_state_resets_vote_recovery`, plus
+`initial_delivery_does_not_recreate_share_after_recovery_cleanup` for cleanup
+racing active helper delivery.
 
 ## Helper identity and payload invariants
 
