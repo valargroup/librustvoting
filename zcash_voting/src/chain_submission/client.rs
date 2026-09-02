@@ -21,18 +21,53 @@ use super::{
     ChainSubmissionResult, ChainSubmissionTarget, ChainTransport,
 };
 
-/// Required finite policy and chain context for a submission client.
+/// Chain identity and finite policy for one submission client.
+///
+/// Construction validates the complete configuration before performing any
+/// network request or changing durable submission state.
 #[derive(Clone, Debug)]
 pub struct ChainSubmissionClientConfig {
+    /// Network included in every durable submission identity.
+    ///
+    /// Mainnet also requires every configured endpoint to use HTTPS.
     pub network: Network,
+    /// Vote-chain identifier included in every durable submission identity.
+    ///
+    /// The value must contain 1 to 128 printable ASCII bytes without
+    /// whitespace.
     pub vote_chain_id: String,
+    /// Ordered, distinct vote-chain base URLs.
+    ///
+    /// One to eight HTTP(S) URLs are required. URLs must not contain
+    /// credentials, a query, or a fragment, and duplicates are rejected after
+    /// canonicalization. Fresh POST failover and status lookup follow this
+    /// order. Exact tree recovery reads from the first endpoint; later
+    /// recovery POSTs rotate by durable reservation ordinal.
     pub endpoints: Vec<String>,
+    /// Maximum time to track a usable candidate hash before entering recovery.
+    ///
+    /// This must be a nonzero whole number of seconds. The window starts when
+    /// the durable row first enters `Tracking` and is not reset by polling,
+    /// diagnostics, restarts, or later advancement calls.
     pub tracking_window: Duration,
+    /// Maximum POST attempts made by one advancement call.
+    ///
+    /// This must be between one and eight and must not exceed the number of
+    /// distinct configured endpoints. Historical durable attempt count does
+    /// not reduce a later call's independent bounded budget.
     pub maximum_post_attempts: usize,
+    /// Delays between consecutive POST attempts in one advancement call.
+    ///
+    /// This must contain exactly `maximum_post_attempts - 1` entries. Every
+    /// delay must be nonzero and no greater than ten minutes.
     pub retry_backoffs: Vec<Duration>,
 }
 
-/// Host-owned cancellation and epoch token captured by one bounded call.
+/// Host-owned cancellation and session-epoch authority for bounded calls.
+///
+/// Clones share both values. Cancellation and epoch changes are observed at
+/// lifecycle boundaries but do not roll back a reservation, dispatch
+/// classification, or confirmation that is already durable.
 #[derive(Clone, Debug)]
 pub struct ChainSubmissionControl {
     cancelled: Arc<AtomicBool>,
@@ -51,6 +86,7 @@ pub enum ChainRecoveryMode {
 }
 
 impl ChainSubmissionControl {
+    /// Creates an uncancelled control at the supplied host operation epoch.
     pub fn new(operation_epoch: u64) -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -58,20 +94,26 @@ impl ChainSubmissionControl {
         }
     }
 
+    /// Permanently cancels this control and every clone of it.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    /// Invalidates already-captured work after a host account/session switch.
+    /// Replaces the shared epoch, invalidating calls that captured another one.
+    ///
+    /// A later call captures the new value. Changing the epoch does not undo
+    /// durable effects produced before the mismatch is observed.
     pub fn set_operation_epoch(&self, operation_epoch: u64) {
         self.operation_epoch
             .store(operation_epoch, Ordering::Release);
     }
 
+    /// Returns whether this control or one of its clones was cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    /// Returns the current shared host operation epoch.
     pub fn operation_epoch(&self) -> u64 {
         self.operation_epoch.load(Ordering::Acquire)
     }
@@ -89,20 +131,32 @@ impl SubmissionControl for ChainSubmissionControl {
 
 /// Inputs that identify and sign one prepared delegation generation.
 pub struct AdvanceDelegation {
+    /// Canonical 32-byte round identifier used by the prepared bundle.
     pub vote_round_id: [u8; 32],
+    /// Durable bundle containing the prepared delegation inputs.
     pub bundle_index: u32,
+    /// Signer for the delegation reconstructed from the locked durable inputs.
     pub signer: DelegationSigner,
 }
 
 /// Inputs that identify one prepared singleton vote generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdvanceVote {
+    /// Canonical 32-byte round identifier used by the prepared bundle.
     pub vote_round_id: [u8; 32],
+    /// Durable bundle containing the prepared vote inputs.
     pub bundle_index: u32,
+    /// Proposal whose durable singleton vote is advanced.
     pub proposal_id: u32,
 }
 
-/// SDK-owned submission lifecycle using one injected HTTP mechanism.
+/// SDK-owned durable submission lifecycle using one HTTP mechanism.
+///
+/// Each advancement serializes work for its identity, reconstructs the
+/// semantic generation from `db`, and owns reservation, submission,
+/// reconciliation, and atomic confirmation. Callers should schedule another
+/// bounded pass from [`ChainSubmissionResult`] rather than mutating submission
+/// state directly.
 pub struct ChainSubmissionClient<T> {
     db: Arc<VotingDb>,
     network: Network,
@@ -112,6 +166,16 @@ pub struct ChainSubmissionClient<T> {
 }
 
 impl ChainSubmissionClient<HyperTransport> {
+    /// Creates a client backed by the SDK's default HTTP transport.
+    ///
+    /// Construction validates `config` but performs no network request and
+    /// does not change durable submission state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainSubmissionFailureKind::InvalidInput`] if the chain
+    /// identifier, endpoints, tracking window, attempt count, or backoff
+    /// relationship is invalid.
     pub fn new(
         db: Arc<VotingDb>,
         config: ChainSubmissionClientConfig,
@@ -121,6 +185,18 @@ impl ChainSubmissionClient<HyperTransport> {
 }
 
 impl<T: ChainTransport> ChainSubmissionClient<T> {
+    /// Creates a client backed by a caller-supplied transport.
+    ///
+    /// The injected transport changes only HTTP execution; validation,
+    /// persistence, locking, retry bounds, and result postconditions are the
+    /// same as for [`ChainSubmissionClient::new`]. Construction performs no
+    /// network request and does not change durable submission state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainSubmissionFailureKind::InvalidInput`] if the chain
+    /// identifier, endpoints, tracking window, attempt count, or backoff
+    /// relationship is invalid.
     pub fn with_transport(
         db: Arc<VotingDb>,
         transport: T,
@@ -155,6 +231,20 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         })
     }
 
+    /// Advances one prepared delegation through one bounded status-only pass.
+    ///
+    /// The pass may durably reserve before POST, submit, poll a candidate, and
+    /// atomically persist confirmation plus the applicable bundle, recovery,
+    /// domain, and helper projections. It does not scan the commitment tree.
+    /// A non-cancelled result represents the authoritative durable outcome
+    /// reported by [`ChainSubmissionResult::durable_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure for invalid identity or prepared state, invariant or
+    /// storage failure, transport failure, or invalid protocol data. Once
+    /// dispatch may have occurred, cancellation or failure does not erase the
+    /// strongest state reported by [`ChainSubmissionFailure::strongest_state`].
     pub async fn advance_delegation(
         &self,
         request: AdvanceDelegation,
@@ -173,6 +263,20 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .await
     }
 
+    /// Advances one prepared delegation through one bounded pass.
+    ///
+    /// This has the same durable side effects and result postconditions as
+    /// [`Self::advance_delegation`]. [`ChainRecoveryMode::ExactTree`] may,
+    /// after candidate-first reconciliation is inconclusive, scan one fixed
+    /// complete tree snapshot and atomically confirm an exact unique layout or
+    /// authorize one same-generation retry within this call's attempt budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure for invalid identity or prepared state, invariant or
+    /// storage failure, transport failure, or invalid protocol or recovery
+    /// data. Durable or possibly-dispatched state remains available through
+    /// [`ChainSubmissionFailure::strongest_state`].
     pub async fn advance_delegation_with_recovery(
         &self,
         request: AdvanceDelegation,
@@ -193,6 +297,20 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .await
     }
 
+    /// Advances one prepared singleton vote through one bounded status-only pass.
+    ///
+    /// The pass may durably reserve before POST, submit, poll a candidate, and
+    /// atomically persist confirmation plus the applicable bundle, vote,
+    /// recovery, domain, and helper projections. It does not scan the
+    /// commitment tree. A non-cancelled result represents the authoritative
+    /// durable outcome reported by [`ChainSubmissionResult::durable_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure for invalid identity or prepared state, invariant or
+    /// storage failure, transport failure, or invalid protocol data. Once
+    /// dispatch may have occurred, cancellation or failure does not erase the
+    /// strongest state reported by [`ChainSubmissionFailure::strongest_state`].
     pub async fn advance_vote(
         &self,
         request: AdvanceVote,
@@ -210,6 +328,20 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
             .await
     }
 
+    /// Advances one prepared singleton vote through one bounded pass.
+    ///
+    /// This has the same durable side effects and result postconditions as
+    /// [`Self::advance_vote`]. [`ChainRecoveryMode::ExactTree`] may, after
+    /// candidate-first reconciliation is inconclusive, scan one fixed complete
+    /// tree snapshot and atomically confirm an exact unique layout or authorize
+    /// one same-generation retry within this call's attempt budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure for invalid identity or prepared state, invariant or
+    /// storage failure, transport failure, or invalid protocol or recovery
+    /// data. Durable or possibly-dispatched state remains available through
+    /// [`ChainSubmissionFailure::strongest_state`].
     pub async fn advance_vote_with_recovery(
         &self,
         request: AdvanceVote,
