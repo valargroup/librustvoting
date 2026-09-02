@@ -380,19 +380,26 @@ Each recovery pass:
 
 The scanner validates snapshot identity, heights, roots, ranges, absolute
 indexes, pagination progress, final size, canonical field encodings, and
-response bounds. It has finite protocol ceilings for request count, bytes,
-leaves, elapsed time, and memory. Those ceilings cover the maximum valid
-snapshot size for every supported network. Configuration may lower per-request
-limits only when the resulting page count still permits a complete traversal;
-an invalid combination is rejected before chain submission or recovery is
-enabled. Before reading leaves, validated snapshot metadata and page limits
-must show that a complete traversal fits the ceilings. There is no independent
-whole-pass budget that can repeatedly truncate a supported snapshot. The
-whole-pass elapsed ceiling is derived from the maximum request count and
-per-request timeout; it is not a shorter restart budget. Metadata beyond a
-protocol ceiling is an unsupported response and no leaf scan starts.
-Cancellation is checked between requests and before the confirmation commit
-point.
+response bounds. Recovery uses the following fixed ceilings:
+
+- `16,777,216` leaves, the full `2^24` vote-commitment-tree capacity;
+- `4,096` leaf-range requests of at most `4,096` leaves each;
+- `8 MiB` per response and `32 GiB` across the complete pass;
+- `60 seconds` per request and `72 hours` across the complete pass; and
+- `16 MiB` working memory beyond the expected layout and transport buffers.
+
+The tree's documented month-scale design point is approximately one million
+leaves, so the leaf ceiling retains more than sixteen-fold headroom and also
+covers every structurally valid tree. Responses are processed as a stream; the
+complete tree is never retained in memory. Configuration may lower a
+per-request range, byte, or timeout only when the derived request count, total
+bytes, and worst-case elapsed time still fit the complete-pass ceilings. An
+invalid combination is rejected before chain submission or recovery is
+enabled. Before reading leaves, validated snapshot metadata must show that a
+complete traversal fits. There is no smaller whole-pass work budget that can
+repeatedly truncate a valid snapshot. Metadata claiming more than `2^24`
+leaves is malformed and no leaf scan starts. Cancellation is checked between
+requests and before the confirmation commit point.
 
 Finding one member is insufficient. Singleton outputs must be adjacent and in
 order. A batch must contain the final successor VAN followed immediately by
@@ -552,12 +559,13 @@ recovery material nor creates, regenerates, or advances a generation-bound
 helper plan. A digestless `Recovering` guard likewise preserves its original
 evidence and any independently durable records.
 
-In particular, `recovery::clear` does not remove a protected generation's
-helper plan or its accepted, attempting, ambiguous, scheduled, or otherwise
-pending delivery records. Preserving only the plan is insufficient: forgetting
-a possibly dispatched helper POST could make later delivery treat it as fresh
-work. Helper state remains resumable until it completes or explicit round or
-account deletion removes it.
+There is no standalone recovery-clear operation. The destructive
+`clear_recovery_state` primitive may remove recovery material, helper plans,
+and all helper-delivery history, but it is private to explicit account
+deletion. Account deletion invokes it only after closing the account operation
+gate, preventing new entrants, draining active work, and retaining exclusive
+access through deletion. Ordinary cleanup, reset, and round deletion never
+invoke this primitive.
 
 An unresolved row cannot be pruned merely because it has no candidate hash.
 Hashless `Recovering` is exactly the case that requires preservation. Bundle
@@ -573,7 +581,9 @@ Explicit round or account deletion is the destructive escape hatch. It closes
 the matching operation gate before checking active work, prevents new entrants,
 drains shared holders, and retains exclusive access through deletion. It
 returns `Busy` while work remains. Deletion removes local evidence but cannot
-undo a transaction that may already be on chain.
+undo a transaction that may already be on chain. Round deletion removes the
+gated round directly; only account deletion may invoke
+`clear_recovery_state`.
 
 ## Version 17 to version 18
 
@@ -675,7 +685,8 @@ The public API does not expose:
 - hash provenance attachment;
 - attempt insertion or retirement;
 - recovery-descriptor or tree-receipt persistence; or
-- scan-cursor or partial-match persistence.
+- scan-cursor or partial-match persistence; or
+- standalone recovery clearing.
 
 Delegation, vote, and batch lifecycle entry points are the only route to new
 submission, polling, recovery, and confirmation. Event parsing, tree matching,
@@ -722,8 +733,10 @@ Tests cover:
 - delegation, singleton, and batch exact layouts recover positions;
 - partial, reordered, nonadjacent, and duplicate layouts do not confirm;
 - scans use one validated fixed complete snapshot;
-- supported snapshots fit complete-pass request, byte, leaf, elapsed-time, and
-  memory ceilings by construction, without a smaller restart budget;
+- a full `2^24`-leaf snapshot fits the `4,096`-request, `32 GiB`, `72`-hour,
+  and streaming-memory ceilings without a smaller restart budget;
+- invalid lower per-request configuration is rejected before submission or
+  recovery is enabled;
 - interrupted scans restart without durable cursors or partial evidence; and
 - tree confirmation never invents a hash.
 
@@ -794,9 +807,10 @@ Tests cover:
   exception;
 - fresh and migrated v18 schema equivalence and stale-v18 fingerprint
   rejection;
-- cleanup preserves every unresolved generation and its retry/recovery data;
-- `recovery::clear` preserves each protected generation's helper plan and
-  complete pending, attempting, and ambiguous delivery history;
+- ordinary cleanup and reset preserve every unresolved generation, its
+  retry/recovery data, helper plan, and complete delivery history;
+- standalone recovery clearing is not public or used by round cleanup, and the
+  destructive primitive runs only under exclusive account deletion;
 - partial pruning refuses protected ranges without renumbering bundles;
 - deletion gates block new work and wait for active work;
 - planners and recovery snapshots derive from the authoritative row; and

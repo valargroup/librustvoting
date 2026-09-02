@@ -1307,30 +1307,24 @@ Regression tests: `migrate_from_launch_version_preserves_delegation_state`,
 
 ### Recovery cleanup
 
-Explicit recovery cleanup removes only share-delivery rows and retryable,
-unconfirmed vote recovery artifacts that are not protected by an authoritative
-chain-submission row. For `Submitting`, `Tracking`, `Recovering`, `Confirmed`,
-and `LegacyConfirmed`, it preserves the complete helper plan and every
-accepted, attempting, ambiguous, scheduled, or otherwise pending delivery row
-bound to that generation. Preserving only the plan is insufficient because
-forgetting a possibly dispatched helper POST would make later delivery treat it
-as fresh work. Cleanup also preserves ballot intent, confirmed vote positions,
-and imported delegation capabilities. Explicit round or account deletion is
-the separate destructive operation.
+There is no standalone recovery-cleanup operation. Ordinary cleanup, reset,
+and round deletion do not call `clear_recovery_state`; they preserve helper
+plans and delivery history required by unresolved or confirmed chain
+submissions.
+
+`clear_recovery_state` is a private destructive primitive used only by explicit
+account deletion. It may remove every share-delivery row and retryable recovery
+artifact because account deletion removes the owning local account. The account
+operation gate must be closed, new entrants blocked, and active work drained
+before it runs. Exclusive access is retained through deletion.
 
 Enforcement:
-[`recovery::clear`](../zcash_voting/src/recovery.rs) and
-`clear_recovery_state` in
+the account-deletion path and private `clear_recovery_state` in
 [`storage/queries/mod.rs`](../zcash_voting/src/storage/queries/mod.rs).
 
-Regression tests:
-`clear_preserves_recorded_positions_and_resets_unconfirmed_votes` and
-`test_clear_recovery_state_resets_vote_recovery`, plus
-`initial_delivery_does_not_recreate_share_after_recovery_cleanup` for cleanup
-racing active helper delivery. Those removal cases apply only to unprotected
-state. Coverage must also show that cleanup preserves a protected generation's
-plan and complete delivery history, including attempting and ambiguous POST
-records, until delivery completes or explicit round or account deletion occurs.
+Regression coverage must show that ordinary cleanup, reset, and round deletion
+cannot invoke the primitive; account deletion waits for active helper work and
+then removes delivery rows; and no public recovery-clear API remains.
 
 ## Helper identity and payload invariants
 
