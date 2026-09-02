@@ -19,24 +19,31 @@
 //!    digest as a delivery acknowledgement. The funds controller compares it
 //!    with the stored digest and redelivers the same bytes after a mismatch or
 //!    missing acknowledgement.
-//! 5. After broadcast, the voter calls [`voter_confirm_delegation`] for every
-//!    bundle with its confirmed transaction event. Imported capability rounds
-//!    cannot create votes until every bundle has a public VAN position.
-//! 6. The voter calls [`voter_build_signed_vote`], submits the vote-chain
-//!    payload, asks the SDK to prepare the complete helper-share plan, records
-//!    its confirmed tree position, then submits the prepared plan through
-//!    [`crate::example_vote`].
+//! 5. After broadcast, the voter drives [`voter_advance_delegation`] for every
+//!    bundle until it confirms. The SDK polls the transaction and records the
+//!    public VAN position; the voter supplies no hash and no chain events.
+//!    Imported capability rounds cannot create votes until every bundle has a
+//!    public VAN position.
+//! 6. The voter calls [`voter_build_signed_vote`], drives the cast-vote
+//!    transaction with [`crate::example_vote::advance_committed_vote`], asks
+//!    the SDK to prepare the complete helper-share plan, then submits the
+//!    prepared plan through [`crate::example_vote`]. The SDK records the
+//!    confirmed tree position itself.
 //!
-//! Authenticated transport, durable controller outbox storage, chain
-//! submission, event monitoring, helper transport routing, cancellation, and
-//! tracking timers remain owned by the integrating applications. Helper plan
+//! Authenticated transport, durable controller outbox storage, helper transport
+//! routing, cancellation, and scheduling remain owned by the integrating
+//! applications. Chain submission, event interpretation, and confirmation are
+//! owned by the SDK lifecycle. Helper plan
 //! persistence is SDK-owned.
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
+
 use zcash_voting::prelude::{
-    confirm_delegation_submission, CommittedVote, DelegationCapabilityDigest,
-    DelegationConfirmation, DraftVote, ExportedDelegationCapability, Network,
-    RoundBoundVotingHotkeyTarget, TxEvent, VotingDb, VotingHotkey,
+    AdvanceImportedDelegation, ChainSubmissionClient, ChainSubmissionClientConfig,
+    ChainSubmissionControl, ChainSubmissionResult, CommittedVote, DelegationCapabilityDigest,
+    DraftVote, ExportedDelegationCapability, Network, RoundBoundVotingHotkeyTarget, VotingDb,
+    VotingHotkey,
 };
 use zcash_voting::VotingRoundParams;
 
@@ -106,30 +113,41 @@ pub fn voter_import_capability(
     .context("import voter delegation capability")
 }
 
-/// Voter step: records the confirmed delegation transaction and VAN position.
-pub fn voter_confirm_delegation(
-    voting_db: &VotingDb,
-    round_id: &str,
+/// Voter step: advances the imported bundle's delegation submission one pass.
+///
+/// The SDK adopts the package's already-broadcast transaction hash, polls it,
+/// and writes the confirmed VAN position atomically. It never submits this
+/// transaction. A voter never supplies signing material, parses chain events,
+/// or records a transaction hash. Re-invoke while the result is
+/// [`ChainSubmissionResult::Pending`]; the confirmed VAN position is available
+/// from the returned confirmation.
+pub async fn voter_advance_delegation(
+    voting_db: Arc<VotingDb>,
+    config: ChainSubmissionClientConfig,
+    vote_round_id: [u8; 32],
     bundle_index: u32,
-    delegation_tx_hash: &str,
-    events: &[TxEvent],
-) -> Result<DelegationConfirmation> {
-    confirm_delegation_submission(
-        voting_db,
-        round_id,
-        bundle_index,
-        delegation_tx_hash,
-        events,
-    )
-    .context("record voter delegation confirmation")
+    control: &ChainSubmissionControl,
+) -> Result<ChainSubmissionResult> {
+    let client = ChainSubmissionClient::new(voting_db, config)
+        .map_err(|failure| anyhow::anyhow!("build chain submission client: {failure}"))?;
+    client
+        .advance_imported_delegation(
+            AdvanceImportedDelegation {
+                vote_round_id,
+                bundle_index,
+            },
+            control,
+        )
+        .await
+        .map_err(|failure| anyhow::anyhow!("advance delegation chain submission: {failure}"))
 }
 
 /// Voter step: syncs the confirmed VAN, builds ZKP2, and signs one vote.
 ///
-/// Submit the chain payload from
-/// [`crate::example_vote::committed_vote_submission`], then persist its hash
-/// and confirmed tree position with
-/// [`crate::example_vote::record_committed_vote_execution`]. Ask the SDK to
+/// Drive the cast-vote transaction with
+/// [`crate::example_vote::advance_committed_vote`] until it confirms; the SDK
+/// records the transaction hash and confirmed tree position itself. Ask the SDK
+/// to
 /// create and persist one complete helper plan with
 /// [`crate::example_vote::prepare_committed_vote_shares`] before calling
 /// [`crate::example_vote::submit_committed_vote_shares`]. After restart,

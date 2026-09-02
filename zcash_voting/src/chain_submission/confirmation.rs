@@ -5,7 +5,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use crate::{confirmation::TxEvent, types::VotingError};
 
 use super::{
-    generation::{DerivedChainSubmission, ExpectedTreeLayout},
+    generation::{BoundGeneration, DerivedChainSubmission, ExpectedTreeLayout},
     result::ValidatedChainSubmissionConfirmation,
     ChainSubmissionTarget,
 };
@@ -184,6 +184,36 @@ pub(super) fn validate_hash_confirmation(
     }
 }
 
+/// Validates a committed capability-imported delegation without requiring a
+/// reconstructable request body.
+pub(super) fn validate_imported_delegation_confirmation(
+    bound: &BoundGeneration,
+    transaction_hash: super::CandidateTransactionHash,
+    events: &[TxEvent],
+) -> Result<ValidatedChainSubmissionConfirmation, VotingError> {
+    let identity = bound.generation().identity();
+    if !matches!(
+        (identity.target(), bound.expected_layout()),
+        (
+            ChainSubmissionTarget::Delegation,
+            ExpectedTreeLayout::Delegation { .. }
+        )
+    ) {
+        return Err(VotingError::InvalidInput {
+            message: "imported delegation confirmation has an invalid generation layout"
+                .to_string(),
+        });
+    }
+    let round_id = hex::encode(identity.vote_round_id());
+    let event = required_event_for_round(events, DELEGATE_VOTE_EVENT, &round_id)?;
+    let final_van_position = parse_compat_u64(
+        required_attribute(event, DELEGATE_VOTE_EVENT, LEAF_INDEX_ATTRIBUTE)?,
+        "delegate_vote leaf_index",
+    )?;
+    ValidatedChainSubmissionConfirmation::from_hash(transaction_hash, final_van_position, vec![])
+        .map_err(confirmation_error)
+}
+
 fn required_event_for_round<'a>(
     events: &'a [TxEvent],
     event_type: &str,
@@ -346,17 +376,17 @@ fn confirmation_error(error: super::ChainSubmissionConfirmationError) -> VotingE
 /// back its transaction if this function returns an error.
 pub(super) fn apply_confirmed_generation(
     conn: &rusqlite::Transaction<'_>,
-    derived: &DerivedChainSubmission,
+    bound: &BoundGeneration,
     confirmation: &ValidatedChainSubmissionConfirmation,
 ) -> Result<(), VotingError> {
-    let generation = derived.generation();
+    let generation = bound.generation();
     let identity = generation.identity();
     let round_id = hex::encode(identity.vote_round_id());
     let confirmation = confirmation.confirmation();
     let transaction_hash = confirmation.transaction_hash().map(|hash| hash.to_string());
     let positions = confirmation.vote_commitment_positions();
 
-    match (identity.target(), derived.expected_layout()) {
+    match (identity.target(), bound.expected_layout()) {
         (ChainSubmissionTarget::Delegation, ExpectedTreeLayout::Delegation { .. })
             if positions.is_empty() =>
         {
@@ -391,7 +421,7 @@ pub(super) fn apply_confirmed_generation(
                 vote_commitments, ..
             },
         ) if positions.len() == vote_commitments.len()
-            && derived.ordered_proposal_ids().len() == positions.len() =>
+            && bound.ordered_proposal_ids().len() == positions.len() =>
         {
             crate::confirmation::apply_vote_batch_confirmation_with_conn(
                 conn,
@@ -402,7 +432,7 @@ pub(super) fn apply_confirmed_generation(
                 transaction_hash.as_deref(),
                 confirmation.final_van_position(),
                 positions,
-                Some(derived.ordered_proposal_ids()),
+                Some(bound.ordered_proposal_ids()),
                 None,
             )
         }

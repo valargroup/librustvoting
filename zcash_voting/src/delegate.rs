@@ -771,7 +771,8 @@ pub struct DelegationSubmission {
 /// Signed delegation bundle plus bundle-level metadata for wallet submission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedDelegationBundle {
-    /// Chain-ready delegation fields produced by [`submission`].
+    /// Chain-ready delegation fields produced by
+    /// [`PreparedDelegationBundle::submission`].
     pub submission: DelegationSubmission,
     /// Full governance PCZT bytes that were signed for this bundle.
     pub pczt_bytes: Vec<u8>,
@@ -956,7 +957,9 @@ impl PreparedDelegationBundle {
         let signer = match signer {
             PreparedSigner::Signature { sig, sighash } => DelegationSigner::signature(sig, sighash),
         };
-        crate::delegate::submission(voting_db, &self.round_id, self.bundle_index, signer)
+        let wallet_id = voting_db.wallet_id();
+        let conn = voting_db.conn();
+        submission_with_conn(&conn, &wallet_id, &self.round_id, self.bundle_index, signer)
     }
 
     /// Assembles a signed delegation bundle plus wallet-facing metadata.
@@ -1168,21 +1171,7 @@ pub fn prove(
     })
 }
 
-/// Assembles chain-ready delegation submission fields for one bundle.
-///
-/// Signers provide a SpendAuth signature over the stored PCZT sighash.
-pub fn submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    signer: DelegationSigner,
-) -> Result<DelegationSubmission, VotingError> {
-    let wallet_id = db.wallet_id();
-    let conn = db.conn();
-    submission_with_conn(&conn, &wallet_id, round_id, bundle_index, signer)
-}
-
-/// Reconstructs a delegation request from durable state on `conn`.
+/// Reconstructs a chain-ready delegation request from durable state on `conn`.
 ///
 /// The supplied signature must verify under the stored randomized key and
 /// stored PCZT sighash. This function performs no signing or durable writes.
@@ -1236,29 +1225,6 @@ pub(crate) fn submission_with_conn(
         sighash,
         tx1_effects: data.tx1_effects,
     })
-}
-
-/// Records the submitted delegation transaction hash for recovery.
-pub fn record_submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    tx_hash: &str,
-) -> Result<(), VotingError> {
-    db.store_delegation_tx_hash(round_id, bundle_index, tx_hash)
-}
-
-/// Records the confirmed VAN leaf position for a delegated bundle.
-///
-/// Cast-vote callers should use `confirmation::confirm_vote_submission` so the
-/// vote hash, successor VAN position, and VC position are stored atomically.
-pub fn record_van_position(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    position: u32,
-) -> Result<(), VotingError> {
-    db.store_van_position(round_id, bundle_index, position)
 }
 
 /// Extracts the ZIP-244 shielded sighash from a serialized voting PCZT.

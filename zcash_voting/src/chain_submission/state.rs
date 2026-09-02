@@ -43,6 +43,7 @@ pub(super) enum SubmissionObservation {
     CandidatePending,
     TrackingWindowExpired(ChainSubmissionDiagnostic),
     CandidateCommittedFailure(ChainSubmissionDiagnostic),
+    TerminalCandidateFailure(ChainSubmissionDiagnostic),
     Confirmed(ValidatedChainSubmissionConfirmation),
     ContinueRecovery,
     AbandonedSubmitting(ChainSubmissionDiagnostic),
@@ -101,6 +102,10 @@ pub(super) fn apply_submission_observation(
             candidate_transaction_hash: None,
             ambiguity_diagnostic: diagnostic,
         })),
+        (
+            Some(State::Tracking { .. } | State::Recovering { .. }),
+            Observation::TerminalCandidateFailure(diagnostic),
+        ) => Ok(Some(State::Rejected(diagnostic))),
         (
             Some(State::Tracking {
                 candidate_transaction_hash,
@@ -217,6 +222,7 @@ impl SubmissionObservation {
             Self::CandidatePending => "candidate_pending",
             Self::TrackingWindowExpired(_) => "tracking_window_expired",
             Self::CandidateCommittedFailure(_) => "candidate_committed_failure",
+            Self::TerminalCandidateFailure(_) => "terminal_candidate_failure",
             Self::Confirmed(_) => "confirmed",
             Self::ContinueRecovery => "continue_recovery",
             Self::AbandonedSubmitting(_) => "abandoned_submitting",
@@ -401,6 +407,28 @@ mod tests {
     }
 
     #[test]
+    fn terminal_candidate_failure_rejects_poll_only_tracking_and_recovery() {
+        let failure = diagnostic("imported transaction committed unsuccessfully");
+        for state in [
+            SubmissionRecordState::Tracking {
+                candidate_transaction_hash: candidate(4),
+            },
+            SubmissionRecordState::Recovering {
+                candidate_transaction_hash: Some(candidate(4)),
+                ambiguity_diagnostic: diagnostic("tracking expired"),
+            },
+        ] {
+            assert_eq!(
+                apply(
+                    Some(state),
+                    SubmissionObservation::TerminalCandidateFailure(failure.clone())
+                ),
+                Some(SubmissionRecordState::Rejected(failure.clone()))
+            );
+        }
+    }
+
+    #[test]
     fn tracking_confirmation_requires_durable_hash() {
         assert_eq!(
             apply_submission_observation(
@@ -533,6 +561,7 @@ mod tests {
         CandidatePending,
         TrackingWindowExpired,
         CandidateCommittedFailure,
+        TerminalCandidateFailure,
         ConfirmedByHash,
         ConfirmedByTree,
         ContinueRecovery,
@@ -540,7 +569,7 @@ mod tests {
     }
 
     impl ObservationKind {
-        const ALL: [Self; 12] = [
+        const ALL: [Self; 13] = [
             Self::ReserveFreshSubmission,
             Self::DefinitelyUnsent,
             Self::UsableCandidateHash,
@@ -549,6 +578,7 @@ mod tests {
             Self::CandidatePending,
             Self::TrackingWindowExpired,
             Self::CandidateCommittedFailure,
+            Self::TerminalCandidateFailure,
             Self::ConfirmedByHash,
             Self::ConfirmedByTree,
             Self::ContinueRecovery,
@@ -574,6 +604,9 @@ mod tests {
                 }
                 Self::CandidateCommittedFailure => {
                     SubmissionObservation::CandidateCommittedFailure(diagnostic("failed"))
+                }
+                Self::TerminalCandidateFailure => {
+                    SubmissionObservation::TerminalCandidateFailure(diagnostic("terminal"))
                 }
                 Self::ConfirmedByHash => {
                     SubmissionObservation::Confirmed(hash_confirmation(candidate(1)))
@@ -606,6 +639,7 @@ mod tests {
                 Observation::CandidatePending
                     | Observation::TrackingWindowExpired
                     | Observation::CandidateCommittedFailure
+                    | Observation::TerminalCandidateFailure
                     | Observation::ConfirmedByHash
             ),
             State::RecoveringWithoutCandidate => matches!(
@@ -614,6 +648,7 @@ mod tests {
                     | Observation::UsableCandidateHash
                     | Observation::PossiblyDispatched
                     | Observation::DefiniteRejection
+                    | Observation::TerminalCandidateFailure
                     | Observation::ConfirmedByTree
                     | Observation::ContinueRecovery
             ),
@@ -625,6 +660,7 @@ mod tests {
                     | Observation::DefiniteRejection
                     | Observation::CandidatePending
                     | Observation::CandidateCommittedFailure
+                    | Observation::TerminalCandidateFailure
                     | Observation::ConfirmedByHash
                     | Observation::ConfirmedByTree
                     | Observation::ContinueRecovery

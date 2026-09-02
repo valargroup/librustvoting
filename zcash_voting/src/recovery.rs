@@ -4,6 +4,7 @@
 //! fetch one typed snapshot instead of querying low-level storage tables.
 
 use crate::{
+    chain_submission::planning::{delegation_transaction_hash, vote_transaction_hash},
     phases::{DelegationPhase, SharePhase, VotePhase, WorkflowPhase},
     round::VotingDb,
     share,
@@ -99,9 +100,8 @@ pub fn recoverable_commitment_bundle(
     proposal_id: u32,
 ) -> Result<Option<RecoverableCommitmentBundle>, VotingError> {
     let fields = db.get_commitment_bundle_recovery_fields(round_id, bundle_index, proposal_id)?;
-    let has_vote_tx_hash = db
-        .get_vote_tx_hash(round_id, bundle_index, proposal_id)?
-        .is_some();
+    let has_vote_tx_hash =
+        vote_transaction_hash(db, round_id, bundle_index, proposal_id)?.is_some();
 
     match fields {
         Some((Some(commitment_bundle_json), Some(position))) => {
@@ -184,7 +184,7 @@ pub fn round_snapshot(db: &VotingDb, round_id: &str) -> Result<RoundRecoverySnap
             Ok(DelegationRecovery {
                 bundle_index,
                 phase,
-                tx_hash: db.get_delegation_tx_hash(round_id, bundle_index)?,
+                tx_hash: delegation_transaction_hash(db, round_id, bundle_index)?,
                 van_leaf_position: db.load_optional_van_position_u64(round_id, bundle_index)?,
             })
         })
@@ -230,7 +230,7 @@ fn build_vote_recovery_rows(
     db.vote_phases(round_id)?
         .into_iter()
         .map(|(bundle_index, proposal_id, phase)| {
-            let tx_hash = db.get_vote_tx_hash(round_id, bundle_index, proposal_id)?;
+            let tx_hash = vote_transaction_hash(db, round_id, bundle_index, proposal_id)?;
             let fields =
                 db.get_commitment_bundle_recovery_fields(round_id, bundle_index, proposal_id)?;
             let (has_commitment_bundle, vc_tree_position) = match fields {

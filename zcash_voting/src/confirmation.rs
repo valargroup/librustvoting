@@ -1,28 +1,17 @@
-//! Chain confirmation parsing and durable submission recording.
+//! Durable domain projection applied when a chain submission confirms.
 //!
-//! Wallets submit delegation and cast-vote transactions through their own chain
-//! clients. This module owns the common step that turns the confirmed tx events
-//! back into voting DB state.
+//! This module is a private lifecycle mechanism. The `chain_submission`
+//! coordinator owns submission, polling, and event interpretation; these
+//! `apply_*_with_conn` operations write the delegation and vote projections
+//! inside the caller's transaction so submission state, domain state, and
+//! helper-share advancement commit atomically. There is no public entry point
+//! that lets a host record a confirmation itself.
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use rusqlite::{named_params, OptionalExtension, TransactionBehavior};
+use rusqlite::{named_params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{queries, VotingDb};
+use crate::storage::queries;
 use crate::types::VotingError;
-pub use crate::wire::{DelegationConfirmation, VoteBatchConfirmation, VoteConfirmation};
-
-const DELEGATE_VOTE_EVENT: &str = "delegate_vote";
-const CAST_VOTE_EVENT: &str = "cast_vote";
-const CAST_VOTE_BATCH_EVENT: &str = "cast_vote_batch";
-const LEAF_INDEX_ATTRIBUTE: &str = "leaf_index";
-const BATCH_DIGEST_ATTRIBUTE: &str = "batch_digest";
-const BATCH_SIZE_ATTRIBUTE: &str = "batch_size";
-const FINAL_VAN_LEAF_INDEX_ATTRIBUTE: &str = "final_van_leaf_index";
-const VC_LEAF_INDICES_ATTRIBUTE: &str = "vote_commitment_leaf_indices";
-const PROPOSAL_IDS_ATTRIBUTE: &str = "proposal_ids";
-const VAN_NULLIFIERS_ATTRIBUTE: &str = "van_nullifiers";
-const ROUND_ID_ATTRIBUTES: [&str; 2] = ["vote_round_id", "round_id"];
 
 /// One chain transaction event returned by a wallet's chain client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,224 +30,6 @@ pub struct TxEventAttribute {
     pub key: String,
     /// Attribute value.
     pub value: String,
-}
-
-/// Parses and records a confirmed delegation transaction in one durable step.
-///
-/// # Errors
-///
-/// Returns an error when confirmation parsing fails, the bundle row is missing,
-/// the event round id does not match `round_id`, stored confirmation fields
-/// conflict, multiple same-round delegation events are present, or the DB
-/// transaction cannot commit.
-pub fn confirm_delegation_submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    tx_hash: &str,
-    events: &[TxEvent],
-) -> Result<DelegationConfirmation, VotingError> {
-    let confirmation = parse_delegation_confirmation_for_round(tx_hash, round_id, events)?;
-    record_delegation_confirmation(db, round_id, bundle_index, &confirmation)?;
-    Ok(confirmation)
-}
-
-/// Records a confirmed delegation transaction atomically.
-///
-/// Repeated calls with the same tx hash are accepted. If later cast-vote
-/// confirmations have already advanced the bundle's current VAN pointer, the
-/// delegation replay records the tx hash without rewinding the pointer.
-///
-/// # Errors
-///
-/// Returns an error when the bundle row is missing, stored confirmation fields
-/// conflict, or the DB transaction cannot commit.
-fn record_delegation_confirmation(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    confirmation: &DelegationConfirmation,
-) -> Result<(), VotingError> {
-    require_tx_hash(&confirmation.tx_hash)?;
-    let mut conn = db.conn();
-    let wallet_id = db.wallet_id();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("delegation confirmation transaction failed: {e}"),
-        })?;
-    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-    )?;
-
-    apply_delegation_confirmation_with_conn(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-        Some(&confirmation.tx_hash),
-        u64::from(confirmation.van_leaf_position),
-    )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit delegation confirmation transaction failed: {e}"),
-    })
-}
-
-/// Parses and records a confirmed cast-vote transaction in one durable step.
-///
-/// # Errors
-///
-/// Returns an error when confirmation parsing fails, the vote or bundle row is
-/// missing, the event round id does not match `round_id`, stored confirmation
-/// fields conflict, the vote belongs to an atomic batch, multiple same-round
-/// cast-vote events are present, or the DB transaction cannot commit.
-pub fn confirm_vote_submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    tx_hash: &str,
-    events: &[TxEvent],
-) -> Result<VoteConfirmation, VotingError> {
-    let confirmation = parse_vote_confirmation_for_round(tx_hash, round_id, events)?;
-    record_vote_confirmation(db, round_id, bundle_index, proposal_id, &confirmation)?;
-    Ok(confirmation)
-}
-
-/// Parses and atomically records a confirmed atomic cast-vote batch.
-pub fn confirm_vote_batch_submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    expected_batch_digest: &[u8],
-    tx_hash: &str,
-    events: &[TxEvent],
-) -> Result<VoteBatchConfirmation, VotingError> {
-    let expected_batch_digest: [u8; 32] =
-        expected_batch_digest
-            .try_into()
-            .map_err(|_| VotingError::InvalidInput {
-                message: format!(
-                    "expected_batch_digest must be 32 bytes, got {}",
-                    expected_batch_digest.len()
-                ),
-            })?;
-    let confirmation = parse_vote_batch_confirmation_for_round(tx_hash, round_id, events)?;
-    if confirmation.batch_digest.as_slice() != expected_batch_digest {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "cast_vote_batch digest mismatch: expected {}, got {}",
-                hex::encode(expected_batch_digest),
-                hex::encode(&confirmation.batch_digest)
-            ),
-        });
-    }
-    record_vote_batch_confirmation(
-        db,
-        round_id,
-        bundle_index,
-        expected_batch_digest,
-        &confirmation,
-        events,
-    )?;
-    Ok(confirmation)
-}
-
-fn record_vote_batch_confirmation(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    batch_digest: [u8; 32],
-    confirmation: &VoteBatchConfirmation,
-    events: &[TxEvent],
-) -> Result<(), VotingError> {
-    require_tx_hash(&confirmation.tx_hash)?;
-    let event = required_event_for_round(events, CAST_VOTE_BATCH_EVENT, round_id)?;
-    let event_nullifiers = parse_csv_strings(required_attribute(
-        event,
-        CAST_VOTE_BATCH_EVENT,
-        VAN_NULLIFIERS_ATTRIBUTE,
-    )?)?;
-    let mut conn = db.conn();
-    let wallet_id = db.wallet_id();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("vote batch confirmation transaction failed: {e}"),
-        })?;
-    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-    )?;
-    apply_vote_batch_confirmation_with_conn(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-        batch_digest,
-        Some(&confirmation.tx_hash),
-        u64::from(confirmation.van_leaf_position),
-        &confirmation.vc_tree_positions,
-        Some(&confirmation.proposal_ids),
-        Some(&event_nullifiers),
-    )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote batch confirmation transaction failed: {e}"),
-    })
-}
-
-/// Records a confirmed cast-vote transaction atomically.
-///
-/// Repeated calls with the same tx hash and VC tree position are accepted. The
-/// bundle's current VAN leaf position advances to the confirmed cast-vote output
-/// position, but an older confirmation replay cannot rewind it.
-///
-/// # Errors
-///
-/// Returns an error when the vote or bundle row is missing, stored confirmation
-/// fields conflict, ballot intent no longer matches the vote, or the DB
-/// transaction cannot commit.
-fn record_vote_confirmation(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    confirmation: &VoteConfirmation,
-) -> Result<(), VotingError> {
-    require_tx_hash(&confirmation.tx_hash)?;
-    let mut conn = db.conn();
-    let wallet_id = db.wallet_id();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("vote confirmation transaction failed: {e}"),
-        })?;
-    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-    )?;
-
-    apply_vote_confirmation_with_conn(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-        proposal_id,
-        Some(&confirmation.tx_hash),
-        u64::from(confirmation.van_leaf_position),
-        confirmation.vc_tree_position,
-    )?;
-
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote confirmation transaction failed: {e}"),
-    })
 }
 
 fn require_sqlite_position(position: u64, field: &str) -> Result<(), VotingError> {
@@ -479,222 +250,6 @@ fn require_vote_recovery_json(
     }
 }
 
-fn parse_delegation_confirmation_for_round(
-    tx_hash: &str,
-    round_id: &str,
-    events: &[TxEvent],
-) -> Result<DelegationConfirmation, VotingError> {
-    require_tx_hash(tx_hash)?;
-    let event = required_event_for_round(events, DELEGATE_VOTE_EVENT, round_id)?;
-    let raw_leaf_index = required_attribute(event, DELEGATE_VOTE_EVENT, LEAF_INDEX_ATTRIBUTE)?;
-    let van_leaf_position = parse_compat_u32(raw_leaf_index, "delegate_vote leaf_index")?;
-    Ok(DelegationConfirmation {
-        tx_hash: tx_hash.to_string(),
-        van_leaf_position,
-    })
-}
-
-fn parse_vote_confirmation_for_round(
-    tx_hash: &str,
-    round_id: &str,
-    events: &[TxEvent],
-) -> Result<VoteConfirmation, VotingError> {
-    require_tx_hash(tx_hash)?;
-    let event = required_event_for_round(events, CAST_VOTE_EVENT, round_id)?;
-    let raw_leaf_index = required_attribute(event, CAST_VOTE_EVENT, LEAF_INDEX_ATTRIBUTE)?;
-    parse_vote_confirmation_leaf_index(tx_hash, raw_leaf_index)
-}
-
-fn parse_vote_batch_confirmation_for_round(
-    tx_hash: &str,
-    round_id: &str,
-    events: &[TxEvent],
-) -> Result<VoteBatchConfirmation, VotingError> {
-    require_tx_hash(tx_hash)?;
-    let event = required_event_for_round(events, CAST_VOTE_BATCH_EVENT, round_id)?;
-    let batch_digest = hex::decode(required_attribute(
-        event,
-        CAST_VOTE_BATCH_EVENT,
-        BATCH_DIGEST_ATTRIBUTE,
-    )?)
-    .map_err(|e| VotingError::InvalidInput {
-        message: format!("cast_vote_batch batch_digest is not hex: {e}"),
-    })?;
-    if batch_digest.len() != 32 {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "cast_vote_batch batch_digest must decode to 32 bytes, got {}",
-                batch_digest.len()
-            ),
-        });
-    }
-    let batch_size = parse_compat_u32(
-        required_attribute(event, CAST_VOTE_BATCH_EVENT, BATCH_SIZE_ATTRIBUTE)?,
-        "cast_vote_batch batch_size",
-    )? as usize;
-    let van_leaf_position = parse_compat_u32(
-        required_attribute(event, CAST_VOTE_BATCH_EVENT, FINAL_VAN_LEAF_INDEX_ATTRIBUTE)?,
-        "cast_vote_batch final VAN leaf position",
-    )?;
-    let proposal_ids = parse_csv_u32(required_attribute(
-        event,
-        CAST_VOTE_BATCH_EVENT,
-        PROPOSAL_IDS_ATTRIBUTE,
-    )?)?;
-    let vc_tree_positions = parse_csv_u64(required_attribute(
-        event,
-        CAST_VOTE_BATCH_EVENT,
-        VC_LEAF_INDICES_ATTRIBUTE,
-    )?)?;
-    if batch_size == 0 || proposal_ids.len() != batch_size || vc_tree_positions.len() != batch_size
-    {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "cast_vote_batch event size mismatch: size={batch_size}, proposals={}, VC positions={}",
-                proposal_ids.len(),
-                vc_tree_positions.len()
-            ),
-        });
-    }
-    Ok(VoteBatchConfirmation {
-        tx_hash: tx_hash.to_string(),
-        batch_digest,
-        van_leaf_position,
-        proposal_ids,
-        vc_tree_positions,
-    })
-}
-
-fn parse_vote_confirmation_leaf_index(
-    tx_hash: &str,
-    raw_leaf_index: &str,
-) -> Result<VoteConfirmation, VotingError> {
-    let parts = raw_leaf_index.split(',').collect::<Vec<_>>();
-    if parts.len() != 2 {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "malformed cast_vote leaf_index {raw_leaf_index:?}; expected van_position,vc_position"
-            ),
-        });
-    }
-
-    let van_leaf_position = parse_u32(parts[0].trim(), "cast_vote VAN leaf position")?;
-    let vc_tree_position = parse_u64(parts[1].trim(), "cast_vote VC tree position")?;
-    Ok(VoteConfirmation {
-        tx_hash: tx_hash.to_string(),
-        van_leaf_position,
-        vc_tree_position,
-    })
-}
-
-fn required_event_for_round<'a>(
-    events: &'a [TxEvent],
-    event_type: &str,
-    round_id: &str,
-) -> Result<&'a TxEvent, VotingError> {
-    let mut matching_event: Option<&TxEvent> = None;
-    let mut wrong_round: Option<&str> = None;
-    let mut saw_event_without_round = false;
-
-    for event in events.iter().filter(|event| event.event_type == event_type) {
-        match round_attribute(event) {
-            Some(event_round_id) if event_round_id_matches(event_round_id, round_id) => {
-                if matching_event.is_some() {
-                    return Err(VotingError::InvalidInput {
-                        message: format!(
-                            "ambiguous {event_type} events for round {round_id}; expected exactly one matching event"
-                        ),
-                    });
-                }
-                matching_event = Some(event);
-            }
-            Some(event_round_id) => wrong_round = Some(event_round_id),
-            None => saw_event_without_round = true,
-        }
-    }
-
-    if let Some(event) = matching_event {
-        return Ok(event);
-    }
-    if let Some(event_round_id) = wrong_round {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "{event_type} round id mismatch: expected {round_id}, got {event_round_id}"
-            ),
-        });
-    }
-    if saw_event_without_round {
-        return Err(VotingError::InvalidInput {
-            message: format!("{event_type} event is missing vote_round_id or round_id"),
-        });
-    }
-    Err(VotingError::InvalidInput {
-        message: format!("missing {event_type} event in transaction events"),
-    })
-}
-
-fn round_attribute(event: &TxEvent) -> Option<&str> {
-    ROUND_ID_ATTRIBUTES
-        .iter()
-        .find_map(|key| event_attribute(event, key))
-}
-
-fn required_attribute<'a>(
-    event: &'a TxEvent,
-    event_type: &str,
-    key: &str,
-) -> Result<&'a str, VotingError> {
-    event_attribute(event, key).ok_or_else(|| VotingError::InvalidInput {
-        message: format!("missing {event_type} {key} in transaction events"),
-    })
-}
-
-fn event_attribute<'a>(event: &'a TxEvent, key: &str) -> Option<&'a str> {
-    event
-        .attributes
-        .iter()
-        .find(|attribute| attribute.key == key)
-        .map(|attribute| attribute.value.as_str())
-}
-
-fn event_round_id_matches(event_round_id: &str, expected_round_id: &str) -> bool {
-    // Recover exact plain text that a compatibility client mistook for Base64.
-    event_round_id == expected_round_id
-        || BASE64_STANDARD.encode(event_round_id.as_bytes()) == expected_round_id
-}
-
-fn parse_compat_u32(raw: &str, field: &str) -> Result<u32, VotingError> {
-    let raw = raw.trim();
-    if let Ok(position) = raw.parse::<u32>() {
-        return Ok(position);
-    }
-
-    // Some chain clients opportunistically Base64-decode CometBFT event text.
-    // Re-encoding restores a numeric position that was mistaken for Base64.
-    if !raw.is_ascii() {
-        if let Ok(position) = BASE64_STANDARD.encode(raw.as_bytes()).parse::<u32>() {
-            return Ok(position);
-        }
-    }
-
-    parse_u32(raw, field)
-}
-
-fn parse_compat_u64(raw: &str, field: &str) -> Result<u64, VotingError> {
-    let raw = raw.trim();
-    if let Ok(position) = raw.parse::<u64>() {
-        return Ok(position);
-    }
-
-    if !raw.is_ascii() {
-        if let Ok(position) = BASE64_STANDARD.encode(raw.as_bytes()).parse::<u64>() {
-            return Ok(position);
-        }
-    }
-
-    parse_u64(raw, field)
-}
-
 fn require_tx_hash(tx_hash: &str) -> Result<(), VotingError> {
     if tx_hash.trim().is_empty() {
         return Err(VotingError::InvalidInput {
@@ -702,51 +257,6 @@ fn require_tx_hash(tx_hash: &str) -> Result<(), VotingError> {
         });
     }
     Ok(())
-}
-
-fn parse_u32(raw: &str, field: &str) -> Result<u32, VotingError> {
-    raw.parse::<u32>().map_err(|_| VotingError::InvalidInput {
-        message: format!("{field} must be an unsigned 32-bit integer, got {raw:?}"),
-    })
-}
-
-fn parse_u64(raw: &str, field: &str) -> Result<u64, VotingError> {
-    raw.parse::<u64>().map_err(|_| VotingError::InvalidInput {
-        message: format!("{field} must be an unsigned 64-bit integer, got {raw:?}"),
-    })
-}
-
-fn parse_csv_strings(raw: &str) -> Result<Vec<String>, VotingError> {
-    if raw.is_empty() {
-        return Err(VotingError::InvalidInput {
-            message: "comma-separated event attribute must not be empty".to_string(),
-        });
-    }
-    let values = raw
-        .split(',')
-        .map(str::trim)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if values.iter().any(String::is_empty) {
-        return Err(VotingError::InvalidInput {
-            message: format!("malformed comma-separated event attribute {raw:?}"),
-        });
-    }
-    Ok(values)
-}
-
-fn parse_csv_u32(raw: &str) -> Result<Vec<u32>, VotingError> {
-    parse_csv_strings(raw)?
-        .into_iter()
-        .map(|value| parse_compat_u32(&value, "cast_vote_batch proposal id"))
-        .collect()
-}
-
-fn parse_csv_u64(raw: &str) -> Result<Vec<u64>, VotingError> {
-    parse_csv_strings(raw)?
-        .into_iter()
-        .map(|value| parse_compat_u64(&value, "cast_vote_batch VC tree position"))
-        .collect()
 }
 
 fn load_bundle_confirmation_fields(
@@ -850,24 +360,115 @@ mod tests {
     use crate::vote::{VoteBatchRecovery, VoteRecoveryBundle};
 
     const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    const OTHER_ROUND_ID: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const WALLET_ID: &str = "wallet-1";
 
-    fn event(event_type: &str, key: &str, value: &str) -> TxEvent {
-        event_with_attrs(event_type, &[(key, value)])
+    /// Typed delegation confirmation used to drive the projection under test.
+    ///
+    /// The lifecycle derives these values from chain events; these tests supply
+    /// them directly so the assertions cover the durable projection rather than
+    /// event parsing.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct DelegationConfirmation {
+        tx_hash: String,
+        van_leaf_position: u32,
     }
 
-    fn event_with_attrs(event_type: &str, attributes: &[(&str, &str)]) -> TxEvent {
-        TxEvent {
-            event_type: event_type.to_string(),
-            attributes: attributes
-                .iter()
-                .map(|(key, value)| TxEventAttribute {
-                    key: key.to_string(),
-                    value: value.to_string(),
-                })
-                .collect(),
-        }
+    /// Typed singleton cast-vote confirmation.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct VoteConfirmation {
+        tx_hash: String,
+        van_leaf_position: u32,
+        vc_tree_position: u64,
+    }
+
+    /// Typed atomic-batch confirmation in signed action order.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct VoteBatchConfirmation {
+        tx_hash: String,
+        van_leaf_position: u32,
+        proposal_ids: Vec<u32>,
+        vc_tree_positions: Vec<u64>,
+    }
+
+    /// Applies a delegation confirmation in its own immediate transaction.
+    fn record_delegation_confirmation(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        confirmation: &DelegationConfirmation,
+    ) -> Result<(), VotingError> {
+        let wallet_id = db.wallet_id();
+        let mut conn = db.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        apply_delegation_confirmation_with_conn(
+            &tx,
+            &wallet_id,
+            round_id,
+            bundle_index,
+            Some(&confirmation.tx_hash),
+            u64::from(confirmation.van_leaf_position),
+        )?;
+        tx.commit().unwrap();
+        Ok(())
+    }
+
+    /// Applies a singleton vote confirmation in its own immediate transaction.
+    fn record_vote_confirmation(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        confirmation: &VoteConfirmation,
+    ) -> Result<(), VotingError> {
+        let wallet_id = db.wallet_id();
+        let mut conn = db.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        apply_vote_confirmation_with_conn(
+            &tx,
+            &wallet_id,
+            round_id,
+            bundle_index,
+            proposal_id,
+            Some(&confirmation.tx_hash),
+            u64::from(confirmation.van_leaf_position),
+            confirmation.vc_tree_position,
+        )?;
+        tx.commit().unwrap();
+        Ok(())
+    }
+
+    /// Applies an atomic-batch confirmation in its own immediate transaction.
+    fn record_vote_batch_confirmation(
+        db: &VotingDb,
+        round_id: &str,
+        bundle_index: u32,
+        batch_digest: [u8; 32],
+        confirmation: &VoteBatchConfirmation,
+        van_nullifiers: &[String],
+    ) -> Result<(), VotingError> {
+        let wallet_id = db.wallet_id();
+        let mut conn = db.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        apply_vote_batch_confirmation_with_conn(
+            &tx,
+            &wallet_id,
+            round_id,
+            bundle_index,
+            batch_digest,
+            Some(&confirmation.tx_hash),
+            u64::from(confirmation.van_leaf_position),
+            &confirmation.vc_tree_positions,
+            Some(&confirmation.proposal_ids),
+            Some(van_nullifiers),
+        )?;
+        tx.commit().unwrap();
+        Ok(())
     }
 
     fn test_db() -> VotingDb {
@@ -1158,287 +759,23 @@ mod tests {
         (digest, [first, second])
     }
 
-    fn vote_batch_events(digest: [u8; 32], recoveries: &[VoteRecoveryBundle]) -> Vec<TxEvent> {
-        let digest = hex::encode(digest);
+    /// Builds the typed two-action batch confirmation plus its VAN nullifiers.
+    fn vote_batch_confirmation(
+        recoveries: &[VoteRecoveryBundle],
+    ) -> (VoteBatchConfirmation, Vec<String>) {
         let nullifiers = recoveries
             .iter()
             .map(|recovery| hex::encode(recovery.van_nullifier))
-            .collect::<Vec<_>>()
-            .join(",");
-        vec![event_with_attrs(
-            CAST_VOTE_BATCH_EVENT,
-            &[
-                ("round_id", ROUND_ID),
-                (BATCH_DIGEST_ATTRIBUTE, &digest),
-                (BATCH_SIZE_ATTRIBUTE, "2"),
-                (FINAL_VAN_LEAF_INDEX_ATTRIBUTE, "10"),
-                (VC_LEAF_INDICES_ATTRIBUTE, "11,12"),
-                (PROPOSAL_IDS_ATTRIBUTE, "1,2"),
-                (VAN_NULLIFIERS_ATTRIBUTE, &nullifiers),
-            ],
-        )]
-    }
-
-    #[test]
-    fn parses_delegation_leaf_index() {
-        let parsed = parse_delegation_confirmation_for_round(
-            "tx-1",
-            ROUND_ID,
-            &[event_with_attrs(
-                DELEGATE_VOTE_EVENT,
-                &[("round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "42")],
-            )],
+            .collect::<Vec<_>>();
+        (
+            VoteBatchConfirmation {
+                tx_hash: "batch-tx".to_string(),
+                van_leaf_position: 10,
+                proposal_ids: vec![1, 2],
+                vc_tree_positions: vec![11, 12],
+            },
+            nullifiers,
         )
-        .unwrap();
-
-        assert_eq!(
-            parsed,
-            DelegationConfirmation {
-                tx_hash: "tx-1".to_string(),
-                van_leaf_position: 42,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_status_values_changed_by_legacy_base64_heuristic() {
-        let round_id = "0400".repeat(16);
-        let decoded_round_id =
-            String::from_utf8(BASE64_STANDARD.decode(&round_id).unwrap()).unwrap();
-        let decoded_leaf_index =
-            String::from_utf8(BASE64_STANDARD.decode("1400").unwrap()).unwrap();
-
-        let parsed = parse_delegation_confirmation_for_round(
-            "tx-1",
-            &round_id,
-            &[event_with_attrs(
-                DELEGATE_VOTE_EVENT,
-                &[
-                    ("vote_round_id", &decoded_round_id),
-                    (LEAF_INDEX_ATTRIBUTE, &decoded_leaf_index),
-                ],
-            )],
-        )
-        .unwrap();
-
-        assert_eq!(parsed.van_leaf_position, 1400);
-    }
-
-    #[test]
-    fn parses_batch_positions_changed_by_legacy_base64_heuristic() {
-        let round_id = "0400".repeat(16);
-        let decoded_round_id =
-            String::from_utf8(BASE64_STANDARD.decode(&round_id).unwrap()).unwrap();
-        let decoded_position = String::from_utf8(BASE64_STANDARD.decode("1400").unwrap()).unwrap();
-        let digest = "ab".repeat(32);
-
-        let parsed = parse_vote_batch_confirmation_for_round(
-            "batch-tx",
-            &round_id,
-            &[event_with_attrs(
-                CAST_VOTE_BATCH_EVENT,
-                &[
-                    ("vote_round_id", &decoded_round_id),
-                    (BATCH_DIGEST_ATTRIBUTE, &digest),
-                    (BATCH_SIZE_ATTRIBUTE, "1"),
-                    (FINAL_VAN_LEAF_INDEX_ATTRIBUTE, &decoded_position),
-                    (VC_LEAF_INDICES_ATTRIBUTE, &decoded_position),
-                    (PROPOSAL_IDS_ATTRIBUTE, "1"),
-                ],
-            )],
-        )
-        .unwrap();
-
-        assert_eq!(parsed.van_leaf_position, 1400);
-        assert_eq!(parsed.vc_tree_positions, vec![1400]);
-    }
-
-    #[test]
-    fn parses_cast_vote_leaf_indexes() {
-        let parsed = parse_vote_confirmation_for_round(
-            "tx-1",
-            ROUND_ID,
-            &[event_with_attrs(
-                CAST_VOTE_EVENT,
-                &[("round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "7,789")],
-            )],
-        )
-        .unwrap();
-
-        assert_eq!(
-            parsed,
-            VoteConfirmation {
-                tx_hash: "tx-1".to_string(),
-                van_leaf_position: 7,
-                vc_tree_position: 789,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_cast_vote_batch_event_in_action_order() {
-        let digest = "ab".repeat(32);
-        let parsed = parse_vote_batch_confirmation_for_round(
-            "batch-tx",
-            ROUND_ID,
-            &[event_with_attrs(
-                CAST_VOTE_BATCH_EVENT,
-                &[
-                    ("round_id", ROUND_ID),
-                    (BATCH_DIGEST_ATTRIBUTE, &digest),
-                    (BATCH_SIZE_ATTRIBUTE, "2"),
-                    (FINAL_VAN_LEAF_INDEX_ATTRIBUTE, "7"),
-                    (VC_LEAF_INDICES_ATTRIBUTE, "8,9"),
-                    (PROPOSAL_IDS_ATTRIBUTE, "1,15"),
-                    (VAN_NULLIFIERS_ATTRIBUTE, "aa,bb"),
-                ],
-            )],
-        )
-        .unwrap();
-
-        assert_eq!(parsed.tx_hash, "batch-tx");
-        assert_eq!(parsed.batch_digest, vec![0xAB; 32]);
-        assert_eq!(parsed.van_leaf_position, 7);
-        assert_eq!(parsed.proposal_ids, vec![1, 15]);
-        assert_eq!(parsed.vc_tree_positions, vec![8, 9]);
-    }
-
-    #[test]
-    fn malformed_cast_vote_leaf_index_fails() {
-        let err = parse_vote_confirmation_for_round(
-            "tx-1",
-            ROUND_ID,
-            &[event_with_attrs(
-                CAST_VOTE_EVENT,
-                &[("round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "7")],
-            )],
-        )
-        .unwrap_err();
-
-        assert!(matches!(err, VotingError::InvalidInput { .. }));
-    }
-
-    #[test]
-    fn parser_scans_later_matching_events() {
-        let parsed = parse_delegation_confirmation_for_round(
-            "tx-1",
-            ROUND_ID,
-            &[
-                TxEvent {
-                    event_type: DELEGATE_VOTE_EVENT.to_string(),
-                    attributes: vec![],
-                },
-                event_with_attrs(
-                    DELEGATE_VOTE_EVENT,
-                    &[("round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "42")],
-                ),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(parsed.van_leaf_position, 42);
-    }
-
-    #[test]
-    fn tx_event_decodes_chain_json_shape() {
-        let events: Vec<TxEvent> = serde_json::from_str(
-            r#"[{"type":"delegate_vote","attributes":[{"key":"vote_round_id","value":"1111111111111111111111111111111111111111111111111111111111111111"},{"key":"leaf_index","value":"42"}]}]"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            parse_delegation_confirmation_for_round("tx-1", ROUND_ID, &events)
-                .unwrap()
-                .van_leaf_position,
-            42
-        );
-    }
-
-    #[test]
-    fn confirm_delegation_uses_event_matching_round_id() {
-        let db = test_db();
-        insert_bundle(&db, 0);
-        let confirmation = confirm_delegation_submission(
-            &db,
-            ROUND_ID,
-            0,
-            "tx-1",
-            &[
-                event_with_attrs(
-                    DELEGATE_VOTE_EVENT,
-                    &[
-                        ("vote_round_id", OTHER_ROUND_ID),
-                        (LEAF_INDEX_ATTRIBUTE, "99"),
-                    ],
-                ),
-                event_with_attrs(
-                    DELEGATE_VOTE_EVENT,
-                    &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "42")],
-                ),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(confirmation.van_leaf_position, 42);
-        assert_eq!(
-            queries::load_van_position(&db.conn(), ROUND_ID, WALLET_ID, 0).unwrap(),
-            42
-        );
-    }
-
-    #[test]
-    fn confirm_delegation_rejects_ambiguous_same_round_events() {
-        let db = test_db();
-        insert_bundle(&db, 0);
-        let err = confirm_delegation_submission(
-            &db,
-            ROUND_ID,
-            0,
-            "tx-1",
-            &[
-                event_with_attrs(
-                    DELEGATE_VOTE_EVENT,
-                    &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "42")],
-                ),
-                event_with_attrs(
-                    DELEGATE_VOTE_EVENT,
-                    &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "43")],
-                ),
-            ],
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("ambiguous delegate_vote events"));
-        assert_eq!(
-            queries::get_delegation_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0)
-                .unwrap()
-                .as_deref(),
-            None
-        );
-    }
-
-    #[test]
-    fn confirm_delegation_rejects_missing_round_id() {
-        let db = test_db();
-        insert_bundle(&db, 0);
-        let err = confirm_delegation_submission(
-            &db,
-            ROUND_ID,
-            0,
-            "tx-1",
-            &[event(DELEGATE_VOTE_EVENT, LEAF_INDEX_ATTRIBUTE, "42")],
-        )
-        .unwrap_err();
-
-        assert!(err
-            .to_string()
-            .contains("missing vote_round_id or round_id"));
-        assert_eq!(
-            queries::get_delegation_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0)
-                .unwrap()
-                .as_deref(),
-            None
-        );
     }
 
     #[test]
@@ -1475,7 +812,7 @@ mod tests {
         insert_bundle(&db, 0);
         let mut conn = db.conn();
         let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
 
         let error = apply_delegation_confirmation_with_conn(
@@ -1499,7 +836,7 @@ mod tests {
 
         let mut conn = db.conn();
         let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
         let position = u64::from(u32::MAX) + 1;
         apply_delegation_confirmation_with_conn(&tx, WALLET_ID, ROUND_ID, 0, None, position)
@@ -1701,14 +1038,12 @@ mod tests {
             store_helper_plan_bound_to_vote(&db, 0, 1),
             store_helper_plan_bound_to_vote(&db, 0, 2),
         ];
-        let events = vote_batch_events(digest, &recoveries);
+        let (confirmation, nullifiers) = vote_batch_confirmation(&recoveries);
 
-        let first =
-            confirm_vote_batch_submission(&db, ROUND_ID, 0, &digest, "batch-tx", &events).unwrap();
-        let replay =
-            confirm_vote_batch_submission(&db, ROUND_ID, 0, &digest, "batch-tx", &events).unwrap();
-
-        assert_eq!(replay, first);
+        record_vote_batch_confirmation(&db, ROUND_ID, 0, digest, &confirmation, &nullifiers)
+            .unwrap();
+        record_vote_batch_confirmation(&db, ROUND_ID, 0, digest, &confirmation, &nullifiers)
+            .unwrap();
         assert_eq!(
             queries::load_van_position(&db.conn(), ROUND_ID, WALLET_ID, 0).unwrap(),
             10
@@ -1762,7 +1097,7 @@ mod tests {
         let db = test_db();
         insert_bundle(&db, 0);
         let (digest, recoveries) = store_two_action_batch(&db);
-        let events = vote_batch_events(digest, &recoveries);
+        let (confirmation, nullifiers) = vote_batch_confirmation(&recoveries);
         db.conn()
             .execute(
                 "UPDATE votes SET vc_tree_position = 999
@@ -1777,8 +1112,9 @@ mod tests {
             )
             .unwrap();
 
-        let error = confirm_vote_batch_submission(&db, ROUND_ID, 0, &digest, "batch-tx", &events)
-            .unwrap_err();
+        let error =
+            record_vote_batch_confirmation(&db, ROUND_ID, 0, digest, &confirmation, &nullifiers)
+                .unwrap_err();
 
         assert!(error
             .to_string()
@@ -1847,7 +1183,7 @@ mod tests {
         {
             let mut conn = db.conn();
             let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .unwrap();
             let proposal_ids = recoveries
                 .iter()
@@ -2159,90 +1495,6 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("proposal_id mismatch"));
-        assert_eq!(
-            queries::get_vote_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0, 1)
-                .unwrap()
-                .as_deref(),
-            None
-        );
-        assert!(queries::load_van_position(&db.conn(), ROUND_ID, WALLET_ID, 0).is_err());
-        let (json, pos): (Option<String>, Option<i64>) = db
-            .conn()
-            .query_row(
-                "SELECT commitment_bundle_json, vc_tree_position FROM votes
-                 WHERE round_id = :round_id
-                   AND wallet_id = :wallet_id
-                   AND bundle_index = 0
-                   AND proposal_id = 1",
-                named_params! {
-                    ":round_id": ROUND_ID,
-                    ":wallet_id": WALLET_ID,
-                },
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(json.as_deref(), Some(recovery_json.as_str()));
-        assert_eq!(pos, None);
-    }
-
-    #[test]
-    fn confirm_vote_rejects_ambiguous_same_round_events() {
-        let db = test_db();
-        insert_bundle(&db, 0);
-        insert_vote(&db, 0, 1);
-        let err = confirm_vote_submission(
-            &db,
-            ROUND_ID,
-            0,
-            1,
-            "tx-1",
-            &[
-                event_with_attrs(
-                    CAST_VOTE_EVENT,
-                    &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "7,789")],
-                ),
-                event_with_attrs(
-                    CAST_VOTE_EVENT,
-                    &[("vote_round_id", ROUND_ID), (LEAF_INDEX_ATTRIBUTE, "8,790")],
-                ),
-            ],
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("ambiguous cast_vote events"));
-        assert_eq!(
-            queries::get_vote_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0, 1)
-                .unwrap()
-                .as_deref(),
-            None
-        );
-    }
-
-    #[test]
-    fn confirm_vote_rejects_mismatched_round_id_without_writes() {
-        let db = test_db();
-        insert_bundle(&db, 0);
-        insert_vote(&db, 0, 1);
-        let recovery_json = valid_recovery_json(456);
-        store_recovery_json(&db, 0, 1, &recovery_json);
-
-        let err = confirm_vote_submission(
-            &db,
-            ROUND_ID,
-            0,
-            1,
-            "vote-tx",
-            &[event_with_attrs(
-                CAST_VOTE_EVENT,
-                &[
-                    ("round_id", OTHER_ROUND_ID),
-                    (LEAF_INDEX_ATTRIBUTE, "8,789"),
-                ],
-            )],
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("round id mismatch"));
         assert_eq!(
             queries::get_vote_tx_hash(&db.conn(), ROUND_ID, WALLET_ID, 0, 1)
                 .unwrap()

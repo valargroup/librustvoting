@@ -22,8 +22,10 @@ mod tests;
 
 #[cfg(test)]
 use super::{
-    confirmation::validate_hash_confirmation, coordination::BundleOperationKey,
-    result::ValidatedChainSubmissionConfirmation, state::apply_submission_observation,
+    confirmation::{validate_hash_confirmation, validate_imported_delegation_confirmation},
+    coordination::BundleOperationKey,
+    result::ValidatedChainSubmissionConfirmation,
+    state::apply_submission_observation,
 };
 
 /// Inputs from which storage reconstructs a closed semantic generation.
@@ -31,6 +33,9 @@ pub(super) enum SubmissionDerivationRequest {
     Delegation {
         identity: ChainSubmissionIdentity,
         signer: DelegationSigner,
+    },
+    ImportedDelegation {
+        identity: ChainSubmissionIdentity,
     },
     Vote {
         identity: ChainSubmissionIdentity,
@@ -44,6 +49,7 @@ impl SubmissionDerivationRequest {
     pub(super) fn identity(&self) -> &ChainSubmissionIdentity {
         match self {
             Self::Delegation { identity, .. }
+            | Self::ImportedDelegation { identity }
             | Self::Vote { identity }
             | Self::VoteBatch { identity } => identity,
         }
@@ -65,6 +71,14 @@ impl StoreAdvancementRequest {
     pub(super) fn delegation(identity: ChainSubmissionIdentity, signer: DelegationSigner) -> Self {
         Self {
             derivation: SubmissionDerivationRequest::Delegation { identity, signer },
+            member_identities: vec![],
+            ordered_batch_proposal_ids: None,
+        }
+    }
+
+    pub(super) fn imported_delegation(identity: ChainSubmissionIdentity) -> Self {
+        Self {
+            derivation: SubmissionDerivationRequest::ImportedDelegation { identity },
             member_identities: vec![],
             ordered_batch_proposal_ids: None,
         }
@@ -158,6 +172,13 @@ impl StoreAdvancementRequest {
         )
     }
 
+    pub(super) fn is_imported_delegation(&self) -> bool {
+        matches!(
+            self.derivation,
+            SubmissionDerivationRequest::ImportedDelegation { .. }
+        )
+    }
+
     fn verify_batch_roster(
         &self,
         authoritative_ordered_proposal_ids: &[u32],
@@ -178,6 +199,9 @@ impl StoreAdvancementRequest {
             (&self.derivation, self.identity().target()),
             (
                 SubmissionDerivationRequest::Delegation { .. },
+                ChainSubmissionTarget::Delegation
+            ) | (
+                SubmissionDerivationRequest::ImportedDelegation { .. },
                 ChainSubmissionTarget::Delegation
             ) | (
                 SubmissionDerivationRequest::Vote { .. },
@@ -223,6 +247,25 @@ impl StoredChainSubmission {
             state: SubmissionRecordState::Submitting,
             committed_post_reservations,
             tracking_started_at: None,
+            diagnostic: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn adopted_imported_delegation(
+        generation: &ChainSubmissionGeneration,
+        candidate_transaction_hash: super::CandidateTransactionHash,
+        now: u64,
+    ) -> Self {
+        Self {
+            identity: generation.identity().clone(),
+            generation_digest: generation.digest(),
+            state: SubmissionRecordState::Tracking {
+                candidate_transaction_hash,
+            },
+            committed_post_reservations: 0,
+            tracking_started_at: Some(now),
             diagnostic: None,
             created_at: now,
             updated_at: now,
@@ -852,6 +895,33 @@ pub(super) mod memory {
 
                 let derived = Self::derive(state, request.derivation())?;
                 request.verify_batch_roster(derived.ordered_proposal_ids())?;
+                if request.is_imported_delegation() {
+                    let candidate = derived.imported_candidate().ok_or_else(|| {
+                        ChainSubmissionFailure::without_state(
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            "imported delegation derivation omitted its transaction hash",
+                        )
+                    })?;
+                    if Self::candidate_owner(state, request.identity(), candidate).is_some() {
+                        return Err(ChainSubmissionFailure::without_state(
+                            ChainSubmissionFailureKind::InvalidInput,
+                            "imported delegation transaction hash belongs to another submission",
+                        ));
+                    }
+                    let record = StoredChainSubmission::adopted_imported_delegation(
+                        derived.generation(),
+                        candidate,
+                        now,
+                    );
+                    state
+                        .records
+                        .insert(request.identity().clone(), record.clone());
+                    return Ok(StoreAdmission::Ready {
+                        derived: Box::new(derived),
+                        record,
+                        fresh_reservation: false,
+                    });
+                }
                 let record = StoredChainSubmission::fresh(
                     derived.generation(),
                     reservation_ordinal,
@@ -1046,16 +1116,22 @@ pub(super) mod memory {
                 if !commit_allowed() {
                     return Ok(ConfirmationCommit::Interrupted(record));
                 }
-                let confirmation =
-                    validate_hash_confirmation(&derived, candidate, &committed.events).map_err(
-                        |error| {
-                            ChainSubmissionFailure::with_durable_state(
-                                ChainSubmissionFailureKind::Protocol,
-                                record.durable_state(),
-                                error.to_string(),
-                            )
-                        },
-                    )?;
+                let confirmation = if request.is_imported_delegation() {
+                    validate_imported_delegation_confirmation(
+                        derived.bound(),
+                        candidate,
+                        &committed.events,
+                    )
+                } else {
+                    validate_hash_confirmation(&derived, candidate, &committed.events)
+                }
+                .map_err(|error| {
+                    ChainSubmissionFailure::with_durable_state(
+                        ChainSubmissionFailureKind::Protocol,
+                        record.durable_state(),
+                        error.to_string(),
+                    )
+                })?;
                 if let Some(hook) = self.confirmation_validated_hook.lock().unwrap().take() {
                     hook();
                 }

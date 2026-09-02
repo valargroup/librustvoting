@@ -1716,7 +1716,8 @@ pub(crate) fn load_vote_row_state(
 /// Cast-vote confirmations should use `confirmation::confirm_vote_submission`
 /// so the vote hash, successor VAN position, and VC position are recorded
 /// atomically.
-pub fn store_van_position(
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) fn store_van_position(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -2898,7 +2899,7 @@ pub fn delete_bundles_from(
 
 // --- Recovery state: TX hashes ---
 
-pub fn store_delegation_tx_hash(
+pub(crate) fn store_delegation_tx_hash(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
@@ -2993,7 +2994,7 @@ pub fn get_delegation_tx_hash(
     })
 }
 
-pub fn record_vote_submission(
+pub(crate) fn record_vote_submission(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,

@@ -5,9 +5,9 @@
 //! needed by mobile SDK boundaries without exposing proof-circuit internals.
 
 pub use crate::chain_submission::{
-    AdvanceDelegation, AdvanceVote, AdvanceVoteBatch, CandidateTransactionHash,
-    CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse, ChainPostDispatch,
-    ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
+    AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse,
+    ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
     ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
     ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
     ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,
@@ -18,16 +18,11 @@ pub use crate::chain_submission::{
     ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
 
-pub use crate::confirmation::{
-    confirm_delegation_submission, confirm_vote_batch_submission, confirm_vote_submission,
-    DelegationConfirmation, TxEvent, TxEventAttribute, VoteBatchConfirmation, VoteConfirmation,
-};
 pub use crate::delegate::gather_delegation_lwd_inputs;
 pub use crate::delegate::LightwalletdBranchIdProvider;
 pub use crate::delegate::{
-    branch_id_for_height, display_memo, load_account_keys, pczt_sighash, record_submission,
-    record_van_position, setup as setup_delegation, signing_request as delegation_signing_request,
-    spend_auth_signature, submission as delegation_submission, BranchIdProvider,
+    branch_id_for_height, display_memo, load_account_keys, pczt_sighash, setup as setup_delegation,
+    signing_request as delegation_signing_request, spend_auth_signature, BranchIdProvider,
     DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProgress, DelegationProof,
     DelegationSetup, DelegationSigner, DelegationSigningRequest, DelegationSubmission,
     KeystoneSigningRequest, PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
@@ -117,14 +112,12 @@ pub use crate::types::{
 pub use crate::vote::{
     commit as commit_vote, commit_atomic_vote_batch, commit_batch, parse_recovery,
     persist_prepared_atomic_vote_batch, persist_prepared_commit, persist_prepared_commit_batch,
-    prepare_atomic_vote_batch, prepare_commit, prepare_commit_batch,
-    record_batch_submission as record_vote_batch_submission,
-    record_submission as record_vote_submission, record_vc_position, recover_atomic_vote_batch,
-    recover_signed_commitments, recovery_bundle, serialize_recovery, submission as vote_submission,
-    validate_draft_vote, validate_draft_votes, AtomicVoteBatch, CommittedVote, DraftVote,
-    PreparedAtomicVoteBatch, PreparedVoteCommit, PreparedVoteCommitments, SignedVoteBatch,
-    SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteBatchRecovery, VoteCommit,
-    VoteCommitBatch, VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
+    prepare_atomic_vote_batch, prepare_commit, prepare_commit_batch, recover_atomic_vote_batch,
+    recover_signed_commitments, recovery_bundle, serialize_recovery, validate_draft_vote,
+    validate_draft_votes, AtomicVoteBatch, CommittedVote, DraftVote, PreparedAtomicVoteBatch,
+    PreparedVoteCommit, PreparedVoteCommitments, SignedVoteBatch, SignedVoteCommitment,
+    SignedVoteCommitments, VanWitness, VoteBatchRecovery, VoteCommit, VoteCommitBatch,
+    VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
     DEFAULT_BATCH_PROOF_CONCURRENCY, MAX_VOTE_BATCH_ACTIONS,
 };
 pub use crate::wire::{

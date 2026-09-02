@@ -13,11 +13,13 @@ use crate::{
 };
 
 use super::{
-    ChainSubmissionGeneration, ChainSubmissionGenerationDigest, ChainSubmissionIdentity,
-    ChainSubmissionTarget,
+    CandidateTransactionHash, ChainSubmissionGeneration, ChainSubmissionGenerationDigest,
+    ChainSubmissionIdentity, ChainSubmissionTarget,
 };
 
 const GENERATION_DOMAIN_V1: &[u8] = b"zcash_voting.chain_submission.generation.v1\0";
+const IMPORTED_DELEGATION_DOMAIN_V1: &[u8] =
+    b"zcash_voting.chain_submission.imported_delegation.v1\0";
 type PaddedNoteSecret = ([u8; 32], [u8; 32]);
 
 /// Tree leaves expected from a generation, retained in protocol action order.
@@ -59,6 +61,9 @@ impl ExpectedTreeLayout {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ChainSubmissionRequest {
     Delegation(DelegationSubmissionWire),
+    /// A capability-imported delegation is already broadcast and has no
+    /// request body available to this wallet.
+    ImportedDelegation(CandidateTransactionHash),
     Vote(VoteCommitmentWire),
     VoteBatch(VoteCommitmentBatchWire),
 }
@@ -94,6 +99,22 @@ impl BoundGeneration {
     }
 }
 
+/// Poll-only generation adopted from a delegation capability package.
+pub(super) struct ImportedDelegationGeneration {
+    bound: BoundGeneration,
+    candidate_transaction_hash: CandidateTransactionHash,
+}
+
+impl ImportedDelegationGeneration {
+    pub(super) fn into_bound(self) -> BoundGeneration {
+        self.bound
+    }
+
+    pub(super) fn candidate_transaction_hash(&self) -> CandidateTransactionHash {
+        self.candidate_transaction_hash
+    }
+}
+
 /// A semantic generation and its matching wire request and confirmation layout.
 #[derive(Clone)]
 pub(super) struct DerivedChainSubmission {
@@ -125,9 +146,21 @@ impl DerivedChainSubmission {
         self.bound.generation()
     }
 
+    /// Returns the generation and confirmation layout without its wire request.
+    pub(super) fn bound(&self) -> &BoundGeneration {
+        &self.bound
+    }
+
     /// Returns the closed wire request reconstructed from durable inputs.
     pub(super) fn request(&self) -> &ChainSubmissionRequest {
         &self.request
+    }
+
+    pub(super) fn imported_candidate(&self) -> Option<CandidateTransactionHash> {
+        match self.request {
+            ChainSubmissionRequest::ImportedDelegation(candidate) => Some(candidate),
+            _ => None,
+        }
     }
 
     /// Returns the tree layout expected from a successful submission.
@@ -146,8 +179,12 @@ struct GenerationTranscript(Sha256);
 
 impl GenerationTranscript {
     fn new() -> Self {
+        Self::with_domain(GENERATION_DOMAIN_V1)
+    }
+
+    fn with_domain(domain: &[u8]) -> Self {
         let mut hash = Sha256::new();
-        hash.update(GENERATION_DOMAIN_V1);
+        hash.update(domain);
         Self(hash)
     }
 
@@ -587,6 +624,117 @@ fn delegation_generation(
     hash_identity(&mut transcript, identity);
     hash_delegation_inputs(&mut transcript, inputs);
     ChainSubmissionGeneration::new(identity.clone(), transcript.finish())
+}
+
+/// Binds the public evidence available to a voter that imported a delegation
+/// capability produced and broadcast by a separate funds controller.
+///
+/// Imported bundles intentionally omit every private construction input needed
+/// to rebuild or redispatch the transaction. Their generation therefore binds
+/// the identity, expected VAN, and exact package transaction hash under a
+/// separate domain and can only be used for polling and confirmation.
+pub(super) fn generation_for_imported_delegation(
+    conn: &rusqlite::Connection,
+    identity: &ChainSubmissionIdentity,
+) -> Result<ImportedDelegationGeneration, VotingError> {
+    if identity.target() != ChainSubmissionTarget::Delegation {
+        return Err(VotingError::InvalidInput {
+            message: "imported delegation generation requires a delegation identity".to_string(),
+        });
+    }
+    let round_id = validate_identity_context(conn, identity)?;
+    let (governance_commitment, transaction_hash, imported): (Vec<u8>, String, bool) = conn
+        .query_row(
+            "SELECT b.gov_comm, b.delegation_tx_hash,
+                    COALESCE(
+                        b.note_positions_blob IS NULL
+                        AND b.note_identity_hashes_blob IS NULL
+                        AND b.dummy_nullifiers IS NULL
+                        AND b.rho_signed IS NULL
+                        AND b.padded_note_data IS NULL
+                        AND b.nf_signed IS NULL
+                        AND b.cmx_new IS NULL
+                        AND b.alpha IS NULL
+                        AND b.rseed_signed IS NULL
+                        AND b.rseed_output IS NULL
+                        AND b.rk IS NULL
+                        AND b.gov_nullifiers_blob IS NULL
+                        AND b.padded_note_secrets IS NULL
+                        AND b.pczt_sighash IS NULL
+                        AND b.tx1_effects IS NULL
+                        AND b.van_comm_rand IS NOT NULL
+                        AND b.gov_comm IS NOT NULL
+                        AND b.total_note_value IS NOT NULL
+                        AND b.address_index = 0
+                        AND b.delegation_tx_hash IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM proofs p
+                            WHERE p.round_id = b.round_id
+                              AND p.wallet_id = b.wallet_id
+                              AND p.bundle_index = b.bundle_index
+                        ), 0)
+             FROM bundles b
+             WHERE b.round_id = :round_id
+               AND b.wallet_id = :wallet_id
+               AND b.bundle_index = :bundle_index",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": identity.wallet_id(),
+                ":bundle_index": i64::from(identity.bundle_index()),
+            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| VotingError::InvalidInput {
+            message: format!(
+                "imported delegation capability bundle not found for round={round_id}, bundle={}: {error}",
+                identity.bundle_index()
+            ),
+        })?;
+    if !imported {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round={round_id}, bundle={} is not an imported delegation capability bundle",
+                identity.bundle_index()
+            ),
+        });
+    }
+
+    let governance_commitment = checked_blob32(governance_commitment, "imported gov_comm")?;
+    let candidate_transaction_hash = transaction_hash
+        .parse::<CandidateTransactionHash>()
+        .map_err(|error| VotingError::InvalidInput {
+            message: format!("stored imported delegation transaction hash is invalid: {error}"),
+        })?;
+    let mut transcript = GenerationTranscript::with_domain(IMPORTED_DELEGATION_DOMAIN_V1);
+    hash_identity(&mut transcript, identity);
+    transcript.bytes32("imported_delegation.gov_comm", &governance_commitment);
+    transcript.bytes32(
+        "imported_delegation.transaction_hash",
+        candidate_transaction_hash.as_bytes(),
+    );
+    Ok(ImportedDelegationGeneration {
+        bound: BoundGeneration {
+            generation: ChainSubmissionGeneration::new(identity.clone(), transcript.finish()),
+            expected_layout: ExpectedTreeLayout::Delegation {
+                delegation_van: governance_commitment,
+            },
+            ordered_proposal_ids: vec![],
+        },
+        candidate_transaction_hash,
+    })
+}
+
+/// Re-derives one capability-imported delegation for status reconciliation.
+pub(super) fn derive_imported_delegation(
+    conn: &rusqlite::Connection,
+    identity: &ChainSubmissionIdentity,
+) -> Result<DerivedChainSubmission, VotingError> {
+    let imported = generation_for_imported_delegation(conn, identity)?;
+    let candidate_transaction_hash = imported.candidate_transaction_hash();
+    Ok(DerivedChainSubmission {
+        bound: imported.into_bound(),
+        request: ChainSubmissionRequest::ImportedDelegation(candidate_transaction_hash),
+    })
 }
 
 /// Binds one complete persisted delegation generation without a signer.
@@ -1457,7 +1605,7 @@ mod tests {
                 .unwrap();
             crate::chain_submission::confirmation::apply_confirmed_generation(
                 &tx,
-                &before,
+                before.bound(),
                 &confirmation,
             )
             .unwrap();
