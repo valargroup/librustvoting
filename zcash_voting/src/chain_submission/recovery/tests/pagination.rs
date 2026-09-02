@@ -1,6 +1,51 @@
 use super::*;
 
 #[tokio::test]
+async fn cursor_progressing_empty_page_is_accepted() {
+    let leaves = [[3; 32], [4; 32]];
+    let mut frontier: Frontier<MerkleHashVote, { TREE_DEPTH as u8 }> = Frontier::empty();
+    for leaf in &leaves {
+        assert!(frontier.append(MerkleHashVote::from_bytes(leaf).unwrap()));
+    }
+    let root = BASE64_STANDARD.encode(frontier.root().to_bytes());
+    let responses = vec![
+        ChainHttpResponse::json(
+            200,
+            serde_json::to_vec(&serde_json::json!({
+                "tree": { "next_index": 2, "root": root, "height": 2 }
+            }))
+            .unwrap(),
+        ),
+        ChainHttpResponse::json(200, br#"{"blocks":[],"next_from_height":1}"#.to_vec()),
+        ChainHttpResponse::json(
+            200,
+            serde_json::to_vec(&serde_json::json!({
+                "blocks": [{
+                    "height": 2,
+                    "start_index": 0,
+                    "leaves": leaves.map(|leaf| BASE64_STANDARD.encode(leaf)),
+                    "root": root
+                }],
+                "next_from_height": 0
+            }))
+            .unwrap(),
+        ),
+    ];
+
+    let (outcome, urls) = scan_responses(responses, None).await.unwrap();
+
+    assert!(matches!(
+        outcome,
+        RecoveryScanOutcome::Match {
+            final_van_position: 0,
+            vote_commitment_positions
+        } if vote_commitment_positions == vec![1]
+    ));
+    assert!(urls[1].contains("from_height=0&to_height=2"));
+    assert!(urls[2].contains("from_height=1&to_height=2"));
+}
+
+#[tokio::test]
 async fn incomplete_pagination_produces_no_authorization() {
     let leaves = [[8; 32], [9; 32]];
     let mut frontier: Frontier<MerkleHashVote, { TREE_DEPTH as u8 }> = Frontier::empty();

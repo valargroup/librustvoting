@@ -152,9 +152,9 @@ pub(super) async fn scan_exact_layout<'a, T: ChainTransport>(
             get_json_with_size(protocol.transport(), url, &interrupted).await?;
         leaf_request_count += 1;
         total_bytes = total_bytes.saturating_add(bytes as u64);
-        if total_bytes > MAX_RECOVERY_TOTAL_BYTES || page.blocks.is_empty() {
+        if total_bytes > MAX_RECOVERY_TOTAL_BYTES {
             return Err(RecoveryScanFailure::Invalid(invalid(
-                "tree recovery pagination is incomplete or oversized",
+                "tree recovery responses exceed the total byte limit",
             )));
         }
         let page_leaf_count: usize = page.blocks.iter().map(|block| block.leaves.len()).sum();
