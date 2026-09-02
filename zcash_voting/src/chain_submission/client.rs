@@ -31,10 +31,11 @@ pub struct ChainSubmissionClientConfig {
     ///
     /// Mainnet also requires every configured endpoint to use HTTPS.
     pub network: Network,
-    /// Vote-chain identifier included in every durable submission identity.
+    /// Vote-chain deployment identifier validated for configuration compatibility.
     ///
-    /// The value must contain 1 to 128 printable ASCII bytes without
-    /// whitespace.
+    /// This selects the configured deployment but does not bind a submission
+    /// identity or generation. The value must contain 1 to 128 printable ASCII
+    /// bytes without whitespace.
     pub vote_chain_id: String,
     /// Ordered, distinct vote-chain base URLs.
     ///
@@ -160,7 +161,6 @@ pub struct AdvanceVote {
 pub struct ChainSubmissionClient<T> {
     db: Arc<VotingDb>,
     network: Network,
-    vote_chain_id: String,
     coordinator:
         ChainSubmissionCoordinator<T, SqliteChainSubmissionStore, SystemChainSubmissionClock>,
 }
@@ -226,7 +226,6 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         Ok(Self {
             db,
             network: config.network,
-            vote_chain_id: config.vote_chain_id,
             coordinator,
         })
     }
@@ -369,7 +368,6 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         ChainSubmissionIdentity::new(
             self.db.wallet_id(),
             self.network,
-            &self.vote_chain_id,
             vote_round_id,
             bundle_index,
             target,

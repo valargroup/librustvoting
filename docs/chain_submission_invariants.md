@@ -563,9 +563,12 @@ reordered, nonadjacent, or otherwise incomplete occurrences are not
 confirmation and do not prevent authorization after the otherwise valid
 complete scan.
 
-The scanner validates snapshot identity, heights, roots, ranges, absolute
-indexes, pagination progress, final size, canonical field encodings, and
-response bounds. Recovery uses the following fixed ceilings:
+The scanner validates snapshot identity, heights, roots, ranges, pagination
+progress, final size, canonical field encodings, and response bounds. A
+nonempty block's absolute start index must identify its first leaf. An empty
+checkpoint has no first leaf, so its start index is ignored while its ordered
+height and unchanged tree root remain mandatory. Recovery uses the following
+fixed ceilings:
 
 - `16,777,216` leaves, the full `2^24` vote-commitment-tree capacity;
 - `4,096` leaf-range requests of at most `4,096` leaves each;
@@ -1053,6 +1056,9 @@ Phase 6 recovery coverage is anchored by
 `exact_vote_layout_recovers_adjacent_ordered_positions`,
 `complete_no_match_authorizes_only_the_captured_generation_and_candidate`,
 `duplicate_complete_layout_is_ambiguous_not_confirmation`,
+`empty_checkpoint_ignores_start_index_after_earlier_leaves`,
+`nonempty_block_with_discontinuous_start_index_is_rejected`,
+`empty_checkpoint_with_contradictory_root_is_rejected`,
 `incomplete_pagination_produces_no_authorization`,
 `full_tree_capacity_fits_the_fixed_request_and_byte_ceilings`, and
 `tree_confirmation_is_atomic_clamps_timestamp_and_survives_reopen_without_a_hash`.

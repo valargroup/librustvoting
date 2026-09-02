@@ -166,7 +166,7 @@ pub(super) async fn scan_exact_layout<'a, T: ChainTransport>(
         for block in page.blocks {
             if block.height > snapshot.height
                 || previous_height.is_some_and(|height| block.height <= height)
-                || block.start_index != next_index
+                || (!block.leaves.is_empty() && block.start_index != next_index)
             {
                 return Err(RecoveryScanFailure::Invalid(invalid(
                     "tree recovery block sequence is discontinuous",

@@ -53,7 +53,6 @@ fn derived() -> DerivedChainSubmission {
     let identity = ChainSubmissionIdentity::new(
         "wallet",
         Network::Testnet,
-        "chain",
         [1; 32],
         0,
         ChainSubmissionTarget::Vote { proposal_id: 7 },

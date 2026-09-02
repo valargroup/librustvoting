@@ -49,7 +49,6 @@ pub(super) fn identity() -> ChainSubmissionIdentity {
     ChainSubmissionIdentity::new(
         "wallet",
         crate::Network::Testnet,
-        "vote-chain-1",
         [0x11; 32],
         0,
         ChainSubmissionTarget::Vote { proposal_id: 1 },

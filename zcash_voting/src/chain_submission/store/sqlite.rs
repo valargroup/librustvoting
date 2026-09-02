@@ -581,12 +581,13 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
         now: u64,
     ) -> Result<ConfirmationCommit, ChainSubmissionFailure> {
         self.transact(|tx| {
-            let mut record = load_native(tx, expected_generation.identity())?.ok_or_else(|| {
-                ChainSubmissionFailure::without_state(
-                    ChainSubmissionFailureKind::InvariantViolation,
-                    "submission disappeared before tree confirmation",
-                )
-            })?;
+            let mut record =
+                load_submission(tx, expected_generation.identity())?.ok_or_else(|| {
+                    ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvariantViolation,
+                        "submission disappeared before tree confirmation",
+                    )
+                })?;
             ensure_generation(&record, expected_generation)?;
             let derived = derive(tx, request.derivation())
                 .map_err(|error| preserve_loaded_state(error, Some(&record)))?;
@@ -645,7 +646,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                     "recovery request does not match its authorization identity",
                 ));
             }
-            let mut record = load_native(tx, identity)?.ok_or_else(|| {
+            let mut record = load_submission(tx, identity)?.ok_or_else(|| {
                 ChainSubmissionFailure::without_state(
                     ChainSubmissionFailureKind::InvariantViolation,
                     "submission disappeared before recovery retry reservation",
