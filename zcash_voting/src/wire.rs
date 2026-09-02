@@ -134,41 +134,6 @@ pub struct VoteShareWire {
     pub submit_at: u64,
 }
 
-/// Parsed confirmation data for a submitted delegation transaction.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DelegationConfirmation {
-    /// Confirmed transaction hash.
-    pub tx_hash: String,
-    /// Confirmed vote-authority-note leaf position.
-    pub van_leaf_position: u32,
-}
-
-/// Parsed confirmation data for a submitted cast-vote transaction.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoteConfirmation {
-    /// Confirmed transaction hash.
-    pub tx_hash: String,
-    /// Confirmed vote-authority-note leaf position.
-    pub van_leaf_position: u32,
-    /// Confirmed vote commitment tree position.
-    pub vc_tree_position: u64,
-}
-
-/// Parsed confirmation data for one atomic cast-vote batch.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoteBatchConfirmation {
-    /// Confirmed transaction hash shared by every action.
-    pub tx_hash: String,
-    /// Raw 32-byte digest emitted by the chain.
-    pub batch_digest: Vec<u8>,
-    /// Leaf position of the batch's final vote-authority note.
-    pub van_leaf_position: u32,
-    /// Proposal identifiers in signed action order.
-    pub proposal_ids: Vec<u32>,
-    /// Vote-commitment leaf positions in signed action order.
-    pub vc_tree_positions: Vec<u64>,
-}
-
 /// Version 1 public handoff for a round-bound voting hotkey target.
 ///
 /// Use [`VotingHotkeyTargetV1::from_json`], [`VotingHotkeyTargetV1::to_json`],
@@ -415,6 +380,23 @@ pub struct RoundPlanView {
     pub completed_for_display: bool,
     pub completed_vote_display: Option<CompletedVoteDisplayView>,
     pub needs_draft_setup: bool,
+    /// True when delegation work needs fresh or restored wallet signing material.
+    ///
+    /// Read these derived flags instead of matching `NextStepView::kind`
+    /// strings: the SDK computes them from an exhaustive match, so a new step
+    /// kind cannot silently read as "no work" in a host allowlist.
+    pub needs_delegation_signing: bool,
+    /// True when a delegation is in flight. Consult `needs_delegation_signing`
+    /// to learn whether the next pass also needs signing material.
+    pub has_in_flight_delegation: bool,
+    /// True when vote or helper-share submission work remains to drive.
+    pub needs_vote_polling: bool,
+    /// True when any vote or share work remains, counting share confirmation
+    /// only when it is blocking.
+    pub has_remaining_vote_or_share_work: bool,
+    /// True when any vote or share work remains, counting share confirmation
+    /// unconditionally.
+    pub has_recoverable_vote_or_share_work: bool,
     pub primary_action: String,
     pub next_steps: Vec<NextStepView>,
     pub delegation_statuses: Vec<DelegationStatusView>,

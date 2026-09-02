@@ -352,6 +352,12 @@ where
                     .submit_delegation_with_dispatch(endpoint_index, submission, dispatch)
                     .await
             }
+            ChainSubmissionRequest::ImportedDelegation(_) => {
+                PostAttemptOutcome::LocalFailure(ChainSubmissionDiagnostic::from_redacted_message(
+                    ChainSubmissionDiagnosticKind::InvalidProtocolResponse,
+                    "a capability-imported delegation cannot be dispatched by the voter",
+                ))
+            }
             ChainSubmissionRequest::Vote(submission) => {
                 self.protocol
                     .submit_vote_with_dispatch(endpoint_index, submission, dispatch)
@@ -516,9 +522,14 @@ where
                             ChainSubmissionDiagnosticKind::ChainRejected,
                             "tracked vote-chain transaction committed unsuccessfully",
                         );
+                        let observation = if request.is_imported_delegation() {
+                            SubmissionObservation::TerminalCandidateFailure(diagnostic.clone())
+                        } else {
+                            SubmissionObservation::CandidateCommittedFailure(diagnostic.clone())
+                        };
                         self.reconcile_with_durable_state(
                             derived.generation(),
-                            SubmissionObservation::CandidateCommittedFailure(diagnostic.clone()),
+                            observation,
                             Some(diagnostic),
                             ChainSubmissionState::Tracking,
                         )?
@@ -578,6 +589,22 @@ where
                         control,
                     }),
                     LookupProgress::Observed(TransactionStatusObservation::CommittedFailure(_)) => {
+                        if request.is_imported_delegation() {
+                            let diagnostic = ChainSubmissionDiagnostic::from_redacted_message(
+                                ChainSubmissionDiagnosticKind::ChainRejected,
+                                "imported vote-chain transaction committed unsuccessfully",
+                            );
+                            return self
+                                .reconcile_with_durable_state(
+                                    derived.generation(),
+                                    SubmissionObservation::TerminalCandidateFailure(
+                                        diagnostic.clone(),
+                                    ),
+                                    Some(diagnostic),
+                                    ChainSubmissionState::Recovering,
+                                )?
+                                .public_result();
+                        }
                         let record = self.reconcile_with_durable_state(
                             derived.generation(),
                             SubmissionObservation::CandidateCommittedFailure(

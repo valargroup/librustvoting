@@ -601,16 +601,6 @@ impl CommittedVote {
         .await
     }
 
-    /// Reconstructs chain-ready cast-vote fields from persisted recovery state.
-    pub fn submission(&self, db: &VotingDb) -> Result<VoteSubmission, VotingError> {
-        submission(
-            db,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-        )
-    }
-
     /// Serializes the persisted recovery bundle for this committed vote.
     pub fn recovery_json(&self, db: &VotingDb) -> Result<String, VotingError> {
         let bundle = recovery_bundle(
@@ -643,32 +633,6 @@ impl CommittedVote {
             ),
         })?;
         signed_commitment_from_parts(&self.commit, &recovery)
-    }
-
-    /// Records the cast-vote transaction hash for this vote.
-    pub fn record_submission(&self, db: &VotingDb, tx_hash: &str) -> Result<(), VotingError> {
-        record_submission(
-            db,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-            tx_hash,
-        )
-    }
-
-    /// Records the confirmed vote-commitment tree position for this vote.
-    pub fn record_vc_position(
-        &self,
-        db: &VotingDb,
-        vc_tree_position: u64,
-    ) -> Result<(), VotingError> {
-        record_vc_position(
-            db,
-            &self.round_id,
-            self.bundle_index,
-            self.commit.proposal_id,
-            vc_tree_position,
-        )
     }
 }
 
@@ -2056,25 +2020,6 @@ fn recover_commit_with_generation(
     Ok((commit_from_recovery(&recovery)?, commitment_bundle_json))
 }
 
-/// Reconstructs chain-ready cast-vote fields from persisted recovery state.
-pub fn submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-) -> Result<VoteSubmission, VotingError> {
-    recovery_bundle(db, round_id, bundle_index, proposal_id)?
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: format!(
-                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
-            ),
-        })
-        .and_then(|bundle| {
-            ensure_singleton_vote_recovery(&bundle)?;
-            Ok(submission_from_recovery(&bundle))
-        })
-}
-
 /// Extracts the chain-visible vote fields from a recovery bundle.
 ///
 /// Callers that require singleton semantics must validate the bundle first.
@@ -2090,74 +2035,6 @@ pub(crate) fn submission_from_recovery(bundle: &VoteRecoveryBundle) -> VoteSubmi
         vote_auth_sig: bundle.vote_auth_sig,
         anchor_height: bundle.anchor_height,
     }
-}
-
-/// Records the cast-vote transaction hash and marks a singleton vote submitted.
-///
-/// Atomic batch members must use [`record_batch_submission`].
-pub fn record_submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    tx_hash: &str,
-) -> Result<(), VotingError> {
-    db.record_vote_submission(round_id, bundle_index, proposal_id, tx_hash)
-}
-
-/// Atomically records one transaction hash for every action in a persisted
-/// vote batch. This is the durable retry point immediately after CheckTx.
-pub fn record_batch_submission(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    batch_digest: &[u8],
-    tx_hash: &str,
-) -> Result<(), VotingError> {
-    let batch_digest: [u8; 32] =
-        batch_digest
-            .try_into()
-            .map_err(|_| VotingError::InvalidInput {
-                message: format!("batch_digest must be 32 bytes, got {}", batch_digest.len()),
-            })?;
-    if tx_hash.trim().is_empty() {
-        return Err(VotingError::InvalidInput {
-            message: "tx_hash must not be empty".to_string(),
-        });
-    }
-    let wallet_id = db.wallet_id();
-    let mut conn = db.conn();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin vote batch submission transaction failed: {e}"),
-        })?;
-    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-    )?;
-    let recoveries = load_vote_batch_recoveries_with_conn(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-        batch_digest,
-    )?;
-    for recovery in recoveries {
-        crate::storage::queries::record_vote_submission(
-            &tx,
-            round_id,
-            &wallet_id,
-            bundle_index,
-            recovery.proposal_id,
-            tx_hash,
-        )?;
-    }
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote batch submission transaction failed: {e}"),
-    })
 }
 
 pub(crate) fn load_vote_batch_recoveries_with_conn(
@@ -2512,46 +2389,6 @@ fn clear_unsubmitted_vote_recovery_with_conn(
         message: format!("clear stale vote shares failed: {e}"),
     })?;
     Ok(())
-}
-
-/// Records the on-chain vote commitment tree position after confirmation.
-///
-/// This does not advance the bundle's current VAN position. Prefer
-/// `confirmation::confirm_vote_submission` when recording chain events so all
-/// confirmation fields are stored atomically. Atomic batch members must use
-/// `confirmation::confirm_vote_batch_submission`.
-pub fn record_vc_position(
-    db: &VotingDb,
-    round_id: &str,
-    bundle_index: u32,
-    proposal_id: u32,
-    vc_tree_position: u64,
-) -> Result<(), VotingError> {
-    let wallet_id = db.wallet_id();
-    let mut conn = db.conn();
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| VotingError::Internal {
-            message: format!("begin vote VC position transaction failed: {e}"),
-        })?;
-    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-    )?;
-    ensure_singleton_vote_update_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?;
-    record_vc_position_with_conn(
-        &tx,
-        &wallet_id,
-        round_id,
-        bundle_index,
-        proposal_id,
-        vc_tree_position,
-    )?;
-    tx.commit().map_err(|e| VotingError::Internal {
-        message: format!("commit vote VC position transaction failed: {e}"),
-    })
 }
 
 pub(crate) fn record_vc_position_with_conn(
@@ -3728,6 +3565,105 @@ fn array32_vec(label: &str, values: Vec<Vec<u8>>) -> Result<Vec<[u8; 32]>, Votin
         .collect()
 }
 
+// Test-only durable writers.
+//
+// Chain submission is driven exclusively by the `chain_submission` lifecycle,
+// which is the sole authority for submission and confirmation. These helpers
+// write the same durable rows the lifecycle writes so tests can cover the
+// singleton/batch guards and the position-conflict rules directly. They are
+// compiled only for this crate's tests and for the `test-fixtures` feature;
+// production builds must not enable that feature.
+
+/// Marks one singleton vote submitted with `tx_hash`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn record_submission(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    tx_hash: &str,
+) -> Result<(), VotingError> {
+    db.record_vote_submission(round_id, bundle_index, proposal_id, tx_hash)
+}
+
+/// Records one transaction hash for every action in a persisted batch.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn record_batch_submission(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    batch_digest: &[u8],
+    tx_hash: &str,
+) -> Result<(), VotingError> {
+    let batch_digest: [u8; 32] =
+        batch_digest
+            .try_into()
+            .map_err(|_| VotingError::InvalidInput {
+                message: format!("batch_digest must be 32 bytes, got {}", batch_digest.len()),
+            })?;
+    if tx_hash.trim().is_empty() {
+        return Err(VotingError::InvalidInput {
+            message: "tx_hash must not be empty".to_string(),
+        });
+    }
+    let wallet_id = db.wallet_id();
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::Internal {
+            message: format!("begin vote batch submission transaction failed: {e}"),
+        })?;
+    let recoveries = load_vote_batch_recoveries_with_conn(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+        batch_digest,
+    )?;
+    for recovery in recoveries {
+        crate::storage::queries::record_vote_submission(
+            &tx,
+            round_id,
+            &wallet_id,
+            bundle_index,
+            recovery.proposal_id,
+            tx_hash,
+        )?;
+    }
+    tx.commit().map_err(|e| VotingError::Internal {
+        message: format!("commit vote batch submission transaction failed: {e}"),
+    })
+}
+
+/// Records the confirmed vote-commitment position for one singleton vote.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn record_vc_position(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    vc_tree_position: u64,
+) -> Result<(), VotingError> {
+    let wallet_id = db.wallet_id();
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| VotingError::Internal {
+            message: format!("begin vote VC position transaction failed: {e}"),
+        })?;
+    ensure_singleton_vote_update_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?;
+    record_vc_position_with_conn(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+        proposal_id,
+        vc_tree_position,
+    )?;
+    tx.commit().map_err(|e| VotingError::Internal {
+        message: format!("commit vote VC position transaction failed: {e}"),
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4576,7 +4512,7 @@ mod tests {
         let loaded = recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().unwrap();
         assert_eq!(loaded.vote_commitment, [0x12; 32]);
 
-        let submission = submission(&db, ROUND_ID, 0, 1).unwrap();
+        let submission = submission_from_recovery(&loaded);
         assert_eq!(submission.vote_round_id, ROUND_ID);
         assert_eq!(submission.r_vpk, [0x15; 32]);
         assert_eq!(submission.vote_auth_sig, [0x17; 64]);
@@ -4768,7 +4704,8 @@ mod tests {
             recovered.data().vote_commitment,
             committed.data().vote_commitment
         );
-        let submission = recovered.submission(&db).unwrap();
+        let submission =
+            submission_from_recovery(&recovery_bundle(&db, ROUND_ID, 0, 1).unwrap().unwrap());
         assert_eq!(submission.vote_round_id, ROUND_ID);
         assert_eq!(submission.vote_auth_sig, [0x17; 64]);
 
@@ -4804,12 +4741,12 @@ mod tests {
         crate::share::confirm(&db, ROUND_ID, 0, 1, 0).unwrap();
         assert!(crate::share::unconfirmed(&db, ROUND_ID).unwrap().is_empty());
 
-        recovered.record_submission(&db, "vote-tx").unwrap();
+        record_submission(&db, ROUND_ID, 0, 1, "vote-tx").unwrap();
         assert_eq!(
             db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap().as_deref(),
             Some("vote-tx")
         );
-        recovered.record_vc_position(&db, 789).unwrap();
+        record_vc_position(&db, ROUND_ID, 0, 1, 789).unwrap();
         assert_eq!(
             recovery_bundle(&db, ROUND_ID, 0, 1)
                 .unwrap()

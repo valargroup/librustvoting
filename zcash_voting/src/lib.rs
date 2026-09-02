@@ -3,12 +3,19 @@
 //! Wallet SDKs should import [`prelude`] and follow the lifecycle:
 //! create a round, bind eligible notes into bundles, precompute witness/PIR
 //! data, build a delegation PCZT, prove delegation, sync the vote commitment
-//! tree, cast votes with `vote::commit`, advance delegation and singleton-vote
-//! submissions through [`ChainSubmissionClient`], then recover helper-share
-//! payloads through `share`. New integrations should use `round`, `precompute`,
-//! `delegate`, `vote`, `chain_submission`, `share`, and `session` rather than
-//! writing storage rows directly. Exact commitment-tree recovery is explicit
-//! per advancement call; status-only advancement remains the default.
+//! tree, cast votes with `vote::commit`, drive chain submission through
+//! [`ChainSubmissionClient`], then recover helper-share payloads through
+//! `share`. New integrations should use `round`, `precompute`, `delegate`,
+//! `vote`, `chain_submission`, `share`, and `session` rather than writing
+//! storage rows directly. Exact commitment-tree recovery is explicit per
+//! advancement call; status-only advancement remains the default.
+//!
+//! [`ChainSubmissionClient`] is the sole authority for submitting, polling,
+//! recovering, and confirming delegation and cast-vote transactions. Hosts
+//! supply an HTTP transport, scheduling, and cancellation; they do not build
+//! chain requests, interpret chain events, or record transaction hashes and
+//! tree positions. See [`chain_submission`] for the removed version-17
+//! mutation APIs and the compile-time checks that keep them removed.
 
 #[cfg(all(feature = "lrz", feature = "zakura"))]
 compile_error!("features `lrz` and `zakura` cannot be enabled together");
@@ -20,7 +27,7 @@ pub mod action;
 pub mod backend;
 pub mod chain_submission;
 pub mod config;
-pub mod confirmation;
+pub(crate) mod confirmation;
 pub mod delegate;
 pub mod delegation_capability;
 pub mod error;
@@ -59,9 +66,9 @@ pub mod zkp1;
 pub mod zkp2;
 
 pub use chain_submission::{
-    AdvanceDelegation, AdvanceVote, AdvanceVoteBatch, CandidateTransactionHash,
-    CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse, ChainPostDispatch,
-    ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
+    AdvanceDelegation, AdvanceImportedDelegation, AdvanceVote, AdvanceVoteBatch,
+    CandidateTransactionHash, CandidateTransactionHashError, ChainHttpRequest, ChainHttpResponse,
+    ChainPostDispatch, ChainRecoveryMode, ChainSubmissionClient, ChainSubmissionClientConfig,
     ChainSubmissionConfirmation, ChainSubmissionConfirmationError,
     ChainSubmissionConfirmationSource, ChainSubmissionControl, ChainSubmissionDiagnostic,
     ChainSubmissionDiagnosticKind, ChainSubmissionFailure, ChainSubmissionFailureKind,

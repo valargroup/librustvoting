@@ -26,6 +26,8 @@ pub enum DelegationPhase {
     Submitted,
     /// Submission or reconciliation is owned by the chain lifecycle facade.
     SubmissionManaged,
+    /// The authoritative lifecycle row is terminally rejected.
+    SubmissionRejected,
     /// The vote authority note leaf position has been recovered from chain.
     Confirmed,
 }
@@ -44,6 +46,8 @@ pub enum WorkflowPhase {
     SubmittedShare,
     /// Submission or reconciliation is owned by the chain lifecycle facade.
     SubmissionManaged,
+    /// The authoritative lifecycle row is terminally rejected.
+    SubmissionRejected,
     Confirmed,
 }
 
@@ -59,6 +63,8 @@ pub enum VotePhase {
     Submitted,
     /// Submission or reconciliation is owned by the chain lifecycle facade.
     SubmissionManaged,
+    /// The authoritative lifecycle row is terminally rejected.
+    SubmissionRejected,
     /// The vote commitment tree position has been recorded.
     Confirmed,
 }
@@ -71,6 +77,7 @@ impl VotePhase {
             Self::Committed => "committed",
             Self::Submitted => "submitted",
             Self::SubmissionManaged => "submission_managed",
+            Self::SubmissionRejected => "submission_rejected",
             Self::Confirmed => "confirmed",
         }
     }
@@ -105,6 +112,7 @@ impl DelegationPhase {
             Self::Proved => "proved",
             Self::Submitted => "submitted",
             Self::SubmissionManaged => "submission_managed",
+            Self::SubmissionRejected => "submission_rejected",
             Self::Confirmed => "confirmed",
         }
     }
@@ -120,6 +128,7 @@ impl WorkflowPhase {
             Self::SubmittedVote => "submitted_vote",
             Self::SubmittedShare => "submitted_share",
             Self::SubmissionManaged => "submission_managed",
+            Self::SubmissionRejected => "submission_rejected",
             Self::Confirmed => "confirmed",
         }
     }
@@ -131,6 +140,7 @@ impl WorkflowPhase {
             DelegationPhase::PcztBuilt | DelegationPhase::Proved => Self::Signed,
             DelegationPhase::Submitted => Self::SubmittedDelegation,
             DelegationPhase::SubmissionManaged => Self::SubmissionManaged,
+            DelegationPhase::SubmissionRejected => Self::SubmissionRejected,
             DelegationPhase::Confirmed => Self::Confirmed,
         }
     }
@@ -142,6 +152,7 @@ impl WorkflowPhase {
             VotePhase::Committed => Self::Signed,
             VotePhase::Submitted => Self::SubmittedVote,
             VotePhase::SubmissionManaged => Self::SubmissionManaged,
+            VotePhase::SubmissionRejected => Self::SubmissionRejected,
             VotePhase::Confirmed => Self::Confirmed,
         }
     }
@@ -179,10 +190,9 @@ impl VotingDb {
                         ),
                         b.delegation_tx_hash IS NOT NULL,
                         b.van_leaf_position IS NOT NULL,
-                        EXISTS(SELECT 1 FROM chain_submissions s
-                                WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
-                                  AND s.bundle_index=b.bundle_index AND s.kind='delegation'
-                                  AND s.state IN ('submitting','tracking','recovering','rejected'))
+                        (SELECT s.state FROM chain_submissions s
+                         WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
+                           AND s.bundle_index=b.bundle_index AND s.kind='delegation')
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -198,7 +208,7 @@ impl VotingDb {
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
                         row.get::<_, i64>(3)? != 0,
-                        row.get::<_, i64>(4)? != 0,
+                        row.get::<_, Option<String>>(4)?.as_deref(),
                     ))
                 },
             )
@@ -234,10 +244,9 @@ impl VotingDb {
                         ),
                         b.delegation_tx_hash IS NOT NULL,
                         b.van_leaf_position IS NOT NULL,
-                        EXISTS(SELECT 1 FROM chain_submissions s
-                                WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
-                                  AND s.bundle_index=b.bundle_index AND s.kind='delegation'
-                                  AND s.state IN ('submitting','tracking','recovering','rejected'))
+                        (SELECT s.state FROM chain_submissions s
+                         WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
+                           AND s.bundle_index=b.bundle_index AND s.kind='delegation')
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -258,7 +267,7 @@ impl VotingDb {
                             row.get::<_, i64>(2)? != 0,
                             row.get::<_, i64>(3)? != 0,
                             row.get::<_, i64>(4)? != 0,
-                            row.get::<_, i64>(5)? != 0,
+                            row.get::<_, Option<String>>(5)?.as_deref(),
                         ),
                     ))
                 },
@@ -500,9 +509,8 @@ fn load_vote_phases(
 
 fn authoritative_submission_phase(state: Option<&str>) -> Option<VotePhase> {
     match state {
-        Some("submitting" | "tracking" | "recovering" | "rejected") => {
-            Some(VotePhase::SubmissionManaged)
-        }
+        Some("submitting" | "tracking" | "recovering") => Some(VotePhase::SubmissionManaged),
+        Some("rejected") => Some(VotePhase::SubmissionRejected),
         Some("confirmed") => Some(VotePhase::Confirmed),
         _ => None,
     }
@@ -705,6 +713,10 @@ mod tests {
             "submission_managed"
         );
         assert_eq!(
+            WorkflowPhase::for_delegation(DelegationPhase::SubmissionRejected).as_str(),
+            "submission_rejected"
+        );
+        assert_eq!(
             WorkflowPhase::for_delegation(DelegationPhase::Submitted).as_str(),
             "submitted_delegation"
         );
@@ -730,6 +742,10 @@ mod tests {
             "submission_managed"
         );
         assert_eq!(
+            WorkflowPhase::for_vote(VotePhase::SubmissionRejected).as_str(),
+            "submission_rejected"
+        );
+        assert_eq!(
             WorkflowPhase::for_vote(VotePhase::Confirmed).as_str(),
             "confirmed"
         );
@@ -750,20 +766,17 @@ fn phase_from_columns(
     has_proof: bool,
     has_tx_hash: bool,
     has_van_position: bool,
-    submission_managed: bool,
+    authoritative_state: Option<&str>,
 ) -> DelegationPhase {
-    if submission_managed {
-        DelegationPhase::SubmissionManaged
-    } else if has_van_position {
-        DelegationPhase::Confirmed
-    } else if has_tx_hash {
-        DelegationPhase::Submitted
-    } else if has_proof {
-        DelegationPhase::Proved
-    } else if has_pczt {
-        DelegationPhase::PcztBuilt
-    } else {
-        DelegationPhase::Prepared
+    match authoritative_state {
+        Some("submitting" | "tracking" | "recovering") => DelegationPhase::SubmissionManaged,
+        Some("rejected") => DelegationPhase::SubmissionRejected,
+        Some("confirmed") => DelegationPhase::Confirmed,
+        _ if has_van_position => DelegationPhase::Confirmed,
+        _ if has_tx_hash => DelegationPhase::Submitted,
+        _ if has_proof => DelegationPhase::Proved,
+        _ if has_pczt => DelegationPhase::PcztBuilt,
+        _ => DelegationPhase::Prepared,
     }
 }
 

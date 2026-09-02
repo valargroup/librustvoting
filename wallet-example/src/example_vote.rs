@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use zcash_voting::prelude::{
     commit_atomic_vote_batch, commit_batch, sync_vote_tree, track_pending_shares, van_witness,
-    CommittedVote, DraftVote, HelperClient, HelperFleetPreflight, NoopProgressReporter,
-    ShareBatchDeliveryReport, ShareDeliveryPlan, ShareDeliveryPlanningParams,
+    AdvanceVote, ChainSubmissionClient, ChainSubmissionClientConfig, ChainSubmissionControl,
+    ChainSubmissionResult, CommittedVote, DraftVote, HelperClient, HelperFleetPreflight,
+    NoopProgressReporter, ShareBatchDeliveryReport, ShareDeliveryPlan, ShareDeliveryPlanningParams,
     ShareDeliverySubmissionParams, ShareTimingPolicy, ShareTrackingParams, ShareTrackingReport,
-    SignedVoteBatch, SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteSigner,
-    VoteSubmission, VotingDb, VotingHotkey,
+    SignedVoteBatch, SignedVoteCommitment, SignedVoteCommitments, VanWitness, VoteSigner, VotingDb,
+    VotingHotkey,
 };
 
 /// Inputs for deriving a Merkle witness for one confirmed delegation bundle.
@@ -78,10 +81,15 @@ pub struct WalletShareTrackingRequest<'a> {
     pub vote_end_time_seconds: Option<u64>,
 }
 
-/// Network-side results to persist after the caller submits a committed vote.
-pub struct WalletVoteExecutionRequest<'a> {
-    pub vote_tx_hash: &'a str,
-    pub vc_tree_position: u64,
+/// Identifies the committed vote whose chain submission should be advanced.
+///
+/// `vote_round_id` is the 32-byte round identifier. The SDK derives the
+/// transaction from persisted recovery state, so the wallet supplies no chain
+/// fields of its own.
+pub struct WalletVoteExecutionRequest {
+    pub vote_round_id: [u8; 32],
+    pub bundle_index: u32,
+    pub proposal_id: u32,
 }
 
 /// Derives the VAN witness needed to commit votes for one bundle.
@@ -186,20 +194,6 @@ pub fn commit_atomic_vote_bundle_batch(
     .context("commit atomic cast-vote batch")
 }
 
-/// Returns the cast-vote payload the caller should submit to the vote chain.
-///
-/// Helper shares must be planned with [`prepare_committed_vote_shares`] and sent
-/// through [`submit_committed_vote_shares`] so every attempt is journaled
-/// before dispatch.
-pub fn committed_vote_submission(
-    voting_db: &VotingDb,
-    committed: &CommittedVote,
-) -> Result<VoteSubmission> {
-    committed
-        .submission(voting_db)
-        .context("build vote submission")
-}
-
 /// Returns a single wallet-facing aggregate for external API boundaries.
 ///
 /// This includes chain fields and stored recovery JSON in one typed object.
@@ -300,22 +294,40 @@ pub async fn track_committed_vote_shares(
         .context("track pending helper shares")
 }
 
-/// Persists successful vote-chain submission fields.
+/// Advances one committed vote's chain submission by a single bounded pass.
 ///
-/// Helper-share submission persists each attempt inside
-/// `CommittedVote::submit_prepared_shares`; it is intentionally absent here
-/// so a wallet cannot accidentally record a post-hoc result twice.
-pub fn record_committed_vote_execution(
-    voting_db: &VotingDb,
-    committed: &CommittedVote,
-    request: WalletVoteExecutionRequest<'_>,
-) -> Result<()> {
-    committed
-        .record_submission(voting_db, request.vote_tx_hash)
-        .context("record vote submission")?;
-    committed
-        .record_vc_position(voting_db, request.vc_tree_position)
-        .context("record vote commitment tree position")?;
-
-    Ok(())
+/// The SDK owns endpoint construction, request encoding, dispatch, polling,
+/// recovery, and confirmation. A wallet never builds the chain request, repeats
+/// an ambiguously dispatched POST, or writes confirmation state; it only
+/// decides when to call again.
+///
+/// One call performs at most one bounded pass and returns:
+///
+/// - [`ChainSubmissionResult::Confirmed`] once confirmation is durable,
+/// - [`ChainSubmissionResult::Pending`] to schedule another call,
+/// - [`ChainSubmissionResult::Rejected`] for a deterministic chain rejection, or
+/// - [`ChainSubmissionResult::Cancelled`] when cancellation preceded dispatch.
+///
+/// Call this in a loop that re-invokes on `Pending`. Helper-share delivery is
+/// separate: plan with [`prepare_committed_vote_shares`] and send through
+/// [`submit_committed_vote_shares`] after the vote confirms.
+pub async fn advance_committed_vote(
+    voting_db: Arc<VotingDb>,
+    config: ChainSubmissionClientConfig,
+    request: WalletVoteExecutionRequest,
+    control: &ChainSubmissionControl,
+) -> Result<ChainSubmissionResult> {
+    let client = ChainSubmissionClient::new(voting_db, config)
+        .map_err(|failure| anyhow::anyhow!("build chain submission client: {failure}"))?;
+    client
+        .advance_vote(
+            AdvanceVote {
+                vote_round_id: request.vote_round_id,
+                bundle_index: request.bundle_index,
+                proposal_id: request.proposal_id,
+            },
+            control,
+        )
+        .await
+        .map_err(|failure| anyhow::anyhow!("advance vote chain submission: {failure}"))
 }

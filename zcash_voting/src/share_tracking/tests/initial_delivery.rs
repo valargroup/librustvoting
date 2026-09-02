@@ -621,8 +621,8 @@ async fn stale_committed_vote_submission_is_rejected_before_side_effects() {
     let mut replacement_recovery = original_recovery;
     replacement_recovery.vote_commitment = [0x42; 32];
     crate::vote::insert_recovery_fixture(&db, &replacement_recovery).unwrap();
-    let current_handle = crate::vote::CommittedVote::recover(&db, ROUND_ID, 0, 1).unwrap();
-    current_handle.record_vc_position(&db, 789).unwrap();
+
+    crate::vote::record_vc_position(&db, ROUND_ID, 0, 1, 789).unwrap();
 
     let configured = helpers(1);
     let plan = ShareSubmissionPlan {

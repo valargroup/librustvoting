@@ -1607,6 +1607,10 @@ impl VotingDb {
     /// The app calls this after parsing the delegation TX response events.
     /// Cast-vote callers should use `confirmation::confirm_vote_submission` so
     /// all confirmation fields are stored atomically.
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn store_van_position(
         &self,
         round_id: &str,
@@ -1786,6 +1790,10 @@ impl VotingDb {
 
     // --- Recovery state ---
 
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn store_delegation_tx_hash(
         &self,
         round_id: &str,
@@ -1831,6 +1839,10 @@ impl VotingDb {
     ///
     /// Atomic batch members must use `vote::record_batch_submission` so every
     /// action advances together.
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn record_vote_submission(
         &self,
         round_id: &str,
@@ -1867,6 +1879,10 @@ impl VotingDb {
     }
 
     /// Atomically records a delegation transaction hash with idempotency checks.
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn mark_delegation_submitted(
         &self,
         round_id: &str,
@@ -1893,6 +1909,10 @@ impl VotingDb {
     ///
     /// Atomic batch members must use `vote::record_batch_submission` so every
     /// action advances together.
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn mark_vote_submitted(
         &self,
         round_id: &str,
@@ -2663,6 +2683,7 @@ impl VotingDb {
 }
 
 /// Accepts missing or matching text fields and rejects conflicting values.
+#[cfg(any(test, feature = "test-fixtures"))]
 fn check_text_conflict(
     existing: Option<&str>,
     requested: &str,
@@ -6415,8 +6436,9 @@ mod tests {
         assert_eq!(request.sighash, setup.pczt_sighash);
 
         let signature = sign_delegation_request(&sender_seed, &request);
-        let submission = crate::delegate::submission(
-            &db,
+        let submission = crate::delegate::submission_with_conn(
+            &db.conn(),
+            &db.wallet_id(),
             ROUND_ID,
             0,
             crate::delegate::DelegationSigner::signature(signature, request.sighash),

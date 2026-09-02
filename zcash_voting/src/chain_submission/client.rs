@@ -140,6 +140,16 @@ pub struct AdvanceDelegation {
     pub signer: DelegationSigner,
 }
 
+/// Identifies an already-broadcast delegation imported from a capability
+/// package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdvanceImportedDelegation {
+    /// Canonical 32-byte round identifier bound by the imported package.
+    pub vote_round_id: [u8; 32],
+    /// Imported bundle whose stored package hash should be polled.
+    pub bundle_index: u32,
+}
+
 /// Inputs that identify one prepared singleton vote generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdvanceVote {
@@ -270,6 +280,40 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         self.coordinator
             .advance(
                 StoreAdvancementRequest::delegation(identity, request.signer),
+                control,
+            )
+            .await
+    }
+
+    /// Adopts and advances one already-broadcast capability delegation.
+    ///
+    /// The first active pass validates the structurally imported bundle and
+    /// atomically adopts its stored package hash as a poll-only lifecycle
+    /// generation. The voter never supplies a signer, transaction hash, request
+    /// body, or chain events, and this path never dispatches or retries a POST.
+    /// Re-invoke while the result is pending; confirmation atomically records
+    /// the imported bundle's VAN position.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure when the identity does not name an imported capability
+    /// bundle, its stored hash or generation conflicts, status transport or
+    /// protocol validation fails, or durable adoption/confirmation cannot
+    /// commit. Any adopted state remains available through
+    /// [`ChainSubmissionFailure::strongest_state`].
+    pub async fn advance_imported_delegation(
+        &self,
+        request: AdvanceImportedDelegation,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let identity = self.identity(
+            request.vote_round_id,
+            request.bundle_index,
+            ChainSubmissionTarget::Delegation,
+        )?;
+        self.coordinator
+            .advance(
+                StoreAdvancementRequest::imported_delegation(identity),
                 control,
             )
             .await

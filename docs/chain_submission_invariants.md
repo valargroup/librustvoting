@@ -7,9 +7,11 @@ This document is the normative specification for vote-chain submission in
 document and its behavior-oriented conformance tests in the same change.
 
 The design has one authoritative `chain_submissions` row for each semantic
-generation, and every row is created by the lifecycle itself: no pre-upgrade
-evidence is imported into it. The design does not use an attempt journal or a
-durable scan workflow.
+generation. Locally prepared rows are created by the lifecycle before POST;
+the one narrow exception is a structurally imported delegation capability,
+whose package hash is lazily adopted into a poll-only row. No pre-upgrade
+evidence is imported. The design does not use an attempt journal or a durable
+scan workflow.
 
 The normal path is:
 
@@ -30,8 +32,8 @@ recovery never runs for ordinary `Tracking`.
 
 ## Scope and authority
 
-The lifecycle covers delegation, singleton vote, and atomic vote-batch
-submission. It owns:
+The lifecycle covers local delegation, imported poll-only delegation,
+singleton vote, and atomic vote-batch submission. It owns:
 
 - reservation before POST;
 - transport classification, bounded retry, and failover;
@@ -166,6 +168,13 @@ delegation.tx1_effects
 delegation.proof
 ```
 
+Imported delegation adoption uses the separate ASCII domain
+`zcash_voting.chain_submission.imported_delegation.v1` followed by a NUL byte.
+Its typed transcript contains the common delegation identity, the imported
+`delegation.gov_comm`, and the package's canonical transaction hash. Adoption
+is allowed only for the exact structural capability-import shape. The hash is
+read from the locked database row, never supplied by the caller.
+
 Vote generations contain the `votes` sequence. Each `votes.<index>` member is
 encoded in this order: `vote_round_id`, `bundle_index`, `proposal_id`,
 `vote_decision`, `anchor_height`, `single_share`, `num_options`,
@@ -218,7 +227,9 @@ There is exactly one `chain_submissions` row for a semantic generation. The
 durable primary key is derived from the identity alone, and one total
 uniqueness constraint covers the decoded identity columns, so two reservations
 for one submission cannot coexist. Creation and every durable state or field
-mutation occur in immediate transactions.
+mutation occur in immediate transactions. An imported delegation's first
+advance pass derives and inserts its `Tracking` row atomically with zero POST
+reservations; every other new row starts with a pre-POST reservation.
 
 Every row carries the generation digest it was reserved for; the column is not
 nullable. Reservation acquires every applicable batch-member identity lock in
@@ -309,10 +320,10 @@ Their meanings are:
 - `Confirmed`: chain success and all required local confirmation updates are
   durable. Its source records what the confirmation rests on: `hash` or
   `tree`, with the exact generation positions.
-- `Rejected`: a compatibility-only terminal row retained for previously
-  persisted lifecycle data. Current runtime rejection codes are diagnostic
-  because they may depend on node state or chain time; new runtime work does
-  not enter this state.
+- `Rejected`: a terminal row. Local POST rejection codes remain recovery
+  diagnostics because they may depend on node state or chain time. A
+  poll-only imported transaction enters `Rejected` when status proves that its
+  one immutable candidate committed unsuccessfully.
 
 The normal transitions are:
 
@@ -324,9 +335,15 @@ Submitting -> Recovering     chain rejection code
 Tracking -> Tracking         hash still pending
 Tracking -> Recovering       bounded tracking window expires inconclusively
 Tracking -> Confirmed        committed success and atomic persistence
-Tracking -> Recovering       committed failure, failed candidate cleared
+Tracking -> Recovering       local committed failure, failed candidate cleared
 Recovering -> Recovering     candidate, retry, no match, or interruption
 Recovering -> Confirmed      candidate success or exact tree layout
+
+imported new -> Tracking     atomically adopt the stored package hash
+imported Tracking -> Rejected
+                             immutable candidate committed unsuccessfully
+imported Recovering -> Rejected
+                             immutable candidate committed unsuccessfully
 ```
 
 The same lifecycle is shown as a text state machine below:
@@ -349,13 +366,15 @@ new
 abandoned Submitting on restart -- normalize --> Recovering
 ```
 
-The absence of `Recovering -> Tracking` and `Recovering -> Rejected` edges is
-intentional. Once recovery ambiguity exists, only confirmation or explicit
-deletion can resolve or remove it.
+For locally constructed submissions, the absence of `Recovering -> Tracking`
+and `Recovering -> Rejected` edges is intentional. Once local recovery
+ambiguity exists, only confirmation or explicit deletion can resolve or remove
+it. Imported poll-only delegation is the narrow exception: its immutable
+candidate can become terminally `Rejected` from `Recovering`.
 
-`Recovering` does not transition to `Tracking` or `Rejected`. In particular, a
-later hash, rejection, committed-failure candidate, cancellation, or empty scan
-cannot erase the original ambiguity. A pending or unreadable candidate is never
+Local `Recovering` does not transition to `Tracking` or `Rejected`. In
+particular, a later hash, rejection, committed-failure candidate, cancellation,
+or empty scan cannot erase the original ambiguity. A pending or unreadable candidate is never
 overwritten and normally blocks another POST. It may be atomically retired only
 as part of the retry reservation directly authorized by candidate-first
 reconciliation completing a valid full-tree pass with no complete match. A
@@ -468,9 +487,9 @@ generation.
 
 ## Reconciliation and retry
 
-One lifecycle facade provides typed delegation, vote, and batch entry points.
-It owns submission, polling, recovery, and confirmation; planners do not
-compose lower-level mutation APIs.
+One lifecycle facade provides typed local delegation, imported-delegation,
+vote, and batch entry points. It owns submission, polling, recovery, and
+confirmation; planners do not compose lower-level mutation APIs.
 
 Reconciliation is state-driven:
 
@@ -480,7 +499,10 @@ Reconciliation is state-driven:
   becomes `Recovering` while retaining the candidate hash.
 - a `Recovering` row polls its candidate hash first. If hash polling does
   not confirm, the lifecycle may perform one bounded tree recovery pass.
-- `Confirmed` and compatibility `Rejected` rows perform no network mutation,
+- an imported delegation remains candidate-preserving and status-only in both
+  `Tracking` and `Recovering`; it never scans or retries, and a committed
+  failure becomes terminal `Rejected`;
+- `Confirmed` and `Rejected` rows perform no network mutation,
   whatever the confirmation source.
 
 A pending or temporarily unreadable candidate remains available for later
@@ -529,7 +551,7 @@ Restart plans are derived from the authoritative row:
 - `Recovering` schedules candidate-first reconciliation and tree
   recovery, then same-generation retry when permitted;
 - `Confirmed` enables dependent domain and helper work;
-- a compatibility `Rejected` row schedules no reconciliation; and
+- a `Rejected` row schedules no reconciliation;
 - absent rows permit fresh work if bundle causality allows it.
 
 An unresolved generation blocks only later work that consumes its unknown
@@ -711,9 +733,11 @@ confirmation is never presented as the confirming transaction.
 recovery remains authorized. It may carry no candidate after an atomic
 retirement-and-reservation or committed-failure clearing, without implying that
 a retired transaction failed or that another retry is already authorized.
-`Rejected` means a compatibility row is terminally rejected. New HTTP 422 and
-committed-failure observations return `Pending(Recovering)` instead, preserving
-the bound generation for exact-tree recovery and same-generation retry.
+`Rejected` means the row is terminally rejected. Local HTTP rejection and
+committed-failure observations return `Pending(Recovering)`, preserving the
+bound generation for exact-tree recovery and same-generation retry. An
+imported poll-only candidate that commits unsuccessfully returns `Rejected`;
+there is no signed request that this wallet could safely retry.
 
 `Cancelled` is returned only when cancellation occurs before possible dispatch
 and no stronger durable state exists. Cancellation never hides `Tracking`,
@@ -770,7 +794,7 @@ order, and batch digest are locked. Delegation setup, nullifiers, proof inputs,
 and VAN randomizer are likewise locked. Re-selecting the same generation is
 idempotent; changing it is rejected.
 
-A compatibility terminal rejection does not release an atomic batch's member
+A terminal rejection does not release an atomic batch's member
 locks. The rejected row still projects its phase through the signed recovery
 rows that define its ordered roster, so a conflicting ballot-intent change must
 fail before clearing vote recovery or helper-delivery records. A rejected
@@ -934,9 +958,13 @@ Tests cover:
 - polling, diagnostics, and restart do not reset the durable tracking window;
 - promotion alone does not retire the candidate or permit redispatch;
 - hash polling produces atomic `Confirmed`;
+- imported capability adoption starts directly in candidate-preserving
+  `Tracking` with zero POST reservations and no signer;
+- imported `Tracking` and `Recovering` never dispatch, scan, or retry, and a
+  committed failure becomes terminal `Rejected` without becoming hashless;
 - a chain rejection code produces bound hashless `Recovering` with a redacted
   diagnostic;
-- committed failure clears the tracked candidate into `Recovering`;
+- local committed failure clears the tracked candidate into `Recovering`;
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class produces `Recovering`;
 - restart from `Submitting` produces `Recovering`;
@@ -1075,6 +1103,11 @@ Tests cover:
 - deletion gates block new work and wait for active work;
 - planners and recovery snapshots derive from the authoritative row; and
 - removed legacy mutation APIs fail compile-time surface checks.
+
+The compile-time surface check is the `compile_fail` doctest set on the
+`chain_submission` module. It covers every removed confirmation entry point,
+transaction-hash and position recorder, payload builder, the private
+chain-event vocabulary, and the raw storage writers.
 
 These tests are the review contract for changes to chain submission behavior.
 
