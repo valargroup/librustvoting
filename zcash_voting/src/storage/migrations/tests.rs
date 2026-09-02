@@ -446,15 +446,14 @@ fn noncanonical_v17_round_ids_create_no_submission() {
     }
 }
 
-/// Identity defects other than a noncanonical round id are corruption, not
-/// an excuse to silently omit authoritative lifecycle protection.
+/// Invalid proposal identities cannot own authoritative lifecycle protection.
 #[test]
-fn invalid_v17_wallet_and_proposal_identities_abort_atomically() {
-    for (wallet_id, proposal_id, expected_error) in [
-        ("", 1, "chain submission wallet_id must not be empty"),
-        ("wallet", 0, "proposal_id must be between 1 and 15, got 0"),
-        ("wallet", 16, "proposal_id must be between 1 and 15, got 16"),
+fn invalid_v17_proposal_identities_abort_atomically() {
+    for (proposal_id, expected_error) in [
+        (0, "proposal_id must be between 1 and 15, got 0"),
+        (16, "proposal_id must be between 1 and 15, got 16"),
     ] {
+        let wallet_id = "wallet";
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(&v17_schema()).unwrap();
         queries::insert_round(
@@ -817,6 +816,56 @@ fn v17_identity_key_matches_the_runtime_store() {
     .unwrap()
     .expect("the fixture round id is canonical");
     assert_eq!(stored, submission_identity_key(&identity));
+}
+
+/// Empty identities written outside the public API cannot block database open.
+#[test]
+fn empty_wallet_namespace_is_skipped_without_blocking_open() {
+    let temp = v17_file(|conn| {
+        queries::insert_round(conn, "", crate::Network::Testnet, &test_params(), None).unwrap();
+        queries::insert_bundle(conn, ROUND, "", 0, &[1]).unwrap();
+        queries::store_vote(conn, ROUND, "", 0, 1, 1, &[1; 32]).unwrap();
+        conn.execute(
+            "UPDATE bundles SET van_leaf_position=7
+                  WHERE round_id=?1 AND wallet_id='' AND bundle_index=0",
+            [ROUND],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE votes SET vc_tree_position=8
+                  WHERE round_id=?1 AND wallet_id='' AND bundle_index=0 AND proposal_id=1",
+            [ROUND],
+        )
+        .unwrap();
+    });
+
+    let db = crate::storage::VotingDb::open(temp.path()).unwrap();
+    db.set_wallet_id("wallet");
+
+    assert_eq!(db.wallet_id(), "wallet");
+    assert_eq!(
+        db.conn()
+            .query_row("SELECT count(*) FROM chain_submissions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    let positions: (i64, i64) = db
+        .conn()
+        .query_row(
+            "SELECT b.van_leaf_position, v.vc_tree_position
+               FROM bundles b
+               JOIN votes v USING (round_id, wallet_id, bundle_index)
+              WHERE b.wallet_id=''",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(positions, (7, 8));
+    drop(db);
+
+    crate::storage::VotingDb::open(temp.path()).unwrap();
 }
 
 /// Columns read back when asserting how one migrated row was bound.
@@ -1272,7 +1321,7 @@ fn reopening_a_migrated_database_is_a_no_op() {
 }
 
 #[test]
-fn v17_position_ownership_is_scoped_by_network() {
+fn v17_position_ownership_is_scoped_by_network_and_round() {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&v17_schema()).unwrap();
     for (round_id, network) in [
@@ -1282,7 +1331,7 @@ fn v17_position_ownership_is_scoped_by_network() {
         ),
         (
             "2222222222222222222222222222222222222222222222222222222222222222",
-            crate::Network::Testnet,
+            crate::Network::Mainnet,
         ),
     ] {
         let mut params = test_params();
@@ -1435,7 +1484,7 @@ fn v17_legacy_projection_vans_remain_exempt_from_ownership() {
 }
 
 #[test]
-fn v17_validated_van_ownership_is_scoped_by_network() {
+fn v17_validated_van_ownership_is_scoped_by_network_and_round() {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&v17_schema()).unwrap();
     for (round_id, network) in [
@@ -1445,7 +1494,7 @@ fn v17_validated_van_ownership_is_scoped_by_network() {
         ),
         (
             "2222222222222222222222222222222222222222222222222222222222222222",
-            crate::Network::Mainnet,
+            crate::Network::Testnet,
         ),
     ] {
         let mut params = test_params();
@@ -1519,7 +1568,7 @@ fn v17_recovering_guards_still_validate_every_observed_position() {
 }
 
 #[test]
-fn malformed_v17_recovery_rolls_back_without_changing_version() {
+fn malformed_v17_recovery_becomes_a_member_guard_without_blocking_other_rows() {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(&v17_schema()).unwrap();
     queries::insert_round(
@@ -1537,20 +1586,64 @@ fn malformed_v17_recovery_rolls_back_without_changing_version() {
         [],
     )
     .unwrap();
+    let other_round = "2222222222222222222222222222222222222222222222222222222222222222";
+    let mut other_params = test_params();
+    other_params.vote_round_id = other_round.to_string();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &other_params,
+        None,
+    )
+    .unwrap();
+    queries::insert_bundle(&conn, other_round, "wallet", 0, &[1]).unwrap();
+    queries::store_vote(&conn, other_round, "wallet", 0, 1, 1, &[2; 32]).unwrap();
+    conn.execute(
+        "UPDATE bundles SET van_leaf_position=17 WHERE round_id=?1",
+        [other_round],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE votes SET vc_tree_position=18 WHERE round_id=?1",
+        [other_round],
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 17).unwrap();
 
-    assert!(migrate(&mut conn).is_err());
+    migrate(&mut conn).unwrap();
     assert_eq!(
         conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        17
+        CURRENT_VERSION
     );
-    assert!(!table_names(&conn).contains(&"chain_submissions".to_string()));
+    let rows: Vec<(String, bool, Option<String>)> = conn
+        .prepare(
+            "SELECT state, generation_digest IS NOT NULL, diagnostic_kind
+               FROM chain_submissions ORDER BY round_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "recovering".to_string(),
+                false,
+                Some("legacy_evidence_invalid".to_string())
+            ),
+            ("confirmed".to_string(), false, None),
+        ]
+    );
     assert_eq!(
         conn.query_row(
-            "SELECT commitment_bundle_json FROM votes WHERE proposal_id=1",
-            [],
-            |row| row.get::<_, String>(0),
+            "SELECT commitment_bundle_json FROM votes
+              WHERE round_id=?1 AND proposal_id=1",
+            [ROUND],
+            |row| row.get::<_, String>(0)
         )
         .unwrap(),
         "{broken"
@@ -1558,7 +1651,7 @@ fn malformed_v17_recovery_rolls_back_without_changing_version() {
 }
 
 #[test]
-fn v17_recovery_must_match_its_owning_vote_row() {
+fn v17_recovery_mismatches_become_member_guards() {
     const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     let base = released_singleton_recovery_json(ROUND_ID);
     let stored_commitment =
@@ -1592,14 +1685,26 @@ fn v17_recovery_must_match_its_owning_vote_row() {
         .unwrap();
         conn.pragma_update(None, "user_version", 17).unwrap();
 
-        let error = migrate(&mut conn).unwrap_err();
-        assert!(error.to_string().contains("mismatch"), "{field}: {error}");
+        migrate(&mut conn).unwrap();
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            17
+            CURRENT_VERSION,
+            "{field}"
         );
-        assert!(!table_names(&conn).contains(&"chain_submissions".to_string()));
+        let (state, has_digest, diagnostic): (String, bool, String) = conn
+            .query_row(
+                "SELECT state, generation_digest IS NOT NULL, diagnostic_kind
+                   FROM chain_submissions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), has_digest, diagnostic.as_str()),
+            ("recovering", false, "legacy_evidence_invalid"),
+            "{field}"
+        );
     }
 
     let mut conn = Connection::open_in_memory().unwrap();
@@ -1615,20 +1720,17 @@ fn v17_recovery_must_match_its_owning_vote_row() {
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 17).unwrap();
-    let error = migrate(&mut conn).unwrap_err();
-    assert!(
-        error.to_string().contains("vc_tree_position mismatch"),
-        "{error}"
-    );
-    assert_eq!(
-        conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
-            .unwrap(),
-        17
-    );
+    migrate(&mut conn).unwrap();
+    let diagnostic: String = conn
+        .query_row("SELECT diagnostic_kind FROM chain_submissions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(diagnostic, "legacy_evidence_invalid");
 }
 
 #[test]
-fn v17_atomic_batches_must_be_complete_and_consistent() {
+fn v17_invalid_atomic_batches_become_member_guards() {
     const ROUND_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     let (first, second) = released_batch_recovery_json(ROUND_ID);
     let stored_commitments = [&first, &second].map(|json| {
@@ -1716,15 +1818,92 @@ fn v17_atomic_batches_must_be_complete_and_consistent() {
 
     for (label, first_json, second_json, shared_hash) in corruptions {
         let mut conn = open_batch(first_json.as_deref(), second_json.as_deref(), shared_hash);
-        let error = migrate(&mut conn).unwrap_err();
-        assert!(!error.to_string().is_empty(), "{label}");
+        let singleton =
+            recovery_json_with_tree_position(&released_singleton_recovery_json(ROUND_ID), 8);
+        let mut singleton_value: serde_json::Value = serde_json::from_str(&singleton).unwrap();
+        singleton_value["proposal_id"] = serde_json::json!(3);
+        let singleton = serde_json::to_string(&singleton_value).unwrap();
+        let parsed_singleton = crate::vote::parse_recovery(&singleton).unwrap();
+        let singleton_commitment =
+            crate::vote::stored_vote_commitment_bytes(&parsed_singleton).unwrap();
+        queries::store_vote(
+            &conn,
+            ROUND_ID,
+            "wallet",
+            0,
+            3,
+            parsed_singleton.vote_decision,
+            &singleton_commitment,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE votes SET commitment_bundle_json=?1, vc_tree_position=8
+                  WHERE round_id=?2 AND wallet_id='wallet'
+                    AND bundle_index=0 AND proposal_id=3",
+            rusqlite::params![singleton, ROUND_ID],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE bundles SET van_leaf_position=7
+                  WHERE round_id=?1 AND wallet_id='wallet' AND bundle_index=0",
+            [ROUND_ID],
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            17,
+            CURRENT_VERSION,
             "{label}"
         );
-        assert!(!table_names(&conn).contains(&"chain_submissions".to_string()));
+        let guards: Vec<(i64, String, bool, String)> = conn
+            .prepare(
+                "SELECT proposal_id, state, generation_digest IS NOT NULL, diagnostic_kind
+                   FROM chain_submissions
+                  WHERE diagnostic_kind='legacy_evidence_invalid'
+                  ORDER BY proposal_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            guards,
+            vec![
+                (
+                    1,
+                    "recovering".to_string(),
+                    false,
+                    "legacy_evidence_invalid".to_string()
+                ),
+                (
+                    2,
+                    "recovering".to_string(),
+                    false,
+                    "legacy_evidence_invalid".to_string()
+                ),
+            ],
+            "{label}"
+        );
+        let unrelated: (String, String) = conn
+            .query_row(
+                "SELECT state, confirmation_source FROM chain_submissions
+                  WHERE kind='vote' AND proposal_id=3",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            unrelated,
+            ("confirmed".to_string(), "legacy_import".to_string()),
+            "{label}"
+        );
+        let first_dump = chain_submission_dump(&conn);
+        migrate(&mut conn).unwrap();
+        assert_eq!(chain_submission_dump(&conn), first_dump, "{label}");
     }
 }
 

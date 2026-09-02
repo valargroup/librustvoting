@@ -61,6 +61,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   longer undecodable. `ChainSubmissionDiagnosticKind` gained the matching
   variant, so such a guard loads as an authoritative row instead of failing the
   whole record with an opaque storage error.
+- Malformed or internally inconsistent version-17 recovery and atomic-batch
+  evidence now migrates to member-scoped guards with the distinct
+  `LegacyEvidenceInvalid` diagnostic instead of preventing the voting database
+  from opening.
 - Chain-submission cancellation now removes a fresh reservation when transport
   dispatch has not begun. Batch admission derives its identity locks from the
   complete request roster, verifies the persisted roster before reading
@@ -78,7 +82,7 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Ballot-intent changes and bundle pruning now preserve every active semantic
   generation and its helper-delivery material under the lifecycle round gate.
   Version-17 vote-position collision checks are scoped to each independent
-  network tree. Migration validates recovery identity and vote semantics
+  network-and-round tree. Migration validates recovery identity and vote semantics
   against the owning row, validates complete atomic recovery-batch groups, and
   omits obsolete delegation guards when a terminal legacy vote already proves
   the bundle successor completed.

@@ -655,6 +655,10 @@ mod tests {
                 "reconciliation_pending",
                 ChainSubmissionDiagnosticKind::ReconciliationPending,
             ),
+            (
+                "legacy_evidence_invalid",
+                ChainSubmissionDiagnosticKind::LegacyEvidenceInvalid,
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -1093,6 +1097,7 @@ fn parse_diagnostic_kind(value: &str) -> rusqlite::Result<ChainSubmissionDiagnos
         "generation_derivation_failed" => {
             Ok(ChainSubmissionDiagnosticKind::GenerationDerivationFailed)
         }
+        "legacy_evidence_invalid" => Ok(ChainSubmissionDiagnosticKind::LegacyEvidenceInvalid),
         "storage_failure" => Ok(ChainSubmissionDiagnosticKind::StorageFailure),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
@@ -1107,6 +1112,7 @@ fn diagnostic_name(value: ChainSubmissionDiagnosticKind) -> &'static str {
         ChainSubmissionDiagnosticKind::InvalidProtocolResponse => "invalid_protocol_response",
         ChainSubmissionDiagnosticKind::RecoveryUnavailable => "recovery_unavailable",
         ChainSubmissionDiagnosticKind::GenerationDerivationFailed => "generation_derivation_failed",
+        ChainSubmissionDiagnosticKind::LegacyEvidenceInvalid => "legacy_evidence_invalid",
         ChainSubmissionDiagnosticKind::StorageFailure => "storage_failure",
     }
 }

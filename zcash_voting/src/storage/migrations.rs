@@ -316,10 +316,11 @@ fn parse_network(network: &str) -> Result<crate::Network, VotingError> {
 /// type, so a migrated row and a natively reserved row for the same submission
 /// collide on the primary key rather than occupying separate namespaces.
 ///
-/// Returns `None` when the round id cannot form a canonical lifecycle identity.
-/// Such a round can never be the subject of runtime submission work either, so
-/// there is nothing to guard: the row is left as version-17 domain data, which
-/// keeps the round prunable and explicitly deletable.
+/// Returns `None` when the stored identity cannot participate in the lifecycle.
+///
+/// A noncanonical round can never be submitted, while an empty wallet id could
+/// only have been written outside the public API. Both remain as version-17
+/// domain data so malformed legacy evidence cannot block database opening.
 fn v17_identity(
     wallet_id: &str,
     network: &str,
@@ -347,7 +348,10 @@ fn v17_identity(
         target,
     ) {
         Ok(identity) => Ok(Some(identity)),
-        Err(ChainSubmissionIdentityError::InvalidVoteRoundId) => Ok(None),
+        Err(
+            ChainSubmissionIdentityError::EmptyWalletId
+            | ChainSubmissionIdentityError::InvalidVoteRoundId,
+        ) => Ok(None),
         Err(error) => Err(VotingError::Internal {
             message: format!(
                 "invalid version-17 chain-submission identity for wallet={wallet_id}, \
@@ -372,6 +376,8 @@ const RECOVERY_UNAVAILABLE_DIAGNOSTIC: &str =
     "version-17 chain evidence lacks generation recovery material";
 const GENERATION_DERIVATION_FAILED_DIAGNOSTIC: &str =
     "version-17 recovery material could not derive a generation";
+const LEGACY_EVIDENCE_INVALID_DIAGNOSTIC: &str =
+    "version-17 recovery evidence is malformed or internally inconsistent";
 
 impl V17Import {
     /// Permanently guards evidence that has no recovery inputs to bind.
@@ -401,6 +407,19 @@ impl V17Import {
             vote_commitment_positions: None,
             diagnostic_kind: Some("generation_derivation_failed"),
             diagnostic: Some(GENERATION_DERIVATION_FAILED_DIAGNOSTIC),
+        }
+    }
+
+    /// Permanently guards malformed or internally inconsistent legacy evidence.
+    fn legacy_evidence_invalid_guard() -> Self {
+        Self {
+            generation_digest: None,
+            state: "recovering",
+            confirmation_source: None,
+            final_van_position: None,
+            vote_commitment_positions: None,
+            diagnostic_kind: Some("legacy_evidence_invalid"),
+            diagnostic: Some(LEGACY_EVIDENCE_INVALID_DIAGNOSTIC),
         }
     }
 
@@ -491,8 +510,9 @@ fn positions_match_expected_layout(
 /// A `legacy_projection` VAN is deliberately excluded because migration cannot
 /// validate that it belongs to the projected generation.
 fn register_v17_legacy_import_van(
-    observed_output_positions: &mut std::collections::HashSet<(String, u64)>,
+    observed_output_positions: &mut std::collections::HashSet<(String, String, u64)>,
     network: &str,
+    round_id: &str,
     import: &V17Import,
 ) -> Result<(), VotingError> {
     if import.confirmation_source != Some("legacy_import") {
@@ -503,10 +523,10 @@ fn register_v17_legacy_import_van(
         .ok_or_else(|| VotingError::Internal {
             message: "version-17 legacy import is missing its validated VAN position".to_string(),
         })?;
-    if !observed_output_positions.insert((network.to_string(), position)) {
+    if !observed_output_positions.insert((network.to_string(), round_id.to_string(), position)) {
         return Err(VotingError::Internal {
             message: format!(
-                "version-17 {network} validated output position {position} has multiple owners"
+                "version-17 {network} round {round_id} validated output position {position} has multiple owners"
             ),
         });
     }
@@ -560,6 +580,7 @@ fn insert_v17_submission(
 
 /// Scopes one provable atomic batch: wallet, network, round, bundle, digest.
 type V17BatchScope = (String, String, String, i64, [u8; 32]);
+type V17VoteMemberScope = (String, String, String, i64, i64);
 
 type V17VoteEvidenceRow = (
     String,
@@ -577,27 +598,67 @@ type V17VoteEvidenceRow = (
     bool,
 );
 
-fn validate_v17_recovery_batches(rows: &[V17VoteEvidenceRow]) -> Result<(), VotingError> {
-    use std::collections::HashMap;
+/// Identifies legacy vote members whose recovery evidence cannot be trusted.
+///
+/// Data-shape failures are scoped to singleton member identities so one corrupt
+/// historical group cannot block the database upgrade. A member guard also
+/// blocks any future atomic batch that overlaps it.
+fn audit_v17_recovery_evidence(
+    rows: &[V17VoteEvidenceRow],
+) -> std::collections::HashSet<V17VoteMemberScope> {
+    use std::collections::{HashMap, HashSet};
 
     type BatchScope = (String, String, String, i64, [u8; 32]);
     type SharedHashScope = (String, String, String, i64, String);
 
-    let mut batches: HashMap<BatchScope, Vec<(crate::vote::VoteRecoveryBundle, Option<String>)>> =
+    let member_scope =
+        |row: &V17VoteEvidenceRow| (row.1.clone(), row.2.clone(), row.0.clone(), row.3, row.4);
+    let mut invalid_members = HashSet::new();
+    let mut batches: HashMap<
+        BatchScope,
+        Vec<(
+            V17VoteMemberScope,
+            crate::vote::VoteRecoveryBundle,
+            Option<String>,
+        )>,
+    > = HashMap::new();
+    let mut shared_hashes: HashMap<SharedHashScope, Vec<(V17VoteMemberScope, Option<[u8; 32]>)>> =
         HashMap::new();
-    let mut shared_hashes: HashMap<SharedHashScope, Vec<Option<[u8; 32]>>> = HashMap::new();
 
     for row in rows {
-        let parsed = row
-            .8
-            .as_deref()
-            .map(crate::vote::parse_recovery)
-            .transpose()?;
-        let batch_digest = parsed
-            .as_ref()
-            .and_then(|recovery| recovery.batch.as_ref().map(|batch| batch.digest));
+        let scope = member_scope(row);
+        let mut batch_digest = None;
+        let parsed = match row.8.as_deref().map(crate::vote::parse_recovery) {
+            Some(Ok(recovery)) => Some(recovery),
+            Some(Err(_)) => {
+                invalid_members.insert(scope.clone());
+                None
+            }
+            None => None,
+        };
         if let Some(recovery) = parsed {
-            if let Some(batch) = recovery.batch.as_ref() {
+            let owning_vote_matches = u32::try_from(row.3)
+                .ok()
+                .zip(u32::try_from(row.4).ok())
+                .is_some_and(|(bundle_index, proposal_id)| {
+                    crate::vote::validate_recovery_matches_stored_vote(
+                        &recovery,
+                        &row.0,
+                        bundle_index,
+                        proposal_id,
+                        row.9,
+                        row.10.as_deref(),
+                    )
+                    .is_ok()
+                })
+                && row.7.is_none_or(|position| {
+                    u64::try_from(position)
+                        .is_ok_and(|position| recovery.vc_tree_position == position)
+                });
+            if !owning_vote_matches {
+                invalid_members.insert(scope.clone());
+            } else if let Some(batch) = recovery.batch.as_ref() {
+                batch_digest = Some(batch.digest);
                 batches
                     .entry((
                         row.1.clone(),
@@ -607,7 +668,7 @@ fn validate_v17_recovery_batches(rows: &[V17VoteEvidenceRow]) -> Result<(), Voti
                         batch.digest,
                     ))
                     .or_default()
-                    .push((recovery, row.5.clone()));
+                    .push((scope.clone(), recovery, row.5.clone()));
             }
         }
         if let Some(hash) = row.5.as_ref() {
@@ -620,61 +681,32 @@ fn validate_v17_recovery_batches(rows: &[V17VoteEvidenceRow]) -> Result<(), Voti
                     hash.clone(),
                 ))
                 .or_default()
-                .push(batch_digest);
+                .push((scope, batch_digest));
         }
     }
 
     for ((wallet, network, round, bundle, digest), mut members) in batches {
-        let expected_size = members[0].0.batch.as_ref().unwrap().size;
-        if members.len() != expected_size as usize
-            || members
+        let expected_size = members[0].1.batch.as_ref().unwrap().size;
+        let complete = members.len() == expected_size as usize
+            && members
                 .iter()
-                .any(|(recovery, _)| recovery.batch.as_ref().unwrap().size != expected_size)
-        {
-            return Err(VotingError::Internal {
-                message: format!(
-                    "incomplete version-17 vote batch for wallet={wallet}, network={network}, round={round}, bundle={bundle}"
-                ),
-            });
-        }
-        members.sort_by_key(|(recovery, _)| recovery.batch.as_ref().unwrap().index);
-        if members
+                .all(|(_, recovery, _)| recovery.batch.as_ref().unwrap().size == expected_size);
+        members.sort_by_key(|(_, recovery, _)| recovery.batch.as_ref().unwrap().index);
+        let ordered = !members.iter().enumerate().any(|(index, (_, recovery, _))| {
+            recovery.batch.as_ref().unwrap().index != index as u32
+        });
+        let anchor_height = members[0].1.anchor_height;
+        let common_anchor = !members
             .iter()
-            .enumerate()
-            .any(|(index, (recovery, _))| recovery.batch.as_ref().unwrap().index != index as u32)
-        {
-            return Err(VotingError::Internal {
-                message: format!(
-                    "inconsistent version-17 vote batch ordering for wallet={wallet}, network={network}, round={round}, bundle={bundle}"
-                ),
-            });
-        }
-        let anchor_height = members[0].0.anchor_height;
-        if members
+            .any(|(_, recovery, _)| recovery.anchor_height != anchor_height);
+        let first_hash = members[0].2.as_deref();
+        let common_hash = !members
             .iter()
-            .any(|(recovery, _)| recovery.anchor_height != anchor_height)
-        {
-            return Err(VotingError::Internal {
-                message: format!(
-                    "inconsistent version-17 vote batch anchor for wallet={wallet}, network={network}, round={round}, bundle={bundle}"
-                ),
-            });
-        }
-        let first_hash = members[0].1.as_deref();
-        if members
-            .iter()
-            .any(|(_, hash)| hash.as_deref() != first_hash)
-        {
-            return Err(VotingError::Internal {
-                message: format!(
-                    "inconsistent version-17 vote batch hash for wallet={wallet}, network={network}, round={round}, bundle={bundle}"
-                ),
-            });
-        }
+            .any(|(_, _, hash)| hash.as_deref() != first_hash);
         let actions = members
             .iter()
             .map(
-                |(recovery, _)| crate::vote_commitment::CastVoteBatchSighashAction {
+                |(_, recovery, _)| crate::vote_commitment::CastVoteBatchSighashAction {
                     r_vpk: &recovery.r_vpk,
                     van_nullifier: &recovery.van_nullifier,
                     vote_authority_note_new: &recovery.vote_authority_note_new,
@@ -683,32 +715,42 @@ fn validate_v17_recovery_batches(rows: &[V17VoteEvidenceRow]) -> Result<(), Voti
                 },
             )
             .collect::<Vec<_>>();
-        let recomputed = crate::vote_commitment::cast_vote_batch_sighash(
+        let digest_matches = crate::vote_commitment::cast_vote_batch_sighash(
             &round,
             u64::from(anchor_height),
             &actions,
-        )?;
-        if recomputed != digest {
-            return Err(VotingError::Internal {
-                message: format!(
-                    "version-17 vote batch digest mismatch for wallet={wallet}, network={network}, round={round}, bundle={bundle}"
-                ),
-            });
+        )
+        .is_ok_and(|recomputed| recomputed == digest);
+        if !complete || !ordered || !common_anchor || !common_hash || !digest_matches {
+            let batch_hashes = members
+                .iter()
+                .filter_map(|(_, _, hash)| hash.clone())
+                .collect::<HashSet<_>>();
+            invalid_members.extend(members.iter().map(|(scope, _, _)| scope.clone()));
+            for row in rows.iter().filter(|row| {
+                row.1 == wallet
+                    && row.2 == network
+                    && row.0 == round
+                    && row.3 == bundle
+                    && (row
+                        .5
+                        .as_ref()
+                        .is_some_and(|hash| batch_hashes.contains(hash))
+                        || (row.5.is_none() && row.7.is_none() && row.8.is_none()))
+            }) {
+                invalid_members.insert(member_scope(row));
+            }
         }
     }
 
-    for ((wallet, network, round, bundle, _), digests) in shared_hashes {
+    for ((_wallet, _network, _round, _bundle, _), digests) in shared_hashes {
         if digests.len() > 1
-            && (digests[0].is_none() || digests.iter().any(|digest| *digest != digests[0]))
+            && (digests[0].1.is_none() || digests.iter().any(|(_, digest)| *digest != digests[0].1))
         {
-            return Err(VotingError::Internal {
-                message: format!(
-                    "shared version-17 vote hash is not one reconstructable batch for wallet={wallet}, network={network}, round={round}, bundle={bundle}"
-                ),
-            });
+            invalid_members.extend(digests.into_iter().map(|(scope, _)| scope));
         }
     }
-    Ok(())
+    invalid_members
 }
 
 /// Imports every version-17 row that carries chain evidence.
@@ -724,7 +766,9 @@ fn validate_v17_recovery_batches(rows: &[V17VoteEvidenceRow]) -> Result<(), Voti
 /// permanently unbound digestless guard, allowing the database upgrade to
 /// complete without treating corrupt recovery as authoritative.
 ///
-/// Any row that cannot be represented without guessing aborts the migration.
+/// Malformed row-local evidence becomes an authoritative member guard.
+/// Cross-row output ownership ambiguity, an identity that cannot name a guard,
+/// and operational storage failures still abort the migration.
 fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> {
     let mut observed_output_positions = std::collections::HashSet::new();
     let mut statement = tx
@@ -767,7 +811,7 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         .collect::<Result<Vec<_>, _>>()
         .map_err(migration_error)?;
     drop(statement);
-    validate_v17_recovery_batches(&rows)?;
+    let invalid_vote_members = audit_v17_recovery_evidence(&rows);
 
     // Batch members are bound once, as a single vote_batch generation. A
     // provable batch has already been validated for completeness, ordering,
@@ -785,60 +829,29 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         van,
         vc,
         recovery,
-        stored_choice,
-        stored_commitment,
+        _stored_choice,
+        _stored_commitment,
         created,
         shared_hash,
     ) in rows
     {
-        let bundle_index = u32::try_from(bundle).map_err(|_| VotingError::Internal {
-            message: "invalid legacy bundle index".to_string(),
-        })?;
+        let invalid_recovery_evidence = invalid_vote_members.contains(&(
+            wallet_id.clone(),
+            network.clone(),
+            round_id.clone(),
+            bundle,
+            proposal,
+        ));
         let proposal_id = u32::try_from(proposal).map_err(|_| VotingError::Internal {
             message: "invalid legacy proposal id".to_string(),
         })?;
         let mut recovery_batch_digest = None;
-        if let Some(json) = recovery.as_deref() {
-            if !tx
-                .query_row("SELECT json_valid(?1)", [json], |row| row.get::<_, bool>(0))
-                .map_err(migration_error)?
-            {
-                return Err(VotingError::Internal {
-                    message: format!("malformed non-null vote recovery JSON for round={round_id}, bundle={bundle}, proposal={proposal}"),
-                });
-            }
-            // The public recovery loader performs the complete closed-format
+        if let Some(json) = recovery.as_deref().filter(|_| !invalid_recovery_evidence) {
+            // The audit above performed the same closed-format and owning-row
             // validation used by runtime generation derivation.
-            let parsed = crate::vote::recovery_bundle_with_conn(
-                tx,
-                &wallet_id,
-                &round_id,
-                bundle_index,
-                proposal_id,
-            )?
-            .ok_or_else(|| VotingError::Internal {
-                message: "non-null legacy recovery JSON disappeared while migrating".to_string(),
+            let parsed = crate::vote::parse_recovery(json).map_err(|_| VotingError::Internal {
+                message: "audited version-17 recovery became unreadable".to_string(),
             })?;
-            crate::vote::validate_recovery_matches_stored_vote(
-                &parsed,
-                &round_id,
-                bundle_index,
-                proposal_id,
-                stored_choice,
-                stored_commitment.as_deref(),
-            )?;
-            if let Some(position) = vc {
-                let position = u64::try_from(position).map_err(|_| VotingError::Internal {
-                    message: "negative legacy VC position".to_string(),
-                })?;
-                if parsed.vc_tree_position != position {
-                    return Err(VotingError::Internal {
-                        message: format!(
-                            "vote recovery bundle vc_tree_position mismatch for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
-                        ),
-                    });
-                }
-            }
             recovery_batch_digest = parsed.batch.as_ref().map(|batch| batch.digest);
         }
         let checked_van = van
@@ -856,15 +869,19 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
             })
             .transpose()?;
         if let Some(position) = checked_vc {
-            if !observed_output_positions.insert((network.clone(), position)) {
+            if !observed_output_positions.insert((network.clone(), round_id.clone(), position)) {
                 return Err(VotingError::Internal {
                     message: format!(
-                        "version-17 {network} vote commitment position {position} has multiple owners"
+                        "version-17 {network} round {round_id} vote commitment position {position} has multiple owners"
                     ),
                 });
             }
         }
-        let has_evidence = hash.is_some() || van.is_some() || vc.is_some() || recovery.is_some();
+        let has_evidence = invalid_recovery_evidence
+            || hash.is_some()
+            || van.is_some()
+            || vc.is_some()
+            || recovery.is_some();
         if !has_evidence {
             continue;
         }
@@ -901,7 +918,9 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
             continue;
         };
 
-        let import = if recovery.is_some() && !batch_indicated {
+        let import = if invalid_recovery_evidence {
+            V17Import::legacy_evidence_invalid_guard()
+        } else if recovery.is_some() && !batch_indicated {
             // Bind valid recovery, but quarantine an underivable historical
             // generation instead of blocking the complete database upgrade.
             match generation_for_vote(tx, &identity) {
@@ -922,7 +941,12 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
         } else {
             V17Import::recovery_unavailable_guard()
         };
-        register_v17_legacy_import_van(&mut observed_output_positions, &network, &import)?;
+        register_v17_legacy_import_van(
+            &mut observed_output_positions,
+            &network,
+            &round_id,
+            &import,
+        )?;
         insert_v17_submission(
             tx,
             &identity,
@@ -1004,7 +1028,12 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
             final_van,
             positions,
         )?;
-        register_v17_legacy_import_van(&mut observed_output_positions, &network, &import)?;
+        register_v17_legacy_import_van(
+            &mut observed_output_positions,
+            &network,
+            &round_id,
+            &import,
+        )?;
         insert_v17_submission(
             tx,
             &identity,
@@ -1116,7 +1145,12 @@ fn backfill_v17_chain_evidence(tx: &Transaction<'_>) -> Result<(), VotingError> 
             Err(error @ VotingError::Storage { .. }) => return Err(error),
             Err(_) => V17Import::generation_derivation_failed_guard(),
         };
-        register_v17_legacy_import_van(&mut observed_output_positions, &network, &import)?;
+        register_v17_legacy_import_van(
+            &mut observed_output_positions,
+            &network,
+            &round_id,
+            &import,
+        )?;
         insert_v17_submission(tx, &identity, "delegation", None, None, created_at, import)?;
     }
     Ok(())

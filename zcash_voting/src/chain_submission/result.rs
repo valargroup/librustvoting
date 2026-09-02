@@ -32,6 +32,11 @@ pub enum ChainSubmissionDiagnosticKind {
     /// inputs were persisted at all. Both leave the row permanently unbound,
     /// but only this one indicates inputs that are present and unusable.
     GenerationDerivationFailed,
+    /// Version-17 recovery evidence is malformed or internally inconsistent.
+    ///
+    /// The affected identity remains permanently guarded because migration
+    /// cannot safely infer which historical generation, if any, was submitted.
+    LegacyEvidenceInvalid,
     StorageFailure,
 }
 
