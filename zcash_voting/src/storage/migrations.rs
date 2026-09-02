@@ -191,6 +191,24 @@ UPDATE proofs AS p
     (
         18,
         "ALTER TABLE bundles ADD COLUMN delegation_pczt BLOB;
+-- A legacy signature that does not match the bundle's current signing fields
+-- can block a valid replacement forever. Remove only local, unsubmitted rows;
+-- the validated storage path will accept a signature for the current setup.
+DELETE FROM keystone_signatures
+ WHERE EXISTS (
+       SELECT 1
+         FROM bundles b
+        WHERE b.round_id = keystone_signatures.round_id
+          AND b.wallet_id = keystone_signatures.wallet_id
+          AND b.bundle_index = keystone_signatures.bundle_index
+          AND b.note_positions_blob IS NOT NULL
+          AND b.delegation_tx_hash IS NULL
+          AND b.van_leaf_position IS NULL
+          AND (b.pczt_sighash IS NULL
+               OR b.rk IS NULL
+               OR keystone_signatures.sighash != b.pczt_sighash
+               OR keystone_signatures.rk != b.rk)
+   );
 -- Existing setup predates durable PCZT storage, so a successful proof cannot
 -- be bound to the current randomized signing context. Demote every local,
 -- unsubmitted proof without a durable PCZT so ZKP1 can be rebuilt against the
@@ -208,11 +226,14 @@ UPDATE proofs AS p
           AND b.note_positions_blob IS NOT NULL
           AND b.delegation_tx_hash IS NULL
           AND b.van_leaf_position IS NULL
-   );
--- Clear every remaining locally rebuildable setup that has neither a usable
--- proof nor a durable signature. Its binding fields cannot be paired with a
--- newly generated signer request.
-UPDATE bundles
+   );",
+    ),
+];
+
+/// Clear a legacy local setup after proof demotion and signature validation
+/// leave it with no usable proof or signature. Submitted, confirmed, and
+/// imported bundles remain untouched.
+const CLEAR_UNBOUND_LEGACY_DELEGATION_SETUP_SQL: &str = "UPDATE bundles
    SET van_comm_rand = NULL,
        dummy_nullifiers = NULL,
        rho_signed = NULL,
@@ -246,9 +267,7 @@ UPDATE bundles
          FROM keystone_signatures
         WHERE round_id = bundles.round_id
           AND wallet_id = bundles.wallet_id
-   );",
-    ),
-];
+   );";
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
 DROP TABLE IF EXISTS ballot_intent;
@@ -262,6 +281,71 @@ DROP TABLE IF EXISTS proofs;
 DROP TABLE IF EXISTS bundles;
 DROP TABLE IF EXISTS cached_tree_state;
 DROP TABLE IF EXISTS rounds;";
+
+fn delete_invalid_legacy_keystone_signatures(conn: &Connection) -> Result<(), VotingError> {
+    let candidates = {
+        let mut statement = conn
+            .prepare(
+                "SELECT k.round_id, k.wallet_id, k.bundle_index,
+                        k.sig, k.sighash, k.rk, b.pczt_sighash, b.rk
+                 FROM keystone_signatures k
+                 JOIN bundles b
+                   ON b.round_id = k.round_id
+                  AND b.wallet_id = k.wallet_id
+                  AND b.bundle_index = k.bundle_index
+                 WHERE b.delegation_pczt IS NULL
+                   AND b.note_positions_blob IS NOT NULL
+                   AND b.delegation_tx_hash IS NULL
+                   AND b.van_leaf_position IS NULL",
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to inspect legacy Keystone signatures: {e}"),
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u32,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                ))
+            })
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to query legacy Keystone signatures: {e}"),
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to read legacy Keystone signature: {e}"),
+            })?
+    };
+
+    for (round_id, wallet_id, bundle_index, sig, sighash, rk, stored_sighash, stored_rk) in
+        candidates
+    {
+        let valid = stored_sighash.as_deref() == Some(sighash.as_slice())
+            && stored_rk.as_deref() == Some(rk.as_slice())
+            && super::operations::verify_delegation_spend_auth_signature(&rk, &sighash, &sig)
+                .is_ok();
+        if valid {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM keystone_signatures
+             WHERE round_id = ?1 AND wallet_id = ?2 AND bundle_index = ?3",
+            rusqlite::params![round_id, wallet_id, bundle_index],
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!(
+                "failed to remove invalid legacy Keystone signature for bundle {bundle_index}: {e}"
+            ),
+        })?;
+    }
+    Ok(())
+}
 
 pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     let version: u32 = conn
@@ -312,6 +396,15 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
                     e
                 ),
             })?;
+            if *from == 18 {
+                delete_invalid_legacy_keystone_signatures(&tx)?;
+                tx.execute_batch(CLEAR_UNBOUND_LEGACY_DELEGATION_SETUP_SQL)
+                    .map_err(|e| VotingError::Internal {
+                        message: format!(
+                            "failed to clear unusable legacy delegation setup after signature validation: {e}"
+                        ),
+                    })?;
+            }
             upgraded = from + 1;
         }
         if upgraded != CURRENT_VERSION {
@@ -442,6 +535,33 @@ mod tests {
             nc_root: vec![0xAA; 32],
             nullifier_imt_root: vec![0xBB; 32],
         }
+    }
+
+    fn valid_keystone_signature(sighash: &[u8; 32]) -> ([u8; 32], [u8; 64]) {
+        use crate::backend::{
+            orchard::{
+                keys::{SpendAuthorizingKey, SpendingKey},
+                primitives::redpallas::{SpendAuth, VerificationKey},
+            },
+            pasta_curves::pallas,
+            zcash_keys::keys::UnifiedSpendingKey,
+        };
+        use zcash_protocol::consensus::TEST_NETWORK;
+        use zip32::AccountId;
+
+        let usk = UnifiedSpendingKey::from_seed(
+            &TEST_NETWORK,
+            &[0x42; 64],
+            AccountId::try_from(0).unwrap(),
+        )
+        .unwrap();
+        let sk: SpendingKey = *usk.orchard();
+        let ask = SpendAuthorizingKey::from(&sk);
+        let randomized_signing_key = ask.randomize(&pallas::Scalar::from(7));
+        let rk: [u8; 32] = (&VerificationKey::<SpendAuth>::from(&randomized_signing_key)).into();
+        let signature =
+            randomized_signing_key.sign(voting_crypto_deps::rand::rngs::OsRng, sighash);
+        (rk, (&signature).into())
     }
 
     fn store_complete_delegation_setup(conn: &Connection, bundle_index: u32) {
@@ -783,7 +903,7 @@ mod tests {
         )
         .unwrap();
         // This signature arrived after cleanup and is bound to setup that no
-        // longer exists. The intact signature remains a migration control.
+        // longer exists. Its mismatched context must not block reconstruction.
         queries::store_keystone_signature(
             &conn,
             "test-round",
@@ -840,7 +960,7 @@ mod tests {
             .unwrap();
         assert_eq!(repaired, (vec![0xAC; 96], 0));
 
-        // Version 19 also demotes intact unsigned legacy proofs because their
+        // Version 19 also demotes intact legacy proofs because their
         // exact PCZT was never persisted for a future Keystone request.
         let repaired_legacy_unsigned: (Vec<u8>, i64) = conn
             .query_row(
@@ -883,9 +1003,19 @@ mod tests {
         assert_eq!(repaired_partial, (vec![0xE1; 96], 0));
 
         let signatures = queries::get_keystone_signatures(&conn, "test-round", "wallet").unwrap();
-        assert_eq!(signatures.len(), 1);
-        assert_eq!(signatures[0].bundle_index, 3);
-        assert_eq!(signatures[0].sig, vec![0x21; 64]);
+        assert!(signatures.is_empty());
+        let stale_setup_presence: (i64, i64) = conn
+            .query_row(
+                "SELECT pczt_sighash IS NOT NULL, rk IS NOT NULL
+                 FROM bundles
+                 WHERE round_id = 'test-round'
+                   AND wallet_id = 'wallet'
+                   AND bundle_index = 3",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stale_setup_presence, (0, 0));
         let proofless_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM proofs
@@ -926,19 +1056,41 @@ mod tests {
             .unwrap();
             store_complete_v18_delegation_setup(&conn, bundle_index);
         }
+        // The tuple matches bundle 0's stored context, but the signature is
+        // invalid. Migration must remove it so setup can be rebuilt.
+        queries::store_keystone_signature(
+            &conn,
+            "test-round",
+            "wallet",
+            0,
+            &[0; 64],
+            &[0x09; 32],
+            &[0x0A; 32],
+        )
+        .unwrap();
         queries::store_proof(&conn, "test-round", "wallet", 1, &[0xA1; 96]).unwrap();
         // Represent a released database where proof A survived a reset before
         // setup B and its Keystone signature were persisted. Without the exact
         // PCZT, migration cannot prove that the successful proof belongs to B.
         queries::store_proof(&conn, "test-round", "wallet", 2, &[0xA2; 96]).unwrap();
+        let signed_sighash = [0x09; 32];
+        let (signed_rk, signed_signature) = valid_keystone_signature(&signed_sighash);
+        conn.execute(
+            "UPDATE bundles SET rk = ?1
+             WHERE round_id = 'test-round'
+               AND wallet_id = 'wallet'
+               AND bundle_index = 2",
+            [signed_rk.as_slice()],
+        )
+        .unwrap();
         queries::store_keystone_signature(
             &conn,
             "test-round",
             "wallet",
             2,
-            &[0xA2; 64],
-            &[0x09; 32],
-            &[0x0A; 32],
+            &signed_signature,
+            &signed_sighash,
+            &signed_rk,
         )
         .unwrap();
         conn.execute(
@@ -1006,7 +1158,7 @@ mod tests {
         let signatures = queries::get_keystone_signatures(&conn, "test-round", "wallet").unwrap();
         assert_eq!(signatures.len(), 1);
         assert_eq!(signatures[0].bundle_index, 2);
-        assert_eq!(signatures[0].sig, vec![0xA2; 64]);
+        assert_eq!(signatures[0].sig, signed_signature);
 
         queries::store_proof(&conn, "test-round", "wallet", 2, &[0xB2; 96]).unwrap();
         let reproved =

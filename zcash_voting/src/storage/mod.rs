@@ -78,7 +78,9 @@ pub struct KeystoneSignatureInput {
 /// Counts from an idempotent atomic Keystone signature batch write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeystoneSignatureBatchResult {
+    /// Rows newly inserted or repaired from a stale or invalid legacy value.
     pub inserted: u32,
+    /// Existing valid rows retained for an equivalent signing context.
     pub already_present: u32,
 }
 

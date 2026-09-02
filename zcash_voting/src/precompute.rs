@@ -1240,8 +1240,16 @@ mod session_reset_tests {
         db.ensure_bundles(ROUND_ID, &[note(0), note(1)]).unwrap();
         seed_unsigned_setup_fields(&db, ROUND_ID, 0);
         seed_unsigned_setup_fields(&db, ROUND_ID, 1);
-        db.store_keystone_signature(ROUND_ID, 0, &[0x11; 64], &[0xAA; 32], &[0x22; 32])
-            .unwrap();
+        queries::store_keystone_signature(
+            &db.conn(),
+            ROUND_ID,
+            WALLET_ID,
+            0,
+            &[0x11; 64],
+            &[0xAA; 32],
+            &[0x22; 32],
+        )
+        .unwrap();
 
         reset_voting_session_state(&db, ROUND_ID).unwrap();
 

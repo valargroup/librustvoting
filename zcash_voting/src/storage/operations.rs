@@ -240,7 +240,7 @@ fn pir_cache_nullifier_targets(
     Ok(targets)
 }
 
-fn verify_delegation_spend_auth_signature(
+pub(super) fn verify_delegation_spend_auth_signature(
     rk: &[u8],
     sighash: &[u8],
     signature: &[u8],
@@ -1252,12 +1252,12 @@ impl VotingDb {
             queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
         validate_delegation_keys_for_round(&params, stored_network, keys)?;
         queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
-        let signing_context =
-            queries::load_delegation_signing_context(&conn, round_id, &wallet_id, bundle_index)?;
         let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
         let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, &wallet_id, bundle_index)?;
         let witnesses = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
         validate_witnesses_for_round(&witnesses, &params)?;
+        let signing_context =
+            queries::load_delegation_signing_context(&conn, round_id, &wallet_id, bundle_index)?;
 
         // Load Phase 1 randomness for ZCA-74 fix: ensures Phase 2 produces
         // the same nf_signed/cmx_new that Phase 1 committed to in the PCZT.
@@ -1867,6 +1867,7 @@ impl VotingDb {
         )
     }
 
+    /// Validate and store one Keystone signature against the persisted setup.
     pub fn store_keystone_signature(
         &self,
         round_id: &str,
@@ -1887,12 +1888,14 @@ impl VotingDb {
         .map(|_| ())
     }
 
-    /// Atomically store a batch of Keystone delegation signatures.
+    /// Atomically validate and store a batch of Keystone delegation signatures.
     ///
-    /// Replaying a tuple with the same sighash and randomized key is
-    /// idempotent even if the signature bytes differ. Reusing a bundle index
-    /// for a different signing context returns a typed conflict and rolls the
-    /// complete batch back.
+    /// Every tuple must match the bundle's persisted sighash and randomized key
+    /// and pass SpendAuth verification before any write commits. Replaying an
+    /// existing valid signing context is idempotent even if the signature bytes
+    /// differ. A verified current-context signature repairs a stale or invalid
+    /// legacy row. A tuple for another signing context returns a typed conflict
+    /// and rolls the complete batch back.
     pub fn store_keystone_signatures_batch(
         &self,
         round_id: &str,
@@ -1936,9 +1939,28 @@ impl VotingDb {
         let mut already_present = 0u32;
 
         for signature in signatures {
+            let signing_context = queries::load_delegation_signing_context(
+                &tx,
+                round_id,
+                &wallet_id,
+                signature.bundle_index,
+            )?;
+            if signing_context.pczt_sighash != signature.sighash
+                || signing_context.rk != signature.rk
+            {
+                return Err(VotingError::KeystoneSignatureConflict {
+                    bundle_index: signature.bundle_index,
+                });
+            }
+            verify_delegation_spend_auth_signature(
+                &signing_context.rk,
+                &signing_context.pczt_sighash,
+                &signature.sig,
+            )?;
+
             let existing = tx
                 .query_row(
-                    "SELECT sighash, rk FROM keystone_signatures
+                    "SELECT sig, sighash, rk FROM keystone_signatures
                      WHERE round_id = :round_id AND wallet_id = :wallet_id
                        AND bundle_index = :bundle_index",
                     rusqlite::named_params! {
@@ -1946,21 +1968,58 @@ impl VotingDb {
                         ":wallet_id": &wallet_id,
                         ":bundle_index": signature.bundle_index as i64,
                     },
-                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|e| VotingError::Internal {
                     message: format!("failed to read existing Keystone signature: {e}"),
                 })?;
 
-            if let Some((sighash, rk)) = existing {
-                if sighash == signature.sighash && rk == signature.rk {
+            if let Some((sig, sighash, rk)) = existing {
+                let existing_matches_current =
+                    sighash == signing_context.pczt_sighash && rk == signing_context.rk;
+                let existing_is_valid = existing_matches_current
+                    && (sig == signature.sig
+                        || verify_delegation_spend_auth_signature(
+                            &signing_context.rk,
+                            &signing_context.pczt_sighash,
+                            &sig,
+                        )
+                        .is_ok());
+                if existing_is_valid {
                     already_present += 1;
                     continue;
                 }
-                return Err(VotingError::KeystoneSignatureConflict {
-                    bundle_index: signature.bundle_index,
-                });
+
+                tx.execute(
+                    "UPDATE keystone_signatures
+                     SET sig = :sig, sighash = :sighash, rk = :rk, created_at = :created_at
+                     WHERE round_id = :round_id AND wallet_id = :wallet_id
+                       AND bundle_index = :bundle_index",
+                    rusqlite::named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": &wallet_id,
+                        ":bundle_index": signature.bundle_index as i64,
+                        ":sig": &signature.sig,
+                        ":sighash": &signature.sighash,
+                        ":rk": &signature.rk,
+                        ":created_at": created_at,
+                    },
+                )
+                .map_err(|e| VotingError::Internal {
+                    message: format!(
+                        "failed to repair Keystone signature for bundle {}: {e}",
+                        signature.bundle_index
+                    ),
+                })?;
+                inserted += 1;
+                continue;
             }
 
             tx.execute(
@@ -2720,8 +2779,7 @@ mod tests {
         let ask = SpendAuthorizingKey::from(&sk);
         let rsk = ask.randomize(alpha);
         let rk: [u8; 32] = (&VerificationKey::<SpendAuth>::from(&rsk)).into();
-        let mut rng = voting_crypto_deps::rand::rngs::OsRng;
-        let sig = rsk.sign(&mut rng, sighash);
+        let sig = rsk.sign(voting_crypto_deps::rand::rngs::OsRng, sighash);
 
         (rk, (&sig).into())
     }
@@ -2742,8 +2800,7 @@ mod tests {
         let alpha = Option::<pallas::Scalar>::from(pallas::Scalar::from_repr(request.alpha))
             .expect("test stores a valid alpha scalar");
         let rsk = ask.randomize(&alpha);
-        let mut rng = voting_crypto_deps::rand::rngs::OsRng;
-        let sig = rsk.sign(&mut rng, &request.sighash);
+        let sig = rsk.sign(voting_crypto_deps::rand::rngs::OsRng, &request.sighash);
 
         (&sig).into()
     }
@@ -3341,8 +3398,46 @@ mod tests {
         assert_eq!(other_cache_count, 1);
     }
 
+    fn keystone_signature_fixture(
+        bundle_index: u32,
+        seed_byte: u8,
+        sighash_byte: u8,
+    ) -> KeystoneSignatureInput {
+        let sighash = [sighash_byte; 32];
+        let (rk, sig) = test_randomized_spendauth_signature(
+            &[seed_byte; 64],
+            0,
+            &pallas::Scalar::from(u64::from(bundle_index) + 1),
+            &sighash,
+        );
+        KeystoneSignatureInput {
+            bundle_index,
+            sig: sig.to_vec(),
+            sighash: sighash.to_vec(),
+            rk: rk.to_vec(),
+        }
+    }
+
+    fn store_keystone_signing_context_fixture(db: &VotingDb, signature: &KeystoneSignatureInput) {
+        let rows = db
+            .conn()
+            .execute(
+                "UPDATE bundles SET pczt_sighash = ?1, rk = ?2
+                 WHERE round_id = ?3 AND wallet_id = ?4 AND bundle_index = ?5",
+                rusqlite::params![
+                    &signature.sighash,
+                    &signature.rk,
+                    ROUND_ID,
+                    W,
+                    signature.bundle_index,
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
     #[test]
-    fn keystone_signature_batch_is_atomic_idempotent_and_reports_typed_conflicts() {
+    fn keystone_signature_batch_verifies_context_and_is_atomic_and_idempotent() {
         let db = test_db();
         db.init_round(Network::Testnet, &test_params(), None)
             .unwrap();
@@ -3356,12 +3451,11 @@ mod tests {
             &[identity_note_with_position(8)],
         )
         .unwrap();
-        let signature = KeystoneSignatureInput {
-            bundle_index: 0,
-            sig: vec![0x11; 64],
-            sighash: vec![0x22; 32],
-            rk: vec![0x33; 32],
-        };
+        let signature = keystone_signature_fixture(0, 0x41, 0x21);
+        let alternate_valid_signature = keystone_signature_fixture(0, 0x41, 0x21);
+        let second_signature = keystone_signature_fixture(1, 0x42, 0x22);
+        store_keystone_signing_context_fixture(&db, &signature);
+        store_keystone_signing_context_fixture(&db, &second_signature);
 
         let inserted = db
             .store_keystone_signatures_batch(ROUND_ID, std::slice::from_ref(&signature))
@@ -3376,10 +3470,7 @@ mod tests {
         let replayed = db
             .store_keystone_signatures_batch(
                 ROUND_ID,
-                &[KeystoneSignatureInput {
-                    sig: vec![0x44; 64],
-                    ..signature.clone()
-                }],
+                std::slice::from_ref(&alternate_valid_signature),
             )
             .unwrap();
         assert_eq!(
@@ -3389,19 +3480,29 @@ mod tests {
                 already_present: 1,
             }
         );
+        let stored = db.get_keystone_signatures(ROUND_ID).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].sig, signature.sig);
+
+        let invalid_signature = KeystoneSignatureInput {
+            sig: vec![0; 64],
+            ..signature.clone()
+        };
+        let error = db
+            .store_keystone_signatures_batch(ROUND_ID, &[invalid_signature])
+            .expect_err("an invalid SpendAuth signature must be rejected");
+        assert!(error
+            .to_string()
+            .contains("signature does not verify against stored delegation rk and sighash"));
 
         let error = db
             .store_keystone_signatures_batch(
                 ROUND_ID,
                 &[
-                    KeystoneSignatureInput {
-                        bundle_index: 1,
-                        ..signature.clone()
-                    },
+                    second_signature.clone(),
                     KeystoneSignatureInput {
                         bundle_index: 0,
-                        sighash: vec![0x55; 32],
-                        ..signature
+                        ..second_signature
                     },
                 ],
             )
@@ -3412,7 +3513,43 @@ mod tests {
         ));
         let stored = db.get_keystone_signatures(ROUND_ID).unwrap();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].sig, vec![0x11; 64]);
+        assert_eq!(stored[0].sig, signature.sig);
+    }
+
+    #[test]
+    fn keystone_signature_batch_repairs_invalid_legacy_row() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        let signature = keystone_signature_fixture(0, 0x41, 0x21);
+        store_keystone_signing_context_fixture(&db, &signature);
+        queries::store_keystone_signature(
+            &db.conn(),
+            ROUND_ID,
+            W,
+            0,
+            &[0; 64],
+            &signature.sighash,
+            &signature.rk,
+        )
+        .unwrap();
+
+        let repaired = db
+            .store_keystone_signatures_batch(ROUND_ID, std::slice::from_ref(&signature))
+            .unwrap();
+
+        assert_eq!(
+            repaired,
+            KeystoneSignatureBatchResult {
+                inserted: 1,
+                already_present: 0,
+            }
+        );
+        let stored = db.get_keystone_signatures(ROUND_ID).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].sig, signature.sig);
     }
 
     #[test]
