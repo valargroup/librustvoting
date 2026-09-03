@@ -2839,6 +2839,12 @@ mod tests {
                 Some(hex::encode(candidate).as_str())
             );
         }
+        assert_eq!(snapshot.commitment_bundles.len(), 2);
+        for (bundle, proposal_id) in snapshot.commitment_bundles.iter().zip([1, 2]) {
+            assert_eq!(bundle.bundle_index, 0);
+            assert_eq!(bundle.proposal_id, proposal_id);
+            assert_eq!(bundle.vc_tree_position, 0);
+        }
     }
 
     fn insert_batch_row_fixture(

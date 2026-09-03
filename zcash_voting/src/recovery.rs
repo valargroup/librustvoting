@@ -114,16 +114,48 @@ pub struct RoundRecoverySnapshot {
 ///
 /// If the bundle JSON exists but `vc_tree_position` is still NULL, this returns
 /// `Some` with placeholder tree position `0` only when the vote transaction hash
-/// has already been recorded; otherwise it returns `None`.
+/// is known from the authoritative singleton or atomic-batch lifecycle row;
+/// otherwise it returns `None`.
 pub fn recoverable_commitment_bundle(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
 ) -> Result<Option<RecoverableCommitmentBundle>, VotingError> {
+    let ordered_batch_digest = db
+        .vote_submission_statuses(round_id)?
+        .into_iter()
+        .find(|status| status.bundle_index == bundle_index && status.proposal_id == proposal_id)
+        .and_then(|status| status.ordered_batch_digest);
+    let has_vote_tx_hash = match ordered_batch_digest {
+        Some(ordered_batch_digest) => vote_batch_transaction_hash(
+            db,
+            round_id,
+            bundle_index,
+            ordered_batch_digest,
+            proposal_id,
+        )?
+        .is_some(),
+        None => vote_transaction_hash(db, round_id, bundle_index, proposal_id)?.is_some(),
+    };
+
+    recoverable_commitment_bundle_with_hash_presence(
+        db,
+        round_id,
+        bundle_index,
+        proposal_id,
+        has_vote_tx_hash,
+    )
+}
+
+fn recoverable_commitment_bundle_with_hash_presence(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    has_vote_tx_hash: bool,
+) -> Result<Option<RecoverableCommitmentBundle>, VotingError> {
     let fields = db.get_commitment_bundle_recovery_fields(round_id, bundle_index, proposal_id)?;
-    let has_vote_tx_hash =
-        vote_transaction_hash(db, round_id, bundle_index, proposal_id)?.is_some();
 
     match fields {
         Some((Some(commitment_bundle_json), Some(position))) => {
@@ -192,9 +224,13 @@ pub fn round_snapshot(db: &VotingDb, round_id: &str) -> Result<RoundRecoverySnap
     let votes = build_vote_recovery_rows(db, round_id, &vote_rows)?;
     let mut commitment_bundles = Vec::new();
     for vote in &votes {
-        if let Some(bundle) =
-            recoverable_commitment_bundle(db, round_id, vote.bundle_index, vote.proposal_id)?
-        {
+        if let Some(bundle) = recoverable_commitment_bundle_with_hash_presence(
+            db,
+            round_id,
+            vote.bundle_index,
+            vote.proposal_id,
+            vote.tx_hash.is_some(),
+        )? {
             commitment_bundles.push(bundle);
         }
     }
