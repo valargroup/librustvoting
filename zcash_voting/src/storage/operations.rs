@@ -1604,9 +1604,6 @@ impl VotingDb {
     }
 
     /// Store the VAN leaf position after delegation TX is confirmed on chain.
-    /// The app calls this after parsing the delegation TX response events.
-    /// Cast-vote callers should use `confirmation::confirm_vote_submission` so
-    /// all confirmation fields are stored atomically.
     /// Test-only durable writer. Production callers reach chain state
     /// through the `chain_submission` lifecycle, which is the only
     /// authority for submission and confirmation.

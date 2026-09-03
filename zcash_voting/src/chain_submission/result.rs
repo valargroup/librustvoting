@@ -10,11 +10,28 @@ pub const MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES: usize = 512;
 /// The durable lifecycle states stored for lifecycle-owned submissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChainSubmissionState {
+    /// A POST reservation exists and dispatch has not yet been classified.
     Submitting,
+    /// A returned transaction hash is being polled within the finite
+    /// tracking window.
     Tracking,
+    /// Dispatch could not be excluded and no usable hash is being tracked, or
+    /// tracking ended inconclusively; further bounded retries, polling, or
+    /// exact-tree recovery may still resolve the submission.
     Recovering,
+    /// Terminal: the bounded POST dispatch is durably treated as submitted, but
+    /// no transaction hash and no confirmation positions are available.
+    ///
+    /// This is not a confirmation. The lifecycle performs no further retry,
+    /// polling, or tree recovery for the generation, and dependent work (such
+    /// as the next bundle generation) stays blocked exactly as it would behind
+    /// an unresolved submission. Hosts surface the stored diagnostic to the
+    /// user rather than scheduling another pass.
     SubmittedWithoutHash,
+    /// Terminal: the transaction committed successfully and its positions are
+    /// recorded.
     Confirmed,
+    /// Terminal: the chain definitively rejected the submission.
     Rejected,
 }
 

@@ -1713,9 +1713,8 @@ pub(crate) fn load_vote_row_state(
 
 /// Store the VAN leaf position after delegation TX is confirmed on chain.
 ///
-/// Cast-vote confirmations should use `confirmation::confirm_vote_submission`
-/// so the vote hash, successor VAN position, and VC position are recorded
-/// atomically.
+/// Test-only writer; production confirmation is recorded atomically by the
+/// `chain_submission` lifecycle.
 #[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) fn store_van_position(
     conn: &Connection,

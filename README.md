@@ -85,8 +85,10 @@ stage-oriented API:
   requests, and assembles signed delegation submissions. Wallets keep root seed
   material outside this crate, sign requests at the wallet boundary, and pass
   only signature bytes back through `PreparedSigner::signature`.
-- `confirmation::*` parses delegation and cast-vote tx events, then records tx
-  hashes and tree positions atomically.
+- `chain_submission::ChainSubmissionClient` is the only route to chain
+  confirmation. Its `advance_*` calls parse delegation and cast-vote tx events
+  internally and record tx hashes and tree positions atomically; hosts never
+  handle chain events themselves.
 - `vote::*` builds ZKP #2, signs cast-vote payloads, persists the canonical
   `VoteRecoveryBundle`, and reconstructs vote-chain submissions after a crash.
 - `share::*` computes helper-share nullifiers and applies scheduling policy.
