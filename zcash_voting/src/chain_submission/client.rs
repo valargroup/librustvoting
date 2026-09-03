@@ -151,6 +151,19 @@ pub struct AdvanceVote {
     pub proposal_id: u32,
 }
 
+/// Inputs that identify one prepared atomic vote-batch generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdvanceVoteBatch {
+    /// Canonical 32-byte round identifier used by every prepared batch member.
+    pub vote_round_id: [u8; 32],
+    /// Durable bundle containing the prepared batch inputs.
+    pub bundle_index: u32,
+    /// Digest binding the complete ordered batch roster.
+    pub ordered_batch_digest: [u8; 32],
+    /// Proposal identifiers in signed action order.
+    pub ordered_proposal_ids: Vec<u32>,
+}
+
 /// SDK-owned durable submission lifecycle using one HTTP mechanism.
 ///
 /// Each advancement serializes work for its identity, reconstructs the
@@ -356,6 +369,69 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         )?;
         self.coordinator
             .advance_with_recovery(StoreAdvancementRequest::vote(identity), recovery, control)
+            .await
+    }
+
+    /// Advances one prepared atomic vote batch through one bounded status-only pass.
+    ///
+    /// The pass validates a non-empty, protocol-bounded, duplicate-free proposal
+    /// roster, then rederives its locked durable roster and ordered digest. It
+    /// may durably reserve before POST, submit the complete batch, poll a
+    /// candidate, and atomically persist confirmation for every batch member.
+    /// It does not scan the commitment tree. A non-cancelled result represents
+    /// the authoritative durable outcome reported by
+    /// [`ChainSubmissionResult::durable_state`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure for invalid identity, roster, digest, or prepared
+    /// state; invariant or storage failure; transport failure; or invalid
+    /// protocol data. Once dispatch may have occurred, cancellation or failure
+    /// does not erase the strongest state reported by
+    /// [`ChainSubmissionFailure::strongest_state`].
+    pub async fn advance_vote_batch(
+        &self,
+        request: AdvanceVoteBatch,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        self.advance_vote_batch_with_recovery(request, ChainRecoveryMode::StatusOnly, control)
+            .await
+    }
+
+    /// Advances one prepared atomic vote batch through one bounded pass.
+    ///
+    /// This has the same validation, durable and network side effects, and
+    /// result postconditions as [`Self::advance_vote_batch`].
+    /// [`ChainRecoveryMode::StatusOnly`] reconciles only through a known
+    /// transaction hash. [`ChainRecoveryMode::ExactTree`] may, after
+    /// candidate-first reconciliation is inconclusive, scan one fixed complete
+    /// tree snapshot and atomically confirm only the unique exact ordered batch
+    /// layout or authorize one same-generation retry within this call's attempt
+    /// budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure for invalid identity, roster, digest, or prepared
+    /// state; invariant or storage failure; transport failure; or invalid
+    /// protocol or recovery data. Durable or possibly-dispatched state remains
+    /// available through [`ChainSubmissionFailure::strongest_state`].
+    pub async fn advance_vote_batch_with_recovery(
+        &self,
+        request: AdvanceVoteBatch,
+        recovery: ChainRecoveryMode,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let identity = self.identity(
+            request.vote_round_id,
+            request.bundle_index,
+            ChainSubmissionTarget::VoteBatch {
+                ordered_batch_digest: request.ordered_batch_digest,
+            },
+        )?;
+        let advancement =
+            StoreAdvancementRequest::vote_batch(identity, request.ordered_proposal_ids)?;
+        self.coordinator
+            .advance_with_recovery(advancement, recovery, control)
             .await
     }
 
