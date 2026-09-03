@@ -120,13 +120,16 @@ input validation, persisted-proof loading, PIR cache access, generation, and
 proof persistence even if the host changes the database's selected wallet
 while the operation is waiting or running. Supplied bundle notes and delegation
 keys are validated against that captured wallet before any persisted proof is
-accepted for reuse. Validation reproduces the target-bound VAN commitment, so
-a same-network, same-round hotkey substitution cannot reuse another target's
-proof. Progress, including the waiting notification, is delivered live and in
-emission order from a dedicated delivery thread that the proof operation never
-waits on. A reporter may therefore enter proof generation directly or dispatch
-it to another thread; that work waits at most until the operation releases its
-lock, which it does without waiting on the reporter. `ensure_proof` returns
+accepted for reuse. Validation reproduces both the target-bound VAN commitment
+and the zero-value output note commitment from the complete 43-byte Orchard
+receiver. The latter binds the transmission key's encoded y-coordinate sign,
+which the VAN's affine x-coordinate does not retain, so a same-network,
+same-round target substitution cannot reuse another target's proof. Progress,
+including the waiting notification, is delivered live and in emission order
+from a dedicated delivery thread that the proof operation never waits on. A
+reporter may therefore enter proof generation directly or dispatch it to
+another thread; that work waits at most until the operation releases its lock,
+which it does without waiting on the reporter. `ensure_proof` returns
 only after every emitted event has been delivered. Different bundle identities
 remain independent throughout.
 Terminal submission rejection preserves and reuses the proof bound to the
@@ -1353,6 +1356,7 @@ Delegation proof coordination is anchored by
 `failed_leader_releases_the_waiting_retry`. Durable reuse and wallet capture
 are anchored by `reused_proof_rejects_mismatched_notes`,
 `reused_proof_rejects_mismatched_keys`,
+`reused_proof_rejects_receiver_sign_flip`,
 `reentrant_progress_reporter_reuses_after_lock_release`,
 `cross_thread_reentrant_progress_reporter_reuses_after_lock_release`,
 `progress_reaches_the_host_while_the_operation_is_still_running`,

@@ -73,7 +73,7 @@ pub(super) fn pir_client() -> pir_client::PirClientBlocking {
 fn seed_wallet(db: &VotingDb, wallet_id: &str, proof_byte: u8) {
     let params = VotingRoundParams {
         vote_round_id: ROUND_ID.to_string(),
-        snapshot_height: 1,
+        snapshot_height: 4_134_000,
         ea_pk: pallas::Point::generator().to_bytes().to_vec(),
         nc_root: vec![0x31; 32],
         nullifier_imt_root: vec![0x32; 32],
@@ -92,6 +92,16 @@ fn seed_wallet(db: &VotingDb, wallet_id: &str, proof_byte: u8) {
         &van_comm_rand,
     )
     .unwrap();
+    let rho_signed = pallas::Base::from(7).to_repr();
+    let rseed_output = [0x44; 32];
+    let cmx_new = crate::action::derive_governance_output_cmx(
+        &delegation_keys.hotkey_raw_address,
+        &rho_signed,
+        &rseed_output,
+        Network::Testnet,
+        params.snapshot_height,
+    )
+    .unwrap();
     let conn = db.conn();
     queries::insert_round(&conn, wallet_id, Network::Testnet, &params, None).unwrap();
     queries::insert_bundle_notes(&conn, ROUND_ID, wallet_id, 0, &[selected_note]).unwrap();
@@ -102,13 +112,13 @@ fn seed_wallet(db: &VotingDb, wallet_id: &str, proof_byte: u8) {
         0,
         &van_comm_rand,
         &[],
-        &[0x41; 32],
+        &rho_signed,
         &[],
         &[proof_byte.wrapping_add(1); 32],
-        &[proof_byte.wrapping_add(2); 32],
+        &cmx_new,
         &[0x42; 32],
         &[0x43; 32],
-        &[0x44; 32],
+        &rseed_output,
         &gov_comm,
         13_000_000,
         0,
@@ -127,7 +137,7 @@ fn seed_wallet(db: &VotingDb, wallet_id: &str, proof_byte: u8) {
         &[proof_byte.wrapping_add(4); 32],
         &gov_nullifiers,
         &[proof_byte.wrapping_add(1); 32],
-        &[proof_byte.wrapping_add(2); 32],
+        &cmx_new,
         &gov_comm,
     )
     .unwrap();

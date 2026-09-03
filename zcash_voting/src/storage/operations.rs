@@ -77,6 +77,7 @@ fn validate_delegation_keys_for_round(
 fn validate_delegation_target_for_bundle(
     conn: &rusqlite::Connection,
     params: &VotingRoundParams,
+    stored_network: Network,
     identity: &DelegationProofIdentity,
     keys: &DelegationKeys,
 ) -> Result<(), VotingError> {
@@ -85,6 +86,46 @@ fn validate_delegation_target_for_bundle(
         identity.round_id(),
         identity.wallet_id(),
         identity.bundle_index(),
+    )?;
+    let rho_signed: [u8; 32] =
+        binding
+            .rho_signed
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!(
+                    "stored rho_signed must be 32 bytes, got {}",
+                    binding.rho_signed.len()
+                ),
+            })?;
+    let rseed_output: [u8; 32] =
+        binding
+            .rseed_output
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!(
+                    "stored rseed_output must be 32 bytes, got {}",
+                    binding.rseed_output.len()
+                ),
+            })?;
+    let stored_cmx: [u8; 32] =
+        binding
+            .cmx_new
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!(
+                    "stored cmx_new must be 32 bytes, got {}",
+                    binding.cmx_new.len()
+                ),
+            })?;
+    let expected_cmx = crate::action::derive_governance_output_cmx(
+        &keys.hotkey_raw_address,
+        &rho_signed,
+        &rseed_output,
+        stored_network,
+        params.snapshot_height,
     )?;
     let (g_d_x, pk_d_x) =
         crate::action::derive_hotkey_x_coords_from_raw_address(&keys.hotkey_raw_address)?;
@@ -102,7 +143,7 @@ fn validate_delegation_target_for_bundle(
         &vote_round_id,
         &binding.van_comm_rand,
     )?;
-    if expected_van != binding.gov_comm {
+    if expected_van != binding.gov_comm || expected_cmx != stored_cmx {
         return Err(VotingError::InvalidInput {
             message: "delegation keys hotkey target does not match stored bundle target"
                 .to_string(),
@@ -1348,7 +1389,7 @@ impl VotingDb {
             identity.wallet_id(),
         )?;
         validate_delegation_keys_for_round(&params, stored_network, keys)?;
-        validate_delegation_target_for_bundle(&conn, &params, identity, keys)
+        validate_delegation_target_for_bundle(&conn, &params, stored_network, identity, keys)
     }
 
     /// Builds and persists the real delegation ZKP (#1) for a captured wallet.

@@ -9,7 +9,7 @@ use std::{
 use crate::{
     delegate::{ensure_proof, DelegationProgress, DelegationProofStatus},
     types::DelegationProgressBridge,
-    Network, VotingError,
+    Network, VotingError, VotingHotkeyTarget,
 };
 
 use super::{
@@ -79,6 +79,48 @@ fn reused_proof_rejects_mismatched_keys() {
         assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains(expected_message), "{error}");
     }
+}
+
+#[test]
+fn reused_proof_rejects_receiver_sign_flip() {
+    let db = db_with_persisted_proofs();
+    let original_keys = keys(Network::Testnet, 1);
+    let mut sign_flipped_keys = original_keys.clone();
+    sign_flipped_keys.hotkey_raw_address[42] ^= 0x80;
+
+    VotingHotkeyTarget::from_raw_orchard_address(
+        &sign_flipped_keys.hotkey_raw_address,
+        Network::Testnet,
+    )
+    .expect("flipping the encoded y-coordinate sign retains a valid Orchard receiver");
+    assert_eq!(
+        crate::action::derive_hotkey_x_coords_from_raw_address(&original_keys.hotkey_raw_address)
+            .unwrap(),
+        crate::action::derive_hotkey_x_coords_from_raw_address(
+            &sign_flipped_keys.hotkey_raw_address
+        )
+        .unwrap(),
+        "the VAN's affine x-coordinates do not distinguish the sign-flipped receiver"
+    );
+
+    let error = ensure_proof(
+        &db,
+        ROUND_ID,
+        0,
+        &[note()],
+        &sign_flipped_keys,
+        &pir_client(),
+        &crate::types::NoopProgressReporter,
+    )
+    .expect_err("a persisted proof must remain bound to the exact Orchard receiver");
+
+    assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("hotkey target does not match stored bundle target"),
+        "{error}"
+    );
 }
 
 #[test]
