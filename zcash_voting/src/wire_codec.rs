@@ -733,6 +733,50 @@ impl TryFrom<session::NextStep> for NextStepView {
     }
 }
 
+impl From<NextStepView> for session::NextStep {
+    /// Rebuilds the planner step a host selected from a plan view.
+    ///
+    /// Fields the kind does not use are ignored, mirroring how the view
+    /// zero-fills them.
+    fn from(view: NextStepView) -> Self {
+        use crate::wire::NextStepKind as Kind;
+        match view.kind {
+            Kind::Delegate => Self::Delegate {
+                bundle_index: view.bundle_index,
+            },
+            Kind::AdvanceDelegation => Self::AdvanceDelegation {
+                bundle_index: view.bundle_index,
+            },
+            Kind::AdvanceImportedDelegation => Self::AdvanceImportedDelegation {
+                bundle_index: view.bundle_index,
+            },
+            Kind::CastVote => Self::CastVote {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+                choice: view.choice,
+            },
+            Kind::AdvanceVote => Self::AdvanceVote {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+            },
+            Kind::AdvanceVoteBatch => Self::AdvanceVoteBatch {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+            },
+            Kind::SubmitShares => Self::SubmitShares {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+                share_index: view.share_index,
+            },
+            Kind::ConfirmShare => Self::ConfirmShare {
+                bundle_index: view.bundle_index,
+                proposal_id: view.proposal_id,
+                share_index: view.share_index,
+            },
+        }
+    }
+}
+
 impl From<session::DelegationStatus> for DelegationStatusView {
     fn from(status: session::DelegationStatus) -> Self {
         Self {
