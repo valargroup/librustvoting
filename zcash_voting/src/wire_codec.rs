@@ -30,9 +30,9 @@ use crate::{
         DelegationSubmissionWire, NextStepView, RoundPlanView, RoundRecoveryStateView,
         ShareDelegationRecordView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
         SignedVoteBatchView, SignedVoteCommitmentView, SignedVoteCommitmentsView,
-        VoteCommitmentBatchWire, VoteCommitmentWire, VoteRecoveryView, VoteRecoveryWorkView,
-        VoteShareWire, VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView,
-        VotingRoundParams,
+        SubmissionDiagnosticView, VoteCommitmentBatchWire, VoteCommitmentWire, VoteRecoveryView,
+        VoteRecoveryWorkView, VoteShareWire, VotingHotkeyTargetV1, VotingNoteRefView,
+        VotingNoteSelectionResultView, VotingRoundParams,
     },
     BundlePolicy,
 };
@@ -568,6 +568,15 @@ impl TryFrom<SignedVoteBatch> for SignedVoteBatchView {
     }
 }
 
+impl From<crate::chain_submission::ChainSubmissionDiagnostic> for SubmissionDiagnosticView {
+    fn from(diagnostic: crate::chain_submission::ChainSubmissionDiagnostic) -> Self {
+        Self {
+            kind: diagnostic.kind().as_str().to_string(),
+            message: diagnostic.message().to_string(),
+        }
+    }
+}
+
 impl From<recovery::DelegationRecovery> for DelegationRecoveryView {
     fn from(record: recovery::DelegationRecovery) -> Self {
         Self {
@@ -575,6 +584,7 @@ impl From<recovery::DelegationRecovery> for DelegationRecoveryView {
             phase: record.workflow_phase().as_str().to_string(),
             tx_hash: record.tx_hash,
             van_leaf_position: record.van_leaf_position,
+            submission_diagnostic: record.submission_diagnostic.map(Into::into),
         }
     }
 }
@@ -589,6 +599,7 @@ impl From<recovery::VoteRecovery> for VoteRecoveryView {
             tx_hash: record.tx_hash,
             vc_tree_position: record.vc_tree_position,
             has_commitment_bundle: record.has_commitment_bundle,
+            submission_diagnostic: record.submission_diagnostic.map(Into::into),
         }
     }
 }
@@ -723,6 +734,7 @@ impl From<session::DelegationStatus> for DelegationStatusView {
                 .as_str()
                 .to_string(),
             tx_hash: status.tx_hash,
+            submission_diagnostic: status.submission_diagnostic.map(Into::into),
         }
     }
 }
@@ -1764,6 +1776,7 @@ mod tests {
                 bundle_index: 2,
                 phase: crate::phases::DelegationPhase::Submitted,
                 tx_hash: Some("delegation-tx".to_string()),
+                submission_diagnostic: None,
             }],
             recovered_delegation_work: vec![
                 session::DelegationRecoveryWork {

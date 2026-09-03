@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::chain_submission::planning::{
     delegation_is_capability_imported, delegation_transaction_hash, vote_transaction_hash,
 };
-use crate::phases::{DelegationPhase, SharePhase, VotePhase};
+use crate::chain_submission::ChainSubmissionDiagnostic;
+use crate::phases::{DelegationPhase, DelegationSubmissionStatus, SharePhase, VotePhase};
 use crate::share_policy::{round_immediate_share_key, ImmediateShareKey};
 use crate::storage::{queries, VotingDb};
 use crate::types::{
@@ -414,6 +415,14 @@ pub struct DelegationStatus {
     pub bundle_index: u32,
     pub phase: DelegationPhase,
     pub tx_hash: Option<String>,
+    /// Diagnostic stored on the bundle's authoritative lifecycle row.
+    ///
+    /// Always present for `SubmittedWithoutHash` and `SubmissionRejected`.
+    /// Those phases are terminal and schedule no `next_steps`, so after a
+    /// restart this field is how a host surfaces why the delegation needs
+    /// manual handling. May also be present while `SubmissionManaged`
+    /// recovers from an ambiguous dispatch.
+    pub submission_diagnostic: Option<ChainSubmissionDiagnostic>,
 }
 
 /// Kind of vote recovery work grouped from `NextStep`s.
@@ -581,15 +590,16 @@ fn missing_recovery_field(message: String) -> VotingError {
 fn delegation_statuses(
     db: &VotingDb,
     round_id: &str,
-    delegation: &BTreeMap<u32, DelegationPhase>,
+    delegation: &[DelegationSubmissionStatus],
 ) -> Result<Vec<DelegationStatus>, VotingError> {
     delegation
         .iter()
-        .map(|(&bundle_index, &phase)| {
+        .map(|status| {
             Ok(DelegationStatus {
-                bundle_index,
-                phase,
-                tx_hash: delegation_transaction_hash(db, round_id, bundle_index)?,
+                bundle_index: status.bundle_index,
+                phase: status.phase,
+                tx_hash: delegation_transaction_hash(db, round_id, status.bundle_index)?,
+                submission_diagnostic: status.diagnostic.clone(),
             })
         })
         .collect()
@@ -1035,8 +1045,11 @@ pub fn resume_plan(
     round_id: &str,
     proposal_ids: &[u32],
 ) -> Result<RoundPlan, VotingError> {
-    let delegation: BTreeMap<u32, DelegationPhase> =
-        db.delegation_phases(round_id)?.into_iter().collect();
+    let delegation_submissions = db.delegation_submission_statuses(round_id)?;
+    let delegation: BTreeMap<u32, DelegationPhase> = delegation_submissions
+        .iter()
+        .map(|status| (status.bundle_index, status.phase))
+        .collect();
     let votes: BTreeMap<(u32, u32), VotePhase> = db
         .vote_phases(round_id)?
         .into_iter()
@@ -1343,7 +1356,7 @@ pub fn resume_plan(
             _ => true,
         });
 
-    let delegation_statuses = delegation_statuses(db, round_id, &delegation)?;
+    let delegation_statuses = delegation_statuses(db, round_id, &delegation_submissions)?;
     let hotkey_bound = delegation
         .values()
         .any(|phase| *phase != DelegationPhase::Prepared)
@@ -1970,6 +1983,7 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Prepared,
                 tx_hash: None,
+                submission_diagnostic: None,
             }]
         );
         assert!(!plan.blocking_recovery);
@@ -2399,6 +2413,16 @@ mod tests {
         assert!(plan.next_steps.is_empty(), "{:?}", plan.next_steps);
         assert!(plan.blocking_recovery);
         assert!(!plan.pending_recovery);
+        // No later lifecycle call is scheduled, so the plan itself must carry
+        // the stored diagnostic a wallet shows for manual handling.
+        let status = &plan.delegation_statuses[0];
+        assert_eq!(status.phase, DelegationPhase::SubmittedWithoutHash);
+        let diagnostic = status.submission_diagnostic.as_ref().unwrap();
+        assert_eq!(
+            diagnostic.kind(),
+            crate::chain_submission::ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted
+        );
+        assert_eq!(diagnostic.message(), "submission has no usable hash");
     }
 
     #[test]
@@ -3441,6 +3465,7 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Confirmed,
                 tx_hash: Some("dtx".to_string()),
+                submission_diagnostic: None,
             }]
         );
         assert!(plan.recovered_delegation_work.is_empty());

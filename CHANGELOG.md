@@ -40,12 +40,12 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation capability-handoff export flow.
 - **Breaking:** the raw storage writers behind those APIs are no longer public
   API. `storage::queries::{store_van_position, store_delegation_tx_hash,
-  record_vote_submission}` are crate-private, and
+  record_vote_submission}`,
   `VotingDb::{store_van_position, store_delegation_tx_hash,
-  record_vote_submission, mark_delegation_submitted, mark_vote_submitted}` plus
+  record_vote_submission, mark_delegation_submitted, mark_vote_submitted}`, and
   `vote::{record_submission, record_batch_submission, record_vc_position}` are
-  available only under the `test-fixtures` feature, which production builds must
-  not enable. Read-only projections are unchanged.
+  crate-private test helpers that no Cargo feature, including `test-fixtures`,
+  exposes. Read-only projections are unchanged.
 
 ### Added
 
@@ -62,6 +62,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   planner/recovery-work variants for capability imports. The lifecycle lazily
   adopts the stored package hash, polls without a signer, POST, tree scan, or
   retry, confirms atomically, and terminally rejects a committed failure.
+- `RoundPlan::delegation_statuses`, `RoundRecoverySnapshot::{delegation,
+  votes}`, and their wire views carry `submission_diagnostic`, the diagnostic
+  stored on the authoritative lifecycle row. It is always present for the
+  terminal `SubmittedWithoutHash` and `SubmissionRejected` phases, which
+  schedule no further lifecycle call, so a host can show why manual handling
+  is needed after a restart without re-driving the lifecycle.
+  `ChainSubmissionDiagnosticKind::as_str` exposes the stable discriminator
+  used by storage and the views.
 - `RoundPlan` and `RoundPlanView` expose derived work predicates:
   `needs_delegation_signing`, `has_in_flight_delegation`, `needs_vote_polling`,
   `has_remaining_vote_or_share_work`, and `has_recoverable_vote_or_share_work`.

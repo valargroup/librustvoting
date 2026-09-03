@@ -579,7 +579,11 @@ Restart plans are derived from the authoritative row:
 - `Tracking` schedules hash polling;
 - `Recovering` schedules candidate-first reconciliation and tree
   recovery, then same-generation retry when permitted;
-- `SubmittedWithoutHash` schedules no polling, recovery, or retry;
+- `SubmittedWithoutHash` schedules no polling, recovery, or retry; its stored
+  diagnostic is exposed read-only through `RoundPlan::delegation_statuses`
+  and `RoundRecoverySnapshot` so a host restarted after the terminal
+  transition can still surface it (`submitted_without_hash_delegation_blocks_without_pending_recovery`,
+  `round_snapshot_exposes_terminal_submission_diagnostics`);
 - `Confirmed` enables dependent domain and helper work;
 - a `Rejected` row schedules no reconciliation;
 - absent rows permit fresh work if bundle causality allows it.

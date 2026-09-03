@@ -48,6 +48,38 @@ pub enum ChainSubmissionDiagnosticKind {
     StorageFailure,
 }
 
+impl ChainSubmissionDiagnosticKind {
+    /// Returns the stable string discriminator used by durable storage and
+    /// FFI views.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AmbiguousDispatch => "ambiguous_dispatch",
+            Self::AmbiguousAttemptsExhausted => "ambiguous_attempts_exhausted",
+            Self::NullifierAlreadySpent => "nullifier_already_spent",
+            Self::TrackingWindowExpired => "tracking_window_expired",
+            Self::ChainRejected => "chain_rejected",
+            Self::ReconciliationPending => "reconciliation_pending",
+            Self::InvalidProtocolResponse => "invalid_protocol_response",
+            Self::StorageFailure => "storage_failure",
+        }
+    }
+
+    /// Parses the discriminator written by [`Self::as_str`].
+    pub(crate) fn from_stable_name(value: &str) -> Option<Self> {
+        match value {
+            "ambiguous_dispatch" => Some(Self::AmbiguousDispatch),
+            "ambiguous_attempts_exhausted" => Some(Self::AmbiguousAttemptsExhausted),
+            "nullifier_already_spent" => Some(Self::NullifierAlreadySpent),
+            "tracking_window_expired" => Some(Self::TrackingWindowExpired),
+            "chain_rejected" => Some(Self::ChainRejected),
+            "reconciliation_pending" => Some(Self::ReconciliationPending),
+            "invalid_protocol_response" => Some(Self::InvalidProtocolResponse),
+            "storage_failure" => Some(Self::StorageFailure),
+            _ => None,
+        }
+    }
+}
+
 /// A bounded UTF-8 diagnostic that is safe for durable storage.
 ///
 /// The constructor's name makes the trust boundary explicit: callers must

@@ -258,6 +258,19 @@ pub struct VoteRecord {
     pub choice: u32,
 }
 
+/// Stored lifecycle diagnostic of an authoritative chain-submission row.
+///
+/// `kind` is the stable discriminator from
+/// `ChainSubmissionDiagnosticKind::as_str`; `message` is the bounded,
+/// redacted text the lifecycle persisted. Present on terminal
+/// `submitted_without_hash` and `rejected` rows, which schedule no further
+/// lifecycle call, so this is what a host shows for manual handling.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionDiagnosticView {
+    pub kind: String,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationRecoveryView {
     pub bundle_index: u32,
@@ -265,6 +278,8 @@ pub struct DelegationRecoveryView {
     pub tx_hash: Option<String>,
     /// Confirmed VAN leaf position, if delegation has been projected.
     pub van_leaf_position: Option<u64>,
+    #[serde(default)]
+    pub submission_diagnostic: Option<SubmissionDiagnosticView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +291,8 @@ pub struct VoteRecoveryView {
     pub tx_hash: Option<String>,
     pub vc_tree_position: Option<u64>,
     pub has_commitment_bundle: bool,
+    #[serde(default)]
+    pub submission_diagnostic: Option<SubmissionDiagnosticView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +354,8 @@ pub struct DelegationStatusView {
     pub bundle_index: u32,
     pub phase: String,
     pub tx_hash: Option<String>,
+    #[serde(default)]
+    pub submission_diagnostic: Option<SubmissionDiagnosticView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -4,7 +4,10 @@
 //! fetch one typed snapshot instead of querying low-level storage tables.
 
 use crate::{
-    chain_submission::planning::{delegation_transaction_hash, vote_transaction_hash},
+    chain_submission::{
+        planning::{delegation_transaction_hash, vote_transaction_hash},
+        ChainSubmissionDiagnostic,
+    },
     phases::{DelegationPhase, SharePhase, VotePhase, WorkflowPhase},
     round::VotingDb,
     share,
@@ -31,6 +34,14 @@ pub struct DelegationRecovery {
     pub tx_hash: Option<String>,
     /// Confirmed VAN leaf position, preserving the lifecycle's full `u64` range.
     pub van_leaf_position: Option<u64>,
+    /// Diagnostic stored on the authoritative lifecycle row.
+    ///
+    /// Always present for `SubmittedWithoutHash` and `SubmissionRejected`,
+    /// where it is the only evidence a wallet can show after a restart, since
+    /// those terminal phases schedule no further lifecycle call. May also be
+    /// present for a `SubmissionManaged` bundle whose ambiguity is still under
+    /// recovery.
+    pub submission_diagnostic: Option<ChainSubmissionDiagnostic>,
 }
 
 impl DelegationRecovery {
@@ -50,6 +61,10 @@ pub struct VoteRecovery {
     pub tx_hash: Option<String>,
     pub vc_tree_position: Option<u64>,
     pub has_commitment_bundle: bool,
+    /// Diagnostic stored on the authoritative singleton or batch lifecycle
+    /// row, with the same presence rules as
+    /// [`DelegationRecovery::submission_diagnostic`].
+    pub submission_diagnostic: Option<ChainSubmissionDiagnostic>,
 }
 
 impl VoteRecovery {
@@ -178,14 +193,16 @@ pub fn round_snapshot(db: &VotingDb, round_id: &str) -> Result<RoundRecoverySnap
     }
 
     let delegation = db
-        .delegation_phases(round_id)?
+        .delegation_submission_statuses(round_id)?
         .into_iter()
-        .map(|(bundle_index, phase)| {
+        .map(|status| {
+            let bundle_index = status.bundle_index;
             Ok(DelegationRecovery {
                 bundle_index,
-                phase,
+                phase: status.phase,
                 tx_hash: delegation_transaction_hash(db, round_id, bundle_index)?,
                 van_leaf_position: db.load_optional_van_position_u64(round_id, bundle_index)?,
+                submission_diagnostic: status.diagnostic,
             })
         })
         .collect::<Result<Vec<_>, VotingError>>()?;
@@ -227,9 +244,11 @@ fn build_vote_recovery_rows(
         .map(|row| ((row.bundle_index, row.proposal_id), row.choice))
         .collect::<BTreeMap<_, _>>();
 
-    db.vote_phases(round_id)?
+    db.vote_submission_statuses(round_id)?
         .into_iter()
-        .map(|(bundle_index, proposal_id, phase)| {
+        .map(|status| {
+            let (bundle_index, proposal_id, phase) =
+                (status.bundle_index, status.proposal_id, status.phase);
             let tx_hash = vote_transaction_hash(db, round_id, bundle_index, proposal_id)?;
             let fields =
                 db.get_commitment_bundle_recovery_fields(round_id, bundle_index, proposal_id)?;
@@ -266,6 +285,7 @@ fn build_vote_recovery_rows(
                 tx_hash,
                 vc_tree_position,
                 has_commitment_bundle,
+                submission_diagnostic: status.diagnostic,
             })
         })
         .collect()
@@ -274,7 +294,10 @@ fn build_vote_recovery_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{round::RoundParams, storage::queries, types::NoteInfo};
+    use crate::{
+        chain_submission::ChainSubmissionDiagnosticKind, round::RoundParams, storage::queries,
+        types::NoteInfo, wire::RoundRecoveryStateView,
+    };
 
     const ROUND_ID: &str = "3333333333333333333333333333333333333333333333333333333333333333";
     const WALLET_ID: &str = "wallet-recovery";
@@ -453,6 +476,103 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
     }
 
+    /// Inserts one authoritative lifecycle row in a terminal state that
+    /// stores a diagnostic and nothing else, as the coordinator leaves it.
+    fn insert_terminal_submission(
+        db: &VotingDb,
+        state: &str,
+        kind: &str,
+        proposal_id: Option<u32>,
+        diagnostic_kind: &str,
+        diagnostic: &str,
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, ?4, ?5, ?6, ?7, 1, ?8, ?9, 9, 10)",
+                rusqlite::params![
+                    format!("{kind}-{state}").into_bytes().repeat(4),
+                    ROUND_ID,
+                    db.wallet_id(),
+                    kind,
+                    proposal_id.map(i64::from),
+                    vec![0x52_u8; 32],
+                    state,
+                    diagnostic_kind,
+                    diagnostic,
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn round_snapshot_exposes_terminal_submission_diagnostics() {
+        let db = db_with_round(WALLET_ID);
+        insert_vote(&db, 0, 1, 0, b"vote-0-1");
+        insert_terminal_submission(
+            &db,
+            "submitted_without_hash",
+            "delegation",
+            None,
+            "ambiguous_attempts_exhausted",
+            "configured POST attempts exhausted after ambiguous dispatch",
+        );
+        insert_terminal_submission(
+            &db,
+            "rejected",
+            "vote",
+            Some(1),
+            "chain_rejected",
+            "vote chain rejected the transaction",
+        );
+
+        let snapshot = round_snapshot(&db, ROUND_ID).unwrap();
+
+        let delegation = &snapshot.delegation[0];
+        assert_eq!(delegation.phase, DelegationPhase::SubmittedWithoutHash);
+        assert_eq!(delegation.tx_hash, None);
+        let diagnostic = delegation.submission_diagnostic.as_ref().unwrap();
+        assert_eq!(
+            diagnostic.kind(),
+            ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted
+        );
+        assert_eq!(
+            diagnostic.message(),
+            "configured POST attempts exhausted after ambiguous dispatch"
+        );
+        assert!(snapshot.delegation[1..]
+            .iter()
+            .all(|other| other.submission_diagnostic.is_none()));
+
+        let vote = &snapshot.votes[0];
+        assert_eq!(vote.phase, VotePhase::SubmissionRejected);
+        let diagnostic = vote.submission_diagnostic.as_ref().unwrap();
+        assert_eq!(
+            diagnostic.kind(),
+            ChainSubmissionDiagnosticKind::ChainRejected
+        );
+        assert_eq!(diagnostic.message(), "vote chain rejected the transaction");
+
+        let view = RoundRecoveryStateView::from(snapshot);
+        let delegation_view = view.delegation[0].submission_diagnostic.as_ref().unwrap();
+        assert_eq!(delegation_view.kind, "ambiguous_attempts_exhausted");
+        assert_eq!(
+            delegation_view.message,
+            "configured POST attempts exhausted after ambiguous dispatch"
+        );
+        assert_eq!(
+            view.votes[0]
+                .submission_diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.kind.as_str()),
+            Some("chain_rejected")
+        );
+    }
+
     #[test]
     fn recovery_records_expose_stable_workflow_phases() {
         let delegation = DelegationRecovery {
@@ -460,6 +580,7 @@ mod tests {
             phase: DelegationPhase::Proved,
             tx_hash: None,
             van_leaf_position: None,
+            submission_diagnostic: None,
         };
         assert_eq!(delegation.workflow_phase(), WorkflowPhase::Signed);
 
@@ -471,6 +592,7 @@ mod tests {
             tx_hash: Some("vtx".to_string()),
             vc_tree_position: None,
             has_commitment_bundle: true,
+            submission_diagnostic: None,
         };
         assert_eq!(vote.workflow_phase(), WorkflowPhase::SubmittedVote);
 

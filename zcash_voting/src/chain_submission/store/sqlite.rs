@@ -223,32 +223,7 @@ fn encode_positions(positions: &[u64]) -> Vec<u8> {
 }
 
 fn parse_diagnostic_kind(value: &str) -> rusqlite::Result<ChainSubmissionDiagnosticKind> {
-    match value {
-        "ambiguous_dispatch" => Ok(ChainSubmissionDiagnosticKind::AmbiguousDispatch),
-        "ambiguous_attempts_exhausted" => {
-            Ok(ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted)
-        }
-        "nullifier_already_spent" => Ok(ChainSubmissionDiagnosticKind::NullifierAlreadySpent),
-        "tracking_window_expired" => Ok(ChainSubmissionDiagnosticKind::TrackingWindowExpired),
-        "chain_rejected" => Ok(ChainSubmissionDiagnosticKind::ChainRejected),
-        "reconciliation_pending" => Ok(ChainSubmissionDiagnosticKind::ReconciliationPending),
-        "invalid_protocol_response" => Ok(ChainSubmissionDiagnosticKind::InvalidProtocolResponse),
-        "storage_failure" => Ok(ChainSubmissionDiagnosticKind::StorageFailure),
-        _ => Err(rusqlite::Error::InvalidQuery),
-    }
-}
-
-fn diagnostic_name(value: ChainSubmissionDiagnosticKind) -> &'static str {
-    match value {
-        ChainSubmissionDiagnosticKind::AmbiguousDispatch => "ambiguous_dispatch",
-        ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted => "ambiguous_attempts_exhausted",
-        ChainSubmissionDiagnosticKind::NullifierAlreadySpent => "nullifier_already_spent",
-        ChainSubmissionDiagnosticKind::TrackingWindowExpired => "tracking_window_expired",
-        ChainSubmissionDiagnosticKind::ChainRejected => "chain_rejected",
-        ChainSubmissionDiagnosticKind::ReconciliationPending => "reconciliation_pending",
-        ChainSubmissionDiagnosticKind::InvalidProtocolResponse => "invalid_protocol_response",
-        ChainSubmissionDiagnosticKind::StorageFailure => "storage_failure",
-    }
+    ChainSubmissionDiagnosticKind::from_stable_name(value).ok_or(rusqlite::Error::InvalidQuery)
 }
 
 fn insert_fresh(
@@ -368,7 +343,7 @@ fn persist_mutable(
         named_params! {
             ":state": state, ":candidate": candidate.map(|v| v.as_bytes().to_vec()),
             ":attempts": record.committed_post_reservations(), ":tracking": record.tracking_started_at(),
-            ":diagnostic_kind": diagnostic.map(|v| diagnostic_name(v.kind())),
+            ":diagnostic_kind": diagnostic.map(|v| v.kind().as_str()),
             ":diagnostic": diagnostic.map(ChainSubmissionDiagnostic::message),
             ":source": source, ":confirmed_hash": confirmed_hash.map(|v| v.as_bytes().to_vec()),
             ":final_van": final_van, ":positions": positions, ":updated": record.updated_at(),
