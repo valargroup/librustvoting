@@ -283,36 +283,28 @@ where
 
             match outcome {
                 PostAttemptOutcome::Accepted(candidate) => {
-                    let record = self.classify_dispatched_post(
+                    let record = self.classify_returned_candidate(
                         derived.generation(),
-                        SubmissionObservation::UsableCandidateHash(candidate),
+                        candidate,
+                        attempt_index + 1 == self.policy.maximum_post_attempts,
                     )?;
-                    if attempt_index + 1 == self.policy.maximum_post_attempts
-                        && is_retryable_dispatch_ambiguity(&record)
-                    {
-                        let exhausted = ChainSubmissionDiagnostic::from_redacted_message(
-                            ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
-                            "configured POST attempts exhausted after vote-chain returned an unusable transaction hash",
-                        );
+                    if returned_candidate_is_unusable(&record) {
+                        reserved = record;
+                        ambiguity_seen = true;
+                    } else {
                         return self
-                            .classify_dispatched_post(
-                                derived.generation(),
-                                SubmissionObservation::SubmittedWithoutHash(exhausted),
-                            )?
-                            .public_result();
+                            .reconcile_existing(
+                                &request,
+                                &operation,
+                                lease,
+                                derived,
+                                record,
+                                recovery,
+                                attempt_index + 1,
+                                control,
+                            )
+                            .await;
                     }
-                    return self
-                        .reconcile_existing(
-                            &request,
-                            &operation,
-                            lease,
-                            derived,
-                            record,
-                            recovery,
-                            attempt_index + 1,
-                            control,
-                        )
-                        .await;
                 }
                 PostAttemptOutcome::Rejected {
                     kind, diagnostic, ..
@@ -523,6 +515,34 @@ where
             .map_err(|error| {
                 ChainSubmissionFailure::with_known_possible_dispatch(error.kind(), error.message())
             })
+    }
+
+    /// Persists a returned hash, including store-detected ownership collisions.
+    ///
+    /// A collision is dispatch ambiguity rather than usable acceptance. It
+    /// consumes the current attempt and becomes terminal when no attempt remains.
+    fn classify_returned_candidate(
+        &self,
+        generation: &super::ChainSubmissionGeneration,
+        candidate: super::CandidateTransactionHash,
+        is_final_attempt: bool,
+    ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
+        let record = self.classify_dispatched_post(
+            generation,
+            SubmissionObservation::UsableCandidateHash(candidate),
+        )?;
+        if !is_final_attempt || !returned_candidate_is_unusable(&record) {
+            return Ok(record);
+        }
+        self.classify_dispatched_post(
+            generation,
+            SubmissionObservation::SubmittedWithoutHash(
+                ChainSubmissionDiagnostic::from_redacted_message(
+                    ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
+                    "configured POST attempts exhausted after vote-chain returned an unusable transaction hash",
+                ),
+            ),
+        )
     }
 
     fn remove_fresh_reservation(
@@ -1014,10 +1034,7 @@ where
         };
         match outcome {
             PostAttemptOutcome::Accepted(candidate) => self
-                .classify_dispatched_post(
-                    derived.generation(),
-                    SubmissionObservation::UsableCandidateHash(candidate),
-                )?
+                .classify_returned_candidate(derived.generation(), candidate, is_final_attempt)?
                 .public_result(),
             PostAttemptOutcome::Rejected {
                 kind, diagnostic, ..
@@ -1295,6 +1312,16 @@ fn interrupted_without_state(
 
 fn is_retryable_dispatch_ambiguity(record: &StoredChainSubmission) -> bool {
     record.state().permits_ambiguous_retry()
+}
+
+fn returned_candidate_is_unusable(record: &StoredChainSubmission) -> bool {
+    matches!(
+        record.state(),
+        SubmissionRecordState::Recovering {
+            candidate_transaction_hash: None,
+            ..
+        }
+    )
 }
 
 fn lookup_diagnostic(failure: &LookupFailure) -> ChainSubmissionDiagnostic {

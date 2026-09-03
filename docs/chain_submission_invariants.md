@@ -301,10 +301,12 @@ One canonical candidate or hash-confirmed transaction belongs to at most one
 native semantic generation. If POST acceptance returns a hash already owned by
 another generation, the lifecycle does not poll or confirm that hash for the
 new generation. It persists an invalid-protocol dispatch ambiguity as hashless
-`Recovering` when another attempt remains in the current invocation, or as
-terminal `SubmittedWithoutHash` when the collision consumes the final attempt.
-Later advancement of that terminal row performs no POST. Confirmation rechecks
-ownership in the same transaction as the terminal projection.
+`Recovering` when another attempt remains in the current invocation and then
+continues through the same bounded retry loop. It persists terminal
+`SubmittedWithoutHash` when the collision consumes the final attempt, including
+a final POST reserved after exact-tree recovery. Later advancement of that
+terminal row performs no POST. Confirmation rechecks ownership in the same
+transaction as the terminal projection.
 Diagnostics are bounded, valid UTF-8, escaped, and redacted before storage.
 Raw response bodies and sensitive cryptographic material are never persisted in
 diagnostics or emitted through ordinary logging.
@@ -1015,9 +1017,14 @@ Tests cover:
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class is durably recorded before retry, and final
   ambiguous-attempt exhaustion produces `SubmittedWithoutHash`;
+- `nonfinal_candidate_hash_collision_uses_the_remaining_bounded_retry` proves
+  that a collision before the final attempt continues through the same
+  invocation's remaining retry budget;
 - `final_candidate_hash_collision_exhausts_without_lookup_or_redispatch`
   proves that a final accepted hash owned by another generation becomes
   terminal `SubmittedWithoutHash` and later advancement sends no POST;
+- `final_recovery_hash_collision_exhausts_without_later_redispatch` proves the
+  same terminal rule for a final POST reserved by exact-tree recovery;
 - restart from `Submitting` produces `Recovering`;
 - retry limits and endpoint failover are bounded per lifecycle invocation,
   attempts may exceed endpoint count, and endpoint selection cycles by ordinal;
