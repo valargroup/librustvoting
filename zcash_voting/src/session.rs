@@ -9,7 +9,12 @@ use rusqlite::{named_params, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::phases::{DelegationPhase, SharePhase, VotePhase};
+use crate::chain_submission::planning::{
+    delegation_is_capability_imported, delegation_transaction_hash, vote_batch_transaction_hash,
+    vote_transaction_hash,
+};
+use crate::chain_submission::ChainSubmissionDiagnostic;
+use crate::phases::{DelegationPhase, DelegationSubmissionStatus, SharePhase, VotePhase};
 use crate::share_policy::{round_immediate_share_key, ImmediateShareKey};
 use crate::storage::{queries, VotingDb};
 use crate::types::{
@@ -250,12 +255,22 @@ fn now_secs() -> i64 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NextStep {
-    Delegate {
-        bundle_index: u32,
-    },
-    PollDelegation {
-        bundle_index: u32,
-    },
+    /// Run the delegation flow: this bundle still needs a signed delegation
+    /// before anything can be dispatched.
+    Delegate { bundle_index: u32 },
+    /// Advance one delegation that is already durably in flight.
+    ///
+    /// Call `ChainSubmissionClient::advance_delegation_with_recovery` with
+    /// `ChainRecoveryMode::ExactTree`. Emitted while the authoritative
+    /// generation is `Submitting`, `Tracking`, or `Recovering`, and requires
+    /// the wallet to restore signing material for the locked generation.
+    AdvanceDelegation { bundle_index: u32 },
+    /// Poll one already-broadcast delegation imported from a capability.
+    ///
+    /// Call `ChainSubmissionClient::advance_imported_delegation`. The lifecycle
+    /// adopts the package hash on the first pass and never asks the voter for a
+    /// signer or dispatches the transaction again.
+    AdvanceImportedDelegation { bundle_index: u32 },
     /// Cast a vote using the recorded ballot intent choice.
     ///
     /// A changed choice is recoverable only until a cast-vote transaction has
@@ -267,14 +282,14 @@ pub enum NextStep {
         proposal_id: u32,
         choice: u32,
     },
-    /// Submit a previously committed singleton vote using persisted recovery
-    /// material.
+    /// Advance one singleton vote's chain submission by one bounded pass.
     ///
-    /// Wallets should reconstruct the cast-vote fields with `vote::submission`
-    /// instead of rebuilding them from a caller-supplied draft. Submit those
-    /// fields to the vote chain, persist the cast-vote tx hash with
-    /// `vote::record_submission` while polling, then call
-    /// `confirmation::confirm_vote_submission` after the transaction confirms.
+    /// Call `ChainSubmissionClient::advance_vote_with_recovery` with
+    /// `ChainRecoveryMode::ExactTree`. The lifecycle owns transaction
+    /// construction, dispatch, polling, recovery, and confirmation, so
+    /// reserving, submitting, and reconciling are one host call rather than
+    /// separate submit and poll steps. Re-invoke while the result is pending.
+    ///
     /// Recover the `CommittedVote`, preflight the complete helper fleet, and
     /// call `CommittedVote::prepare_share_delivery` to create or reload its
     /// complete persisted plan. After confirmation, submit through
@@ -283,35 +298,15 @@ pub enum NextStep {
     /// helpers removed from the current fleet. The typed method rebuilds
     /// payloads with the confirmed commitment-tree position and journals each
     /// POST before dispatch.
-    SubmitVote {
-        bundle_index: u32,
-        proposal_id: u32,
-    },
-    /// Submit one previously committed atomic vote batch.
+    AdvanceVote { bundle_index: u32, proposal_id: u32 },
+    /// Advance one atomic vote batch's chain submission by one bounded pass.
     ///
     /// `proposal_id` identifies the batch's first ordered action and is only a
-    /// recovery anchor. Pass it to `vote::recover_atomic_vote_batch`, submit
-    /// the returned canonical `batch_json` once, and atomically persist the
-    /// shared transaction hash with `vote::record_batch_submission`.
-    SubmitVoteBatch {
-        bundle_index: u32,
-        proposal_id: u32,
-    },
-    /// Poll one previously submitted singleton vote.
-    PollVote {
-        bundle_index: u32,
-        proposal_id: u32,
-    },
-    /// Poll one submitted atomic vote batch.
-    ///
-    /// `proposal_id` is the same recovery anchor returned by
-    /// `SubmitVoteBatch`. Recover the batch digest with
-    /// `vote::recover_atomic_vote_batch`, then pass it to
-    /// `confirmation::confirm_vote_batch_submission` after confirmation.
-    PollVoteBatch {
-        bundle_index: u32,
-        proposal_id: u32,
-    },
+    /// recovery anchor. Call
+    /// `ChainSubmissionClient::advance_vote_batch_with_recovery` with
+    /// `ChainRecoveryMode::ExactTree`; the lifecycle confirms every member
+    /// atomically.
+    AdvanceVoteBatch { bundle_index: u32, proposal_id: u32 },
     /// Resume helper-share submission for a committed vote.
     ///
     /// This covers the crash boundary after the cast-vote transaction confirms
@@ -342,12 +337,11 @@ impl NextStep {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Delegate { .. } => "delegate",
-            Self::PollDelegation { .. } => "poll_delegation",
+            Self::AdvanceDelegation { .. } => "advance_delegation",
+            Self::AdvanceImportedDelegation { .. } => "advance_imported_delegation",
             Self::CastVote { .. } => "cast_vote",
-            Self::SubmitVote { .. } => "submit_vote",
-            Self::SubmitVoteBatch { .. } => "submit_vote_batch",
-            Self::PollVote { .. } => "poll_vote",
-            Self::PollVoteBatch { .. } => "poll_vote_batch",
+            Self::AdvanceVote { .. } => "advance_vote",
+            Self::AdvanceVoteBatch { .. } => "advance_vote_batch",
             Self::SubmitShares { .. } => "submit_shares",
             Self::ConfirmShare { .. } => "confirm_share",
         }
@@ -389,8 +383,10 @@ impl RoundPlanAction {
 pub enum DelegationRecoveryWorkKind {
     /// Run the delegation flow for this bundle.
     Delegate,
-    /// Poll an already-submitted delegation transaction.
-    PollDelegation,
+    /// Advance a delegation transaction that is already in flight.
+    AdvanceDelegation,
+    /// Advance an imported, already-broadcast delegation without signing.
+    AdvanceImportedDelegation,
 }
 
 impl DelegationRecoveryWorkKind {
@@ -398,7 +394,8 @@ impl DelegationRecoveryWorkKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Delegate => "delegate",
-            Self::PollDelegation => "poll_delegation",
+            Self::AdvanceDelegation => "advance_delegation",
+            Self::AdvanceImportedDelegation => "advance_imported_delegation",
         }
     }
 }
@@ -409,7 +406,7 @@ pub struct DelegationRecoveryWork {
     pub kind: DelegationRecoveryWorkKind,
     pub bundle_index: u32,
     pub phase: DelegationPhase,
-    /// Present only when `kind == DelegationRecoveryWorkKind::PollDelegation`.
+    /// Present for either delegation-advancement kind when a hash is known.
     pub tx_hash: Option<String>,
 }
 
@@ -419,20 +416,24 @@ pub struct DelegationStatus {
     pub bundle_index: u32,
     pub phase: DelegationPhase,
     pub tx_hash: Option<String>,
+    /// Diagnostic stored on the bundle's authoritative lifecycle row.
+    ///
+    /// Always present for `SubmittedWithoutHash` and `SubmissionRejected`.
+    /// Those phases are terminal and schedule no `next_steps`, so after a
+    /// restart this field is how a host surfaces why the delegation needs
+    /// manual handling. May also be present while `SubmissionManaged`
+    /// recovers from an ambiguous dispatch.
+    pub submission_diagnostic: Option<ChainSubmissionDiagnostic>,
 }
 
 /// Kind of vote recovery work grouped from `NextStep`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VoteRecoveryWorkKind {
-    /// Submit a committed singleton vote using persisted recovery material.
-    SubmitVote,
-    /// Submit a committed atomic vote batch using persisted recovery material.
-    SubmitVoteBatch,
-    /// Poll an already-submitted singleton vote transaction.
-    PollVote,
-    /// Poll an already-submitted atomic vote batch transaction.
-    PollVoteBatch,
+    /// Advance a committed singleton vote using persisted recovery material.
+    AdvanceVote,
+    /// Advance a committed atomic vote batch using persisted recovery material.
+    AdvanceVoteBatch,
     /// Submit one or more missing helper shares for a confirmed vote.
     SubmitShares,
 }
@@ -441,10 +442,8 @@ impl VoteRecoveryWorkKind {
     /// Returns the stable string discriminator used by FFI layers.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::SubmitVote => "submit_vote",
-            Self::SubmitVoteBatch => "submit_vote_batch",
-            Self::PollVote => "poll_vote",
-            Self::PollVoteBatch => "poll_vote_batch",
+            Self::AdvanceVote => "advance_vote",
+            Self::AdvanceVoteBatch => "advance_vote_batch",
             Self::SubmitShares => "submit_shares",
         }
     }
@@ -458,7 +457,10 @@ pub struct VoteRecoveryWork {
     /// Proposal key for singleton work, or the first ordered action used as the
     /// recovery anchor for batch work.
     pub proposal_id: u32,
-    /// Present only for poll work.
+    /// Transaction hash the lifecycle already knows for `AdvanceVote` or
+    /// `AdvanceVoteBatch`: the confirmed hash, else the candidate hash of the
+    /// in-flight generation. Absent before the first accepted POST, after a
+    /// hashless recovery, and always for `SubmitShares`.
     pub tx_hash: Option<String>,
     /// Present only when `kind == VoteRecoveryWorkKind::SubmitShares`.
     pub vc_tree_position: Option<u64>,
@@ -523,6 +525,28 @@ pub struct RoundPlan {
     pub needs_draft_setup: bool,
     /// Primary work area derived from the crate-owned recovery state.
     pub primary_action: RoundPlanAction,
+    /// True when delegation work needs fresh or restored wallet signing material.
+    ///
+    /// Hosts should read this instead of scanning `next_steps` for a kind.
+    /// Every derived predicate below is computed from an exhaustive match over
+    /// [`NextStep`], so a new step variant is a compile error here rather than
+    /// silently reading as "no work" in a downstream allowlist.
+    pub needs_delegation_signing: bool,
+    /// True when a delegation is durably in flight. Consult
+    /// `needs_delegation_signing` to learn whether its next pass also needs
+    /// signing material.
+    pub has_in_flight_delegation: bool,
+    /// True when vote or helper-share work remains that the host should keep
+    /// driving: casting, advancing a chain submission, or submitting shares.
+    ///
+    /// Excludes helper-share confirmation, which background polling completes.
+    pub needs_vote_polling: bool,
+    /// True when any vote or share work remains, counting share confirmation
+    /// only when it is blocking.
+    pub has_remaining_vote_or_share_work: bool,
+    /// True when any vote or share work remains that is actionable from
+    /// persisted state, counting share confirmation unconditionally.
+    pub has_recoverable_vote_or_share_work: bool,
     /// Delegation recovery work grouped from `next_steps` for wallet orchestration.
     pub recovered_delegation_work: Vec<DelegationRecoveryWork>,
     /// Vote recovery work grouped from `next_steps` for wallet orchestration.
@@ -535,25 +559,18 @@ fn step_rank(step: &NextStep) -> (u32, u32, u32, u32) {
     // question finishes across all bundles before later questions resume.
     match step {
         NextStep::Delegate { bundle_index } => (0, 0, *bundle_index, 0),
-        NextStep::PollDelegation { bundle_index } => (0, 0, *bundle_index, 0),
+        NextStep::AdvanceDelegation { bundle_index }
+        | NextStep::AdvanceImportedDelegation { bundle_index } => (0, 0, *bundle_index, 0),
         NextStep::CastVote {
             bundle_index,
             proposal_id,
             choice: _,
         } => (1, *proposal_id, *bundle_index, 0),
-        NextStep::SubmitVote {
+        NextStep::AdvanceVote {
             bundle_index,
             proposal_id,
         }
-        | NextStep::SubmitVoteBatch {
-            bundle_index,
-            proposal_id,
-        } => (1, *proposal_id, *bundle_index, 0),
-        NextStep::PollVote {
-            bundle_index,
-            proposal_id,
-        }
-        | NextStep::PollVoteBatch {
+        | NextStep::AdvanceVoteBatch {
             bundle_index,
             proposal_id,
         } => (1, *proposal_id, *bundle_index, 0),
@@ -577,15 +594,16 @@ fn missing_recovery_field(message: String) -> VotingError {
 fn delegation_statuses(
     db: &VotingDb,
     round_id: &str,
-    delegation: &BTreeMap<u32, DelegationPhase>,
+    delegation: &[DelegationSubmissionStatus],
 ) -> Result<Vec<DelegationStatus>, VotingError> {
     delegation
         .iter()
-        .map(|(&bundle_index, &phase)| {
+        .map(|status| {
             Ok(DelegationStatus {
-                bundle_index,
-                phase,
-                tx_hash: db.get_delegation_tx_hash(round_id, bundle_index)?,
+                bundle_index: status.bundle_index,
+                phase: status.phase,
+                tx_hash: delegation_transaction_hash(db, round_id, status.bundle_index)?,
+                submission_diagnostic: status.diagnostic.clone(),
             })
         })
         .collect()
@@ -613,27 +631,43 @@ fn recovered_delegation_work_from_steps(
                     tx_hash: None,
                 });
             }
-            NextStep::PollDelegation { bundle_index } => {
+            NextStep::AdvanceDelegation { bundle_index } => {
                 let phase = delegation.get(&bundle_index).copied().ok_or_else(|| {
                     missing_recovery_field(format!(
                         "poll delegation step missing phase for round={round_id}, bundle={bundle_index}"
                     ))
                 })?;
-                let tx_hash = db
-                    .get_delegation_tx_hash(round_id, bundle_index)?
-                    .ok_or_else(|| {
-                        missing_recovery_field(format!(
-                            "poll delegation step missing tx_hash for round={round_id}, bundle={bundle_index}"
-                        ))
-                    })?;
+                // A reserved-but-undispatched generation has no hash yet, so
+                // the hash is reported when known rather than required.
+                let tx_hash = delegation_transaction_hash(db, round_id, bundle_index)?;
                 work.push(DelegationRecoveryWork {
-                    kind: DelegationRecoveryWorkKind::PollDelegation,
+                    kind: DelegationRecoveryWorkKind::AdvanceDelegation,
                     bundle_index,
                     phase,
-                    tx_hash: Some(tx_hash),
+                    tx_hash,
                 });
             }
-            _ => {}
+            NextStep::AdvanceImportedDelegation { bundle_index } => {
+                let phase = delegation.get(&bundle_index).copied().ok_or_else(|| {
+                    missing_recovery_field(format!(
+                        "imported delegation step missing phase for round={round_id}, bundle={bundle_index}"
+                    ))
+                })?;
+                let tx_hash = delegation_transaction_hash(db, round_id, bundle_index)?;
+                work.push(DelegationRecoveryWork {
+                    kind: DelegationRecoveryWorkKind::AdvanceImportedDelegation,
+                    bundle_index,
+                    phase,
+                    tx_hash,
+                });
+            }
+            // Listed exhaustively on purpose: a new step must be classified
+            // here rather than silently dropped.
+            NextStep::CastVote { .. }
+            | NextStep::AdvanceVote { .. }
+            | NextStep::AdvanceVoteBatch { .. }
+            | NextStep::SubmitShares { .. }
+            | NextStep::ConfirmShare { .. } => {}
         }
     }
     Ok(work)
@@ -650,13 +684,13 @@ fn recovered_vote_work_from_steps(
     let mut pending_vote_confirmation_keys = BTreeSet::new();
     for step in steps {
         match step {
-            NextStep::PollVote {
+            NextStep::AdvanceVote {
                 bundle_index,
                 proposal_id,
             } => {
                 pending_vote_confirmation_keys.insert((*bundle_index, *proposal_id));
             }
-            NextStep::PollVoteBatch {
+            NextStep::AdvanceVoteBatch {
                 bundle_index,
                 proposal_id,
             } => {
@@ -664,7 +698,7 @@ fn recovered_vote_work_from_steps(
                     .get(&(*bundle_index, *proposal_id))
                     .ok_or_else(|| {
                         missing_recovery_field(format!(
-                            "poll vote batch step missing active batch for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+                            "advance vote batch step missing active batch for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
                         ))
                     })?;
                 pending_vote_confirmation_keys.extend(
@@ -677,69 +711,55 @@ fn recovered_vote_work_from_steps(
                         .map(|(vote_key, _)| *vote_key),
                 );
             }
-            _ => {}
+            // Listed exhaustively on purpose: a new step must be classified
+            // here rather than silently dropped.
+            NextStep::Delegate { .. }
+            | NextStep::AdvanceDelegation { .. }
+            | NextStep::AdvanceImportedDelegation { .. }
+            | NextStep::CastVote { .. }
+            | NextStep::SubmitShares { .. }
+            | NextStep::ConfirmShare { .. } => {}
         }
     }
     for step in steps {
         match *step {
-            NextStep::SubmitVote {
-                bundle_index,
-                proposal_id,
-            } => work.push(VoteRecoveryWork {
-                kind: VoteRecoveryWorkKind::SubmitVote,
-                bundle_index,
-                proposal_id,
-                tx_hash: None,
-                vc_tree_position: None,
-                share_indexes: Vec::new(),
-            }),
-            NextStep::SubmitVoteBatch {
-                bundle_index,
-                proposal_id,
-            } => work.push(VoteRecoveryWork {
-                kind: VoteRecoveryWorkKind::SubmitVoteBatch,
-                bundle_index,
-                proposal_id,
-                tx_hash: None,
-                vc_tree_position: None,
-                share_indexes: Vec::new(),
-            }),
-            NextStep::PollVote {
+            // A reserved-but-undispatched generation has no hash yet, so the
+            // hash is reported when known rather than required.
+            NextStep::AdvanceVote {
                 bundle_index,
                 proposal_id,
             } => {
-                let tx_hash = db
-                    .get_vote_tx_hash(round_id, bundle_index, proposal_id)?
-                    .ok_or_else(|| {
-                        missing_recovery_field(format!(
-                            "poll vote step missing tx_hash for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
-                        ))
-                    })?;
+                let tx_hash = vote_transaction_hash(db, round_id, bundle_index, proposal_id)?;
                 work.push(VoteRecoveryWork {
-                    kind: VoteRecoveryWorkKind::PollVote,
+                    kind: VoteRecoveryWorkKind::AdvanceVote,
                     bundle_index,
                     proposal_id,
-                    tx_hash: Some(tx_hash),
+                    tx_hash,
                     vc_tree_position: None,
                     share_indexes: Vec::new(),
                 });
             }
-            NextStep::PollVoteBatch {
+            NextStep::AdvanceVoteBatch {
                 bundle_index,
                 proposal_id,
             } => {
-                let tx_hash = db
-                    .get_vote_tx_hash(round_id, bundle_index, proposal_id)?
-                    .ok_or_else(|| {
-                        missing_recovery_field(format!(
-                            "poll vote batch step missing tx_hash for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
-                        ))
-                    })?;
+                // The batch row is the authority for an in-flight batch; the
+                // anchor member's own columns hold nothing until confirmation.
+                let batch = active_vote_batches
+                    .get(&(bundle_index, proposal_id))
+                    .expect("classified above from the same step list");
+                let tx_hash = vote_batch_transaction_hash(
+                    db,
+                    round_id,
+                    bundle_index,
+                    batch.digest,
+                    proposal_id,
+                )?;
                 work.push(VoteRecoveryWork {
-                    kind: VoteRecoveryWorkKind::PollVoteBatch,
+                    kind: VoteRecoveryWorkKind::AdvanceVoteBatch,
                     bundle_index,
                     proposal_id,
-                    tx_hash: Some(tx_hash),
+                    tx_hash,
                     vc_tree_position: None,
                     share_indexes: Vec::new(),
                 });
@@ -775,7 +795,13 @@ fn recovered_vote_work_from_steps(
                     share_index,
                 )?;
             }
-            _ => {}
+            // Listed exhaustively on purpose: a new step must be classified
+            // here rather than silently dropped.
+            NextStep::Delegate { .. }
+            | NextStep::AdvanceDelegation { .. }
+            | NextStep::AdvanceImportedDelegation { .. }
+            | NextStep::CastVote { .. }
+            | NextStep::ConfirmShare { .. } => {}
         }
     }
     Ok(work)
@@ -834,7 +860,9 @@ fn select_primary_action(
     if steps.iter().any(|step| {
         matches!(
             step,
-            NextStep::Delegate { .. } | NextStep::PollDelegation { .. }
+            NextStep::Delegate { .. }
+                | NextStep::AdvanceDelegation { .. }
+                | NextStep::AdvanceImportedDelegation { .. }
         )
     }) {
         return RoundPlanAction::Delegate;
@@ -843,10 +871,8 @@ fn select_primary_action(
         matches!(
             step,
             NextStep::CastVote { .. }
-                | NextStep::SubmitVote { .. }
-                | NextStep::SubmitVoteBatch { .. }
-                | NextStep::PollVote { .. }
-                | NextStep::PollVoteBatch { .. }
+                | NextStep::AdvanceVote { .. }
+                | NextStep::AdvanceVoteBatch { .. }
                 | NextStep::SubmitShares { .. }
         )
     }) {
@@ -911,7 +937,10 @@ fn active_vote_batches_by_vote(
     let wallet_id = db.wallet_id();
 
     for (&(bundle_index, proposal_id), &phase) in votes {
-        if !matches!(phase, VotePhase::Committed | VotePhase::Submitted) {
+        if !matches!(
+            phase,
+            VotePhase::Committed | VotePhase::Submitted | VotePhase::SubmissionManaged
+        ) {
             continue;
         }
         if batches_by_vote.contains_key(&(bundle_index, proposal_id)) {
@@ -965,9 +994,13 @@ fn active_vote_batches_by_vote(
                     ),
                 });
             }
+            // A member with no recorded intent is not a conflict: the batch is
+            // lifecycle-owned and must stay schedulable whatever the host has
+            // recorded so far. Only a differing or skipped intent conflicts.
             if vote_choices.get(&vote_key) != Some(&recovery.vote_decision)
-                || intents.get(&recovery.proposal_id)
-                    != Some(&Decision::Choice(recovery.vote_decision))
+                || intents
+                    .get(&recovery.proposal_id)
+                    .is_some_and(|intent| *intent != Decision::Choice(recovery.vote_decision))
             {
                 return Err(VotingError::InvalidInput {
                     message: format!(
@@ -977,25 +1010,24 @@ fn active_vote_batches_by_vote(
                 });
             }
             if phase == VotePhase::Submitted {
-                let tx_hash = db
-                    .get_vote_tx_hash(round_id, bundle_index, recovery.proposal_id)?
-                    .ok_or_else(|| VotingError::InvalidInput {
-                        message: format!(
-                            "submitted atomic vote batch is missing a transaction hash for round={round_id}, bundle={bundle_index}, proposal={}",
-                            recovery.proposal_id
-                        ),
-                    })?;
-                if shared_tx_hash
-                    .as_ref()
-                    .is_some_and(|expected| expected != &tx_hash)
+                // A batch generation reserved before its POST has no hash yet.
+                // Every member that does report one must agree, because one
+                // atomic batch is exactly one transaction.
+                if let Some(tx_hash) =
+                    vote_transaction_hash(db, round_id, bundle_index, recovery.proposal_id)?
                 {
-                    return Err(VotingError::InvalidInput {
-                        message: format!(
-                            "submitted atomic vote batch has conflicting transaction hashes for round={round_id}, bundle={bundle_index}"
-                        ),
-                    });
+                    if shared_tx_hash
+                        .as_ref()
+                        .is_some_and(|expected| expected != &tx_hash)
+                    {
+                        return Err(VotingError::InvalidInput {
+                            message: format!(
+                                "submitted atomic vote batch has conflicting transaction hashes for round={round_id}, bundle={bundle_index}"
+                            ),
+                        });
+                    }
+                    shared_tx_hash = Some(tx_hash);
                 }
-                shared_tx_hash = Some(tx_hash);
             }
         }
 
@@ -1019,6 +1051,48 @@ fn active_vote_batches_by_vote(
     Ok(batches_by_vote)
 }
 
+/// Schedules the chain-advancement step for one vote that is committed,
+/// submitted, or lifecycle-owned.
+///
+/// A batch member schedules one `AdvanceVoteBatch` per batch, keyed by the
+/// anchor proposal; a singleton schedules `AdvanceVote`. A `Submitted` vote
+/// must still hold its recovery material, because advancement reconstructs
+/// the transaction from it.
+fn push_vote_advance_step(
+    db: &VotingDb,
+    round_id: &str,
+    steps: &mut Vec<NextStep>,
+    planned_vote_batches: &mut BTreeSet<(u32, [u8; 32])>,
+    active_vote_batches: &BTreeMap<(u32, u32), ActiveVoteBatch>,
+    vote_key: (u32, u32),
+    phase: VotePhase,
+) -> Result<(), VotingError> {
+    let (bundle_index, proposal_id) = vote_key;
+    if phase == VotePhase::Submitted
+        && !vote_has_recovery_bundle(db, round_id, bundle_index, proposal_id)?
+    {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} bundle {bundle_index} proposal {proposal_id} has a submitted vote without recovery material"
+            ),
+        });
+    }
+    if let Some(batch) = active_vote_batches.get(&vote_key) {
+        if planned_vote_batches.insert((bundle_index, batch.digest)) {
+            steps.push(NextStep::AdvanceVoteBatch {
+                bundle_index,
+                proposal_id: batch.anchor_proposal_id,
+            });
+        }
+    } else {
+        steps.push(NextStep::AdvanceVote {
+            bundle_index,
+            proposal_id,
+        });
+    }
+    Ok(())
+}
+
 /// Build the resume plan for `round_id`.
 ///
 /// `proposal_ids` is the round's full set of proposal ids (from the wallet's
@@ -1032,8 +1106,11 @@ pub fn resume_plan(
     round_id: &str,
     proposal_ids: &[u32],
 ) -> Result<RoundPlan, VotingError> {
-    let delegation: BTreeMap<u32, DelegationPhase> =
-        db.delegation_phases(round_id)?.into_iter().collect();
+    let delegation_submissions = db.delegation_submission_statuses(round_id)?;
+    let delegation: BTreeMap<u32, DelegationPhase> = delegation_submissions
+        .iter()
+        .map(|status| (status.bundle_index, status.phase))
+        .collect();
     let votes: BTreeMap<(u32, u32), VotePhase> = db
         .vote_phases(round_id)?
         .into_iter()
@@ -1093,19 +1170,34 @@ pub fn resume_plan(
             !stale_vote_keys.contains(key)
                 && matches!(
                     phase,
-                    VotePhase::Committed | VotePhase::Submitted | VotePhase::SubmissionManaged
+                    VotePhase::Committed
+                        | VotePhase::Submitted
+                        | VotePhase::SubmissionManaged
+                        | VotePhase::SubmittedWithoutHash
                 )
         })
         .map(|(&(bundle_index, _), _)| bundle_index)
         .chain(delegation.iter().filter_map(|(&bundle_index, phase)| {
-            (*phase == DelegationPhase::SubmissionManaged).then_some(bundle_index)
+            matches!(
+                phase,
+                DelegationPhase::SubmissionManaged
+                    | DelegationPhase::SubmittedWithoutHash
+                    | DelegationPhase::SubmissionRejected
+            )
+            .then_some(bundle_index)
         }))
         .collect::<BTreeSet<_>>();
 
     for &(bundle_index, proposal_id) in &stale_vote_keys {
         if matches!(
             votes.get(&(bundle_index, proposal_id)),
-            Some(VotePhase::Submitted | VotePhase::SubmissionManaged | VotePhase::Confirmed)
+            Some(
+                VotePhase::Submitted
+                    | VotePhase::SubmissionManaged
+                    | VotePhase::SubmittedWithoutHash
+                    | VotePhase::SubmissionRejected
+                    | VotePhase::Confirmed
+            )
         ) {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -1156,46 +1248,23 @@ pub fn resume_plan(
                         });
                     }
                 }
-                Some(VotePhase::Committed) => {
-                    if let Some(batch) = active_vote_batches.get(&vote_key) {
-                        if planned_vote_batches.insert((b, batch.digest)) {
-                            steps.push(NextStep::SubmitVoteBatch {
-                                bundle_index: b,
-                                proposal_id: batch.anchor_proposal_id,
-                            });
-                        }
-                    } else {
-                        steps.push(NextStep::SubmitVote {
-                            bundle_index: b,
-                            proposal_id: pid,
-                        });
-                    }
+                Some(
+                    phase @ (VotePhase::Committed
+                    | VotePhase::Submitted
+                    | VotePhase::SubmissionManaged),
+                ) => {
+                    push_vote_advance_step(
+                        db,
+                        round_id,
+                        &mut steps,
+                        &mut planned_vote_batches,
+                        &active_vote_batches,
+                        vote_key,
+                        *phase,
+                    )?;
                 }
-                Some(VotePhase::Submitted) => {
-                    if !vote_has_recovery_bundle(db, round_id, b, pid)? {
-                        return Err(VotingError::InvalidInput {
-                            message: format!(
-                                "round {round_id} bundle {b} proposal {pid} has a submitted vote without recovery material"
-                            ),
-                        });
-                    }
-                    if let Some(batch) = active_vote_batches.get(&vote_key) {
-                        if planned_vote_batches.insert((b, batch.digest)) {
-                            steps.push(NextStep::PollVoteBatch {
-                                bundle_index: b,
-                                proposal_id: batch.anchor_proposal_id,
-                            });
-                        }
-                    } else {
-                        steps.push(NextStep::PollVote {
-                            bundle_index: b,
-                            proposal_id: pid,
-                        });
-                    }
-                }
-                // The chain-submission lifecycle owns every network action for
-                // this persisted generation.
-                Some(VotePhase::SubmissionManaged) => {}
+                Some(VotePhase::SubmittedWithoutHash) => {}
+                Some(VotePhase::SubmissionRejected) => {}
                 // Prepared or no row yet -> still needs casting.
                 _ => {
                     if bundles_with_pending_vote_chains.contains(&b) {
@@ -1212,15 +1281,43 @@ pub fn resume_plan(
         }
     }
 
+    // Advancement for votes already on the wire does not depend on ballot
+    // intent. A lifecycle-owned or submitted vote whose proposal has no
+    // recorded intent is still the wallet's transaction and must be driven to
+    // resolution; a skipped or differing intent was rejected above as a
+    // conflict, so only intent-less proposals reach this pass.
+    for (&vote_key, &phase) in &votes {
+        let (b, pid) = vote_key;
+        if intents.contains_key(&pid)
+            || !matches!(phase, VotePhase::Submitted | VotePhase::SubmissionManaged)
+        {
+            continue;
+        }
+        push_vote_advance_step(
+            db,
+            round_id,
+            &mut steps,
+            &mut planned_vote_batches,
+            &active_vote_batches,
+            (b, pid),
+            phase,
+        )?;
+    }
+
     // Delegation steps: resume any mid-flight delegation; otherwise only the
     // prerequisite for a bundle that still has a vote to cast.
     for &b in &bundles {
         match delegation.get(&b) {
             Some(DelegationPhase::Confirmed) => {}
-            Some(DelegationPhase::Submitted) => {
-                steps.push(NextStep::PollDelegation { bundle_index: b });
+            Some(DelegationPhase::Submitted | DelegationPhase::SubmissionManaged) => {
+                if delegation_is_capability_imported(db, round_id, b)? {
+                    steps.push(NextStep::AdvanceImportedDelegation { bundle_index: b });
+                } else {
+                    steps.push(NextStep::AdvanceDelegation { bundle_index: b });
+                }
             }
-            Some(DelegationPhase::SubmissionManaged) => {}
+            Some(DelegationPhase::SubmittedWithoutHash) => {}
+            Some(DelegationPhase::SubmissionRejected) => {}
             // Prepared / PcztBuilt / Proved: still needs the delegate flow.
             _ => {
                 if bundles_needing_delegation.contains(&b) {
@@ -1280,7 +1377,23 @@ pub fn resume_plan(
         || votes
             .values()
             .any(|phase| *phase == VotePhase::SubmissionManaged);
+    // Terminal hashless dispatch keeps the foreground closed but schedules
+    // no recovery step, so it contributes to `blocking_recovery` only.
+    let submitted_without_hash = delegation
+        .values()
+        .any(|phase| *phase == DelegationPhase::SubmittedWithoutHash)
+        || votes
+            .values()
+            .any(|phase| *phase == VotePhase::SubmittedWithoutHash);
+    let submission_rejected = delegation
+        .values()
+        .any(|phase| *phase == DelegationPhase::SubmissionRejected)
+        || votes
+            .values()
+            .any(|phase| *phase == VotePhase::SubmissionRejected);
     let blocking_recovery = submission_managed
+        || submitted_without_hash
+        || submission_rejected
         || steps.iter().any(|step| match step {
             NextStep::ConfirmShare {
                 bundle_index,
@@ -1290,7 +1403,7 @@ pub fn resume_plan(
             _ => true,
         });
 
-    let delegation_statuses = delegation_statuses(db, round_id, &delegation)?;
+    let delegation_statuses = delegation_statuses(db, round_id, &delegation_submissions)?;
     let hotkey_bound = delegation
         .values()
         .any(|phase| *phase != DelegationPhase::Prepared)
@@ -1339,6 +1452,8 @@ pub fn resume_plan(
             voted_at,
         )
     });
+    // `SubmittedWithoutHash` and `SubmissionRejected` are terminal: they block
+    // the foreground above but are not pending recovery work.
     let pending_recovery = submission_managed || !steps.is_empty();
     let needs_draft_setup = !blocking_recovery && !all_decided && !open_proposals.is_empty();
     let primary_action = select_primary_action(
@@ -1356,6 +1471,8 @@ pub fn resume_plan(
         &active_vote_batches,
         &steps,
     )?;
+
+    let work_summary = summarize_plan_work(&steps, blocking_share_work);
 
     let immediate_share_key =
         round_immediate_share_key(bundles.iter().copied().max(), &choice_proposals);
@@ -1385,9 +1502,65 @@ pub fn resume_plan(
         completed_vote_display,
         needs_draft_setup,
         primary_action,
+        needs_delegation_signing: work_summary.needs_delegation_signing,
+        has_in_flight_delegation: work_summary.has_in_flight_delegation,
+        needs_vote_polling: work_summary.needs_vote_polling,
+        has_remaining_vote_or_share_work: work_summary.has_remaining_vote_or_share_work,
+        has_recoverable_vote_or_share_work: work_summary.has_recoverable_vote_or_share_work,
         recovered_delegation_work,
         recovered_vote_work,
     })
+}
+
+/// Derived predicates describing what kind of work a plan still contains.
+///
+/// Every arm is listed explicitly. Adding a [`NextStep`] variant must be a
+/// compile error here: a host that scans step kinds through an allowlist reads
+/// an unrecognised kind as "no work", which silently strands a round, so the
+/// classification has to live in one place the compiler checks.
+struct PlanWorkSummary {
+    needs_delegation_signing: bool,
+    has_in_flight_delegation: bool,
+    needs_vote_polling: bool,
+    has_remaining_vote_or_share_work: bool,
+    has_recoverable_vote_or_share_work: bool,
+}
+
+fn summarize_plan_work(steps: &[NextStep], blocking_share_work: bool) -> PlanWorkSummary {
+    let mut summary = PlanWorkSummary {
+        needs_delegation_signing: false,
+        has_in_flight_delegation: false,
+        needs_vote_polling: false,
+        has_remaining_vote_or_share_work: false,
+        has_recoverable_vote_or_share_work: false,
+    };
+    for step in steps {
+        match step {
+            NextStep::Delegate { .. } => summary.needs_delegation_signing = true,
+            NextStep::AdvanceDelegation { .. } => {
+                summary.needs_delegation_signing = true;
+                summary.has_in_flight_delegation = true;
+            }
+            NextStep::AdvanceImportedDelegation { .. } => {
+                summary.has_in_flight_delegation = true;
+            }
+            NextStep::CastVote { .. }
+            | NextStep::AdvanceVote { .. }
+            | NextStep::AdvanceVoteBatch { .. }
+            | NextStep::SubmitShares { .. } => {
+                summary.needs_vote_polling = true;
+                summary.has_remaining_vote_or_share_work = true;
+                summary.has_recoverable_vote_or_share_work = true;
+            }
+            NextStep::ConfirmShare { .. } => {
+                summary.has_recoverable_vote_or_share_work = true;
+                if blocking_share_work {
+                    summary.has_remaining_vote_or_share_work = true;
+                }
+            }
+        }
+    }
+    summary
 }
 
 fn vote_has_recovery_bundle(
@@ -1857,6 +2030,7 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Prepared,
                 tx_hash: None,
+                submission_diagnostic: None,
             }]
         );
         assert!(!plan.blocking_recovery);
@@ -1903,7 +2077,7 @@ mod tests {
     }
 
     #[test]
-    fn submitted_but_unconfirmed_vote_yields_poll() {
+    fn submitted_legacy_vote_without_a_lifecycle_row_yields_an_advance_step() {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
@@ -1915,7 +2089,7 @@ mod tests {
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert_eq!(
             plan.next_steps,
-            vec![NextStep::PollVote {
+            vec![NextStep::AdvanceVote {
                 bundle_index: 0,
                 proposal_id: 2
             }]
@@ -1923,7 +2097,7 @@ mod tests {
         assert_eq!(
             plan.recovered_vote_work,
             vec![VoteRecoveryWork {
-                kind: VoteRecoveryWorkKind::PollVote,
+                kind: VoteRecoveryWorkKind::AdvanceVote,
                 bundle_index: 0,
                 proposal_id: 2,
                 tx_hash: Some("vtx".to_string()),
@@ -1969,7 +2143,7 @@ mod tests {
         assert_eq!(
             plan.next_steps,
             vec![
-                NextStep::PollVote {
+                NextStep::AdvanceVote {
                     bundle_index: 0,
                     proposal_id: 2,
                 },
@@ -1986,7 +2160,7 @@ mod tests {
         assert_eq!(
             plan.recovered_vote_work,
             vec![VoteRecoveryWork {
-                kind: VoteRecoveryWorkKind::PollVote,
+                kind: VoteRecoveryWorkKind::AdvanceVote,
                 bundle_index: 0,
                 proposal_id: 2,
                 tx_hash: Some("vtx".to_string()),
@@ -2014,7 +2188,7 @@ mod tests {
         assert_eq!(
             plan.next_steps,
             vec![
-                NextStep::PollVoteBatch {
+                NextStep::AdvanceVoteBatch {
                     bundle_index: 0,
                     proposal_id: 1,
                 },
@@ -2031,7 +2205,7 @@ mod tests {
         assert_eq!(
             plan.recovered_vote_work,
             vec![VoteRecoveryWork {
-                kind: VoteRecoveryWorkKind::PollVoteBatch,
+                kind: VoteRecoveryWorkKind::AdvanceVoteBatch,
                 bundle_index: 0,
                 proposal_id: 1,
                 tx_hash: Some("batch-tx".to_string()),
@@ -2039,6 +2213,263 @@ mod tests {
                 share_indexes: Vec::new(),
             }]
         );
+    }
+
+    /// Inserts one in-flight `chain_submissions` row for `kind`/`proposal_id`.
+    ///
+    /// `candidate` is the durable candidate transaction hash the lifecycle
+    /// recorded before confirmation; `Submitting` has none because intent is
+    /// reserved before the POST. The version-17 projection columns stay null,
+    /// which is exactly the state that used to read as "unsubmitted".
+    fn insert_in_flight_submission(
+        db: &VotingDb,
+        state: &str,
+        kind: &str,
+        proposal_id: Option<u32>,
+        candidate: Option<[u8; 32]>,
+    ) {
+        let candidate = candidate.map(|hash| hash.to_vec());
+        let tracking_started_at = candidate.as_ref().map(|_| 10_i64);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, proposal_id, generation_digest, state, candidate_transaction_hash,
+                  committed_post_reservations, tracking_started_at,
+                  diagnostic_kind, diagnostic, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, ?4, ?5, ?6,
+                         ?7, ?8, 1, ?9,
+                         CASE WHEN ?7 IN ('recovering','submitted_without_hash')
+                              THEN 'ambiguous_attempts_exhausted' END,
+                         CASE WHEN ?7 IN ('recovering','submitted_without_hash')
+                              THEN 'submission has no usable hash' END,
+                         9, 10)",
+                rusqlite::params![
+                    vec![0x51_u8; 32],
+                    ROUND,
+                    W,
+                    kind,
+                    proposal_id.map(|id| id as i64),
+                    vec![0x52_u8; 32],
+                    state,
+                    candidate,
+                    tracking_started_at
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_second_network_generation_makes_the_reported_hash_ambiguous() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+
+        let insert = |network: &str, identity: u8, digest: u8, candidate: u8| {
+            db.conn()
+                .execute(
+                    "INSERT INTO chain_submissions
+                     (identity_key, round_id, wallet_id, network, bundle_index,
+                      kind, proposal_id, generation_digest, state, candidate_transaction_hash,
+                      committed_post_reservations, tracking_started_at, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 0, 'vote', 2, ?5,
+                             'tracking', ?6, 1, 10, 9, 10)",
+                    rusqlite::params![
+                        vec![identity; 32],
+                        ROUND,
+                        W,
+                        network,
+                        vec![digest; 32],
+                        vec![candidate; 32]
+                    ],
+                )
+                .unwrap();
+        };
+
+        insert("testnet", 0x81, 0x82, 0x83);
+        assert_eq!(
+            crate::chain_submission::planning::vote_transaction_hash(&db, ROUND, 0, 2).unwrap(),
+            Some(hex::encode([0x83_u8; 32])),
+            "one generation reports its own hash"
+        );
+
+        // The same vote on a second configured network. Submission identity
+        // includes the network, so both rows are legal; a planner carries no
+        // network context, so attributing either hash would be a guess.
+        insert("regtest", 0x91, 0x92, 0x93);
+        assert_eq!(
+            crate::chain_submission::planning::vote_transaction_hash(&db, ROUND, 0, 2).unwrap(),
+            None,
+            "an ambiguous hash must not be attributed to this vote"
+        );
+    }
+
+    #[test]
+    fn plan_work_summary_classifies_every_step_kind() {
+        // Locally prepared delegations need the signing key on both their
+        // first and later advancement passes.
+        let signing = summarize_plan_work(&[NextStep::Delegate { bundle_index: 0 }], false);
+        assert!(signing.needs_delegation_signing);
+        assert!(!signing.has_in_flight_delegation);
+        assert!(!signing.needs_vote_polling);
+
+        let in_flight =
+            summarize_plan_work(&[NextStep::AdvanceDelegation { bundle_index: 0 }], false);
+        assert!(in_flight.needs_delegation_signing);
+        assert!(in_flight.has_in_flight_delegation);
+
+        let imported = summarize_plan_work(
+            &[NextStep::AdvanceImportedDelegation { bundle_index: 0 }],
+            false,
+        );
+        assert!(!imported.needs_delegation_signing);
+        assert!(imported.has_in_flight_delegation);
+
+        for step in [
+            NextStep::CastVote {
+                bundle_index: 0,
+                proposal_id: 1,
+                choice: 0,
+            },
+            NextStep::AdvanceVote {
+                bundle_index: 0,
+                proposal_id: 1,
+            },
+            NextStep::AdvanceVoteBatch {
+                bundle_index: 0,
+                proposal_id: 1,
+            },
+            NextStep::SubmitShares {
+                bundle_index: 0,
+                proposal_id: 1,
+                share_index: 0,
+            },
+        ] {
+            let kind = step.kind();
+            let summary = summarize_plan_work(&[step], false);
+            assert!(summary.needs_vote_polling, "{kind}");
+            assert!(summary.has_remaining_vote_or_share_work, "{kind}");
+            assert!(summary.has_recoverable_vote_or_share_work, "{kind}");
+            assert!(!summary.needs_delegation_signing, "{kind}");
+        }
+
+        // Share confirmation is always recoverable work, but only counts as
+        // remaining work while it is blocking; otherwise background polling
+        // finishes it without holding the foreground flow open.
+        let confirm = [NextStep::ConfirmShare {
+            bundle_index: 0,
+            proposal_id: 1,
+            share_index: 0,
+        }];
+        let non_blocking = summarize_plan_work(&confirm, false);
+        assert!(non_blocking.has_recoverable_vote_or_share_work);
+        assert!(!non_blocking.has_remaining_vote_or_share_work);
+        assert!(!non_blocking.needs_vote_polling);
+
+        let blocking = summarize_plan_work(&confirm, true);
+        assert!(blocking.has_remaining_vote_or_share_work);
+        assert!(!blocking.needs_vote_polling);
+
+        // An empty plan claims no work of any kind.
+        let empty = summarize_plan_work(&[], true);
+        assert!(!empty.needs_delegation_signing);
+        assert!(!empty.has_in_flight_delegation);
+        assert!(!empty.needs_vote_polling);
+        assert!(!empty.has_remaining_vote_or_share_work);
+        assert!(!empty.has_recoverable_vote_or_share_work);
+    }
+
+    #[test]
+    fn every_managed_submission_state_yields_a_typed_advance_step() {
+        for (state, candidate) in [
+            ("submitting", None),
+            ("tracking", Some([0x61; 32])),
+            ("recovering", Some([0x62; 32])),
+        ] {
+            let delegation_db = db_with_bundle();
+            delegation_db
+                .set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+                .unwrap();
+            insert_in_flight_submission(&delegation_db, state, "delegation", None, candidate);
+            assert!(resume_plan(&delegation_db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .next_steps
+                .contains(&NextStep::AdvanceDelegation { bundle_index: 0 }));
+
+            let vote_db = db_with_bundle();
+            vote_db
+                .set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+                .unwrap();
+            vote_db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+            vote_db.store_van_position(ROUND, 0, 7).unwrap();
+            crate::storage::queries::store_vote(&vote_db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16])
+                .unwrap();
+            store_vote_recovery_fixture(&vote_db, 0, 2, 1, None);
+            insert_in_flight_submission(&vote_db, state, "vote", Some(2), candidate);
+            assert!(resume_plan(&vote_db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .next_steps
+                .contains(&NextStep::AdvanceVote {
+                    bundle_index: 0,
+                    proposal_id: 2,
+                }));
+        }
+    }
+
+    #[test]
+    fn submitted_without_hash_schedules_no_chain_recovery_step() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+        insert_in_flight_submission(&db, "submitted_without_hash", "vote", Some(2), None);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            db.vote_phase(ROUND, 0, 2).unwrap(),
+            VotePhase::SubmittedWithoutHash
+        );
+        assert!(!plan.next_steps.iter().any(|step| matches!(
+            step,
+            NextStep::AdvanceVote { .. } | NextStep::AdvanceVoteBatch { .. }
+        )));
+        assert!(plan.blocking_recovery);
+        assert!(
+            !plan.pending_recovery,
+            "terminal hashless dispatch is not pending recovery work"
+        );
+    }
+
+    #[test]
+    fn submitted_without_hash_delegation_blocks_without_pending_recovery() {
+        let db = db_with_bundle();
+        insert_in_flight_submission(&db, "submitted_without_hash", "delegation", None, None);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            db.delegation_phase(ROUND, 0).unwrap(),
+            DelegationPhase::SubmittedWithoutHash
+        );
+        assert!(plan.next_steps.is_empty(), "{:?}", plan.next_steps);
+        assert!(plan.blocking_recovery);
+        assert!(!plan.pending_recovery);
+        // No later lifecycle call is scheduled, so the plan itself must carry
+        // the stored diagnostic a wallet shows for manual handling.
+        let status = &plan.delegation_statuses[0];
+        assert_eq!(status.phase, DelegationPhase::SubmittedWithoutHash);
+        let diagnostic = status.submission_diagnostic.as_ref().unwrap();
+        assert_eq!(
+            diagnostic.kind(),
+            crate::chain_submission::ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted
+        );
+        assert_eq!(diagnostic.message(), "submission has no usable hash");
     }
 
     #[test]
@@ -2055,7 +2486,7 @@ mod tests {
 
         assert_eq!(
             plan.next_steps,
-            vec![NextStep::SubmitVote {
+            vec![NextStep::AdvanceVote {
                 bundle_index: 0,
                 proposal_id: 2
             }]
@@ -2065,7 +2496,7 @@ mod tests {
         assert_eq!(
             plan.recovered_vote_work,
             vec![VoteRecoveryWork {
-                kind: VoteRecoveryWorkKind::SubmitVote,
+                kind: VoteRecoveryWorkKind::AdvanceVote,
                 bundle_index: 0,
                 proposal_id: 2,
                 tx_hash: None,
@@ -2076,7 +2507,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_owned_delegation_and_vote_yield_no_legacy_steps() {
+    fn lifecycle_owned_delegation_and_vote_yield_typed_advance_steps() {
         for tx_hash in [None, Some("legacy-vtx")] {
             let db = db_with_bundle();
             db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
@@ -2134,11 +2565,21 @@ mod tests {
 
             let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
-            assert!(plan.next_steps.is_empty());
-            assert!(plan.recovered_vote_work.is_empty());
+            assert_eq!(
+                plan.next_steps,
+                vec![
+                    NextStep::AdvanceDelegation { bundle_index: 0 },
+                    NextStep::AdvanceVote {
+                        bundle_index: 0,
+                        proposal_id: 2,
+                    },
+                ]
+            );
+            assert_eq!(plan.recovered_vote_work.len(), 1);
+            assert_eq!(plan.recovered_delegation_work.len(), 1);
             assert!(plan.pending_recovery);
             assert!(plan.blocking_recovery);
-            assert_eq!(plan.primary_action, RoundPlanAction::Idle);
+            assert_eq!(plan.primary_action, RoundPlanAction::Delegate);
             assert_eq!(
                 db.delegation_phase(ROUND, 0).unwrap(),
                 DelegationPhase::SubmissionManaged
@@ -2151,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_hashless_recovery_is_contained_until_tree_recovery_lands() {
+    fn bound_hashless_recovery_yields_a_typed_advance_step() {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
@@ -2184,14 +2625,382 @@ mod tests {
 
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
-        assert!(plan.next_steps.is_empty());
-        assert!(plan.recovered_vote_work.is_empty());
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::AdvanceVote {
+                bundle_index: 0,
+                proposal_id: 2,
+            }]
+        );
+        assert_eq!(plan.recovered_vote_work.len(), 1);
         assert!(plan.pending_recovery);
         assert!(plan.blocking_recovery);
-        assert_eq!(plan.primary_action, RoundPlanAction::Idle);
+        assert_eq!(plan.primary_action, RoundPlanAction::Vote);
         assert_eq!(
             db.vote_phase(ROUND, 0, 2).unwrap(),
             VotePhase::SubmissionManaged
+        );
+    }
+
+    #[test]
+    fn lifecycle_owned_vote_without_ballot_intent_still_yields_an_advance_step() {
+        // The host never recorded an intent for proposal 2, yet the lifecycle
+        // owns a vote for it. Advancement must not wait on the ballot.
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+        align_stored_commitments_with_recovery(&db, &[2]);
+        let identity = submission_identity_fixture(ChainSubmissionTarget::Vote { proposal_id: 2 });
+        let generation = generation_for_vote(&db.conn(), &identity).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, ?4,
+                         'recovering', 1, 'ambiguous_dispatch',
+                         'vote response was lost after dispatch', 9, 9)",
+                rusqlite::params![
+                    submission_identity_key(&identity),
+                    ROUND,
+                    W,
+                    generation.generation().digest().as_bytes().to_vec(),
+                ],
+            )
+            .unwrap();
+        assert!(db.ballot_intents(ROUND).unwrap().is_empty());
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::AdvanceVote {
+                bundle_index: 0,
+                proposal_id: 2,
+            }]
+        );
+        assert_eq!(plan.recovered_vote_work.len(), 1);
+        assert_eq!(
+            plan.recovered_vote_work[0].kind,
+            VoteRecoveryWorkKind::AdvanceVote
+        );
+        assert!(plan.pending_recovery);
+        assert!(plan.blocking_recovery);
+        assert_eq!(plan.primary_action, RoundPlanAction::Vote);
+        assert_eq!(
+            db.vote_phase(ROUND, 0, 2).unwrap(),
+            VotePhase::SubmissionManaged
+        );
+    }
+
+    #[test]
+    fn lifecycle_owned_batch_without_ballot_intent_still_yields_an_advance_step() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
+        align_stored_commitments_with_recovery(&db, &[1, 2]);
+        let identity = submission_identity_fixture(ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        });
+        let generation_digest = {
+            let conn = db.conn();
+            *generation_for_vote_batch(&conn, &identity)
+                .unwrap()
+                .generation()
+                .digest()
+                .as_bytes()
+        };
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, ordered_batch_digest, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote_batch', ?4, ?5,
+                         'recovering', 1, 'ambiguous_dispatch',
+                         'batch response was lost after dispatch', 9, 9)",
+                rusqlite::params![
+                    submission_identity_key(&identity),
+                    ROUND,
+                    W,
+                    ordered_batch_digest.as_slice(),
+                    generation_digest.to_vec(),
+                ],
+            )
+            .unwrap();
+        assert!(db.ballot_intents(ROUND).unwrap().is_empty());
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.next_steps,
+            vec![NextStep::AdvanceVoteBatch {
+                bundle_index: 0,
+                proposal_id: 1,
+            }]
+        );
+        assert_eq!(plan.recovered_vote_work.len(), 1);
+        assert_eq!(
+            plan.recovered_vote_work[0].kind,
+            VoteRecoveryWorkKind::AdvanceVoteBatch
+        );
+        assert!(plan.blocking_recovery);
+        for proposal_id in [1, 2] {
+            assert_eq!(
+                db.vote_phase(ROUND, 0, proposal_id).unwrap(),
+                VotePhase::SubmissionManaged
+            );
+        }
+    }
+
+    #[test]
+    fn in_flight_batch_reports_the_batch_row_candidate_hash() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
+        align_stored_commitments_with_recovery(&db, &[1, 2]);
+        let identity = submission_identity_fixture(ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        });
+        let generation_digest = {
+            let conn = db.conn();
+            *generation_for_vote_batch(&conn, &identity)
+                .unwrap()
+                .generation()
+                .digest()
+                .as_bytes()
+        };
+        let candidate = [0x77_u8; 32];
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, ordered_batch_digest, generation_digest, state,
+                  candidate_transaction_hash, committed_post_reservations,
+                  tracking_started_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote_batch', ?4, ?5,
+                         'tracking', ?6, 1, 10, 9, 10)",
+                rusqlite::params![
+                    submission_identity_key(&identity),
+                    ROUND,
+                    W,
+                    ordered_batch_digest.as_slice(),
+                    generation_digest.to_vec(),
+                    candidate.as_slice(),
+                ],
+            )
+            .unwrap();
+        // Members own no projection hash while the batch is in flight.
+        for proposal_id in [1, 2] {
+            assert_eq!(
+                crate::chain_submission::planning::vote_transaction_hash(
+                    &db,
+                    ROUND,
+                    0,
+                    proposal_id
+                )
+                .unwrap(),
+                None
+            );
+        }
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            plan.recovered_vote_work,
+            vec![VoteRecoveryWork {
+                kind: VoteRecoveryWorkKind::AdvanceVoteBatch,
+                bundle_index: 0,
+                proposal_id: 1,
+                tx_hash: Some(hex::encode(candidate)),
+                vc_tree_position: None,
+                share_indexes: Vec::new(),
+            }]
+        );
+        // The per-vote recovery snapshot reports the same batch hash for
+        // every member.
+        let snapshot = crate::recovery::round_snapshot(&db, ROUND).unwrap();
+        assert_eq!(snapshot.votes.len(), 2);
+        for vote in &snapshot.votes {
+            assert_eq!(vote.phase, VotePhase::SubmissionManaged);
+            assert_eq!(
+                vote.tx_hash.as_deref(),
+                Some(hex::encode(candidate).as_str())
+            );
+        }
+        assert_eq!(snapshot.commitment_bundles.len(), 2);
+        for (bundle, proposal_id) in snapshot.commitment_bundles.iter().zip([1, 2]) {
+            assert_eq!(bundle.bundle_index, 0);
+            assert_eq!(bundle.proposal_id, proposal_id);
+            assert_eq!(bundle.vc_tree_position, 0);
+        }
+    }
+
+    fn insert_batch_row_fixture(
+        db: &VotingDb,
+        identity_key: &[u8],
+        network: &str,
+        ordered_batch_digest: [u8; 32],
+        generation_digest: [u8; 32],
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, ordered_batch_digest, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, 'vote_batch', ?5, ?6,
+                         'recovering', 1, 'ambiguous_dispatch',
+                         'batch response was lost after dispatch', 9, 9)",
+                rusqlite::params![
+                    identity_key,
+                    ROUND,
+                    W,
+                    network,
+                    ordered_batch_digest.as_slice(),
+                    generation_digest.to_vec(),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn batch_row_with_mismatched_generation_digest_is_an_invariant_error() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
+        align_stored_commitments_with_recovery(&db, &[1, 2]);
+        let identity = submission_identity_fixture(ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        });
+        insert_batch_row_fixture(
+            &db,
+            &submission_identity_key(&identity),
+            "testnet",
+            ordered_batch_digest,
+            [0x99; 32],
+        );
+
+        let error = db.vote_phases(ROUND).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generation digest does not match persisted members"),
+            "{error}"
+        );
+        assert!(resume_plan(&db, ROUND, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn vote_claimed_by_two_batch_rows_is_an_invariant_error() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
+        align_stored_commitments_with_recovery(&db, &[1, 2]);
+        let identity = submission_identity_fixture(ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        });
+        let generation_digest = {
+            let conn = db.conn();
+            *generation_for_vote_batch(&conn, &identity)
+                .unwrap()
+                .generation()
+                .digest()
+                .as_bytes()
+        };
+        insert_batch_row_fixture(
+            &db,
+            &submission_identity_key(&identity),
+            "testnet",
+            ordered_batch_digest,
+            generation_digest,
+        );
+        // The identity index is per network, so a second row on another
+        // network is the only way a second batch can claim the same signed
+        // members; the projection reads the whole round and must refuse it.
+        insert_batch_row_fixture(
+            &db,
+            &[0x5A; 32],
+            "mainnet",
+            ordered_batch_digest,
+            generation_digest,
+        );
+
+        let error = db.vote_phases(ROUND).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("belongs to multiple authoritative batches"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn overlapping_singleton_and_batch_rows_are_an_invariant_error() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
+        align_stored_commitments_with_recovery(&db, &[1, 2]);
+        let batch_identity = submission_identity_fixture(ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        });
+        let generation_digest = {
+            let conn = db.conn();
+            *generation_for_vote_batch(&conn, &batch_identity)
+                .unwrap()
+                .generation()
+                .digest()
+                .as_bytes()
+        };
+        insert_batch_row_fixture(
+            &db,
+            &submission_identity_key(&batch_identity),
+            "testnet",
+            ordered_batch_digest,
+            generation_digest,
+        );
+        let singleton_identity =
+            submission_identity_fixture(ChainSubmissionTarget::Vote { proposal_id: 1 });
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, ?4,
+                         'recovering', 1, 'ambiguous_dispatch',
+                         'vote response was lost after dispatch', 9, 9)",
+                rusqlite::params![
+                    submission_identity_key(&singleton_identity),
+                    ROUND,
+                    W,
+                    vec![0x77_u8; 32],
+                ],
+            )
+            .unwrap();
+
+        let error = db.vote_phases(ROUND).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("overlapping authoritative singleton and batch submissions"),
+            "{error}"
         );
     }
 
@@ -2221,7 +3030,7 @@ mod tests {
 
         assert_eq!(
             db.vote_phase(ROUND, 0, 2).unwrap(),
-            VotePhase::SubmissionManaged
+            VotePhase::SubmissionRejected
         );
         assert!(plan.next_steps.is_empty());
         assert!(plan.recovered_vote_work.is_empty());
@@ -2276,7 +3085,7 @@ mod tests {
                 .is_some());
             assert_eq!(
                 db.vote_phase(ROUND, 0, proposal_id).unwrap(),
-                VotePhase::SubmissionManaged
+                VotePhase::SubmissionRejected
             );
         }
         let shares = db.get_share_delegations(ROUND).unwrap();
@@ -2291,15 +3100,15 @@ mod tests {
         let snapshot = crate::recovery::round_snapshot(&db, ROUND).unwrap();
         assert_eq!(snapshot.votes.len(), 2);
         assert!(snapshot.votes.iter().all(|vote| {
-            vote.phase == VotePhase::SubmissionManaged && vote.has_commitment_bundle
+            vote.phase == VotePhase::SubmissionRejected && vote.has_commitment_bundle
         }));
         let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
 
         assert_eq!(
             db.vote_phases(ROUND).unwrap(),
             vec![
-                (0, 1, VotePhase::SubmissionManaged),
-                (0, 2, VotePhase::SubmissionManaged),
+                (0, 1, VotePhase::SubmissionRejected),
+                (0, 2, VotePhase::SubmissionRejected),
             ]
         );
         assert!(plan.next_steps.is_empty());
@@ -2317,7 +3126,7 @@ mod tests {
 
         assert_eq!(
             db.delegation_phase(ROUND, 0).unwrap(),
-            DelegationPhase::SubmissionManaged
+            DelegationPhase::SubmissionRejected
         );
         assert!(plan.next_steps.is_empty());
         assert!(plan.recovered_delegation_work.is_empty());
@@ -2378,7 +3187,7 @@ mod tests {
 
         assert_eq!(
             plan.next_steps,
-            vec![NextStep::SubmitVoteBatch {
+            vec![NextStep::AdvanceVoteBatch {
                 bundle_index: 0,
                 proposal_id: 1,
             }]
@@ -2386,7 +3195,7 @@ mod tests {
         assert_eq!(
             plan.recovered_vote_work,
             vec![VoteRecoveryWork {
-                kind: VoteRecoveryWorkKind::SubmitVoteBatch,
+                kind: VoteRecoveryWorkKind::AdvanceVoteBatch,
                 bundle_index: 0,
                 proposal_id: 1,
                 tx_hash: None,
@@ -2554,7 +3363,7 @@ mod tests {
 
         assert_eq!(
             plan.next_steps,
-            vec![NextStep::PollVoteBatch {
+            vec![NextStep::AdvanceVoteBatch {
                 bundle_index: 0,
                 proposal_id: 1,
             }]
@@ -2562,7 +3371,7 @@ mod tests {
         assert_eq!(
             plan.recovered_vote_work,
             vec![VoteRecoveryWork {
-                kind: VoteRecoveryWorkKind::PollVoteBatch,
+                kind: VoteRecoveryWorkKind::AdvanceVoteBatch,
                 bundle_index: 0,
                 proposal_id: 1,
                 tx_hash: Some("batch-tx".to_string()),
@@ -2588,7 +3397,7 @@ mod tests {
         let committed_plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
         assert_eq!(
             committed_plan.next_steps,
-            vec![NextStep::SubmitVoteBatch {
+            vec![NextStep::AdvanceVoteBatch {
                 bundle_index: 0,
                 proposal_id: 2,
             }]
@@ -2600,7 +3409,7 @@ mod tests {
 
         assert_eq!(
             submitted_plan.next_steps,
-            vec![NextStep::PollVoteBatch {
+            vec![NextStep::AdvanceVoteBatch {
                 bundle_index: 0,
                 proposal_id: 2,
             }]
@@ -3032,13 +3841,13 @@ mod tests {
         let plan = resume_plan(&db, ROUND, &[1]).unwrap();
         assert_eq!(
             plan.next_steps,
-            vec![NextStep::PollDelegation { bundle_index: 0 }]
+            vec![NextStep::AdvanceDelegation { bundle_index: 0 }]
         );
         assert!(plan.hotkey_bound);
         assert_eq!(
             plan.recovered_delegation_work,
             vec![DelegationRecoveryWork {
-                kind: DelegationRecoveryWorkKind::PollDelegation,
+                kind: DelegationRecoveryWorkKind::AdvanceDelegation,
                 bundle_index: 0,
                 phase: DelegationPhase::Submitted,
                 tx_hash: Some("dtx".to_string()),
@@ -3065,6 +3874,7 @@ mod tests {
                 bundle_index: 0,
                 phase: DelegationPhase::Confirmed,
                 tx_hash: Some("dtx".to_string()),
+                submission_diagnostic: None,
             }]
         );
         assert!(plan.recovered_delegation_work.is_empty());
@@ -3147,7 +3957,7 @@ mod tests {
         assert_eq!(
             plan.next_steps,
             vec![
-                NextStep::SubmitVote {
+                NextStep::AdvanceVote {
                     bundle_index: 1,
                     proposal_id: 1,
                 },

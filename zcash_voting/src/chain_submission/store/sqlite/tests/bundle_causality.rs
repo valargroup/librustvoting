@@ -80,6 +80,65 @@ fn active_predecessor_blocks_the_next_bundle_generation() {
     assert_eq!(failure.kind(), ChainSubmissionFailureKind::InvalidInput);
 }
 
+#[test]
+fn hashless_submission_blocks_same_bundle_but_not_unrelated_bundles() {
+    let db = open_prepared(":memory:");
+    crate::vote::insert_recovery_fixture(&db, &recovery_for(0, 2)).unwrap();
+    crate::storage::queries::insert_bundle(&db.conn(), ROUND, "wallet", 1, &[1]).unwrap();
+    crate::vote::insert_recovery_fixture(&db, &recovery_for(1, 1)).unwrap();
+    let store = SqliteChainSubmissionStore::new(db);
+    let first = StoreAdvancementRequest::vote(identity_for(0, 1));
+    let StoreAdmission::Ready { derived, .. } = store.admit(&first, true, 1, 10).unwrap() else {
+        panic!("fresh predecessor")
+    };
+    let ambiguity = ChainSubmissionDiagnostic::from_redacted_message(
+        ChainSubmissionDiagnosticKind::AmbiguousDispatch,
+        "response unavailable",
+    );
+    store
+        .classify_post(
+            derived.generation(),
+            SubmissionObservation::PossiblyDispatched(ambiguity),
+            11,
+        )
+        .unwrap();
+    store
+        .classify_post(
+            derived.generation(),
+            SubmissionObservation::SubmittedWithoutHash(
+                ChainSubmissionDiagnostic::from_redacted_message(
+                    ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
+                    "attempts exhausted",
+                ),
+            ),
+            12,
+        )
+        .unwrap();
+
+    assert!(store
+        .admit(
+            &StoreAdvancementRequest::vote(identity_for(0, 2)),
+            true,
+            1,
+            13,
+        )
+        .is_err());
+    assert!(matches!(
+        store
+            .admit(
+                &StoreAdvancementRequest::vote(identity_for(1, 1)),
+                true,
+                1,
+                13,
+            )
+            .unwrap(),
+        StoreAdmission::Ready {
+            fresh_reservation: true,
+            ..
+        }
+    ));
+}
+
 /// A confirmed vote has already consumed the bundle's delegation output,
 /// so a later delegation reservation is refused before derivation instead
 /// of creating an unresolvable row beside the confirmed successor.
@@ -116,10 +175,7 @@ fn confirmed_vote_refuses_a_later_delegation_reservation() {
 
     let failure = store
         .admit(
-            &StoreAdvancementRequest::delegation(
-                delegation,
-                crate::delegate::DelegationSigner::signature([7; 64], [8; 32]),
-            ),
+            &StoreAdvancementRequest::delegation(delegation, [7; 64]),
             true,
             1,
             10,

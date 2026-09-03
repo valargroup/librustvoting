@@ -55,6 +55,24 @@ fn v17_schema() -> String {
     without_chain_submissions(include_str!("001_init.sql"))
 }
 
+/// The `chain_submissions` DDL exactly as shipped at version 18: no
+/// `submitted_without_hash` state and the original 15-proposal bound.
+fn v18_chain_submission_schema() -> String {
+    include_str!("002_chain_submissions.sql")
+        .replace(
+            "'recovering','submitted_without_hash','confirmed'",
+            "'recovering','confirmed'",
+        )
+        .replace(
+            "proposal_id BETWEEN 1 AND 50",
+            "proposal_id BETWEEN 1 AND 15",
+        )
+        .replace(
+            "    CHECK (state != 'submitted_without_hash'\n        OR (candidate_transaction_hash IS NULL\n            AND confirmed_transaction_hash IS NULL AND final_van_position IS NULL\n            AND vote_commitment_positions IS NULL AND diagnostic_kind IS NOT NULL)),\n",
+            "",
+        )
+}
+
 fn v15_schema() -> String {
     without_durable_ambiguous_deliveries(&v16_schema())
 }
@@ -296,7 +314,7 @@ fn migrated_v17_votes_project_domain_phases() {
 /// `NOT NULL` is what rejects the null digest: SQLite treats a NULL CHECK
 /// result as passing, so the length CHECK alone would not.
 #[test]
-fn fresh_v18_schema_requires_a_bound_generation() {
+fn fresh_current_schema_requires_a_bound_generation() {
     let mut conn = Connection::open_in_memory().unwrap();
     migrate(&mut conn).unwrap();
     queries::insert_round(
@@ -384,6 +402,123 @@ fn fresh_and_migrated_v18_schemas_accept_supported_singleton_proposals() {
         let error = insert(0x51, crate::types::MAX_PROPOSAL_ID + 1).unwrap_err();
         assert!(is_constraint_violation(&error), "{schema_kind}: {error}");
     }
+}
+
+#[test]
+fn v18_submission_rows_migrate_incrementally_to_v19() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&v17_schema()).unwrap();
+    conn.execute_batch(&v18_chain_submission_schema()).unwrap();
+    queries::insert_round(
+        &conn,
+        "wallet",
+        crate::Network::Testnet,
+        &test_params(),
+        None,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO chain_submissions
+         (identity_key, round_id, wallet_id, network, bundle_index, kind,
+          proposal_id, generation_digest, state, committed_post_reservations,
+          tracking_started_at, diagnostic_kind, diagnostic, created_at, updated_at)
+         VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 1, ?3,
+                 'recovering', 7, 8, 'ambiguous_dispatch', 'timeout', 9, 10)",
+        rusqlite::params![vec![0x41_u8; 32], ROUND, vec![0x42_u8; 32]],
+    )
+    .unwrap();
+    // The shipped v18 bound admits proposal 15 and rejects 16.
+    let insert_v18_proposal = |identity_byte: u8, proposal_id: i64| {
+        conn.execute(
+            "INSERT INTO chain_submissions
+             (identity_key, round_id, wallet_id, network, bundle_index, kind,
+              proposal_id, generation_digest, state, committed_post_reservations,
+              created_at, updated_at)
+             VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', ?3, ?4,
+                     'submitting', 1, 9, 9)",
+            rusqlite::params![
+                vec![identity_byte; 32],
+                ROUND,
+                proposal_id,
+                vec![0x42_u8; 32]
+            ],
+        )
+    };
+    insert_v18_proposal(0x43, 15).unwrap();
+    assert!(is_constraint_violation(
+        &insert_v18_proposal(0x44, 16).unwrap_err()
+    ));
+    conn.pragma_update(None, "user_version", 18).unwrap();
+
+    migrate(&mut conn).unwrap();
+    // Reopening a migrated database runs the current-schema fingerprint
+    // check against it; a migration that drifted from the fresh DDL fails here.
+    migrate(&mut conn).unwrap();
+    assert_eq!(
+        chain_submission_schema_fingerprint(&conn).unwrap(),
+        chain_submission_schema_fingerprint(&{
+            let mut fresh = Connection::open_in_memory().unwrap();
+            migrate(&mut fresh).unwrap();
+            fresh
+        })
+        .unwrap()
+    );
+
+    // The rebuild widened the bound: proposal 15 survived and 50 is accepted.
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM chain_submissions WHERE proposal_id = 15",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    conn.execute(
+        "INSERT INTO chain_submissions
+         (identity_key, round_id, wallet_id, network, bundle_index, kind,
+          proposal_id, generation_digest, state, committed_post_reservations,
+          created_at, updated_at)
+         VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 50, ?3,
+                 'submitting', 1, 9, 9)",
+        rusqlite::params![vec![0x45_u8; 32], ROUND, vec![0x42_u8; 32]],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT state, committed_post_reservations, tracking_started_at, diagnostic
+               FROM chain_submissions
+              WHERE identity_key = ?1",
+            [vec![0x41_u8; 32]],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?
+            )),
+        )
+        .unwrap(),
+        ("recovering".to_string(), 7, 8, "timeout".to_string())
+    );
+    conn.execute(
+        "UPDATE chain_submissions
+            SET state='submitted_without_hash',
+                diagnostic_kind='ambiguous_attempts_exhausted',
+                diagnostic='exhausted'
+          WHERE identity_key=?1",
+        [vec![0x41_u8; 32]],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT state, tracking_started_at FROM chain_submissions
+              WHERE identity_key = ?1",
+            [vec![0x41_u8; 32]],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap(),
+        ("submitted_without_hash".to_string(), 8)
+    );
 }
 
 fn is_constraint_violation(error: &rusqlite::Error) -> bool {
@@ -587,32 +722,34 @@ fn v17_projectionless_proved_delegation_remains_fresh_work() {
 }
 
 #[test]
-fn stale_unreleased_v18_schema_is_rejected() {
+fn stale_current_schema_is_rejected() {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE chain_submissions (state TEXT NOT NULL)")
         .unwrap();
-    conn.pragma_update(None, "user_version", 18).unwrap();
+    conn.pragma_update(None, "user_version", CURRENT_VERSION)
+        .unwrap();
 
     let error = migrate(&mut conn).unwrap_err();
     assert!(error
         .to_string()
-        .contains("unsupported unreleased version-18"));
+        .contains("unsupported chain-submission schema for version 19"));
 }
 
 #[test]
-fn v18_fingerprint_rejects_missing_columns_indexes_and_triggers() {
+fn current_fingerprint_rejects_missing_columns_indexes_and_triggers() {
     fn assert_rejected(schema: &str, tamper: Option<&str>) {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema).unwrap();
         if let Some(tamper) = tamper {
             conn.execute_batch(tamper).unwrap();
         }
-        conn.pragma_update(None, "user_version", 18).unwrap();
+        conn.pragma_update(None, "user_version", CURRENT_VERSION)
+            .unwrap();
         let error = migrate(&mut conn).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("unsupported unreleased version-18"),
+                .contains("unsupported chain-submission schema for version 19"),
             "{error}"
         );
     }
@@ -621,6 +758,11 @@ fn v18_fingerprint_rejects_missing_columns_indexes_and_triggers() {
         .replacen("    diagnostic_kind TEXT,\n", "", 1)
         .replacen(
             "    CHECK ((diagnostic_kind IS NULL) = (diagnostic IS NULL)),\n",
+            "",
+            1,
+        )
+        .replacen(
+            "    CHECK (state != 'submitted_without_hash'\n        OR (candidate_transaction_hash IS NULL\n            AND confirmed_transaction_hash IS NULL AND final_van_position IS NULL\n            AND vote_commitment_positions IS NULL AND diagnostic_kind IS NOT NULL)),\n",
             "",
             1,
         );
@@ -783,6 +925,11 @@ fn migrate_from_launch_version_matches_a_fresh_schema() {
             "clear_helper_share_plan_on_vote_generation_change"
         ),
         "migrated and fresh schemas must install the same plan lifecycle trigger"
+    );
+    assert_eq!(
+        chain_submission_schema_fingerprint(&migrated).unwrap(),
+        chain_submission_schema_fingerprint(&fresh).unwrap(),
+        "migrated and fresh chain-submission schemas must share one fingerprint"
     );
 }
 

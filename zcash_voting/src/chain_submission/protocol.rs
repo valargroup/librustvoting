@@ -29,6 +29,13 @@ const DEFAULT_CHAIN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CHAIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_CHAIN_HTTP_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CHAIN_ENDPOINTS: usize = 8;
+const NULLIFIER_ALREADY_SPENT_CODE: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChainRejectionKind {
+    NullifierAlreadySpent,
+    Other,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ChainProtocolTiming {
@@ -72,6 +79,7 @@ pub(super) enum PostAttemptOutcome {
     Accepted(CandidateTransactionHash),
     Rejected {
         code: u32,
+        kind: ChainRejectionKind,
         diagnostic: ChainSubmissionDiagnostic,
         candidate_transaction_hash: Option<CandidateTransactionHash>,
     },
@@ -277,6 +285,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
             self.timing.post_timeout,
         );
 
+        let dispatch_marker = dispatch.clone();
         let response = tokio::time::timeout(
             self.timing.post_timeout,
             self.transport
@@ -284,6 +293,14 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         )
         .await;
         match response {
+            // This deadline is enforced here, not by the transport. While the
+            // dispatch marker is clear no request bytes reached a network
+            // stack, so the attempt is definitely unsent rather than ambiguous.
+            Err(_) if !dispatch_marker.is_possible() => {
+                PostAttemptOutcome::DefinitelyUnsent(ChainTransportError::definitely_unsent(
+                    "vote-chain submission timed out before the transport released the request",
+                ))
+            }
             Err(_) => PostAttemptOutcome::PossiblyDispatched(
                 ChainSubmissionDiagnostic::from_redacted_message(
                     ChainSubmissionDiagnosticKind::AmbiguousDispatch,
@@ -415,6 +432,11 @@ fn parse_post_response(
                 };
             PostAttemptOutcome::Rejected {
                 code,
+                kind: if code == NULLIFIER_ALREADY_SPENT_CODE {
+                    ChainRejectionKind::NullifierAlreadySpent
+                } else {
+                    ChainRejectionKind::Other
+                },
                 // The response log is server-controlled and may echo proofs,
                 // signatures, or the complete request. Keep durable-safe
                 // diagnostics limited to the stable numeric result.
@@ -982,6 +1004,7 @@ mod tests {
         let outcome = client.submit_delegation(0, &delegation()).await;
         let PostAttemptOutcome::Rejected {
             code,
+            kind,
             diagnostic,
             candidate_transaction_hash,
         } = outcome
@@ -989,6 +1012,7 @@ mod tests {
             panic!("expected deterministic rejection");
         };
         assert_eq!(code, 7);
+        assert_eq!(kind, ChainRejectionKind::Other);
         assert_eq!(
             diagnostic.kind(),
             ChainSubmissionDiagnosticKind::ChainRejected
@@ -1021,6 +1045,41 @@ mod tests {
             diagnostic.message(),
             "vote chain rejected transaction with code 7"
         );
+    }
+
+    #[tokio::test]
+    async fn nullifier_spent_is_classified_only_by_numeric_code() {
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.queue(Ok(json(
+            422,
+            r#"{"code":2,"log":"an unrelated and untrusted message"}"#,
+        )));
+        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+
+        assert!(matches!(
+            client.submit_delegation(0, &delegation()).await,
+            PostAttemptOutcome::Rejected {
+                code: 2,
+                kind: ChainRejectionKind::NullifierAlreadySpent,
+                ref diagnostic,
+                ..
+            } if !diagnostic.message().contains("unrelated")
+        ));
+
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.queue(Ok(json(
+            422,
+            r#"{"code":7,"log":"nullifier already spent"}"#,
+        )));
+        let client = protocol_client(transport, Network::Testnet, &["https://vote.example"]);
+        assert!(matches!(
+            client.submit_delegation(0, &delegation()).await,
+            PostAttemptOutcome::Rejected {
+                code: 7,
+                kind: ChainRejectionKind::Other,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

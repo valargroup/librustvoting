@@ -1,6 +1,6 @@
 //! Internal transactional storage contract for the public submission lifecycle.
 
-use crate::{delegate::DelegationSigner, types::VotingError};
+use crate::types::VotingError;
 
 use super::{
     coordination::{SubmissionCoordination, SubmissionOperationKey},
@@ -22,15 +22,20 @@ mod tests;
 
 #[cfg(test)]
 use super::{
-    confirmation::validate_hash_confirmation, coordination::BundleOperationKey,
-    result::ValidatedChainSubmissionConfirmation, state::apply_submission_observation,
+    confirmation::{validate_hash_confirmation, validate_imported_delegation_confirmation},
+    coordination::BundleOperationKey,
+    result::ValidatedChainSubmissionConfirmation,
+    state::apply_submission_observation,
 };
 
 /// Inputs from which storage reconstructs a closed semantic generation.
 pub(super) enum SubmissionDerivationRequest {
     Delegation {
         identity: ChainSubmissionIdentity,
-        signer: DelegationSigner,
+        spend_auth_signature: [u8; 64],
+    },
+    ImportedDelegation {
+        identity: ChainSubmissionIdentity,
     },
     Vote {
         identity: ChainSubmissionIdentity,
@@ -44,6 +49,7 @@ impl SubmissionDerivationRequest {
     pub(super) fn identity(&self) -> &ChainSubmissionIdentity {
         match self {
             Self::Delegation { identity, .. }
+            | Self::ImportedDelegation { identity }
             | Self::Vote { identity }
             | Self::VoteBatch { identity } => identity,
         }
@@ -62,9 +68,23 @@ pub(super) struct StoreAdvancementRequest {
 }
 
 impl StoreAdvancementRequest {
-    pub(super) fn delegation(identity: ChainSubmissionIdentity, signer: DelegationSigner) -> Self {
+    pub(super) fn delegation(
+        identity: ChainSubmissionIdentity,
+        spend_auth_signature: [u8; 64],
+    ) -> Self {
         Self {
-            derivation: SubmissionDerivationRequest::Delegation { identity, signer },
+            derivation: SubmissionDerivationRequest::Delegation {
+                identity,
+                spend_auth_signature,
+            },
+            member_identities: vec![],
+            ordered_batch_proposal_ids: None,
+        }
+    }
+
+    pub(super) fn imported_delegation(identity: ChainSubmissionIdentity) -> Self {
+        Self {
+            derivation: SubmissionDerivationRequest::ImportedDelegation { identity },
             member_identities: vec![],
             ordered_batch_proposal_ids: None,
         }
@@ -158,6 +178,13 @@ impl StoreAdvancementRequest {
         )
     }
 
+    pub(super) fn is_imported_delegation(&self) -> bool {
+        matches!(
+            self.derivation,
+            SubmissionDerivationRequest::ImportedDelegation { .. }
+        )
+    }
+
     fn verify_batch_roster(
         &self,
         authoritative_ordered_proposal_ids: &[u32],
@@ -178,6 +205,9 @@ impl StoreAdvancementRequest {
             (&self.derivation, self.identity().target()),
             (
                 SubmissionDerivationRequest::Delegation { .. },
+                ChainSubmissionTarget::Delegation
+            ) | (
+                SubmissionDerivationRequest::ImportedDelegation { .. },
                 ChainSubmissionTarget::Delegation
             ) | (
                 SubmissionDerivationRequest::Vote { .. },
@@ -212,6 +242,48 @@ pub(super) struct StoredChainSubmission {
 }
 
 impl StoredChainSubmission {
+    /// Applies the bookkeeping every state transition shares, so both stores
+    /// persist identical rows for identical observations.
+    ///
+    /// The stored diagnostic mirrors the typed state wherever the state
+    /// carries one (`Recovering`, `SubmittedWithoutHash`, `Rejected`); an
+    /// explicit lookup diagnostic is retained only for states that carry
+    /// none. Entering `Tracking` from another state with no explicit
+    /// diagnostic clears the previous ambiguity: the usable hash is the later
+    /// observation that replaced it. The tracking window starts once, on the
+    /// first entry into `Tracking`, and `updated_at` never moves backwards.
+    pub(super) fn settle_after_transition(
+        &mut self,
+        previous: ChainSubmissionState,
+        explicit_diagnostic: Option<ChainSubmissionDiagnostic>,
+        now: u64,
+    ) {
+        let entered_tracking = matches!(self.state, SubmissionRecordState::Tracking { .. })
+            && previous != ChainSubmissionState::Tracking;
+        self.diagnostic = match &self.state {
+            SubmissionRecordState::Recovering {
+                ambiguity_diagnostic,
+                ..
+            }
+            | SubmissionRecordState::SubmittedWithoutHash(ambiguity_diagnostic)
+            | SubmissionRecordState::Rejected(ambiguity_diagnostic) => {
+                Some(ambiguity_diagnostic.clone())
+            }
+            _ => match explicit_diagnostic {
+                Some(diagnostic) => Some(diagnostic),
+                None if entered_tracking => None,
+                None => self.diagnostic.take(),
+            },
+        };
+        let effective_now = now.max(self.updated_at);
+        if matches!(self.state, SubmissionRecordState::Tracking { .. })
+            && self.tracking_started_at.is_none()
+        {
+            self.tracking_started_at = Some(effective_now);
+        }
+        self.updated_at = effective_now;
+    }
+
     fn fresh(
         generation: &ChainSubmissionGeneration,
         committed_post_reservations: u64,
@@ -223,6 +295,25 @@ impl StoredChainSubmission {
             state: SubmissionRecordState::Submitting,
             committed_post_reservations,
             tracking_started_at: None,
+            diagnostic: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn adopted_imported_delegation(
+        generation: &ChainSubmissionGeneration,
+        candidate_transaction_hash: super::CandidateTransactionHash,
+        now: u64,
+    ) -> Self {
+        Self {
+            identity: generation.identity().clone(),
+            generation_digest: generation.digest(),
+            state: SubmissionRecordState::Tracking {
+                candidate_transaction_hash,
+            },
+            committed_post_reservations: 0,
+            tracking_started_at: Some(now),
             diagnostic: None,
             created_at: now,
             updated_at: now,
@@ -288,6 +379,9 @@ impl StoredChainSubmission {
                     diagnostic: ambiguity_diagnostic,
                 },
             )),
+            SubmissionRecordState::SubmittedWithoutHash(diagnostic) => {
+                Ok(ChainSubmissionResult::SubmittedWithoutHash(diagnostic))
+            }
             SubmissionRecordState::Confirmed(confirmation) => {
                 Ok(ChainSubmissionResult::Confirmed(confirmation.into_public()))
             }
@@ -341,6 +435,23 @@ pub(super) trait ChainSubmissionStore: Send + Sync {
         &self,
         generation: &ChainSubmissionGeneration,
         observation: SubmissionObservation,
+        now: u64,
+    ) -> Result<StoredChainSubmission, ChainSubmissionFailure>;
+
+    /// Reserves another same-generation POST after durable dispatch ambiguity.
+    ///
+    /// Only a hashless `Recovering` row whose diagnostic came from the
+    /// possibly-dispatched path (`AmbiguousDispatch` or
+    /// `InvalidProtocolResponse`) qualifies; see
+    /// `SubmissionRecordState::permits_ambiguous_retry`. Any other row is an
+    /// invariant violation. The coordinator takes this path directly only
+    /// under status-only advancement; exact-tree advancement scans first and
+    /// reaches a POST through `reserve_recovery_retry`. The reservation count
+    /// is monotonic and is diagnostic only; invocation attempt budgets remain
+    /// coordinator-local.
+    fn reserve_ambiguous_retry(
+        &self,
+        generation: &ChainSubmissionGeneration,
         now: u64,
     ) -> Result<StoredChainSubmission, ChainSubmissionFailure>;
 
@@ -471,6 +582,7 @@ pub(super) mod memory {
         state: Mutex<MemoryState>,
         coordination: SubmissionCoordination,
         fail_confirmation: AtomicBool,
+        fail_ambiguous_retry: AtomicBool,
         batch_roster_reads: AtomicUsize,
         confirmation_validated_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         required_admission_locks: Mutex<Option<Vec<ChainSubmissionIdentity>>>,
@@ -482,6 +594,7 @@ pub(super) mod memory {
                 state: Mutex::new(MemoryState::default()),
                 coordination: SubmissionCoordination::default(),
                 fail_confirmation: AtomicBool::new(false),
+                fail_ambiguous_retry: AtomicBool::new(false),
                 batch_roster_reads: AtomicUsize::new(0),
                 confirmation_validated_hook: Mutex::new(None),
                 required_admission_locks: Mutex::new(None),
@@ -568,6 +681,10 @@ pub(super) mod memory {
             self.fail_confirmation.store(true, Ordering::SeqCst);
         }
 
+        pub(in crate::chain_submission) fn fail_next_ambiguous_retry(&self) {
+            self.fail_ambiguous_retry.store(true, Ordering::SeqCst);
+        }
+
         pub(in crate::chain_submission) fn after_next_confirmation_validation(
             &self,
             hook: impl FnOnce() + Send + 'static,
@@ -652,7 +769,8 @@ pub(super) mod memory {
                         }
                         SubmissionRecordState::Submitting
                         | SubmissionRecordState::Tracking { .. }
-                        | SubmissionRecordState::Recovering { .. } => true,
+                        | SubmissionRecordState::Recovering { .. }
+                        | SubmissionRecordState::SubmittedWithoutHash(_) => true,
                     }
             })
         }
@@ -826,7 +944,9 @@ pub(super) mod memory {
                     ensure_generation(&record, derived.generation())?;
                     if matches!(
                         record.state,
-                        SubmissionRecordState::Confirmed(_) | SubmissionRecordState::Rejected(_)
+                        SubmissionRecordState::Confirmed(_)
+                            | SubmissionRecordState::Rejected(_)
+                            | SubmissionRecordState::SubmittedWithoutHash(_)
                     ) {
                         return Ok(StoreAdmission::Authoritative(record));
                     }
@@ -852,6 +972,33 @@ pub(super) mod memory {
 
                 let derived = Self::derive(state, request.derivation())?;
                 request.verify_batch_roster(derived.ordered_proposal_ids())?;
+                if request.is_imported_delegation() {
+                    let candidate = derived.imported_candidate().ok_or_else(|| {
+                        ChainSubmissionFailure::without_state(
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            "imported delegation derivation omitted its transaction hash",
+                        )
+                    })?;
+                    if Self::candidate_owner(state, request.identity(), candidate).is_some() {
+                        return Err(ChainSubmissionFailure::without_state(
+                            ChainSubmissionFailureKind::InvalidInput,
+                            "imported delegation transaction hash belongs to another submission",
+                        ));
+                    }
+                    let record = StoredChainSubmission::adopted_imported_delegation(
+                        derived.generation(),
+                        candidate,
+                        now,
+                    );
+                    state
+                        .records
+                        .insert(request.identity().clone(), record.clone());
+                    return Ok(StoreAdmission::Ready {
+                        derived: Box::new(derived),
+                        record,
+                        fresh_reservation: false,
+                    });
+                }
                 let record = StoredChainSubmission::fresh(
                     derived.generation(),
                     reservation_ordinal,
@@ -943,22 +1090,56 @@ pub(super) mod memory {
                             "classification unexpectedly removed row",
                         )
                     })?;
-                if matches!(record.state, SubmissionRecordState::Tracking { .. })
-                    && record.tracking_started_at.is_none()
-                {
-                    record.tracking_started_at = Some(now);
+                record.settle_after_transition(previous_state, None, now);
+                state
+                    .records
+                    .insert(generation.identity().clone(), record.clone());
+                Ok(record)
+            })
+        }
+
+        fn reserve_ambiguous_retry(
+            &self,
+            generation: &ChainSubmissionGeneration,
+            now: u64,
+        ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
+            if self.fail_ambiguous_retry.swap(false, Ordering::SeqCst) {
+                return Err(ChainSubmissionFailure::without_state(
+                    ChainSubmissionFailureKind::Storage,
+                    "injected ambiguous retry reservation failure",
+                ));
+            }
+            self.transact(Some(generation.identity()), |state| {
+                let mut record = state
+                    .records
+                    .get(generation.identity())
+                    .cloned()
+                    .ok_or_else(|| {
+                        ChainSubmissionFailure::without_state(
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            "submission disappeared before ambiguous retry reservation",
+                        )
+                    })?;
+                ensure_generation(&record, generation)?;
+                if !record.state().permits_ambiguous_retry() {
+                    return Err(ChainSubmissionFailure::with_durable_state(
+                        ChainSubmissionFailureKind::InvariantViolation,
+                        record.durable_state(),
+                        "ambiguous retry requires a hashless possibly-dispatched recovery row",
+                    ));
                 }
-                record.diagnostic = match &record.state {
-                    SubmissionRecordState::Recovering {
-                        ambiguity_diagnostic,
-                        ..
-                    }
-                    | SubmissionRecordState::Rejected(ambiguity_diagnostic) => {
-                        Some(ambiguity_diagnostic.clone())
-                    }
-                    _ => record.diagnostic,
-                };
-                record.updated_at = now;
+                record.committed_post_reservations = record
+                    .committed_post_reservations
+                    .checked_add(1)
+                    .filter(|count| *count <= i64::MAX as u64)
+                    .ok_or_else(|| {
+                        ChainSubmissionFailure::with_durable_state(
+                            ChainSubmissionFailureKind::InvariantViolation,
+                            ChainSubmissionState::Recovering,
+                            "submission reservation counter overflowed",
+                        )
+                    })?;
+                record.updated_at = now.max(record.updated_at);
                 state
                     .records
                     .insert(generation.identity().clone(), record.clone());
@@ -989,10 +1170,7 @@ pub(super) mod memory {
                 record.state = apply_submission_observation(Some(record.state), observation)
                     .map_err(|error| transition_failure(previous_state, error))?
                     .expect("reconciliation cannot remove a row");
-                if let Some(diagnostic) = diagnostic {
-                    record.diagnostic = Some(diagnostic);
-                }
-                record.updated_at = now;
+                record.settle_after_transition(previous_state, diagnostic, now);
                 state
                     .records
                     .insert(generation.identity().clone(), record.clone());
@@ -1046,16 +1224,22 @@ pub(super) mod memory {
                 if !commit_allowed() {
                     return Ok(ConfirmationCommit::Interrupted(record));
                 }
-                let confirmation =
-                    validate_hash_confirmation(&derived, candidate, &committed.events).map_err(
-                        |error| {
-                            ChainSubmissionFailure::with_durable_state(
-                                ChainSubmissionFailureKind::Protocol,
-                                record.durable_state(),
-                                error.to_string(),
-                            )
-                        },
-                    )?;
+                let confirmation = if request.is_imported_delegation() {
+                    validate_imported_delegation_confirmation(
+                        derived.bound(),
+                        candidate,
+                        &committed.events,
+                    )
+                } else {
+                    validate_hash_confirmation(&derived, candidate, &committed.events)
+                }
+                .map_err(|error| {
+                    ChainSubmissionFailure::with_durable_state(
+                        ChainSubmissionFailureKind::Protocol,
+                        record.durable_state(),
+                        error.to_string(),
+                    )
+                })?;
                 if let Some(hook) = self.confirmation_validated_hook.lock().unwrap().take() {
                     hook();
                 }

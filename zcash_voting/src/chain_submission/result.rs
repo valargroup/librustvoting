@@ -10,10 +10,32 @@ pub const MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES: usize = 512;
 /// The durable lifecycle states stored for lifecycle-owned submissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChainSubmissionState {
+    /// A POST reservation exists and dispatch has not yet been classified.
     Submitting,
+    /// A returned transaction hash is being polled within the finite
+    /// tracking window.
     Tracking,
+    /// Dispatch could not be excluded and no usable hash is being tracked, or
+    /// tracking ended inconclusively; further bounded retries, polling, or
+    /// exact-tree recovery may still resolve the submission.
     Recovering,
+    /// Terminal: the vote chain rejected a retry with "nullifier already
+    /// spent" after this generation was possibly dispatched, which proves an
+    /// earlier dispatch landed, but no transaction hash and no confirmation
+    /// positions are available. Under exact-tree advancement one complete
+    /// tree pass found no layout before this state was written.
+    ///
+    /// This is not a confirmation. The lifecycle performs no further retry,
+    /// polling, or tree recovery for the generation, and dependent work (such
+    /// as the next bundle generation) stays blocked exactly as it would behind
+    /// an unresolved submission. Exhausting an invocation's POST budget never
+    /// produces this state; that leaves the row `Recovering`. Hosts surface the
+    /// stored diagnostic to the user rather than scheduling another pass.
+    SubmittedWithoutHash,
+    /// Terminal: the transaction committed successfully and its positions are
+    /// recorded.
     Confirmed,
+    /// Terminal: the chain definitively rejected the submission.
     Rejected,
 }
 
@@ -21,11 +43,45 @@ pub enum ChainSubmissionState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChainSubmissionDiagnosticKind {
     AmbiguousDispatch,
+    AmbiguousAttemptsExhausted,
+    NullifierAlreadySpent,
     TrackingWindowExpired,
     ChainRejected,
     ReconciliationPending,
     InvalidProtocolResponse,
     StorageFailure,
+}
+
+impl ChainSubmissionDiagnosticKind {
+    /// Returns the stable string discriminator used by durable storage and
+    /// FFI views.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AmbiguousDispatch => "ambiguous_dispatch",
+            Self::AmbiguousAttemptsExhausted => "ambiguous_attempts_exhausted",
+            Self::NullifierAlreadySpent => "nullifier_already_spent",
+            Self::TrackingWindowExpired => "tracking_window_expired",
+            Self::ChainRejected => "chain_rejected",
+            Self::ReconciliationPending => "reconciliation_pending",
+            Self::InvalidProtocolResponse => "invalid_protocol_response",
+            Self::StorageFailure => "storage_failure",
+        }
+    }
+
+    /// Parses the discriminator written by [`Self::as_str`].
+    pub(crate) fn from_stable_name(value: &str) -> Option<Self> {
+        match value {
+            "ambiguous_dispatch" => Some(Self::AmbiguousDispatch),
+            "ambiguous_attempts_exhausted" => Some(Self::AmbiguousAttemptsExhausted),
+            "nullifier_already_spent" => Some(Self::NullifierAlreadySpent),
+            "tracking_window_expired" => Some(Self::TrackingWindowExpired),
+            "chain_rejected" => Some(Self::ChainRejected),
+            "reconciliation_pending" => Some(Self::ReconciliationPending),
+            "invalid_protocol_response" => Some(Self::InvalidProtocolResponse),
+            "storage_failure" => Some(Self::StorageFailure),
+            _ => None,
+        }
+    }
 }
 
 /// A bounded UTF-8 diagnostic that is safe for durable storage.
@@ -209,6 +265,9 @@ pub enum ChainSubmissionPending {
 pub enum ChainSubmissionResult {
     Confirmed(ChainSubmissionConfirmation),
     Pending(ChainSubmissionPending),
+    /// POST dispatch is durably treated as submitted, but no hash or
+    /// confirmation positions are available.
+    SubmittedWithoutHash(ChainSubmissionDiagnostic),
     Rejected(ChainSubmissionDiagnostic),
     Cancelled,
 }
@@ -228,6 +287,7 @@ impl ChainSubmissionResult {
             Self::Pending(ChainSubmissionPending::Recovering { .. }) => {
                 Some(ChainSubmissionState::Recovering)
             }
+            Self::SubmittedWithoutHash(_) => Some(ChainSubmissionState::SubmittedWithoutHash),
             Self::Rejected(_) => Some(ChainSubmissionState::Rejected),
             Self::Cancelled => None,
         }
@@ -450,6 +510,10 @@ mod tests {
                     diagnostic: diagnostic.clone(),
                 }),
                 Some(ChainSubmissionState::Recovering),
+            ),
+            (
+                ChainSubmissionResult::SubmittedWithoutHash(diagnostic.clone()),
+                Some(ChainSubmissionState::SubmittedWithoutHash),
             ),
             (
                 ChainSubmissionResult::Rejected(diagnostic),

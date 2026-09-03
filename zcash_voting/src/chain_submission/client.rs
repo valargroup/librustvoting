@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{delegate::DelegationSigner, storage::VotingDb, HyperTransport, Network};
+use crate::{storage::VotingDb, HyperTransport, Network};
 
 use super::{
     coordinator::{
@@ -53,9 +53,10 @@ pub struct ChainSubmissionClientConfig {
     pub tracking_window: Duration,
     /// Maximum POST attempts made by one advancement call.
     ///
-    /// This must be between one and eight and must not exceed the number of
-    /// distinct configured endpoints. Historical durable attempt count does
-    /// not reduce a later call's independent bounded budget.
+    /// This must be between one and eight. Attempts cycle through the ordered
+    /// endpoints when the budget exceeds the number of distinct endpoints.
+    /// Historical durable attempt count does not reduce a later call's
+    /// independent bounded budget.
     pub maximum_post_attempts: usize,
     /// Delays between consecutive POST attempts in one advancement call.
     ///
@@ -130,14 +131,57 @@ impl SubmissionControl for ChainSubmissionControl {
     }
 }
 
-/// Inputs that identify and sign one prepared delegation generation.
+/// Inputs that identify and authorize one prepared delegation generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdvanceDelegation {
     /// Canonical 32-byte round identifier used by the prepared bundle.
     pub vote_round_id: [u8; 32],
     /// Durable bundle containing the prepared delegation inputs.
     pub bundle_index: u32,
-    /// Signer for the delegation reconstructed from the locked durable inputs.
-    pub signer: DelegationSigner,
+    /// SpendAuth signature verified against the locked durable setup.
+    ///
+    /// The SDK loads the authoritative PCZT sighash and randomized verification
+    /// key from its database. Callers must not reconstruct that signing context.
+    pub spend_auth_signature: [u8; 64],
+}
+
+impl AdvanceDelegation {
+    /// Builds a delegation advancement request from external signature bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainSubmissionFailureKind::InvalidInput`] unless
+    /// `spend_auth_signature` is exactly 64 bytes.
+    pub fn from_signature_bytes(
+        vote_round_id: [u8; 32],
+        bundle_index: u32,
+        spend_auth_signature: &[u8],
+    ) -> Result<Self, ChainSubmissionFailure> {
+        let spend_auth_signature = spend_auth_signature.try_into().map_err(|_| {
+            ChainSubmissionFailure::without_state(
+                ChainSubmissionFailureKind::InvalidInput,
+                format!(
+                    "delegation SpendAuth signature must be 64 bytes, got {}",
+                    spend_auth_signature.len()
+                ),
+            )
+        })?;
+        Ok(Self {
+            vote_round_id,
+            bundle_index,
+            spend_auth_signature,
+        })
+    }
+}
+
+/// Identifies an already-broadcast delegation imported from a capability
+/// package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdvanceImportedDelegation {
+    /// Canonical 32-byte round identifier bound by the imported package.
+    pub vote_round_id: [u8; 32],
+    /// Imported bundle whose stored package hash should be polled.
+    pub bundle_index: u32,
 }
 
 /// Inputs that identify one prepared singleton vote generation.
@@ -251,6 +295,13 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// A non-cancelled result represents the authoritative durable outcome
     /// reported by [`ChainSubmissionResult::durable_state`].
     ///
+    /// This status-only entry point never scans the tree. It may re-POST a
+    /// hashless `Recovering` generation whose diagnostic records dispatch
+    /// ambiguity, but it cannot confirm a generation that already landed
+    /// without a usable hash. Execute a local `NextStep::AdvanceDelegation`
+    /// through [`Self::advance_delegation_with_recovery`] with
+    /// [`ChainRecoveryMode::ExactTree`], which scans before any POST.
+    ///
     /// # Errors
     ///
     /// Returns a failure for invalid identity or prepared state, invariant or
@@ -269,7 +320,41 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         )?;
         self.coordinator
             .advance(
-                StoreAdvancementRequest::delegation(identity, request.signer),
+                StoreAdvancementRequest::delegation(identity, request.spend_auth_signature),
+                control,
+            )
+            .await
+    }
+
+    /// Adopts and advances one already-broadcast capability delegation.
+    ///
+    /// The first active pass validates the structurally imported bundle and
+    /// atomically adopts its stored package hash as a poll-only lifecycle
+    /// generation. The voter never supplies a signer, transaction hash, request
+    /// body, or chain events, and this path never dispatches or retries a POST.
+    /// Re-invoke while the result is pending; confirmation atomically records
+    /// the imported bundle's VAN position.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure when the identity does not name an imported capability
+    /// bundle, its stored hash or generation conflicts, status transport or
+    /// protocol validation fails, or durable adoption/confirmation cannot
+    /// commit. Any adopted state remains available through
+    /// [`ChainSubmissionFailure::strongest_state`].
+    pub async fn advance_imported_delegation(
+        &self,
+        request: AdvanceImportedDelegation,
+        control: &ChainSubmissionControl,
+    ) -> Result<ChainSubmissionResult, ChainSubmissionFailure> {
+        let identity = self.identity(
+            request.vote_round_id,
+            request.bundle_index,
+            ChainSubmissionTarget::Delegation,
+        )?;
+        self.coordinator
+            .advance(
+                StoreAdvancementRequest::imported_delegation(identity),
                 control,
             )
             .await
@@ -282,6 +367,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// after candidate-first reconciliation is inconclusive, scan one fixed
     /// complete tree snapshot and atomically confirm an exact unique layout or
     /// authorize one same-generation retry within this call's attempt budget.
+    /// Use that mode when executing a local `NextStep::AdvanceDelegation`.
     ///
     /// # Errors
     ///
@@ -302,7 +388,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
         )?;
         self.coordinator
             .advance_with_recovery(
-                StoreAdvancementRequest::delegation(identity, request.signer),
+                StoreAdvancementRequest::delegation(identity, request.spend_auth_signature),
                 recovery,
                 control,
             )
@@ -316,6 +402,13 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// recovery, domain, and helper projections. It does not scan the
     /// commitment tree. A non-cancelled result represents the authoritative
     /// durable outcome reported by [`ChainSubmissionResult::durable_state`].
+    ///
+    /// This status-only entry point never scans the tree. It may re-POST a
+    /// hashless `Recovering` generation whose diagnostic records dispatch
+    /// ambiguity, but it cannot confirm a generation that already landed
+    /// without a usable hash. Execute `NextStep::AdvanceVote` through
+    /// [`Self::advance_vote_with_recovery`] with
+    /// [`ChainRecoveryMode::ExactTree`], which scans before any POST.
     ///
     /// # Errors
     ///
@@ -347,6 +440,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// candidate-first reconciliation is inconclusive, scan one fixed complete
     /// tree snapshot and atomically confirm an exact unique layout or authorize
     /// one same-generation retry within this call's attempt budget.
+    /// Use that mode when executing `NextStep::AdvanceVote`.
     ///
     /// # Errors
     ///
@@ -382,6 +476,13 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// the authoritative durable outcome reported by
     /// [`ChainSubmissionResult::durable_state`].
     ///
+    /// This status-only entry point never scans the tree. It may re-POST a
+    /// hashless `Recovering` generation whose diagnostic records dispatch
+    /// ambiguity, but it cannot confirm a generation that already landed
+    /// without a usable hash. Execute `NextStep::AdvanceVoteBatch` through
+    /// [`Self::advance_vote_batch_with_recovery`] with
+    /// [`ChainRecoveryMode::ExactTree`], which scans before any POST.
+    ///
     /// # Errors
     ///
     /// Returns a failure for invalid identity, roster, digest, or prepared
@@ -408,6 +509,7 @@ impl<T: ChainTransport> ChainSubmissionClient<T> {
     /// tree snapshot and atomically confirm only the unique exact ordered batch
     /// layout or authorize one same-generation retry within this call's attempt
     /// budget.
+    /// Use `ExactTree` when executing `NextStep::AdvanceVoteBatch`.
     ///
     /// # Errors
     ///

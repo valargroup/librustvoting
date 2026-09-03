@@ -385,6 +385,7 @@ fn validate_witnesses_for_round(
 /// SQLite's writer reservation. Lifecycle admission uses the same transaction
 /// behavior, so no native authority can appear between this check and the
 /// caller's projection write.
+#[cfg(test)]
 pub(crate) fn reject_legacy_chain_mutation_in_tx(
     tx: &rusqlite::Transaction<'_>,
     wallet_id: &str,
@@ -1604,10 +1605,11 @@ impl VotingDb {
     }
 
     /// Store the VAN leaf position after delegation TX is confirmed on chain.
-    /// The app calls this after parsing the delegation TX response events.
-    /// Cast-vote callers should use `confirmation::confirm_vote_submission` so
-    /// all confirmation fields are stored atomically.
-    pub fn store_van_position(
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(test)]
+    pub(crate) fn store_van_position(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -1786,7 +1788,11 @@ impl VotingDb {
 
     // --- Recovery state ---
 
-    pub fn store_delegation_tx_hash(
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(test)]
+    pub(crate) fn store_delegation_tx_hash(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -1831,7 +1837,11 @@ impl VotingDb {
     ///
     /// Atomic batch members must use `vote::record_batch_submission` so every
     /// action advances together.
-    pub fn record_vote_submission(
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(test)]
+    pub(crate) fn record_vote_submission(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -1867,7 +1877,11 @@ impl VotingDb {
     }
 
     /// Atomically records a delegation transaction hash with idempotency checks.
-    pub fn mark_delegation_submitted(
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(test)]
+    pub(crate) fn mark_delegation_submitted(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -1893,7 +1907,11 @@ impl VotingDb {
     ///
     /// Atomic batch members must use `vote::record_batch_submission` so every
     /// action advances together.
-    pub fn mark_vote_submitted(
+    /// Test-only durable writer. Production callers reach chain state
+    /// through the `chain_submission` lifecycle, which is the only
+    /// authority for submission and confirmation.
+    #[cfg(test)]
+    pub(crate) fn mark_vote_submitted(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -2663,6 +2681,7 @@ impl VotingDb {
 }
 
 /// Accepts missing or matching text fields and rejects conflicting values.
+#[cfg(test)]
 fn check_text_conflict(
     existing: Option<&str>,
     requested: &str,
@@ -6415,11 +6434,12 @@ mod tests {
         assert_eq!(request.sighash, setup.pczt_sighash);
 
         let signature = sign_delegation_request(&sender_seed, &request);
-        let submission = crate::delegate::submission(
-            &db,
+        let submission = crate::delegate::submission_with_conn(
+            &db.conn(),
+            &db.wallet_id(),
             ROUND_ID,
             0,
-            crate::delegate::DelegationSigner::signature(signature, request.sighash),
+            signature,
         )
         .unwrap();
 

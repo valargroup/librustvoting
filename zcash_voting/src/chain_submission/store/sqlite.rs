@@ -12,9 +12,15 @@ use super::{
     StoreAdvancementRequest, StoredChainSubmission, SubmissionDerivationRequest,
 };
 use crate::chain_submission::{
-    confirmation::{apply_confirmed_generation, validate_hash_confirmation},
+    confirmation::{
+        apply_confirmed_generation, validate_hash_confirmation,
+        validate_imported_delegation_confirmation,
+    },
     coordination::SubmissionCoordination,
-    generation::{derive_delegation, derive_vote, derive_vote_batch, DerivedChainSubmission},
+    generation::{
+        derive_delegation, derive_imported_delegation, derive_vote, derive_vote_batch,
+        DerivedChainSubmission,
+    },
     identity::{network_name, submission_identity_key},
     result::ValidatedChainSubmissionConfirmation,
     state::{apply_submission_observation, SubmissionObservation, SubmissionRecordState},
@@ -63,16 +69,12 @@ fn derive(
     request: &SubmissionDerivationRequest,
 ) -> Result<DerivedChainSubmission, ChainSubmissionFailure> {
     match request {
-        SubmissionDerivationRequest::Delegation { identity, signer } => {
-            let signer = match signer {
-                crate::delegate::DelegationSigner::Signature { sig, sighash } => {
-                    crate::delegate::DelegationSigner::Signature {
-                        sig: *sig,
-                        sighash: *sighash,
-                    }
-                }
-            };
-            derive_delegation(tx, identity, signer)
+        SubmissionDerivationRequest::Delegation {
+            identity,
+            spend_auth_signature,
+        } => derive_delegation(tx, identity, *spend_auth_signature),
+        SubmissionDerivationRequest::ImportedDelegation { identity } => {
+            derive_imported_delegation(tx, identity)
         }
         SubmissionDerivationRequest::Vote { identity } => derive_vote(tx, identity),
         SubmissionDerivationRequest::VoteBatch { identity } => derive_vote_batch(tx, identity),
@@ -148,6 +150,9 @@ fn load_one<P: rusqlite::Params>(
                 candidate_transaction_hash: candidate,
                 ambiguity_diagnostic: diagnostic.clone().ok_or(rusqlite::Error::InvalidQuery)?,
             },
+            "submitted_without_hash" => SubmissionRecordState::SubmittedWithoutHash(
+                diagnostic.clone().ok_or(rusqlite::Error::InvalidQuery)?,
+            ),
             "confirmed" => {
                 let (source, final_van, positions, hash) =
                     confirmation.ok_or(rusqlite::Error::InvalidQuery)?;
@@ -218,26 +223,7 @@ fn encode_positions(positions: &[u64]) -> Vec<u8> {
 }
 
 fn parse_diagnostic_kind(value: &str) -> rusqlite::Result<ChainSubmissionDiagnosticKind> {
-    match value {
-        "ambiguous_dispatch" => Ok(ChainSubmissionDiagnosticKind::AmbiguousDispatch),
-        "tracking_window_expired" => Ok(ChainSubmissionDiagnosticKind::TrackingWindowExpired),
-        "chain_rejected" => Ok(ChainSubmissionDiagnosticKind::ChainRejected),
-        "reconciliation_pending" => Ok(ChainSubmissionDiagnosticKind::ReconciliationPending),
-        "invalid_protocol_response" => Ok(ChainSubmissionDiagnosticKind::InvalidProtocolResponse),
-        "storage_failure" => Ok(ChainSubmissionDiagnosticKind::StorageFailure),
-        _ => Err(rusqlite::Error::InvalidQuery),
-    }
-}
-
-fn diagnostic_name(value: ChainSubmissionDiagnosticKind) -> &'static str {
-    match value {
-        ChainSubmissionDiagnosticKind::AmbiguousDispatch => "ambiguous_dispatch",
-        ChainSubmissionDiagnosticKind::TrackingWindowExpired => "tracking_window_expired",
-        ChainSubmissionDiagnosticKind::ChainRejected => "chain_rejected",
-        ChainSubmissionDiagnosticKind::ReconciliationPending => "reconciliation_pending",
-        ChainSubmissionDiagnosticKind::InvalidProtocolResponse => "invalid_protocol_response",
-        ChainSubmissionDiagnosticKind::StorageFailure => "storage_failure",
-    }
+    ChainSubmissionDiagnosticKind::from_stable_name(value).ok_or(rusqlite::Error::InvalidQuery)
 }
 
 fn insert_fresh(
@@ -272,6 +258,34 @@ fn insert_fresh(
     Ok(())
 }
 
+fn insert_imported_delegation(
+    tx: &Transaction<'_>,
+    record: &StoredChainSubmission,
+    candidate_transaction_hash: CandidateTransactionHash,
+) -> Result<(), ChainSubmissionFailure> {
+    let identity = record.identity();
+    tx.execute(
+        "INSERT INTO chain_submissions
+         (identity_key, round_id, wallet_id, network, bundle_index, kind,
+          generation_digest, state, candidate_transaction_hash,
+          committed_post_reservations, tracking_started_at, created_at, updated_at)
+         VALUES (:key, :round, :wallet, :network, :bundle, 'delegation',
+                 :digest, 'tracking', :candidate, 0, :created, :created, :created)",
+        named_params! {
+            ":key": submission_identity_key(identity),
+            ":round": hex::encode(identity.vote_round_id()),
+            ":wallet": identity.wallet_id(),
+            ":network": network_name(identity.network()),
+            ":bundle": identity.bundle_index(),
+            ":digest": record.generation_digest().as_bytes(),
+            ":candidate": candidate_transaction_hash.as_bytes(),
+            ":created": record.created_at(),
+        },
+    )
+    .map_err(storage_error)?;
+    Ok(())
+}
+
 fn persist_mutable(
     tx: &Transaction<'_>,
     record: &StoredChainSubmission,
@@ -295,6 +309,9 @@ fn persist_mutable(
             Some(ambiguity_diagnostic),
             None,
         ),
+        SubmissionRecordState::SubmittedWithoutHash(diagnostic) => {
+            ("submitted_without_hash", None, Some(diagnostic), None)
+        }
         SubmissionRecordState::Confirmed(value) => (
             "confirmed",
             value.confirmation().transaction_hash(),
@@ -326,7 +343,7 @@ fn persist_mutable(
         named_params! {
             ":state": state, ":candidate": candidate.map(|v| v.as_bytes().to_vec()),
             ":attempts": record.committed_post_reservations(), ":tracking": record.tracking_started_at(),
-            ":diagnostic_kind": diagnostic.map(|v| diagnostic_name(v.kind())),
+            ":diagnostic_kind": diagnostic.map(|v| v.kind().as_str()),
             ":diagnostic": diagnostic.map(ChainSubmissionDiagnostic::message),
             ":source": source, ":confirmed_hash": confirmed_hash.map(|v| v.as_bytes().to_vec()),
             ":final_van": final_van, ":positions": positions, ":updated": record.updated_at(),
@@ -423,7 +440,12 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                 };
                 request.verify_batch_roster(derived.ordered_proposal_ids()).map_err(|error| preserve_loaded_state(error, Some(&record)))?;
                 ensure_generation(&record, derived.generation())?;
-                if matches!(record.state(), SubmissionRecordState::Confirmed(_) | SubmissionRecordState::Rejected(_)) {
+                if matches!(
+                    record.state(),
+                    SubmissionRecordState::Confirmed(_)
+                        | SubmissionRecordState::Rejected(_)
+                        | SubmissionRecordState::SubmittedWithoutHash(_)
+                ) {
                     return Ok(StoreAdmission::Authoritative(record));
                 }
                 return Ok(StoreAdmission::Ready { derived: Box::new(derived), record, fresh_reservation: false });
@@ -431,7 +453,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
             let predecessor: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM chain_submissions WHERE wallet_id=:wallet AND network=:network
                   AND round_id=:round AND bundle_index=:bundle
-                  AND state IN ('submitting','tracking','recovering')) ",
+                  AND state IN ('submitting','tracking','recovering','submitted_without_hash')) ",
                 named_params! { ":wallet": request.identity().wallet_id(), ":network": network_name(request.identity().network()),
                     ":round": hex::encode(request.identity().vote_round_id()), ":bundle": request.identity().bundle_index() },
                 |row| row.get(0),
@@ -450,6 +472,41 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
                     |row| row.get(0),
                 ).map_err(storage_error)?;
                 if superseded { return Err(ChainSubmissionFailure::without_state(ChainSubmissionFailureKind::InvalidInput, "a confirmed vote already succeeds this bundle's delegation")); }
+            }
+            if request.is_imported_delegation() {
+                let derived = derive(tx, request.derivation())?;
+                let candidate = derived.imported_candidate().ok_or_else(|| {
+                    ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvariantViolation,
+                        "imported delegation derivation omitted its transaction hash",
+                    )
+                })?;
+                let owned_elsewhere: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM chain_submissions
+                          WHERE candidate_transaction_hash = :candidate
+                             OR confirmed_transaction_hash = :candidate)",
+                        named_params! { ":candidate": candidate.as_bytes() },
+                        |row| row.get(0),
+                    )
+                    .map_err(storage_error)?;
+                if owned_elsewhere {
+                    return Err(ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvalidInput,
+                        "imported delegation transaction hash belongs to another submission",
+                    ));
+                }
+                let record = StoredChainSubmission::adopted_imported_delegation(
+                    derived.generation(),
+                    candidate,
+                    now,
+                );
+                insert_imported_delegation(tx, &record, candidate)?;
+                return Ok(StoreAdmission::Ready {
+                    derived: Box::new(derived),
+                    record,
+                    fresh_reservation: false,
+                });
             }
             let derived = match batch_derived {
                 Some(derived) => derived,
@@ -507,6 +564,43 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
         self.apply_observation(generation, observation, None, now)
     }
 
+    fn reserve_ambiguous_retry(
+        &self,
+        generation: &ChainSubmissionGeneration,
+        now: u64,
+    ) -> Result<StoredChainSubmission, ChainSubmissionFailure> {
+        self.transact(|tx| {
+            let mut record = load_submission(tx, generation.identity())?.ok_or_else(|| {
+                ChainSubmissionFailure::without_state(
+                    ChainSubmissionFailureKind::InvariantViolation,
+                    "submission disappeared before ambiguous retry reservation",
+                )
+            })?;
+            ensure_generation(&record, generation)?;
+            if !record.state().permits_ambiguous_retry() {
+                return Err(ChainSubmissionFailure::with_durable_state(
+                    ChainSubmissionFailureKind::InvariantViolation,
+                    record.durable_state(),
+                    "ambiguous retry requires a hashless possibly-dispatched recovery row",
+                ));
+            }
+            record.committed_post_reservations = record
+                .committed_post_reservations
+                .checked_add(1)
+                .filter(|count| *count <= i64::MAX as u64)
+                .ok_or_else(|| {
+                    ChainSubmissionFailure::with_durable_state(
+                        ChainSubmissionFailureKind::InvariantViolation,
+                        ChainSubmissionState::Recovering,
+                        "submission reservation counter overflowed",
+                    )
+                })?;
+            record.updated_at = now.max(record.updated_at);
+            persist_mutable(tx, &record)?;
+            Ok(record)
+        })
+    }
+
     fn reconcile(
         &self,
         generation: &ChainSubmissionGeneration,
@@ -547,8 +641,16 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
             if !commit_allowed() {
                 return Ok(ConfirmationCommit::Interrupted(record));
             }
-            let confirmation = validate_hash_confirmation(&derived, candidate, &committed.events)
-                .map_err(|error| {
+            let confirmation = if request.is_imported_delegation() {
+                validate_imported_delegation_confirmation(
+                    derived.bound(),
+                    candidate,
+                    &committed.events,
+                )
+            } else {
+                validate_hash_confirmation(&derived, candidate, &committed.events)
+            }
+            .map_err(|error| {
                 ChainSubmissionFailure::with_durable_state(
                     ChainSubmissionFailureKind::Protocol,
                     record.durable_state(),
@@ -564,7 +666,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
             .unwrap();
             record.diagnostic = None;
             record.updated_at = now.max(record.updated_at);
-            apply_confirmed_generation(tx, &derived, &confirmation)
+            apply_confirmed_generation(tx, derived.bound(), &confirmation)
                 .map_err(map_generation_error)?;
             persist_mutable(tx, &record)?;
             Ok(ConfirmationCommit::Confirmed(record))
@@ -625,7 +727,7 @@ impl ChainSubmissionStore for SqliteChainSubmissionStore {
             .expect("tree confirmation remains durable");
             record.diagnostic = None;
             record.updated_at = now.max(record.updated_at);
-            apply_confirmed_generation(tx, &derived, &confirmation)
+            apply_confirmed_generation(tx, derived.bound(), &confirmation)
                 .map_err(map_generation_error)?;
             persist_mutable(tx, &record)?;
             Ok(ConfirmationCommit::Confirmed(record))
@@ -753,26 +855,7 @@ impl SqliteChainSubmissionStore {
                 .ok_or_else(|| {
                     transition_failure(previous, "transition unexpectedly removed durable row")
                 })?;
-            if let Some(value) = diagnostic {
-                record.diagnostic = Some(value);
-            }
-            record.diagnostic = match &record.state {
-                SubmissionRecordState::Recovering {
-                    ambiguity_diagnostic,
-                    ..
-                }
-                | SubmissionRecordState::Rejected(ambiguity_diagnostic) => {
-                    Some(ambiguity_diagnostic.clone())
-                }
-                _ => record.diagnostic,
-            };
-            let effective_now = now.max(record.updated_at);
-            if matches!(record.state(), SubmissionRecordState::Tracking { .. })
-                && record.tracking_started_at.is_none()
-            {
-                record.tracking_started_at = Some(effective_now);
-            }
-            record.updated_at = effective_now;
+            record.settle_after_transition(previous, diagnostic, now);
             persist_mutable(tx, &record)?;
             Ok(record)
         })

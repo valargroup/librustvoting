@@ -9,12 +9,26 @@ use std::collections::BTreeMap;
 
 use rusqlite::{named_params, Connection};
 
-use super::{authoritative_submission_phase, VotePhase};
+use super::{authoritative_submission_phase, stored_submission_diagnostic, VotePhase};
 use crate::{
-    chain_submission::{generation_for_vote_batch, ChainSubmissionIdentity, ChainSubmissionTarget},
+    chain_submission::{
+        generation_for_vote_batch, ChainSubmissionDiagnostic, ChainSubmissionIdentity,
+        ChainSubmissionTarget,
+    },
     storage::queries,
     types::VotingError,
 };
+
+/// Phase and stored diagnostic an authoritative batch row projects onto one
+/// of its member votes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AuthoritativeBatchMember {
+    pub(super) phase: VotePhase,
+    pub(super) diagnostic: Option<ChainSubmissionDiagnostic>,
+    /// Digest of the batch row that owns this member, so callers can read
+    /// that row's hash: members own no lifecycle row of their own.
+    pub(super) ordered_batch_digest: [u8; 32],
+}
 
 /// Loads every member phase claimed by an authoritative batch row.
 ///
@@ -28,11 +42,12 @@ pub(super) fn load_authoritative_batch_phases(
     wallet_id: &str,
     round_id: &str,
     bundle_index: Option<u32>,
-) -> Result<BTreeMap<(u32, u32), VotePhase>, VotingError> {
+) -> Result<BTreeMap<(u32, u32), AuthoritativeBatchMember>, VotingError> {
     let batch_rows = {
         let mut statement = conn
             .prepare(
-                "SELECT bundle_index, ordered_batch_digest, generation_digest, state
+                "SELECT bundle_index, ordered_batch_digest, generation_digest, state,
+                        diagnostic_kind, diagnostic
                    FROM chain_submissions
                   WHERE round_id=:round_id AND wallet_id=:wallet_id
                     AND kind='vote_batch'
@@ -54,6 +69,8 @@ pub(super) fn load_authoritative_batch_phases(
                         row.get::<_, Vec<u8>>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
@@ -79,7 +96,15 @@ pub(super) fn load_authoritative_batch_phases(
     let network = queries::load_round_network(conn, round_id, wallet_id)?;
     let mut phases_by_member = BTreeMap::new();
 
-    for (stored_bundle_index, ordered_digest, generation_digest, state) in batch_rows {
+    for (
+        stored_bundle_index,
+        ordered_digest,
+        generation_digest,
+        state,
+        diagnostic_kind,
+        diagnostic,
+    ) in batch_rows
+    {
         let Some(phase) = authoritative_submission_phase(Some(&state)) else {
             continue;
         };
@@ -98,6 +123,11 @@ pub(super) fn load_authoritative_batch_phases(
                         digest.len()
                     ),
                 })?;
+        let member = AuthoritativeBatchMember {
+            phase,
+            diagnostic: stored_submission_diagnostic(diagnostic_kind, diagnostic)?,
+            ordered_batch_digest,
+        };
         let identity = ChainSubmissionIdentity::new(
             wallet_id,
             network,
@@ -121,7 +151,7 @@ pub(super) fn load_authoritative_batch_phases(
         }
         for &member_proposal_id in bound_generation.ordered_proposal_ids() {
             if phases_by_member
-                .insert((stored_bundle_index, member_proposal_id), phase)
+                .insert((stored_bundle_index, member_proposal_id), member.clone())
                 .is_some()
             {
                 return Err(VotingError::Internal {

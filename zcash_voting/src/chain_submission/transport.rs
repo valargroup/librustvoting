@@ -243,6 +243,12 @@ pub trait ChainTransport: Send + Sync {
     /// dispatch as soon as their POST future is polled. Implementations that
     /// own a more precise handoff point should override this method and mark it
     /// immediately before releasing the request to their network stack.
+    ///
+    /// The marker must be set from within the returned future's own poll, not
+    /// from a detached task: the SDK enforces its POST deadline around this
+    /// future and reads the marker after dropping it, classifying a timeout
+    /// with a clear marker as definitely unsent. A marker set later would
+    /// turn a request that did reach the network into a silent redispatch.
     fn chain_post_json_with_dispatch<'a>(
         &'a self,
         request: ChainHttpRequest,

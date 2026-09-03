@@ -2,6 +2,7 @@
 
 use super::super::*;
 use super::fixtures::*;
+use crate::chain_submission::ChainSubmissionResult;
 
 #[test]
 fn tracking_and_atomic_confirmation_survive_reopen() {
@@ -122,4 +123,193 @@ fn lifecycle_timestamps_clamp_when_wall_clock_moves_backward() {
         .unwrap();
     assert_eq!(recovering.durable_state(), ChainSubmissionState::Recovering);
     assert_eq!(recovering.updated_at(), 100);
+}
+
+#[test]
+fn tracked_recovery_completes_without_hash_and_retains_tracking_start() {
+    let path = temporary_path("tracked-recovery-submitted-without-hash");
+    {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(db);
+        let StoreAdmission::Ready { derived, .. } = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 10)
+            .unwrap()
+        else {
+            panic!("fresh admission")
+        };
+        store
+            .classify_post(
+                derived.generation(),
+                SubmissionObservation::UsableCandidateHash(CandidateTransactionHash::from_bytes(
+                    [0x77; 32],
+                )),
+                11,
+            )
+            .unwrap();
+        store
+            .reconcile(
+                derived.generation(),
+                SubmissionObservation::TrackingWindowExpired(
+                    ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::TrackingWindowExpired,
+                        "tracking window expired",
+                    ),
+                ),
+                None,
+                12,
+            )
+            .unwrap();
+        let record = store
+            .classify_post(
+                derived.generation(),
+                SubmissionObservation::SubmittedWithoutHash(
+                    ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
+                        "attempts exhausted",
+                    ),
+                ),
+                13,
+            )
+            .unwrap();
+
+        assert_eq!(
+            record.durable_state(),
+            ChainSubmissionState::SubmittedWithoutHash
+        );
+        assert_eq!(record.tracking_started_at(), Some(11));
+    }
+    {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(db);
+        let StoreAdmission::Authoritative(record) = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 14)
+            .unwrap()
+        else {
+            panic!("hashless submitted state must be terminal")
+        };
+        assert_eq!(
+            record.durable_state(),
+            ChainSubmissionState::SubmittedWithoutHash
+        );
+        assert_eq!(record.tracking_started_at(), Some(11));
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn submitted_without_hash_survives_reopen_without_domain_confirmation() {
+    let path = temporary_path("submitted-without-hash");
+    {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(Arc::clone(&db));
+        let StoreAdmission::Ready { derived, .. } = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 10)
+            .unwrap()
+        else {
+            panic!("fresh admission")
+        };
+        let ambiguity = ChainSubmissionDiagnostic::from_redacted_message(
+            ChainSubmissionDiagnosticKind::AmbiguousDispatch,
+            "response unavailable",
+        );
+        store
+            .classify_post(
+                derived.generation(),
+                SubmissionObservation::PossiblyDispatched(ambiguity),
+                11,
+            )
+            .unwrap();
+        let exhausted = ChainSubmissionDiagnostic::from_redacted_message(
+            ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
+            "attempts exhausted",
+        );
+        let record = store
+            .classify_post(
+                derived.generation(),
+                SubmissionObservation::SubmittedWithoutHash(exhausted),
+                12,
+            )
+            .unwrap();
+        assert_eq!(
+            record.durable_state(),
+            ChainSubmissionState::SubmittedWithoutHash
+        );
+        assert_eq!(db.get_vote_tx_hash(ROUND, 0, 1).unwrap(), None);
+    }
+    {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(db);
+        let StoreAdmission::Authoritative(record) = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 13)
+            .unwrap()
+        else {
+            panic!("hashless submitted state must be terminal")
+        };
+        assert!(matches!(
+            record.public_result().unwrap(),
+            ChainSubmissionResult::SubmittedWithoutHash(_)
+        ));
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn usable_hash_after_dispatch_ambiguity_clears_the_stored_diagnostic() {
+    let path = temporary_path("ambiguity-cleared-by-usable-hash");
+    let generation = {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(db);
+        let StoreAdmission::Ready { derived, .. } = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 10)
+            .unwrap()
+        else {
+            panic!("fresh admission")
+        };
+        let generation = derived.generation().clone();
+        let ambiguous = store
+            .classify_post(
+                &generation,
+                SubmissionObservation::PossiblyDispatched(
+                    ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::AmbiguousDispatch,
+                        "response lost",
+                    ),
+                ),
+                11,
+            )
+            .unwrap();
+        assert_eq!(
+            ambiguous.diagnostic().map(|d| d.kind()),
+            Some(ChainSubmissionDiagnosticKind::AmbiguousDispatch)
+        );
+        store.reserve_ambiguous_retry(&generation, 12).unwrap();
+        let tracking = store
+            .classify_post(
+                &generation,
+                SubmissionObservation::UsableCandidateHash(CandidateTransactionHash::from_bytes(
+                    [0x45; 32],
+                )),
+                13,
+            )
+            .unwrap();
+        assert_eq!(tracking.durable_state(), ChainSubmissionState::Tracking);
+        assert_eq!(tracking.diagnostic(), None);
+        assert_eq!(tracking.tracking_started_at(), Some(13));
+        generation
+    };
+    {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(db);
+        let StoreAdmission::Ready { record, .. } = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 14)
+            .unwrap()
+        else {
+            panic!("tracking row remains reconcilable")
+        };
+        assert!(record.generation_digest() == generation.digest());
+        assert_eq!(record.durable_state(), ChainSubmissionState::Tracking);
+        assert_eq!(record.diagnostic(), None);
+        assert_eq!(record.tracking_started_at(), Some(13));
+    }
+    let _ = std::fs::remove_file(path);
 }

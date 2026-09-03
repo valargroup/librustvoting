@@ -6,16 +6,81 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+### Removed
+
+- **Breaking:** removed `delegate::DelegationSigner` and replaced
+  `AdvanceDelegation::signer` with `spend_auth_signature`. Delegation chain
+  submission now accepts only the external SpendAuth signature and loads the
+  authoritative PCZT sighash and randomized verification key from durable SDK
+  state.
+- **Breaking:** collapsed the session planner's submit/poll step duality now
+  that one bounded `advance_*` call both dispatches and reconciles.
+  `NextStep::{SubmitVote, PollVote}` become `AdvanceVote`,
+  `NextStep::{SubmitVoteBatch, PollVoteBatch}` become `AdvanceVoteBatch`, and
+  `NextStep::PollDelegation` becomes `AdvanceDelegation`; `Delegate` still
+  means "this bundle needs a signed delegation from the wallet" and stays
+  distinct. `VoteRecoveryWorkKind` and `DelegationRecoveryWorkKind` collapse the
+  same way. Stable FFI `kind` strings change to `advance_delegation`,
+  `advance_vote`, and `advance_vote_batch`.
+- **Breaking:** removed the version-17 chain-submission and confirmation
+  mutation APIs. `ChainSubmissionClient` is now the only public route to
+  submission, polling, recovery, and confirmation. Deleted
+  `confirmation::{confirm_delegation_submission, confirm_vote_submission,
+  confirm_vote_batch_submission}`, `delegate::{record_submission,
+  record_van_position}`, `vote::{record_submission, record_batch_submission,
+  record_vc_position}`, and `CommittedVote::{record_submission,
+  record_vc_position}`. The `confirmation` module is now private, so the
+  host-supplied chain-event vocabulary `TxEvent`/`TxEventAttribute` and the
+  `DelegationConfirmation`/`VoteConfirmation`/`VoteBatchConfirmation` result
+  types are no longer public; event parsing is a private lifecycle mechanism.
+- **Breaking:** removed the chain-ready payload builders `vote::submission`,
+  `CommittedVote::submission`, and `delegate::submission`. The lifecycle
+  constructs and dispatches the transaction itself.
+  `PreparedDelegationBundle::{submission, signed_bundle}` remain for the
+  delegation capability-handoff export flow.
+- **Breaking:** the raw storage writers behind those APIs are no longer public
+  API. `storage::queries::{store_van_position, store_delegation_tx_hash,
+  record_vote_submission}`,
+  `VotingDb::{store_van_position, store_delegation_tx_hash,
+  record_vote_submission, mark_delegation_submitted, mark_vote_submitted}`, and
+  `vote::{record_submission, record_batch_submission, record_vc_position}` are
+  crate-private test helpers that no Cargo feature, including `test-fixtures`,
+  exposes. Read-only projections are unchanged.
+
 ### Added
 
 - Added the public bounded `ChainSubmissionClient` for delegation and
-  singleton-vote submission, status advancement, and opt-in exact
+  singleton-vote and atomic vote-batch submission, status advancement, and opt-in exact
   commitment-tree recovery. Its internal coordinator and store provide durable
   pre-POST reservation, bounded failover, candidate-first reconciliation,
   restart-stable tracking deadlines, sticky recovery, atomic confirmation,
   canonical lifecycle serialization, store-owned lock authority, causal bundle
   admission, strict confirmation-event validation, unique candidate ownership,
   and exact committed-reservation accounting.
+- Added `AdvanceImportedDelegation`,
+  `ChainSubmissionClient::advance_imported_delegation`, and the matching
+  planner/recovery-work variants for capability imports. The lifecycle lazily
+  adopts the stored package hash, polls without a signer, POST, tree scan, or
+  retry, confirms atomically, and terminally rejects a committed failure.
+- `RoundPlan::delegation_statuses`, `RoundRecoverySnapshot::{delegation,
+  votes}`, and their wire views carry `submission_diagnostic`, the diagnostic
+  stored on the authoritative lifecycle row. It is always present for the
+  terminal `SubmittedWithoutHash` and `SubmissionRejected` phases, which
+  schedule no further lifecycle call, so a host can show why manual handling
+  is needed after a restart without re-driving the lifecycle.
+  `ChainSubmissionDiagnosticKind::as_str` exposes the stable discriminator
+  used by storage and the views.
+- `RoundPlan` and `RoundPlanView` expose derived work predicates:
+  `needs_delegation_signing`, `has_in_flight_delegation`, `needs_vote_polling`,
+  `has_remaining_vote_or_share_work`, and `has_recoverable_vote_or_share_work`.
+  Hosts should read these instead of matching `NextStepView::kind` strings.
+  They are computed from an exhaustive match over `NextStep`, so adding a step
+  variant is a compile error in the SDK rather than an unrecognised kind that a
+  downstream allowlist silently reads as "no work" — a failure mode that
+  strands a round with no symptom.
+- `chain_submission` carries `compile_fail` doctests asserting that every
+  removed mutation API and raw writer stays off the public surface, satisfying
+  the compile-time surface check in `chain_submission_invariants.md`.
 
 ### Changed
 
@@ -44,9 +109,72 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   1–50 while retaining 16 encrypted shares per vote commitment. This consumes
   the breaking circuit and verification-key change from `voting-circuits
   0.12.0-rc.1`.
+- **Breaking:** `session::resume_plan`, `recovery::round_snapshot`, and
+  `VotingDb::{delegation_phase, delegation_phases, vote_phase, vote_phases}`
+  now derive submission state from the authoritative `chain_submissions` row
+  instead of the version-17 projection columns. A generation that is
+  `Submitting`, `Tracking`, or `Recovering` reports as submission-managed and
+  yields an advance step, so a transaction that may already be on the wire is never
+  dispatched a second time. Those columns record a hash only on confirmation,
+  so the previous behavior reported an in-flight transaction as never
+  submitted. Poll steps now carry `tx_hash: None` while a reserved generation
+  has not yet produced a candidate hash, instead of failing the plan.
+- **Breaking:** rejected authoritative rows now project as the distinct
+  `SubmissionRejected` phase instead of `SubmissionManaged`, and schedule no
+  advance work. `needs_delegation_signing` is now true for local
+  `AdvanceDelegation` retries; imported capability polling is represented by
+  its signer-free step instead.
+- The planner's step-consuming derivations no longer use wildcard match arms, so
+  an unclassified `NextStep` cannot be silently dropped inside the SDK either.
+  As a result a blocking `ConfirmShare` is now withheld from recovered vote work
+  while its vote still has any outstanding chain work, not only while it is
+  awaiting confirmation; such a share is not actionable until the vote confirms.
 
 ### Fixed
 
+- Exhausting an invocation's POST budget on a possibly-dispatched attempt, a
+  colliding hash, or cancellation during the final dispatch no longer ends a
+  generation as `SubmittedWithoutHash`. The row stays hashless `Recovering`
+  with its last dispatch diagnostic, and a later invocation may scan or retry.
+  `SubmittedWithoutHash` is now reachable only through chain rejection code 2
+  after unresolved dispatch.
+- `ExactTree` advancement of a hashless dispatch-ambiguity row now scans the
+  tree before any POST, and a code-2 rejection after unresolved dispatch runs
+  one tree pass before the terminal transition, so a generation that already
+  landed is confirmed with positions instead of stranding its bundle.
+  Status-only advancement keeps the direct retry.
+- A non-final exact-tree recovery retry whose accepted hash collides with
+  another generation now continues through the remaining bounded attempts.
+- `ExactTree` advancement of an imported delegation never scans the tree.
+- `VoteRecovery::tx_hash` in the round snapshot now reports the batch row's
+  candidate hash for in-flight batch members, matching `VoteRecoveryWork`.
+- A usable hash that follows durable dispatch ambiguity clears the stored
+  ambiguity diagnostic when the row enters `Tracking`.
+- A vote-chain POST that hits the SDK's own deadline before the transport
+  marks dispatch is now classified as definitely unsent, so the fresh
+  reservation is removed and bounded failover continues instead of persisting
+  terminal `SubmittedWithoutHash` for a request that never left the wallet.
+- Rejection code 2 on an exact-tree recovery retry ends a generation as
+  `SubmittedWithoutHash` only when the durable row still carries unresolved
+  dispatch evidence. A retry after a rejected POST or a committed failure now
+  surfaces an error and leaves the row recoverable.
+- A possibly-dispatched recovery retry now durably records the new dispatch
+  ambiguity and continues through the invocation's remaining bounded attempts;
+  a later invocation may reserve the next POST directly instead of repeating
+  a full tree pass.
+- `resume_plan` now schedules `AdvanceVote` and `AdvanceVoteBatch` for
+  lifecycle-owned and submitted votes whose proposal has no recorded ballot
+  intent, and a missing intent no longer fails planning for a batch member.
+- `VoteRecoveryWork::tx_hash` for `AdvanceVoteBatch` now reports the in-flight
+  batch row's candidate hash, looked up by ordered batch digest.
+- Local delegation, singleton-vote, and vote-batch `resume_plan` advance steps
+  now direct hosts through exact-tree recovery. Following the documented
+  pending loop can therefore resolve a hashless `Recovering` generation instead
+  of repeatedly returning its unchanged status-only result; imported
+  delegations remain poll-only.
+- Delegation advancement no longer reparses or requires a returned full PCZT
+  to reconstruct its sighash. Background-precomputed, recovered, and Keystone
+  flows may omit PCZT bytes without stranding submission in the host adapter.
 - Chain-submission cancellation now removes a fresh reservation when transport
   dispatch has not begun. Batch admission derives its identity locks from the
   complete request roster, verifies the persisted roster before reading any

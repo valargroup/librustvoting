@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::VotingError;
 
-const CURRENT_VERSION: u32 = 18;
+const CURRENT_VERSION: u32 = 19;
 
 /// Schema version that `001_init.sql` produces, and the oldest version that can
 /// be upgraded in place.
@@ -125,6 +125,10 @@ END;",
         17,
         include_str!("migrations/002_chain_submissions.sql"),
     ),
+    (
+        18,
+        include_str!("migrations/003_hashless_submission.sql"),
+    ),
 ];
 
 const RESET_SQL: &str = "DROP TABLE IF EXISTS pir_proof_cache;
@@ -158,7 +162,7 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     }
 
     if version == CURRENT_VERSION {
-        return verify_v18_schema(conn);
+        return verify_current_chain_submission_schema(conn);
     }
 
     let tx = conn.transaction().map_err(|e| VotingError::Internal {
@@ -213,7 +217,7 @@ pub fn migrate(conn: &mut Connection) -> Result<(), VotingError> {
     Ok(())
 }
 
-fn verify_v18_schema(conn: &Connection) -> Result<(), VotingError> {
+fn verify_current_chain_submission_schema(conn: &Connection) -> Result<(), VotingError> {
     let expected = Connection::open_in_memory().map_err(migration_error)?;
     expected
         .execute_batch(include_str!("migrations/002_chain_submissions.sql"))
@@ -221,7 +225,8 @@ fn verify_v18_schema(conn: &Connection) -> Result<(), VotingError> {
     if chain_submission_schema_fingerprint(conn)? != chain_submission_schema_fingerprint(&expected)?
     {
         return Err(VotingError::Internal {
-            message: "database uses an unsupported unreleased version-18 chain-submission schema; recreate it from version 17".to_string(),
+            message: "database uses an unsupported chain-submission schema for version 19"
+                .to_string(),
         });
     }
     Ok(())

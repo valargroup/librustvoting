@@ -6,11 +6,68 @@
 
 use rusqlite::{named_params, Connection, OptionalExtension};
 
-use crate::{storage::VotingDb, types::VotingError};
+use crate::{
+    chain_submission::{ChainSubmissionDiagnostic, ChainSubmissionDiagnosticKind},
+    storage::VotingDb,
+    types::VotingError,
+};
 
 mod authoritative_batch;
 
 use authoritative_batch::load_authoritative_batch_phases;
+
+/// Delegation phase of one bundle together with the diagnostic its
+/// authoritative `chain_submissions` row stores, if any.
+///
+/// The diagnostic is always present for `SubmittedWithoutHash` and
+/// `SubmissionRejected`, where it is the only evidence a host can show for a
+/// terminal outcome, and may be present while `SubmissionManaged` describes an
+/// ambiguity still under recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DelegationSubmissionStatus {
+    pub(crate) bundle_index: u32,
+    pub(crate) phase: DelegationPhase,
+    pub(crate) diagnostic: Option<ChainSubmissionDiagnostic>,
+}
+
+/// Vote phase of one `(bundle, proposal)` key together with the diagnostic of
+/// its authoritative singleton or batch row, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VoteSubmissionStatus {
+    pub(crate) bundle_index: u32,
+    pub(crate) proposal_id: u32,
+    pub(crate) phase: VotePhase,
+    pub(crate) diagnostic: Option<ChainSubmissionDiagnostic>,
+    /// Digest of the authoritative batch row that owns this vote, when the
+    /// phase comes from a batch rather than a singleton row or the domain
+    /// columns. The batch row, not the member, holds the candidate hash.
+    pub(crate) ordered_batch_digest: Option<[u8; 32]>,
+}
+
+/// Rebuilds the stored lifecycle diagnostic from its two projection columns.
+///
+/// Both columns are written together by the lifecycle store, so one without
+/// the other or an unknown kind is corrupt state rather than "no diagnostic".
+fn stored_submission_diagnostic(
+    kind: Option<String>,
+    message: Option<String>,
+) -> Result<Option<ChainSubmissionDiagnostic>, VotingError> {
+    match (kind, message) {
+        (None, None) => Ok(None),
+        (Some(kind), Some(message)) => ChainSubmissionDiagnosticKind::from_stable_name(&kind)
+            .map(|kind| {
+                Some(ChainSubmissionDiagnostic::from_redacted_message(
+                    kind, message,
+                ))
+            })
+            .ok_or_else(|| VotingError::Internal {
+                message: format!("chain submission row stores unknown diagnostic kind {kind:?}"),
+            }),
+        _ => Err(VotingError::Internal {
+            message: "chain submission row stores a diagnostic kind without a message or a message without a kind".to_string(),
+        }),
+    }
+}
 
 /// Delegation lifecycle for one bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +83,10 @@ pub enum DelegationPhase {
     Submitted,
     /// Submission or reconciliation is owned by the chain lifecycle facade.
     SubmissionManaged,
+    /// Dispatch is durably submitted without a usable transaction hash.
+    SubmittedWithoutHash,
+    /// The authoritative lifecycle row is terminally rejected.
+    SubmissionRejected,
     /// The vote authority note leaf position has been recovered from chain.
     Confirmed,
 }
@@ -44,6 +105,8 @@ pub enum WorkflowPhase {
     SubmittedShare,
     /// Submission or reconciliation is owned by the chain lifecycle facade.
     SubmissionManaged,
+    /// The authoritative lifecycle row is terminally rejected.
+    SubmissionRejected,
     Confirmed,
 }
 
@@ -59,6 +122,10 @@ pub enum VotePhase {
     Submitted,
     /// Submission or reconciliation is owned by the chain lifecycle facade.
     SubmissionManaged,
+    /// Dispatch is durably submitted without a usable transaction hash.
+    SubmittedWithoutHash,
+    /// The authoritative lifecycle row is terminally rejected.
+    SubmissionRejected,
     /// The vote commitment tree position has been recorded.
     Confirmed,
 }
@@ -71,6 +138,8 @@ impl VotePhase {
             Self::Committed => "committed",
             Self::Submitted => "submitted",
             Self::SubmissionManaged => "submission_managed",
+            Self::SubmittedWithoutHash => "submitted_without_hash",
+            Self::SubmissionRejected => "submission_rejected",
             Self::Confirmed => "confirmed",
         }
     }
@@ -105,6 +174,8 @@ impl DelegationPhase {
             Self::Proved => "proved",
             Self::Submitted => "submitted",
             Self::SubmissionManaged => "submission_managed",
+            Self::SubmittedWithoutHash => "submitted_without_hash",
+            Self::SubmissionRejected => "submission_rejected",
             Self::Confirmed => "confirmed",
         }
     }
@@ -120,6 +191,7 @@ impl WorkflowPhase {
             Self::SubmittedVote => "submitted_vote",
             Self::SubmittedShare => "submitted_share",
             Self::SubmissionManaged => "submission_managed",
+            Self::SubmissionRejected => "submission_rejected",
             Self::Confirmed => "confirmed",
         }
     }
@@ -131,6 +203,8 @@ impl WorkflowPhase {
             DelegationPhase::PcztBuilt | DelegationPhase::Proved => Self::Signed,
             DelegationPhase::Submitted => Self::SubmittedDelegation,
             DelegationPhase::SubmissionManaged => Self::SubmissionManaged,
+            DelegationPhase::SubmittedWithoutHash => Self::SubmittedDelegation,
+            DelegationPhase::SubmissionRejected => Self::SubmissionRejected,
             DelegationPhase::Confirmed => Self::Confirmed,
         }
     }
@@ -142,6 +216,8 @@ impl WorkflowPhase {
             VotePhase::Committed => Self::Signed,
             VotePhase::Submitted => Self::SubmittedVote,
             VotePhase::SubmissionManaged => Self::SubmissionManaged,
+            VotePhase::SubmittedWithoutHash => Self::SubmittedVote,
+            VotePhase::SubmissionRejected => Self::SubmissionRejected,
             VotePhase::Confirmed => Self::Confirmed,
         }
     }
@@ -179,10 +255,9 @@ impl VotingDb {
                         ),
                         b.delegation_tx_hash IS NOT NULL,
                         b.van_leaf_position IS NOT NULL,
-                        EXISTS(SELECT 1 FROM chain_submissions s
-                                WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
-                                  AND s.bundle_index=b.bundle_index AND s.kind='delegation'
-                                  AND s.state IN ('submitting','tracking','recovering','rejected'))
+                        (SELECT s.state FROM chain_submissions s
+                         WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
+                           AND s.bundle_index=b.bundle_index AND s.kind='delegation')
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -198,7 +273,7 @@ impl VotingDb {
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
                         row.get::<_, i64>(3)? != 0,
-                        row.get::<_, i64>(4)? != 0,
+                        row.get::<_, Option<String>>(4)?.as_deref(),
                     ))
                 },
             )
@@ -219,6 +294,21 @@ impl VotingDb {
         &self,
         round_id: &str,
     ) -> Result<Vec<(u32, DelegationPhase)>, VotingError> {
+        Ok(self
+            .delegation_submission_statuses(round_id)?
+            .into_iter()
+            .map(|status| (status.bundle_index, status.phase))
+            .collect())
+    }
+
+    /// Lists delegation phases with the stored lifecycle diagnostic of each
+    /// bundle's authoritative submission row.
+    ///
+    /// Results are sorted by `bundle_index` and scoped to the current wallet id.
+    pub(crate) fn delegation_submission_statuses(
+        &self,
+        round_id: &str,
+    ) -> Result<Vec<DelegationSubmissionStatus>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         let mut stmt = conn
@@ -234,11 +324,13 @@ impl VotingDb {
                         ),
                         b.delegation_tx_hash IS NOT NULL,
                         b.van_leaf_position IS NOT NULL,
-                        EXISTS(SELECT 1 FROM chain_submissions s
-                                WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
-                                  AND s.bundle_index=b.bundle_index AND s.kind='delegation'
-                                  AND s.state IN ('submitting','tracking','recovering','rejected'))
+                        s.state, s.diagnostic_kind, s.diagnostic
                  FROM bundles b
+                 LEFT JOIN chain_submissions s
+                   ON s.round_id = b.round_id
+                  AND s.wallet_id = b.wallet_id
+                  AND s.bundle_index = b.bundle_index
+                  AND s.kind = 'delegation'
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
                  ORDER BY b.bundle_index",
@@ -258,8 +350,10 @@ impl VotingDb {
                             row.get::<_, i64>(2)? != 0,
                             row.get::<_, i64>(3)? != 0,
                             row.get::<_, i64>(4)? != 0,
-                            row.get::<_, i64>(5)? != 0,
+                            row.get::<_, Option<String>>(5)?.as_deref(),
                         ),
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
@@ -271,7 +365,15 @@ impl VotingDb {
                 message: format!("failed to read delegation phase row: {e}"),
             })?;
 
-        Ok(rows)
+        rows.into_iter()
+            .map(|(bundle_index, phase, diagnostic_kind, diagnostic)| {
+                Ok(DelegationSubmissionStatus {
+                    bundle_index,
+                    phase,
+                    diagnostic: stored_submission_diagnostic(diagnostic_kind, diagnostic)?,
+                })
+            })
+            .collect()
     }
 
     /// Loads the canonical vote phase for one bundle/proposal pair.
@@ -283,7 +385,7 @@ impl VotingDb {
     ) -> Result<VotePhase, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let phase = load_vote_phases(
+        let phase = load_vote_submission_statuses(
             &conn,
             &wallet_id,
             round_id,
@@ -292,7 +394,7 @@ impl VotingDb {
         )?
         .into_iter()
         .next()
-        .map(|(_, _, phase)| phase);
+        .map(|status| status.phase);
 
         phase.ok_or_else(|| VotingError::InvalidInput {
             message: format!(
@@ -303,9 +405,22 @@ impl VotingDb {
 
     /// Lists canonical vote phases for all votes in one round.
     pub fn vote_phases(&self, round_id: &str) -> Result<Vec<(u32, u32, VotePhase)>, VotingError> {
+        Ok(self
+            .vote_submission_statuses(round_id)?
+            .into_iter()
+            .map(|status| (status.bundle_index, status.proposal_id, status.phase))
+            .collect())
+    }
+
+    /// Lists vote phases with the stored lifecycle diagnostic of each vote's
+    /// authoritative singleton or batch submission row.
+    pub(crate) fn vote_submission_statuses(
+        &self,
+        round_id: &str,
+    ) -> Result<Vec<VoteSubmissionStatus>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        load_vote_phases(&conn, &wallet_id, round_id, None, None)
+        load_vote_submission_statuses(&conn, &wallet_id, round_id, None, None)
     }
 
     /// Loads the canonical helper-share phase for one share record.
@@ -406,25 +521,27 @@ struct VotePhaseEvidence {
     has_vc_position: bool,
     has_recovery_bundle: bool,
     singleton_submission_state: Option<String>,
+    singleton_diagnostic_kind: Option<String>,
+    singleton_diagnostic: Option<String>,
 }
 
 /// Projects vote rows through their authoritative singleton or atomic-batch
 /// submission. Batch membership is accepted only after the persisted signed
 /// batch and its complete generation digest have been re-derived.
-fn load_vote_phases(
+fn load_vote_submission_statuses(
     conn: &Connection,
     wallet_id: &str,
     round_id: &str,
     bundle_index: Option<u32>,
     proposal_id: Option<u32>,
-) -> Result<Vec<(u32, u32, VotePhase)>, VotingError> {
+) -> Result<Vec<VoteSubmissionStatus>, VotingError> {
     let vote_evidence = {
         let mut statement = conn
             .prepare(
                 "SELECT v.bundle_index, v.proposal_id, v.tx_hash IS NOT NULL,
                         v.vc_tree_position IS NOT NULL,
                         v.commitment_bundle_json IS NOT NULL,
-                        singleton.state
+                        singleton.state, singleton.diagnostic_kind, singleton.diagnostic
                    FROM votes v
                    LEFT JOIN chain_submissions singleton
                      ON singleton.round_id=v.round_id
@@ -456,6 +573,8 @@ fn load_vote_phases(
                         has_vc_position: row.get::<_, i64>(3)? != 0,
                         has_recovery_bundle: row.get::<_, i64>(4)? != 0,
                         singleton_submission_state: row.get(5)?,
+                        singleton_diagnostic_kind: row.get(6)?,
+                        singleton_diagnostic: row.get(7)?,
                     })
                 },
             )
@@ -469,16 +588,14 @@ fn load_vote_phases(
         evidence
     };
 
-    let batch_phases = load_authoritative_batch_phases(conn, wallet_id, round_id, bundle_index)?;
+    let batch_members = load_authoritative_batch_phases(conn, wallet_id, round_id, bundle_index)?;
     vote_evidence
         .into_iter()
         .map(|evidence| {
             let singleton_phase =
                 authoritative_submission_phase(evidence.singleton_submission_state.as_deref());
-            let batch_phase = batch_phases
-                .get(&(evidence.bundle_index, evidence.proposal_id))
-                .copied();
-            if singleton_phase.is_some() && batch_phase.is_some() {
+            let batch_member = batch_members.get(&(evidence.bundle_index, evidence.proposal_id));
+            if singleton_phase.is_some() && batch_member.is_some() {
                 return Err(VotingError::Internal {
                     message: format!(
                         "vote has overlapping authoritative singleton and batch submissions for round={round_id}, bundle={}, proposal={}",
@@ -486,23 +603,47 @@ fn load_vote_phases(
                     ),
                 });
             }
-            let phase = singleton_phase.or(batch_phase).unwrap_or_else(|| {
-                vote_phase_from_columns(
-                    evidence.has_tx_hash,
-                    evidence.has_vc_position,
-                    evidence.has_recovery_bundle,
-                )
-            });
-            Ok((evidence.bundle_index, evidence.proposal_id, phase))
+            let (phase, diagnostic, ordered_batch_digest) = match (singleton_phase, batch_member)
+            {
+                (Some(phase), _) => (
+                    phase,
+                    stored_submission_diagnostic(
+                        evidence.singleton_diagnostic_kind,
+                        evidence.singleton_diagnostic,
+                    )?,
+                    None,
+                ),
+                (None, Some(member)) => (
+                    member.phase,
+                    member.diagnostic.clone(),
+                    Some(member.ordered_batch_digest),
+                ),
+                (None, None) => (
+                    vote_phase_from_columns(
+                        evidence.has_tx_hash,
+                        evidence.has_vc_position,
+                        evidence.has_recovery_bundle,
+                    ),
+                    None,
+                    None,
+                ),
+            };
+            Ok(VoteSubmissionStatus {
+                bundle_index: evidence.bundle_index,
+                proposal_id: evidence.proposal_id,
+                phase,
+                diagnostic,
+                ordered_batch_digest,
+            })
         })
         .collect()
 }
 
 fn authoritative_submission_phase(state: Option<&str>) -> Option<VotePhase> {
     match state {
-        Some("submitting" | "tracking" | "recovering" | "rejected") => {
-            Some(VotePhase::SubmissionManaged)
-        }
+        Some("submitting" | "tracking" | "recovering") => Some(VotePhase::SubmissionManaged),
+        Some("submitted_without_hash") => Some(VotePhase::SubmittedWithoutHash),
+        Some("rejected") => Some(VotePhase::SubmissionRejected),
         Some("confirmed") => Some(VotePhase::Confirmed),
         _ => None,
     }
@@ -705,6 +846,10 @@ mod tests {
             "submission_managed"
         );
         assert_eq!(
+            WorkflowPhase::for_delegation(DelegationPhase::SubmissionRejected).as_str(),
+            "submission_rejected"
+        );
+        assert_eq!(
             WorkflowPhase::for_delegation(DelegationPhase::Submitted).as_str(),
             "submitted_delegation"
         );
@@ -730,6 +875,10 @@ mod tests {
             "submission_managed"
         );
         assert_eq!(
+            WorkflowPhase::for_vote(VotePhase::SubmissionRejected).as_str(),
+            "submission_rejected"
+        );
+        assert_eq!(
             WorkflowPhase::for_vote(VotePhase::Confirmed).as_str(),
             "confirmed"
         );
@@ -750,20 +899,18 @@ fn phase_from_columns(
     has_proof: bool,
     has_tx_hash: bool,
     has_van_position: bool,
-    submission_managed: bool,
+    authoritative_state: Option<&str>,
 ) -> DelegationPhase {
-    if submission_managed {
-        DelegationPhase::SubmissionManaged
-    } else if has_van_position {
-        DelegationPhase::Confirmed
-    } else if has_tx_hash {
-        DelegationPhase::Submitted
-    } else if has_proof {
-        DelegationPhase::Proved
-    } else if has_pczt {
-        DelegationPhase::PcztBuilt
-    } else {
-        DelegationPhase::Prepared
+    match authoritative_state {
+        Some("submitting" | "tracking" | "recovering") => DelegationPhase::SubmissionManaged,
+        Some("submitted_without_hash") => DelegationPhase::SubmittedWithoutHash,
+        Some("rejected") => DelegationPhase::SubmissionRejected,
+        Some("confirmed") => DelegationPhase::Confirmed,
+        _ if has_van_position => DelegationPhase::Confirmed,
+        _ if has_tx_hash => DelegationPhase::Submitted,
+        _ if has_proof => DelegationPhase::Proved,
+        _ if has_pczt => DelegationPhase::PcztBuilt,
+        _ => DelegationPhase::Prepared,
     }
 }
 

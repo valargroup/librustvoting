@@ -30,9 +30,9 @@ use crate::{
         DelegationSubmissionWire, NextStepView, RoundPlanView, RoundRecoveryStateView,
         ShareDelegationRecordView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
         SignedVoteBatchView, SignedVoteCommitmentView, SignedVoteCommitmentsView,
-        VoteCommitmentBatchWire, VoteCommitmentWire, VoteRecoveryView, VoteRecoveryWorkView,
-        VoteShareWire, VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView,
-        VotingRoundParams,
+        SubmissionDiagnosticView, VoteCommitmentBatchWire, VoteCommitmentWire, VoteRecoveryView,
+        VoteRecoveryWorkView, VoteShareWire, VotingHotkeyTargetV1, VotingNoteRefView,
+        VotingNoteSelectionResultView, VotingRoundParams,
     },
     BundlePolicy,
 };
@@ -568,6 +568,15 @@ impl TryFrom<SignedVoteBatch> for SignedVoteBatchView {
     }
 }
 
+impl From<crate::chain_submission::ChainSubmissionDiagnostic> for SubmissionDiagnosticView {
+    fn from(diagnostic: crate::chain_submission::ChainSubmissionDiagnostic) -> Self {
+        Self {
+            kind: diagnostic.kind().as_str().to_string(),
+            message: diagnostic.message().to_string(),
+        }
+    }
+}
+
 impl From<recovery::DelegationRecovery> for DelegationRecoveryView {
     fn from(record: recovery::DelegationRecovery) -> Self {
         Self {
@@ -575,6 +584,7 @@ impl From<recovery::DelegationRecovery> for DelegationRecoveryView {
             phase: record.workflow_phase().as_str().to_string(),
             tx_hash: record.tx_hash,
             van_leaf_position: record.van_leaf_position,
+            submission_diagnostic: record.submission_diagnostic.map(Into::into),
         }
     }
 }
@@ -589,6 +599,7 @@ impl From<recovery::VoteRecovery> for VoteRecoveryView {
             tx_hash: record.tx_hash,
             vc_tree_position: record.vc_tree_position,
             has_commitment_bundle: record.has_commitment_bundle,
+            submission_diagnostic: record.submission_diagnostic.map(Into::into),
         }
     }
 }
@@ -662,7 +673,8 @@ impl TryFrom<session::NextStep> for NextStepView {
         let kind = step.kind().to_string();
         match step {
             session::NextStep::Delegate { bundle_index }
-            | session::NextStep::PollDelegation { bundle_index } => Ok(Self {
+            | session::NextStep::AdvanceDelegation { bundle_index }
+            | session::NextStep::AdvanceImportedDelegation { bundle_index } => Ok(Self {
                 kind,
                 bundle_index,
                 proposal_id: 0,
@@ -680,19 +692,11 @@ impl TryFrom<session::NextStep> for NextStepView {
                 choice,
                 share_index: 0,
             }),
-            session::NextStep::SubmitVote {
+            session::NextStep::AdvanceVote {
                 bundle_index,
                 proposal_id,
             }
-            | session::NextStep::SubmitVoteBatch {
-                bundle_index,
-                proposal_id,
-            }
-            | session::NextStep::PollVote {
-                bundle_index,
-                proposal_id,
-            }
-            | session::NextStep::PollVoteBatch {
+            | session::NextStep::AdvanceVoteBatch {
                 bundle_index,
                 proposal_id,
             } => Ok(Self {
@@ -730,6 +734,7 @@ impl From<session::DelegationStatus> for DelegationStatusView {
                 .as_str()
                 .to_string(),
             tx_hash: status.tx_hash,
+            submission_diagnostic: status.submission_diagnostic.map(Into::into),
         }
     }
 }
@@ -792,6 +797,11 @@ impl TryFrom<session::RoundPlan> for RoundPlanView {
             completed_for_display: plan.completed_for_display,
             completed_vote_display: plan.completed_vote_display.map(Into::into),
             needs_draft_setup: plan.needs_draft_setup,
+            needs_delegation_signing: plan.needs_delegation_signing,
+            has_in_flight_delegation: plan.has_in_flight_delegation,
+            needs_vote_polling: plan.needs_vote_polling,
+            has_remaining_vote_or_share_work: plan.has_remaining_vote_or_share_work,
+            has_recoverable_vote_or_share_work: plan.has_recoverable_vote_or_share_work,
             primary_action: plan.primary_action.as_str().to_string(),
             next_steps: plan
                 .next_steps
@@ -1720,28 +1730,33 @@ mod tests {
                 voted_at: Some(123),
             }),
             needs_draft_setup: false,
+            needs_delegation_signing: true,
+            has_in_flight_delegation: true,
+            needs_vote_polling: true,
+            has_remaining_vote_or_share_work: true,
+            has_recoverable_vote_or_share_work: true,
             primary_action: session::RoundPlanAction::Vote,
             next_steps: vec![
                 session::NextStep::Delegate { bundle_index: 1 },
-                session::NextStep::PollDelegation { bundle_index: 2 },
+                session::NextStep::AdvanceDelegation { bundle_index: 2 },
                 session::NextStep::CastVote {
                     bundle_index: 3,
                     proposal_id: 11,
                     choice: 1,
                 },
-                session::NextStep::SubmitVote {
+                session::NextStep::AdvanceVote {
                     bundle_index: 4,
                     proposal_id: 12,
                 },
-                session::NextStep::SubmitVoteBatch {
+                session::NextStep::AdvanceVoteBatch {
                     bundle_index: 5,
                     proposal_id: 13,
                 },
-                session::NextStep::PollVote {
+                session::NextStep::AdvanceVote {
                     bundle_index: 6,
                     proposal_id: 14,
                 },
-                session::NextStep::PollVoteBatch {
+                session::NextStep::AdvanceVoteBatch {
                     bundle_index: 7,
                     proposal_id: 15,
                 },
@@ -1755,21 +1770,31 @@ mod tests {
                     proposal_id: 15,
                     share_index: 1,
                 },
+                session::NextStep::AdvanceImportedDelegation { bundle_index: 10 },
             ],
             delegation_statuses: vec![session::DelegationStatus {
                 bundle_index: 2,
                 phase: crate::phases::DelegationPhase::Submitted,
                 tx_hash: Some("delegation-tx".to_string()),
+                submission_diagnostic: None,
             }],
-            recovered_delegation_work: vec![session::DelegationRecoveryWork {
-                kind: session::DelegationRecoveryWorkKind::PollDelegation,
-                bundle_index: 2,
-                phase: crate::phases::DelegationPhase::Submitted,
-                tx_hash: Some("delegation-tx".to_string()),
-            }],
+            recovered_delegation_work: vec![
+                session::DelegationRecoveryWork {
+                    kind: session::DelegationRecoveryWorkKind::AdvanceDelegation,
+                    bundle_index: 2,
+                    phase: crate::phases::DelegationPhase::Submitted,
+                    tx_hash: Some("delegation-tx".to_string()),
+                },
+                session::DelegationRecoveryWork {
+                    kind: session::DelegationRecoveryWorkKind::AdvanceImportedDelegation,
+                    bundle_index: 10,
+                    phase: crate::phases::DelegationPhase::SubmissionManaged,
+                    tx_hash: Some("imported-delegation-tx".to_string()),
+                },
+            ],
             recovered_vote_work: vec![
                 session::VoteRecoveryWork {
-                    kind: session::VoteRecoveryWorkKind::SubmitVoteBatch,
+                    kind: session::VoteRecoveryWorkKind::AdvanceVoteBatch,
                     bundle_index: 4,
                     proposal_id: 12,
                     tx_hash: None,
@@ -1777,7 +1802,7 @@ mod tests {
                     share_indexes: Vec::new(),
                 },
                 session::VoteRecoveryWork {
-                    kind: session::VoteRecoveryWorkKind::PollVoteBatch,
+                    kind: session::VoteRecoveryWorkKind::AdvanceVoteBatch,
                     bundle_index: 5,
                     proposal_id: 13,
                     tx_hash: Some("batch-tx".to_string()),
@@ -1847,14 +1872,15 @@ mod tests {
             kinds,
             vec![
                 "delegate",
-                "poll_delegation",
+                "advance_delegation",
                 "cast_vote",
-                "submit_vote",
-                "submit_vote_batch",
-                "poll_vote",
-                "poll_vote_batch",
+                "advance_vote",
+                "advance_vote_batch",
+                "advance_vote",
+                "advance_vote_batch",
                 "submit_shares",
-                "confirm_share"
+                "confirm_share",
+                "advance_imported_delegation"
             ]
         );
         assert_eq!(view.next_steps[0].bundle_index, 1);
@@ -1862,9 +1888,13 @@ mod tests {
         assert_eq!(view.next_steps[2].choice, 1);
         assert_eq!(view.next_steps[8].share_index, 1);
         assert_eq!(view.delegation_statuses[0].phase, "submitted_delegation");
-        assert_eq!(view.recovered_delegation_work[0].kind, "poll_delegation");
-        assert_eq!(view.recovered_vote_work[0].kind, "submit_vote_batch");
-        assert_eq!(view.recovered_vote_work[1].kind, "poll_vote_batch");
+        assert_eq!(view.recovered_delegation_work[0].kind, "advance_delegation");
+        assert_eq!(
+            view.recovered_delegation_work[1].kind,
+            "advance_imported_delegation"
+        );
+        assert_eq!(view.recovered_vote_work[0].kind, "advance_vote_batch");
+        assert_eq!(view.recovered_vote_work[1].kind, "advance_vote_batch");
         assert_eq!(
             view.recovered_vote_work[1].tx_hash.as_deref(),
             Some("batch-tx")

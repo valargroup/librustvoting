@@ -60,7 +60,7 @@ pub fn load_round_recovery_context(
 
 /// Reconstructs the committed vote handle for a resume step.
 ///
-/// Use this for singleton `NextStep::SubmitVote` and per-vote
+/// Use this for singleton `NextStep::AdvanceVote` and per-vote
 /// `NextStep::SubmitShares` work to avoid rebuilding proofs during recovery.
 pub fn recover_committed_vote_for_step(
     voting_db: &VotingDb,
@@ -68,7 +68,7 @@ pub fn recover_committed_vote_for_step(
     step: &NextStep,
 ) -> Result<Option<CommittedVote>> {
     match *step {
-        NextStep::SubmitVote {
+        NextStep::AdvanceVote {
             bundle_index,
             proposal_id,
         }
@@ -85,20 +85,17 @@ pub fn recover_committed_vote_for_step(
 
 /// Reconstructs one complete atomic batch for a batch resume step.
 ///
-/// Submit `batch_json` once for `NextStep::SubmitVoteBatch`. For either batch
-/// step, retain `batch_digest` for `record_vote_batch_submission` and
-/// `confirm_vote_batch_submission`.
+/// This is inspection and display material. Execute the chain transaction with
+/// `ChainSubmissionClient::advance_vote_batch_with_recovery` and
+/// `ChainRecoveryMode::ExactTree`. The client derives the same batch from
+/// persisted recovery state; retain `batch_digest` to identify that generation.
 pub fn recover_vote_batch_for_step(
     voting_db: &VotingDb,
     round_id: &str,
     step: &NextStep,
 ) -> Result<Option<SignedVoteBatch>> {
     match *step {
-        NextStep::SubmitVoteBatch {
-            bundle_index,
-            proposal_id,
-        }
-        | NextStep::PollVoteBatch {
+        NextStep::AdvanceVoteBatch {
             bundle_index,
             proposal_id,
         } => recover_atomic_vote_batch(voting_db, round_id, bundle_index, proposal_id)
