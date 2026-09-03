@@ -20,6 +20,7 @@ use super::{
 const API_PREFIX: [&str; 2] = ["shielded-vote", "v1"];
 const DELEGATION_ENDPOINT: &str = "delegate-vote";
 const VOTE_ENDPOINT: &str = "cast-vote";
+const VOTE_BATCH_ENDPOINT: &str = "cast-vote-batch";
 // CheckTx may use its complete 120-second server budget to verify a proof. The
 // client default leaves time for connection setup and response delivery.
 const MIN_CHAIN_POST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -195,7 +196,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                 )))
             }
         };
-        self.post(endpoint_index, DELEGATION_ENDPOINT, body, dispatch)
+        self.post(endpoint_index, DELEGATION_ENDPOINT, body, None, dispatch)
             .await
     }
 
@@ -223,8 +224,33 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                 )))
             }
         };
-        self.post(endpoint_index, VOTE_ENDPOINT, body, dispatch)
+        self.post(endpoint_index, VOTE_ENDPOINT, body, None, dispatch)
             .await
+    }
+
+    pub(super) async fn submit_vote_batch_with_dispatch(
+        &self,
+        endpoint_index: usize,
+        submission: &crate::wire::VoteCommitmentBatchWire,
+        expected_batch_digest: [u8; 32],
+        dispatch: ChainPostDispatch,
+    ) -> PostAttemptOutcome {
+        let body = match submission.to_json() {
+            Ok(json) => json.into_bytes(),
+            Err(error) => {
+                return PostAttemptOutcome::LocalFailure(invalid_protocol(format!(
+                    "serialize vote-batch request failed: {error}"
+                )))
+            }
+        };
+        self.post(
+            endpoint_index,
+            VOTE_BATCH_ENDPOINT,
+            body,
+            Some(expected_batch_digest),
+            dispatch,
+        )
+        .await
     }
 
     async fn post(
@@ -232,6 +258,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
         endpoint_index: usize,
         endpoint: &str,
         body: Vec<u8>,
+        expected_batch_digest: Option<[u8; 32]>,
         dispatch: ChainPostDispatch,
     ) -> PostAttemptOutcome {
         if body.len() > MAX_CHAIN_HTTP_REQUEST_BYTES {
@@ -263,7 +290,7 @@ impl<T: ChainTransport> ChainProtocolClient<T> {
                     "vote-chain submission timed out",
                 ),
             ),
-            Ok(Ok(response)) => parse_post_response(response),
+            Ok(Ok(response)) => parse_post_response(response, expected_batch_digest),
             Ok(Err(error)) if error.kind() == ChainTransportFailureKind::DefinitelyUnsent => {
                 PostAttemptOutcome::DefinitelyUnsent(error)
             }
@@ -332,7 +359,10 @@ fn chain_request(url: String, has_json_body: bool, timeout: Duration) -> ChainHt
     ChainHttpRequest::new(url, headers, timeout, MAX_CHAIN_HTTP_RESPONSE_BYTES)
 }
 
-fn parse_post_response(response: ChainHttpResponse) -> PostAttemptOutcome {
+fn parse_post_response(
+    response: ChainHttpResponse,
+    expected_batch_digest: Option<[u8; 32]>,
+) -> PostAttemptOutcome {
     if let Err(diagnostic) = validate_json_response(&response) {
         return PostAttemptOutcome::PossiblyDispatched(diagnostic);
     }
@@ -344,6 +374,26 @@ fn parse_post_response(response: ChainHttpResponse) -> PostAttemptOutcome {
             ))
         }
     };
+    match (expected_batch_digest, &parsed.batch_digest) {
+        (Some(expected), BatchDigestJson::Present(observed))
+            if observed == &hex::encode(expected) => {}
+        (Some(_), BatchDigestJson::Present(_)) => {
+            return PostAttemptOutcome::PossiblyDispatched(invalid_protocol(
+                "vote-batch response contained an invalid batch digest",
+            ))
+        }
+        (Some(_), BatchDigestJson::Absent) => {
+            return PostAttemptOutcome::PossiblyDispatched(invalid_protocol(
+                "vote-batch response omitted its batch digest",
+            ))
+        }
+        (None, BatchDigestJson::Present(_)) => {
+            return PostAttemptOutcome::PossiblyDispatched(invalid_protocol(
+                "non-batch vote-chain response contained a batch digest",
+            ))
+        }
+        (None, BatchDigestJson::Absent) => {}
+    }
 
     match (response.status(), parsed.code) {
         (200, 0) => match parsed.tx_hash.as_deref().and_then(normalize_candidate_hash) {
@@ -465,6 +515,21 @@ struct TransactionResultJson {
     #[serde(default)]
     #[serde(rename = "log")]
     _log: String,
+    #[serde(default)]
+    batch_digest: BatchDigestJson,
+}
+
+#[derive(Default)]
+enum BatchDigestJson {
+    #[default]
+    Absent,
+    Present(String),
+}
+
+impl<'de> Deserialize<'de> for BatchDigestJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::Present)
+    }
 }
 
 #[derive(Deserialize)]
@@ -589,6 +654,8 @@ fn invalid_protocol(message: impl AsRef<str>) -> ChainSubmissionDiagnostic {
 
 #[cfg(test)]
 mod tests {
+    mod batch_request;
+
     use std::{
         collections::VecDeque,
         sync::{Arc, Mutex},

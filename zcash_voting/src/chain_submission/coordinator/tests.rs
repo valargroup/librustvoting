@@ -360,6 +360,183 @@ async fn recovery_retry_rejection_hash_is_not_candidate_evidence() {
 }
 
 #[tokio::test]
+async fn atomic_vote_batch_uses_shared_lifecycle_and_confirms_ordered_positions() {
+    let identity = batch_identity(0);
+    let proposals = vec![1, 2, 5];
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Ok(accepted_batch(&identity)));
+    transport.queue(Ok(batch_confirmed(&identity, &proposals)));
+
+    let result = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    )
+    .advance(
+        StoreAdvancementRequest::vote_batch(identity.clone(), proposals).unwrap(),
+        &ManualControl::default(),
+    )
+    .await
+    .unwrap();
+
+    let ChainSubmissionResult::Confirmed(confirmation) = result else {
+        panic!("batch must confirm atomically")
+    };
+    assert_eq!(confirmation.final_van_position(), 7);
+    assert_eq!(confirmation.vote_commitment_positions(), &[8, 9, 10]);
+    assert_eq!(transport.methods(), vec!["POST", "GET"]);
+    assert_eq!(
+        store.record(&identity).unwrap().durable_state(),
+        ChainSubmissionState::Confirmed
+    );
+}
+
+#[tokio::test]
+async fn atomic_vote_batches_from_one_through_protocol_maximum_confirm() {
+    for size in 1..=crate::vote::MAX_VOTE_BATCH_ACTIONS {
+        let identity = batch_identity(size as u32);
+        let proposals = (1..=size as u32).collect::<Vec<_>>();
+        let store = Arc::new(InMemoryChainSubmissionStore::default());
+        store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
+        let transport = Arc::new(ScriptedTransport::default());
+        transport.queue(Ok(accepted_batch(&identity)));
+        transport.queue(Ok(batch_confirmed(&identity, &proposals)));
+
+        let result = coordinator(transport, store, ManualClock::new(100), 10)
+            .advance(
+                StoreAdvancementRequest::vote_batch(identity, proposals).unwrap(),
+                &ManualControl::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, ChainSubmissionResult::Confirmed(_)));
+    }
+}
+
+#[tokio::test]
+async fn exact_recovery_confirms_complete_ordered_batch_layout() {
+    let identity = batch_identity(0);
+    let proposals = vec![1, 2, 5];
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    for response in tree_responses(&[[8; 32], [3; 32], [4; 32], [4; 32], [4; 32], [7; 32]]) {
+        transport.queue(Ok(response));
+    }
+
+    let result = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    )
+    .advance_with_recovery(
+        StoreAdvancementRequest::vote_batch(identity, proposals).unwrap(),
+        ChainRecoveryMode::ExactTree,
+        &ManualControl::default(),
+    )
+    .await
+    .unwrap();
+
+    let ChainSubmissionResult::Confirmed(confirmation) = result else {
+        panic!("complete ordered batch layout must confirm")
+    };
+    assert_eq!(
+        confirmation.source(),
+        super::super::ChainSubmissionConfirmationSource::Tree
+    );
+    assert_eq!(confirmation.final_van_position(), 1);
+    assert_eq!(confirmation.vote_commitment_positions(), &[2, 3, 4]);
+    assert_eq!(transport.methods(), vec!["POST", "GET", "GET"]);
+}
+
+#[tokio::test]
+async fn reordered_batch_confirmation_leaves_tracking_authoritative() {
+    let identity = batch_identity(0);
+    let proposals = vec![1, 2, 5];
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Ok(accepted_batch(&identity)));
+    transport.queue(Ok(batch_confirmed(&identity, &[1, 5, 2])));
+
+    let failure = coordinator(transport, Arc::clone(&store), ManualClock::new(100), 10)
+        .advance(
+            StoreAdvancementRequest::vote_batch(identity.clone(), proposals).unwrap(),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Protocol);
+    assert_eq!(
+        store.record(&identity).unwrap().durable_state(),
+        ChainSubmissionState::Tracking
+    );
+    assert!(store.projection(&identity).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_nonadjacent_batch_tree_members_authorize_retry_without_confirmation() {
+    let identity = batch_identity(0);
+    let proposals = vec![1, 2, 5];
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    for response in tree_responses(&[[3; 32], [4; 32], [8; 32], [4; 32], [4; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.queue(Ok(accepted_batch(&identity)));
+
+    let protocol = ChainProtocolClient::new(
+        Arc::clone(&transport),
+        Network::Testnet,
+        &[
+            "https://one.example".to_string(),
+            "https://two.example".to_string(),
+        ],
+    )
+    .unwrap();
+    let coordinator = ChainSubmissionCoordinator::new(
+        protocol,
+        Arc::clone(&store),
+        ManualClock::new(100),
+        CoordinatorPolicy::new(Duration::from_secs(10), 2, vec![Duration::from_secs(1)]).unwrap(),
+    )
+    .unwrap();
+
+    let result = coordinator
+        .advance_with_recovery(
+            StoreAdvancementRequest::vote_batch(identity.clone(), proposals).unwrap(),
+            ChainRecoveryMode::ExactTree,
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: Some(_),
+            ..
+        })
+    ));
+    assert_eq!(
+        store
+            .record(&identity)
+            .unwrap()
+            .committed_post_reservations(),
+        2
+    );
+    assert!(store.projection(&identity).is_none());
+}
+
+#[tokio::test]
 async fn recovering_candidate_is_polled_before_no_match_retry_reservation() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
@@ -831,15 +1008,15 @@ fn derived_batch(
     let votes = ordered_proposal_ids
         .iter()
         .map(|proposal_id| VoteCommitmentWire {
-            van_nullifier: hex::encode([2; 32]),
-            vote_authority_note_new: hex::encode([3; 32]),
-            vote_commitment: hex::encode([4; 32]),
+            van_nullifier: BASE64_STANDARD.encode([2; 32]),
+            vote_authority_note_new: BASE64_STANDARD.encode([3; 32]),
+            vote_commitment: BASE64_STANDARD.encode([4; 32]),
             proposal_id: *proposal_id,
             proof: hex::encode([5; 8]),
             vote_round_id: hex::encode(identity.vote_round_id()),
             anchor_height: 1,
-            r_vpk: hex::encode([6; 32]),
-            vote_auth_sig: hex::encode([7; 64]),
+            r_vpk: BASE64_STANDARD.encode([6; 32]),
+            vote_auth_sig: BASE64_STANDARD.encode([7; 64]),
         })
         .collect();
     DerivedChainSubmission::new(
@@ -860,6 +1037,23 @@ fn accepted() -> ChainHttpResponse {
     ChainHttpResponse::json(
         200,
         format!(r#"{{"tx_hash":"{HASH}","code":0,"log":""}}"#).into_bytes(),
+    )
+}
+
+fn accepted_batch(identity: &ChainSubmissionIdentity) -> ChainHttpResponse {
+    let ChainSubmissionTarget::VoteBatch {
+        ordered_batch_digest,
+    } = identity.target()
+    else {
+        panic!("batch response requires a vote-batch identity")
+    };
+    ChainHttpResponse::json(
+        200,
+        format!(
+            r#"{{"tx_hash":"{HASH}","code":0,"log":"","batch_digest":"{}"}}"#,
+            hex::encode(ordered_batch_digest)
+        )
+        .into_bytes(),
     )
 }
 
@@ -939,6 +1133,64 @@ fn confirmed(identity: &ChainSubmissionIdentity) -> ChainHttpResponse {
             "code": 0,
             "log": "",
             "events": [event],
+        }))
+        .unwrap(),
+    )
+}
+
+fn batch_confirmed(
+    identity: &ChainSubmissionIdentity,
+    ordered_proposal_ids: &[u32],
+) -> ChainHttpResponse {
+    let proposal_ids = ordered_proposal_ids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let positions = (0..ordered_proposal_ids.len())
+        .map(|index| (8 + index as u64).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let nullifiers = std::iter::repeat_n(hex::encode([2; 32]), ordered_proposal_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let event = TxEvent {
+        event_type: "cast_vote_batch".to_string(),
+        attributes: vec![
+            TxEventAttribute {
+                key: "vote_round_id".to_string(),
+                value: hex::encode(identity.vote_round_id()),
+            },
+            TxEventAttribute {
+                key: "batch_digest".to_string(),
+                value: hex::encode([9; 32]),
+            },
+            TxEventAttribute {
+                key: "batch_size".to_string(),
+                value: ordered_proposal_ids.len().to_string(),
+            },
+            TxEventAttribute {
+                key: "final_van_leaf_index".to_string(),
+                value: "7".to_string(),
+            },
+            TxEventAttribute {
+                key: "vote_commitment_leaf_indices".to_string(),
+                value: positions,
+            },
+            TxEventAttribute {
+                key: "proposal_ids".to_string(),
+                value: proposal_ids,
+            },
+            TxEventAttribute {
+                key: "van_nullifiers".to_string(),
+                value: nullifiers,
+            },
+        ],
+    };
+    ChainHttpResponse::json(
+        200,
+        serde_json::to_vec(&serde_json::json!({
+            "height": "9", "code": 0, "log": "", "events": [event]
         }))
         .unwrap(),
     )
@@ -1795,6 +2047,7 @@ async fn exclusive_round_gate_prevents_batch_roster_reads() {
         .ok()
         .expect("round should initially be idle");
     let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Err(ChainTransportError::definitely_unsent("refused")));
     let (advance_started, advance_started_rx) = tokio::sync::oneshot::channel();
     let task = {
         let coordinator = coordinator(
@@ -1832,10 +2085,10 @@ async fn exclusive_round_gate_prevents_batch_roster_reads() {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Protocol);
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::Transport);
     assert_eq!(store.batch_roster_reads(), 1);
     assert!(store.record(&batch).is_none());
-    assert!(transport.methods().is_empty());
+    assert_eq!(transport.methods(), vec!["POST"]);
 }
 
 #[test]
@@ -2099,6 +2352,66 @@ async fn same_identity_concurrency_releases_only_one_post() {
             coordinator
                 .advance(
                     StoreAdvancementRequest::vote(identity),
+                    &ManualControl::default(),
+                )
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(transport.methods(), vec!["POST"]);
+    release.notify_one();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+
+    assert_eq!(transport.methods(), vec!["POST", "GET", "GET"]);
+    assert_eq!(
+        store
+            .record(&identity)
+            .unwrap()
+            .committed_post_reservations(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn same_batch_concurrency_releases_only_one_atomic_post() {
+    let identity = batch_identity(0);
+    let proposals = vec![1, 2];
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Ok(accepted_batch(&identity)));
+    transport.queue(Ok(pending()));
+    transport.queue(Ok(pending()));
+    let (entered, release) = transport.gate_first_post();
+    let coordinator = Arc::new(coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    ));
+
+    let first = {
+        let coordinator = Arc::clone(&coordinator);
+        let identity = identity.clone();
+        let proposals = proposals.clone();
+        tokio::spawn(async move {
+            coordinator
+                .advance(
+                    StoreAdvancementRequest::vote_batch(identity, proposals).unwrap(),
+                    &ManualControl::default(),
+                )
+                .await
+        })
+    };
+    entered.notified().await;
+    let second = {
+        let coordinator = Arc::clone(&coordinator);
+        let identity = identity.clone();
+        tokio::spawn(async move {
+            coordinator
+                .advance(
+                    StoreAdvancementRequest::vote_batch(identity, proposals).unwrap(),
                     &ManualControl::default(),
                 )
                 .await

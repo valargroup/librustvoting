@@ -29,7 +29,7 @@ mod store;
 mod transport;
 
 pub use client::{
-    AdvanceDelegation, AdvanceVote, ChainRecoveryMode, ChainSubmissionClient,
+    AdvanceDelegation, AdvanceVote, AdvanceVoteBatch, ChainRecoveryMode, ChainSubmissionClient,
     ChainSubmissionClientConfig, ChainSubmissionControl,
 };
 #[cfg(test)]
