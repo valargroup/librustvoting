@@ -979,8 +979,14 @@ deletion skip that impossible gate and remain available.
 Version 19 adds the `submitted_without_hash` durable state. Existing version-18
 databases are upgraded incrementally by rebuilding `chain_submissions` inside
 the migration transaction while preserving every row and reinstalling its
-indexes and triggers. `002_chain_submissions.sql` and `001_init.sql` create the
-same final schema for fresh databases.
+indexes and triggers. The rebuild also carries a version-18 database created
+with the original `proposal_id BETWEEN 1 AND 15` bound to the current 1..=50
+bound; it is the only upgrade path for such a database, because the current
+`002_chain_submissions.sql` is applied only to version-17 databases and the
+version-18 fingerprint check rejects the older DDL. `002_chain_submissions.sql`
+and `001_init.sql` create the same final schema for fresh databases
+(`v18_submission_rows_migrate_incrementally_to_v19`,
+`migrate_from_launch_version_matches_a_fresh_schema`).
 
 The `17 -> 18` step is schema only. It creates `chain_submissions` and imports
 nothing: every version-17 row of `votes`, `bundles`, and `rounds` is preserved
@@ -1430,13 +1436,13 @@ Public-lifecycle engine coverage is anchored by
 `reset_voting_session_state_scopes_submission_protection_to_its_bundle`,
 `reset_voting_session_state_preserves_proved_bundle_setup_fields`,
 `noncanonical_legacy_round_ids_remain_deletable`,
-`lifecycle_owned_delegation_and_vote_yield_no_legacy_steps`,
-`bound_hashless_recovery_is_contained_until_tree_recovery_lands`,
+`lifecycle_owned_delegation_and_vote_yield_typed_advance_steps`,
+`bound_hashless_recovery_yields_a_typed_advance_step`,
 `rejected_singleton_vote_never_yields_submit_or_poll_work`,
 `rejected_vote_batch_never_reschedules_its_members`,
 `rejected_delegation_never_yields_delegate_work`,
 `round_snapshot_reports_lifecycle_owned_recovery`,
 `lifecycle_owned_vote_locks_conflicting_intent`,
 `public_vote_writers_reserve_before_validation_and_wait_on_contention`,
-`cancellation_during_dispatch_persists_recovery`, and
-`operation_epoch_change_during_dispatch_persists_recovery`.
+`cancellation_during_final_dispatch_persists_hashless_recovery`, and
+`operation_epoch_change_during_final_dispatch_persists_hashless_recovery`.

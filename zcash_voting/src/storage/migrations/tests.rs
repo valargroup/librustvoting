@@ -55,11 +55,17 @@ fn v17_schema() -> String {
     without_chain_submissions(include_str!("001_init.sql"))
 }
 
+/// The `chain_submissions` DDL exactly as shipped at version 18: no
+/// `submitted_without_hash` state and the original 15-proposal bound.
 fn v18_chain_submission_schema() -> String {
     include_str!("002_chain_submissions.sql")
         .replace(
             "'recovering','submitted_without_hash','confirmed'",
             "'recovering','confirmed'",
+        )
+        .replace(
+            "proposal_id BETWEEN 1 AND 50",
+            "proposal_id BETWEEN 1 AND 15",
         )
         .replace(
             "    CHECK (state != 'submitted_without_hash'\n        OR (candidate_transaction_hash IS NULL\n            AND confirmed_transaction_hash IS NULL AND final_van_position IS NULL\n            AND vote_commitment_positions IS NULL AND diagnostic_kind IS NOT NULL)),\n",
@@ -421,6 +427,27 @@ fn v18_submission_rows_migrate_incrementally_to_v19() {
         rusqlite::params![vec![0x41_u8; 32], ROUND, vec![0x42_u8; 32]],
     )
     .unwrap();
+    // The shipped v18 bound admits proposal 15 and rejects 16.
+    let insert_v18_proposal = |identity_byte: u8, proposal_id: i64| {
+        conn.execute(
+            "INSERT INTO chain_submissions
+             (identity_key, round_id, wallet_id, network, bundle_index, kind,
+              proposal_id, generation_digest, state, committed_post_reservations,
+              created_at, updated_at)
+             VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', ?3, ?4,
+                     'submitting', 1, 9, 9)",
+            rusqlite::params![
+                vec![identity_byte; 32],
+                ROUND,
+                proposal_id,
+                vec![0x42_u8; 32]
+            ],
+        )
+    };
+    insert_v18_proposal(0x43, 15).unwrap();
+    assert!(is_constraint_violation(
+        &insert_v18_proposal(0x44, 16).unwrap_err()
+    ));
     conn.pragma_update(None, "user_version", 18).unwrap();
 
     migrate(&mut conn).unwrap();
@@ -437,11 +464,32 @@ fn v18_submission_rows_migrate_incrementally_to_v19() {
         .unwrap()
     );
 
+    // The rebuild widened the bound: proposal 15 survived and 50 is accepted.
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM chain_submissions WHERE proposal_id = 15",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+    conn.execute(
+        "INSERT INTO chain_submissions
+         (identity_key, round_id, wallet_id, network, bundle_index, kind,
+          proposal_id, generation_digest, state, committed_post_reservations,
+          created_at, updated_at)
+         VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 50, ?3,
+                 'submitting', 1, 9, 9)",
+        rusqlite::params![vec![0x45_u8; 32], ROUND, vec![0x42_u8; 32]],
+    )
+    .unwrap();
     assert_eq!(
         conn.query_row(
             "SELECT state, committed_post_reservations, tracking_started_at, diagnostic
-               FROM chain_submissions",
-            [],
+               FROM chain_submissions
+              WHERE identity_key = ?1",
+            [vec![0x41_u8; 32]],
             |row| Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
@@ -463,8 +511,9 @@ fn v18_submission_rows_migrate_incrementally_to_v19() {
     .unwrap();
     assert_eq!(
         conn.query_row(
-            "SELECT state, tracking_started_at FROM chain_submissions",
-            [],
+            "SELECT state, tracking_started_at FROM chain_submissions
+              WHERE identity_key = ?1",
+            [vec![0x41_u8; 32]],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .unwrap(),
