@@ -1331,7 +1331,8 @@ opens only filesystem databases, accepts non-UTF-8 native paths on platforms
 where SQLite supports them, and disables SQLite URI interpretation. The path is
 resolved before opening, including a dangling symlink whose target database
 must be created, and the same canonical path is given to SQLite and the
-authority registry. A symlink cannot therefore split the opened database from
+authority registry. SQLite's final no-follow open makes a post-resolution
+symlink change fail closed, so a symlink cannot split the opened database from
 its lifecycle authority;
 `VotingDb::open_in_memory` creates an independent database with a private
 authority. The legacy UTF-8 string constructor accepts only filesystem paths.

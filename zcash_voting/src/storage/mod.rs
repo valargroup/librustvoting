@@ -115,14 +115,7 @@ impl VotingDb {
     pub fn open_path(path: &Path) -> Result<Self, VotingError> {
         validate_database_path(path)?;
         let canonical_path = canonical_database_path(path)?;
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let connection = Connection::open_with_flags(&canonical_path, flags).map_err(|error| {
-            VotingError::Internal {
-                message: format!("failed to open database: {error}"),
-            }
-        })?;
+        let connection = open_canonical_database_file(&canonical_path)?;
         let database_authority = DatabaseAuthority::for_file(canonical_path)?;
 
         Self::initialize(connection, database_authority)
@@ -192,6 +185,17 @@ impl VotingDb {
     ) -> &crate::chain_submission::coordination::SubmissionCoordination {
         self.database_authority.chain_submission()
     }
+}
+
+/// Opens a resolved database path without following a later symlink change.
+fn open_canonical_database_file(canonical_path: &Path) -> Result<Connection, VotingError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Connection::open_with_flags(canonical_path, flags).map_err(|error| VotingError::Internal {
+        message: format!("failed to open database: {error}"),
+    })
 }
 
 /// Rejects SQLite's non-filesystem magic names before any database is opened.

@@ -85,7 +85,8 @@ native paths, including non-UTF-8 paths on platforms where SQLite supports
 them, and disables SQLite URI interpretation. It resolves the target before
 opening, including a dangling symlink whose target database must be created,
 and passes that same canonical path to SQLite and the authority registry. A
-symlink cannot therefore split one opened file from its authority;
+final no-follow open makes a post-resolution symlink change fail closed, so a
+symlink cannot split one opened file from its authority;
 `VotingDb::open_in_memory` creates one private authority for one independent
 in-memory database. The legacy UTF-8 string constructor accepts only filesystem
 paths. Empty paths, SQLite's `:memory:` magic name, and `file:` URIs are

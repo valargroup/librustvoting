@@ -256,6 +256,25 @@ fn dangling_symlink_and_created_target_share_one_database_authority() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn final_database_open_rejects_a_symlink_added_after_resolution() {
+    let directory = temporary_path("post-resolution-symlink-parent");
+    std::fs::create_dir_all(&directory).unwrap();
+    let target_path = directory.join("target.sqlite");
+    let requested_path = directory.join("requested.sqlite");
+    drop(VotingDb::open_path(&target_path).unwrap());
+
+    let resolved_path = canonical_database_path(&requested_path).unwrap();
+    symlink(&target_path, &requested_path).unwrap();
+
+    assert!(open_canonical_database_file(&resolved_path).is_err());
+
+    std::fs::remove_file(requested_path).unwrap();
+    remove_sqlite_files(&target_path);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_file_paths_share_one_database_authority() {
