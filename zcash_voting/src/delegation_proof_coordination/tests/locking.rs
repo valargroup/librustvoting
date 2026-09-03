@@ -6,6 +6,8 @@ use std::{
     thread,
 };
 
+use crate::VotingError;
+
 use super::super::{coordinate, DelegationProofIdentity};
 
 fn identity(wallet_id: &str, bundle_index: u32) -> DelegationProofIdentity {
@@ -37,7 +39,7 @@ fn identical_proof_work_waits_and_reuses_durable_completion() {
                         released = wake.wait(released).unwrap();
                     }
                     proof_ready.store(true, Ordering::SeqCst);
-                    true
+                    Ok(true)
                 },
             )
         })
@@ -55,10 +57,10 @@ fn identical_proof_work_waits_and_reuses_durable_completion() {
                 || waited.store(true, Ordering::SeqCst),
                 |_| {
                     if proof_ready.load(Ordering::SeqCst) {
-                        false
+                        Ok(false)
                     } else {
                         generation_count.fetch_add(1, Ordering::SeqCst);
-                        true
+                        Ok(true)
                     }
                 },
             )
@@ -72,8 +74,8 @@ fn identical_proof_work_waits_and_reuses_durable_completion() {
     *released.lock().unwrap() = true;
     wake.notify_all();
 
-    assert!(leader.join().unwrap());
-    assert!(!follower.join().unwrap());
+    assert!(leader.join().unwrap().unwrap());
+    assert!(!follower.join().unwrap().unwrap());
     assert_eq!(generation_count.load(Ordering::SeqCst), 1);
 }
 
@@ -97,8 +99,10 @@ fn different_bundles_enter_proof_work_concurrently() {
                     max_active.fetch_max(current, Ordering::SeqCst);
                     both_entered.wait();
                     active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
                 },
-            );
+            )
+            .unwrap();
         }));
     }
 
@@ -127,7 +131,9 @@ fn failed_leader_releases_the_waiting_retry() {
                     while !*released {
                         released = wake.wait(released).unwrap();
                     }
-                    Err::<(), _>("leader failed")
+                    Err::<(), _>(VotingError::ProofFailed {
+                        message: "leader failed".to_string(),
+                    })
                 },
             )
         })
@@ -141,7 +147,7 @@ fn failed_leader_releases_the_waiting_retry() {
             coordinate(
                 identity("retry-wallet", 0),
                 || waited.store(true, Ordering::SeqCst),
-                |_| Ok::<_, &str>("generated after retry"),
+                |_| Ok("generated after retry"),
             )
         })
     };
@@ -152,6 +158,9 @@ fn failed_leader_releases_the_waiting_retry() {
     *released.lock().unwrap() = true;
     wake.notify_all();
 
-    assert_eq!(leader.join().unwrap(), Err("leader failed"));
-    assert_eq!(follower.join().unwrap(), Ok("generated after retry"));
+    assert!(matches!(
+        leader.join().unwrap(),
+        Err(VotingError::ProofFailed { message }) if message == "leader failed"
+    ));
+    assert_eq!(follower.join().unwrap().unwrap(), "generated after retry");
 }

@@ -120,7 +120,11 @@ input validation, persisted-proof loading, PIR cache access, generation, and
 proof persistence even if the host changes the database's selected wallet
 while the operation is waiting or running. Supplied bundle notes and delegation
 keys are validated against that captured wallet before any persisted proof is
-accepted for reuse.
+accepted for reuse. Validation reproduces the target-bound VAN commitment, so
+a same-network, same-round hotkey substitution cannot reuse another target's
+proof. A progress callback that reenters proof generation for the same identity
+on the same thread fails with `VotingError::Busy` rather than waiting on its own
+lock.
 
 ## Identity and semantic generation
 
@@ -1249,6 +1253,8 @@ Tests cover:
   wallet/round/bundle while distinct bundles remain parallel;
 - reused delegation proofs still reject mismatched notes or keys, and an
   account switch cannot retarget a waiting proof operation or its PIR cache;
+- a same-round hotkey substitution cannot reuse a persisted proof, and
+  same-thread progress callback reentry fails without deadlocking;
 - bundle locking prevents two successors from consuming the same VAN;
 - a confirmed vote or batch refuses a later delegation reservation for its
   bundle before derivation or dispatch;
@@ -1337,6 +1343,7 @@ Delegation proof coordination is anchored by
 `failed_leader_releases_the_waiting_retry`. Durable reuse and wallet capture
 are anchored by `reused_proof_rejects_mismatched_notes`,
 `reused_proof_rejects_mismatched_keys`,
+`reentrant_progress_reporter_returns_busy`,
 `wallet_switch_does_not_retarget_waiting_proof`, and
 `pir_fetch_persists_under_captured_wallet`.
 

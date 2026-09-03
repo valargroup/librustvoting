@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     backend::pasta_curves::{
-        group::{Group, GroupEncoding},
+        group::{ff::PrimeField, Group, GroupEncoding},
         pallas,
     },
     delegate::DelegationKeys,
@@ -33,7 +33,11 @@ pub(super) fn note() -> NoteInfo {
 }
 
 pub(super) fn keys(network: Network, round_byte: u8) -> DelegationKeys {
-    let voting_hotkey = VotingHotkey::from_stored_secret(&[0x21; 64], network).unwrap();
+    keys_for_hotkey(network, round_byte, 0x21)
+}
+
+pub(super) fn keys_for_hotkey(network: Network, round_byte: u8, hotkey_byte: u8) -> DelegationKeys {
+    let voting_hotkey = VotingHotkey::from_stored_secret(&[hotkey_byte; 64], network).unwrap();
     let target = RoundBoundVotingHotkeyTarget::from_validated_parts(
         voting_hotkey.delegation_target(),
         "vote-chain-1".to_string(),
@@ -75,6 +79,19 @@ fn seed_wallet(db: &VotingDb, wallet_id: &str, proof_byte: u8) {
         nullifier_imt_root: vec![0x32; 32],
     };
     let selected_note = note();
+    let delegation_keys = keys(Network::Testnet, 1);
+    let (g_d_x, pk_d_x) =
+        crate::action::derive_hotkey_x_coords_from_raw_address(&delegation_keys.hotkey_raw_address)
+            .unwrap();
+    let van_comm_rand = pallas::Base::from(9).to_repr().to_vec();
+    let gov_comm = crate::governance::construct_van(
+        &g_d_x,
+        &pk_d_x,
+        13_000_000,
+        &hex::decode(ROUND_ID).unwrap(),
+        &van_comm_rand,
+    )
+    .unwrap();
     let conn = db.conn();
     queries::insert_round(&conn, wallet_id, Network::Testnet, &params, None).unwrap();
     queries::insert_bundle_notes(&conn, ROUND_ID, wallet_id, 0, &[selected_note]).unwrap();
@@ -83,7 +100,7 @@ fn seed_wallet(db: &VotingDb, wallet_id: &str, proof_byte: u8) {
         ROUND_ID,
         wallet_id,
         0,
-        &[0x40; 32],
+        &van_comm_rand,
         &[],
         &[0x41; 32],
         &[],
@@ -92,7 +109,7 @@ fn seed_wallet(db: &VotingDb, wallet_id: &str, proof_byte: u8) {
         &[0x42; 32],
         &[0x43; 32],
         &[0x44; 32],
-        &[proof_byte.wrapping_add(3); 32],
+        &gov_comm,
         13_000_000,
         0,
         &[],
@@ -111,7 +128,7 @@ fn seed_wallet(db: &VotingDb, wallet_id: &str, proof_byte: u8) {
         &gov_nullifiers,
         &[proof_byte.wrapping_add(1); 32],
         &[proof_byte.wrapping_add(2); 32],
-        &[proof_byte.wrapping_add(3); 32],
+        &gov_comm,
     )
     .unwrap();
 }

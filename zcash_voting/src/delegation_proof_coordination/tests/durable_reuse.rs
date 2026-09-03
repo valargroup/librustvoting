@@ -15,8 +15,8 @@ use crate::{
 use super::{
     super::{coordinate, DelegationProofIdentity},
     fixtures::{
-        db_with_persisted_proofs, keys, note, pir_client, ROUND_ID, WALLET_A, WALLET_A_PROOF_BYTE,
-        WALLET_B,
+        db_with_persisted_proofs, keys, keys_for_hotkey, note, pir_client, ROUND_ID, WALLET_A,
+        WALLET_A_PROOF_BYTE, WALLET_B,
     },
 };
 
@@ -60,6 +60,10 @@ fn reused_proof_rejects_mismatched_keys() {
             keys(Network::Testnet, 2),
             "voting target round does not match delegation round",
         ),
+        (
+            keys_for_hotkey(Network::Testnet, 1, 0x22),
+            "delegation keys hotkey target does not match stored bundle target",
+        ),
     ] {
         let error = ensure_proof(
             &db,
@@ -75,6 +79,47 @@ fn reused_proof_rejects_mismatched_keys() {
         assert!(matches!(error, VotingError::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains(expected_message), "{error}");
     }
+}
+
+#[test]
+fn reentrant_progress_reporter_returns_busy() {
+    let db = Arc::new(db_with_persisted_proofs());
+    let reentrant_error = Arc::new(Mutex::new(None));
+    let callback_error = Arc::clone(&reentrant_error);
+    let callback_db = Arc::clone(&db);
+    let progress = DelegationProgressBridge::new(move |event| {
+        if event == DelegationProgress::ProofComplete {
+            let error = ensure_proof(
+                &callback_db,
+                ROUND_ID,
+                0,
+                &[note()],
+                &keys(Network::Testnet, 1),
+                &pir_client(),
+                &crate::types::NoopProgressReporter,
+            )
+            .expect_err("same-thread proof reentry must not wait on its own lock");
+            *callback_error.lock().unwrap() = Some(error);
+        }
+    });
+
+    let completion = ensure_proof(
+        &db,
+        ROUND_ID,
+        0,
+        &[note()],
+        &keys(Network::Testnet, 1),
+        &pir_client(),
+        &progress,
+    )
+    .unwrap();
+
+    assert_eq!(completion.status, DelegationProofStatus::Reused);
+    assert!(matches!(
+        reentrant_error.lock().unwrap().take(),
+        Some(VotingError::Busy { message })
+            if message.contains("delegation proof generation is already active on this thread")
+    ));
 }
 
 #[test]
@@ -97,8 +142,9 @@ fn wallet_switch_does_not_retarget_waiting_proof() {
                     while !*released {
                         released = wake.wait(released).unwrap();
                     }
+                    Ok(())
                 },
-            );
+            )
         })
     };
     leader_started.wait();
@@ -134,7 +180,7 @@ fn wallet_switch_does_not_retarget_waiting_proof() {
     *released.lock().unwrap() = true;
     wake.notify_all();
 
-    leader.join().unwrap();
+    leader.join().unwrap().unwrap();
     let completion = follower.join().unwrap().unwrap();
     assert_eq!(completion.status, DelegationProofStatus::Reused);
     assert_eq!(completion.proof.bytes, vec![WALLET_A_PROOF_BYTE; 96]);

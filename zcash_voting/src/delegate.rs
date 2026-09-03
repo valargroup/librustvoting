@@ -1176,6 +1176,8 @@ pub fn signing_request(
 ///
 /// Witnesses and PIR proof precompute data must already be present. The proof
 /// result is checked against PCZT-derived public fields before persistence.
+/// Calls made reentrantly from a progress reporter for the same bundle return
+/// [`VotingError::Busy`].
 pub fn prove(
     db: &VotingDb,
     round_id: &str,
@@ -1198,7 +1200,8 @@ pub fn prove(
 /// # Errors
 ///
 /// Returns [`VotingError`] when durable state cannot be read or validated, or
-/// when proof generation or persistence fails.
+/// when proof generation or persistence fails. A call made reentrantly from a
+/// progress reporter for the same bundle returns [`VotingError::Busy`].
 pub fn ensure_proof(
     db: &VotingDb,
     round_id: &str,
@@ -1216,6 +1219,7 @@ pub fn ensure_proof(
             db.validate_delegation_proof_inputs(identity, notes, keys)?;
 
             if let Some(proof) = load_persisted_proof(db, identity)? {
+                db.validate_delegation_proof_target(identity, keys)?;
                 stages.on_progress(DelegationProgress::ProofComplete);
                 return Ok(DelegationProofCompletion {
                     proof,

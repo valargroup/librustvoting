@@ -74,6 +74,44 @@ fn validate_delegation_keys_for_round(
     keys.validate_target_round(params)
 }
 
+fn validate_delegation_target_for_bundle(
+    conn: &rusqlite::Connection,
+    params: &VotingRoundParams,
+    identity: &DelegationProofIdentity,
+    keys: &DelegationKeys,
+) -> Result<(), VotingError> {
+    let binding = queries::load_delegation_target_binding_inputs(
+        conn,
+        identity.round_id(),
+        identity.wallet_id(),
+        identity.bundle_index(),
+    )?;
+    let (g_d_x, pk_d_x) =
+        crate::action::derive_hotkey_x_coords_from_raw_address(&keys.hotkey_raw_address)?;
+    let vote_round_id =
+        hex::decode(&params.vote_round_id).map_err(|error| VotingError::Internal {
+            message: format!(
+                "invalid stored vote_round_id hex '{}': {error}",
+                params.vote_round_id
+            ),
+        })?;
+    let expected_van = crate::governance::construct_van(
+        &g_d_x,
+        &pk_d_x,
+        binding.total_note_value,
+        &vote_round_id,
+        &binding.van_comm_rand,
+    )?;
+    if expected_van != binding.gov_comm {
+        return Err(VotingError::InvalidInput {
+            message: "delegation keys hotkey target does not match stored bundle target"
+                .to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 fn validate_network_matches_round(
     stored_network: Network,
     requested_network: Network,
@@ -1294,6 +1332,23 @@ impl VotingDb {
             identity.bundle_index(),
             notes,
         )
+    }
+
+    /// Validates that supplied keys reproduce a persisted bundle's target-bound
+    /// VAN commitment before its proof is reused.
+    pub(crate) fn validate_delegation_proof_target(
+        &self,
+        identity: &DelegationProofIdentity,
+        keys: &DelegationKeys,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let (params, stored_network) = queries::load_round_params_with_network(
+            &conn,
+            identity.round_id(),
+            identity.wallet_id(),
+        )?;
+        validate_delegation_keys_for_round(&params, stored_network, keys)?;
+        validate_delegation_target_for_bundle(&conn, &params, identity, keys)
     }
 
     /// Builds and persists the real delegation ZKP (#1) for a captured wallet.
