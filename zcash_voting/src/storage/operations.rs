@@ -3303,18 +3303,6 @@ mod tests {
         queries::insert_bundle(&db.conn(), &round_id, W, 1, &[1]).unwrap();
 
         assert_eq!(db.delete_skipped_bundles(&round_id, 1).unwrap(), 1);
-        db.conn()
-            .execute(
-                "INSERT INTO chain_submissions
-                 (identity_key, round_id, wallet_id, network, bundle_index,
-                  kind, proposal_id, generation_digest, state, committed_post_reservations,
-                  diagnostic_kind, diagnostic, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, NULL,
-                         'recovering', 0, 'recovery_unavailable',
-                         'legacy generation cannot be reconstructed', 10, 10)",
-                rusqlite::params![vec![0x41_u8; 32], &round_id, W],
-            )
-            .unwrap();
 
         db.clear_round(&round_id).unwrap();
         assert!(!db.has_round(&round_id).unwrap());

@@ -105,10 +105,9 @@ pub(crate) fn network_name(network: Network) -> &'static str {
 
 /// Derives the durable primary key for one submission identity.
 ///
-/// This is the only identity key in the system. Runtime reservation and the
-/// version-17 migration both call it, so a migrated row and a natively reserved
-/// row for the same identity collide on the primary key instead of needing a
-/// separate guard namespace and exclusion checks.
+/// This is the only identity key in the system, so two reservations for the
+/// same identity collide on the primary key instead of needing a separate
+/// namespace and exclusion checks.
 ///
 /// Every variable-length component is length-prefixed, so no two distinct
 /// identities can produce the same key by rearranging their field boundaries.

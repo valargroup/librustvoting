@@ -2255,43 +2255,6 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
     proposal_id: u32,
     choice: Option<u32>,
 ) -> Result<(), VotingError> {
-    let migration_guard_conflict: bool = conn
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM chain_submissions submission
-                 JOIN votes vote
-                   ON vote.round_id=submission.round_id
-                  AND vote.wallet_id=submission.wallet_id
-                  AND vote.bundle_index=submission.bundle_index
-                  AND vote.proposal_id=submission.proposal_id
-                WHERE submission.round_id=:round_id
-                  AND submission.wallet_id=:wallet_id
-                  AND submission.kind='vote'
-                  AND submission.generation_digest IS NULL
-                  AND submission.proposal_id=:proposal_id
-                  AND (:choice IS NULL OR vote.choice != :choice)
-             )",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":proposal_id": proposal_id as i64,
-                ":choice": choice.map(i64::from),
-            },
-            |row| row.get(0),
-        )
-        .map_err(|error| VotingError::Internal {
-            message: format!(
-                "failed to check migration guard before changing ballot intent: {error}"
-            ),
-        })?;
-    if migration_guard_conflict {
-        return Err(VotingError::InvalidInput {
-            message: format!(
-                "round {round_id} proposal {proposal_id} has lifecycle-owned legacy evidence and its ballot intent is locked"
-            ),
-        });
-    }
-
     let mut stmt = conn
         .prepare(
             "SELECT bundle_index, choice, commitment_bundle_json

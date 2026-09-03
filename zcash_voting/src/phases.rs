@@ -61,8 +61,6 @@ pub enum VotePhase {
     Submitted,
     /// Submission or reconciliation is owned by the chain lifecycle facade.
     SubmissionManaged,
-    /// A migration-only authoritative marker proves the legacy vote completed.
-    LegacyConfirmed,
     /// The vote commitment tree position has been recorded.
     Confirmed,
 }
@@ -75,7 +73,6 @@ impl VotePhase {
             Self::Committed => "committed",
             Self::Submitted => "submitted",
             Self::SubmissionManaged => "submission_managed",
-            Self::LegacyConfirmed => "legacy_confirmed",
             Self::Confirmed => "confirmed",
         }
     }
@@ -147,7 +144,6 @@ impl WorkflowPhase {
             VotePhase::Committed => Self::Signed,
             VotePhase::Submitted => Self::SubmittedVote,
             VotePhase::SubmissionManaged => Self::SubmissionManaged,
-            VotePhase::LegacyConfirmed => Self::Confirmed,
             VotePhase::Confirmed => Self::Confirmed,
         }
     }
@@ -188,14 +184,7 @@ impl VotingDb {
                         EXISTS(SELECT 1 FROM chain_submissions s
                                 WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
                                   AND s.bundle_index=b.bundle_index AND s.kind='delegation'
-                                  AND s.state IN ('submitting','tracking','recovering','rejected')
-                                  AND NOT EXISTS(SELECT 1 FROM chain_submissions successor
-                                                   WHERE successor.round_id=s.round_id
-                                                     AND successor.wallet_id=s.wallet_id
-                                                     AND successor.network=s.network
-                                                     AND successor.bundle_index=s.bundle_index
-                                                     AND successor.kind IN ('vote','vote_batch')
-                                                     AND successor.state='confirmed'))
+                                  AND s.state IN ('submitting','tracking','recovering','rejected'))
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -250,14 +239,7 @@ impl VotingDb {
                         EXISTS(SELECT 1 FROM chain_submissions s
                                 WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
                                   AND s.bundle_index=b.bundle_index AND s.kind='delegation'
-                                  AND s.state IN ('submitting','tracking','recovering','rejected')
-                                  AND NOT EXISTS(SELECT 1 FROM chain_submissions successor
-                                                   WHERE successor.round_id=s.round_id
-                                                     AND successor.wallet_id=s.wallet_id
-                                                     AND successor.network=s.network
-                                                     AND successor.bundle_index=s.bundle_index
-                                                     AND successor.kind IN ('vote','vote_batch')
-                                                     AND successor.state='confirmed'))
+                                  AND s.state IN ('submitting','tracking','recovering','rejected'))
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -426,7 +408,6 @@ struct VotePhaseEvidence {
     has_vc_position: bool,
     has_recovery_bundle: bool,
     singleton_submission_state: Option<String>,
-    singleton_confirmation_source: Option<String>,
 }
 
 /// Projects vote rows through their authoritative singleton or atomic-batch
@@ -445,7 +426,7 @@ fn load_vote_phases(
                 "SELECT v.bundle_index, v.proposal_id, v.tx_hash IS NOT NULL,
                         v.vc_tree_position IS NOT NULL,
                         v.commitment_bundle_json IS NOT NULL,
-                        singleton.state, singleton.confirmation_source
+                        singleton.state
                    FROM votes v
                    LEFT JOIN chain_submissions singleton
                      ON singleton.round_id=v.round_id
@@ -477,7 +458,6 @@ fn load_vote_phases(
                         has_vc_position: row.get::<_, i64>(3)? != 0,
                         has_recovery_bundle: row.get::<_, i64>(4)? != 0,
                         singleton_submission_state: row.get(5)?,
-                        singleton_confirmation_source: row.get(6)?,
                     })
                 },
             )
@@ -495,10 +475,8 @@ fn load_vote_phases(
     vote_evidence
         .into_iter()
         .map(|evidence| {
-            let singleton_phase = authoritative_submission_phase(
-                evidence.singleton_submission_state.as_deref(),
-                evidence.singleton_confirmation_source.as_deref(),
-            );
+            let singleton_phase =
+                authoritative_submission_phase(evidence.singleton_submission_state.as_deref());
             let batch_phase = batch_phases
                 .get(&(evidence.bundle_index, evidence.proposal_id))
                 .copied();
@@ -515,9 +493,6 @@ fn load_vote_phases(
                     evidence.has_tx_hash,
                     evidence.has_vc_position,
                     evidence.has_recovery_bundle,
-                    false,
-                    false,
-                    false,
                 )
             });
             Ok((evidence.bundle_index, evidence.proposal_id, phase))
@@ -534,8 +509,7 @@ fn load_authoritative_batch_phases(
     let batch_rows = {
         let mut statement = conn
             .prepare(
-                "SELECT bundle_index, ordered_batch_digest, generation_digest,
-                        state, confirmation_source
+                "SELECT bundle_index, ordered_batch_digest, generation_digest, state
                    FROM chain_submissions
                   WHERE round_id=:round_id AND wallet_id=:wallet_id
                     AND kind='vote_batch'
@@ -555,9 +529,8 @@ fn load_authoritative_batch_phases(
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -583,8 +556,8 @@ fn load_authoritative_batch_phases(
     let network = queries::load_round_network(conn, round_id, wallet_id)?;
     let mut phases_by_member = BTreeMap::new();
 
-    for (stored_bundle_index, ordered_digest, generation_digest, state, source) in batch_rows {
-        let Some(phase) = authoritative_submission_phase(Some(&state), source.as_deref()) else {
+    for (stored_bundle_index, ordered_digest, generation_digest, state) in batch_rows {
+        let Some(phase) = authoritative_submission_phase(Some(&state)) else {
             continue;
         };
         let stored_bundle_index =
@@ -616,7 +589,7 @@ fn load_authoritative_batch_phases(
         })?;
         let bound_generation = generation_for_vote_batch(conn, &identity)?;
         let expected_generation_digest = bound_generation.generation().digest();
-        if generation_digest.as_deref() != Some(expected_generation_digest.as_bytes()) {
+        if generation_digest.as_slice() != expected_generation_digest.as_bytes() {
             return Err(VotingError::Internal {
                 message: format!(
                     "authoritative vote batch generation digest does not match persisted members for round={round_id}, bundle={stored_bundle_index}"
@@ -640,16 +613,12 @@ fn load_authoritative_batch_phases(
     Ok(phases_by_member)
 }
 
-fn authoritative_submission_phase(
-    state: Option<&str>,
-    confirmation_source: Option<&str>,
-) -> Option<VotePhase> {
-    match (state, confirmation_source) {
-        (Some("submitting" | "tracking" | "recovering" | "rejected"), _) => {
+fn authoritative_submission_phase(state: Option<&str>) -> Option<VotePhase> {
+    match state {
+        Some("submitting" | "tracking" | "recovering" | "rejected") => {
             Some(VotePhase::SubmissionManaged)
         }
-        (Some("confirmed"), Some("legacy_projection")) => Some(VotePhase::LegacyConfirmed),
-        (Some("confirmed"), _) => Some(VotePhase::Confirmed),
+        Some("confirmed") => Some(VotePhase::Confirmed),
         _ => None,
     }
 }
@@ -757,52 +726,6 @@ mod tests {
         assert_eq!(
             db.delegation_phase(ROUND_ID, 0).unwrap(),
             DelegationPhase::Confirmed
-        );
-    }
-
-    #[test]
-    fn confirmed_batch_supersedes_delegation_in_phase_queries() {
-        let db = db_with_bundle();
-        db.store_van_position(ROUND_ID, 0, 42).unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO chain_submissions
-                   (identity_key, round_id, wallet_id, network, bundle_index,
-                    kind, generation_digest, state, committed_post_reservations,
-                    created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', ?4,
-                         'recovering', 0, 1, 1)",
-                rusqlite::params![vec![0x71_u8; 32], ROUND_ID, WALLET_ID, vec![0x72_u8; 32],],
-            )
-            .unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO chain_submissions
-                   (identity_key, round_id, wallet_id, network, bundle_index,
-                    kind, ordered_batch_digest, generation_digest, state,
-                    committed_post_reservations, confirmation_source,
-                    final_van_position, vote_commitment_positions,
-                    created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote_batch', ?4, ?5,
-                         'confirmed', 0, 'tree', 42, ?6, 2, 2)",
-                rusqlite::params![
-                    vec![0x73_u8; 32],
-                    ROUND_ID,
-                    WALLET_ID,
-                    vec![0x74_u8; 32],
-                    vec![0x75_u8; 32],
-                    vec![1_u8],
-                ],
-            )
-            .unwrap();
-
-        assert_eq!(
-            db.delegation_phase(ROUND_ID, 0).unwrap(),
-            DelegationPhase::Confirmed
-        );
-        assert_eq!(
-            db.delegation_phases(ROUND_ID).unwrap(),
-            vec![(0, DelegationPhase::Confirmed)]
         );
     }
 
@@ -922,10 +845,6 @@ mod tests {
             "submission_managed"
         );
         assert_eq!(
-            WorkflowPhase::for_vote(VotePhase::LegacyConfirmed).as_str(),
-            "confirmed"
-        );
-        assert_eq!(
             WorkflowPhase::for_vote(VotePhase::Confirmed).as_str(),
             "confirmed"
         );
@@ -963,26 +882,17 @@ fn phase_from_columns(
     }
 }
 
-/// Projects one vote's workflow phase.
+/// Projects one vote's workflow phase from its version-17 domain columns.
 ///
-/// The authoritative `chain_submissions` row wins whenever one exists: an
-/// unresolved row is lifecycle-owned, and a confirmation is terminal whether it
-/// was validated at runtime, reconstructed during migration, or preserved as a
-/// version-17 projection. Only a vote with no submission row falls back to the
-/// version-17 domain columns.
+/// This is the fallback for a vote with no authoritative `chain_submissions`
+/// row; whenever such a row exists it wins, whether unresolved or confirmed by
+/// hash or tree. Pre-upgrade rounds keep displaying through this projection.
 fn vote_phase_from_columns(
     has_tx_hash: bool,
     has_vc_position: bool,
     has_recovery_bundle: bool,
-    submission_managed: bool,
-    legacy_projection_confirmed: bool,
-    submission_confirmed: bool,
 ) -> VotePhase {
-    if legacy_projection_confirmed {
-        VotePhase::LegacyConfirmed
-    } else if submission_managed {
-        VotePhase::SubmissionManaged
-    } else if submission_confirmed || (has_tx_hash && has_vc_position && has_recovery_bundle) {
+    if has_tx_hash && has_vc_position && has_recovery_bundle {
         VotePhase::Confirmed
     } else if has_tx_hash {
         VotePhase::Submitted

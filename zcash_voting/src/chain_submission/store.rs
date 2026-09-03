@@ -22,10 +22,8 @@ pub(super) use sqlite::SqliteChainSubmissionStore;
 
 #[cfg(test)]
 use super::{
-    confirmation::validate_hash_confirmation,
-    coordination::BundleOperationKey,
-    result::ValidatedChainSubmissionConfirmation,
-    state::{apply_submission_observation, DigestlessRecoveryGuard},
+    confirmation::validate_hash_confirmation, coordination::BundleOperationKey,
+    state::apply_submission_observation,
 };
 
 /// Inputs from which storage reconstructs a closed semantic generation.
@@ -175,25 +173,6 @@ impl StoreAdvancementRequest {
         Ok(())
     }
 
-    fn singleton_identity(
-        &self,
-        proposal_id: u32,
-    ) -> Result<ChainSubmissionIdentity, ChainSubmissionFailure> {
-        ChainSubmissionIdentity::new(
-            self.identity().wallet_id(),
-            self.identity().network(),
-            *self.identity().vote_round_id(),
-            self.identity().bundle_index(),
-            ChainSubmissionTarget::Vote { proposal_id },
-        )
-        .map_err(|error| {
-            ChainSubmissionFailure::without_state(
-                ChainSubmissionFailureKind::InvalidInput,
-                error.to_string(),
-            )
-        })
-    }
-
     fn validate_target(&self) -> Result<(), ChainSubmissionFailure> {
         let valid = matches!(
             (&self.derivation, self.identity().target()),
@@ -223,7 +202,7 @@ impl StoreAdvancementRequest {
 #[derive(Clone)]
 pub(super) struct StoredChainSubmission {
     identity: ChainSubmissionIdentity,
-    generation_digest: Option<ChainSubmissionGenerationDigest>,
+    generation_digest: ChainSubmissionGenerationDigest,
     state: SubmissionRecordState,
     committed_post_reservations: u64,
     tracking_started_at: Option<u64>,
@@ -240,54 +219,9 @@ impl StoredChainSubmission {
     ) -> Self {
         Self {
             identity: generation.identity().clone(),
-            generation_digest: Some(generation.digest()),
+            generation_digest: generation.digest(),
             state: SubmissionRecordState::Submitting,
             committed_post_reservations,
-            tracking_started_at: None,
-            diagnostic: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn digestless_guard(identity: ChainSubmissionIdentity, now: u64) -> Self {
-        let diagnostic = ChainSubmissionDiagnostic::from_redacted_message(
-            super::ChainSubmissionDiagnosticKind::RecoveryUnavailable,
-            "version-17 chain evidence lacks generation recovery material",
-        );
-        Self {
-            identity,
-            generation_digest: None,
-            state: SubmissionRecordState::DigestlessRecoveryGuard(
-                DigestlessRecoveryGuard::from_diagnostic(diagnostic.clone()),
-            ),
-            committed_post_reservations: 0,
-            tracking_started_at: None,
-            diagnostic: Some(diagnostic),
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn legacy_projection_confirmed(
-        identity: ChainSubmissionIdentity,
-        final_van_position: u64,
-        vote_commitment_position: u64,
-        now: u64,
-    ) -> Self {
-        Self {
-            identity,
-            generation_digest: None,
-            state: SubmissionRecordState::Confirmed(
-                ValidatedChainSubmissionConfirmation::from_legacy_projection(
-                    final_van_position,
-                    vote_commitment_position,
-                )
-                .expect("valid legacy positions"),
-            ),
-            committed_post_reservations: 0,
             tracking_started_at: None,
             diagnostic: None,
             created_at: now,
@@ -299,7 +233,7 @@ impl StoredChainSubmission {
         &self.identity
     }
 
-    pub(super) fn generation_digest(&self) -> Option<ChainSubmissionGenerationDigest> {
+    pub(super) fn generation_digest(&self) -> ChainSubmissionGenerationDigest {
         self.generation_digest
     }
 
@@ -354,12 +288,6 @@ impl StoredChainSubmission {
                     diagnostic: ambiguity_diagnostic,
                 },
             )),
-            SubmissionRecordState::DigestlessRecoveryGuard(guard) => Ok(
-                ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
-                    candidate_transaction_hash: None,
-                    diagnostic: guard.diagnostic().clone(),
-                }),
-            ),
             SubmissionRecordState::Confirmed(confirmation) => {
                 Ok(ChainSubmissionResult::Confirmed(confirmation.into_public()))
             }
@@ -451,7 +379,7 @@ pub(super) fn ensure_generation(
     generation: &ChainSubmissionGeneration,
 ) -> Result<(), ChainSubmissionFailure> {
     if record.identity() != generation.identity()
-        || record.generation_digest() != Some(generation.digest())
+        || record.generation_digest() != generation.digest()
     {
         return Err(ChainSubmissionFailure::with_durable_state(
             ChainSubmissionFailureKind::InvalidInput,
@@ -685,32 +613,28 @@ pub(super) mod memory {
                         == BundleOperationKey::from_identity(requested)
                     && match record.state() {
                         SubmissionRecordState::Rejected(_) => false,
-                        // A migrated legacy projection has no domain projection
-                        // to apply: its positions were already recorded by
-                        // version 17, and its observed successor VAN is what
-                        // lets the next proposal in the bundle proceed.
+                        // A confirmed predecessor is authoritative once its
+                        // domain projection has been applied.
                         SubmissionRecordState::Confirmed(_) => {
-                            record.generation_digest().is_some()
-                                && !state.projections.contains_key(record.identity())
+                            !state.projections.contains_key(record.identity())
                         }
                         SubmissionRecordState::Submitting
                         | SubmissionRecordState::Tracking { .. }
-                        | SubmissionRecordState::Recovering { .. }
-                        | SubmissionRecordState::DigestlessRecoveryGuard(_) => {
-                            !Self::has_confirmed_vote_successor(state, record.identity())
-                        }
+                        | SubmissionRecordState::Recovering { .. } => true,
                     }
             })
         }
 
-        fn has_confirmed_vote_successor(
+        /// A confirmed vote or batch has consumed the bundle's delegation
+        /// output, so a new delegation generation is refused before derivation.
+        fn delegation_is_superseded(
             state: &MemoryState,
-            predecessor: &ChainSubmissionIdentity,
+            requested: &ChainSubmissionIdentity,
         ) -> bool {
-            matches!(predecessor.target(), ChainSubmissionTarget::Delegation)
+            matches!(requested.target(), ChainSubmissionTarget::Delegation)
                 && state.records.values().any(|successor| {
                     BundleOperationKey::from_identity(successor.identity())
-                        == BundleOperationKey::from_identity(predecessor)
+                        == BundleOperationKey::from_identity(requested)
                         && matches!(
                             successor.identity().target(),
                             ChainSubmissionTarget::Vote { .. }
@@ -812,20 +736,6 @@ pub(super) mod memory {
                         }
                         return Ok(StoreAdmission::Authoritative(record));
                     }
-                    if request.is_batch() {
-                        for member_identity in &request.member_identities {
-                            let Some(guard) = state.records.get(member_identity) else {
-                                continue;
-                            };
-                            if guard.generation_digest().is_none() {
-                                return Err(ChainSubmissionFailure::with_durable_state(
-                                    ChainSubmissionFailureKind::InvalidInput,
-                                    guard.durable_state(),
-                                    "atomic vote batch overlaps a migration-only singleton guard",
-                                ));
-                            }
-                        }
-                    }
                     return Ok(StoreAdmission::NoAuthoritativeState);
                 }
 
@@ -846,19 +756,6 @@ pub(super) mod memory {
                     request
                         .verify_batch_roster(authoritative_roster)
                         .map_err(|error| preserve_loaded_state(error, existing.as_ref()))?;
-                    for proposal_id in authoritative_roster {
-                        let member_identity = request.singleton_identity(*proposal_id)?;
-                        let Some(guard) = state.records.get(&member_identity) else {
-                            continue;
-                        };
-                        if guard.generation_digest().is_none() {
-                            return Err(ChainSubmissionFailure::with_durable_state(
-                                ChainSubmissionFailureKind::InvalidInput,
-                                guard.durable_state(),
-                                "atomic vote batch overlaps a migration-only singleton guard",
-                            ));
-                        }
-                    }
                 }
 
                 if let Some(mut record) = existing {
@@ -882,12 +779,6 @@ pub(super) mod memory {
                         state
                             .records
                             .insert(request.identity().clone(), record.clone());
-                        return Ok(StoreAdmission::Authoritative(record));
-                    }
-                    // A digestless row is a migration-only marker: its
-                    // generation was never bound, so it is returned before any
-                    // derivation or network work is attempted.
-                    if record.generation_digest().is_none() {
                         return Ok(StoreAdmission::Authoritative(record));
                     }
                     let derived = Self::derive(state, request.derivation()).map_err(|error| {
@@ -918,6 +809,12 @@ pub(super) mod memory {
                     return Err(ChainSubmissionFailure::without_state(
                         ChainSubmissionFailureKind::InvalidInput,
                         "another submission for this bundle has not established an authoritative successor",
+                    ));
+                }
+                if Self::delegation_is_superseded(state, request.identity()) {
+                    return Err(ChainSubmissionFailure::without_state(
+                        ChainSubmissionFailureKind::InvalidInput,
+                        "a confirmed vote already succeeds this bundle's delegation",
                     ));
                 }
 

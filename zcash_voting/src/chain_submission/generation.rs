@@ -67,8 +67,8 @@ pub(super) enum ChainSubmissionRequest {
 ///
 /// This is everything derivation needs to *identify* a submission. It is
 /// deliberately separate from the wire request, which additionally requires a
-/// live delegation signer, so the version-17 migration can bind a generation to
-/// durable recovery inputs without reconstructing a dispatchable request.
+/// live delegation signer, so a generation can be bound to durable recovery
+/// inputs without reconstructing a dispatchable request.
 #[derive(Clone)]
 pub(crate) struct BoundGeneration {
     generation: ChainSubmissionGeneration,

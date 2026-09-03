@@ -5,23 +5,6 @@ use super::result::ValidatedChainSubmissionConfirmation;
 use super::ChainSubmissionDiagnosticKind;
 use super::{CandidateTransactionHash, ChainSubmissionDiagnostic, ChainSubmissionState};
 
-/// Migration-only guard data preserving why generation recovery is unavailable.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct DigestlessRecoveryGuard {
-    diagnostic: ChainSubmissionDiagnostic,
-}
-
-impl DigestlessRecoveryGuard {
-    /// Retains the migration diagnostic as part of the immutable guard state.
-    pub(super) fn from_diagnostic(diagnostic: ChainSubmissionDiagnostic) -> Self {
-        Self { diagnostic }
-    }
-
-    pub(super) fn diagnostic(&self) -> &ChainSubmissionDiagnostic {
-        &self.diagnostic
-    }
-}
-
 /// Authoritative typed state for one semantic generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SubmissionRecordState {
@@ -33,11 +16,6 @@ pub(super) enum SubmissionRecordState {
         candidate_transaction_hash: Option<CandidateTransactionHash>,
         ambiguity_diagnostic: ChainSubmissionDiagnostic,
     },
-    /// Migration-only guard whose original generation cannot be derived.
-    ///
-    /// This variant cannot carry a candidate and permanently rejects every
-    /// runtime lifecycle observation.
-    DigestlessRecoveryGuard(DigestlessRecoveryGuard),
     Confirmed(ValidatedChainSubmissionConfirmation),
     Rejected(ChainSubmissionDiagnostic),
 }
@@ -47,9 +25,7 @@ impl SubmissionRecordState {
         match self {
             Self::Submitting => ChainSubmissionState::Submitting,
             Self::Tracking { .. } => ChainSubmissionState::Tracking,
-            Self::Recovering { .. } | Self::DigestlessRecoveryGuard(_) => {
-                ChainSubmissionState::Recovering
-            }
+            Self::Recovering { .. } => ChainSubmissionState::Recovering,
             Self::Confirmed(_) => ChainSubmissionState::Confirmed,
             Self::Rejected(_) => ChainSubmissionState::Rejected,
         }
@@ -211,9 +187,6 @@ fn require_hash_confirmation_for_candidate(
         {
             Ok(())
         }
-        migration_only if migration_only.is_migration_only() => {
-            Err(SubmissionTransitionError::MigrationOnlyConfirmationOutsideMigration)
-        }
         _ => Err(SubmissionTransitionError::ConfirmationDoesNotMatchCandidate),
     }
 }
@@ -230,10 +203,6 @@ fn require_valid_recovery_confirmation(
             require_hash_confirmation_for_candidate(confirmation, candidate)
         }
         ValidatedChainSubmissionConfirmation::Tree(_) => Ok(()),
-        ValidatedChainSubmissionConfirmation::LegacyImport(_)
-        | ValidatedChainSubmissionConfirmation::LegacyProjection(_) => {
-            Err(SubmissionTransitionError::MigrationOnlyConfirmationOutsideMigration)
-        }
     }
 }
 
@@ -266,8 +235,6 @@ pub(super) enum SubmissionTransitionError {
     ConflictingCandidateHash,
     #[error("hash confirmation does not match the durable candidate transaction")]
     ConfirmationDoesNotMatchCandidate,
-    #[error("imported legacy confirmation is valid only during database migration")]
-    MigrationOnlyConfirmationOutsideMigration,
     #[error("terminal confirmation conflicts with the durable confirmation")]
     ConflictingConfirmation,
 }
@@ -293,15 +260,6 @@ mod tests {
 
     fn tree_confirmation() -> ValidatedChainSubmissionConfirmation {
         ValidatedChainSubmissionConfirmation::from_tree(10, vec![11]).unwrap()
-    }
-
-    fn legacy_projection_confirmation() -> ValidatedChainSubmissionConfirmation {
-        ValidatedChainSubmissionConfirmation::from_legacy_projection(10, 11).unwrap()
-    }
-
-    fn legacy_import_confirmation() -> ValidatedChainSubmissionConfirmation {
-        ValidatedChainSubmissionConfirmation::from_legacy_import(Some(candidate(1)), 10, vec![11])
-            .unwrap()
     }
 
     fn apply(
@@ -500,62 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn digestless_guard_rejects_every_runtime_observation() {
-        let diagnostic = ChainSubmissionDiagnostic::from_redacted_message(
-            ChainSubmissionDiagnosticKind::GenerationDerivationFailed,
-            "version-17 recovery inputs cannot derive a generation",
-        );
-        let guard_data = DigestlessRecoveryGuard::from_diagnostic(diagnostic.clone());
-        assert_eq!(guard_data.diagnostic(), &diagnostic);
-        let guard = Some(SubmissionRecordState::DigestlessRecoveryGuard(guard_data));
-
-        for observation_kind in ObservationKind::ALL {
-            assert!(
-                apply_submission_observation(guard.clone(), observation_kind.observation())
-                    .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_projection_confirmation_is_terminal_and_never_produced_at_runtime() {
-        let legacy = Some(SubmissionRecordState::Confirmed(
-            legacy_projection_confirmation(),
-        ));
-
-        // A migrated projection is terminal: only its own identical replay is a
-        // no-op, and no runtime observation can reach or recreate it.
-        for observation_kind in ObservationKind::ALL {
-            let result =
-                apply_submission_observation(legacy.clone(), observation_kind.observation());
-            match observation_kind {
-                ObservationKind::ConfirmedByLegacyProjection => {
-                    assert_eq!(result, Ok(legacy.clone()))
-                }
-                _ => assert!(result.is_err(), "{observation_kind:?} must not apply"),
-            }
-        }
-
-        for state in [
-            SubmissionRecordState::Tracking {
-                candidate_transaction_hash: candidate(1),
-            },
-            SubmissionRecordState::Recovering {
-                candidate_transaction_hash: None,
-                ambiguity_diagnostic: diagnostic("ambiguous"),
-            },
-        ] {
-            assert_eq!(
-                apply_submission_observation(
-                    Some(state),
-                    SubmissionObservation::Confirmed(legacy_projection_confirmation()),
-                ),
-                Err(SubmissionTransitionError::MigrationOnlyConfirmationOutsideMigration)
-            );
-        }
-    }
-
-    #[test]
     fn conflicting_recovery_candidate_is_an_invariant_error() {
         let recovering = Some(SubmissionRecordState::Recovering {
             candidate_transaction_hash: Some(candidate(1)),
@@ -578,26 +480,20 @@ mod tests {
         Tracking,
         RecoveringWithoutCandidate,
         RecoveringWithCandidate,
-        DigestlessRecoveryGuard,
         ConfirmedByHash,
         ConfirmedByTree,
-        ConfirmedByLegacyImport,
-        ConfirmedByLegacyProjection,
         Rejected,
     }
 
     impl StateCase {
-        const ALL: [Self; 11] = [
+        const ALL: [Self; 8] = [
             Self::Absent,
             Self::Submitting,
             Self::Tracking,
             Self::RecoveringWithoutCandidate,
             Self::RecoveringWithCandidate,
-            Self::DigestlessRecoveryGuard,
             Self::ConfirmedByHash,
             Self::ConfirmedByTree,
-            Self::ConfirmedByLegacyImport,
-            Self::ConfirmedByLegacyProjection,
             Self::Rejected,
         ];
 
@@ -616,25 +512,12 @@ mod tests {
                     candidate_transaction_hash: Some(candidate(1)),
                     ambiguity_diagnostic: diagnostic("ambiguous"),
                 }),
-                Self::DigestlessRecoveryGuard => {
-                    Some(SubmissionRecordState::DigestlessRecoveryGuard(
-                        DigestlessRecoveryGuard::from_diagnostic(diagnostic(
-                            "generation recovery unavailable",
-                        )),
-                    ))
-                }
                 Self::ConfirmedByHash => Some(SubmissionRecordState::Confirmed(hash_confirmation(
                     candidate(1),
                 ))),
                 Self::ConfirmedByTree => {
                     Some(SubmissionRecordState::Confirmed(tree_confirmation()))
                 }
-                Self::ConfirmedByLegacyImport => Some(SubmissionRecordState::Confirmed(
-                    legacy_import_confirmation(),
-                )),
-                Self::ConfirmedByLegacyProjection => Some(SubmissionRecordState::Confirmed(
-                    legacy_projection_confirmation(),
-                )),
                 Self::Rejected => Some(SubmissionRecordState::Rejected(diagnostic("rejected"))),
             }
         }
@@ -652,14 +535,12 @@ mod tests {
         CandidateCommittedFailure,
         ConfirmedByHash,
         ConfirmedByTree,
-        ConfirmedByLegacyImport,
-        ConfirmedByLegacyProjection,
         ContinueRecovery,
         AbandonedSubmitting,
     }
 
     impl ObservationKind {
-        const ALL: [Self; 14] = [
+        const ALL: [Self; 12] = [
             Self::ReserveFreshSubmission,
             Self::DefinitelyUnsent,
             Self::UsableCandidateHash,
@@ -670,8 +551,6 @@ mod tests {
             Self::CandidateCommittedFailure,
             Self::ConfirmedByHash,
             Self::ConfirmedByTree,
-            Self::ConfirmedByLegacyImport,
-            Self::ConfirmedByLegacyProjection,
             Self::ContinueRecovery,
             Self::AbandonedSubmitting,
         ];
@@ -700,12 +579,6 @@ mod tests {
                     SubmissionObservation::Confirmed(hash_confirmation(candidate(1)))
                 }
                 Self::ConfirmedByTree => SubmissionObservation::Confirmed(tree_confirmation()),
-                Self::ConfirmedByLegacyImport => {
-                    SubmissionObservation::Confirmed(legacy_import_confirmation())
-                }
-                Self::ConfirmedByLegacyProjection => {
-                    SubmissionObservation::Confirmed(legacy_projection_confirmation())
-                }
                 Self::ContinueRecovery => SubmissionObservation::ContinueRecovery,
                 Self::AbandonedSubmitting => {
                     SubmissionObservation::AbandonedSubmitting(diagnostic("abandoned"))
@@ -756,15 +629,8 @@ mod tests {
                     | Observation::ConfirmedByTree
                     | Observation::ContinueRecovery
             ),
-            State::DigestlessRecoveryGuard => false,
             State::ConfirmedByHash => matches!(observation, Observation::ConfirmedByHash),
             State::ConfirmedByTree => matches!(observation, Observation::ConfirmedByTree),
-            State::ConfirmedByLegacyImport => {
-                matches!(observation, Observation::ConfirmedByLegacyImport)
-            }
-            State::ConfirmedByLegacyProjection => {
-                matches!(observation, Observation::ConfirmedByLegacyProjection)
-            }
             State::Rejected => false,
         }
     }

@@ -7,14 +7,14 @@ CREATE TABLE chain_submissions (
     kind TEXT NOT NULL CHECK (kind IN ('delegation','vote','vote_batch')),
     proposal_id INTEGER,
     ordered_batch_digest BLOB,
-    generation_digest BLOB,
+    generation_digest BLOB NOT NULL CHECK (length(generation_digest) = 32),
     state TEXT NOT NULL CHECK (state IN ('submitting','tracking','recovering','confirmed','rejected')),
     candidate_transaction_hash BLOB,
     committed_post_reservations INTEGER NOT NULL DEFAULT 0 CHECK (committed_post_reservations >= 0),
     tracking_started_at INTEGER,
     diagnostic_kind TEXT,
     diagnostic TEXT,
-    confirmation_source TEXT CHECK (confirmation_source IN ('hash','tree','legacy_import','legacy_projection')),
+    confirmation_source TEXT CHECK (confirmation_source IN ('hash','tree')),
     confirmed_transaction_hash BLOB,
     final_van_position INTEGER,
     vote_commitment_positions BLOB,
@@ -25,13 +25,6 @@ CREATE TABLE chain_submissions (
     CHECK ((kind = 'delegation' AND proposal_id IS NULL AND ordered_batch_digest IS NULL)
         OR (kind = 'vote' AND proposal_id BETWEEN 1 AND 15 AND ordered_batch_digest IS NULL)
         OR (kind = 'vote_batch' AND proposal_id IS NULL AND length(ordered_batch_digest) = 32)),
-    CHECK ((generation_digest IS NULL
-            AND candidate_transaction_hash IS NULL
-            AND committed_post_reservations = 0
-            AND tracking_started_at IS NULL
-            AND (state = 'recovering'
-                 OR (state = 'confirmed' AND confirmation_source = 'legacy_projection')))
-        OR length(generation_digest) = 32),
     CHECK (candidate_transaction_hash IS NULL OR length(candidate_transaction_hash) = 32),
     CHECK (confirmed_transaction_hash IS NULL OR length(confirmed_transaction_hash) = 32),
     CHECK ((state = 'submitting' AND candidate_transaction_hash IS NULL AND tracking_started_at IS NULL)
@@ -42,12 +35,9 @@ CREATE TABLE chain_submissions (
     CHECK ((state = 'confirmed') = (confirmation_source IS NOT NULL)),
     CHECK (state != 'confirmed'
         OR (final_van_position IS NOT NULL AND vote_commitment_positions IS NOT NULL)),
-    CHECK (confirmation_source != 'legacy_projection' OR
-        (kind = 'vote' AND state = 'confirmed' AND generation_digest IS NULL
-         AND confirmed_transaction_hash IS NULL)),
     CHECK (confirmation_source != 'hash' OR
         (confirmed_transaction_hash IS NOT NULL AND candidate_transaction_hash = confirmed_transaction_hash)),
-    CHECK (confirmation_source NOT IN ('tree','legacy_projection') OR confirmed_transaction_hash IS NULL)
+    CHECK (confirmation_source != 'tree' OR confirmed_transaction_hash IS NULL)
 );
 
 CREATE UNIQUE INDEX chain_submissions_identity

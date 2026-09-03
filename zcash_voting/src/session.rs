@@ -1105,12 +1105,7 @@ pub fn resume_plan(
     for &(bundle_index, proposal_id) in &stale_vote_keys {
         if matches!(
             votes.get(&(bundle_index, proposal_id)),
-            Some(
-                VotePhase::Submitted
-                    | VotePhase::SubmissionManaged
-                    | VotePhase::LegacyConfirmed
-                    | VotePhase::Confirmed
-            )
+            Some(VotePhase::Submitted | VotePhase::SubmissionManaged | VotePhase::Confirmed)
         ) {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -1201,9 +1196,6 @@ pub fn resume_plan(
                 // The chain-submission lifecycle owns every network action for
                 // this persisted generation, including migration-only guards.
                 Some(VotePhase::SubmissionManaged) => {}
-                // The v17 projection proves completion but cannot safely
-                // reconstruct helper material or any network operation.
-                Some(VotePhase::LegacyConfirmed) => {}
                 // Prepared or no row yet -> still needs casting.
                 _ => {
                     if bundles_with_pending_vote_chains.contains(&b) {
@@ -1311,10 +1303,7 @@ pub fn resume_plan(
                 && bundles.iter().all(|&b| {
                     let vote_key = (b, pid);
                     vote_choices.get(&vote_key) == Some(choice)
-                        && matches!(
-                            votes.get(&vote_key),
-                            Some(VotePhase::Confirmed | VotePhase::LegacyConfirmed)
-                        )
+                        && matches!(votes.get(&vote_key), Some(VotePhase::Confirmed))
                 })
         }
         None => false,
@@ -2087,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_owned_legacy_vote_never_yields_submit_or_poll_work() {
+    fn lifecycle_owned_delegation_and_vote_yield_no_legacy_steps() {
         for tx_hash in [None, Some("legacy-vtx")] {
             let db = db_with_bundle();
             db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
@@ -2097,9 +2086,13 @@ mod tests {
             crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16])
                 .unwrap();
             store_vote_recovery_fixture(&db, 0, 2, 1, None);
+            align_stored_commitments_with_recovery(&db, &[2]);
             if let Some(tx_hash) = tx_hash {
                 db.record_vote_submission(ROUND, 0, 2, tx_hash).unwrap();
             }
+            let vote_identity =
+                submission_identity_fixture(ChainSubmissionTarget::Vote { proposal_id: 2 });
+            let vote_generation = generation_for_vote(&db.conn(), &vote_identity).unwrap();
             db.conn()
                 .execute(
                     "INSERT INTO chain_submissions
@@ -2107,12 +2100,19 @@ mod tests {
                       bundle_index, kind, proposal_id, generation_digest, state,
                       committed_post_reservations, diagnostic_kind, diagnostic,
                       created_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, NULL,
-                             'recovering', 0, 'recovery_unavailable',
-                             'version-17 vote-chain evidence is lifecycle-owned', 9, 9)",
-                    rusqlite::params![vec![0x71_u8; 32], ROUND, W],
+                     VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, ?4,
+                             'recovering', 0, 'reconciliation_pending',
+                             'possible dispatch awaits tree recovery', 9, 9)",
+                    rusqlite::params![
+                        submission_identity_key(&vote_identity),
+                        ROUND,
+                        W,
+                        vote_generation.generation().digest().as_bytes().to_vec(),
+                    ],
                 )
                 .unwrap();
+            let delegation_identity =
+                submission_identity_fixture(ChainSubmissionTarget::Delegation);
             db.conn()
                 .execute(
                     "INSERT INTO chain_submissions
@@ -2121,9 +2121,14 @@ mod tests {
                       committed_post_reservations, diagnostic_kind, diagnostic,
                       created_at, updated_at)
                      VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', NULL,
-                             NULL, 'recovering', 0, 'recovery_unavailable',
-                             'version-17 delegation evidence is lifecycle-owned', 9, 9)",
-                    rusqlite::params![vec![0x73_u8; 32], ROUND, W],
+                             ?4, 'recovering', 0, 'ambiguous_dispatch',
+                             'delegation response was lost after dispatch', 9, 9)",
+                    rusqlite::params![
+                        submission_identity_key(&delegation_identity),
+                        ROUND,
+                        W,
+                        vec![0x73_u8; 32],
+                    ],
                 )
                 .unwrap();
 
@@ -2319,80 +2324,43 @@ mod tests {
     }
 
     #[test]
-    fn legacy_projection_vote_is_terminal_without_recovery_work() {
+    fn lifecycle_owned_vote_locks_conflicting_intent() {
         let db = db_with_bundle();
-        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
             .unwrap();
-        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 0, None);
+        align_stored_commitments_with_recovery(&db, &[2]);
+        let identity = submission_identity_fixture(ChainSubmissionTarget::Vote { proposal_id: 2 });
+        let generation = generation_for_vote(&db.conn(), &identity).unwrap();
         db.conn()
             .execute(
                 "INSERT INTO chain_submissions
                  (identity_key, round_id, wallet_id, network,
                   bundle_index, kind, proposal_id, generation_digest, state,
-                  committed_post_reservations, confirmation_source,
-                  final_van_position, vote_commitment_positions, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, NULL,
-                         'confirmed', 0, 'legacy_projection', 7, ?4, 9, 9)",
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, ?4,
+                         'recovering', 0, 'reconciliation_pending',
+                         'possible dispatch awaits tree recovery', 9, 9)",
                 rusqlite::params![
-                    vec![0x75_u8; 32],
+                    submission_identity_key(&identity),
                     ROUND,
                     W,
-                    [vec![1, 0, 0, 0, 1], 8_u64.to_be_bytes().to_vec()].concat()
+                    generation.generation().digest().as_bytes().to_vec(),
                 ],
             )
             .unwrap();
 
-        let plan = resume_plan(&db, ROUND, &[2]).unwrap();
-
-        assert_eq!(
-            db.vote_phase(ROUND, 0, 2).unwrap(),
-            VotePhase::LegacyConfirmed
-        );
-        assert!(plan.next_steps.is_empty());
-        assert!(plan.recovered_vote_work.is_empty());
-        assert!(!plan.pending_recovery);
-        assert!(plan.all_decided);
-        assert!(plan.completed_for_display);
-    }
-
-    #[test]
-    fn recovery_free_migration_guards_lock_conflicting_intent() {
-        for state in ["recovering", "confirmed"] {
-            let db = db_with_bundle();
-            db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
-                .unwrap();
-            crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16])
-                .unwrap();
-            let positions = [vec![1, 0, 0, 0, 1], 8_u64.to_be_bytes().to_vec()].concat();
-            db.conn()
-                .execute(
-                    "INSERT INTO chain_submissions
-                     (identity_key, round_id, wallet_id, network,
-                      bundle_index, kind, proposal_id, generation_digest, state,
-                      committed_post_reservations, diagnostic_kind, diagnostic,
-                      confirmation_source, final_van_position,
-                      vote_commitment_positions, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, NULL,
-                             ?4, 0,
-                             CASE WHEN ?4='recovering' THEN 'recovery_unavailable' END,
-                             CASE WHEN ?4='recovering' THEN 'legacy evidence is incomplete' END,
-                             CASE WHEN ?4='confirmed' THEN 'legacy_projection' END,
-                             CASE WHEN ?4='confirmed' THEN 7 END,
-                             CASE WHEN ?4='confirmed' THEN ?5 END, 9, 9)",
-                    rusqlite::params![vec![state.as_bytes()[0]; 32], ROUND, W, state, positions],
-                )
-                .unwrap();
-
-            for decision in [Decision::Choice(1), Decision::Skipped] {
-                let error = db.set_ballot_intent(ROUND, 2, decision, 3).unwrap_err();
-                assert!(
-                    error.to_string().contains("ballot intent is locked"),
-                    "{error}"
-                );
-            }
-            db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
-                .unwrap();
+        for decision in [Decision::Choice(1), Decision::Skipped] {
+            let error = db.set_ballot_intent(ROUND, 2, decision, 3).unwrap_err();
+            assert!(
+                error.to_string().contains("ballot intent is locked"),
+                "{error}"
+            );
         }
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
     }
 
     #[test]

@@ -728,50 +728,7 @@ async fn cancelled_batch_entry_requires_no_recovery_or_roster_derivation() {
 }
 
 #[tokio::test]
-async fn cancelled_batch_entry_preserves_requested_member_guard_without_roster_read() {
-    let batch = batch_identity(0);
-    let guarded_member = identity(2, 0);
-    let cases = [
-        (
-            StoredChainSubmission::legacy_projection_confirmed(guarded_member.clone(), 4, 5, 1),
-            ChainSubmissionState::Confirmed,
-        ),
-        (
-            StoredChainSubmission::digestless_guard(guarded_member, 1),
-            ChainSubmissionState::Recovering,
-        ),
-    ];
-
-    for (guard, expected_state) in cases {
-        let store = Arc::new(InMemoryChainSubmissionStore::default());
-        store.seed_record(guard);
-        let transport = Arc::new(ScriptedTransport::default());
-        let control = ManualControl::default();
-        control.cancelled.store(true, Ordering::SeqCst);
-
-        let failure = coordinator(
-            Arc::clone(&transport),
-            Arc::clone(&store),
-            ManualClock::new(100),
-            10,
-        )
-        .advance(
-            StoreAdvancementRequest::vote_batch(batch.clone(), vec![1, 2]).unwrap(),
-            &control,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(failure.kind(), ChainSubmissionFailureKind::InvalidInput);
-        assert_eq!(failure.strongest_state().unwrap().state(), expected_state);
-        assert_eq!(store.batch_roster_reads(), 0);
-        assert!(store.record(&batch).is_none());
-        assert!(transport.methods().is_empty());
-    }
-}
-
-#[tokio::test]
-async fn cancelled_batch_entry_returns_authoritative_batch_before_stale_member_guard() {
+async fn cancelled_batch_entry_returns_authoritative_batch_before_stale_roster() {
     let batch = batch_identity(0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived_batch(batch.clone(), vec![1, 2]));
@@ -784,7 +741,6 @@ async fn cancelled_batch_entry_returns_authoritative_batch_before_stale_member_g
             ..
         }
     ));
-    store.seed_record(StoredChainSubmission::digestless_guard(identity(3, 0), 1));
     let roster_reads_before_cancellation = store.batch_roster_reads();
     let transport = Arc::new(ScriptedTransport::default());
     let control = ManualControl::default();
@@ -866,48 +822,6 @@ async fn cancelled_entry_normalizes_abandoned_submitting_without_network_work() 
 }
 
 #[tokio::test]
-async fn migration_guards_return_before_derivation_or_network_work() {
-    let legacy_identity = identity(1, 0);
-    let digestless_identity = identity(2, 0);
-    let store = Arc::new(InMemoryChainSubmissionStore::default());
-    store.seed_record(StoredChainSubmission::legacy_projection_confirmed(
-        legacy_identity.clone(),
-        4,
-        5,
-        1,
-    ));
-    store.seed_record(StoredChainSubmission::digestless_guard(
-        digestless_identity.clone(),
-        1,
-    ));
-    let transport = Arc::new(ScriptedTransport::default());
-    let coordinator = coordinator(Arc::clone(&transport), store, ManualClock::new(100), 10);
-
-    let legacy = coordinator
-        .advance(
-            StoreAdvancementRequest::vote(legacy_identity),
-            &ManualControl::default(),
-        )
-        .await
-        .unwrap();
-    let digestless = coordinator
-        .advance(
-            StoreAdvancementRequest::vote(digestless_identity),
-            &ManualControl::default(),
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(legacy, ChainSubmissionResult::Confirmed(ref confirmation) if confirmation.source() == super::super::ChainSubmissionConfirmationSource::LegacyProjection)
-    );
-    assert!(
-        matches!(digestless, ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering { candidate_transaction_hash: None, ref diagnostic }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::RecoveryUnavailable)
-    );
-    assert!(transport.methods().is_empty());
-}
-
-#[tokio::test]
 async fn chain_rejection_preserves_bound_recovery_and_redacts_diagnostics() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
@@ -938,7 +852,6 @@ async fn chain_rejection_preserves_bound_recovery_and_redacts_diagnostics() {
     );
     let record = store.record(&identity).unwrap();
     assert_eq!(record.durable_state(), ChainSubmissionState::Recovering);
-    assert!(record.generation_digest().is_some());
 
     let replay = coordinator
         .advance(
@@ -1222,40 +1135,6 @@ async fn failed_active_entry_normalization_reports_possible_dispatch() {
     assert!(transport.methods().is_empty());
 }
 
-#[tokio::test]
-async fn guarded_batch_is_rejected_before_derivation_or_dispatch() {
-    let member_two = identity(2, 0);
-    let batch = batch_identity(0);
-    let store = Arc::new(InMemoryChainSubmissionStore::default());
-    store.seed_batch_roster(batch.clone(), vec![1, 2]);
-    store.seed_record(StoredChainSubmission::digestless_guard(
-        member_two.clone(),
-        1,
-    ));
-    let transport = Arc::new(ScriptedTransport::default());
-
-    let failure = coordinator(
-        Arc::clone(&transport),
-        Arc::clone(&store),
-        ManualClock::new(100),
-        10,
-    )
-    .advance(
-        StoreAdvancementRequest::vote_batch(batch.clone(), vec![1, 2]).unwrap(),
-        &ManualControl::default(),
-    )
-    .await
-    .unwrap_err();
-
-    assert_eq!(failure.kind(), ChainSubmissionFailureKind::InvalidInput);
-    assert_eq!(
-        failure.strongest_state().unwrap().state(),
-        ChainSubmissionState::Recovering
-    );
-    assert!(store.record(&batch).is_none());
-    assert!(transport.methods().is_empty());
-}
-
 #[test]
 fn batch_roster_mismatch_never_creates_a_reservation() {
     let batch = batch_identity(0);
@@ -1397,15 +1276,21 @@ fn active_batch_admission_requires_a_persisted_roster() {
 }
 
 #[tokio::test]
-async fn omitted_batch_member_fails_before_its_unlocked_legacy_guard_is_read() {
+async fn omitted_batch_member_fails_before_its_unlocked_row_is_read() {
     let batch = batch_identity(0);
     let member_one = identity(1, 0);
-    let guarded_member = identity(2, 0);
+    let unlocked_member = identity(2, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived_batch(batch.clone(), vec![1, 2]));
-    store.seed_record(StoredChainSubmission::digestless_guard(
-        guarded_member.clone(),
-        1,
+    store.seed_derivation(derived(unlocked_member.clone(), 2));
+    assert!(matches!(
+        store
+            .admit(&StoreAdvancementRequest::vote(unlocked_member), true, 1, 1)
+            .unwrap(),
+        StoreAdmission::Ready {
+            fresh_reservation: true,
+            ..
+        }
     ));
     store.require_admission_identity_locks(vec![batch.clone(), member_one]);
     let transport = Arc::new(ScriptedTransport::default());
@@ -1419,7 +1304,7 @@ async fn omitted_batch_member_fails_before_its_unlocked_legacy_guard_is_read() {
     )
     .advance(request, &ManualControl::default())
     .await
-    .expect_err("omitted guarded member must fail");
+    .expect_err("omitted member must fail");
 
     assert_eq!(failure.kind(), ChainSubmissionFailureKind::InvalidInput);
     assert!(failure.strongest_state().is_none());
@@ -1961,33 +1846,42 @@ async fn atomically_confirmed_predecessor_allows_the_next_bundle_generation() {
 }
 
 #[tokio::test]
-async fn legacy_projection_predecessor_allows_the_next_bundle_generation() {
-    let first_identity = identity(1, 0);
-    let second_identity = identity(2, 0);
+async fn confirmed_successor_refuses_delegation_reservation() {
+    let vote_identity = identity(1, 0);
+    let delegation = delegation_identity(0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
-    store.seed_record(StoredChainSubmission::legacy_projection_confirmed(
-        first_identity,
-        4,
-        5,
-        1,
-    ));
-    store.seed_derivation(derived(second_identity.clone(), 2));
+    store.seed_derivation(derived(vote_identity.clone(), 1));
     let transport = Arc::new(ScriptedTransport::default());
     transport.queue(Ok(accepted()));
-    transport.queue(Ok(pending()));
-
-    let result = coordinator(Arc::clone(&transport), store, ManualClock::new(100), 10)
+    transport.queue(Ok(confirmed(&vote_identity)));
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    );
+    let vote = coordinator
         .advance(
-            StoreAdvancementRequest::vote(second_identity),
+            StoreAdvancementRequest::vote(vote_identity),
             &ManualControl::default(),
         )
         .await
         .unwrap();
+    assert!(matches!(vote, ChainSubmissionResult::Confirmed(_)));
 
-    assert!(matches!(
-        result,
-        ChainSubmissionResult::Pending(ChainSubmissionPending::Tracking { .. })
-    ));
+    let failure = coordinator
+        .advance(
+            StoreAdvancementRequest::delegation(
+                delegation.clone(),
+                DelegationSigner::signature([7; 64], [8; 32]),
+            ),
+            &ManualControl::default(),
+        )
+        .await
+        .expect_err("a confirmed successor must refuse a delegation reservation");
+
+    assert_eq!(failure.kind(), ChainSubmissionFailureKind::InvalidInput);
+    assert!(store.record(&delegation).is_none());
     assert_eq!(transport.methods(), vec!["POST", "GET"]);
 }
 

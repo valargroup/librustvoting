@@ -326,9 +326,9 @@ mod tests {
     }
 
     #[test]
-    fn round_snapshot_reports_lifecycle_owned_legacy_recovery() {
+    fn round_snapshot_reports_lifecycle_owned_recovery() {
         let db = db_with_round(WALLET_ID);
-        db.store_delegation_tx_hash(ROUND_ID, 0, "legacy-delegation")
+        db.store_delegation_tx_hash(ROUND_ID, 0, "delegation-tx")
             .unwrap();
         insert_vote(&db, 0, 1, 0, b"vote-0-1");
         store_commitment_bundle(&db, 0, 1, r#"{"bundle":"pending"}"#, None);
@@ -339,10 +339,10 @@ mod tests {
                   bundle_index, kind, proposal_id, generation_digest, state,
                   committed_post_reservations, diagnostic_kind, diagnostic,
                   created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, NULL,
-                         'recovering', 0, 'recovery_unavailable',
-                         'version-17 vote-chain evidence is lifecycle-owned', 9, 9)",
-                rusqlite::params![vec![0x72_u8; 32], ROUND_ID, WALLET_ID],
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, ?4,
+                         'recovering', 0, 'ambiguous_dispatch',
+                         'vote response was lost after dispatch', 9, 9)",
+                rusqlite::params![vec![0x72_u8; 32], ROUND_ID, WALLET_ID, vec![0x62_u8; 32]],
             )
             .unwrap();
         db.conn()
@@ -353,9 +353,9 @@ mod tests {
                   committed_post_reservations, diagnostic_kind, diagnostic,
                   created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', NULL,
-                         NULL, 'recovering', 0, 'recovery_unavailable',
-                         'version-17 delegation evidence is lifecycle-owned', 9, 9)",
-                rusqlite::params![vec![0x74_u8; 32], ROUND_ID, WALLET_ID],
+                         ?4, 'recovering', 0, 'ambiguous_dispatch',
+                         'delegation response was lost after dispatch', 9, 9)",
+                rusqlite::params![vec![0x74_u8; 32], ROUND_ID, WALLET_ID, vec![0x64_u8; 32]],
             )
             .unwrap();
 
@@ -372,33 +372,6 @@ mod tests {
             WorkflowPhase::SubmissionManaged
         );
         assert!(snapshot.votes[0].has_commitment_bundle);
-    }
-
-    #[test]
-    fn round_snapshot_reports_recovery_free_legacy_confirmation() {
-        let db = db_with_round(WALLET_ID);
-        insert_vote(&db, 0, 1, 0, b"vote-0-1");
-        let positions = [vec![1, 0, 0, 0, 1], 8_u64.to_be_bytes().to_vec()].concat();
-        db.conn()
-            .execute(
-                "INSERT INTO chain_submissions
-                 (identity_key, round_id, wallet_id, network,
-                  bundle_index, kind, proposal_id, generation_digest, state,
-                  committed_post_reservations, confirmation_source,
-                  final_van_position, vote_commitment_positions, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, NULL,
-                         'confirmed', 0, 'legacy_projection', 7, ?4, 9, 9)",
-                rusqlite::params![vec![0x75_u8; 32], ROUND_ID, WALLET_ID, positions],
-            )
-            .unwrap();
-
-        let snapshot = round_snapshot(&db, ROUND_ID).unwrap();
-
-        assert_eq!(snapshot.votes.len(), 1);
-        assert_eq!(snapshot.votes[0].phase, VotePhase::LegacyConfirmed);
-        assert_eq!(snapshot.votes[0].workflow_phase(), WorkflowPhase::Confirmed);
-        assert!(!snapshot.votes[0].has_commitment_bundle);
-        assert!(snapshot.commitment_bundles.is_empty());
     }
 
     #[test]
