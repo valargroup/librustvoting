@@ -126,6 +126,77 @@ fn lifecycle_timestamps_clamp_when_wall_clock_moves_backward() {
 }
 
 #[test]
+fn tracked_recovery_completes_without_hash_and_retains_tracking_start() {
+    let path = temporary_path("tracked-recovery-submitted-without-hash");
+    {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(db);
+        let StoreAdmission::Ready { derived, .. } = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 10)
+            .unwrap()
+        else {
+            panic!("fresh admission")
+        };
+        store
+            .classify_post(
+                derived.generation(),
+                SubmissionObservation::UsableCandidateHash(CandidateTransactionHash::from_bytes(
+                    [0x77; 32],
+                )),
+                11,
+            )
+            .unwrap();
+        store
+            .reconcile(
+                derived.generation(),
+                SubmissionObservation::TrackingWindowExpired(
+                    ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::TrackingWindowExpired,
+                        "tracking window expired",
+                    ),
+                ),
+                None,
+                12,
+            )
+            .unwrap();
+        let record = store
+            .classify_post(
+                derived.generation(),
+                SubmissionObservation::SubmittedWithoutHash(
+                    ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
+                        "attempts exhausted",
+                    ),
+                ),
+                13,
+            )
+            .unwrap();
+
+        assert_eq!(
+            record.durable_state(),
+            ChainSubmissionState::SubmittedWithoutHash
+        );
+        assert_eq!(record.tracking_started_at(), Some(11));
+    }
+    {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(db);
+        let StoreAdmission::Authoritative(record) = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 14)
+            .unwrap()
+        else {
+            panic!("hashless submitted state must be terminal")
+        };
+        assert_eq!(
+            record.durable_state(),
+            ChainSubmissionState::SubmittedWithoutHash
+        );
+        assert_eq!(record.tracking_started_at(), Some(11));
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn submitted_without_hash_survives_reopen_without_domain_confirmation() {
     let path = temporary_path("submitted-without-hash");
     {

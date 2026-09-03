@@ -336,7 +336,8 @@ Their meanings are:
   until confirmation, bounded hashless submission, or explicit deletion.
 - `SubmittedWithoutHash`: bounded POST dispatch is durably treated as submitted,
   but no candidate hash or confirmation positions are available. It is terminal
-  and schedules neither polling nor tree recovery.
+  and schedules neither polling nor tree recovery. A generation that previously
+  entered `Tracking` retains its immutable tracking-start timestamp.
 - `Confirmed`: chain success and all required local confirmation updates are
   durable. Its source records what the confirmation rests on: `hash` or
   `tree`, with the exact generation positions.
@@ -1001,6 +1002,8 @@ Tests cover:
 - rejection code 2 after durable ambiguity produces terminal
   `SubmittedWithoutHash` by numeric code alone, while other deterministic
   rejections surface an error and preserve earlier ambiguity;
+- a tracked generation can complete as `SubmittedWithoutHash` while retaining
+  its immutable first-tracking timestamp;
 - local committed failure clears the tracked candidate into `Recovering`;
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class is durably recorded before retry, and final
@@ -1263,6 +1266,7 @@ Public-lifecycle engine coverage is anchored by
 `v18_submission_rows_migrate_incrementally_to_v19`,
 `noncanonical_v17_round_ids_create_no_submission`,
 `current_fingerprint_rejects_missing_columns_indexes_and_triggers`,
+`tracked_recovery_completes_without_hash_and_retains_tracking_start`,
 `submitted_without_hash_survives_reopen_without_domain_confirmation`,
 `hashless_submission_blocks_same_bundle_but_not_unrelated_bundles`,
 `submitted_without_hash_schedules_no_chain_recovery_step`,

@@ -62,7 +62,7 @@ fn v18_chain_submission_schema() -> String {
             "'recovering','confirmed'",
         )
         .replace(
-            "    CHECK (state != 'submitted_without_hash'\n        OR (candidate_transaction_hash IS NULL AND tracking_started_at IS NULL\n            AND confirmed_transaction_hash IS NULL AND final_van_position IS NULL\n            AND vote_commitment_positions IS NULL AND diagnostic_kind IS NOT NULL)),\n",
+            "    CHECK (state != 'submitted_without_hash'\n        OR (candidate_transaction_hash IS NULL\n            AND confirmed_transaction_hash IS NULL AND final_van_position IS NULL\n            AND vote_commitment_positions IS NULL AND diagnostic_kind IS NOT NULL)),\n",
             "",
         )
 }
@@ -415,9 +415,9 @@ fn v18_submission_rows_migrate_incrementally_to_v19() {
         "INSERT INTO chain_submissions
          (identity_key, round_id, wallet_id, network, bundle_index, kind,
           proposal_id, generation_digest, state, committed_post_reservations,
-          diagnostic_kind, diagnostic, created_at, updated_at)
+          tracking_started_at, diagnostic_kind, diagnostic, created_at, updated_at)
          VALUES (?1, ?2, 'wallet', 'testnet', 0, 'vote', 1, ?3,
-                 'recovering', 7, 'ambiguous_dispatch', 'timeout', 9, 10)",
+                 'recovering', 7, 8, 'ambiguous_dispatch', 'timeout', 9, 10)",
         rusqlite::params![vec![0x41_u8; 32], ROUND, vec![0x42_u8; 32]],
     )
     .unwrap();
@@ -427,17 +427,18 @@ fn v18_submission_rows_migrate_incrementally_to_v19() {
 
     assert_eq!(
         conn.query_row(
-            "SELECT state, committed_post_reservations, diagnostic
+            "SELECT state, committed_post_reservations, tracking_started_at, diagnostic
                FROM chain_submissions",
             [],
             |row| Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?
             )),
         )
         .unwrap(),
-        ("recovering".to_string(), 7, "timeout".to_string())
+        ("recovering".to_string(), 7, 8, "timeout".to_string())
     );
     conn.execute(
         "UPDATE chain_submissions
@@ -448,6 +449,15 @@ fn v18_submission_rows_migrate_incrementally_to_v19() {
         [vec![0x41_u8; 32]],
     )
     .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT state, tracking_started_at FROM chain_submissions",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap(),
+        ("submitted_without_hash".to_string(), 8)
+    );
 }
 
 fn is_constraint_violation(error: &rusqlite::Error) -> bool {
@@ -691,7 +701,7 @@ fn current_fingerprint_rejects_missing_columns_indexes_and_triggers() {
             1,
         )
         .replacen(
-            "    CHECK (state != 'submitted_without_hash'\n        OR (candidate_transaction_hash IS NULL AND tracking_started_at IS NULL\n            AND confirmed_transaction_hash IS NULL AND final_van_position IS NULL\n            AND vote_commitment_positions IS NULL AND diagnostic_kind IS NOT NULL)),\n",
+            "    CHECK (state != 'submitted_without_hash'\n        OR (candidate_transaction_hash IS NULL\n            AND confirmed_transaction_hash IS NULL AND final_van_position IS NULL\n            AND vote_commitment_positions IS NULL AND diagnostic_kind IS NOT NULL)),\n",
             "",
             1,
         );
