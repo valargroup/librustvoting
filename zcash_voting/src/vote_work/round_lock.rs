@@ -10,7 +10,10 @@ use crate::ChainSubmissionControl;
 
 const ROUND_LOCK_CANCEL_CHECK_MILLISECONDS: u64 = 50;
 
-type RoundLockKey = (String, String);
+/// `(wallet_id, round_id, bundle)`. `None` is the round-wide scope used by
+/// chain and share steps; `Some(bundle)` scopes delegation work so bundles
+/// prove and sign concurrently.
+type RoundLockKey = (String, String, Option<u32>);
 
 static ROUND_LOCKS: LazyLock<Mutex<HashMap<RoundLockKey, Weak<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -18,9 +21,10 @@ static ROUND_LOCKS: LazyLock<Mutex<HashMap<RoundLockKey, Weak<AsyncMutex<()>>>>>
 pub(super) async fn acquire(
     wallet_id: String,
     round_id: &str,
+    bundle_index: Option<u32>,
     control: &ChainSubmissionControl,
 ) -> Result<Option<OwnedMutexGuard<()>>, String> {
-    let key = (wallet_id, round_id.to_string());
+    let key = (wallet_id, round_id.to_string(), bundle_index);
     let lock = {
         let mut locks = ROUND_LOCKS
             .lock()

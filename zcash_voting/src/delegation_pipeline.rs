@@ -476,6 +476,87 @@ impl<W: WalletDbOpener + 'static> DelegationPipeline<W> {
     }
 }
 
+/// Object-safe delegation stages the round executor drives.
+///
+/// [`DelegationPipeline`] implements this for any wallet opener, so the
+/// executor does not carry the opener's type parameter.
+pub trait DelegationDriver: Send + Sync {
+    /// Round the driver is bound to.
+    fn round_id(&self) -> &str;
+
+    /// Proves and signs one bundle on the calling thread.
+    fn prove_and_sign_blocking(
+        &self,
+        bundle_index: u32,
+        signer: &DelegationSigner,
+        pir: &PirFleet,
+        progress: &dyn DelegationProgressReporter,
+    ) -> Result<SignedDelegationBundle, VotingError>;
+
+    /// Produces a fresh SpendAuth signature over the bundle's persisted
+    /// sighash, for re-dispatching a delegation that is already prepared.
+    fn resign_blocking(
+        &self,
+        bundle_index: u32,
+        signer: &DelegationSigner,
+    ) -> Result<[u8; 64], VotingError>;
+}
+
+impl<W: WalletDbOpener> DelegationDriver for DelegationPipeline<W> {
+    fn round_id(&self) -> &str {
+        DelegationPipeline::round_id(self)
+    }
+
+    fn prove_and_sign_blocking(
+        &self,
+        bundle_index: u32,
+        signer: &DelegationSigner,
+        pir: &PirFleet,
+        progress: &dyn DelegationProgressReporter,
+    ) -> Result<SignedDelegationBundle, VotingError> {
+        DelegationPipeline::prove_and_sign_blocking(self, bundle_index, signer, pir, progress)
+    }
+
+    fn resign_blocking(
+        &self,
+        bundle_index: u32,
+        signer: &DelegationSigner,
+    ) -> Result<[u8; 64], VotingError> {
+        let prepared = self.prepare(bundle_index)?;
+        match signer {
+            DelegationSigner::Software(signer) => {
+                signer.sign(prepared.signing_request(&self.voting_db)?)
+            }
+            DelegationSigner::Keystone(KeystoneSignatureSource::Provided { sig, .. }) => sig
+                .as_slice()
+                .try_into()
+                .map_err(|_| VotingError::InvalidInput {
+                    message: format!("Keystone signature must be 64 bytes, got {}", sig.len()),
+                }),
+            DelegationSigner::Keystone(KeystoneSignatureSource::Stored) => {
+                let record = self
+                    .voting_db
+                    .get_keystone_signatures(self.round_id())?
+                    .into_iter()
+                    .find(|record| record.bundle_index == bundle_index)
+                    .ok_or_else(|| VotingError::InvalidInput {
+                        message: format!("no stored Keystone signature for bundle {bundle_index}"),
+                    })?;
+                record
+                    .sig
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| VotingError::InvalidInput {
+                        message: format!(
+                            "stored Keystone signature must be 64 bytes, got {}",
+                            record.sig.len()
+                        ),
+                    })
+            }
+        }
+    }
+}
+
 // Matches the keygen warm-up threads in voting-circuits.
 const PROVING_STACK_BYTES: usize = 64 * 1024 * 1024;
 

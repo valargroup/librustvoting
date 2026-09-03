@@ -41,8 +41,9 @@ pub use crate::delegation_capability::{
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
 pub use crate::delegation_pipeline::{
-    start_proving_cache_warmup, DelegationPipeline, DelegationSigner, KeystoneSignatureSource,
-    SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport, WalletDbOpener,
+    start_proving_cache_warmup, DelegationDriver, DelegationPipeline, DelegationSigner,
+    KeystoneSignatureSource, SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport,
+    WalletDbOpener,
 };
 pub use crate::error::{
     DelegationSetupField, VotingError, VotingErrorKind, VotingErrorKindView, VotingErrorView,
@@ -133,11 +134,16 @@ pub use crate::vote::{
     persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
     PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
 };
+#[allow(deprecated)]
+pub use crate::vote_work::VoteRecoveryExecutor;
 pub use crate::vote_work::{
-    NoopVoteRecoveryProgressReporter, VoteRecoveryAdvance, VoteRecoveryDisposition,
-    VoteRecoveryExecutor, VoteRecoveryFailure, VoteRecoveryFailureKind, VoteRecoveryKey,
-    VoteRecoveryProgress, VoteRecoveryProgressBridge, VoteRecoveryProgressReporter,
-    VoteRecoveryRequest, VoteShareDeliveryReport,
+    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter,
+    NoopVoteRecoveryProgressReporter, ProposalRosterEntry, RoundBinding, RoundExecutor,
+    RoundHostContext, RoundStepDisposition, RoundStepFailure, RoundStepFailureKind,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge, RoundStepProgressReporter,
+    VoteRecoveryAdvance, VoteRecoveryDisposition, VoteRecoveryFailure, VoteRecoveryFailureKind,
+    VoteRecoveryKey, VoteRecoveryProgress, VoteRecoveryProgressBridge,
+    VoteRecoveryProgressReporter, VoteRecoveryRequest, VoteShareDeliveryReport,
 };
 pub use crate::wire::{
     DelegationSubmissionWire, SignedVoteBatchView, VoteCommitmentBatchWire, VoteCommitmentWire,

@@ -83,8 +83,9 @@ pub use chain_submission::{
     ChainTransportFuture, MAX_CHAIN_HTTP_RESPONSE_BYTES, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
 pub use delegation_pipeline::{
-    start_proving_cache_warmup, DelegationPipeline, DelegationSigner, KeystoneSignatureSource,
-    SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport, WalletDbOpener,
+    start_proving_cache_warmup, DelegationDriver, DelegationPipeline, DelegationSigner,
+    KeystoneSignatureSource, SpendAuthSigner, SqliteWalletDbOpener, VotingEligibilityReport,
+    WalletDbOpener,
 };
 pub use error::{DelegationSetupField, VotingErrorKind, VotingErrorKindView, VotingErrorView};
 pub use helper::client::{
@@ -109,11 +110,16 @@ pub use vote::{
     persist_prepared_vote_work, prepare_vote_work, recover_vote_commitment, ConfirmedVote,
     PreparedVoteWork, VoteCommitmentRecovery, VoteWorkRequest,
 };
+#[allow(deprecated)]
+pub use vote_work::VoteRecoveryExecutor;
 pub use vote_work::{
-    NoopVoteRecoveryProgressReporter, VoteRecoveryAdvance, VoteRecoveryDisposition,
-    VoteRecoveryExecutor, VoteRecoveryFailure, VoteRecoveryFailureKind, VoteRecoveryKey,
-    VoteRecoveryProgress, VoteRecoveryProgressBridge, VoteRecoveryProgressReporter,
-    VoteRecoveryRequest, VoteShareDeliveryReport,
+    BallotIntent, DelegationStepInputs, NoopRoundStepProgressReporter,
+    NoopVoteRecoveryProgressReporter, ProposalRosterEntry, RoundBinding, RoundExecutor,
+    RoundHostContext, RoundStepDisposition, RoundStepFailure, RoundStepFailureKind,
+    RoundStepOutcome, RoundStepProgress, RoundStepProgressBridge, RoundStepProgressReporter,
+    VoteRecoveryAdvance, VoteRecoveryDisposition, VoteRecoveryFailure, VoteRecoveryFailureKind,
+    VoteRecoveryKey, VoteRecoveryProgress, VoteRecoveryProgressBridge,
+    VoteRecoveryProgressReporter, VoteRecoveryRequest, VoteShareDeliveryReport,
 };
 
 pub use delegation_capability::{

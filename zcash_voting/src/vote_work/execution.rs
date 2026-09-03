@@ -8,12 +8,12 @@ use crate::{
 };
 
 use super::{
-    round_lock, VoteRecoveryAdvance, VoteRecoveryDisposition, VoteRecoveryExecutor,
-    VoteRecoveryFailure, VoteRecoveryFailureKind, VoteRecoveryKey, VoteRecoveryProgress,
-    VoteRecoveryProgressReporter, VoteRecoveryRequest, VoteShareDeliveryReport,
+    round_lock, RoundExecutor, VoteRecoveryAdvance, VoteRecoveryDisposition, VoteRecoveryFailure,
+    VoteRecoveryFailureKind, VoteRecoveryKey, VoteRecoveryProgress, VoteRecoveryProgressReporter,
+    VoteRecoveryRequest, VoteShareDeliveryReport,
 };
 
-impl<T: ChainTransport> VoteRecoveryExecutor<T> {
+impl<T: ChainTransport> RoundExecutor<T> {
     /// Advances the first SDK-grouped persisted vote work by one bounded pass.
     ///
     /// The method serializes callers per wallet and round, derives work only
@@ -39,7 +39,7 @@ impl<T: ChainTransport> VoteRecoveryExecutor<T> {
         };
 
         let Some(_round_guard) =
-            round_lock::acquire(self.database.wallet_id(), request.round_id, control)
+            round_lock::acquire(self.database.wallet_id(), request.round_id, None, control)
                 .await
                 .map_err(|message| {
                     self.failure(
@@ -278,7 +278,7 @@ impl<T: ChainTransport> VoteRecoveryExecutor<T> {
         )
     }
 
-    fn recover_work_votes(
+    pub(super) fn recover_work_votes(
         &self,
         work: &crate::session::VoteRecoveryWork,
         request: VoteRecoveryRequest<'_>,
@@ -421,7 +421,7 @@ impl<T: ChainTransport> VoteRecoveryExecutor<T> {
     }
 }
 
-fn vote_key(vote: &CommittedVote) -> VoteRecoveryKey {
+pub(super) fn vote_key(vote: &CommittedVote) -> VoteRecoveryKey {
     VoteRecoveryKey {
         bundle_index: vote.bundle_index(),
         proposal_id: vote.proposal_id(),
