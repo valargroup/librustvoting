@@ -1325,13 +1325,17 @@ the owning rows, and foreign-key cascades remove the round's helper plans and
 delivery history as part of that deletion. The records are not selectively
 cleared while their round remains live. Every `VotingDb` handle opened on the
 same canonical SQLite file in the owning process shares one database authority,
-so an exclusive deletion requested through one handle cannot bypass a chain
-submission lifecycle lease held through another handle. Connections using the
-same named shared-cache SQLite memory URI or the same rooted name under
-SQLite's `memdb` VFS share an authority by decoded database name and selected
-VFS. Equal names opened through distinct VFSes, anonymous or unrooted memory
-databases, plain `:memory:`, explicitly private-cache memory, and SQLite
-temporary databases remain independent authorities.
+including files whose native path is not valid UTF-8, so an exclusive deletion
+requested through one handle cannot bypass a chain submission lifecycle lease
+held through another handle. Named `mode=memory` URIs and named `memdb`
+databases conservatively share an authority unless an unrooted name explicitly
+selects `cache=private`; rooted `memdb` names remain shared even under that
+option. This covers SQLite's process-wide shared-cache default and explicit
+shared caching for unrooted `memdb` names. The decoded database name and
+selected VFS form the authority identity. Equal names opened through distinct
+VFSes, anonymous memory databases, plain `:memory:`, private-cache unrooted
+memory databases, and SQLite temporary databases remain independent
+authorities.
 
 Enforcement:
 [`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),
@@ -1345,8 +1349,9 @@ standalone recovery-clear API or storage primitive remains.
 file-backed cross-handle deletion boundary while recovery material is reserved;
 `shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission`
 covers the same boundary for URI-backed shared memory, and
-`memdb_handle_cannot_delete_state_reserved_by_an_active_submission` covers it
-for SQLite's `memdb` VFS.
+`memdb_handle_cannot_delete_state_reserved_by_an_active_submission` and
+`shared_cache_memdb_handle_cannot_delete_an_active_submission` cover rooted and
+explicitly shared-cache forms of SQLite's `memdb` VFS.
 
 ## Helper identity and payload invariants
 

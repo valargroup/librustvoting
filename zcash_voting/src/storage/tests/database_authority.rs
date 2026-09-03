@@ -4,6 +4,9 @@ use std::{
     sync::{Arc, Barrier},
 };
 
+#[cfg(target_os = "linux")]
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
 use super::super::*;
 
 fn unique_label(label: &str) -> String {
@@ -44,10 +47,13 @@ fn sqlite_vfs_names() -> Vec<String> {
 }
 
 fn remove_sqlite_files(path: &Path) {
-    let path = path.to_string_lossy();
-    let _ = std::fs::remove_file(path.as_ref());
-    let _ = std::fs::remove_file(format!("{path}-shm"));
-    let _ = std::fs::remove_file(format!("{path}-wal"));
+    let mut shared_memory_path = path.as_os_str().to_os_string();
+    shared_memory_path.push("-shm");
+    let mut write_ahead_log_path = path.as_os_str().to_os_string();
+    write_ahead_log_path.push("-wal");
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(shared_memory_path);
+    let _ = std::fs::remove_file(write_ahead_log_path);
 }
 
 #[test]
@@ -86,11 +92,24 @@ fn shared_memory_handles_share_one_database_authority() {
 }
 
 #[test]
+fn memory_mode_without_explicit_cache_conservatively_shares_authority() {
+    let uri = format!("file:{}?mode=memory", unique_label("implicit-memory-cache"));
+    let first = VotingDb::open(&uri).unwrap();
+    let second = VotingDb::open(&uri).unwrap();
+
+    assert!(Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}
+
+#[test]
 fn rooted_memdb_handles_share_one_database_authority() {
     let label = unique_label("memdb");
     for uri in [
         format!("file:/{label}-slash?vfs=memdb"),
         format!("file:%5C{label}-backslash?vfs=memdb"),
+        format!("file:/{label}-private?vfs=memdb&cache=private"),
     ] {
         let first = VotingDb::open(&uri).unwrap();
         let second = VotingDb::open(&uri).unwrap();
@@ -100,6 +119,21 @@ fn rooted_memdb_handles_share_one_database_authority() {
             &second.database_authority
         ));
     }
+}
+
+#[test]
+fn unrooted_memdb_handles_with_shared_cache_share_one_database_authority() {
+    let uri = format!(
+        "file:{}?vfs=memdb&cache=shared",
+        unique_label("shared-cache-memdb")
+    );
+    let first = VotingDb::open(&uri).unwrap();
+    let second = VotingDb::open(&uri).unwrap();
+
+    assert!(Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
 }
 
 #[test]
@@ -234,6 +268,52 @@ fn normalized_paths_share_one_database_authority() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_file_uri_handles_share_one_database_authority() {
+    let path_prefix = std::env::temp_dir().join(unique_label("non-utf8"));
+    let mut path_bytes = path_prefix.as_os_str().as_bytes().to_vec();
+    path_bytes.extend_from_slice(b"-%FF.sqlite");
+    let uri = format!("file:{}", String::from_utf8(path_bytes.clone()).unwrap());
+    let percent_escape = path_bytes
+        .windows(3)
+        .position(|window| window == b"%FF")
+        .unwrap();
+    path_bytes.splice(percent_escape..percent_escape + 3, [0xff]);
+    let sqlite_path = PathBuf::from(OsStr::from_bytes(&path_bytes));
+
+    let first = VotingDb::open(&uri).unwrap();
+    let second = VotingDb::open(&uri).unwrap();
+
+    assert!(Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+
+    drop((first, second));
+    remove_sqlite_files(&sqlite_path);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn raw_non_utf8_filenames_resolve_one_database_authority() {
+    let path_prefix = std::env::temp_dir().join(unique_label("raw-non-utf8"));
+    let mut path_bytes = path_prefix.as_os_str().as_bytes().to_vec();
+    path_bytes.extend_from_slice(&[b'-', 0xff]);
+    path_bytes.extend_from_slice(b".sqlite");
+    let sqlite_path = PathBuf::from(OsStr::from_bytes(&path_bytes));
+    let first_connection = Connection::open(&sqlite_path).unwrap();
+    let second_connection = Connection::open(&sqlite_path).unwrap();
+
+    let first = DatabaseAuthority::for_connection(&first_connection, "").unwrap();
+    let second = DatabaseAuthority::for_connection(&second_connection, "").unwrap();
+
+    assert!(Arc::ptr_eq(&first, &second));
+
+    drop((first, second, first_connection, second_connection));
+    remove_sqlite_files(&sqlite_path);
+}
+
 #[test]
 fn in_memory_handles_have_independent_database_authorities() {
     let first = VotingDb::open(":memory:").unwrap();
@@ -271,10 +351,14 @@ fn empty_name_memory_handles_have_independent_database_authorities() {
 }
 
 #[test]
-fn unshared_memdb_names_have_independent_database_authorities() {
+fn unnamed_or_private_memdb_handles_have_independent_database_authorities() {
     for uri in [
-        format!("file:{}?vfs=memdb", unique_label("unrooted-memdb")),
         "file:/?vfs=memdb".to_owned(),
+        "file:%5C?vfs=memdb".to_owned(),
+        format!(
+            "file:{}?vfs=memdb&cache=private",
+            unique_label("private-unrooted-memdb")
+        ),
     ] {
         let first = VotingDb::open(&uri).unwrap();
         let second = VotingDb::open(&uri).unwrap();

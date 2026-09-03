@@ -25,6 +25,13 @@ async fn memdb_handle_cannot_delete_state_reserved_by_an_active_submission() {
     assert_second_handle_cannot_delete_active_submission(&uri).await;
 }
 
+#[tokio::test]
+async fn shared_cache_memdb_handle_cannot_delete_an_active_submission() {
+    let name = temporary_path("shared-cache-memdb-deletion").replace(['/', '.'], "-");
+    let uri = format!("file:{name}?vfs=memdb&cache=shared");
+    assert_second_handle_cannot_delete_active_submission(&uri).await;
+}
+
 async fn assert_second_handle_cannot_delete_active_submission(path: &str) {
     let submitting_db = open_prepared(path);
     let deleting_db = Arc::new(VotingDb::open(path).unwrap());

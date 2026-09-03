@@ -100,7 +100,7 @@ impl VotingDb {
     /// Open (or create) the voting database at the given path.
     /// An empty path opens an independent SQLite temporary database.
     /// Plain `:memory:` databases are independent, while handles using the
-    /// same shared-cache SQLite memory URI share lifecycle coordination.
+    /// same named memory URI may conservatively share lifecycle coordination.
     /// Runs migrations automatically.
     /// Call `set_wallet_id` before performing any round operations.
     pub fn open(path: &str) -> Result<Self, VotingError> {

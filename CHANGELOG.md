@@ -64,9 +64,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - VAN positions above `u32::MAX` are now read losslessly; legacy `u32` readers
   return a range error instead of wrapping.
 - Independently opened SQLite handles now share chain-submission lifecycle
-  coordination for one canonical file, named shared-cache memory database, or
-  rooted `memdb` database and VFS, so a destructive operation cannot bypass an
-  in-flight submission lease. Anonymous memory databases remain independent.
+  coordination for one canonical file, including non-UTF-8 native paths, or
+  any named memory database that SQLite may share under its URI cache and VFS
+  rules, so a destructive operation cannot bypass an in-flight submission
+  lease. Anonymous memory and unrooted private-cache databases remain
+  independent.
 
 ### Removed
 

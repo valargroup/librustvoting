@@ -11,6 +11,9 @@ use rusqlite::Connection;
 
 use crate::{chain_submission::coordination::SubmissionCoordination, types::VotingError};
 
+#[cfg(unix)]
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
 /// Stable process-local identity for a database that more than one handle can open.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum DatabaseIdentity {
@@ -40,10 +43,10 @@ impl DatabaseAuthority {
     /// Returns the authority for the connection's main database.
     ///
     /// File-backed databases are interned by canonical path. SQLite URI memory
-    /// databases with shared caching and rooted `memdb` names are interned by
-    /// SQLite's decoded database name and selected VFS. Plain `:memory:`,
-    /// anonymous, temporary, and explicitly private-cache memory databases
-    /// receive private authorities.
+    /// databases that may use shared caching and named `memdb` databases are
+    /// interned by SQLite's decoded database name and selected VFS. Plain
+    /// `:memory:`, anonymous, temporary, and explicitly private-cache memory
+    /// databases receive private authorities.
     pub(super) fn for_connection(
         connection: &Connection,
         opening_path: &str,
@@ -80,7 +83,7 @@ impl DatabaseIdentity {
         connection: &Connection,
         opening_path: &str,
     ) -> Result<Option<Self>, VotingError> {
-        if let Some(sqlite_path) = connection.path().filter(|path| !path.is_empty()) {
+        if let Some(sqlite_path) = connection_file_path(connection)? {
             let canonical_path =
                 std::fs::canonicalize(sqlite_path).map_err(|error| VotingError::Storage {
                     message: format!("failed to resolve SQLite database authority: {error}"),
@@ -96,6 +99,33 @@ impl DatabaseIdentity {
             database_name,
             vfs_identity: selected_vfs.identity,
         }))
+    }
+}
+
+/// Returns SQLite's main filename without requiring it to be valid UTF-8.
+fn connection_file_path(connection: &Connection) -> Result<Option<PathBuf>, VotingError> {
+    // SAFETY: the connection remains borrowed for the call and `main` is
+    // NUL-terminated. SQLite owns the returned string for the connection's
+    // lifetime.
+    let sqlite_path = unsafe {
+        let filename = rusqlite::ffi::sqlite3_db_filename(connection.handle(), c"main".as_ptr());
+        (!filename.is_null()).then(|| CStr::from_ptr(filename).to_bytes())
+    };
+    let Some(sqlite_path) = sqlite_path.filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+
+    #[cfg(unix)]
+    {
+        Ok(Some(PathBuf::from(OsStr::from_bytes(sqlite_path))))
+    }
+    #[cfg(not(unix))]
+    {
+        let sqlite_path =
+            std::str::from_utf8(sqlite_path).map_err(|error| VotingError::Storage {
+                message: format!("SQLite database path is not valid UTF-8: {error}"),
+            })?;
+        Ok(Some(PathBuf::from(sqlite_path)))
     }
 }
 
@@ -140,14 +170,20 @@ fn shared_memory_name(opening_path: &str, is_memdb: bool) -> Option<Vec<u8>> {
 
     let database_name = decode_uri_component(encoded_name);
     let mut uri_memory_mode = false;
-    let mut shared_cache = false;
+    let mut shared_cache = None;
     for option in query.split('&').filter(|option| !option.is_empty()) {
         let (encoded_key, encoded_value) = option.split_once('=').unwrap_or((option, ""));
         let key = decode_uri_component(encoded_key);
         let value = decode_uri_component(encoded_value);
         match key.as_slice() {
             b"mode" => uri_memory_mode = value == b"memory",
-            b"cache" => shared_cache = value == b"shared",
+            b"cache" => {
+                shared_cache = match value.as_slice() {
+                    b"shared" => Some(true),
+                    b"private" => Some(false),
+                    _ => None,
+                }
+            }
             _ => {}
         }
     }
@@ -156,12 +192,14 @@ fn shared_memory_name(opening_path: &str, is_memdb: bool) -> Option<Vec<u8>> {
         return None;
     }
 
-    let is_shared = if is_memdb {
-        database_name.len() > 1 && matches!(database_name[0], b'/' | b'\\')
-    } else {
-        (database_name == b":memory:" || uri_memory_mode) && shared_cache
+    let rooted_memdb_name =
+        is_memdb && database_name.len() > 1 && matches!(database_name[0], b'/' | b'\\');
+    let uses_shared_cache = match shared_cache {
+        Some(false) => false,
+        Some(true) => database_name == b":memory:" || uri_memory_mode || is_memdb,
+        None => uri_memory_mode || (is_memdb && database_name != b"/" && database_name != b"\\"),
     };
-    is_shared.then_some(database_name)
+    (rooted_memdb_name || uses_shared_cache).then_some(database_name)
 }
 
 /// Removes the optional authority using SQLite's accepted file-URI forms.
