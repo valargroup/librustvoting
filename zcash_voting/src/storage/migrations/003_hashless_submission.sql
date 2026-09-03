@@ -39,7 +39,7 @@ CREATE TABLE chain_submissions (
         OR (state = 'tracking' AND candidate_transaction_hash IS NOT NULL AND tracking_started_at IS NOT NULL)
         OR state IN ('recovering','submitted_without_hash','confirmed','rejected')),
     CHECK (state != 'submitted_without_hash'
-        OR (candidate_transaction_hash IS NULL AND tracking_started_at IS NULL
+        OR (candidate_transaction_hash IS NULL
             AND confirmed_transaction_hash IS NULL AND final_van_position IS NULL
             AND vote_commitment_positions IS NULL AND diagnostic_kind IS NOT NULL)),
     CHECK ((diagnostic_kind IS NULL) = (diagnostic IS NULL)),
