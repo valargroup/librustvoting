@@ -24,7 +24,6 @@ use crate::{
         ChainTransportFuture,
     },
     confirmation::{TxEvent, TxEventAttribute},
-    delegate::DelegationSigner,
     types::Network,
     wire::{DelegationSubmissionWire, VoteCommitmentBatchWire, VoteCommitmentWire},
 };
@@ -1284,10 +1283,7 @@ async fn delegation_uses_the_same_lifecycle_and_atomic_confirmation_path() {
 
     let result = coordinator(transport, Arc::clone(&store), ManualClock::new(100), 10)
         .advance(
-            StoreAdvancementRequest::delegation(
-                identity.clone(),
-                DelegationSigner::signature([7; 64], [8; 32]),
-            ),
+            StoreAdvancementRequest::delegation(identity.clone(), [7; 64]),
             &ManualControl::default(),
         )
         .await
@@ -2764,10 +2760,7 @@ async fn confirmed_successor_refuses_delegation_reservation() {
 
     let failure = coordinator
         .advance(
-            StoreAdvancementRequest::delegation(
-                delegation.clone(),
-                DelegationSigner::signature([7; 64], [8; 32]),
-            ),
+            StoreAdvancementRequest::delegation(delegation.clone(), [7; 64]),
             &ManualControl::default(),
         )
         .await

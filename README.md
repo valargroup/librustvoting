@@ -131,6 +131,8 @@ stage-oriented API:
 
   `needs_delegation_signing` is true for both `Delegate` and
   `AdvanceDelegation`, because locally prepared retries must be signed again.
+  The host passes only the new SpendAuth signature to the advancement request;
+  the SDK reloads and validates its stored signing context.
   Imported capability bundles yield `AdvanceImportedDelegation`; that path is
   signer-free and poll-only.
 

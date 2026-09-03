@@ -8,6 +8,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Removed
 
+- **Breaking:** removed `delegate::DelegationSigner` and replaced
+  `AdvanceDelegation::signer` with `spend_auth_signature`. Delegation chain
+  submission now accepts only the external SpendAuth signature and loads the
+  authoritative PCZT sighash and randomized verification key from durable SDK
+  state.
 - **Breaking:** collapsed the session planner's submit/poll step duality now
   that one bounded `advance_*` call both dispatches and reconciles.
   `NextStep::{SubmitVote, PollVote}` become `AdvanceVote`,
@@ -119,6 +124,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Delegation advancement no longer reparses or requires a returned full PCZT
+  to reconstruct its sighash. Background-precomputed, recovered, and Keystone
+  flows may omit PCZT bytes without stranding submission in the host adapter.
 - Chain-submission cancellation now removes a fresh reservation when transport
   dispatch has not begun. Batch admission derives its identity locks from the
   complete request roster, verifies the persisted roster before reading any

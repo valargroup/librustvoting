@@ -6441,7 +6441,7 @@ mod tests {
             &db.wallet_id(),
             ROUND_ID,
             0,
-            crate::delegate::DelegationSigner::signature(signature, request.sighash),
+            signature,
         )
         .unwrap();
 

@@ -24,8 +24,8 @@ pub use crate::delegate::{
     branch_id_for_height, display_memo, load_account_keys, pczt_sighash, setup as setup_delegation,
     signing_request as delegation_signing_request, spend_auth_signature, BranchIdProvider,
     DelegationAccountKeys, DelegationKeys, DelegationPhase, DelegationProgress, DelegationProof,
-    DelegationSetup, DelegationSigner, DelegationSigningRequest, DelegationSubmission,
-    KeystoneSigningRequest, PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
+    DelegationSetup, DelegationSigningRequest, DelegationSubmission, KeystoneSigningRequest,
+    PreparedDelegationReport, PreparedSigner, SignedDelegationBundle,
 };
 pub use crate::delegate::{
     prepare_delegation_bundle, prepare_delegation_bundle_for_target,

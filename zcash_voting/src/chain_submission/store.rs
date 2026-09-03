@@ -1,6 +1,6 @@
 //! Internal transactional storage contract for the public submission lifecycle.
 
-use crate::{delegate::DelegationSigner, types::VotingError};
+use crate::types::VotingError;
 
 use super::{
     coordination::{SubmissionCoordination, SubmissionOperationKey},
@@ -32,7 +32,7 @@ use super::{
 pub(super) enum SubmissionDerivationRequest {
     Delegation {
         identity: ChainSubmissionIdentity,
-        signer: DelegationSigner,
+        spend_auth_signature: [u8; 64],
     },
     ImportedDelegation {
         identity: ChainSubmissionIdentity,
@@ -68,9 +68,15 @@ pub(super) struct StoreAdvancementRequest {
 }
 
 impl StoreAdvancementRequest {
-    pub(super) fn delegation(identity: ChainSubmissionIdentity, signer: DelegationSigner) -> Self {
+    pub(super) fn delegation(
+        identity: ChainSubmissionIdentity,
+        spend_auth_signature: [u8; 64],
+    ) -> Self {
         Self {
-            derivation: SubmissionDerivationRequest::Delegation { identity, signer },
+            derivation: SubmissionDerivationRequest::Delegation {
+                identity,
+                spend_auth_signature,
+            },
             member_identities: vec![],
             ordered_batch_proposal_ids: None,
         }

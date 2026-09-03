@@ -47,6 +47,12 @@ All public submission entry points are typed. Callers cannot submit arbitrary
 JSON or directly record hashes, confirmation positions, or lifecycle states.
 Domain hash and position columns are projections maintained by the lifecycle,
 not competing sources of submission state.
+For a locally prepared delegation, the caller supplies only the 64-byte
+SpendAuth signature produced at the wallet signing boundary. The caller does
+not supply, reconstruct, or select the sighash used by chain submission. The
+lifecycle loads the authoritative PCZT sighash and randomized verification key
+from the locked bundle row and verifies the signature against both before any
+reservation or network request.
 An implementation phase that cannot yet perform the complete candidate-first
 recovery, fixed-snapshot tree scan, and authorized same-generation retry keeps
 its submission entry points private. A partial public lifecycle that can enter
@@ -128,6 +134,11 @@ Confirmation-only hashes, positions, timestamps, diagnostics, and a
 software-delegation SpendAuth signature are excluded. A restarted software
 delegation may therefore be re-signed, but the lifecycle must verify the new
 signature against the same locked semantic generation before dispatch.
+The full PCZT and caller-facing wire payload are not chain-submission
+authority. They may be omitted after signing and are never parsed to recover a
+sighash for submission. A present, absent, stale, or malformed returned PCZT
+cannot override the bundle row; only the externally produced signature bytes
+cross into the lifecycle request.
 
 Generation digest version 1 is SHA-256 over the ASCII domain
 `zcash_voting.chain_submission.generation.v1` followed by a NUL byte and a
@@ -397,7 +408,9 @@ Before releasing any POST byte, the lifecycle:
    submission-identity locks in canonical order;
 2. loads the authoritative row;
 3. loads and locks the generation inputs and derives the generation digest and
-   expected layout;
+   expected layout; for delegation this includes loading the stored 32-byte
+   PCZT sighash and randomized verification key and verifying the supplied
+   SpendAuth signature against them;
 4. creates the `Submitting` row, or validates the existing same-generation
    `Recovering` row;
 5. increments the attempt count for the request; and
@@ -958,6 +971,12 @@ Tests cover:
 - polling, diagnostics, and restart do not reset the durable tracking window;
 - promotion alone does not retire the candidate or permit redispatch;
 - hash polling produces atomic `Confirmed`;
+- local delegation accepts only a 64-byte SpendAuth signature, loads its
+  sighash and randomized verification key from the locked bundle, and rejects
+  malformed stored context or a non-verifying signature before reservation or
+  network I/O;
+- local delegation advancement is independent of returned PCZT bytes and
+  caller-facing wire payload fields other than the SpendAuth signature;
 - imported capability adoption starts directly in candidate-preserving
   `Tracking` with zero POST reservations and no signer;
 - imported `Tracking` and `Recovering` never dispatch, scan, or retry, and a
@@ -1153,6 +1172,11 @@ Generation and confirmation coverage is anchored by
 `records_vote_batch_confirmation_replay_and_helper_positions`.
 
 Public-lifecycle engine coverage is anchored by
+`delegation_advancement_accepts_exact_spend_auth_signature_bytes`,
+`delegation_advancement_rejects_malformed_spend_auth_signature_bytes`,
+`persisted_delegation_derives_and_rejects_a_forged_signature`,
+`persisted_delegation_rejects_malformed_authoritative_sighash`,
+`persisted_delegation_rejects_signature_for_another_sighash`,
 `reservation_commits_before_post_and_accepted_hash_is_tracking`,
 `delegation_uses_the_same_lifecycle_and_atomic_confirmation_path`,
 `reservation_failure_dispatches_nothing_and_writes_nothing`,
