@@ -446,8 +446,9 @@ pub fn minimum_voting_eligibility_for_notes(
 ///
 /// # Errors
 ///
-/// Returns [`VotingError::InvalidInput`] if notes are malformed or if the note
-/// set does not include enough quantized voting weight.
+/// Returns [`VotingError::InvalidInput`] if notes are malformed and
+/// [`VotingError::InsufficientEligibility`] if the note set does not include
+/// enough quantized voting weight.
 pub fn validate_minimum_voting_eligibility_for_notes(
     notes: &[NoteInfo],
     policy: BundlePolicy,
@@ -497,11 +498,12 @@ pub fn minimum_voting_eligibility_and_plan_for_notes(
 pub(crate) fn minimum_voting_eligibility_error(
     eligibility: MinimumVotingEligibility,
 ) -> VotingError {
-    VotingError::InvalidInput {
-        message: format!(
-            "minimum voting eligibility requires at least one eligible voting bundle with {MINIMUM_VOTING_WEIGHT_ZATOSHI} zatoshi voting weight; selected {} distinct notes across eligible bundles with {} zatoshi eligible bundle weight",
-            eligibility.distinct_note_count, eligibility.eligible_weight
-        ),
+    VotingError::InsufficientEligibility {
+        required_weight_zatoshi: MINIMUM_VOTING_WEIGHT_ZATOSHI,
+        selected_weight_zatoshi: eligibility.eligible_weight,
+        snapshot_height: None,
+        required_notes: u32::try_from(MINIMUM_VOTING_NOTE_COUNT).unwrap_or(u32::MAX),
+        selected_notes: u32::try_from(eligibility.distinct_note_count).unwrap_or(u32::MAX),
     }
 }
 

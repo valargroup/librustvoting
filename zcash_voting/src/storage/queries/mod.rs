@@ -1123,31 +1123,28 @@ fn store_delegation_data_inner(
     };
     if let Some(existing_secrets) = existing_secrets {
         if existing_secrets != secrets_blob {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "refusing to overwrite padded_note_secrets for round={}, bundle={}",
-                    round_id, bundle_index
-                ),
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::PaddedNoteSecrets,
             });
         }
     }
     if let Some(existing_sighash) = existing_sighash {
         if existing_sighash != pczt_sighash {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "refusing to overwrite pczt_sighash for round={}, bundle={}",
-                    round_id, bundle_index
-                ),
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::PcztSighash,
             });
         }
     }
     if let (Some(existing_tx1_effects), Some(tx1_effects)) = (existing_tx1_effects, tx1_effects) {
         if existing_tx1_effects != tx1_effects {
-            return Err(VotingError::InvalidInput {
-                message: format!(
-                    "refusing to overwrite tx1_effects for round={}, bundle={}",
-                    round_id, bundle_index
-                ),
+            return Err(VotingError::SetupAlreadyPersisted {
+                round_id: round_id.to_string(),
+                bundle_index,
+                field: crate::types::DelegationSetupField::Tx1Effects,
             });
         }
     }

@@ -59,8 +59,70 @@ const TREE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct HyperResponse {
     status: u16,
-    headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+/// Where a PIR HTTP request failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PirHttpFailurePhase {
+    /// The request could not be constructed.
+    Build,
+    /// No connection could be established.
+    Connect,
+    /// The request was sent but no response arrived.
+    Send,
+    /// The response body could not be read within the size limit.
+    Body,
+    /// The whole request exceeded the transport deadline.
+    Timeout,
+    /// The server answered with a non-success status.
+    Status,
+}
+
+/// Typed failure the SDK transport attaches to PIR request errors.
+///
+/// PIR client errors are `anyhow` chains; this value sits inside that chain so
+/// callers can classify retryability with
+/// [`PirHttpFailure::from_error_chain`] instead of parsing text. A custom PIR
+/// transport should attach the same value to its failures to get typed
+/// retry decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("PIR HTTP {phase:?} failure{}", pir_status_suffix(.http_status))]
+pub struct PirHttpFailure {
+    pub phase: PirHttpFailurePhase,
+    pub http_status: Option<u16>,
+}
+
+fn pir_status_suffix(status: &Option<u16>) -> String {
+    status
+        .map(|status| format!(" (status {status})"))
+        .unwrap_or_default()
+}
+
+impl PirHttpFailure {
+    /// Whether another endpoint or a later attempt may succeed.
+    pub fn retryable(&self) -> bool {
+        match self.phase {
+            PirHttpFailurePhase::Connect
+            | PirHttpFailurePhase::Send
+            | PirHttpFailurePhase::Body
+            | PirHttpFailurePhase::Timeout => true,
+            PirHttpFailurePhase::Status => {
+                matches!(self.http_status, Some(408 | 429) | Some(500..=599))
+            }
+            PirHttpFailurePhase::Build => false,
+        }
+    }
+
+    /// Finds the typed failure anywhere in an `anyhow` error chain.
+    pub fn from_error_chain(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+
+    fn wrap(self, message: String) -> anyhow::Error {
+        anyhow::Error::new(self).context(message)
+    }
 }
 
 /// Hyper HTTP transport for client-side network requests.
@@ -145,16 +207,6 @@ impl HyperTransport {
             .await
             .context("send HTTP request")?;
         let status = response.status().as_u16();
-        let headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.as_str().to_string(), value.to_string()))
-            })
-            .collect();
         let body = Limited::new(response.into_body(), max_response_bytes)
             .collect()
             .await
@@ -166,11 +218,7 @@ impl HyperTransport {
             .to_bytes()
             .to_vec();
 
-        Ok(HyperResponse {
-            status,
-            headers,
-            body,
-        })
+        Ok(HyperResponse { status, body })
     }
 
     /// Performs one helper request under a caller-supplied deadline.
@@ -282,37 +330,99 @@ impl Drop for BlockingRuntime {
     }
 }
 
-impl pir_client::Transport for HyperTransport {
-    fn get<'a>(&'a self, url: &'a str) -> pir_client::TransportFuture<'a> {
-        Box::pin(async move {
-            tokio::time::timeout(
-                PIR_REQUEST_TIMEOUT,
-                self.request(Method::GET, url, Vec::new(), MAX_PIR_RESPONSE_BYTES),
-            )
-            .await
-            .context("PIR HTTP request timed out")?
-            .map(|response| pir_client::TransportResponse {
-                status: response.status,
-                headers: response.headers,
-                body: response.body,
+impl HyperTransport {
+    /// Performs one PIR request, attaching a [`PirHttpFailure`] to every
+    /// failure so callers can classify retryability without parsing text.
+    /// Non-success statuses are failures here rather than in the PIR client,
+    /// which lets the status reach the classifier.
+    async fn pir_request(
+        &self,
+        method: Method,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Result<pir_client::TransportResponse> {
+        use PirHttpFailurePhase as Phase;
+        let request = Request::builder()
+            .method(method)
+            .uri(url)
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|error| {
+                PirHttpFailure {
+                    phase: Phase::Build,
+                    http_status: None,
+                }
+                .wrap(format!("build HTTP request: {error}"))
+            })?;
+        tokio::time::timeout(PIR_REQUEST_TIMEOUT, async {
+            let response = self.client.request(request).await.map_err(|error| {
+                let phase = if error.is_connect() {
+                    Phase::Connect
+                } else {
+                    Phase::Send
+                };
+                PirHttpFailure {
+                    phase,
+                    http_status: None,
+                }
+                .wrap(format!("send HTTP request: {error}"))
+            })?;
+            let status = response.status().as_u16();
+            let headers = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .collect();
+            let body = Limited::new(response.into_body(), MAX_PIR_RESPONSE_BYTES)
+                .collect()
+                .await
+                .map_err(|error| {
+                    PirHttpFailure {
+                        phase: Phase::Body,
+                        http_status: Some(status),
+                    }
+                    .wrap(format!(
+                        "read HTTP response body (limit {MAX_PIR_RESPONSE_BYTES} bytes): {error}"
+                    ))
+                })?
+                .to_bytes()
+                .to_vec();
+            if !(200..300).contains(&status) {
+                let preview: String = String::from_utf8_lossy(&body).chars().take(256).collect();
+                return Err(PirHttpFailure {
+                    phase: Phase::Status,
+                    http_status: Some(status),
+                }
+                .wrap(format!("PIR HTTP status {status} body={preview}")));
+            }
+            Ok(pir_client::TransportResponse {
+                status,
+                headers,
+                body,
             })
         })
+        .await
+        .map_err(|_| {
+            PirHttpFailure {
+                phase: Phase::Timeout,
+                http_status: None,
+            }
+            .wrap("PIR HTTP request timed out".to_string())
+        })?
+    }
+}
+
+impl pir_client::Transport for HyperTransport {
+    fn get<'a>(&'a self, url: &'a str) -> pir_client::TransportFuture<'a> {
+        Box::pin(self.pir_request(Method::GET, url, Vec::new()))
     }
 
     fn post<'a>(&'a self, url: &'a str, body: Vec<u8>) -> pir_client::TransportFuture<'a> {
-        Box::pin(async move {
-            tokio::time::timeout(
-                PIR_REQUEST_TIMEOUT,
-                self.request(Method::POST, url, body, MAX_PIR_RESPONSE_BYTES),
-            )
-            .await
-            .context("PIR HTTP request timed out")?
-            .map(|response| pir_client::TransportResponse {
-                status: response.status,
-                headers: response.headers,
-                body: response.body,
-            })
-        })
+        Box::pin(self.pir_request(Method::POST, url, body))
     }
 }
 
@@ -995,5 +1105,48 @@ mod tests {
         });
 
         assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod typed_pir_failure_tests {
+    use super::{PirHttpFailure, PirHttpFailurePhase as Phase};
+
+    #[test]
+    fn retryability_follows_phase_and_status() {
+        let retryable = |phase, http_status| PirHttpFailure { phase, http_status }.retryable();
+        assert!(retryable(Phase::Connect, None));
+        assert!(retryable(Phase::Send, None));
+        assert!(retryable(Phase::Body, Some(200)));
+        assert!(retryable(Phase::Timeout, None));
+        assert!(retryable(Phase::Status, Some(408)));
+        assert!(retryable(Phase::Status, Some(429)));
+        assert!(retryable(Phase::Status, Some(503)));
+        assert!(!retryable(Phase::Status, Some(404)));
+        assert!(!retryable(Phase::Status, Some(400)));
+        assert!(!retryable(Phase::Build, None));
+    }
+
+    #[test]
+    fn typed_failure_survives_anyhow_context_and_maps_to_pir_unavailable() {
+        let error = PirHttpFailure {
+            phase: Phase::Status,
+            http_status: Some(502),
+        }
+        .wrap("PIR HTTP status 502 body=".to_string())
+        .context("fetch proof");
+        let typed = PirHttpFailure::from_error_chain(&error).expect("typed failure in chain");
+        assert_eq!(typed.http_status, Some(502));
+
+        let mapped =
+            crate::pir::map_pir_fetch_error(Some("https://pir"), "PIR parallel fetch failed", error);
+        assert!(mapped.retryable());
+        assert_eq!(mapped.kind(), crate::VotingErrorKind::PirUnavailable);
+        let text = mapped.to_string();
+        assert!(text.contains("PIR parallel fetch failed"), "{text}");
+        assert!(text.contains("https://pir"), "{text}");
+
+        let foreign = crate::pir::map_pir_fetch_error(None, "PIR parallel fetch failed", anyhow::anyhow!("opaque"));
+        assert!(!foreign.retryable());
     }
 }

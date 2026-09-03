@@ -20,8 +20,8 @@ use crate::{
     types::{
         validate_32_bytes, validate_encrypted_shares, validate_proposal_id, validate_round_params,
         validate_share_index, validate_vote_chain_id, validate_vote_round_id_hex, Network, NoteRef,
-        RoundBoundVotingHotkeyTarget, SelectedNotes, SharePayload, VotingError, VotingHotkeyTarget,
-        MAX_VOTE_OPTIONS,
+        RoundBoundVotingHotkeyTarget, SelectedNotes, SharePayload, VotingError, VotingErrorKind,
+        VotingHotkeyTarget, MAX_VOTE_OPTIONS,
     },
     vote::{SignedVoteBatch, SignedVoteCommitment, SignedVoteCommitments, VoteSubmission},
     wire::{
@@ -31,8 +31,8 @@ use crate::{
         ShareDelegationRecordView, ShareWorkflowRecoveryView, SignedDelegationPayloadView,
         SignedVoteBatchView, SignedVoteCommitmentView, SignedVoteCommitmentsView,
         SubmissionDiagnosticView, VoteCommitmentBatchWire, VoteCommitmentWire, VoteRecoveryView,
-        VoteRecoveryWorkView, VoteShareWire, VotingHotkeyTargetV1, VotingNoteRefView,
-        VotingNoteSelectionResultView, VotingRoundParams,
+        VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView, VotingErrorView,
+        VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView, VotingRoundParams,
     },
     BundlePolicy,
 };
@@ -863,8 +863,160 @@ fn helper_tree_position(value: u64) -> Result<u64, VotingError> {
     Ok(value)
 }
 
+impl From<&VotingError> for VotingErrorView {
+    fn from(error: &VotingError) -> Self {
+        let mut view = VotingErrorView {
+            kind: error.kind().into(),
+            retryable: error.retryable(),
+            message: error.to_string(),
+            bundle_index: None,
+            snapshot_height: None,
+            required_weight_zatoshi: None,
+            selected_weight_zatoshi: None,
+            required_notes: None,
+            selected_notes: None,
+            http_status: None,
+            endpoint: None,
+        };
+        match error {
+            VotingError::KeystoneSignatureConflict { bundle_index } => {
+                view.bundle_index = Some(*bundle_index);
+            }
+            VotingError::InsufficientEligibility {
+                required_weight_zatoshi,
+                selected_weight_zatoshi,
+                snapshot_height,
+                required_notes,
+                selected_notes,
+            } => {
+                view.required_weight_zatoshi = Some(*required_weight_zatoshi);
+                view.selected_weight_zatoshi = Some(*selected_weight_zatoshi);
+                view.snapshot_height = *snapshot_height;
+                view.required_notes = Some(*required_notes);
+                view.selected_notes = Some(*selected_notes);
+            }
+            VotingError::NoSpendableNotes { snapshot_height } => {
+                view.snapshot_height = Some(*snapshot_height);
+            }
+            VotingError::SetupAlreadyPersisted { bundle_index, .. } => {
+                view.bundle_index = Some(*bundle_index);
+            }
+            VotingError::PirUnavailable {
+                endpoint,
+                http_status,
+                ..
+            } => {
+                view.http_status = *http_status;
+                view.endpoint = endpoint.clone();
+            }
+            _ => {}
+        }
+        view
+    }
+}
+
+impl From<VotingError> for VotingErrorView {
+    fn from(error: VotingError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl From<VotingErrorKind> for VotingErrorKindView {
+    fn from(kind: VotingErrorKind) -> Self {
+        match kind {
+            VotingErrorKind::InvalidInput => Self::InvalidInput,
+            VotingErrorKind::KeystoneSignatureConflict => Self::KeystoneSignatureConflict,
+            VotingErrorKind::ProofFailed => Self::ProofFailed,
+            VotingErrorKind::Busy => Self::Busy,
+            VotingErrorKind::Storage => Self::Storage,
+            VotingErrorKind::Internal => Self::Internal,
+            VotingErrorKind::InsufficientEligibility => Self::InsufficientEligibility,
+            VotingErrorKind::NoSpendableNotes => Self::NoSpendableNotes,
+            VotingErrorKind::SetupAlreadyPersisted => Self::SetupAlreadyPersisted,
+            VotingErrorKind::DbBusy => Self::DbBusy,
+            VotingErrorKind::PirUnavailable => Self::PirUnavailable,
+        }
+    }
+}
+
+impl VotingError {
+    /// Wallet-facing view of this error.
+    pub fn to_view(&self) -> VotingErrorView {
+        VotingErrorView::from(self)
+    }
+}
+
+impl std::fmt::Display for VotingErrorView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VotingErrorView {}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn voting_error_view_carries_structured_payloads() {
+        use crate::types::DelegationSetupField;
+        use crate::wire::VotingErrorKindView;
+        use crate::VotingError;
+
+        let eligibility = VotingError::InsufficientEligibility {
+            required_weight_zatoshi: 12_500_000,
+            selected_weight_zatoshi: 3,
+            snapshot_height: None,
+            required_notes: 5,
+            selected_notes: 2,
+        }
+        .with_snapshot_height(42)
+        .to_view();
+        assert_eq!(eligibility.kind, VotingErrorKindView::InsufficientEligibility);
+        assert!(!eligibility.retryable);
+        assert_eq!(eligibility.snapshot_height, Some(42));
+        assert_eq!(eligibility.required_weight_zatoshi, Some(12_500_000));
+        assert_eq!(eligibility.selected_weight_zatoshi, Some(3));
+        assert_eq!(eligibility.required_notes, Some(5));
+        assert_eq!(eligibility.selected_notes, Some(2));
+        assert!(eligibility.message.contains("at snapshot height 42"));
+
+        let busy = VotingError::DbBusy {
+            message: "locked".to_string(),
+        }
+        .to_view();
+        assert_eq!(busy.kind, VotingErrorKindView::DbBusy);
+        assert!(busy.retryable);
+
+        let pir = VotingError::PirUnavailable {
+            endpoint: Some("https://pir".to_string()),
+            http_status: Some(503),
+            retryable: true,
+            message: "m".to_string(),
+        }
+        .to_view();
+        assert_eq!(pir.kind, VotingErrorKindView::PirUnavailable);
+        assert_eq!(pir.http_status, Some(503));
+        assert_eq!(pir.endpoint.as_deref(), Some("https://pir"));
+        assert!(pir.retryable);
+
+        let setup = VotingError::SetupAlreadyPersisted {
+            round_id: "r".to_string(),
+            bundle_index: 3,
+            field: DelegationSetupField::Tx1Effects,
+        }
+        .to_view();
+        assert_eq!(setup.kind, VotingErrorKindView::SetupAlreadyPersisted);
+        assert_eq!(setup.bundle_index, Some(3));
+
+        let conflict = VotingError::KeystoneSignatureConflict { bundle_index: 9 }.to_view();
+        assert_eq!(conflict.bundle_index, Some(9));
+
+        let json = serde_json::to_string(&pir).unwrap();
+        assert!(json.contains("\"kind\":\"pir_unavailable\""), "{json}");
+        let round_trip: crate::wire::VotingErrorView = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, pir);
+    }
+
     use super::*;
     use crate::vote::SignedVoteCommitment;
     use crate::VotingHotkey;

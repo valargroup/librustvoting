@@ -1111,9 +1111,9 @@ impl VotingDb {
                     });
                 }
                 eprintln!("[ZKP1] Precomputing PIR proofs: {} missing", nfs.len());
-                pir_client.fetch_proofs(nfs).map_err(|e| VotingError::Internal {
-                    message: format!("PIR parallel fetch failed: {e}"),
-                })
+                pir_client
+                    .fetch_proofs(nfs)
+                    .map_err(|e| crate::pir::map_pir_fetch_error(None, "PIR parallel fetch failed", e))
             },
         )?;
 
@@ -1163,9 +1163,7 @@ impl VotingDb {
             |nfs| {
                 pir_client
                     .fetch_proofs(nfs)
-                    .map_err(|e| VotingError::Internal {
-                        message: format!("PIR parallel fetch failed: {e}"),
-                    })
+                    .map_err(|e| crate::pir::map_pir_fetch_error(None, "PIR parallel fetch failed", e))
             },
         )
     }

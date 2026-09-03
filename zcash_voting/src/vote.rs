@@ -1709,7 +1709,7 @@ pub fn prepare_commit(
                     draft.proposal_id,
                 )?
                 .ok_or_else(|| vote_not_found_error(round_id, bundle_index, draft.proposal_id))?;
-                Ok((recovered, CapturedVoteState::Recovered(state)))
+                Ok::<_, VotingError>((recovered, CapturedVoteState::Recovered(state)))
             })
             .transpose()?;
         if recovered.is_none() {

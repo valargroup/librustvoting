@@ -427,3 +427,48 @@ pub struct RoundPlanView {
     pub immediate_share_confirmed: bool,
     pub all_decided: bool,
 }
+
+/// Stable error category exposed across the wallet boundary.
+///
+/// Mirrors [`crate::VotingErrorKind`]; `Other` covers categories added to the
+/// crate after this view was generated for a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VotingErrorKindView {
+    InvalidInput,
+    KeystoneSignatureConflict,
+    ProofFailed,
+    Busy,
+    Storage,
+    Internal,
+    InsufficientEligibility,
+    NoSpendableNotes,
+    SetupAlreadyPersisted,
+    DbBusy,
+    PirUnavailable,
+    Other,
+}
+
+/// Wallet-facing view of a [`crate::VotingError`].
+///
+/// `kind`, `retryable`, and `message` are always populated. The remaining
+/// fields carry the structured payload of the kinds that have one:
+/// `bundle_index` for `KeystoneSignatureConflict` and `SetupAlreadyPersisted`;
+/// `snapshot_height`, the weight fields, and the note counts for
+/// `InsufficientEligibility` and `NoSpendableNotes`; `http_status` and
+/// `endpoint` for `PirUnavailable`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VotingErrorView {
+    pub kind: VotingErrorKindView,
+    pub retryable: bool,
+    pub message: String,
+    pub bundle_index: Option<u32>,
+    pub snapshot_height: Option<u64>,
+    pub required_weight_zatoshi: Option<u64>,
+    pub selected_weight_zatoshi: Option<u64>,
+    pub required_notes: Option<u32>,
+    pub selected_notes: Option<u32>,
+    pub http_status: Option<u16>,
+    pub endpoint: Option<String>,
+}

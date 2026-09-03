@@ -4,7 +4,7 @@ use crate::{
     vote::{recover_atomic_vote_batch, CommittedVote},
     AdvanceVote, AdvanceVoteBatch, ChainRecoveryMode, ChainSubmissionControl,
     ChainSubmissionFailure, ChainSubmissionFailureKind, ChainSubmissionResult, ChainTransport,
-    VotingError, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
+    VotingError, VotingErrorKind, MAX_CHAIN_SUBMISSION_DIAGNOSTIC_BYTES,
 };
 
 use super::{
@@ -346,13 +346,17 @@ impl<T: ChainTransport> VoteRecoveryExecutor<T> {
         work: Option<crate::session::VoteRecoveryWork>,
         request: VoteRecoveryRequest<'_>,
     ) -> VoteRecoveryFailure {
-        let kind = match error {
-            VotingError::InvalidInput { .. } => VoteRecoveryFailureKind::InvalidInput,
-            VotingError::Busy { .. } => VoteRecoveryFailureKind::Busy,
-            VotingError::Storage { .. } => VoteRecoveryFailureKind::Storage,
-            VotingError::KeystoneSignatureConflict { .. }
-            | VotingError::ProofFailed { .. }
-            | VotingError::Internal { .. } => VoteRecoveryFailureKind::InvariantViolation,
+        let kind = match error.kind() {
+            VotingErrorKind::InvalidInput
+            | VotingErrorKind::InsufficientEligibility
+            | VotingErrorKind::NoSpendableNotes
+            | VotingErrorKind::SetupAlreadyPersisted => VoteRecoveryFailureKind::InvalidInput,
+            VotingErrorKind::Busy | VotingErrorKind::DbBusy => VoteRecoveryFailureKind::Busy,
+            VotingErrorKind::Storage => VoteRecoveryFailureKind::Storage,
+            VotingErrorKind::PirUnavailable => VoteRecoveryFailureKind::Transport,
+            VotingErrorKind::KeystoneSignatureConflict
+            | VotingErrorKind::ProofFailed
+            | VotingErrorKind::Internal => VoteRecoveryFailureKind::InvariantViolation,
         };
         self.failure(kind, work, None, None, error.to_string(), request)
     }

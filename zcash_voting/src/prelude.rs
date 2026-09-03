@@ -39,7 +39,9 @@ pub use crate::delegation_capability::{
     ImportDelegationCapabilityParams, MAX_DELEGATION_CAPABILITY_BUNDLES,
     MAX_DELEGATION_CAPABILITY_JSON_BYTES,
 };
-pub use crate::error::VotingError;
+pub use crate::error::{
+    DelegationSetupField, VotingError, VotingErrorKind, VotingErrorKindView, VotingErrorView,
+};
 pub use crate::governance::{BALLOT_DIVISOR, BUNDLE_NOTE_SLOTS};
 pub use crate::helper::client::{
     HelperClient, HelperClientConfig, HelperError, HelperFleetPreflight, ShareStatus,

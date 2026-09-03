@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use crate::config::{validate_and_convert_pir_layout, PirLayout};
+use crate::http_transport::PirHttpFailure;
 use crate::types::VotingError;
 
 pub use crate::pir_snapshot::{
@@ -60,8 +61,8 @@ pub fn negotiated_pir_layout(layout: PirLayout) -> Result<NegotiatedPirLayout, V
 /// (for example after exact-height snapshot probing). Fails closed before any
 /// private query when the layout is unknown or the config/server handshake
 /// rejects the server. Layout mismatches (including `poly_len`) surface as
-/// [`VotingError::InvalidInput`]; other connect failures remain
-/// [`VotingError::Internal`].
+/// [`VotingError::InvalidInput`]; other connect failures surface as
+/// [`VotingError::PirUnavailable`] with a typed retryability decision.
 pub fn connect_pir_blocking(
     pir_layout: PirLayout,
     endpoint_url: &str,
@@ -75,7 +76,7 @@ pub fn connect_pir_blocking(
     }
     let expected_layout = negotiated_pir_layout(pir_layout)?;
     PirClientBlocking::with_transport(&endpoint, expected_layout, transport)
-        .map_err(map_pir_connect_error)
+        .map_err(|err| map_pir_connect_error(&endpoint, err))
 }
 
 /// Connects an async PIR client using an explicit layout and endpoint URL.
@@ -95,22 +96,41 @@ pub async fn connect_pir(
     let expected_layout = negotiated_pir_layout(pir_layout)?;
     PirClient::with_transport(&endpoint, expected_layout, transport)
         .await
-        .map_err(map_pir_connect_error)
+        .map_err(|err| map_pir_connect_error(&endpoint, err))
 }
 
 fn normalize_endpoint_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-fn map_pir_connect_error(err: impl std::fmt::Display) -> VotingError {
-    let detail = err.to_string();
-    let message = format!("PIR connect failed: {detail}");
+fn map_pir_connect_error(endpoint: &str, err: anyhow::Error) -> VotingError {
+    let detail = format!("{err:#}");
     // Config/server layout or poly_len disagreement is a caller/config
-    // incompatibility, not an unexpected internal failure.
+    // incompatibility, not an endpoint availability problem.
     if detail.contains("PIR layout mismatch") || detail.contains("PIR poly_len mismatch") {
-        VotingError::InvalidInput { message }
-    } else {
-        VotingError::Internal { message }
+        return VotingError::InvalidInput {
+            message: format!("PIR connect failed: {detail}"),
+        };
+    }
+    map_pir_fetch_error(Some(endpoint), "PIR connect failed", err)
+}
+
+/// Converts a PIR client failure into [`VotingError::PirUnavailable`].
+///
+/// Retryability and the HTTP status come from the typed
+/// [`PirHttpFailure`] the SDK transport attaches; a foreign transport that
+/// reports only text yields a non-retryable error.
+pub(crate) fn map_pir_fetch_error(
+    endpoint: Option<&str>,
+    context: &str,
+    err: anyhow::Error,
+) -> VotingError {
+    let typed = PirHttpFailure::from_error_chain(&err);
+    VotingError::PirUnavailable {
+        endpoint: endpoint.map(str::to_string),
+        http_status: typed.and_then(|failure| failure.http_status),
+        retryable: typed.is_some_and(PirHttpFailure::retryable),
+        message: format!("{context}: {err:#}"),
     }
 }
 
