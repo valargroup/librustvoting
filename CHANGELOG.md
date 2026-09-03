@@ -144,6 +144,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   ambiguity and continues through the invocation's remaining bounded attempts;
   a later invocation may reserve the next POST directly instead of repeating
   a full tree pass.
+- `resume_plan` now schedules `AdvanceVote` and `AdvanceVoteBatch` for
+  lifecycle-owned and submitted votes whose proposal has no recorded ballot
+  intent, and a missing intent no longer fails planning for a batch member.
+- `VoteRecoveryWork::tx_hash` for `AdvanceVoteBatch` now reports the in-flight
+  batch row's candidate hash, looked up by ordered batch digest.
 - Local delegation, singleton-vote, and vote-batch `resume_plan` advance steps
   now direct hosts through exact-tree recovery. Following the documented
   pending loop can therefore resolve a hashless `Recovering` generation instead

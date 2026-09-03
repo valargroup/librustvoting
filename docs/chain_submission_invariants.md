@@ -611,6 +611,19 @@ Restart plans are derived from the authoritative row:
 - a `Rejected` row schedules no reconciliation;
 - absent rows permit fresh work if bundle causality allows it.
 
+Advancement steps for a lifecycle-owned (`SubmissionManaged`) or `Submitted`
+vote are derived from the authoritative rows alone and never depend on a
+recorded ballot intent: a transaction that may already be on the wire is the
+wallet's whatever the host has recorded so far. A missing intent is not a
+conflict for a singleton or a batch member; only a differing or skipped intent
+conflicts, and that conflict is rejected before any step is planned
+(`lifecycle_owned_vote_without_ballot_intent_still_yields_an_advance_step`,
+`lifecycle_owned_batch_without_ballot_intent_still_yields_an_advance_step`).
+Recovery work for an in-flight batch reports the hash held by the batch's own
+authoritative row, looked up by ordered batch digest, because batch members own
+no lifecycle row and their projection columns stay empty until confirmation
+(`in_flight_batch_reports_the_batch_row_candidate_hash`).
+
 Hosts must execute local delegation, singleton-vote, and vote-batch advance
 steps through the matching `*_with_recovery` entry point with
 `ChainRecoveryMode::ExactTree`. The same mode is safe for `Tracking` and fresh

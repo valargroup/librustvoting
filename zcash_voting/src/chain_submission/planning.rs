@@ -22,6 +22,8 @@ pub(crate) enum PlanningTarget {
     Delegation,
     /// One vote, matched against its own singleton generation.
     Vote { proposal_id: u32 },
+    /// One atomic vote batch, matched by its ordered batch digest.
+    VoteBatch { ordered_batch_digest: [u8; 32] },
 }
 
 /// Returns whether one bundle came from a delegation capability import.
@@ -62,7 +64,9 @@ pub(crate) fn delegation_is_capability_imported(
 /// matching a vote against any batch on its bundle would attribute another
 /// generation's hash to an unrelated vote. A batch member reports no hash until
 /// confirmation writes the shared hash into its own projection column, which
-/// the caller's fallback then reads.
+/// the caller's fallback then reads. A caller that knows the batch digest asks
+/// for the batch row itself, which is authoritative while the batch is in
+/// flight.
 ///
 /// Prefers the confirmed hash, then the candidate hash of an in-flight
 /// generation. Returns `None` when no authoritative row exists, when the row
@@ -97,32 +101,38 @@ pub(crate) fn lifecycle_transaction_hash(
 
     let mut hashes: Vec<Vec<u8>> = Vec::new();
     {
-        let (sql, delegation) = match target {
-            PlanningTarget::Delegation => (format!("{SELECT}cs.kind = 'delegation'{ORDER}"), true),
-            PlanningTarget::Vote { .. } => (
-                format!("{SELECT}cs.kind = 'vote' AND cs.proposal_id = :proposal{ORDER}"),
-                false,
+        let sql = match target {
+            PlanningTarget::Delegation => format!("{SELECT}cs.kind = 'delegation'{ORDER}"),
+            PlanningTarget::Vote { .. } => {
+                format!("{SELECT}cs.kind = 'vote' AND cs.proposal_id = :proposal{ORDER}")
+            }
+            PlanningTarget::VoteBatch { .. } => format!(
+                "{SELECT}cs.kind = 'vote_batch' AND cs.ordered_batch_digest = :digest{ORDER}"
             ),
         };
         let mut statement = conn.prepare(&sql).map_err(|e| VotingError::Internal {
             message: format!("failed to prepare lifecycle transaction hash query: {e}"),
         })?;
-        let mut rows = if delegation {
-            statement.query(named_params! {
+        let mut rows = match target {
+            PlanningTarget::Delegation => statement.query(named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
-            })
-        } else {
-            let PlanningTarget::Vote { proposal_id } = target else {
-                unreachable!("delegation handled above")
-            };
-            statement.query(named_params! {
+            }),
+            PlanningTarget::Vote { proposal_id } => statement.query(named_params! {
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
                 ":proposal": proposal_id as i64,
-            })
+            }),
+            PlanningTarget::VoteBatch {
+                ordered_batch_digest,
+            } => statement.query(named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":digest": ordered_batch_digest.as_slice(),
+            }),
         }
         .map_err(|e| VotingError::Internal {
             message: format!("failed to load lifecycle transaction hash: {e}"),
@@ -162,6 +172,33 @@ pub(crate) fn delegation_transaction_hash(
         return Ok(Some(hash));
     }
     db.get_delegation_tx_hash(round_id, bundle_index)
+}
+
+/// Transaction hash to report for one atomic vote batch.
+///
+/// The batch row is authoritative while the batch is in flight: its members
+/// own no lifecycle rows and their projection columns stay empty until
+/// confirmation. Falls back to the anchor member's own hash so a confirmed or
+/// migrated batch keeps reporting the hash its projection columns hold.
+pub(crate) fn vote_batch_transaction_hash(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    ordered_batch_digest: [u8; 32],
+    anchor_proposal_id: u32,
+) -> Result<Option<String>, VotingError> {
+    if let Some(hash) = lifecycle_transaction_hash(
+        &db.conn(),
+        &db.wallet_id(),
+        round_id,
+        bundle_index,
+        PlanningTarget::VoteBatch {
+            ordered_batch_digest,
+        },
+    )? {
+        return Ok(Some(hash));
+    }
+    vote_transaction_hash(db, round_id, bundle_index, anchor_proposal_id)
 }
 
 /// Transaction hash to report for one vote, singleton or batch member.
