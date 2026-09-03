@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    ffi::CStr,
     path::PathBuf,
     sync::{Arc, LazyLock, Mutex, Weak},
 };
@@ -20,6 +21,12 @@ enum DatabaseIdentity {
     },
 }
 
+/// Identity and memory semantics of the VFS selected by SQLite.
+struct ConnectionVfs {
+    identity: usize,
+    is_memdb: bool,
+}
+
 /// Process-local owner of coordination that must agree across database handles.
 #[derive(Default)]
 pub(super) struct DatabaseAuthority {
@@ -33,9 +40,10 @@ impl DatabaseAuthority {
     /// Returns the authority for the connection's main database.
     ///
     /// File-backed databases are interned by canonical path. SQLite URI memory
-    /// databases with shared caching are interned by SQLite's decoded database
-    /// name and selected VFS. Plain `:memory:`, temporary, and explicitly
-    /// private-cache memory databases receive private authorities.
+    /// databases with shared caching and rooted `memdb` names are interned by
+    /// SQLite's decoded database name and selected VFS. Plain `:memory:`,
+    /// anonymous, temporary, and explicitly private-cache memory databases
+    /// receive private authorities.
     pub(super) fn for_connection(
         connection: &Connection,
         opening_path: &str,
@@ -80,18 +88,19 @@ impl DatabaseIdentity {
             return Ok(Some(Self::File(canonical_path)));
         }
 
-        let Some(database_name) = shared_memory_name(opening_path) else {
+        let selected_vfs = connection_vfs(connection)?;
+        let Some(database_name) = shared_memory_name(opening_path, selected_vfs.is_memdb) else {
             return Ok(None);
         };
         Ok(Some(Self::SharedMemory {
             database_name,
-            vfs_identity: connection_vfs_identity(connection)?,
+            vfs_identity: selected_vfs.identity,
         }))
     }
 }
 
-/// Returns the process-local identity of the VFS selected for this connection.
-fn connection_vfs_identity(connection: &Connection) -> Result<usize, VotingError> {
+/// Returns the identity and memory semantics of the selected VFS.
+fn connection_vfs(connection: &Connection) -> Result<ConnectionVfs, VotingError> {
     let mut selected_vfs: *mut rusqlite::ffi::sqlite3_vfs = std::ptr::null_mut();
     // SAFETY: the rusqlite connection remains borrowed for the call, `main` is
     // NUL-terminated, and SQLite writes one VFS pointer into `selected_vfs`.
@@ -108,11 +117,20 @@ fn connection_vfs_identity(connection: &Connection) -> Result<usize, VotingError
             message: format!("failed to resolve SQLite VFS identity: result code {result}"),
         });
     }
-    Ok(selected_vfs.addr())
+    // SAFETY: a successful `SQLITE_FCNTL_VFS_POINTER` call returned SQLite's
+    // live VFS registration, whose required `zName` field is NUL-terminated.
+    let is_memdb = unsafe {
+        let vfs_name = (*selected_vfs).zName;
+        !vfs_name.is_null() && CStr::from_ptr(vfs_name).to_bytes() == b"memdb"
+    };
+    Ok(ConnectionVfs {
+        identity: selected_vfs.addr(),
+        is_memdb,
+    })
 }
 
-/// Returns SQLite's decoded database name for a shared-cache memory URI.
-fn shared_memory_name(opening_path: &str) -> Option<Vec<u8>> {
+/// Returns SQLite's decoded name when the selected memory backend shares it.
+fn shared_memory_name(opening_path: &str, is_memdb: bool) -> Option<Vec<u8>> {
     let uri = opening_path.strip_prefix("file:")?;
     let uri = strip_uri_authority(uri)?;
     let uri = uri
@@ -134,7 +152,16 @@ fn shared_memory_name(opening_path: &str) -> Option<Vec<u8>> {
         }
     }
 
-    ((database_name == b":memory:" || uri_memory_mode) && shared_cache).then_some(database_name)
+    if database_name.is_empty() {
+        return None;
+    }
+
+    let is_shared = if is_memdb {
+        database_name.len() > 1 && matches!(database_name[0], b'/' | b'\\')
+    } else {
+        (database_name == b":memory:" || uri_memory_mode) && shared_cache
+    };
+    is_shared.then_some(database_name)
 }
 
 /// Removes the optional authority using SQLite's accepted file-URI forms.

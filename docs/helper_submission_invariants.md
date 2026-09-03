@@ -1327,10 +1327,11 @@ cleared while their round remains live. Every `VotingDb` handle opened on the
 same canonical SQLite file in the owning process shares one database authority,
 so an exclusive deletion requested through one handle cannot bypass a chain
 submission lifecycle lease held through another handle. Connections using the
-same shared-cache SQLite memory URI share an authority by decoded database
-name and selected VFS. Equal names opened through distinct VFSes, plain
-`:memory:`, explicitly private-cache memory, and SQLite temporary databases
-remain independent authorities.
+same named shared-cache SQLite memory URI or the same rooted name under
+SQLite's `memdb` VFS share an authority by decoded database name and selected
+VFS. Equal names opened through distinct VFSes, anonymous or unrooted memory
+databases, plain `:memory:`, explicitly private-cache memory, and SQLite
+temporary databases remain independent authorities.
 
 Enforcement:
 [`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),
@@ -1343,7 +1344,9 @@ standalone recovery-clear API or storage primitive remains.
 `second_handle_cannot_delete_state_reserved_by_an_active_submission` covers the
 file-backed cross-handle deletion boundary while recovery material is reserved;
 `shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission`
-covers the same boundary for URI-backed shared memory.
+covers the same boundary for URI-backed shared memory, and
+`memdb_handle_cannot_delete_state_reserved_by_an_active_submission` covers it
+for SQLite's `memdb` VFS.
 
 ## Helper identity and payload invariants
 

@@ -86,6 +86,23 @@ fn shared_memory_handles_share_one_database_authority() {
 }
 
 #[test]
+fn rooted_memdb_handles_share_one_database_authority() {
+    let label = unique_label("memdb");
+    for uri in [
+        format!("file:/{label}-slash?vfs=memdb"),
+        format!("file:%5C{label}-backslash?vfs=memdb"),
+    ] {
+        let first = VotingDb::open(&uri).unwrap();
+        let second = VotingDb::open(&uri).unwrap();
+
+        assert!(Arc::ptr_eq(
+            &first.database_authority,
+            &second.database_authority
+        ));
+    }
+}
+
+#[test]
 fn equivalent_shared_memory_uris_share_one_database_authority() {
     let name = unique_label("shared-memory-alias");
     let encoded_name = name.replace('-', "%2D");
@@ -239,6 +256,34 @@ fn private_cache_memory_handles_have_independent_database_authorities() {
         &first.database_authority,
         &second.database_authority
     ));
+}
+
+#[test]
+fn empty_name_memory_handles_have_independent_database_authorities() {
+    let uri = "file:?mode=memory&cache=shared";
+    let first = VotingDb::open(uri).unwrap();
+    let second = VotingDb::open(uri).unwrap();
+
+    assert!(!Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}
+
+#[test]
+fn unshared_memdb_names_have_independent_database_authorities() {
+    for uri in [
+        format!("file:{}?vfs=memdb", unique_label("unrooted-memdb")),
+        "file:/?vfs=memdb".to_owned(),
+    ] {
+        let first = VotingDb::open(&uri).unwrap();
+        let second = VotingDb::open(&uri).unwrap();
+
+        assert!(!Arc::ptr_eq(
+            &first.database_authority,
+            &second.database_authority
+        ));
+    }
 }
 
 #[test]

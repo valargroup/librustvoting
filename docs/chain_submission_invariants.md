@@ -81,15 +81,16 @@ ledgers.
 One process exclusively owns a voting database. Every handle opened on the
 same canonical SQLite file in that process shares one database authority and
 therefore one lifecycle-coordination registry. Connections using the same
-shared-cache SQLite memory URI share an authority by decoded database name.
-The selected SQLite VFS is also part of that identity, so equal names opened
-through distinct VFSes remain independent. Plain `:memory:`, explicitly
-private-cache memory, and SQLite temporary databases remain independent
-database authorities. Operations capture wallet, round, submission identity,
-and host operation epoch once; an account switch cannot retarget in-flight
-work. Opening one physical SQLite database through distinct hard-link paths is
-unsupported because SQLite's WAL sidecars and this authority identity are
-pathname-based.
+named shared-cache SQLite memory URI or the same rooted name under SQLite's
+`memdb` VFS share an authority by decoded database name. The selected SQLite
+VFS is also part of that identity, so equal names opened through distinct
+VFSes remain independent. Anonymous or unrooted memory databases, plain
+`:memory:`, explicitly private-cache memory, and SQLite temporary databases
+remain independent database authorities. Operations capture wallet, round,
+submission identity, and host operation epoch once; an account switch cannot
+retarget in-flight work. Opening one physical SQLite database through distinct
+hard-link paths is unsupported because SQLite's WAL sidecars and this authority
+identity are pathname-based.
 
 ## Identity and semantic generation
 
@@ -1126,6 +1127,7 @@ Public-lifecycle engine coverage is anchored by
 `coordinators_for_one_store_share_the_same_lock_authority`,
 `second_handle_cannot_delete_state_reserved_by_an_active_submission`,
 `shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission`,
+`memdb_handle_cannot_delete_state_reserved_by_an_active_submission`,
 `exclusive_round_access_is_busy_until_lifecycle_work_finishes`,
 `batch_roster_mismatch_never_creates_a_reservation`,
 `batch_request_supplies_its_complete_recovery_independent_lock_set`,
