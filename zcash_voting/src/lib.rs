@@ -30,6 +30,7 @@ pub mod config;
 pub(crate) mod confirmation;
 pub mod delegate;
 pub mod delegation_capability;
+mod delegation_proof_coordination;
 pub mod error;
 pub mod governance;
 pub mod helper;

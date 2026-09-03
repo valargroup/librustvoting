@@ -24,13 +24,16 @@ precompute → delegate → vote → share lifecycle:
 3. Build the governance PCZT with `setup_delegation`.
 4. Precompute delegation inputs with `note_witnesses` and `delegation_pir`.
 5. After `delegate::setup`, load `delegation_signing_request` and sign it in
-   the wallet. Then prove with `delegate::prove` and drive the transaction with
+   the wallet. Then prove with `PreparedDelegationBundle::ensure_proof` and
+   drive the transaction with
    `ChainSubmissionClient::advance_delegation_with_recovery`, passing
    `ChainRecoveryMode::ExactTree` and only the resulting SpendAuth signature in
    `AdvanceDelegation`. The SDK loads the authoritative sighash and randomized
    verification key, builds the request, dispatches it once, polls it, and
    writes the confirmed VAN position atomically. Call again while the result is
-   `Pending`.
+   `Pending`. Proof production is process-local single-flight per
+   wallet/round/bundle: overlapping foreground and background callers reuse one
+   durable proof, while different bundles remain eligible for parallel work.
 6. Record each terminal ballot decision with `set_ballot_intent`, passing the
    proposal's declared option count so choices are validated before persistence.
    For multiple answered proposals in one bundle, call

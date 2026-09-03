@@ -105,6 +105,37 @@ One process exclusively owns a voting database. Operations capture wallet,
 round, submission identity, and host operation epoch once; an account switch
 cannot retarget in-flight work.
 
+Locally generated delegation proofs are single-flighted within that owning
+process by `(wallet, round, bundle)`. A caller arriving while the same proof is
+being generated waits, then reloads and validates the durable proof before any
+chain-submission reservation. Failure releases the proof operation so a waiter
+may retry from durable state. Different bundle identities remain independent
+and may prove or advance concurrently. This coordination changes neither the
+submission identity nor its generation digest, and it creates no durable
+in-flight state of its own.
+The delegation facade is the only public durable proof-generation workflow;
+the database-level generator is crate-private and cannot bypass coordination.
+The wallet is captured before lock admission and remains authoritative for
+input validation, persisted-proof loading, PIR cache access, generation, and
+proof persistence even if the host changes the database's selected wallet
+while the operation is waiting or running. Supplied bundle notes and delegation
+keys are validated against that captured wallet before any persisted proof is
+accepted for reuse. Validation reproduces both the target-bound VAN commitment
+and the zero-value output note commitment from the complete 43-byte Orchard
+receiver. The latter binds the transmission key's encoded y-coordinate sign,
+which the VAN's affine x-coordinate does not retain, so a same-network,
+same-round target substitution cannot reuse another target's proof. Progress,
+including the waiting notification, is delivered live and in emission order
+from a dedicated delivery thread that the proof operation never waits on. A
+reporter may therefore enter proof generation directly or dispatch it to
+another thread; that work waits at most until the operation releases its lock,
+which it does without waiting on the reporter. `ensure_proof` returns
+only after every emitted event has been delivered. Different bundle identities
+remain independent throughout.
+Terminal submission rejection preserves and reuses the proof bound to the
+rejected generation; proof preparation cannot replace it with new randomized
+bytes.
+
 ## Identity and semantic generation
 
 A submission identity contains:
@@ -1228,6 +1259,15 @@ Tests cover:
 - active singleton and batch generations reject conflicting ballot-intent
   changes before recovery or helper-delivery material is touched;
 - concurrent work cannot reserve two generations for one identity;
+- concurrent producers generate at most one delegation proof for one
+  wallet/round/bundle while distinct bundles remain parallel;
+- reused delegation proofs still reject mismatched notes or keys, and an
+  account switch cannot retarget a waiting proof operation or its PIR cache;
+- a same-round hotkey substitution cannot reuse a persisted proof, and
+  same-thread same- or cross-bundle progress callback reentry fails without
+  deadlocking;
+- waiting-callback reentry fails without recursion, and a terminally rejected
+  delegation continues to reuse its generation-bound proof;
 - bundle locking prevents two successors from consuming the same VAN;
 - a confirmed vote or batch refuses a later delegation reservation for its
   bundle before derivation or dispatch;
@@ -1309,6 +1349,24 @@ The compile-time surface check is the `compile_fail` doctest set on the
 `chain_submission` module. It covers every removed confirmation entry point,
 transaction-hash and position recorder, payload builder, the private
 chain-event vocabulary, and the raw storage writers.
+
+Delegation proof coordination is anchored by
+`identical_proof_work_waits_and_reuses_durable_completion`,
+`different_bundles_enter_proof_work_concurrently`, and
+`failed_leader_releases_the_waiting_retry`. Durable reuse and wallet capture
+are anchored by `reused_proof_rejects_mismatched_notes`,
+`reused_proof_rejects_mismatched_keys`,
+`reused_proof_rejects_receiver_sign_flip`,
+`reentrant_progress_reporter_reuses_after_lock_release`,
+`cross_thread_reentrant_progress_reporter_reuses_after_lock_release`,
+`progress_reaches_the_host_while_the_operation_is_still_running`,
+`blocked_host_callback_does_not_stall_the_producer`,
+`hammered_identities_never_overlap_and_every_caller_returns`,
+`panicking_producer_releases_waiters_and_its_own_thread`,
+`wait_callback_reentry_returns_busy`,
+`rejected_delegation_reuses_persisted_proof`,
+`wallet_switch_does_not_retarget_waiting_proof`, and
+`pir_fetch_persists_under_captured_wallet`.
 
 These tests are the review contract for changes to chain submission behavior.
 

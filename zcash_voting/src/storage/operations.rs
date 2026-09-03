@@ -14,6 +14,7 @@ use voting_circuits::delegation::synthetic_padding_note_parts;
 use zcash_keys::keys::UnifiedFullViewingKey;
 
 use crate::delegate::{DelegationKeys, DelegationSigningRequest};
+use crate::delegation_proof_coordination::DelegationProofIdentity;
 use crate::governance::BUNDLE_NOTE_SLOTS;
 use crate::note_bundling::{BundlePolicy, ChunkResult};
 use crate::storage::queries;
@@ -71,6 +72,85 @@ fn validate_delegation_keys_for_round(
 ) -> Result<(), VotingError> {
     validate_network_matches_round(stored_network, keys.network, "delegation keys")?;
     keys.validate_target_round(params)
+}
+
+fn validate_delegation_target_for_bundle(
+    conn: &rusqlite::Connection,
+    params: &VotingRoundParams,
+    stored_network: Network,
+    identity: &DelegationProofIdentity,
+    keys: &DelegationKeys,
+) -> Result<(), VotingError> {
+    let binding = queries::load_delegation_target_binding_inputs(
+        conn,
+        identity.round_id(),
+        identity.wallet_id(),
+        identity.bundle_index(),
+    )?;
+    let rho_signed: [u8; 32] =
+        binding
+            .rho_signed
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!(
+                    "stored rho_signed must be 32 bytes, got {}",
+                    binding.rho_signed.len()
+                ),
+            })?;
+    let rseed_output: [u8; 32] =
+        binding
+            .rseed_output
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!(
+                    "stored rseed_output must be 32 bytes, got {}",
+                    binding.rseed_output.len()
+                ),
+            })?;
+    let stored_cmx: [u8; 32] =
+        binding
+            .cmx_new
+            .as_slice()
+            .try_into()
+            .map_err(|_| VotingError::Internal {
+                message: format!(
+                    "stored cmx_new must be 32 bytes, got {}",
+                    binding.cmx_new.len()
+                ),
+            })?;
+    let expected_cmx = crate::action::derive_governance_output_cmx(
+        &keys.hotkey_raw_address,
+        &rho_signed,
+        &rseed_output,
+        stored_network,
+        params.snapshot_height,
+    )?;
+    let (g_d_x, pk_d_x) =
+        crate::action::derive_hotkey_x_coords_from_raw_address(&keys.hotkey_raw_address)?;
+    let vote_round_id =
+        hex::decode(&params.vote_round_id).map_err(|error| VotingError::Internal {
+            message: format!(
+                "invalid stored vote_round_id hex '{}': {error}",
+                params.vote_round_id
+            ),
+        })?;
+    let expected_van = crate::governance::construct_van(
+        &g_d_x,
+        &pk_d_x,
+        binding.total_note_value,
+        &vote_round_id,
+        &binding.van_comm_rand,
+    )?;
+    if expected_van != binding.gov_comm || expected_cmx != stored_cmx {
+        return Err(VotingError::InvalidInput {
+            message: "delegation keys hotkey target does not match stored bundle target"
+                .to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_network_matches_round(
@@ -914,7 +994,7 @@ impl VotingDb {
     /// and passed in here for verification and caching.
     ///
     /// Returns cached witnesses on subsequent calls without re-verification.
-    /// Must be called before build_and_prove_delegation.
+    /// Must be called before [`crate::delegate::ensure_proof`].
     pub fn store_witnesses(
         &self,
         round_id: &str,
@@ -976,15 +1056,35 @@ impl VotingDb {
         pir_client: &pir_client::PirClientBlocking,
         network: Network,
     ) -> Result<DelegationPirPrecomputeResult, VotingError> {
+        let wallet_id = self.wallet_id();
+        self.precompute_delegation_pir_for_wallet(
+            &wallet_id,
+            round_id,
+            bundle_index,
+            notes,
+            pir_client,
+            network,
+        )
+    }
+
+    /// Precomputes one bundle's PIR inputs under a previously captured wallet.
+    fn precompute_delegation_pir_for_wallet(
+        &self,
+        wallet_id: &str,
+        round_id: &str,
+        bundle_index: u32,
+        notes: &[NoteInfo],
+        pir_client: &pir_client::PirClientBlocking,
+        network: Network,
+    ) -> Result<DelegationPirPrecomputeResult, VotingError> {
         let (params, padded_nullifiers) = {
             let conn = self.conn();
-            let wallet_id = self.wallet_id();
             let (params, stored_network) =
-                queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
+                queries::load_round_params_with_network(&conn, round_id, wallet_id)?;
             validate_network_matches_round(stored_network, network, "delegation PIR")?;
-            queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
+            queries::require_bundle_notes(&conn, round_id, wallet_id, bundle_index, notes)?;
             let padded_secrets =
-                queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
+                queries::load_padded_note_secrets(&conn, round_id, wallet_id, bundle_index)?;
             let padded_nullifiers =
                 padded_nullifiers_for_circuit(notes, &padded_secrets, stored_network)?;
             (params, padded_nullifiers)
@@ -996,6 +1096,7 @@ impl VotingDb {
         // same snapshot already covers the real notes; only the bundle's
         // padded-slot nullifiers can still be missing here.
         let result = self.precompute_pir_proof_cache_inner(
+            wallet_id,
             notes,
             &padded_nullifiers,
             network,
@@ -1047,12 +1148,14 @@ impl VotingDb {
         network: Network,
         pir_client: &pir_client::PirClientBlocking,
     ) -> Result<PirCachePrecomputeResult, VotingError> {
+        let wallet_id = self.wallet_id();
         let notes = crate::note_bundling::notes_for_pir_proof_cache(notes, bundle_policy)?;
         {
             let conn = self.conn();
             queries::prune_expired_pir_cache(&conn)?;
         }
         self.precompute_pir_proof_cache_inner(
+            &wallet_id,
             &notes,
             &[],
             network,
@@ -1071,13 +1174,13 @@ impl VotingDb {
     /// the network fetch abstracted so tests can supply proofs directly.
     fn precompute_pir_proof_cache_inner(
         &self,
+        wallet_id: &str,
         notes: &[NoteInfo],
         extra_nullifiers: &[Vec<u8>],
         network: Network,
         served_root: pallas::Base,
         fetch: impl FnOnce(&[pallas::Base]) -> Result<Vec<pir_client::ImtProofData>, VotingError>,
     ) -> Result<PirCachePrecomputeResult, VotingError> {
-        let wallet_id = self.wallet_id();
         let targets = pir_cache_nullifier_targets(notes, extra_nullifiers)?;
         let served_root_bytes = served_root.to_repr().to_vec();
 
@@ -1093,7 +1196,7 @@ impl VotingDb {
                 unique_targets.push((nf_bytes, nf));
                 loaded_rows.push(queries::load_pir_cache_row(
                     &conn,
-                    &wallet_id,
+                    wallet_id,
                     network,
                     &served_root_bytes,
                     &nf_bytes,
@@ -1151,7 +1254,7 @@ impl VotingDb {
         let conn = self.conn();
         let fetched_count = fetched_proofs.len() as u32;
         for ((nf_bytes, _), proof) in missing.iter().zip(fetched_proofs.iter()) {
-            queries::store_pir_cache_proof(&conn, &wallet_id, network, nf_bytes, proof)?;
+            queries::store_pir_cache_proof(&conn, wallet_id, network, nf_bytes, proof)?;
         }
 
         Ok(PirCachePrecomputeResult {
@@ -1248,7 +1351,48 @@ impl VotingDb {
         })
     }
 
-    /// Build and prove the real delegation ZKP (#1). Long-running.
+    /// Validates caller-supplied proof inputs against one captured wallet's
+    /// durable round and bundle.
+    pub(crate) fn validate_delegation_proof_inputs(
+        &self,
+        identity: &DelegationProofIdentity,
+        notes: &[NoteInfo],
+        keys: &DelegationKeys,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let (params, stored_network) = queries::load_round_params_with_network(
+            &conn,
+            identity.round_id(),
+            identity.wallet_id(),
+        )?;
+        validate_delegation_keys_for_round(&params, stored_network, keys)?;
+        queries::require_bundle_notes(
+            &conn,
+            identity.round_id(),
+            identity.wallet_id(),
+            identity.bundle_index(),
+            notes,
+        )
+    }
+
+    /// Validates that supplied keys reproduce a persisted bundle's target-bound
+    /// VAN commitment before its proof is reused.
+    pub(crate) fn validate_delegation_proof_target(
+        &self,
+        identity: &DelegationProofIdentity,
+        keys: &DelegationKeys,
+    ) -> Result<(), VotingError> {
+        let conn = self.conn();
+        let (params, stored_network) = queries::load_round_params_with_network(
+            &conn,
+            identity.round_id(),
+            identity.wallet_id(),
+        )?;
+        validate_delegation_keys_for_round(&params, stored_network, keys)?;
+        validate_delegation_target_for_bundle(&conn, &params, stored_network, identity, keys)
+    }
+
+    /// Builds and persists the real delegation ZKP (#1) for a captured wallet.
     ///
     /// Loads all required data from the voting DB:
     /// - alpha, van_comm_rand from delegation data (stored by `build_governance_pczt`)
@@ -1262,36 +1406,37 @@ impl VotingDb {
     /// For padded notes (< 5 real notes), the prover fetches proofs internally via PIR.
     ///
     /// Stores the proof result and advances phase to `DelegationProved`.
-    pub fn build_and_prove_delegation(
+    pub(crate) fn generate_and_persist_delegation_proof(
         &self,
-        round_id: &str,
-        bundle_index: u32,
+        identity: &DelegationProofIdentity,
         notes: &[NoteInfo],
         keys: &DelegationKeys,
         pir_client: &pir_client::PirClientBlocking,
         stages: &dyn DelegationProgressReporter,
     ) -> Result<DelegationProofResult, VotingError> {
+        let wallet_id = identity.wallet_id();
+        let round_id = identity.round_id();
+        let bundle_index = identity.bundle_index();
         let total_start = std::time::Instant::now();
 
         // Phase 1: DB queries
         let db_start = std::time::Instant::now();
         let conn = self.conn();
-        let wallet_id = self.wallet_id();
         let (params, stored_network) =
-            queries::load_round_params_with_network(&conn, round_id, &wallet_id)?;
+            queries::load_round_params_with_network(&conn, round_id, wallet_id)?;
         validate_delegation_keys_for_round(&params, stored_network, keys)?;
-        queries::require_bundle_notes(&conn, round_id, &wallet_id, bundle_index, notes)?;
-        let alpha = queries::load_alpha(&conn, round_id, &wallet_id, bundle_index)?;
-        let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, &wallet_id, bundle_index)?;
-        let witnesses = queries::load_witnesses(&conn, round_id, &wallet_id, bundle_index)?;
+        queries::require_bundle_notes(&conn, round_id, wallet_id, bundle_index, notes)?;
+        let alpha = queries::load_alpha(&conn, round_id, wallet_id, bundle_index)?;
+        let van_comm_rand = queries::load_van_comm_rand(&conn, round_id, wallet_id, bundle_index)?;
+        let witnesses = queries::load_witnesses(&conn, round_id, wallet_id, bundle_index)?;
         validate_witnesses_for_round(&witnesses, &params)?;
 
         // Load Phase 1 randomness for ZCA-74 fix: ensures Phase 2 produces
         // the same nf_signed/cmx_new that Phase 1 committed to in the PCZT.
-        let rseed_signed = queries::load_rseed_signed(&conn, round_id, &wallet_id, bundle_index)?;
-        let rseed_output = queries::load_rseed_output(&conn, round_id, &wallet_id, bundle_index)?;
+        let rseed_signed = queries::load_rseed_signed(&conn, round_id, wallet_id, bundle_index)?;
+        let rseed_output = queries::load_rseed_output(&conn, round_id, wallet_id, bundle_index)?;
         let padded_secrets =
-            queries::load_padded_note_secrets(&conn, round_id, &wallet_id, bundle_index)?;
+            queries::load_padded_note_secrets(&conn, round_id, wallet_id, bundle_index)?;
         // These are the zero-value circuit-side padded nullifiers derived
         // from the Phase 1 padded-note rho/rseed pairs.
         let padded_nullifiers =
@@ -1353,7 +1498,8 @@ impl VotingDb {
 
         // Phase 2: Load/fetch IMT exclusion proofs via PIR.
         let pir_start = std::time::Instant::now();
-        let precompute = self.precompute_delegation_pir(
+        let precompute = self.precompute_delegation_pir_for_wallet(
+            wallet_id,
             round_id,
             bundle_index,
             notes,
@@ -1371,7 +1517,7 @@ impl VotingDb {
         let load_cached_proof = |nf_bytes: &[u8; 32], nf: pallas::Base, what: &str| {
             let proof = queries::load_pir_cache_proof(
                 &conn,
-                &wallet_id,
+                wallet_id,
                 stored_network,
                 &params.nullifier_imt_root,
                 nf_bytes,
@@ -1421,7 +1567,7 @@ impl VotingDb {
         )?;
 
         let result = crate::zkp1::build_and_prove_delegation(
-            &notes,
+            notes,
             &keys.hotkey_raw_address,
             &alpha,
             &van_comm_rand,
@@ -1448,11 +1594,11 @@ impl VotingDb {
             .map_err(|e| VotingError::Internal {
                 message: format!("failed to begin proof result transaction: {e}"),
             })?;
-        queries::store_proof(&tx, round_id, &wallet_id, bundle_index, &result.proof)?;
+        queries::store_proof(&tx, round_id, wallet_id, bundle_index, &result.proof)?;
         queries::store_proof_result_fields_with_van_comm(
             &tx,
             round_id,
-            &wallet_id,
+            wallet_id,
             bundle_index,
             &result.rk,
             &result.gov_nullifiers,
@@ -1460,7 +1606,7 @@ impl VotingDb {
             &result.cmx_new,
             &result.van_comm,
         )?;
-        queries::advance_round_phase(&tx, round_id, &wallet_id, RoundPhase::DelegationProved)?;
+        queries::advance_round_phase(&tx, round_id, wallet_id, RoundPhase::DelegationProved)?;
         tx.commit().map_err(|e| VotingError::Internal {
             message: format!("failed to commit proof result transaction: {e}"),
         })?;
@@ -2698,6 +2844,10 @@ fn check_text_conflict(
 }
 
 #[cfg(test)]
+#[path = "operations/tests/pir_wallet_scope.rs"]
+mod pir_wallet_scope_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{RoundBoundVotingHotkeyTarget, VotingHotkey};
@@ -3829,7 +3979,7 @@ mod tests {
         let extras = vec![vec![0x33u8; 32]];
 
         let result = db
-            .precompute_pir_proof_cache_inner(&notes, &extras, Network::Testnet, root, |nfs| {
+            .precompute_pir_proof_cache_inner(W, &notes, &extras, Network::Testnet, root, |nfs| {
                 Ok(nfs.iter().map(|nf| imt_pir_proof(&imt, *nf)).collect())
             })
             .unwrap();
@@ -3874,7 +4024,7 @@ mod tests {
         );
 
         let result = db
-            .precompute_pir_proof_cache_inner(&notes, &[], Network::Testnet, imt.root(), |_| {
+            .precompute_pir_proof_cache_inner(W, &notes, &[], Network::Testnet, imt.root(), |_| {
                 panic!("fully cached precompute must not fetch")
             })
             .unwrap();
@@ -3917,7 +4067,7 @@ mod tests {
 
         let fetched = std::cell::RefCell::new(Vec::<pallas::Base>::new());
         let result = db
-            .precompute_pir_proof_cache_inner(&notes, &[], Network::Testnet, imt.root(), |nfs| {
+            .precompute_pir_proof_cache_inner(W, &notes, &[], Network::Testnet, imt.root(), |nfs| {
                 fetched.borrow_mut().extend(nfs.iter().copied());
                 Ok(nfs.iter().map(|nf| imt_pir_proof(&imt, *nf)).collect())
             })
@@ -4050,6 +4200,7 @@ mod tests {
 
         let result = db
             .precompute_pir_proof_cache_inner(
+                W,
                 std::slice::from_ref(&note),
                 &[],
                 Network::Testnet,
@@ -4137,9 +4288,14 @@ mod tests {
         );
 
         let result = db
-            .precompute_pir_proof_cache_inner(&notes, &[], Network::Testnet, imt_b.root(), |nfs| {
-                Ok(nfs.iter().map(|nf| imt_pir_proof(&imt_b, *nf)).collect())
-            })
+            .precompute_pir_proof_cache_inner(
+                W,
+                &notes,
+                &[],
+                Network::Testnet,
+                imt_b.root(),
+                |nfs| Ok(nfs.iter().map(|nf| imt_pir_proof(&imt_b, *nf)).collect()),
+            )
             .unwrap();
 
         assert_eq!(result.cached_count, 0);
@@ -4247,6 +4403,7 @@ mod tests {
         short_note.nullifier = vec![0x02; 31];
         let err = db
             .precompute_pir_proof_cache_inner(
+                W,
                 &[short_note],
                 &[],
                 Network::Testnet,
@@ -4266,6 +4423,7 @@ mod tests {
 
         let err = db
             .precompute_pir_proof_cache_inner(
+                W,
                 &[identity_note_with_position(0)],
                 &[vec![0x07; 33]],
                 Network::Testnet,
@@ -4282,6 +4440,7 @@ mod tests {
         // Canonical-encoding failure, not just length.
         let err = db
             .precompute_pir_proof_cache_inner(
+                W,
                 &[],
                 &[vec![0xFF; 32]],
                 Network::Testnet,
@@ -4308,6 +4467,7 @@ mod tests {
         // different value cannot verify for it.
         let err = db
             .precompute_pir_proof_cache_inner(
+                W,
                 &[],
                 &[vec![0u8; 32]],
                 Network::Testnet,
@@ -4338,9 +4498,14 @@ mod tests {
 
         // Valid proofs, but rooted at snapshot B while the server claims A.
         let err = db
-            .precompute_pir_proof_cache_inner(&notes, &[], Network::Testnet, imt_a.root(), |nfs| {
-                Ok(nfs.iter().map(|nf| imt_pir_proof(&imt_b, *nf)).collect())
-            })
+            .precompute_pir_proof_cache_inner(
+                W,
+                &notes,
+                &[],
+                Network::Testnet,
+                imt_a.root(),
+                |nfs| Ok(nfs.iter().map(|nf| imt_pir_proof(&imt_b, *nf)).collect()),
+            )
             .unwrap_err();
 
         assert!(err.to_string().contains("PIR proof root mismatch"), "{err}");
@@ -4357,6 +4522,7 @@ mod tests {
 
         let result = db
             .precompute_pir_proof_cache_inner(
+                W,
                 &[note.clone(), note.clone()],
                 &[duplicate],
                 Network::Testnet,
@@ -4555,6 +4721,7 @@ mod tests {
 
         let precompute = db
             .precompute_pir_proof_cache_inner(
+                W,
                 &notes,
                 &extras,
                 Network::Testnet,
@@ -5116,7 +5283,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_and_prove_delegation_rejects_key_network_mismatch_before_pir() {
+    fn test_ensure_proof_rejects_key_network_mismatch_before_pir() {
         use orchard::keys::{FullViewingKey, SpendingKey};
 
         let db = test_db();
@@ -5143,16 +5310,16 @@ mod tests {
         )
         .unwrap();
 
-        let err = db
-            .build_and_prove_delegation(
-                ROUND_ID,
-                0,
-                &[note],
-                &keys,
-                &pir_client,
-                &crate::types::NoopProgressReporter,
-            )
-            .expect_err("prove path must validate delegation key network");
+        let err = crate::delegate::ensure_proof(
+            &db,
+            ROUND_ID,
+            0,
+            &[note],
+            &keys,
+            &pir_client,
+            &crate::types::NoopProgressReporter,
+        )
+        .expect_err("prove path must validate delegation key network");
 
         assert!(
             err.to_string().contains(
@@ -5163,7 +5330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_and_prove_delegation_rejects_key_round_mismatch_before_pir() {
+    fn test_ensure_proof_rejects_key_round_mismatch_before_pir() {
         let db = test_db();
         let witnesses = vec![valid_empty_tree_witness(0)];
         init_round_for_witnesses(&db, &witnesses);
@@ -5183,22 +5350,22 @@ mod tests {
         )
         .unwrap();
 
-        let err = db
-            .build_and_prove_delegation(
-                ROUND_ID,
-                0,
-                &[note],
-                &keys,
-                &pir_client,
-                &crate::types::NoopProgressReporter,
-            )
-            .expect_err("prove path must validate delegation key target round");
+        let err = crate::delegate::ensure_proof(
+            &db,
+            ROUND_ID,
+            0,
+            &[note],
+            &keys,
+            &pir_client,
+            &crate::types::NoopProgressReporter,
+        )
+        .expect_err("prove path must validate delegation key target round");
 
         assert_target_round_mismatch(err);
     }
 
     #[test]
-    fn test_build_and_prove_delegation_rejects_raw_wrong_root_witness() {
+    fn test_ensure_proof_rejects_raw_wrong_root_witness() {
         use orchard::keys::{FullViewingKey, SpendingKey};
 
         let db = test_db();
@@ -5226,16 +5393,16 @@ mod tests {
         )
         .unwrap();
 
-        let err = db
-            .build_and_prove_delegation(
-                ROUND_ID,
-                0,
-                &[note],
-                &keys,
-                &pir_client,
-                &crate::types::NoopProgressReporter,
-            )
-            .expect_err("raw witness rows must match stored round root before proving");
+        let err = crate::delegate::ensure_proof(
+            &db,
+            ROUND_ID,
+            0,
+            &[note],
+            &keys,
+            &pir_client,
+            &crate::types::NoopProgressReporter,
+        )
+        .expect_err("raw witness rows must match stored round root before proving");
 
         assert!(
             err.to_string()

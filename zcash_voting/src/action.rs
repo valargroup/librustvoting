@@ -114,6 +114,53 @@ pub fn derive_hotkey_x_coords_from_raw_address(
     Ok((g_d_x, pk_d_x))
 }
 
+/// Reconstructs the commitment of the zero-value governance output sent to a
+/// full Orchard receiver.
+///
+/// Unlike the VAN, this commitment binds the complete encoded transmission key,
+/// including its y-coordinate sign bit.
+pub(crate) fn derive_governance_output_cmx(
+    hotkey_raw_address: &[u8; 43],
+    rho_signed: &[u8; 32],
+    rseed_output: &[u8; 32],
+    network: VotingNetwork,
+    snapshot_height: u64,
+) -> Result<[u8; 32], VotingError> {
+    let hotkey_address = Address::from_raw_address_bytes(hotkey_raw_address)
+        .into_option()
+        .ok_or_else(|| VotingError::InvalidInput {
+            message: "hotkey_raw_address is not a valid Orchard address".to_string(),
+        })?;
+    let rho = Rho::from_bytes(rho_signed)
+        .into_option()
+        .ok_or_else(|| VotingError::Internal {
+            message: "stored rho_signed is not a valid Orchard Rho".to_string(),
+        })?;
+    let rseed = RandomSeed::from_bytes(*rseed_output, &rho)
+        .into_option()
+        .ok_or_else(|| VotingError::Internal {
+            message: "stored rseed_output is not valid for rho_signed".to_string(),
+        })?;
+    let consensus_branch_id = crate::lwd::branch_id_for_height(network, snapshot_height)?;
+    let branch_id =
+        BranchId::try_from(consensus_branch_id).map_err(|error| VotingError::Internal {
+            message: format!(
+                "stored snapshot resolves to invalid consensus branch id \
+                 0x{consensus_branch_id:08X}: {error}"
+            ),
+        })?;
+    let note_version = VotingShieldedProtocol::for_branch_id(branch_id)?.note_version();
+    let output_note =
+        orchard::Note::from_parts(hotkey_address, NoteValue::ZERO, rho, rseed, note_version)
+            .into_option()
+            .ok_or_else(|| VotingError::Internal {
+                message: "failed to reconstruct stored governance output note".to_string(),
+            })?;
+    let output_cmx: orchard::note::ExtractedNoteCommitment = output_note.commitment().into();
+
+    Ok(output_cmx.to_bytes())
+}
+
 /// Generate a random valid Rho (retries until the random bytes are a valid Pallas field element).
 fn random_rho(rng: &mut impl RngCore) -> Rho {
     loop {

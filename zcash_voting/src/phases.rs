@@ -241,8 +241,19 @@ impl VotingDb {
         round_id: &str,
         bundle_index: u32,
     ) -> Result<DelegationPhase, VotingError> {
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
+        self.delegation_phase_for_wallet(&wallet_id, round_id, bundle_index)
+    }
+
+    /// Loads one delegation phase under an immutable wallet scope captured by
+    /// a longer-running operation.
+    pub(crate) fn delegation_phase_for_wallet(
+        &self,
+        wallet_id: &str,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<DelegationPhase, VotingError> {
+        let conn = self.conn();
         let phase = conn
             .query_row(
                 "SELECT b.pczt_sighash IS NOT NULL OR b.rk IS NOT NULL,
