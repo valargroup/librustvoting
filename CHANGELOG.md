@@ -120,6 +120,11 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Fixed
 
+- Local delegation, singleton-vote, and vote-batch `resume_plan` advance steps
+  now direct hosts through exact-tree recovery. Following the documented
+  pending loop can therefore resolve a hashless `Recovering` generation instead
+  of repeatedly returning its unchanged status-only result; imported
+  delegations remain poll-only.
 - Delegation advancement no longer reparses or requires a returned full PCZT
   to reconstruct its sighash. Background-precomputed, recovered, and Keystone
   flows may omit PCZT bytes without stranding submission in the host adapter.

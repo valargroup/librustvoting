@@ -85,10 +85,10 @@ pub fn recover_committed_vote_for_step(
 
 /// Reconstructs one complete atomic batch for a batch resume step.
 ///
-/// This is inspection and display material. The chain transaction itself is
-/// dispatched, polled, and confirmed by `ChainSubmissionClient::advance_vote_batch`,
-/// which derives the same batch from persisted recovery state; retain
-/// `batch_digest` to identify that generation.
+/// This is inspection and display material. Execute the chain transaction with
+/// `ChainSubmissionClient::advance_vote_batch_with_recovery` and
+/// `ChainRecoveryMode::ExactTree`. The client derives the same batch from
+/// persisted recovery state; retain `batch_digest` to identify that generation.
 pub fn recover_vote_batch_for_step(
     voting_db: &VotingDb,
     round_id: &str,

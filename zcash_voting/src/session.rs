@@ -258,10 +258,10 @@ pub enum NextStep {
     Delegate { bundle_index: u32 },
     /// Advance one delegation that is already durably in flight.
     ///
-    /// Call `ChainSubmissionClient::advance_delegation`. Emitted while the
-    /// authoritative generation is `Submitting`, `Tracking`, or `Recovering`,
-    /// and requires the wallet to restore signing material for the locked
-    /// generation.
+    /// Call `ChainSubmissionClient::advance_delegation_with_recovery` with
+    /// `ChainRecoveryMode::ExactTree`. Emitted while the authoritative
+    /// generation is `Submitting`, `Tracking`, or `Recovering`, and requires
+    /// the wallet to restore signing material for the locked generation.
     AdvanceDelegation { bundle_index: u32 },
     /// Poll one already-broadcast delegation imported from a capability.
     ///
@@ -282,9 +282,10 @@ pub enum NextStep {
     },
     /// Advance one singleton vote's chain submission by one bounded pass.
     ///
-    /// Call `ChainSubmissionClient::advance_vote`. The lifecycle owns
-    /// transaction construction, dispatch, polling, recovery, and confirmation,
-    /// so reserving, submitting, and reconciling are one host call rather than
+    /// Call `ChainSubmissionClient::advance_vote_with_recovery` with
+    /// `ChainRecoveryMode::ExactTree`. The lifecycle owns transaction
+    /// construction, dispatch, polling, recovery, and confirmation, so
+    /// reserving, submitting, and reconciling are one host call rather than
     /// separate submit and poll steps. Re-invoke while the result is pending.
     ///
     /// Recover the `CommittedVote`, preflight the complete helper fleet, and
@@ -299,8 +300,10 @@ pub enum NextStep {
     /// Advance one atomic vote batch's chain submission by one bounded pass.
     ///
     /// `proposal_id` identifies the batch's first ordered action and is only a
-    /// recovery anchor. Call `ChainSubmissionClient::advance_vote_batch`, which
-    /// dispatches the batch exactly once and confirms every member atomically.
+    /// recovery anchor. Call
+    /// `ChainSubmissionClient::advance_vote_batch_with_recovery` with
+    /// `ChainRecoveryMode::ExactTree`; the lifecycle confirms every member
+    /// atomically.
     AdvanceVoteBatch { bundle_index: u32, proposal_id: u32 },
     /// Resume helper-share submission for a committed vote.
     ///

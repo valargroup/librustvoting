@@ -574,6 +574,15 @@ Restart plans are derived from the authoritative row:
 - a `Rejected` row schedules no reconciliation;
 - absent rows permit fresh work if bundle causality allows it.
 
+Hosts must execute local delegation, singleton-vote, and vote-batch advance
+steps through the matching `*_with_recovery` entry point with
+`ChainRecoveryMode::ExactTree`. The same mode is safe for `Tracking` and fresh
+work because tree recovery activates only for a durable `Recovering` row.
+Routing these steps exclusively through the plain status-only methods is not
+conformant: a hashless `Recovering` row would never scan or receive private
+retry authorization. Imported delegation advancement remains status-only
+because it cannot scan or redispatch.
+
 An unresolved generation blocks only later work that consumes its unknown
 successor VAN. Independent bundles remain schedulable.
 
