@@ -122,11 +122,14 @@ while the operation is waiting or running. Supplied bundle notes and delegation
 keys are validated against that captured wallet before any persisted proof is
 accepted for reuse. Validation reproduces the target-bound VAN commitment, so
 a same-network, same-round hotkey substitution cannot reuse another target's
-proof. A progress callback that reenters proof generation while any proof
-operation is active on the same thread fails with `VotingError::Busy`, even for
-a different bundle identity. This prevents callback-driven cross-bundle lock
-ordering while preserving concurrent work for distinct bundles on separate
-threads. The same rule applies to reentry from the waiting notification.
+proof. Progress emitted while a proof operation owns its process-local lock is
+accumulated and delivered in order after the lock is released. A reporter may
+therefore enter proof generation directly or dispatch it to another thread
+without waiting on the operation that invoked the reporter. The
+`WaitingForExistingProof` notification remains immediate because its caller
+does not yet own the proof lock; direct same-thread reentry from that
+notification fails with `VotingError::Busy`, even for a different bundle
+identity. Different bundle identities remain independent throughout.
 Terminal submission rejection preserves and reuses the proof bound to the
 rejected generation; proof preparation cannot replace it with new randomized
 bytes.

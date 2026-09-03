@@ -6,7 +6,9 @@
 
 mod proof_lock;
 
-use crate::VotingError;
+use std::sync::Mutex;
+
+use crate::{delegate::DelegationProgress, types::DelegationProgressReporter, VotingError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct DelegationProofIdentity {
@@ -34,6 +36,34 @@ impl DelegationProofIdentity {
 
     pub(super) fn bundle_index(&self) -> u32 {
         self.bundle_index
+    }
+}
+
+/// Collects proof progress while coordination is locked for delivery after
+/// the durable proof operation has released its lock.
+#[derive(Default)]
+pub(super) struct DeferredProgressReporter {
+    events: Mutex<Vec<DelegationProgress>>,
+}
+
+impl DeferredProgressReporter {
+    pub(super) fn replay(&self, reporter: &dyn DelegationProgressReporter) {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for event in events.iter().copied() {
+            reporter.on_progress(event);
+        }
+    }
+}
+
+impl DelegationProgressReporter for DeferredProgressReporter {
+    fn on_progress(&self, progress: DelegationProgress) {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(progress);
     }
 }
 

@@ -82,14 +82,14 @@ fn reused_proof_rejects_mismatched_keys() {
 }
 
 #[test]
-fn reentrant_progress_reporter_returns_busy() {
+fn reentrant_progress_reporter_reuses_after_lock_release() {
     let db = Arc::new(db_with_persisted_proofs());
-    let reentrant_error = Arc::new(Mutex::new(None));
-    let callback_error = Arc::clone(&reentrant_error);
+    let reentrant_status = Arc::new(Mutex::new(None));
+    let callback_status = Arc::clone(&reentrant_status);
     let callback_db = Arc::clone(&db);
     let progress = DelegationProgressBridge::new(move |event| {
         if event == DelegationProgress::ProofComplete {
-            let error = ensure_proof(
+            let completion = ensure_proof(
                 &callback_db,
                 ROUND_ID,
                 0,
@@ -98,8 +98,8 @@ fn reentrant_progress_reporter_returns_busy() {
                 &pir_client(),
                 &crate::types::NoopProgressReporter,
             )
-            .expect_err("same-thread proof reentry must not wait on its own lock");
-            *callback_error.lock().unwrap() = Some(error);
+            .expect("deferred callback must run after the proof lock is released");
+            *callback_status.lock().unwrap() = Some(completion.status);
         }
     });
 
@@ -115,15 +115,59 @@ fn reentrant_progress_reporter_returns_busy() {
     .unwrap();
 
     assert_eq!(completion.status, DelegationProofStatus::Reused);
-    assert!(matches!(
-        reentrant_error.lock().unwrap().take(),
-        Some(VotingError::Busy { message })
-            if message.contains("delegation proof generation is already active on this thread")
-    ));
+    assert_eq!(
+        reentrant_status.lock().unwrap().take(),
+        Some(DelegationProofStatus::Reused)
+    );
 }
 
 #[test]
-fn cross_bundle_reentrant_progress_reporter_returns_busy() {
+fn cross_thread_reentrant_progress_reporter_reuses_after_lock_release() {
+    let db = Arc::new(db_with_persisted_proofs());
+    let reentrant_status = Arc::new(Mutex::new(None));
+    let callback_status = Arc::clone(&reentrant_status);
+    let callback_db = Arc::clone(&db);
+    let progress = DelegationProgressBridge::new(move |event| {
+        if event == DelegationProgress::ProofComplete {
+            let worker_db = Arc::clone(&callback_db);
+            let nested = thread::spawn(move || {
+                ensure_proof(
+                    &worker_db,
+                    ROUND_ID,
+                    0,
+                    &[note()],
+                    &keys(Network::Testnet, 1),
+                    &pir_client(),
+                    &crate::types::NoopProgressReporter,
+                )
+            })
+            .join()
+            .unwrap()
+            .expect("deferred callback worker must not wait on the released proof lock");
+            *callback_status.lock().unwrap() = Some(nested.status);
+        }
+    });
+
+    let completion = ensure_proof(
+        &db,
+        ROUND_ID,
+        0,
+        &[note()],
+        &keys(Network::Testnet, 1),
+        &pir_client(),
+        &progress,
+    )
+    .unwrap();
+
+    assert_eq!(completion.status, DelegationProofStatus::Reused);
+    assert_eq!(
+        reentrant_status.lock().unwrap().take(),
+        Some(DelegationProofStatus::Reused)
+    );
+}
+
+#[test]
+fn cross_bundle_reentrant_progress_reporter_enters_after_lock_release() {
     let db = Arc::new(db_with_persisted_proofs());
     let reentrant_error = Arc::new(Mutex::new(None));
     let callback_error = Arc::clone(&reentrant_error);
@@ -139,7 +183,7 @@ fn cross_bundle_reentrant_progress_reporter_returns_busy() {
                 &pir_client(),
                 &crate::types::NoopProgressReporter,
             )
-            .expect_err("cross-bundle proof reentry must not acquire another proof lock");
+            .expect_err("the fixture has no second bundle");
             *callback_error.lock().unwrap() = Some(error);
         }
     });
@@ -158,9 +202,7 @@ fn cross_bundle_reentrant_progress_reporter_returns_busy() {
     assert_eq!(completion.status, DelegationProofStatus::Reused);
     assert!(matches!(
         reentrant_error.lock().unwrap().take(),
-        Some(VotingError::Busy { message })
-            if message.contains("cannot enter round")
-                && message.contains("bundle 1")
+        Some(VotingError::InvalidInput { .. })
     ));
 }
 

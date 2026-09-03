@@ -34,7 +34,7 @@ use crate::selection::{
     GatherDelegationWalletForTargetParams,
 };
 use crate::{
-    delegation_proof_coordination::DelegationProofIdentity,
+    delegation_proof_coordination::{DeferredProgressReporter, DelegationProofIdentity},
     governance::BUNDLE_NOTE_SLOTS,
     precompute::PirPrecomputeReport,
     round::{BundleLayout, RoundParams, VotingDb},
@@ -1176,9 +1176,9 @@ pub fn signing_request(
 ///
 /// Witnesses and PIR proof precompute data must already be present. The proof
 /// result is checked against PCZT-derived public fields before persistence.
-/// Calls made reentrantly from a progress reporter while any proof operation is
-/// active on the current thread return
-/// [`VotingError::Busy`].
+/// Proof progress accumulated during generation is delivered after the
+/// process-local proof lock is released, so reporters may safely dispatch
+/// proof work to another thread.
 pub fn prove(
     db: &VotingDb,
     round_id: &str,
@@ -1201,8 +1201,9 @@ pub fn prove(
 /// # Errors
 ///
 /// Returns [`VotingError`] when durable state cannot be read or validated, or
-/// when proof generation or persistence fails. A call made reentrantly from a
-/// progress reporter while any proof operation is active on the current thread
+/// when proof generation or persistence fails. Proof progress accumulated
+/// during the coordinated operation is delivered after its process-local lock
+/// is released. Reentry directly from the immediate waiting notification
 /// returns [`VotingError::Busy`].
 pub fn ensure_proof(
     db: &VotingDb,
@@ -1214,7 +1215,8 @@ pub fn ensure_proof(
     stages: &dyn DelegationProgressReporter,
 ) -> Result<DelegationProofCompletion, VotingError> {
     let identity = DelegationProofIdentity::new(db.wallet_id(), round_id, bundle_index);
-    crate::delegation_proof_coordination::coordinate(
+    let deferred_progress = DeferredProgressReporter::default();
+    let completion = crate::delegation_proof_coordination::coordinate(
         identity,
         || stages.on_progress(DelegationProgress::WaitingForExistingProof),
         |identity| {
@@ -1222,21 +1224,22 @@ pub fn ensure_proof(
 
             if let Some(proof) = load_persisted_proof(db, identity)? {
                 db.validate_delegation_proof_target(identity, keys)?;
-                stages.on_progress(DelegationProgress::ProofComplete);
+                deferred_progress.on_progress(DelegationProgress::ProofComplete);
                 return Ok(DelegationProofCompletion {
                     proof,
                     status: DelegationProofStatus::Reused,
                 });
             }
 
-            generate_and_persist_proof(db, identity, notes, keys, pir_client, stages).map(|proof| {
-                DelegationProofCompletion {
+            generate_and_persist_proof(db, identity, notes, keys, pir_client, &deferred_progress)
+                .map(|proof| DelegationProofCompletion {
                     proof,
                     status: DelegationProofStatus::Generated,
-                }
-            })
+                })
         },
-    )
+    );
+    deferred_progress.replay(stages);
+    completion
 }
 
 fn generate_and_persist_proof(

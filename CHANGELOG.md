@@ -12,9 +12,10 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   delegation proofs cannot bypass process-local single-flight coordination.
   Use `delegate::ensure_proof` or
   `PreparedDelegationBundle::ensure_proof`; both validate the supplied notes
-  and target-bound keys before returning a generated or reused proof. Same-
-  bundle reentry from any progress callback now returns `VotingError::Busy`,
-  and terminally rejected submissions retain their generation-bound proof.
+  and target-bound keys before returning a generated or reused proof. Proof
+  progress callbacks run after the single-flight lock is released, preventing
+  callback-dispatched proof work from deadlocking, and terminally rejected
+  submissions retain their generation-bound proof.
 - **Breaking:** removed `delegate::DelegationSigner` and replaced
   `AdvanceDelegation::signer` with `spend_auth_signature`. Delegation chain
   submission now accepts only the external SpendAuth signature and loads the
