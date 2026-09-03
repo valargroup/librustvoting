@@ -287,6 +287,20 @@ where
                         derived.generation(),
                         SubmissionObservation::UsableCandidateHash(candidate),
                     )?;
+                    if attempt_index + 1 == self.policy.maximum_post_attempts
+                        && is_retryable_dispatch_ambiguity(&record)
+                    {
+                        let exhausted = ChainSubmissionDiagnostic::from_redacted_message(
+                            ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted,
+                            "configured POST attempts exhausted after vote-chain returned an unusable transaction hash",
+                        );
+                        return self
+                            .classify_dispatched_post(
+                                derived.generation(),
+                                SubmissionObservation::SubmittedWithoutHash(exhausted),
+                            )?
+                            .public_result();
+                    }
                     return self
                         .reconcile_existing(
                             &request,

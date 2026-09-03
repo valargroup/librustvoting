@@ -3055,7 +3055,7 @@ async fn same_bundle_blocks_a_successor_until_the_predecessor_is_authoritative()
 }
 
 #[tokio::test]
-async fn candidate_hash_reuse_across_generations_fails_closed_without_lookup() {
+async fn final_candidate_hash_collision_exhausts_without_lookup_or_redispatch() {
     let first_identity = identity(1, 0);
     let second_identity = identity(2, 1);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
@@ -3080,36 +3080,35 @@ async fn candidate_hash_reuse_across_generations_fails_closed_without_lookup() {
 
     let second_transport = Arc::new(ScriptedTransport::default());
     second_transport.queue(Ok(accepted()));
-    let result = coordinator(
+    let coordinator = coordinator(
         Arc::clone(&second_transport),
         Arc::clone(&store),
         ManualClock::new(101),
         10,
-    )
-    .advance(
-        StoreAdvancementRequest::vote(second_identity.clone()),
-        &ManualControl::default(),
-    )
-    .await
-    .unwrap();
-
-    assert!(matches!(
-        result,
-        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
-            candidate_transaction_hash: None,
-            ..
-        })
-    ));
-    assert_eq!(second_transport.methods(), vec!["POST"]);
-    assert_eq!(
-        store
-            .record(&second_identity)
-            .unwrap()
-            .diagnostic()
-            .unwrap()
-            .kind(),
-        ChainSubmissionDiagnosticKind::InvalidProtocolResponse
     );
+    for _ in 0..2 {
+        let result = coordinator
+            .advance(
+                StoreAdvancementRequest::vote(second_identity.clone()),
+                &ManualControl::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ChainSubmissionResult::SubmittedWithoutHash(ref diagnostic)
+                if diagnostic.kind()
+                    == ChainSubmissionDiagnosticKind::AmbiguousAttemptsExhausted
+        ));
+    }
+
+    assert_eq!(second_transport.methods(), vec!["POST"]);
+    let record = store.record(&second_identity).unwrap();
+    assert_eq!(
+        record.durable_state(),
+        ChainSubmissionState::SubmittedWithoutHash
+    );
+    assert_eq!(record.committed_post_reservations(), 1);
 }
 
 #[tokio::test]

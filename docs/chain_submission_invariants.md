@@ -27,12 +27,14 @@ selection follows the monotonic reservation ordinal modulo endpoint count, so
 three attempts over endpoints A and B use A, B, A. A later invocation receives
 a fresh bounded budget.
 
-An accepted hash returns to ordinary `Tracking`. Exhausting the budget with an
-ambiguous final attempt, or receiving chain rejection code 2 after an ambiguous
-dispatch, produces terminal `SubmittedWithoutHash`. This outcome is not
-confirmation and carries no hash or positions. `Recovering` remains available
-for tracking-window expiry and exact-tree recovery; tree recovery never runs
-for `SubmittedWithoutHash`.
+An accepted hash that is usable for this generation returns to ordinary
+`Tracking`. A hash already owned by another generation is not usable and is
+classified as possible dispatch without a hash. Exhausting the budget with
+that collision or any other ambiguous final attempt, or receiving chain
+rejection code 2 after an ambiguous dispatch, produces terminal
+`SubmittedWithoutHash`. This outcome is not confirmation and carries no hash
+or positions. `Recovering` remains available for tracking-window expiry and
+exact-tree recovery; tree recovery never runs for `SubmittedWithoutHash`.
 
 ## Scope and authority
 
@@ -297,10 +299,12 @@ version-17 hash is never a candidate: it was never checked against a chain
 result, and it remains only in its unchanged domain column.
 One canonical candidate or hash-confirmed transaction belongs to at most one
 native semantic generation. If POST acceptance returns a hash already owned by
-another generation, the new reservation becomes hashless `Recovering` with an
-invalid-protocol diagnostic and the lifecycle does not poll or confirm that
-hash for the new generation. Confirmation rechecks ownership in the same
-transaction as the terminal projection.
+another generation, the lifecycle does not poll or confirm that hash for the
+new generation. It persists an invalid-protocol dispatch ambiguity as hashless
+`Recovering` when another attempt remains in the current invocation, or as
+terminal `SubmittedWithoutHash` when the collision consumes the final attempt.
+Later advancement of that terminal row performs no POST. Confirmation rechecks
+ownership in the same transaction as the terminal projection.
 Diagnostics are bounded, valid UTF-8, escaped, and redacted before storage.
 Raw response bodies and sensitive cryptographic material are never persisted in
 diagnostics or emitted through ordinary logging.
@@ -487,8 +491,8 @@ conservatively changed to `Recovering`; the new process cannot prove that
 request bytes were never released. After backoff, every retry is reserved
 durably and uses reservation ordinal modulo endpoint count.
 
-A canonical success hash transitions either a first attempt or hashless
-dispatch-ambiguity retry to ordinary `Tracking`.
+A canonical success hash not owned by another generation transitions either a
+first attempt or hashless dispatch-ambiguity retry to ordinary `Tracking`.
 An atomic batch response must also contain the canonical lowercase batch digest
 matching the submission identity, for both acceptance and rejection. A missing,
 malformed, noncanonical, or mismatched response digest is not evidence and is
@@ -1011,6 +1015,9 @@ Tests cover:
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class is durably recorded before retry, and final
   ambiguous-attempt exhaustion produces `SubmittedWithoutHash`;
+- `final_candidate_hash_collision_exhausts_without_lookup_or_redispatch`
+  proves that a final accepted hash owned by another generation becomes
+  terminal `SubmittedWithoutHash` and later advancement sends no POST;
 - restart from `Submitting` produces `Recovering`;
 - retry limits and endpoint failover are bounded per lifecycle invocation,
   attempts may exceed endpoint count, and endpoint selection cycles by ordinal;
