@@ -39,6 +39,15 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   submission evidence; explicit round or account deletion remains the
   destructive cleanup boundary.
 
+## v3.1.0
+
+### Changed
+
+- Released the exact `v3.1.0-rc.16` implementation as `v3.1.0` without
+  implementation changes. Its supporting production snapshots were released
+  as `pir-types 0.6.2`, `pir-client 0.7.2`, `voting-circuits 0.11.2`,
+  `vote-commitment-tree 0.6.0`, and `vote-commitment-tree-client 0.8.0`.
+
 ## v3.1.0-rc.16
 
 ### Changed
