@@ -456,7 +456,10 @@ pub struct VoteRecoveryWork {
     /// Proposal key for singleton work, or the first ordered action used as the
     /// recovery anchor for batch work.
     pub proposal_id: u32,
-    /// Present only for poll work.
+    /// Transaction hash the lifecycle already knows for `AdvanceVote` or
+    /// `AdvanceVoteBatch`: the confirmed hash, else the candidate hash of the
+    /// in-flight generation. Absent before the first accepted POST, after a
+    /// hashless recovery, and always for `SubmitShares`.
     pub tx_hash: Option<String>,
     /// Present only when `kind == VoteRecoveryWorkKind::SubmitShares`.
     pub vc_tree_position: Option<u64>,
