@@ -944,7 +944,7 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 18);
         for index in 0..2 {
             let data =
                 queries::load_zkp2_inputs(&conn, &params.vote_round_id, WALLET, index).unwrap();
@@ -998,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_capability_survives_recovery_and_session_reset() {
+    fn imported_capability_survives_session_reset() {
         let (_, params, hotkey, capability) = exported_fixture();
         let capability_json = capability.to_json().unwrap();
         let customer = test_db(":memory:");
@@ -1010,7 +1010,6 @@ mod tests {
         .unwrap();
         let validated = capability.validate().unwrap();
 
-        crate::recovery::clear(&customer, &params.vote_round_id).unwrap();
         crate::precompute::reset_voting_session_state(&customer, &params.vote_round_id).unwrap();
 
         let conn = customer.conn();

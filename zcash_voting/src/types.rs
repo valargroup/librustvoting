@@ -38,8 +38,15 @@ pub(crate) const REGTEST_NU6_3_ACTIVATION_HEIGHT: u32 = 10;
 pub enum VotingError {
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
+    #[error("Keystone signature conflict for bundle {bundle_index}")]
+    KeystoneSignatureConflict { bundle_index: u32 },
     #[error("Proof generation failed: {message}")]
     ProofFailed { message: String },
+    #[error("Voting state is busy: {message}")]
+    Busy { message: String },
+    /// A durable-state read or write failed before its result could be interpreted.
+    #[error("Storage error: {message}")]
+    Storage { message: String },
     #[error("Internal error: {message}")]
     Internal { message: String },
 }
@@ -256,7 +263,8 @@ impl VotingHotkey {
     /// Returns the opaque hotkey secret that should be stored for later reuse.
     ///
     /// Wallet integrations should treat these bytes as an opaque app-owned
-    /// voting hotkey secret, not as wallet seed material.
+    /// voting hotkey secret, not as wallet seed material. Restoring the same
+    /// bytes also reconstructs deterministic local-delegation VAN blindings.
     pub fn stored_secret(&self) -> &[u8] {
         self.stored_secret.as_slice()
     }

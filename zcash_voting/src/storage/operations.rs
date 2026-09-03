@@ -9,7 +9,7 @@ use orchard::{
 };
 use pasta_curves::group::ff::PrimeField;
 use pasta_curves::pallas;
-use rusqlite::TransactionBehavior;
+use rusqlite::{OptionalExtension, TransactionBehavior};
 use voting_circuits::delegation::synthetic_padding_note_parts;
 use zcash_keys::keys::UnifiedFullViewingKey;
 
@@ -18,7 +18,8 @@ use crate::governance::BUNDLE_NOTE_SLOTS;
 use crate::note_bundling::{BundlePolicy, ChunkResult};
 use crate::storage::queries;
 use crate::storage::{
-    KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord, VotingDb,
+    KeystoneSignatureBatchResult, KeystoneSignatureInput, KeystoneSignatureRecord, RoundPhase,
+    RoundState, RoundSummary, VoteRecord, VotingDb,
 };
 use crate::types::{
     DelegationPirPrecomputeResult, DelegationProgressReporter, DelegationProofResult,
@@ -165,7 +166,11 @@ fn pir_cache_nullifier_targets(
     Ok(targets)
 }
 
-fn verify_delegation_spend_auth_signature(
+/// Verifies a RedPallas SpendAuth signature over a delegation sighash.
+///
+/// Malformed stored keys or sighashes are internal errors; malformed or
+/// invalid caller-provided signatures are invalid input.
+pub(crate) fn verify_delegation_spend_auth_signature(
     rk: &[u8],
     sighash: &[u8],
     signature: &[u8],
@@ -376,6 +381,35 @@ fn validate_witnesses_for_round(
     Ok(())
 }
 
+/// Rejects a compatibility mutation after its write transaction has acquired
+/// SQLite's writer reservation. Lifecycle admission uses the same transaction
+/// behavior, so no native authority can appear between this check and the
+/// caller's projection write.
+pub(crate) fn reject_legacy_chain_mutation_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+) -> Result<(), VotingError> {
+    let authoritative: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM chain_submissions
+              WHERE round_id=?1 AND wallet_id=?2 AND bundle_index=?3)",
+            rusqlite::params![round_id, wallet_id, bundle_index],
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: error.to_string(),
+        })?;
+    if authoritative {
+        Err(VotingError::InvalidInput {
+            message: "legacy chain mutation is disabled for a lifecycle-owned bundle".to_string(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 impl VotingDb {
     // --- Round management ---
 
@@ -473,9 +507,127 @@ impl VotingDb {
 
     /// Delete all data for a round.
     pub fn clear_round(&self, round_id: &str) -> Result<(), VotingError> {
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
+        let deletion_identity = self.chain_submission_round_identity(round_id, &wallet_id)?;
+        let _lease = deletion_identity
+            .as_ref()
+            .map(|identity| {
+                self.chain_submission_coordination
+                    .try_acquire_round_exclusive(identity)
+                    .map_err(|error| match error {
+                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
+                            VotingError::Busy {
+                                message: format!("chain submission is active for round {round_id}"),
+                            }
+                        }
+                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(error) => {
+                            VotingError::Internal { message: error.to_string() }
+                        }
+                    })
+            })
+            .transpose()?;
+        let conn = self.conn();
         queries::clear_round(&conn, round_id, &wallet_id)
+    }
+
+    fn chain_submission_round_identity(
+        &self,
+        round_id: &str,
+        wallet_id: &str,
+    ) -> Result<Option<crate::ChainSubmissionIdentity>, VotingError> {
+        let Ok(bytes) = hex::decode(round_id) else {
+            return Ok(None);
+        };
+        let Ok(vote_round_id) = <[u8; 32]>::try_from(bytes) else {
+            return Ok(None);
+        };
+        let network: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT network FROM rounds WHERE round_id=?1 AND wallet_id=?2",
+                rusqlite::params![round_id, wallet_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| VotingError::Internal {
+                message: error.to_string(),
+            })?;
+        let Some(network) = network else {
+            return Ok(None);
+        };
+        let network = match network.as_str() {
+            "mainnet" => crate::Network::Mainnet,
+            "testnet" => crate::Network::Testnet,
+            "regtest" => crate::Network::Regtest,
+            _ => {
+                return Err(VotingError::Internal {
+                    message: "stored round network is invalid".to_string(),
+                })
+            }
+        };
+        let identity = crate::ChainSubmissionIdentity::new(
+            wallet_id,
+            network,
+            vote_round_id,
+            0,
+            crate::ChainSubmissionTarget::Delegation,
+        );
+        // Legacy `init_round` accepted 32-byte hex values that are not a
+        // canonical Pallas field encoding. Such a round cannot own a native
+        // lifecycle lock because the same constructor rejects every native
+        // identity, so destructive cleanup may proceed without a process gate.
+        Ok(identity.ok())
+    }
+
+    /// Delete every durable voting row owned by the current wallet.
+    ///
+    /// Round-owned state is removed through the `rounds` cascade. The same
+    /// transaction also removes round-independent PIR proof-cache rows, so a
+    /// wallet deletion cannot leave browse-only warm-up material behind.
+    pub fn clear_wallet_state(&self) -> Result<u32, VotingError> {
+        let wallet_id = self.wallet_id();
+        let _lease = self
+            .chain_submission_coordination
+            .try_acquire_account_exclusive(&wallet_id)
+            .map_err(|error| match error {
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
+                    VotingError::Busy {
+                        message: "chain submission is active for this wallet".to_string(),
+                    }
+                }
+                crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(
+                    error,
+                ) => VotingError::Internal {
+                    message: error.to_string(),
+                },
+            })?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to begin wallet voting-state cleanup: {e}"),
+            })?;
+        let deleted_rounds = tx
+            .execute(
+                "DELETE FROM rounds WHERE wallet_id = :wallet_id",
+                rusqlite::named_params! { ":wallet_id": &wallet_id },
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to delete wallet voting rounds: {e}"),
+            })?;
+        tx.execute(
+            "DELETE FROM pir_proof_cache WHERE wallet_id = :wallet_id",
+            rusqlite::named_params! { ":wallet_id": &wallet_id },
+        )
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to delete wallet PIR proof cache: {e}"),
+        })?;
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("failed to commit wallet voting-state cleanup: {e}"),
+        })?;
+        u32::try_from(deleted_rounds).map_err(|_| VotingError::Internal {
+            message: format!("deleted voting round count exceeds u32 range: {deleted_rounds}"),
+        })
     }
 
     // --- Bundles ---
@@ -653,6 +805,7 @@ impl VotingDb {
             (params, stored_network)
         };
         let padded_note_secrets = self.ensure_padded_secrets(round_id, bundle_index, notes)?;
+        let van_blinding = keys.van_blinding_for_bundle(&params, bundle_index, notes)?;
         let result = crate::action::build_governance_pczt(
             notes,
             &params,
@@ -665,6 +818,7 @@ impl VotingDb {
             keys.account_index,
             &keys.round_name,
             &padded_note_secrets,
+            van_blinding.as_ref(),
         )?;
         // Compute total note value from input notes
         let total_note_value: u64 = notes
@@ -1459,16 +1613,53 @@ impl VotingDb {
         bundle_index: u32,
         position: u32,
     ) -> Result<(), VotingError> {
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
-        queries::store_van_position(&conn, round_id, &wallet_id, bundle_index, position)
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| VotingError::Internal {
+                message: format!("begin VAN position transaction failed: {error}"),
+            })?;
+        reject_legacy_chain_mutation_in_tx(&tx, &wallet_id, round_id, bundle_index)?;
+        queries::store_van_position(&tx, round_id, &wallet_id, bundle_index, position)?;
+        tx.commit().map_err(|error| VotingError::Internal {
+            message: format!("commit VAN position transaction failed: {error}"),
+        })
     }
 
-    /// Load the VAN leaf position for a bundle.
+    /// Loads a bundle's VAN position when it fits the legacy `u32` interface.
+    ///
+    /// Returns an error when the position is unset or exceeds `u32`; lifecycle
+    /// and recovery callers should use [`Self::load_van_position_u64`].
     pub fn load_van_position(&self, round_id: &str, bundle_index: u32) -> Result<u32, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
         queries::load_van_position(&conn, round_id, &wallet_id, bundle_index)
+    }
+
+    /// Loads a bundle's complete lifecycle VAN position as a `u64`.
+    ///
+    /// Returns an error when the position is unset or durable storage contains
+    /// a negative position.
+    pub fn load_van_position_u64(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<u64, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::load_van_position_u64(&conn, round_id, &wallet_id, bundle_index)
+    }
+
+    /// Loads an optional lifecycle VAN position without hiding corrupt values.
+    pub(crate) fn load_optional_van_position_u64(
+        &self,
+        round_id: &str,
+        bundle_index: u32,
+    ) -> Result<Option<u64>, VotingError> {
+        let conn = self.conn();
+        let wallet_id = self.wallet_id();
+        queries::load_optional_van_position_u64(&conn, round_id, &wallet_id, bundle_index)
     }
 
     /// Reconstruct the delegation TX payload using an externally provided signature.
@@ -1564,8 +1755,32 @@ impl VotingDb {
         round_id: &str,
         keep_count: u32,
     ) -> Result<u64, VotingError> {
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
+        let pruning_identity = self.chain_submission_round_identity(round_id, &wallet_id)?;
+        let _lease = pruning_identity
+            .as_ref()
+            .map(|identity| {
+                self.chain_submission_coordination
+                    .try_acquire_round_exclusive(identity)
+                    .map_err(|error| {
+                        match error {
+                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Busy => {
+                            VotingError::Busy {
+                                message: format!(
+                                    "chain submission is active for round {round_id}"
+                                ),
+                            }
+                        }
+                        crate::chain_submission::coordination::ExclusiveRoundAcquireError::Failure(
+                            error,
+                        ) => VotingError::Internal {
+                            message: error.to_string(),
+                        },
+                    }
+                    })
+            })
+            .transpose()?;
+        let conn = self.conn();
         queries::delete_bundles_from(&conn, round_id, &wallet_id, keep_count)
     }
 
@@ -1577,9 +1792,18 @@ impl VotingDb {
         bundle_index: u32,
         tx_hash: &str,
     ) -> Result<(), VotingError> {
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
-        queries::store_delegation_tx_hash(&conn, round_id, &wallet_id, bundle_index, tx_hash)
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| VotingError::Internal {
+                message: format!("begin delegation hash transaction failed: {error}"),
+            })?;
+        reject_legacy_chain_mutation_in_tx(&tx, &wallet_id, round_id, bundle_index)?;
+        queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
+        tx.commit().map_err(|error| VotingError::Internal {
+            message: format!("commit delegation hash transaction failed: {error}"),
+        })
     }
 
     pub fn get_delegation_tx_hash(
@@ -1621,6 +1845,7 @@ impl VotingDb {
             .map_err(|e| VotingError::Internal {
                 message: format!("begin vote submission transaction failed: {e}"),
             })?;
+        reject_legacy_chain_mutation_in_tx(&tx, &wallet_id, round_id, bundle_index)?;
         crate::vote::ensure_singleton_vote_update_with_conn(
             &tx,
             &wallet_id,
@@ -1655,6 +1880,7 @@ impl VotingDb {
             .map_err(|e| VotingError::Internal {
                 message: format!("begin delegation submitted transaction failed: {e}"),
             })?;
+        reject_legacy_chain_mutation_in_tx(&tx, &wallet_id, round_id, bundle_index)?;
         let stored = queries::get_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index)?;
         check_text_conflict(stored.as_deref(), tx_hash, "delegation tx_hash")?;
         queries::store_delegation_tx_hash(&tx, round_id, &wallet_id, bundle_index, tx_hash)?;
@@ -1681,6 +1907,7 @@ impl VotingDb {
             .map_err(|e| VotingError::Internal {
                 message: format!("begin vote submitted transaction failed: {e}"),
             })?;
+        reject_legacy_chain_mutation_in_tx(&tx, &wallet_id, round_id, bundle_index)?;
         crate::vote::ensure_singleton_vote_update_with_conn(
             &tx,
             &wallet_id,
@@ -1760,17 +1987,124 @@ impl VotingDb {
         sighash: &[u8],
         rk: &[u8],
     ) -> Result<(), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::store_keystone_signature(
-            &conn,
+        self.store_keystone_signatures_batch(
             round_id,
-            &wallet_id,
-            bundle_index,
-            sig,
-            sighash,
-            rk,
+            &[KeystoneSignatureInput {
+                bundle_index,
+                sig: sig.to_vec(),
+                sighash: sighash.to_vec(),
+                rk: rk.to_vec(),
+            }],
         )
+        .map(|_| ())
+    }
+
+    /// Atomically store a batch of Keystone delegation signatures.
+    ///
+    /// Replaying a tuple with the same sighash and randomized key is
+    /// idempotent even if the signature bytes differ. Reusing a bundle index
+    /// for a different signing context returns a typed conflict and rolls the
+    /// complete batch back.
+    pub fn store_keystone_signatures_batch(
+        &self,
+        round_id: &str,
+        signatures: &[KeystoneSignatureInput],
+    ) -> Result<KeystoneSignatureBatchResult, VotingError> {
+        const SIGNATURE_LEN: usize = 64;
+        const SIGHASH_LEN: usize = 32;
+        const RANDOMIZED_KEY_LEN: usize = 32;
+
+        for signature in signatures {
+            for (value, expected, label) in [
+                (signature.sig.as_slice(), SIGNATURE_LEN, "sig"),
+                (signature.sighash.as_slice(), SIGHASH_LEN, "sighash"),
+                (signature.rk.as_slice(), RANDOMIZED_KEY_LEN, "rk"),
+            ] {
+                if value.len() != expected {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "{label} must be exactly {expected} bytes, got {}",
+                            value.len()
+                        ),
+                    });
+                }
+            }
+        }
+
+        let mut conn = self.conn();
+        let wallet_id = self.wallet_id();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to begin Keystone signature batch transaction: {e}"),
+            })?;
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| VotingError::Internal {
+                message: format!("failed to read Keystone signature timestamp: {e}"),
+            })?
+            .as_secs() as i64;
+        let mut inserted = 0u32;
+        let mut already_present = 0u32;
+
+        for signature in signatures {
+            let existing = tx
+                .query_row(
+                    "SELECT sighash, rk FROM keystone_signatures
+                     WHERE round_id = :round_id AND wallet_id = :wallet_id
+                       AND bundle_index = :bundle_index",
+                    rusqlite::named_params! {
+                        ":round_id": round_id,
+                        ":wallet_id": &wallet_id,
+                        ":bundle_index": signature.bundle_index as i64,
+                    },
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()
+                .map_err(|e| VotingError::Internal {
+                    message: format!("failed to read existing Keystone signature: {e}"),
+                })?;
+
+            if let Some((sighash, rk)) = existing {
+                if sighash == signature.sighash && rk == signature.rk {
+                    already_present += 1;
+                    continue;
+                }
+                return Err(VotingError::KeystoneSignatureConflict {
+                    bundle_index: signature.bundle_index,
+                });
+            }
+
+            tx.execute(
+                "INSERT INTO keystone_signatures
+                 (round_id, wallet_id, bundle_index, sig, sighash, rk, created_at)
+                 VALUES (:round_id, :wallet_id, :bundle_index, :sig, :sighash, :rk, :created_at)",
+                rusqlite::named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": &wallet_id,
+                    ":bundle_index": signature.bundle_index as i64,
+                    ":sig": &signature.sig,
+                    ":sighash": &signature.sighash,
+                    ":rk": &signature.rk,
+                    ":created_at": created_at,
+                },
+            )
+            .map_err(|e| VotingError::Internal {
+                message: format!(
+                    "failed to store Keystone signature for bundle {}: {e}",
+                    signature.bundle_index
+                ),
+            })?;
+            inserted += 1;
+        }
+
+        tx.commit().map_err(|e| VotingError::Internal {
+            message: format!("failed to commit Keystone signature batch: {e}"),
+        })?;
+        Ok(KeystoneSignatureBatchResult {
+            inserted,
+            already_present,
+        })
     }
 
     pub fn get_keystone_signatures(
@@ -1782,25 +2116,15 @@ impl VotingDb {
         queries::get_keystone_signatures(&conn, round_id, &wallet_id)
     }
 
-    /// Clears unconfirmed recovery artifacts while preserving ballot intent,
-    /// recorded vote confirmations, and imported delegation capabilities. Use
-    /// `clear_round`/`delete_round` to remove the whole round, including
-    /// recorded decisions.
-    pub fn clear_recovery_state(&self, round_id: &str) -> Result<(), VotingError> {
-        let conn = self.conn();
-        let wallet_id = self.wallet_id();
-        queries::clear_recovery_state(&conn, round_id, &wallet_id)
-    }
-
     /// Clears locally prepared unsigned delegation setup fields for one round
-    /// while preserving submitted bundles, imported capabilities, and bundles
-    /// with persisted Keystone signatures.
+    /// while preserving proved or submitted bundles, imported capabilities,
+    /// and bundles with persisted Keystone signatures.
     pub fn clear_unsigned_delegation_setup_fields(
         &self,
         round_id: &str,
     ) -> Result<(), VotingError> {
-        let conn = self.conn();
         let wallet_id = self.wallet_id();
+        let conn = self.conn();
         queries::clear_unsigned_delegation_setup_fields(&conn, round_id, &wallet_id)
     }
 
@@ -1811,7 +2135,7 @@ impl VotingDb {
     /// This raw storage helper is crate-internal because callers must provide a
     /// nullifier that matches the persisted vote recovery bundle. Wallet
     /// integrations should use
-    /// `CommittedVote::submit_share_to_helpers`, which derives the nullifier
+    /// `CommittedVote::submit_prepared_shares`, which derives the nullifier
     /// and owns journaled delivery.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) fn record_share_delegation(
@@ -1872,6 +2196,7 @@ impl VotingDb {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub(crate) fn record_share_delivery_for_wallet(
         &self,
         wallet_id: &str,
@@ -2060,6 +2385,26 @@ impl VotingDb {
     ) -> Result<Vec<crate::ShareDelegationRecord>, VotingError> {
         let conn = self.conn();
         queries::get_share_delegations(&conn, round_id, wallet_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn get_share_delegation_for_wallet(
+        &self,
+        round_id: &str,
+        wallet_id: &str,
+        bundle_index: u32,
+        proposal_id: u32,
+        share_index: u32,
+    ) -> Result<Option<crate::ShareDelegationRecord>, VotingError> {
+        let conn = self.conn();
+        queries::get_share_delegation(
+            &conn,
+            round_id,
+            wallet_id,
+            bundle_index,
+            proposal_id,
+            share_index,
+        )
     }
 
     /// Load only unconfirmed share delegations for a round.
@@ -2945,6 +3290,143 @@ mod tests {
 
         db.clear_round(ROUND_ID).unwrap();
         assert!(db.list_rounds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn noncanonical_legacy_round_ids_remain_deletable() {
+        let db = test_db();
+        let round_id = "ff".repeat(32);
+        let mut params = test_params();
+        params.vote_round_id.clone_from(&round_id);
+        db.init_round(Network::Testnet, &params, None).unwrap();
+        queries::insert_bundle(&db.conn(), &round_id, W, 0, &[1]).unwrap();
+        queries::insert_bundle(&db.conn(), &round_id, W, 1, &[1]).unwrap();
+
+        assert_eq!(db.delete_skipped_bundles(&round_id, 1).unwrap(), 1);
+
+        db.clear_round(&round_id).unwrap();
+        assert!(!db.has_round(&round_id).unwrap());
+    }
+
+    #[test]
+    fn clear_wallet_state_removes_rounds_and_round_independent_pir_cache_only_for_wallet() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.set_wallet_id("other-wallet");
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        {
+            let conn = db.conn();
+            for wallet_id in [W, "other-wallet"] {
+                conn.execute(
+                    "INSERT INTO pir_proof_cache
+                     (wallet_id, network, nullifier, root, nf_bounds, leaf_pos, path, created_at, updated_at)
+                     VALUES (?1, 'testnet', X'01', X'02', X'03', 0, X'04', 1, 1)",
+                    [wallet_id],
+                )
+                .unwrap();
+            }
+        }
+
+        db.set_wallet_id(W);
+        assert_eq!(db.clear_wallet_state().unwrap(), 1);
+        assert!(db.list_rounds().unwrap().is_empty());
+        let wallet_cache_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pir_proof_cache WHERE wallet_id = ?1",
+                [W],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wallet_cache_count, 0);
+
+        db.set_wallet_id("other-wallet");
+        assert_eq!(db.list_rounds().unwrap().len(), 1);
+        let other_cache_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM pir_proof_cache WHERE wallet_id = ?1",
+                ["other-wallet"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other_cache_count, 1);
+    }
+
+    #[test]
+    fn keystone_signature_batch_is_atomic_idempotent_and_reports_typed_conflicts() {
+        let db = test_db();
+        db.init_round(Network::Testnet, &test_params(), None)
+            .unwrap();
+        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
+            .unwrap();
+        queries::insert_bundle_notes(
+            &db.conn(),
+            ROUND_ID,
+            W,
+            1,
+            &[identity_note_with_position(8)],
+        )
+        .unwrap();
+        let signature = KeystoneSignatureInput {
+            bundle_index: 0,
+            sig: vec![0x11; 64],
+            sighash: vec![0x22; 32],
+            rk: vec![0x33; 32],
+        };
+
+        let inserted = db
+            .store_keystone_signatures_batch(ROUND_ID, std::slice::from_ref(&signature))
+            .unwrap();
+        assert_eq!(
+            inserted,
+            KeystoneSignatureBatchResult {
+                inserted: 1,
+                already_present: 0,
+            }
+        );
+        let replayed = db
+            .store_keystone_signatures_batch(
+                ROUND_ID,
+                &[KeystoneSignatureInput {
+                    sig: vec![0x44; 64],
+                    ..signature.clone()
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            replayed,
+            KeystoneSignatureBatchResult {
+                inserted: 0,
+                already_present: 1,
+            }
+        );
+
+        let error = db
+            .store_keystone_signatures_batch(
+                ROUND_ID,
+                &[
+                    KeystoneSignatureInput {
+                        bundle_index: 1,
+                        ..signature.clone()
+                    },
+                    KeystoneSignatureInput {
+                        bundle_index: 0,
+                        sighash: vec![0x55; 32],
+                        ..signature
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            VotingError::KeystoneSignatureConflict { bundle_index: 0 }
+        ));
+        let stored = db.get_keystone_signatures(ROUND_ID).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].sig, vec![0x11; 64]);
     }
 
     #[test]
@@ -5442,6 +5924,61 @@ mod tests {
             .unwrap();
         assert_eq!(position, None);
 
+        // Lifecycle admission and compatibility projection writes reserve the
+        // same SQLite writer slot. If admission wins, a waiting legacy writer
+        // must observe the committed authority before touching the vote row.
+        db_a.insert_vote_fixture(ROUND_ID, 0, 2, 0, &[0xBB; 32])
+            .unwrap();
+        {
+            SQLITE_BUSY_OBSERVED.store(false, Ordering::SeqCst);
+            let mut writer_conn = db_b.conn();
+            let writer_tx = writer_conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            writer_tx
+                .execute(
+                    "INSERT INTO chain_submissions
+                     (identity_key, round_id, wallet_id, network,
+                      bundle_index, kind, proposal_id, generation_digest, state,
+                      committed_post_reservations, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2,
+                             ?4, 'submitting', 1, 10, 10)",
+                    rusqlite::params![vec![0x51_u8; 32], ROUND_ID, W, vec![0x52_u8; 32]],
+                )
+                .unwrap();
+
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    result_tx
+                        .send(crate::vote::record_submission(
+                            &db_a,
+                            ROUND_ID,
+                            0,
+                            2,
+                            "must-not-persist",
+                        ))
+                        .unwrap();
+                });
+
+                let writer_tx = wait_for_sqlite_contention(
+                    writer_tx,
+                    &result_rx,
+                    "lifecycle-owned vote submission",
+                );
+                writer_tx.commit().unwrap();
+                let error = result_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect_err("the compatibility writer must observe lifecycle authority");
+                assert!(error.to_string().contains("lifecycle-owned bundle"));
+            });
+        }
+        assert_eq!(
+            queries::get_vote_tx_hash(&db_a.conn(), ROUND_ID, W, 0, 2).unwrap(),
+            None
+        );
+
         drop(db_b);
         drop(db_a);
         let _ = std::fs::remove_file(&path);
@@ -5777,30 +6314,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_recovery_state_resets_vote_recovery() {
-        let db = test_db();
-        db.init_round(Network::Testnet, &test_params(), None)
-            .unwrap();
-        db.ensure_bundles(ROUND_ID, &[identity_test_note()])
-            .unwrap();
-        db.insert_vote_fixture(ROUND_ID, 0, 1, 0, &[0xAA; 32])
-            .unwrap();
-        db.record_vote_submission(ROUND_ID, 0, 1, "vote-tx")
-            .unwrap();
-
-        db.clear_recovery_state(ROUND_ID).unwrap();
-
-        let vote = db
-            .get_votes(ROUND_ID)
-            .unwrap()
-            .into_iter()
-            .find(|vote| vote.proposal_id == 1)
-            .expect("vote row remains");
-        assert_eq!(vote.choice, 0);
-        assert_eq!(db.get_vote_tx_hash(ROUND_ID, 0, 1).unwrap(), None);
-    }
-
-    #[test]
     fn test_insert_vote_fixture() {
         let db = test_db();
         db.init_round(Network::Testnet, &test_params(), None)
@@ -6132,6 +6645,127 @@ mod tests {
         db.clear_round(ROUND_ID).unwrap();
         assert!(db.list_rounds().unwrap().is_empty());
         assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), 0);
+    }
+
+    #[test]
+    fn restored_hotkey_reconstructs_van_after_voting_database_loss() {
+        use orchard::keys::{FullViewingKey, SpendingKey};
+
+        fn note(position: u8, value: u64) -> NoteInfo {
+            let mut note = identity_note_with_position(position);
+            note.value = value;
+            note
+        }
+
+        fn build_from_fresh_database(
+            hotkey: &VotingHotkey,
+            notes: &[NoteInfo],
+        ) -> (
+            crate::round::BundleLayout,
+            Vec<(u32, Vec<NoteInfo>, GovernancePczt)>,
+        ) {
+            let db = test_db();
+            db.init_round(Network::Regtest, &test_params_nu6_3(), None)
+                .unwrap();
+            let layout = db
+                .ensure_bundles_with_policy(ROUND_ID, notes, crate::recoverable_bundle_policy_v1())
+                .unwrap();
+
+            let spending_key = SpendingKey::from_bytes([0x42; 32]).expect("valid spending key");
+            let full_viewing_key = FullViewingKey::from(&spending_key);
+            let keys =
+                test_delegation_keys(full_viewing_key.to_bytes().to_vec(), hotkey, [0x42; 32], 0);
+            let bundles = crate::round::note_bundles_for_round(notes, &db, ROUND_ID).unwrap();
+            assert_eq!(bundles.len(), layout.bundle_count as usize);
+
+            let rebuilt = bundles
+                .into_iter()
+                .enumerate()
+                .map(|(bundle_index, expected_notes)| {
+                    let bundle_index = u32::try_from(bundle_index).unwrap();
+                    let public_notes = crate::round::bundle_notes_for_index_for_round(
+                        notes,
+                        &layout,
+                        bundle_index,
+                        &db,
+                        ROUND_ID,
+                    )
+                    .unwrap();
+                    assert_eq!(public_notes, expected_notes);
+                    let pczt = db
+                        .build_governance_pczt(
+                            ROUND_ID,
+                            bundle_index,
+                            &public_notes,
+                            &keys,
+                            nu6_3_branch_id(),
+                        )
+                        .unwrap();
+                    (bundle_index, public_notes, pczt)
+                })
+                .collect();
+
+            (layout, rebuilt)
+        }
+
+        const ZEC: u64 = 100_000_000;
+        let notes = vec![
+            note(12, 10_000 * ZEC),
+            note(2, 10_000 * ZEC),
+            note(9, 5_000 * ZEC),
+            note(21, 4_000 * ZEC),
+            note(5, 4_000 * ZEC),
+            note(18, 4_000 * ZEC),
+            note(7, 4_000 * ZEC),
+            note(14, 4_000 * ZEC),
+            note(30, 10 * ZEC),
+            note(24, 10 * ZEC),
+            note(28, 10 * ZEC),
+            note(26, 10 * ZEC),
+            note(32, 10 * ZEC),
+        ];
+        let mut reordered_notes = notes.clone();
+        reordered_notes.reverse();
+
+        let original = VotingHotkey::from_stored_secret(&[0x43; 64], Network::Regtest).unwrap();
+        let restored =
+            VotingHotkey::from_stored_secret(original.stored_secret(), Network::Regtest).unwrap();
+        let (first_layout, first_bundles) = build_from_fresh_database(&original, &notes);
+        let (second_layout, second_bundles) =
+            build_from_fresh_database(&restored, &reordered_notes);
+
+        assert_eq!(first_layout, second_layout);
+        assert_eq!(first_layout.bundle_count, 2);
+        assert_eq!(first_layout.privacy_trim_dropped_bundles, 1);
+        assert_eq!(first_layout.privacy_trim_dropped_notes, 5);
+        assert_eq!(first_layout.privacy_trim_dropped_value_zatoshi, 50 * ZEC);
+
+        let positions = first_bundles
+            .iter()
+            .map(|(_, notes, _)| notes.iter().map(|note| note.position).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(positions, vec![vec![2, 9, 12], vec![5, 7, 14, 18, 21]]);
+        assert_eq!(
+            first_bundles[0]
+                .1
+                .iter()
+                .map(|note| note.value)
+                .sum::<u64>(),
+            25_000 * ZEC
+        );
+
+        for ((first_index, first_notes, first), (second_index, second_notes, second)) in
+            first_bundles.iter().zip(&second_bundles)
+        {
+            assert_eq!(first_index, second_index);
+            assert_eq!(first_notes, second_notes);
+            assert_eq!(first.van_comm_rand, second.van_comm_rand);
+            assert_eq!(first.van, second.van);
+            assert_ne!(
+                first.pczt_sighash, second.pczt_sighash,
+                "non-recovery PCZT randomness should remain fresh"
+            );
+        }
     }
 
     /// Share delegation lifecycle: record → query → confirm → resubmit → re-record preserves confirmed.

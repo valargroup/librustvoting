@@ -1306,6 +1306,44 @@ mod tests {
     }
 
     #[test]
+    fn delete_skipped_bundles_preserves_chain_submission_evidence_atomically() {
+        let db = test_db("wallet-protected-prune");
+        let notes = vec![
+            note(0, crate::governance::BALLOT_DIVISOR),
+            note(1, crate::governance::BALLOT_DIVISOR),
+        ];
+        db.ensure_bundles(ROUND_ID, &notes).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, generation_digest, state, committed_post_reservations,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', ?4,
+                         'submitting', 1, 10, 10)",
+                rusqlite::params![
+                    vec![0x61_u8; 32],
+                    ROUND_ID,
+                    "wallet-protected-prune",
+                    vec![0x62_u8; 32]
+                ],
+            )
+            .unwrap();
+
+        let bundles_before = db.get_bundle_count(ROUND_ID).unwrap();
+        let error = db.delete_skipped_bundles(ROUND_ID, 0).unwrap_err();
+        assert!(matches!(error, crate::VotingError::Busy { .. }));
+        assert_eq!(db.get_bundle_count(ROUND_ID).unwrap(), bundles_before);
+        let submissions: i64 = db
+            .conn()
+            .query_row("SELECT count(*) FROM chain_submissions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(submissions, 1);
+    }
+
+    #[test]
     fn ensure_bundles_with_skipped_suffix_uses_custom_policy() {
         let db = test_db("wallet-policy-skip");
         let notes = vec![

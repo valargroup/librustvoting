@@ -4,9 +4,13 @@
 //! different pace, so the stable API reports delegation status per bundle
 //! instead of maintaining one lossy round-level phase.
 
-use rusqlite::{named_params, OptionalExtension};
+use rusqlite::{named_params, Connection, OptionalExtension};
 
 use crate::{storage::VotingDb, types::VotingError};
+
+mod authoritative_batch;
+
+use authoritative_batch::load_authoritative_batch_phases;
 
 /// Delegation lifecycle for one bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +24,8 @@ pub enum DelegationPhase {
     Proved,
     /// A delegation transaction hash has been recorded.
     Submitted,
+    /// Submission or reconciliation is owned by the chain lifecycle facade.
+    SubmissionManaged,
     /// The vote authority note leaf position has been recovered from chain.
     Confirmed,
 }
@@ -36,6 +42,8 @@ pub enum WorkflowPhase {
     SubmittedDelegation,
     SubmittedVote,
     SubmittedShare,
+    /// Submission or reconciliation is owned by the chain lifecycle facade.
+    SubmissionManaged,
     Confirmed,
 }
 
@@ -49,6 +57,8 @@ pub enum VotePhase {
     Committed,
     /// A cast-vote transaction hash has been recorded.
     Submitted,
+    /// Submission or reconciliation is owned by the chain lifecycle facade.
+    SubmissionManaged,
     /// The vote commitment tree position has been recorded.
     Confirmed,
 }
@@ -60,6 +70,7 @@ impl VotePhase {
             Self::Prepared => "prepared",
             Self::Committed => "committed",
             Self::Submitted => "submitted",
+            Self::SubmissionManaged => "submission_managed",
             Self::Confirmed => "confirmed",
         }
     }
@@ -93,6 +104,7 @@ impl DelegationPhase {
             Self::PcztBuilt => "pczt_built",
             Self::Proved => "proved",
             Self::Submitted => "submitted",
+            Self::SubmissionManaged => "submission_managed",
             Self::Confirmed => "confirmed",
         }
     }
@@ -107,6 +119,7 @@ impl WorkflowPhase {
             Self::SubmittedDelegation => "submitted_delegation",
             Self::SubmittedVote => "submitted_vote",
             Self::SubmittedShare => "submitted_share",
+            Self::SubmissionManaged => "submission_managed",
             Self::Confirmed => "confirmed",
         }
     }
@@ -117,6 +130,7 @@ impl WorkflowPhase {
             DelegationPhase::Prepared => Self::Prepared,
             DelegationPhase::PcztBuilt | DelegationPhase::Proved => Self::Signed,
             DelegationPhase::Submitted => Self::SubmittedDelegation,
+            DelegationPhase::SubmissionManaged => Self::SubmissionManaged,
             DelegationPhase::Confirmed => Self::Confirmed,
         }
     }
@@ -127,6 +141,7 @@ impl WorkflowPhase {
             VotePhase::Prepared => Self::Prepared,
             VotePhase::Committed => Self::Signed,
             VotePhase::Submitted => Self::SubmittedVote,
+            VotePhase::SubmissionManaged => Self::SubmissionManaged,
             VotePhase::Confirmed => Self::Confirmed,
         }
     }
@@ -163,7 +178,11 @@ impl VotingDb {
                               AND p.success = 1
                         ),
                         b.delegation_tx_hash IS NOT NULL,
-                        b.van_leaf_position IS NOT NULL
+                        b.van_leaf_position IS NOT NULL,
+                        EXISTS(SELECT 1 FROM chain_submissions s
+                                WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
+                                  AND s.bundle_index=b.bundle_index AND s.kind='delegation'
+                                  AND s.state IN ('submitting','tracking','recovering','rejected'))
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -179,6 +198,7 @@ impl VotingDb {
                         row.get::<_, i64>(1)? != 0,
                         row.get::<_, i64>(2)? != 0,
                         row.get::<_, i64>(3)? != 0,
+                        row.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
@@ -213,7 +233,11 @@ impl VotingDb {
                               AND p.success = 1
                         ),
                         b.delegation_tx_hash IS NOT NULL,
-                        b.van_leaf_position IS NOT NULL
+                        b.van_leaf_position IS NOT NULL,
+                        EXISTS(SELECT 1 FROM chain_submissions s
+                                WHERE s.round_id=b.round_id AND s.wallet_id=b.wallet_id
+                                  AND s.bundle_index=b.bundle_index AND s.kind='delegation'
+                                  AND s.state IN ('submitting','tracking','recovering','rejected'))
                  FROM bundles b
                  WHERE b.round_id = :round_id
                    AND b.wallet_id = :wallet_id
@@ -234,6 +258,7 @@ impl VotingDb {
                             row.get::<_, i64>(2)? != 0,
                             row.get::<_, i64>(3)? != 0,
                             row.get::<_, i64>(4)? != 0,
+                            row.get::<_, i64>(5)? != 0,
                         ),
                     ))
                 },
@@ -258,33 +283,16 @@ impl VotingDb {
     ) -> Result<VotePhase, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let phase = conn
-            .query_row(
-                "SELECT tx_hash IS NOT NULL, vc_tree_position IS NOT NULL,
-                        commitment_bundle_json IS NOT NULL
-                 FROM votes
-                 WHERE round_id = :round_id
-                   AND wallet_id = :wallet_id
-                   AND bundle_index = :bundle_index
-                   AND proposal_id = :proposal_id",
-                named_params! {
-                    ":round_id": round_id,
-                    ":wallet_id": wallet_id,
-                    ":bundle_index": bundle_index as i64,
-                    ":proposal_id": proposal_id as i64,
-                },
-                |row| {
-                    Ok(vote_phase_from_columns(
-                        row.get::<_, i64>(0)? != 0,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)? != 0,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to load vote phase: {e}"),
-            })?;
+        let phase = load_vote_phases(
+            &conn,
+            &wallet_id,
+            round_id,
+            Some(bundle_index),
+            Some(proposal_id),
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, _, phase)| phase);
 
         phase.ok_or_else(|| VotingError::InvalidInput {
             message: format!(
@@ -297,41 +305,7 @@ impl VotingDb {
     pub fn vote_phases(&self, round_id: &str) -> Result<Vec<(u32, u32, VotePhase)>, VotingError> {
         let conn = self.conn();
         let wallet_id = self.wallet_id();
-        let mut stmt = conn
-            .prepare(
-                "SELECT bundle_index, proposal_id, tx_hash IS NOT NULL,
-                        vc_tree_position IS NOT NULL, commitment_bundle_json IS NOT NULL
-                 FROM votes
-                 WHERE round_id = :round_id AND wallet_id = :wallet_id
-                 ORDER BY bundle_index, proposal_id",
-            )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to prepare vote phases query: {e}"),
-            })?;
-
-        let rows = stmt
-            .query_map(
-                named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as u32,
-                        row.get::<_, i64>(1)? as u32,
-                        vote_phase_from_columns(
-                            row.get::<_, i64>(2)? != 0,
-                            row.get::<_, i64>(3)? != 0,
-                            row.get::<_, i64>(4)? != 0,
-                        ),
-                    ))
-                },
-            )
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to query vote phases: {e}"),
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to read vote phase row: {e}"),
-            })?;
-        Ok(rows)
+        load_vote_phases(&conn, &wallet_id, round_id, None, None)
     }
 
     /// Loads the canonical helper-share phase for one share record.
@@ -422,6 +396,115 @@ impl VotingDb {
                 message: format!("failed to read share phase row: {e}"),
             })?;
         Ok(rows)
+    }
+}
+
+struct VotePhaseEvidence {
+    bundle_index: u32,
+    proposal_id: u32,
+    has_tx_hash: bool,
+    has_vc_position: bool,
+    has_recovery_bundle: bool,
+    singleton_submission_state: Option<String>,
+}
+
+/// Projects vote rows through their authoritative singleton or atomic-batch
+/// submission. Batch membership is accepted only after the persisted signed
+/// batch and its complete generation digest have been re-derived.
+fn load_vote_phases(
+    conn: &Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: Option<u32>,
+    proposal_id: Option<u32>,
+) -> Result<Vec<(u32, u32, VotePhase)>, VotingError> {
+    let vote_evidence = {
+        let mut statement = conn
+            .prepare(
+                "SELECT v.bundle_index, v.proposal_id, v.tx_hash IS NOT NULL,
+                        v.vc_tree_position IS NOT NULL,
+                        v.commitment_bundle_json IS NOT NULL,
+                        singleton.state
+                   FROM votes v
+                   LEFT JOIN chain_submissions singleton
+                     ON singleton.round_id=v.round_id
+                    AND singleton.wallet_id=v.wallet_id
+                    AND singleton.bundle_index=v.bundle_index
+                    AND singleton.kind='vote'
+                    AND singleton.proposal_id=v.proposal_id
+                  WHERE v.round_id=:round_id AND v.wallet_id=:wallet_id
+                    AND (:bundle_index IS NULL OR v.bundle_index=:bundle_index)
+                    AND (:proposal_id IS NULL OR v.proposal_id=:proposal_id)
+                  ORDER BY v.bundle_index, v.proposal_id",
+            )
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to prepare vote phases query: {error}"),
+            })?;
+        let evidence = statement
+            .query_map(
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":bundle_index": bundle_index.map(i64::from),
+                    ":proposal_id": proposal_id.map(i64::from),
+                },
+                |row| {
+                    Ok(VotePhaseEvidence {
+                        bundle_index: row.get::<_, i64>(0)? as u32,
+                        proposal_id: row.get::<_, i64>(1)? as u32,
+                        has_tx_hash: row.get::<_, i64>(2)? != 0,
+                        has_vc_position: row.get::<_, i64>(3)? != 0,
+                        has_recovery_bundle: row.get::<_, i64>(4)? != 0,
+                        singleton_submission_state: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to query vote phases: {error}"),
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to read vote phase row: {error}"),
+            })?;
+        evidence
+    };
+
+    let batch_phases = load_authoritative_batch_phases(conn, wallet_id, round_id, bundle_index)?;
+    vote_evidence
+        .into_iter()
+        .map(|evidence| {
+            let singleton_phase =
+                authoritative_submission_phase(evidence.singleton_submission_state.as_deref());
+            let batch_phase = batch_phases
+                .get(&(evidence.bundle_index, evidence.proposal_id))
+                .copied();
+            if singleton_phase.is_some() && batch_phase.is_some() {
+                return Err(VotingError::Internal {
+                    message: format!(
+                        "vote has overlapping authoritative singleton and batch submissions for round={round_id}, bundle={}, proposal={}",
+                        evidence.bundle_index, evidence.proposal_id
+                    ),
+                });
+            }
+            let phase = singleton_phase.or(batch_phase).unwrap_or_else(|| {
+                vote_phase_from_columns(
+                    evidence.has_tx_hash,
+                    evidence.has_vc_position,
+                    evidence.has_recovery_bundle,
+                )
+            });
+            Ok((evidence.bundle_index, evidence.proposal_id, phase))
+        })
+        .collect()
+}
+
+fn authoritative_submission_phase(state: Option<&str>) -> Option<VotePhase> {
+    match state {
+        Some("submitting" | "tracking" | "recovering" | "rejected") => {
+            Some(VotePhase::SubmissionManaged)
+        }
+        Some("confirmed") => Some(VotePhase::Confirmed),
+        _ => None,
     }
 }
 
@@ -618,6 +701,10 @@ mod tests {
             "signed"
         );
         assert_eq!(
+            WorkflowPhase::for_delegation(DelegationPhase::SubmissionManaged).as_str(),
+            "submission_managed"
+        );
+        assert_eq!(
             WorkflowPhase::for_delegation(DelegationPhase::Submitted).as_str(),
             "submitted_delegation"
         );
@@ -637,6 +724,10 @@ mod tests {
         assert_eq!(
             WorkflowPhase::for_vote(VotePhase::Submitted).as_str(),
             "submitted_vote"
+        );
+        assert_eq!(
+            WorkflowPhase::for_vote(VotePhase::SubmissionManaged).as_str(),
+            "submission_managed"
         );
         assert_eq!(
             WorkflowPhase::for_vote(VotePhase::Confirmed).as_str(),
@@ -659,8 +750,11 @@ fn phase_from_columns(
     has_proof: bool,
     has_tx_hash: bool,
     has_van_position: bool,
+    submission_managed: bool,
 ) -> DelegationPhase {
-    if has_van_position {
+    if submission_managed {
+        DelegationPhase::SubmissionManaged
+    } else if has_van_position {
         DelegationPhase::Confirmed
     } else if has_tx_hash {
         DelegationPhase::Submitted
@@ -673,6 +767,11 @@ fn phase_from_columns(
     }
 }
 
+/// Projects one vote's workflow phase from its version-17 domain columns.
+///
+/// This is the fallback for a vote with no authoritative `chain_submissions`
+/// row; whenever such a row exists it wins, whether unresolved or confirmed by
+/// hash or tree. Pre-upgrade rounds keep displaying through this projection.
 fn vote_phase_from_columns(
     has_tx_hash: bool,
     has_vc_position: bool,

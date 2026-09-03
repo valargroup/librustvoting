@@ -24,6 +24,44 @@ pub enum Decision {
     Skipped,
 }
 
+/// Durable ballot-intent classification shared by resume and helper planning.
+pub(crate) struct BallotIntentClassification {
+    pub(crate) roster: BTreeSet<u32>,
+    pub(crate) choice_proposals: Vec<u32>,
+    pub(crate) open_proposals: Vec<u32>,
+}
+
+pub(crate) fn classify_ballot_intents(
+    proposal_ids: &[u32],
+    intents: &BTreeMap<u32, Decision>,
+) -> Result<BallotIntentClassification, VotingError> {
+    let mut roster = BTreeSet::new();
+    for &proposal_id in proposal_ids {
+        validate_proposal_id(proposal_id)?;
+        if !roster.insert(proposal_id) {
+            return Err(VotingError::InvalidInput {
+                message: format!("proposal roster contains duplicate id {proposal_id}"),
+            });
+        }
+    }
+
+    let mut choice_proposals = Vec::new();
+    let mut open_proposals = Vec::new();
+    for &proposal_id in &roster {
+        match intents.get(&proposal_id) {
+            Some(Decision::Choice(_)) => choice_proposals.push(proposal_id),
+            Some(Decision::Skipped) => {}
+            None => open_proposals.push(proposal_id),
+        }
+    }
+
+    Ok(BallotIntentClassification {
+        roster,
+        choice_proposals,
+        open_proposals,
+    })
+}
+
 impl VotingDb {
     /// Record (insert or replace) the voter's decision for one proposal.
     ///
@@ -106,14 +144,45 @@ impl VotingDb {
         .map_err(|e| VotingError::Internal {
             message: format!("set_ballot_intent failed: {e}"),
         })?;
-        queries::clear_stale_share_delegations_for_intent(
-            &tx,
-            round_id,
-            &wallet_id,
-            proposal_id,
-            skipped_bool,
-            choice_u32,
-        )?;
+        if skipped_bool {
+            tx.execute(
+                "DELETE FROM share_delegations
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND proposal_id = :proposal_id",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":proposal_id": proposal_id as i64,
+                },
+            )
+        } else if let Some(choice) = choice_u32 {
+            tx.execute(
+                "DELETE FROM share_delegations
+                 WHERE round_id = :round_id
+                   AND wallet_id = :wallet_id
+                   AND proposal_id = :proposal_id
+                   AND NOT EXISTS (
+                       SELECT 1 FROM votes
+                       WHERE votes.round_id = share_delegations.round_id
+                         AND votes.wallet_id = share_delegations.wallet_id
+                         AND votes.bundle_index = share_delegations.bundle_index
+                         AND votes.proposal_id = share_delegations.proposal_id
+                         AND votes.choice = :choice
+                   )",
+                named_params! {
+                    ":round_id": round_id,
+                    ":wallet_id": wallet_id,
+                    ":proposal_id": proposal_id as i64,
+                    ":choice": choice as i64,
+                },
+            )
+        } else {
+            Ok(0)
+        }
+        .map_err(|e| VotingError::Internal {
+            message: format!("failed to clear stale share delegations: {e}"),
+        })?;
         tx.commit().map_err(|e| VotingError::Internal {
             message: format!("set_ballot_intent commit failed: {e}"),
         })?;
@@ -206,11 +275,14 @@ pub enum NextStep {
     /// fields to the vote chain, persist the cast-vote tx hash with
     /// `vote::record_submission` while polling, then call
     /// `confirmation::confirm_vote_submission` after the transaction confirms.
-    /// After confirmation, recover the `CommittedVote`, create and persist its
-    /// complete helper-share plan if none exists, and submit through
-    /// `CommittedVote::submit_share_to_helpers` with the current helper fleet.
-    /// The typed method rebuilds payloads with the confirmed commitment-tree
-    /// position and journals each POST before dispatch.
+    /// Recover the `CommittedVote`, preflight the complete helper fleet, and
+    /// call `CommittedVote::prepare_share_delivery` to create or reload its
+    /// complete persisted plan. After confirmation, submit through
+    /// `CommittedVote::submit_prepared_shares` with the current fleet. A
+    /// reloaded plan retains its original target while delivery excludes
+    /// helpers removed from the current fleet. The typed method rebuilds
+    /// payloads with the confirmed commitment-tree position and journals each
+    /// POST before dispatch.
     SubmitVote {
         bundle_index: u32,
         proposal_id: u32,
@@ -240,18 +312,19 @@ pub enum NextStep {
         bundle_index: u32,
         proposal_id: u32,
     },
-    /// Submit helper shares for an already-confirmed vote.
+    /// Resume helper-share submission for a committed vote.
     ///
     /// This covers the crash boundary after the cast-vote transaction confirms
     /// and before every helper-share row has been durably recorded. The
-    /// `share_index` identifies the missing helper share to submit. Wallets
-    /// should recover the `CommittedVote` and reuse the original full-batch
-    /// planner output when calling `CommittedVote::submit_share_to_helpers`;
-    /// recomputing plans independently for missing shares can violate the
-    /// planner's batch-wide per-helper quota. This crate does not yet persist
-    /// that planner output, so the wallet must persist it before submitting
-    /// the first share. The submission method journals every attempt and
-    /// outcome, but not the batch plan itself.
+    /// `share_index` identifies one missing share for stable recovery UI and
+    /// FFI routing. The host should recover the `CommittedVote`, call
+    /// `CommittedVote::prepare_share_delivery` to load or create the
+    /// SDK-persisted complete plan, and then call
+    /// `CommittedVote::submit_prepared_shares` with the current helper fleet.
+    /// Submission validates the immutable plan against its persisted planning
+    /// fleet, contacts only current helpers, validates the whole batch before
+    /// network I/O, journals every attempt and outcome, and resumes only the
+    /// remaining definite-delivery deficits.
     SubmitShares {
         bundle_index: u32,
         proposal_id: u32,
@@ -424,6 +497,8 @@ pub struct RoundPlan {
     pub open_proposals: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
     pub immediate_share_key: Option<ImmediateShareKey>,
+    /// True when the designated immediate share has durable helper-quorum confirmation.
+    pub immediate_share_confirmed: bool,
     /// Informational: every proposal is either a confirmed Choice or Skipped.
     pub all_decided: bool,
     /// Durable delegation status for every eligible bundle in the round.
@@ -957,10 +1032,6 @@ pub fn resume_plan(
     round_id: &str,
     proposal_ids: &[u32],
 ) -> Result<RoundPlan, VotingError> {
-    for &proposal_id in proposal_ids {
-        validate_proposal_id(proposal_id)?;
-    }
-
     let delegation: BTreeMap<u32, DelegationPhase> =
         db.delegation_phases(round_id)?.into_iter().collect();
     let votes: BTreeMap<(u32, u32), VotePhase> = db
@@ -985,20 +1056,11 @@ pub fn resume_plan(
         },
     );
     let intents: BTreeMap<u32, Decision> = db.ballot_intents(round_id)?.into_iter().collect();
+    let intent_classification = classify_ballot_intents(proposal_ids, &intents)?;
 
     let bundles: Vec<u32> = delegation.keys().copied().collect();
-
-    let mut choice_proposals: Vec<u32> = Vec::new();
-    let mut open_proposals: Vec<u32> = Vec::new();
-    for &pid in proposal_ids {
-        match intents.get(&pid) {
-            Some(Decision::Choice(_)) => choice_proposals.push(pid),
-            Some(Decision::Skipped) => {}
-            None => open_proposals.push(pid),
-        }
-    }
-    choice_proposals.sort_unstable();
-    open_proposals.sort_unstable();
+    let choice_proposals = intent_classification.choice_proposals;
+    let open_proposals = intent_classification.open_proposals;
 
     if !choice_proposals.is_empty() && bundles.is_empty() {
         return Err(VotingError::InvalidInput {
@@ -1029,15 +1091,21 @@ pub fn resume_plan(
         .iter()
         .filter(|(key, phase)| {
             !stale_vote_keys.contains(key)
-                && matches!(phase, VotePhase::Committed | VotePhase::Submitted)
+                && matches!(
+                    phase,
+                    VotePhase::Committed | VotePhase::Submitted | VotePhase::SubmissionManaged
+                )
         })
         .map(|(&(bundle_index, _), _)| bundle_index)
+        .chain(delegation.iter().filter_map(|(&bundle_index, phase)| {
+            (*phase == DelegationPhase::SubmissionManaged).then_some(bundle_index)
+        }))
         .collect::<BTreeSet<_>>();
 
     for &(bundle_index, proposal_id) in &stale_vote_keys {
         if matches!(
             votes.get(&(bundle_index, proposal_id)),
-            Some(VotePhase::Submitted | VotePhase::Confirmed)
+            Some(VotePhase::Submitted | VotePhase::SubmissionManaged | VotePhase::Confirmed)
         ) {
             return Err(VotingError::InvalidInput {
                 message: format!(
@@ -1125,6 +1193,9 @@ pub fn resume_plan(
                         });
                     }
                 }
+                // The chain-submission lifecycle owns every network action for
+                // this persisted generation.
+                Some(VotePhase::SubmissionManaged) => {}
                 // Prepared or no row yet -> still needs casting.
                 _ => {
                     if bundles_with_pending_vote_chains.contains(&b) {
@@ -1149,6 +1220,7 @@ pub fn resume_plan(
             Some(DelegationPhase::Submitted) => {
                 steps.push(NextStep::PollDelegation { bundle_index: b });
             }
+            Some(DelegationPhase::SubmissionManaged) => {}
             // Prepared / PcztBuilt / Proved: still needs the delegate flow.
             _ => {
                 if bundles_needing_delegation.contains(&b) {
@@ -1202,14 +1274,21 @@ pub fn resume_plan(
         .map(|share| (share.bundle_index, share.proposal_id, share.share_index))
         .collect::<BTreeSet<_>>();
     let blocking_share_work = !blocking_confirm_share_keys.is_empty();
-    let blocking_recovery = steps.iter().any(|step| match step {
-        NextStep::ConfirmShare {
-            bundle_index,
-            proposal_id,
-            share_index,
-        } => blocking_confirm_share_keys.contains(&(*bundle_index, *proposal_id, *share_index)),
-        _ => true,
-    });
+    let submission_managed = delegation
+        .values()
+        .any(|phase| *phase == DelegationPhase::SubmissionManaged)
+        || votes
+            .values()
+            .any(|phase| *phase == VotePhase::SubmissionManaged);
+    let blocking_recovery = submission_managed
+        || steps.iter().any(|step| match step {
+            NextStep::ConfirmShare {
+                bundle_index,
+                proposal_id,
+                share_index,
+            } => blocking_confirm_share_keys.contains(&(*bundle_index, *proposal_id, *share_index)),
+            _ => true,
+        });
 
     let delegation_statuses = delegation_statuses(db, round_id, &delegation)?;
     let hotkey_bound = delegation
@@ -1224,7 +1303,7 @@ pub fn resume_plan(
                 && bundles.iter().all(|&b| {
                     let vote_key = (b, pid);
                     vote_choices.get(&vote_key) == Some(choice)
-                        && votes.get(&vote_key) == Some(&VotePhase::Confirmed)
+                        && matches!(votes.get(&vote_key), Some(VotePhase::Confirmed))
                 })
         }
         None => false,
@@ -1260,7 +1339,7 @@ pub fn resume_plan(
             voted_at,
         )
     });
-    let pending_recovery = !steps.is_empty();
+    let pending_recovery = submission_managed || !steps.is_empty();
     let needs_draft_setup = !blocking_recovery && !all_decided && !open_proposals.is_empty();
     let primary_action = select_primary_action(
         &steps,
@@ -1278,15 +1357,24 @@ pub fn resume_plan(
         &steps,
     )?;
 
+    let immediate_share_key =
+        round_immediate_share_key(bundles.iter().copied().max(), &choice_proposals);
+    let immediate_share_confirmed = immediate_share_key.as_ref().is_some_and(|key| {
+        share_delegations.iter().any(|share| {
+            share.bundle_index == key.bundle_index
+                && share.proposal_id == key.proposal_id
+                && share.share_index == key.share_index
+                && share.confirmed
+        })
+    });
+
     Ok(RoundPlan {
         round_id: round_id.to_string(),
         pending_recovery,
         next_steps: steps,
         open_proposals,
-        immediate_share_key: round_immediate_share_key(
-            bundles.iter().copied().max(),
-            &choice_proposals,
-        ),
+        immediate_share_key,
+        immediate_share_confirmed,
         all_decided,
         delegation_statuses,
         blocking_recovery,
@@ -1350,6 +1438,10 @@ fn missing_share_indexes_for_confirmed_vote(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain_submission::{
+        generation_for_vote, generation_for_vote_batch, submission_identity_key,
+        ChainSubmissionIdentity, ChainSubmissionTarget,
+    };
     use crate::round::RoundParams;
     use crate::types::{EncryptedShare, NoteInfo, MAX_PROPOSAL_ID};
     use crate::vote::{DraftVote, VoteBatchRecovery, VoteRecoveryBundle};
@@ -1388,6 +1480,67 @@ mod tests {
             .unwrap();
         db.ensure_bundles(ROUND, &[note(0)]).unwrap();
         db
+    }
+
+    fn record_rejected_submission_fixture(
+        db: &VotingDb,
+        target: ChainSubmissionTarget,
+        generation_digest: [u8; 32],
+    ) {
+        let identity = submission_identity_fixture(target);
+        let (kind, proposal_id, ordered_batch_digest) = match target {
+            ChainSubmissionTarget::Delegation => ("delegation", None, None),
+            ChainSubmissionTarget::Vote { proposal_id } => {
+                ("vote", Some(i64::from(proposal_id)), None)
+            }
+            ChainSubmissionTarget::VoteBatch {
+                ordered_batch_digest,
+            } => ("vote_batch", None, Some(ordered_batch_digest.to_vec())),
+        };
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, ordered_batch_digest,
+                  generation_digest, state, committed_post_reservations,
+                  diagnostic_kind, diagnostic, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, ?4, ?5, ?6, ?7,
+                         'rejected', 1, 'chain_rejected',
+                         'vote chain definitely rejected the generation', 9, 9)",
+                rusqlite::params![
+                    submission_identity_key(&identity),
+                    ROUND,
+                    W,
+                    kind,
+                    proposal_id,
+                    ordered_batch_digest,
+                    generation_digest.to_vec(),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn submission_identity_fixture(target: ChainSubmissionTarget) -> ChainSubmissionIdentity {
+        ChainSubmissionIdentity::new(W, crate::Network::Testnet, [1; 32], 0, target).unwrap()
+    }
+
+    fn align_stored_commitments_with_recovery(db: &VotingDb, proposal_ids: &[u32]) {
+        for &proposal_id in proposal_ids {
+            let recovery = crate::vote::recovery_bundle(db, ROUND, 0, proposal_id)
+                .unwrap()
+                .unwrap();
+            let commitment = crate::vote::stored_vote_commitment_bytes(&recovery).unwrap();
+            let rows = db
+                .conn()
+                .execute(
+                    "UPDATE votes SET commitment = ?1
+                     WHERE round_id = ?2 AND wallet_id = ?3
+                       AND bundle_index = 0 AND proposal_id = ?4",
+                    rusqlite::params![commitment, ROUND, W, i64::from(proposal_id)],
+                )
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
     }
 
     fn store_vote_recovery_fixture(
@@ -1687,6 +1840,7 @@ mod tests {
 
         assert!(resume_plan(&db, ROUND, &[1, 0]).is_err());
         assert!(resume_plan(&db, ROUND, &[1, MAX_PROPOSAL_ID + 1]).is_err());
+        assert!(resume_plan(&db, ROUND, &[1, 1]).is_err());
     }
 
     #[test]
@@ -1919,6 +2073,294 @@ mod tests {
                 share_indexes: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn lifecycle_owned_delegation_and_vote_yield_no_legacy_steps() {
+        for tx_hash in [None, Some("legacy-vtx")] {
+            let db = db_with_bundle();
+            db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+                .unwrap();
+            db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+            db.store_van_position(ROUND, 0, 7).unwrap();
+            crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16])
+                .unwrap();
+            store_vote_recovery_fixture(&db, 0, 2, 1, None);
+            align_stored_commitments_with_recovery(&db, &[2]);
+            if let Some(tx_hash) = tx_hash {
+                db.record_vote_submission(ROUND, 0, 2, tx_hash).unwrap();
+            }
+            let vote_identity =
+                submission_identity_fixture(ChainSubmissionTarget::Vote { proposal_id: 2 });
+            let vote_generation = generation_for_vote(&db.conn(), &vote_identity).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO chain_submissions
+                     (identity_key, round_id, wallet_id, network,
+                      bundle_index, kind, proposal_id, generation_digest, state,
+                      committed_post_reservations, diagnostic_kind, diagnostic,
+                      created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, ?4,
+                             'recovering', 0, 'reconciliation_pending',
+                             'possible dispatch awaits tree recovery', 9, 9)",
+                    rusqlite::params![
+                        submission_identity_key(&vote_identity),
+                        ROUND,
+                        W,
+                        vote_generation.generation().digest().as_bytes().to_vec(),
+                    ],
+                )
+                .unwrap();
+            let delegation_identity =
+                submission_identity_fixture(ChainSubmissionTarget::Delegation);
+            db.conn()
+                .execute(
+                    "INSERT INTO chain_submissions
+                     (identity_key, round_id, wallet_id, network,
+                      bundle_index, kind, proposal_id, generation_digest, state,
+                      committed_post_reservations, diagnostic_kind, diagnostic,
+                      created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', NULL,
+                             ?4, 'recovering', 0, 'ambiguous_dispatch',
+                             'delegation response was lost after dispatch', 9, 9)",
+                    rusqlite::params![
+                        submission_identity_key(&delegation_identity),
+                        ROUND,
+                        W,
+                        vec![0x73_u8; 32],
+                    ],
+                )
+                .unwrap();
+
+            let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+            assert!(plan.next_steps.is_empty());
+            assert!(plan.recovered_vote_work.is_empty());
+            assert!(plan.pending_recovery);
+            assert!(plan.blocking_recovery);
+            assert_eq!(plan.primary_action, RoundPlanAction::Idle);
+            assert_eq!(
+                db.delegation_phase(ROUND, 0).unwrap(),
+                DelegationPhase::SubmissionManaged
+            );
+            assert_eq!(
+                db.vote_phase(ROUND, 0, 2).unwrap(),
+                VotePhase::SubmissionManaged
+            );
+        }
+    }
+
+    #[test]
+    fn bound_hashless_recovery_is_contained_until_tree_recovery_lands() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+        align_stored_commitments_with_recovery(&db, &[2]);
+
+        let identity = submission_identity_fixture(ChainSubmissionTarget::Vote { proposal_id: 2 });
+        let generation = generation_for_vote(&db.conn(), &identity).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, ?4,
+                         'recovering', 0, 'reconciliation_pending',
+                         'version-17 positions require exact tree recovery', 9, 9)",
+                rusqlite::params![
+                    submission_identity_key(&identity),
+                    ROUND,
+                    W,
+                    generation.generation().digest().as_bytes().to_vec(),
+                ],
+            )
+            .unwrap();
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert!(plan.next_steps.is_empty());
+        assert!(plan.recovered_vote_work.is_empty());
+        assert!(plan.pending_recovery);
+        assert!(plan.blocking_recovery);
+        assert_eq!(plan.primary_action, RoundPlanAction::Idle);
+        assert_eq!(
+            db.vote_phase(ROUND, 0, 2).unwrap(),
+            VotePhase::SubmissionManaged
+        );
+    }
+
+    #[test]
+    fn rejected_singleton_vote_never_yields_submit_or_poll_work() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 1, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 1, None);
+        align_stored_commitments_with_recovery(&db, &[2]);
+        let target = ChainSubmissionTarget::Vote { proposal_id: 2 };
+        let identity = submission_identity_fixture(target);
+        let generation_digest = {
+            let conn = db.conn();
+            *generation_for_vote(&conn, &identity)
+                .unwrap()
+                .generation()
+                .digest()
+                .as_bytes()
+        };
+        record_rejected_submission_fixture(&db, target, generation_digest);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            db.vote_phase(ROUND, 0, 2).unwrap(),
+            VotePhase::SubmissionManaged
+        );
+        assert!(plan.next_steps.is_empty());
+        assert!(plan.recovered_vote_work.is_empty());
+    }
+
+    #[test]
+    fn rejected_vote_batch_never_reschedules_its_members() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
+        align_stored_commitments_with_recovery(&db, &[1, 2]);
+        record_confirmed_share_fixture(&db, 0, 1, 0);
+        record_confirmed_share_fixture(&db, 0, 2, 1);
+        let target = ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        };
+        let identity = submission_identity_fixture(target);
+        let generation_digest = {
+            let conn = db.conn();
+            *generation_for_vote_batch(&conn, &identity)
+                .unwrap()
+                .generation()
+                .digest()
+                .as_bytes()
+        };
+        record_rejected_submission_fixture(&db, target, generation_digest);
+
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        for (proposal_id, decision) in [(1, Decision::Choice(2)), (2, Decision::Skipped)] {
+            let error = db
+                .set_ballot_intent(ROUND, proposal_id, decision, 3)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("lifecycle-owned vote recovery"),
+                "unexpected error for proposal {proposal_id}: {error}"
+            );
+        }
+
+        assert_eq!(
+            db.ballot_intents(ROUND).unwrap(),
+            vec![(1, Decision::Choice(0)), (2, Decision::Choice(1))]
+        );
+        for proposal_id in [1, 2] {
+            assert!(crate::vote::recovery_bundle(&db, ROUND, 0, proposal_id)
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                db.vote_phase(ROUND, 0, proposal_id).unwrap(),
+                VotePhase::SubmissionManaged
+            );
+        }
+        let shares = db.get_share_delegations(ROUND).unwrap();
+        assert_eq!(shares.len(), 2);
+        assert!(shares.iter().any(|share| {
+            share.bundle_index == 0 && share.proposal_id == 1 && share.share_index == 0
+        }));
+        assert!(shares.iter().any(|share| {
+            share.bundle_index == 0 && share.proposal_id == 2 && share.share_index == 1
+        }));
+
+        let snapshot = crate::recovery::round_snapshot(&db, ROUND).unwrap();
+        assert_eq!(snapshot.votes.len(), 2);
+        assert!(snapshot.votes.iter().all(|vote| {
+            vote.phase == VotePhase::SubmissionManaged && vote.has_commitment_bundle
+        }));
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            db.vote_phases(ROUND).unwrap(),
+            vec![
+                (0, 1, VotePhase::SubmissionManaged),
+                (0, 2, VotePhase::SubmissionManaged),
+            ]
+        );
+        assert!(plan.next_steps.is_empty());
+        assert!(plan.recovered_vote_work.is_empty());
+    }
+
+    #[test]
+    fn rejected_delegation_never_yields_delegate_work() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        record_rejected_submission_fixture(&db, ChainSubmissionTarget::Delegation, [0x72; 32]);
+
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+
+        assert_eq!(
+            db.delegation_phase(ROUND, 0).unwrap(),
+            DelegationPhase::SubmissionManaged
+        );
+        assert!(plan.next_steps.is_empty());
+        assert!(plan.recovered_delegation_work.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_owned_vote_locks_conflicting_intent() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 0, None);
+        align_stored_commitments_with_recovery(&db, &[2]);
+        let identity = submission_identity_fixture(ChainSubmissionTarget::Vote { proposal_id: 2 });
+        let generation = generation_for_vote(&db.conn(), &identity).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, ?4,
+                         'recovering', 0, 'reconciliation_pending',
+                         'possible dispatch awaits tree recovery', 9, 9)",
+                rusqlite::params![
+                    submission_identity_key(&identity),
+                    ROUND,
+                    W,
+                    generation.generation().digest().as_bytes().to_vec(),
+                ],
+            )
+            .unwrap();
+
+        for decision in [Decision::Choice(1), Decision::Skipped] {
+            let error = db.set_ballot_intent(ROUND, 2, decision, 3).unwrap_err();
+            assert!(
+                error.to_string().contains("ballot intent is locked"),
+                "{error}"
+            );
+        }
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
     }
 
     #[test]
@@ -2229,6 +2671,91 @@ mod tests {
     }
 
     #[test]
+    fn active_singleton_generation_locks_intent_and_recovery_material() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
+        crate::storage::queries::store_vote(&db.conn(), ROUND, W, 0, 2, 0, &[0xCC; 16]).unwrap();
+        store_vote_recovery_fixture(&db, 0, 2, 0, None);
+        record_submitted_share_fixture(&db, 0, 2, 0, &["https://helper.example".to_string()]);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, proposal_id, generation_digest, state, candidate_transaction_hash,
+                  committed_post_reservations, tracking_started_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 2, ?4,
+                         'tracking', ?5, 1, 10, 9, 10)",
+                rusqlite::params![
+                    vec![0x41_u8; 32],
+                    ROUND,
+                    W,
+                    vec![0x42_u8; 32],
+                    vec![0x43_u8; 32]
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("lifecycle-owned vote recovery"),
+            "{error}"
+        );
+        assert!(crate::vote::recovery_bundle(&db, ROUND, 0, 2)
+            .unwrap()
+            .is_some());
+        assert_eq!(db.get_share_delegations(ROUND).unwrap().len(), 1);
+        assert_eq!(
+            db.ballot_intents(ROUND).unwrap(),
+            vec![(2, Decision::Choice(0))]
+        );
+    }
+
+    #[test]
+    fn active_batch_generation_locks_every_member_intent() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 1, Decision::Choice(0), 3)
+            .unwrap();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
+            .unwrap();
+        let digest = store_two_action_batch_recovery_fixture(&db);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, ordered_batch_digest, generation_digest, state,
+                  candidate_transaction_hash, committed_post_reservations,
+                  tracking_started_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote_batch', ?4, ?5,
+                         'tracking', ?6, 1, 10, 9, 10)",
+                rusqlite::params![
+                    vec![0x51_u8; 32],
+                    ROUND,
+                    W,
+                    digest.as_slice(),
+                    vec![0x52_u8; 32],
+                    vec![0x53_u8; 32]
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .set_ballot_intent(ROUND, 2, Decision::Skipped, 3)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("lifecycle-owned vote recovery"),
+            "{error}"
+        );
+        for proposal_id in [1, 2] {
+            assert!(crate::vote::recovery_bundle(&db, ROUND, 0, proposal_id)
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[test]
     fn stale_vote_submission_after_choice_change_is_rejected() {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
@@ -2320,6 +2847,27 @@ mod tests {
                 .unwrap()
                 .immediate_share_key,
             None
+        );
+    }
+
+    #[test]
+    fn round_plan_reports_immediate_share_confirmation() {
+        let db = db_with_bundle();
+        db.set_ballot_intent(ROUND, 2, Decision::Choice(0), 3)
+            .unwrap();
+        assert!(
+            !resume_plan(&db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .immediate_share_confirmed
+        );
+
+        confirm_vote_fixture(&db, 0, 2, 0);
+        record_confirmed_share_fixture(&db, 0, 2, 0);
+
+        assert!(
+            resume_plan(&db, ROUND, &[1, 2, 3])
+                .unwrap()
+                .immediate_share_confirmed
         );
     }
 

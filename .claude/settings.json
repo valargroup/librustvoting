@@ -1,0 +1,27 @@
+{
+  "env": {
+    "CARGO_TERM_COLOR": "never"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(make help)",
+      "Bash(make check)",
+      "Bash(make test)",
+      "Bash(make test-lrz)",
+      "Bash(make test-vct)",
+      "Bash(make doc-test)",
+      "Bash(make clippy)",
+      "Bash(make fmt)",
+      "Bash(make msrv)",
+      "Bash(cargo metadata:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo nextest list:*)",
+      "Bash(cargo fmt --all --check)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)"
+    ]
+  }
+}

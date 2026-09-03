@@ -5,23 +5,25 @@ use pasta_curves::pallas;
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::note_bundling::BundlePolicy;
+use crate::note_bundling::{BundlePlannerVersion, BundlePolicy};
 use crate::storage::{KeystoneSignatureRecord, RoundPhase, RoundState, RoundSummary, VoteRecord};
 use crate::types::{Network, NoteInfo, VotingError, VotingRoundParams, WitnessData};
 
 mod share_delegations;
 
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) use share_delegations::record_share_delegation;
 #[cfg(test)]
 pub(crate) use share_delegations::record_share_delegation_with_after_read;
 pub use share_delegations::{
     add_ambiguous_servers, add_attempting_server, add_sent_servers_preserving_schedule,
-    clear_stale_share_delegations_for_intent, get_share_delegations, get_unconfirmed_delegations,
-    pending_share_rounds, remove_attempting_server, share_is_confirmed,
+    get_share_delegations, get_unconfirmed_delegations, pending_share_rounds,
+    remove_attempting_server, share_is_confirmed,
 };
 pub(crate) use share_delegations::{
     add_ambiguous_servers_for_generation, add_attempting_server_for_generation,
     add_sent_servers_for_generation, add_sent_servers_preserving_schedule_for_generation,
-    mark_share_confirmed, record_share_delegation, record_share_delegation_for_vote_generation,
+    get_share_delegation, mark_share_confirmed, record_share_delegation_for_vote_generation,
     remove_attempting_server_for_generation, share_is_confirmed_for_generation,
     ShareAttemptReservation,
 };
@@ -42,6 +44,8 @@ where
 ///
 /// All fields are required intentionally. Adding a runtime policy field requires
 /// a new persistence DTO and schema version rather than a serde default here.
+/// The version 1 envelope also selects [`BundlePlannerVersion::V1`]; a future
+/// planning algorithm must use a new envelope version.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedBundlePolicyV1 {
@@ -57,19 +61,24 @@ struct PersistedBundlePolicyV1 {
 
 impl From<BundlePolicy> for PersistedBundlePolicyV1 {
     fn from(policy: BundlePolicy) -> Self {
-        Self {
-            max_real_notes_per_bundle: policy.max_real_notes_per_bundle(),
-            bundle_addition_threshold_zatoshi: policy.bundle_addition_threshold(),
-            max_privacy_bundles: policy.max_privacy_bundles(),
-            privacy_drop_bps: policy.privacy_drop_bps(),
-            max_privacy_drop_zatoshi: policy.max_privacy_drop_zatoshi(),
+        match policy.planner_version() {
+            BundlePlannerVersion::V1 => Self {
+                max_real_notes_per_bundle: policy.max_real_notes_per_bundle(),
+                bundle_addition_threshold_zatoshi: policy.bundle_addition_threshold(),
+                max_privacy_bundles: policy.max_privacy_bundles(),
+                privacy_drop_bps: policy.privacy_drop_bps(),
+                max_privacy_drop_zatoshi: policy.max_privacy_drop_zatoshi(),
+            },
         }
     }
 }
 
 impl PersistedBundlePolicyV1 {
     fn into_policy(self) -> Result<BundlePolicy, VotingError> {
-        let mut policy = BundlePolicy::new(self.max_real_notes_per_bundle)?;
+        let mut policy = BundlePolicy::new_with_planner_version(
+            self.max_real_notes_per_bundle,
+            BundlePlannerVersion::V1,
+        )?;
         if let Some(threshold) = self.bundle_addition_threshold_zatoshi {
             policy = policy.with_bundle_addition_threshold(threshold);
         }
@@ -448,8 +457,13 @@ pub fn load_round_network(
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
         |row| row.get::<_, String>(0),
     )
-    .map_err(|e| VotingError::InvalidInput {
-        message: format!("round not found: {} ({})", round_id, e),
+    .map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => VotingError::InvalidInput {
+            message: format!("round not found: {round_id}"),
+        },
+        error => VotingError::Storage {
+            message: format!("failed to load round network for {round_id}: {error}"),
+        },
     })
     .and_then(|network| network_from_storage(&network))
 }
@@ -1616,8 +1630,8 @@ pub fn load_zkp2_inputs(
 ///
 /// # Errors
 ///
-/// - [`VotingError::InvalidInput`] if the round/bundle is missing, or the VAN
-///   leaf position is unset.
+/// - [`VotingError::InvalidInput`] if the round/bundle is missing, the VAN leaf
+///   position is unset, or the position exceeds the legacy `u32` circuit input.
 /// - [`VotingError::Internal`] on SQL failures loading ballot intent or vote state.
 pub(crate) fn load_vote_preparation_state(
     conn: &Connection,
@@ -1690,8 +1704,8 @@ pub(crate) fn load_vote_row_state(
         },
     )
     .optional()
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to load vote state before vote preparation: {e}"),
+    .map_err(|error| VotingError::Storage {
+        message: format!("failed to load vote state before vote preparation: {error}"),
     })
 }
 
@@ -1709,11 +1723,25 @@ pub fn store_van_position(
     bundle_index: u32,
     position: u32,
 ) -> Result<(), VotingError> {
+    store_van_position_u64(conn, round_id, wallet_id, bundle_index, u64::from(position))
+}
+
+/// Stores a lifecycle VAN position after checking the SQLite representation.
+pub(crate) fn store_van_position_u64(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    position: u64,
+) -> Result<(), VotingError> {
+    let position = i64::try_from(position).map_err(|_| VotingError::InvalidInput {
+        message: format!("VAN leaf position {position} does not fit in SQLite i64"),
+    })?;
     let rows = conn
         .execute(
             "UPDATE bundles SET van_leaf_position = :position WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
             named_params! {
-                ":position": position as i64,
+                ":position": position,
                 ":round_id": round_id,
                 ":wallet_id": wallet_id,
                 ":bundle_index": bundle_index as i64,
@@ -1733,25 +1761,69 @@ pub fn store_van_position(
     Ok(())
 }
 
-/// Load the VAN leaf position for witness generation.
+/// Loads a VAN leaf position that fits the legacy `u32` witness interface.
+///
+/// Returns [`VotingError::InvalidInput`] when the position is missing or lies
+/// outside `u32`; use [`load_van_position_u64`] for lifecycle/recovery state.
 pub fn load_van_position(
     conn: &Connection,
     round_id: &str,
     wallet_id: &str,
     bundle_index: u32,
 ) -> Result<u32, VotingError> {
-    conn.query_row(
+    let position = load_van_position_u64(conn, round_id, wallet_id, bundle_index)?;
+    u32::try_from(position).map_err(|_| VotingError::InvalidInput {
+        message: format!(
+            "van_leaf_position {position} for round={round_id}, bundle={bundle_index} does not fit in u32"
+        ),
+    })
+}
+
+/// Loads the complete lifecycle VAN leaf position without narrowing it.
+///
+/// Returns [`VotingError::InvalidInput`] when the position is unset and
+/// [`VotingError::Internal`] when durable storage contains a negative value.
+pub fn load_van_position_u64(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<u64, VotingError> {
+    load_optional_van_position_u64(conn, round_id, wallet_id, bundle_index)?.ok_or_else(|| {
+        VotingError::InvalidInput {
+            message: format!(
+                "van_leaf_position not yet set for round={}, bundle={}",
+                round_id, bundle_index
+            ),
+        }
+    })
+}
+
+/// Loads an optional lifecycle VAN position without hiding malformed storage.
+pub(crate) fn load_optional_van_position_u64(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+) -> Result<Option<u64>, VotingError> {
+    let position = conn.query_row(
         "SELECT van_leaf_position FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index = :bundle_index",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id, ":bundle_index": bundle_index as i64 },
         |row| row.get::<_, Option<i64>>(0),
     )
     .map_err(|e| VotingError::InvalidInput {
         message: format!("no van_leaf_position for round={}, bundle={} ({})", round_id, bundle_index, e),
-    })?
-    .map(|v| v as u32)
-    .ok_or_else(|| VotingError::InvalidInput {
-        message: format!("van_leaf_position not yet set for round={}, bundle={}", round_id, bundle_index),
-    })
+    })?;
+    let Some(position) = position else {
+        return Ok(None);
+    };
+    u64::try_from(position)
+        .map(Some)
+        .map_err(|_| VotingError::Internal {
+            message: format!(
+                "stored van_leaf_position for round={round_id}, bundle={bundle_index} must be non-negative, got {position}"
+            ),
+        })
 }
 
 /// One confirmed VAN position that must be retained during vote-tree sync.
@@ -2771,6 +2843,28 @@ pub fn delete_bundles_from(
         });
     }
 
+    let protected: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM chain_submissions
+              WHERE round_id = :round_id
+                AND wallet_id = :wallet_id
+                AND bundle_index >= :from_index)",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":from_index": from_index as i64,
+            },
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!("failed to check chain-submission prune guard: {error}"),
+        })?;
+    if protected {
+        return Err(VotingError::Busy {
+            message: "cannot prune bundles protected by chain-submission evidence".to_string(),
+        });
+    }
+
     let rows = tx
         .execute(
             "DELETE FROM bundles WHERE round_id = :round_id AND wallet_id = :wallet_id AND bundle_index >= :from_index",
@@ -3171,6 +3265,8 @@ pub fn get_keystone_signatures(
 ///
 /// Imported capability bundles have no local note selection, so their NULL
 /// `note_positions_blob` keeps their voting fields outside this cleanup.
+/// Bundles with a successful proof retain the setup fields required to sign
+/// that proof after a session restart.
 pub fn clear_unsigned_delegation_setup_fields(
     conn: &Connection,
     round_id: &str,
@@ -3202,60 +3298,27 @@ pub fn clear_unsigned_delegation_setup_fields(
            AND van_leaf_position IS NULL
            AND bundle_index NOT IN (
                SELECT bundle_index
+               FROM proofs
+               WHERE round_id = :round_id
+                 AND wallet_id = :wallet_id
+                 AND success = 1
+           )
+           AND bundle_index NOT IN (
+               SELECT bundle_index
                FROM keystone_signatures
                WHERE round_id = :round_id AND wallet_id = :wallet_id
+           )
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM chain_submissions submission
+                WHERE submission.round_id = bundles.round_id
+                  AND submission.wallet_id = bundles.wallet_id
+                  AND submission.bundle_index = bundles.bundle_index
            )",
         named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
     .map_err(|e| VotingError::Internal {
         message: format!("failed to clear unsigned delegation setup fields: {e}"),
-    })?;
-    Ok(())
-}
-
-// --- Recovery state cleanup ---
-
-/// Clears retryable recovery state without erasing recorded confirmations or
-/// imported delegation capabilities.
-pub fn clear_recovery_state(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-) -> Result<(), VotingError> {
-    conn.execute(
-        "DELETE FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id",
-        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear share delegations: {}", e),
-    })?;
-    conn.execute(
-        "DELETE FROM keystone_signatures WHERE round_id = :round_id AND wallet_id = :wallet_id",
-        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear keystone signatures: {}", e),
-    })?;
-    conn.execute(
-        "UPDATE bundles SET delegation_tx_hash = NULL
-         WHERE round_id = :round_id
-           AND wallet_id = :wallet_id
-           AND note_positions_blob IS NOT NULL
-           AND van_leaf_position IS NULL",
-        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear delegation tx hashes: {}", e),
-    })?;
-    conn.execute(
-        "UPDATE votes SET tx_hash = NULL, commitment_bundle_json = NULL
-         WHERE round_id = :round_id
-           AND wallet_id = :wallet_id
-           AND vc_tree_position IS NULL",
-        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-    )
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear vote recovery columns: {}", e),
     })?;
     Ok(())
 }

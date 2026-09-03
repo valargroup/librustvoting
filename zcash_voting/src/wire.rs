@@ -267,7 +267,6 @@ pub struct DraftVote {
 pub struct SignedVoteCommitmentView {
     pub proposal_id: u32,
     pub wire: VoteCommitmentWire,
-    pub shares: Vec<VoteShareWire>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,7 +298,8 @@ pub struct DelegationRecoveryView {
     pub bundle_index: u32,
     pub phase: String,
     pub tx_hash: Option<String>,
-    pub van_leaf_position: Option<u32>,
+    /// Confirmed VAN leaf position, if delegation has been projected.
+    pub van_leaf_position: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,5 +423,6 @@ pub struct RoundPlanView {
     pub open_proposals: Vec<u32>,
     /// The round's single immediate helper-share submission, if designated.
     pub immediate_share_key: Option<ImmediateShareKey>,
+    pub immediate_share_confirmed: bool,
     pub all_decided: bool,
 }

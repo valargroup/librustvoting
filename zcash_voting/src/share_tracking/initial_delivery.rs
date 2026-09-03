@@ -13,8 +13,8 @@ use crate::{
 };
 
 use super::{
-    configured_fleet::ConfiguredHelperFleet, InitialShareSubmissionParams, ShareSubmissionReport,
-    ShareSubmissionRequest,
+    configured_fleet::ConfiguredHelperFleet, CommittedShareSubmissionRequest,
+    InitialShareSubmissionParams, ShareSubmissionReport,
 };
 
 /// Fans one freshly built share out to helpers until enough accept it.
@@ -418,29 +418,31 @@ pub(crate) async fn submit_committed_share_to_helpers(
     proposal_id: u32,
     expected_vote_commitment: &[u8; 32],
     payloads: &[SharePayload],
-    request: ShareSubmissionRequest<'_>,
+    request: CommittedShareSubmissionRequest<'_>,
+    expected_commitment_bundle_json: &str,
+    scope: &share::ShareOperationScope,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<ShareSubmissionReport, VotingError> {
-    let scope = share::ShareOperationScope::capture(db);
     let configured = ConfiguredHelperFleet::new(request.configured_server_urls)?;
+    let planning_fleet = ConfiguredHelperFleet::new(request.planning_server_urls)?;
     let planned = canonical_helper_url_list(&request.plan.target_servers)?;
     if planned.len() != request.plan.target_servers.len() {
         return Err(VotingError::InvalidInput {
             message: "plan target_servers must contain distinct canonical helpers".to_string(),
         });
     }
-    let expected_target = share_submission_target_count(configured.len());
+    let expected_target = share_submission_target_count(planning_fleet.len());
     let planned_target = usize::try_from(request.plan.target_count).unwrap_or(usize::MAX);
     if planned_target != expected_target || planned.len() != planned_target {
         return Err(VotingError::InvalidInput {
             message: format!(
-                "plan target_count and target_servers must match the configured fleet target {expected_target}"
+                "plan target_count and target_servers must match the persisted planning fleet target {expected_target}"
             ),
         });
     }
-    if let Some(server_url) = planned.iter().find(|url| !configured.contains(url)) {
+    if let Some(server_url) = planned.iter().find(|url| !planning_fleet.contains(url)) {
         return Err(VotingError::InvalidInput {
-            message: format!("planned helper is not in configured_server_urls: {server_url}"),
+            message: format!("planned helper is not in the persisted planning fleet: {server_url}"),
         });
     }
     let payload = payloads
@@ -457,7 +459,7 @@ pub(crate) async fn submit_committed_share_to_helpers(
             message: "committed share payload identity does not match its vote handle".to_string(),
         });
     }
-    let (vc_tree_position, expected_nullifier, expected_commitment_bundle_json) =
+    let (vc_tree_position, expected_nullifier) =
         match vote_recovery::helper_recovery_material_for_wallet(
             db,
             scope.wallet_id(),
@@ -466,6 +468,15 @@ pub(crate) async fn submit_committed_share_to_helpers(
             proposal_id,
         )? {
             vote_recovery::HelperRecoveryMaterial::Ready(bundle) => {
+                if bundle.commitment_bundle_json != expected_commitment_bundle_json {
+                    return Err(VotingError::InvalidInput {
+                        message: format!(
+                            "committed vote changed before helper share submission for \
+                             round={round_id}, bundle={bundle_index}, proposal={proposal_id}; \
+                             recover the current committed vote"
+                        ),
+                    });
+                }
                 let recovery = crate::vote::parse_recovery(&bundle.commitment_bundle_json)?;
                 if recovery.vote_commitment != *expected_vote_commitment {
                     return Err(VotingError::InvalidInput {
@@ -481,11 +492,7 @@ pub(crate) async fn submit_committed_share_to_helpers(
                     proposal_id,
                     request.share_index,
                 )?;
-                (
-                    bundle.vc_tree_position,
-                    expected_nullifier,
-                    bundle.commitment_bundle_json,
-                )
+                (bundle.vc_tree_position, expected_nullifier)
             }
             vote_recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
                 return Err(VotingError::InvalidInput {
@@ -505,7 +512,11 @@ pub(crate) async fn submit_committed_share_to_helpers(
     // value returned by persistence.
     let requested_share_wire_json =
         payload.to_wire_json(Some(vc_tree_position), request.plan.submit_at)?;
-    let mut candidates = planned;
+    let mut candidates = planned
+        .into_iter()
+        .filter(|url| configured.contains(url))
+        .collect::<Vec<_>>();
+    let eligible_planned_count = candidates.len();
     let fallback = configured
         .urls()
         .iter()
@@ -520,18 +531,18 @@ pub(crate) async fn submit_committed_share_to_helpers(
         share_index: request.share_index,
         share_wire_json: &requested_share_wire_json,
         #[cfg(test)]
-        planned_servers: &candidates[..planned_target],
+        planned_servers: &candidates[..eligible_planned_count],
         #[cfg(test)]
-        fallback_servers: &candidates[planned_target..],
+        fallback_servers: &candidates[eligible_planned_count..],
         target_count: planned_target,
         submit_at: request.plan.submit_at,
         now_seconds: request.now_seconds,
     };
     let (durable_submit_at, persisted_delivery) = prepare_committed_share_delivery(
         db,
-        &scope,
+        scope,
         &requested_params,
-        &expected_commitment_bundle_json,
+        expected_commitment_bundle_json,
         &expected_nullifier,
     )?;
     let share_wire_json = payload.to_wire_json(Some(vc_tree_position), durable_submit_at)?;
@@ -542,11 +553,11 @@ pub(crate) async fn submit_committed_share_to_helpers(
     };
     dispatch_share_to_canonical_helpers(
         db,
-        &scope,
+        scope,
         client,
         &durable_params,
-        &candidates[..planned_target],
-        &candidates[planned_target..],
+        &candidates[..eligible_planned_count],
+        &candidates[eligible_planned_count..],
         persisted_delivery,
         cancel,
     )

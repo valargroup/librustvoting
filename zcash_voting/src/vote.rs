@@ -187,10 +187,10 @@ pub struct VoteCommit {
     pub r_vpk: [u8; 32],
     pub vote_auth_sig: [u8; 64],
     pub encrypted_shares: Vec<WireEncryptedShare>,
-    pub share_payloads: Vec<SharePayload>,
+    share_payloads: Vec<SharePayload>,
 }
 
-/// Wallet-facing aggregate of one committed vote and public helper-share data.
+/// Wallet-facing aggregate of one committed vote and its durable recovery data.
 #[derive(Clone, Debug)]
 pub struct SignedVoteCommitment {
     pub proposal_id: u32,
@@ -201,7 +201,6 @@ pub struct SignedVoteCommitment {
     pub vote_commitment: [u8; 32],
     pub proof: Vec<u8>,
     pub encrypted_shares: Vec<WireEncryptedShare>,
-    pub share_payloads: Vec<SharePayload>,
     pub anchor_height: u32,
     pub shares_hash: [u8; 32],
     pub share_comms: Vec<[u8; 32]>,
@@ -280,6 +279,7 @@ pub struct PreparedAtomicVoteBatch {
 pub struct CommittedVote {
     round_id: String,
     bundle_index: u32,
+    commitment_bundle_json: String,
     commit: VoteCommit,
 }
 
@@ -297,13 +297,8 @@ impl CommittedVote {
         signer: VoteSigner<'_>,
         stages: &dyn crate::types::VoteCommitStageReporter,
     ) -> Result<Self, VotingError> {
-        let commit =
-            crate::vote::commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
-        Ok(Self {
-            round_id: round_id.to_string(),
-            bundle_index,
-            commit,
-        })
+        crate::vote::commit(db, round_id, bundle_index, draft, witness, signer, stages)?;
+        Self::recover(db, round_id, bundle_index, draft.proposal_id)
     }
 
     /// Reconstructs a committed cast-vote handle from persisted recovery state.
@@ -313,10 +308,12 @@ impl CommittedVote {
         bundle_index: u32,
         proposal_id: u32,
     ) -> Result<Self, VotingError> {
-        let commit = recover_commit(db, round_id, bundle_index, proposal_id)?;
+        let (commit, commitment_bundle_json) =
+            recover_commit_with_generation(db, round_id, bundle_index, proposal_id)?;
         Ok(Self {
             round_id: round_id.to_string(),
             bundle_index,
+            commitment_bundle_json,
             commit,
         })
     }
@@ -336,14 +333,212 @@ impl CommittedVote {
         self.commit.proposal_id
     }
 
-    /// Returns the signed commitment payload and public helper-share data.
-    pub fn data(&self) -> &VoteCommit {
+    /// Returns the committed vote internals for crate-owned lifecycle work.
+    #[cfg(test)]
+    pub(crate) fn data(&self) -> &VoteCommit {
         &self.commit
     }
 
-    /// Returns helper-server payloads to submit outside the wallet library.
-    pub fn share_payloads(&self) -> &[SharePayload] {
-        &self.commit.share_payloads
+    #[cfg(test)]
+    pub(crate) fn share_payloads_mut(&mut self) -> &mut [SharePayload] {
+        &mut self.commit.share_payloads
+    }
+
+    /// Prepares and atomically persists the complete helper-share delivery plan.
+    ///
+    /// `params.proposal_ids` must be the complete proposal roster from the
+    /// authenticated round configuration. Every proposal must have a durable
+    /// terminal ballot intent; the SDK derives the round's immediate share.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VotingError::InvalidInput`] without persisting a plan when the
+    /// roster is empty, duplicated, nonterminal, or differs from durable intent;
+    /// when the committed vote is stale; or when an existing plan conflicts
+    /// with the derived immediate designation or helper-placement policy.
+    pub fn prepare_share_delivery(
+        &self,
+        db: &VotingDb,
+        params: crate::share_tracking::ShareDeliveryPlanningParams<'_>,
+    ) -> Result<crate::share_tracking::ShareDeliveryPlan, VotingError> {
+        crate::share_tracking::prepare_share_delivery_plan(
+            db,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            &self.commitment_bundle_json,
+            &self.commit.share_payloads,
+            params,
+        )
+    }
+
+    /// Submits every incomplete helper share from the persisted complete plan.
+    ///
+    /// The complete plan and every helper payload are validated before the
+    /// first POST. A process-wide semaphore enforces the SDK's exported helper
+    /// concurrency policy across simultaneous wallets and committed votes. The
+    /// plan retains its original target across fleet churn, but only helpers in
+    /// `params.configured_server_urls` are eligible for delivery.
+    /// This handle must match the exact durable recovery snapshot; recover a
+    /// fresh `CommittedVote` after confirmation synchronizes a pre-confirmation
+    /// plan to its confirmed VC tree position.
+    pub async fn submit_prepared_shares(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        params: crate::share_tracking::ShareDeliverySubmissionParams<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<crate::share_tracking::ShareBatchDeliveryReport, VotingError> {
+        use futures_util::{stream, StreamExt as _};
+        use std::sync::LazyLock;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        const DELIVERY_PERMIT_CANCEL_CHECK_MILLISECONDS: u64 = 50;
+        static DELIVERY_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
+            Semaphore::new(crate::share_policy::SHARE_HELPER_MAX_CONCURRENT_POSTS)
+        });
+
+        let scope = crate::share::ShareOperationScope::capture(db);
+        let (plan, plan_generation) = crate::share_tracking::load_share_delivery_plan(
+            db,
+            &scope,
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+            &self.commitment_bundle_json,
+            params.configured_server_urls,
+            &self.commit.share_payloads,
+        )?;
+
+        let recovery = crate::recovery::helper_recovery_material_for_wallet(
+            db,
+            scope.wallet_id(),
+            &self.round_id,
+            self.bundle_index,
+            self.commit.proposal_id,
+        )?;
+        let vc_tree_position = match recovery {
+            crate::recovery::HelperRecoveryMaterial::Ready(bundle)
+                if bundle.commitment_bundle_json == plan_generation =>
+            {
+                bundle.vc_tree_position
+            }
+            crate::recovery::HelperRecoveryMaterial::Ready(_) => {
+                return Err(VotingError::InvalidInput {
+                    message: "committed vote changed after loading its helper-share delivery plan"
+                        .to_string(),
+                })
+            }
+            crate::recovery::HelperRecoveryMaterial::AwaitingVcPosition => {
+                return Err(VotingError::InvalidInput {
+                    message: "committed vote must be confirmed before submitting helper shares"
+                        .to_string(),
+                })
+            }
+            crate::recovery::HelperRecoveryMaterial::Missing => {
+                return Err(VotingError::Internal {
+                    message: "committed vote is missing durable helper recovery material"
+                        .to_string(),
+                })
+            }
+        };
+        for (payload, share_plan) in self.commit.share_payloads.iter().zip(&plan.share_plans) {
+            payload.to_wire_json(Some(vc_tree_position), share_plan.submit_at)?;
+        }
+
+        let configured = params.configured_server_urls.to_vec();
+        let planning_fleet = plan.configured_server_urls.clone();
+        let now_seconds = params.now_seconds;
+        let work = self
+            .commit
+            .share_payloads
+            .iter()
+            .zip(plan.share_plans.iter())
+            .map(|(payload, share_plan)| (payload.enc_share.share_index, share_plan.clone()))
+            .collect::<Vec<_>>();
+        let deliveries = stream::iter(work)
+            .map(|(share_index, share_plan)| {
+                let configured = &configured;
+                let planning_fleet = &planning_fleet;
+                let plan_generation = &plan_generation;
+                let scope = &scope;
+                async move {
+                    if cancel() {
+                        return Ok(None);
+                    }
+                    let acquire_permit = DELIVERY_PERMITS.acquire();
+                    tokio::pin!(acquire_permit);
+                    let permit = loop {
+                        if cancel() {
+                            return Ok(None);
+                        }
+                        tokio::select! {
+                            biased;
+                            result = &mut acquire_permit => {
+                                break result.map_err(|_| VotingError::Internal {
+                                    message: "helper-share delivery semaphore closed".to_string(),
+                                })?;
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(
+                                DELIVERY_PERMIT_CANCEL_CHECK_MILLISECONDS,
+                            )) => {}
+                        }
+                    };
+                    if cancel() {
+                        drop(permit);
+                        return Ok(None);
+                    }
+                    let submission = self
+                        .submit_share_to_helpers_for_generation(
+                            db,
+                            client,
+                            crate::share_tracking::CommittedShareSubmissionRequest {
+                                share_index,
+                                plan: &share_plan,
+                                planning_server_urls: planning_fleet,
+                                configured_server_urls: configured,
+                                now_seconds,
+                            },
+                            plan_generation,
+                            scope,
+                            cancel,
+                        )
+                        .await?;
+                    drop(permit);
+                    Ok(Some(crate::share_tracking::ShareDeliveryOutcome {
+                        share_index,
+                        submission,
+                    }))
+                }
+            })
+            .buffer_unordered(crate::share_policy::SHARE_HELPER_MAX_CONCURRENT_POSTS)
+            .collect::<Vec<Result<Option<crate::share_tracking::ShareDeliveryOutcome>, VotingError>>>()
+            .await;
+        let mut completed = Vec::new();
+        for delivery in deliveries {
+            if let Some(delivery) = delivery? {
+                completed.push(delivery);
+            }
+        }
+        completed.sort_by_key(|delivery| delivery.share_index);
+        let completed_indices = completed
+            .iter()
+            .map(|delivery| delivery.share_index)
+            .collect::<std::collections::HashSet<_>>();
+        let pending_share_indices = self
+            .commit
+            .share_payloads
+            .iter()
+            .map(|payload| payload.enc_share.share_index)
+            .filter(|share_index| !completed_indices.contains(share_index))
+            .collect();
+        Ok(crate::share_tracking::ShareBatchDeliveryReport {
+            deliveries: completed,
+            pending_share_indices,
+            cancelled: cancel(),
+            placement_guarantee: plan.placement_guarantee,
+        })
     }
 
     /// Submits one committed helper share using crate-owned durable journaling.
@@ -361,11 +556,33 @@ impl CommittedVote {
     /// not match that fleet; the share index is absent; or this handle has been
     /// replaced by a newer committed vote. Storage and payload reconstruction
     /// failures are returned unchanged.
-    pub async fn submit_share_to_helpers(
+    #[cfg(test)]
+    pub(crate) async fn submit_share_to_helpers_internal(
         &self,
         db: &VotingDb,
         client: &crate::helper::client::HelperClient,
-        request: crate::share_tracking::ShareSubmissionRequest<'_>,
+        request: crate::share_tracking::CommittedShareSubmissionRequest<'_>,
+        cancel: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<crate::share_tracking::ShareSubmissionReport, VotingError> {
+        let scope = crate::share::ShareOperationScope::capture(db);
+        self.submit_share_to_helpers_for_generation(
+            db,
+            client,
+            request,
+            &self.commitment_bundle_json,
+            &scope,
+            cancel,
+        )
+        .await
+    }
+
+    async fn submit_share_to_helpers_for_generation(
+        &self,
+        db: &VotingDb,
+        client: &crate::helper::client::HelperClient,
+        request: crate::share_tracking::CommittedShareSubmissionRequest<'_>,
+        expected_commitment_bundle_json: &str,
+        scope: &crate::share::ShareOperationScope,
         cancel: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<crate::share_tracking::ShareSubmissionReport, VotingError> {
         crate::share_tracking::submit_committed_share_to_helpers(
@@ -377,6 +594,8 @@ impl CommittedVote {
             &self.commit.vote_commitment,
             &self.commit.share_payloads,
             request,
+            expected_commitment_bundle_json,
+            scope,
             cancel,
         )
         .await
@@ -466,7 +685,6 @@ fn signed_commitment_from_parts(
         vote_commitment: commit.vote_commitment,
         proof: commit.proof.clone(),
         encrypted_shares: commit.encrypted_shares.clone(),
-        share_payloads: commit.share_payloads.clone(),
         anchor_height: commit.anchor_height,
         shares_hash: recovery.shares_hash,
         share_comms: recovery.share_comms.clone(),
@@ -474,6 +692,15 @@ fn signed_commitment_from_parts(
         vote_auth_sig: commit.vote_auth_sig,
         commitment_bundle_json: serialize_recovery(recovery)?,
     })
+}
+
+/// Encodes the chain-visible vote request stored in a recovery bundle.
+///
+/// Helper-share recovery material and confirmation positions are not exposed.
+pub(crate) fn wire_submission_from_recovery(
+    recovery: &VoteRecoveryBundle,
+) -> Result<crate::wire::VoteCommitmentWire, VotingError> {
+    crate::wire::VoteCommitmentWire::try_from(&submission_from_recovery(recovery))
 }
 
 /// Inputs for the historical batch-named singleton preparation API.
@@ -1766,15 +1993,19 @@ fn persist_prepared_commits(
     tx.commit().map_err(|e| VotingError::Internal {
         message: format!("failed to commit prepared vote persistence transaction: {e}"),
     })?;
+    drop(conn);
 
-    Ok(prepared
+    prepared
         .into_iter()
-        .map(|vote| CommittedVote {
-            round_id: vote.round_id,
-            bundle_index: vote.bundle_index,
-            commit: vote.commit,
+        .map(|vote| {
+            CommittedVote::recover(
+                db,
+                &vote.round_id,
+                vote.bundle_index,
+                vote.commit.proposal_id,
+            )
         })
-        .collect())
+        .collect()
 }
 
 struct VoteProofProgressReporter<'a> {
@@ -1793,27 +2024,36 @@ impl ProgressReporter for VoteProofProgressReporter<'_> {
     }
 }
 
-/// Reconstructs a previously committed vote from persisted recovery state.
-///
-/// This returns helper-share payloads using the currently stored vote
-/// commitment tree position. For the pre-confirmation `NextStep::SubmitVote`
-/// cast-vote resend, use [`submission`] so stale helper-share payloads are not
-/// accidentally submitted. After `confirmation::confirm_vote_submission`
-/// records the confirmed VC position, call this helper again and submit the
-/// freshly recovered helper-share payloads.
-pub fn recover_commit(
+/// Reconstructs one committed vote for crate-owned lifecycle work.
+#[cfg(test)]
+pub(crate) fn recover_commit(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
     proposal_id: u32,
 ) -> Result<VoteCommit, VotingError> {
-    recovery_bundle(db, round_id, bundle_index, proposal_id)?
-        .ok_or_else(|| VotingError::InvalidInput {
-            message: format!(
-                "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
-            ),
-        })
-        .and_then(|bundle| commit_from_recovery(&bundle))
+    recover_commit_with_generation(db, round_id, bundle_index, proposal_id)
+        .map(|(commit, _)| commit)
+}
+
+fn recover_commit_with_generation(
+    db: &VotingDb,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+) -> Result<(VoteCommit, String), VotingError> {
+    let wallet_id = db.wallet_id();
+    let conn = db.conn();
+    let commitment_bundle_json =
+        recovery_json_with_conn(&conn, &wallet_id, round_id, bundle_index, proposal_id)?.ok_or_else(
+            || VotingError::InvalidInput {
+                message: format!(
+                    "vote recovery bundle not found for round={round_id}, bundle={bundle_index}, proposal={proposal_id}"
+                ),
+            },
+        )?;
+    let recovery = parse_recovery(&commitment_bundle_json)?;
+    Ok((commit_from_recovery(&recovery)?, commitment_bundle_json))
 }
 
 /// Reconstructs chain-ready cast-vote fields from persisted recovery state.
@@ -1831,18 +2071,25 @@ pub fn submission(
         })
         .and_then(|bundle| {
             ensure_singleton_vote_recovery(&bundle)?;
-            Ok(VoteSubmission {
-                vote_round_id: bundle.vote_round_id,
-                proposal_id: bundle.proposal_id,
-                van_nullifier: bundle.van_nullifier,
-                vote_authority_note_new: bundle.vote_authority_note_new,
-                vote_commitment: bundle.vote_commitment,
-                proof: bundle.proof,
-                r_vpk: bundle.r_vpk,
-                vote_auth_sig: bundle.vote_auth_sig,
-                anchor_height: bundle.anchor_height,
-            })
+            Ok(submission_from_recovery(&bundle))
         })
+}
+
+/// Extracts the chain-visible vote fields from a recovery bundle.
+///
+/// Callers that require singleton semantics must validate the bundle first.
+pub(crate) fn submission_from_recovery(bundle: &VoteRecoveryBundle) -> VoteSubmission {
+    VoteSubmission {
+        vote_round_id: bundle.vote_round_id.clone(),
+        proposal_id: bundle.proposal_id,
+        van_nullifier: bundle.van_nullifier,
+        vote_authority_note_new: bundle.vote_authority_note_new,
+        vote_commitment: bundle.vote_commitment,
+        proof: bundle.proof.clone(),
+        r_vpk: bundle.r_vpk,
+        vote_auth_sig: bundle.vote_auth_sig,
+        anchor_height: bundle.anchor_height,
+    }
 }
 
 /// Records the cast-vote transaction hash and marks a singleton vote submitted.
@@ -1885,6 +2132,12 @@ pub fn record_batch_submission(
         .map_err(|e| VotingError::Internal {
             message: format!("begin vote batch submission transaction failed: {e}"),
         })?;
+    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+    )?;
     let recoveries = load_vote_batch_recoveries_with_conn(
         &tx,
         &wallet_id,
@@ -1920,8 +2173,8 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
              WHERE round_id = :round_id AND wallet_id = :wallet_id
                AND bundle_index = :bundle_index AND commitment_bundle_json IS NOT NULL",
         )
-        .map_err(|e| VotingError::Internal {
-            message: format!("prepare vote batch recovery query failed: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("prepare vote batch recovery query failed: {error}"),
         })?;
     let rows = stmt
         .query_map(
@@ -1932,13 +2185,13 @@ pub(crate) fn load_vote_batch_recoveries_with_conn(
             },
             |row| row.get::<_, String>(0),
         )
-        .map_err(|e| VotingError::Internal {
-            message: format!("query vote batch recovery rows failed: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("query vote batch recovery rows failed: {error}"),
         })?;
     let mut recoveries = Vec::new();
     for row in rows {
-        let recovery = parse_recovery(&row.map_err(|e| VotingError::Internal {
-            message: format!("read vote batch recovery row failed: {e}"),
+        let recovery = parse_recovery(&row.map_err(|error| VotingError::Storage {
+            message: format!("read vote batch recovery row failed: {error}"),
         })?)?;
         if recovery
             .batch
@@ -2070,6 +2323,14 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
 
     let mut batches = Vec::with_capacity(batch_keys.len());
     for (bundle_index, digest) in batch_keys {
+        ensure_vote_recovery_is_not_lifecycle_owned(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            proposal_id,
+            Some(&digest),
+        )?;
         let recoveries =
             load_vote_batch_recoveries_with_conn(conn, wallet_id, round_id, bundle_index, digest)?;
         for recovery in &recoveries {
@@ -2098,6 +2359,14 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
     }
 
     for &(bundle_index, singleton_proposal_id) in &singleton_keys {
+        ensure_vote_recovery_is_not_lifecycle_owned(
+            conn,
+            wallet_id,
+            round_id,
+            bundle_index,
+            singleton_proposal_id,
+            None,
+        )?;
         let state = crate::storage::queries::load_vote_row_state(
             conn,
             round_id,
@@ -2140,6 +2409,56 @@ pub(crate) fn invalidate_unsubmitted_vote_recoveries_for_intent(
         )?;
     }
 
+    Ok(())
+}
+
+/// Rejects intent changes that would erase recovery material still owned by
+/// the chain-submission lifecycle.
+///
+/// Active singleton and batch submissions require their recovery generation.
+/// Rejected batches also retain it because their authoritative member roster is
+/// re-derived from the signed batch recovery rows.
+fn ensure_vote_recovery_is_not_lifecycle_owned(
+    conn: &rusqlite::Connection,
+    wallet_id: &str,
+    round_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    batch_digest: Option<&[u8; 32]>,
+) -> Result<(), VotingError> {
+    let lifecycle_owned: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM chain_submissions
+                  WHERE round_id = :round_id
+                    AND wallet_id = :wallet_id
+                    AND bundle_index = :bundle_index
+                    AND (state IN ('submitting','tracking','recovering')
+                         OR (state = 'rejected' AND kind = 'vote_batch'))
+                    AND ((kind = 'vote' AND proposal_id = :proposal_id)
+                         OR (kind = 'vote_batch' AND ordered_batch_digest = :batch_digest))
+             )",
+            named_params! {
+                ":round_id": round_id,
+                ":wallet_id": wallet_id,
+                ":bundle_index": bundle_index as i64,
+                ":proposal_id": proposal_id as i64,
+                ":batch_digest": batch_digest.map(|digest| digest.as_slice()),
+            },
+            |row| row.get(0),
+        )
+        .map_err(|error| VotingError::Internal {
+            message: format!(
+                "failed to check lifecycle-owned vote recovery before changing ballot intent: {error}"
+            ),
+        })?;
+    if lifecycle_owned {
+        return Err(VotingError::InvalidInput {
+            message: format!(
+                "round {round_id} bundle {bundle_index} proposal {proposal_id} has lifecycle-owned vote recovery and its ballot intent is locked"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -2215,6 +2534,12 @@ pub fn record_vc_position(
         .map_err(|e| VotingError::Internal {
             message: format!("begin vote VC position transaction failed: {e}"),
         })?;
+    crate::storage::operations::reject_legacy_chain_mutation_in_tx(
+        &tx,
+        &wallet_id,
+        round_id,
+        bundle_index,
+    )?;
     ensure_singleton_vote_update_with_conn(&tx, &wallet_id, round_id, bundle_index, proposal_id)?;
     record_vc_position_with_conn(
         &tx,
@@ -2361,13 +2686,16 @@ fn recovery_json_with_conn(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to load vote recovery bundle: {e}"),
+        .map_err(|error| VotingError::Storage {
+            message: format!("failed to load vote recovery bundle: {error}"),
         })?;
     Ok(json.flatten())
 }
 
-fn ensure_singleton_vote_recovery(recovery: &VoteRecoveryBundle) -> Result<(), VotingError> {
+/// Rejects recovery bundles that belong to an atomic batch.
+pub(crate) fn ensure_singleton_vote_recovery(
+    recovery: &VoteRecoveryBundle,
+) -> Result<(), VotingError> {
     if recovery.batch.is_some() {
         return Err(VotingError::InvalidInput {
             message: "vote belongs to an atomic batch; use the complete batch lifecycle instead of a per-vote API"
@@ -2740,7 +3068,11 @@ fn invalid_stored_choice_error(stored_choice: i64) -> VotingError {
     }
 }
 
-fn validate_recovery_matches_stored_vote(
+/// Validates that recovery identity, choice, and commitment match a vote row.
+///
+/// Returns an error for malformed stored choices or any stale/replaced
+/// recovery material; it performs no durable writes.
+pub(crate) fn validate_recovery_matches_stored_vote(
     recovery: &VoteRecoveryBundle,
     round_id: &str,
     bundle_index: u32,
@@ -3045,7 +3377,12 @@ fn commit_from_recovery(bundle: &VoteRecoveryBundle) -> Result<VoteCommit, Votin
     })
 }
 
-fn stored_vote_commitment_bytes(bundle: &VoteRecoveryBundle) -> Result<Vec<u8>, VotingError> {
+/// Returns the canonical stored commitment bytes derived from recovery state.
+///
+/// Confirmation-only fields and helper delivery state are excluded.
+pub(crate) fn stored_vote_commitment_bytes(
+    bundle: &VoteRecoveryBundle,
+) -> Result<Vec<u8>, VotingError> {
     serde_json::to_vec(&serde_json::json!({
         "van_nullifier": hex::encode(bundle.van_nullifier),
         "vote_authority_note_new": hex::encode(bundle.vote_authority_note_new),
@@ -4420,7 +4757,7 @@ mod tests {
         assert_eq!(committed.bundle_index(), 0);
         assert_eq!(committed.proposal_id(), 1);
         assert_eq!(committed.data().vote_commitment, [0x12; 32]);
-        assert_eq!(committed.share_payloads().len(), 2);
+        assert_eq!(committed.data().share_payloads.len(), 2);
         assert_eq!(
             committed.recovery_json(&db).unwrap(),
             serialize_recovery(&recovery).unwrap()
@@ -4516,7 +4853,6 @@ mod tests {
         assert_eq!(signed.proposal_id, 1);
         assert_eq!(signed.choice, recovery.vote_decision);
         assert_eq!(signed.vote_round_id, ROUND_ID);
-        assert_eq!(signed.share_payloads.len(), 2);
         assert_eq!(signed.encrypted_shares[0].c1, vec![0x21; 32]);
         assert_eq!(signed.shares_hash, [0x14; 32]);
         assert_eq!(signed.share_comms[0], [0x51; 32]);

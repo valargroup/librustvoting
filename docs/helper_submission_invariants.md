@@ -25,8 +25,10 @@ The main implementation surfaces are:
   transport, retry, and health behavior;
 - [`share_tracking`](../zcash_voting/src/share_tracking/), whose
   [`mod.rs`](../zcash_voting/src/share_tracking/mod.rs) facade coordinates the
-  validated fleet, initial fan-out, polling, and recovery implemented in
+  validated fleet, durable complete-plan lifecycle, initial fan-out, polling,
+  and recovery implemented in
   [`configured_fleet.rs`](../zcash_voting/src/share_tracking/configured_fleet.rs),
+  [`delivery_plan.rs`](../zcash_voting/src/share_tracking/delivery_plan.rs),
   [`initial_delivery.rs`](../zcash_voting/src/share_tracking/initial_delivery.rs),
   [`confirmation.rs`](../zcash_voting/src/share_tracking/confirmation.rs), and
   [`recovery.rs`](../zcash_voting/src/share_tracking/recovery.rs);
@@ -42,17 +44,25 @@ The main implementation surfaces are:
 The primary confidentiality adversary considered by the helper-distribution
 policy is collusion by the MPC validator committee. Decrypting an encrypted
 share requires control of at least the protocol's two-thirds validator
-threshold. For a complete normal commitment planned as one batch with at least
-two configured helpers, an adversary controlling that threshold together with
-one helper can obtain at most 12 of the 16 plaintext shares from that helper's
-returned initial target assignments.
+threshold. For a complete normal commitment planned once as one batch with at
+least two configured helpers, an adversary controlling that threshold together
+with one helper can obtain at most 12 of the 16 plaintext shares from that
+helper's returned initial target assignments.
 
 This is a 75-percent share-count bound, not necessarily a bound on the
 percentage of voting balance revealed. It is an initial-planning statement,
 not a lifetime possession bound: ambiguous delivery, initial-delivery
-fallback, replenishment, overdue recovery, fleet changes, incomplete or
-independently planned batches, and single-share mode fall outside it. The
-statement also makes no claim about the combined view of colluding helpers.
+fallback, replenishment, overdue recovery, fleet changes, legacy delivery
+state that predates complete-plan persistence, and single-share mode fall
+outside it. New SDK planning atomically persists the complete commitment-wide
+plan before any POST and reuses it across restart; it never replans only the
+missing subset. New plans without preexisting delivery rows report
+`SharePlacementGuarantee::Strict`.
+`SharePlacementGuarantee::LegacyBestEffort` (abbreviated `LegacyBestEffort`
+below) records that delivery rows already existed without a complete original
+plan. It is metadata about old state, not permission to discard or recompute a
+plan. The statement also makes no claim about the combined view of colluding
+helpers.
 
 ## Terminology and state model
 
@@ -241,8 +251,9 @@ normal batch of exactly `S` shares. It does not claim that a helper can never
 physically hold more than `M` shares:
 
 - single-share mode necessarily gives a selected helper the only share;
-- incomplete batches and independently planned shares have no
-  commitment-wide usage history and therefore provide no percentage bound;
+- incomplete low-level batches, independently planned shares, and legacy rows
+  that predate complete-plan persistence have no commitment-wide usage history and
+  therefore provide no percentage bound;
 - an ambiguous POST may have reached a helper without producing a definite
   acceptance; and
 - initial fallback, early replenishment, overdue recovery, and fleet changes
@@ -277,8 +288,8 @@ Regression coverage:
   capacity;
 - the one-helper and single-share forced-coverage exceptions are explicit;
 - single-share mode rejects zero, incomplete, and complete multi-share batches;
-- incomplete or independently planned batches do not advertise the complete
-  batch guarantee;
+- incomplete or independently planned low-level batches and legacy pre-v17
+  state do not advertise the complete batch guarantee;
 - fallback and recovery remain able to exceed the initial-only quota; and
 - `legacy_target_above_protocol_cap_is_effectively_clamped` ensures a durable
   target above the protocol cap cannot drive new placements above the
@@ -288,9 +299,9 @@ Regression coverage:
 
 1. A normal vote commitment contains 16 encrypted shares. Single-share mode
    emits only domain share index 0, and the planner rejects `single_share =
-   true` unless the caller supplies exactly one payload. The wallet example
-   derives this mode from the committed payload count rather than accepting a
-   second caller-supplied mode flag that could contradict the commitment.
+   true` unless the committed vote contains exactly one payload. The SDK
+   derives this mode from the committed payload count; the host cannot pass a
+   contradictory mode flag.
 2. Share indexes identify the post-ZKP-2 shuffled shares. Share index 0 does
    not imply a particular denomination or value.
 3. At most one share is designated as the round's immediate share. It is share
@@ -301,7 +312,8 @@ Regression coverage:
    stable across restart and vote completion. Skipped proposals do not
    participate.
 5. `immediate = true` and `submit_at = 0` are not equivalent. Last-moment and
-   single-share planning can assign `submit_at = 0` to undesignated shares.
+   single-share planning can assign `submit_at = 0` to undesignated shares,
+   but the designated immediate share MUST always have `submit_at = 0`.
 
 Enforcement:
 [`round_immediate_share_key`](../zcash_voting/src/share_policy/initial_placement.rs)
@@ -312,8 +324,8 @@ Regression tests:
 `round_immediate_share_key_uses_highest_bundle_lowest_voted_proposal_and_share_zero`,
 `immediate_batch_position_stays_aligned_and_does_not_perturb_other_plan`,
 `immediate_marker_is_distinct_when_all_shares_submit_immediately`,
-`single_share_mode_rejects_non_singleton_batches`,
-`helper_planning_derives_single_share_mode_from_payload_count`, and the
+`single_share_mode_is_exempt_from_complete_batch_usage_cap`,
+`single_share_mode_rejects_non_singleton_batches`, and the
 round-plan tests in [`session.rs`](../zcash_voting/src/session.rs). The policy
 tests are in
 [`share_policy/tests/initial_placement.rs`](../zcash_voting/src/share_policy/tests/initial_placement.rs).
@@ -342,31 +354,35 @@ The concrete values include:
 | 30 | 10 |
 | 100 | 10 |
 
-An empty helper list is invalid for initial planning even though the pure
-target-count function returns zero. Exactly duplicated input URL strings are
-also invalid because placement is intended to count distinct endpoints. The
-planner itself checks exact strings; it does not parse or canonicalize URLs, so
-the host MUST canonicalize and validate helper identities before planning.
-`canonicalize_helper_base_url` and `canonical_helper_url_list` are exported
-for exactly that purpose.
-
-Canonicalization returning fewer entries than the configured input is a
-duplicate-fleet error, not permission to plan against the reduced list. The
-wallet example enforces this comparison before entropy sizing or planning for
-both exact duplicates and distinct spellings of one canonical endpoint.
+An empty helper list is invalid even though the pure target-count function
+returns zero. The high-level entry point does not accept an unvalidated raw
+list: `HelperClient::preflight_fleet` canonicalizes the complete fleet, rejects
+empty or duplicate canonical identities, derives the readiness target
+internally, and returns `HelperFleetPreflight`.
+FFI boundaries may reconstruct the same public snapshot with
+`HelperFleetPreflight::from_readiness`; it applies the same nonempty,
+canonical, and distinct configured-fleet checks and additionally requires the
+ready list to be a distinct subset of that fleet.
+`CommittedVote::prepare_share_delivery` consumes that validated snapshot.
+It also consumes the complete proposal-id roster from the authenticated round
+configuration. The roster must be nonempty, distinct, and exactly match the
+round's durable terminal ballot intents. The SDK combines those intents with
+the durable bundle set to derive the single immediate share; the host does not
+select an immediate share index.
+Low-level pure planners remain implementation tools, not the wallet lifecycle
+boundary.
 
 The delivery and tracking entry points enforce the stronger trust-boundary
-contract through `ConfiguredHelperFleet`: `submit_share_to_helpers` and
-`track_pending_shares` reject empty fleets, URLs that fail canonicalization,
+contract through validated fleet types: complete-plan preparation, prepared
+batch submission, and `track_pending_shares` reject empty fleets, URLs that fail canonicalization,
 and distinct spellings that canonicalize to the same helper identity with
 `InvalidInput` before any storage or network effect. Misconfiguration must
 surface as an error; configured entries are never silently dropped or
 collapsed.
 
-Planning clamps an explicitly requested target to the available list. The
-crate-private raw fan-out routine preserves its caller's requested target in
-the durable report, but the public typed delivery boundary admits only a
-validated `ConfiguredHelperFleet`.
+The SDK derives the target from the canonical fleet size. Crate-private raw
+fan-out helpers retain explicit targets only for internal and regression use;
+the public lifecycle admits only validated, SDK-derived planning state.
 
 `target_count` is a target for definite acceptances, not an upper bound on the
 number of helpers that may physically hold a share. An ambiguous helper may
@@ -378,9 +394,11 @@ Enforcement:
 [`share_submission_target_count`](../zcash_voting/src/share_policy/server_order.rs),
 `require_share_servers` in
 [`share_policy/initial_placement.rs`](../zcash_voting/src/share_policy/initial_placement.rs),
-and `ConfiguredHelperFleet` plus `submit_share_to_helpers` in
-[`share_tracking/configured_fleet.rs`](../zcash_voting/src/share_tracking/configured_fleet.rs)
-and
+`HelperClient::preflight_fleet` and `HelperFleetPreflight` in
+[`helper/client.rs`](../zcash_voting/src/helper/client.rs), complete-plan
+validation in
+[`share_tracking/delivery_plan.rs`](../zcash_voting/src/share_tracking/delivery_plan.rs),
+and committed delivery in
 [`share_tracking/initial_delivery.rs`](../zcash_voting/src/share_tracking/initial_delivery.rs).
 
 Regression tests:
@@ -396,13 +414,16 @@ includes
 `tracking_rejects_duplicate_spelling_fleet_before_effects`, and
 `tracking_rejects_empty_fleet_before_effects` in
 [`share_tracking/tests/initial_delivery.rs`](../zcash_voting/src/share_tracking/tests/initial_delivery.rs).
-The wallet boundary is covered by
-`helper_planning_rejects_exact_and_canonical_duplicates`.
+The public boundary is also covered by
+`current_boundary_rejects_schema_invalid_bodies_and_canonical_duplicates` in
+[`helper_share_adversarial.rs`](../zcash_voting/tests/helper_share_adversarial.rs).
 
 ### Helper selection and balancing
 
-1. Production planning MUST use CSPRNG entropy supplied by the host. Helper
-   order uses a Fisher-Yates shuffle with eight bytes per shuffle step.
+1. Production planning uses SDK-owned operating-system CSPRNG entropy. The
+   host cannot inject, reuse, persist, or accidentally correlate timing and
+   helper-order bytes. Helper order uses a Fisher-Yates shuffle with eight
+   bytes per shuffle step.
 2. Batch planning consumes independent timing entropy and helper-order entropy
    for every share. Reusing one sample or helper order for all shares is not
    allowed by the batch API.
@@ -422,12 +443,13 @@ The wallet boundary is covered by
    permanent privacy bound. Initial fallback and recovery can place additional
    shares on a helper when needed for liveness. The bound makes no claim about
    the combined view of colluding helpers.
-7. Plans remain positionally aligned with their input shares. The immediate
-   index passed to the batch planner is a batch position, not a domain share
-   index.
-8. The commitment-wide bound applies only when all `S` shares are planned in
-   one batch. Single-share mode and incomplete or independently planned
-   batches do not claim it.
+7. Persisted plans remain positionally aligned with committed payloads. The
+   high-level API accepts a domain share index and maps it to the committed
+   payload position internally.
+8. The commitment-wide bound applies only when all `S` shares are planned once
+   in one batch. The SDK persists that complete batch atomically and reuses it
+   after restart. Single-share mode, incomplete low-level batches, and legacy
+   state marked `LegacyBestEffort` do not claim it.
 
 Enforcement:
 `shuffled_share_server_order`,
@@ -540,8 +562,10 @@ case-insensitively. Invalid URLs, transport failures, non-2xx responses,
 oversized or invalid bodies, and any other status all produce `ready = false`.
 Readiness is advisory and never fails the voting flow by itself.
 
-`HelperClient::preflight` canonicalizes the caller's list, starts every valid
-probe concurrently, and takes the readiness `target_count` explicitly. It
+`HelperClient::preflight_fleet` canonicalizes the caller's list, derives the
+readiness target from the canonical fleet size, and starts every valid probe
+concurrently. Its crate-internal raw preflight primitive receives that derived
+target. It
 collects responses through the two-second soft window. If the target is still
 unmet, pending probes remain alive until enough helpers are ready, every probe
 finishes, or the shared 30-second hard deadline expires. If the target is met
@@ -558,14 +582,15 @@ report invalid or unfinished entries as not ready.
 
 | Operation or limit | Default | Enforced by |
 | --- | ---: | --- |
-| Initial readiness window | 2 seconds (from `SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS`) | `HelperClient::preflight` |
-| Absolute readiness deadline | 30 seconds (from `SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS`) | `HelperClient::preflight` |
+| Initial readiness window | 2 seconds (from `SHARE_HELPER_PREFLIGHT_SOFT_TIMEOUT_MILLISECONDS`) | `HelperClient::preflight_fleet` |
+| Absolute readiness deadline | 30 seconds (from `SHARE_HELPER_PREFLIGHT_HARD_TIMEOUT_MILLISECONDS`) | `HelperClient::preflight_fleet` |
 | One status GET | 5 seconds | `HelperClient::share_status` |
 | Concurrent status GETs per share | 4 (from `SHARE_STATUS_MAX_CONCURRENT_POLLS`) | `poll_share_helpers` |
 | Total status quorum search for one share | 10 seconds (from `SHARE_STATUS_POLL_BUDGET_MILLISECONDS`) | `poll_share_helpers` |
 | One helper POST | 30 seconds | `HelperClient` |
-| Total initial fan-out | 60 seconds | `submit_share_to_helpers` |
-| Minimum budget to start an initial POST | 1 second | `submit_share_to_helpers` |
+| Concurrent initial POSTs across the process | 16 (from `SHARE_HELPER_MAX_CONCURRENT_POSTS`) | `CommittedVote::submit_prepared_shares` |
+| Total initial fan-out per share | 60 seconds | committed share delivery |
+| Minimum budget to start an initial POST | 1 second | committed share delivery |
 | Retry backoffs | 200 ms, then 600 ms | `HelperClient::with_retry` |
 | Accepted response body | 256 KiB | `HelperClient` and `HyperTransport` |
 | Ready-share poll interval | 15 seconds | `next_tracking_delay_seconds` |
@@ -576,7 +601,12 @@ headers, and the complete response body. `HelperClient` wraps every transport
 future in that deadline and rejects responses larger than 256 KiB, so these
 limits also hold when a custom transport ignores the supplied timeout or
 buffers an oversized response. `HyperTransport` additionally enforces both
-while streaming. Successful responses MUST carry `application/json` (optional
+while streaming. Its `with_http_connector` constructor lets a host supply
+socket, proxy, DNS, or route-lifecycle behavior without reimplementing these
+HTTP semantics; because Hyper pools connections, the supplied connector and
+its returned I/O MUST also prevent an old pooled connection from surviving a
+route change that forbids it. Successful responses MUST carry
+`application/json` (optional
 parameters such as `charset` are accepted); the client validates the content
 type metadata returned by every transport. Non-2xx bodies are size-checked
 before diagnostic string conversion while retaining their HTTP status for
@@ -658,11 +688,14 @@ For current POST classification:
 | 2xx with missing or unknown submission status | Ambiguous | Never |
 | Other 5xx statuses | Ambiguous non-transient failure | Never |
 | Other non-2xx statuses | Definite non-transient failure | Never |
-| Malformed caller-supplied JSON | Local definite failure | No request |
+| Body outside the closed `VoteShareWire` schema | Local definite failure | No request |
 
-Malformed caller JSON is rejected before the submission enters the scored
-network path. It therefore performs no request and does not increment or clear
-the selected helper's health state.
+Caller-supplied bodies are parsed as the closed `VoteShareWire` schema,
+validated, and canonically reserialized before submission. Invalid JSON,
+unknown or duplicate fields, oversized bodies, noncanonical encodings, and
+protocol-invalid values are rejected before the submission enters the scored
+network path. Rejection therefore performs no request and does not increment
+or clear the selected helper's health state.
 
 Every 5xx response is ambiguous because the helper may have processed the
 share before returning a server error. The narrower set `500`, `502`, `503`,
@@ -685,31 +718,71 @@ the ambiguous, non-transient 501 boundary.
 
 ## Initial fan-out invariants
 
-`CommittedVote::submit_share_to_helpers` accepts only a committed share index,
-a planner-produced `ShareSubmissionPlan`, the complete current configured
-fleet, and the current health-ordering time. It derives the round, bundle,
-proposal, payload, confirmed VC-tree position, target, and schedule from the
-committed vote and durable confirmation state. It rejects an empty, duplicated,
-or noncanonical fleet, a plan whose target count or targets are not valid for
-that current fleet, a missing confirmed VC position, or a committed handle
-whose vote commitment no longer matches the current durable recovery bundle
-before touching storage or the network. At the wallet host boundary, a
-planning-time fleet change is compatible only while every stored plan remains
-valid against the current fleet; removed planned targets and target-count drift
-are rejected rather than remapped or replanned. The raw journaled submission
-routine is crate-private, and there is no public post-hoc delivery mutator.
+`CommittedVote::prepare_share_delivery` is the planning boundary. It consumes a
+`HelperFleetPreflight` and the authenticated complete proposal roster. In one
+immediate SQLite transaction it requires an exact set of durable terminal
+ballot intents, derives the round-wide immediate key from those intents and the
+durable bundle set, uses SDK-owned entropy, plans every committed payload,
+validates the fleet, target sets, immediate designation, and aggregate quota,
+then writes one generation-bound `helper_share_plans` row. A repeat call,
+including after restart, loads and returns the exact stored plan instead of
+drawing a replacement, even when the newly preflighted helper fleet has
+changed. The current preflight is used only when creating a plan; an existing
+plan validates against its own persisted planning fleet. Existing round plans
+are checked so roster drift cannot create a second or conflicting immediate
+designation.
 
-The `test-fixtures` feature exposes hidden `share::record` and
-`share::record_delivery_fixture` seed helpers for external integration tests.
-They do not exist in production builds and MUST NOT be used to model wallet
-submission behavior.
+`CommittedVote::submit_prepared_shares` is the delivery boundary. It loads that
+plan, requires the plan's exact current committed-vote generation, binds the
+submitting handle to that generation, validates the immutable plan against its
+persisted planning fleet, and separately validates the complete current fleet.
+A handle must contain the exact current recovery snapshot, and
+callers must recover a fresh handle after confirmation changes that snapshot.
+It reconstructs and validates every payload before the first POST, then
+executes all incomplete shares. The original target remains durable across
+fleet churn. Planned targets still present in the current fleet are attempted
+first, followed by every other current helper; removed helpers are never
+contacted or counted. Target-count drift within the persisted plan, malformed
+payloads, aggregate-quota violations, a nonzero schedule on the designated
+immediate share, or a missing confirmed VC position fail before network I/O.
+The raw per-share executor is
+crate-private, and there is no public post-hoc delivery mutator.
 
-Durable preparation is bound atomically to the commitment-bundle generation
-validated for the `CommittedVote` handle. The storage write locks and compares
-that exact recovery snapshot before creating or merging the share row. A
-replacement that lands after the earlier recovery read therefore fails
-preparation before any helper POST instead of combining the old payload with
-the replacement's nullifier.
+Up to 16 share tasks across all wallets and committed votes in the process may
+hold a delivery permit at once. Each task retains per-share serialization, the
+30-second request deadline, the 60-second total fan-out deadline, and durable
+reservation-before-POST. `ShareBatchDeliveryReport` is sorted by domain share
+index. It contains durable reports for completed tasks, the indexes still
+queued when cancellation stopped new work, a final cancellation flag, and the
+persisted placement guarantee. A completed task may still report a placement
+deficit for tracking to repair. Cancellation never rolls back durable effects.
+
+`LegacyBestEffort` is assigned only when v17 first creates a complete plan for
+a vote that already has delivery rows from an older lifecycle. The SDK still
+persists and reuses the new plan. The marker records that earlier placements
+cannot be proven to satisfy the commitment-wide quota; it is never permission
+to replan missing shares or to bypass aggregate-quota validation for the new
+complete plan.
+
+The `test-fixtures` feature exposes hidden `share::record`,
+`share::record_delivery_fixture`, and `share::confirm_fixture` seed helpers for
+external integration tests. They do not exist in production builds and MUST
+NOT be used to model wallet submission behavior.
+
+Complete-plan persistence and per-share preparation are both bound atomically
+to the exact commitment-bundle generation validated for the `CommittedVote`
+handle. Plan loading requires the handle's exact stored generation. The schema
+trigger advances the persisted plan through the confirmation-only VC-position
+transition, so a caller must recover a fresh `CommittedVote` before submitting.
+A version-17 migration first normalizes released singleton recovery JSON that
+predates nullable atomic-batch metadata. This happens before the plan table
+exists, allowing confirmation to remain a byte-exact VC-position-only
+transition without weakening generation comparison for any other recovery
+change.
+A replacement that lands after an earlier recovery read, including one that
+preserves the vote commitment, invalidates the handle or plan and fails before
+any helper POST instead of combining old payload or placement data with the
+replacement generation.
 
 After validation it creates or merges the durable share record. Persistence
 returns the effective write-once `submit_at`; resumed fan-out rebuilds the wire
@@ -767,7 +840,9 @@ by `overlapping_initial_fan_outs_share_one_target`,
 `tracking_waits_for_live_initial_fan_out_before_replenishing`, and
 `concurrent_attempt_reservations_share_one_placement_capacity`.
 Cancellation while waiting for that serialization boundary is covered by
-`cancellation_aborts_initial_wait_for_live_share_operation`.
+`cancellation_aborts_initial_wait_for_live_share_operation`. Destructive
+deletion while a stale delivery result is pending is covered by
+`initial_delivery_does_not_recreate_share_after_round_deletion`.
 Typed-boundary coverage is
 provided by
 `committed_vote_submission_keeps_degraded_planned_target_before_healthy_fallback`,
@@ -777,18 +852,32 @@ provided by
 `repeated_partial_committed_submission_sends_original_schedule_to_new_helper`,
 `repeated_committed_submission_does_not_resurrect_zero_schedule`,
 `committed_vote_submission_rejects_mismatched_plan_before_side_effects`, and
-`invalid_candidate_url_does_not_create_a_share_record`. Cleanup concurrency is
-covered by `initial_delivery_does_not_recreate_share_after_recovery_cleanup`.
-The wallet example validates the complete stored plan set before entering its
-submission loop; `helper_submission_allows_compatible_current_fleet_churn`,
-`helper_submission_rejects_a_removed_planned_target`,
-`helper_submission_rejects_current_fleet_target_drift`, and
-`helper_submission_validates_every_plan_before_delivery` cover its current-
-fleet boundary. `helper_submission_accepts_complete_batch_at_assignment_quota`,
-`helper_submission_rejects_complete_batch_assignment_quota_violation`, and
-`helper_submission_preserves_the_one_helper_complete_batch_exception` ensure a
-persisted complete plan cannot bypass the aggregate per-helper assignment
-limit before delivery begins.
+`invalid_candidate_url_does_not_create_a_share_record`. Released
+recovery-format migration and strict plan invalidation are covered by
+`migrate_v15_recovery_json_preserves_plan_only_through_confirmation`.
+The high-level boundary regressions in
+[`share_tracking/tests/delivery_plan.rs`](../zcash_voting/src/share_tracking/tests/delivery_plan.rs)
+are `stale_handle_cannot_prepare_same_commitment_replacement`,
+`same_commitment_replacement_after_plan_load_stops_every_post`,
+`prepared_batch_stays_bound_to_its_starting_wallet`,
+`complete_plan_is_persisted_and_reused`,
+`preconfirmation_plan_survives_confirmation_restart_and_submission`,
+`preconfirmation_handle_is_stale_after_confirmation_transition`,
+`restart_reuses_the_plan_and_resumes_definite_delivery_deficits`,
+`restart_resumes_with_a_replaced_helper_without_contacting_the_removed_target`,
+`restart_after_fleet_expansion_preserves_the_original_target`,
+`restart_after_fleet_contraction_clamps_delivery_to_current_helpers`,
+`fleet_reordering_preserves_persisted_fleet_identity`,
+`one_helper_fleet_is_planned_and_submitted_by_the_sdk`,
+`every_payload_is_validated_before_the_first_post`,
+`quota_rejects_strict_and_legacy_tampering_but_legacy_metadata_propagates`,
+`complete_roster_derives_exactly_one_round_immediate_share`,
+`skipped_lower_proposal_does_not_take_the_immediate_designation`,
+`planning_rejects_incomplete_duplicate_and_omitting_rosters_before_persistence`,
+`later_lower_choice_blocks_stale_submission_and_a_second_immediate_plan`,
+`delayed_immediate_plan_is_rejected_before_network`, and
+`global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`.
+These replace the former wallet-example planner and per-share delivery tests.
 
 ## Confirmation and health invariants
 
@@ -809,9 +898,10 @@ The status endpoint recognizes exactly `pending` and `confirmed`.
   configured helpers, one confirmation remains insufficient: polling
   continues, the share remains durable-unconfirmed, and recovery is not
   suppressed.
-- `track_pending_shares` is the only public confirmation mutation path. The
-  raw storage transition is crate-private so supported integrations cannot
-  bypass the configured-fleet quorum.
+- `track_pending_shares` and the focused `confirm_pending_share` are the only
+  public confirmation mutation paths. Both use the same quorum poller and
+  generation-bound write. The raw storage transition is crate-private so
+  supported integrations cannot bypass the configured-fleet quorum.
 - `pending` means only that the nullifier is not globally confirmed. It does
   not prove that the answering helper stores the share.
 - A pending response from an ambiguous helper does not promote it into
@@ -825,6 +915,13 @@ The status endpoint recognizes exactly `pending` and `confirmed`.
   toward placement.
 
 Regression tests: `two_distinct_confirmations_stop_status_checks`,
+`focused_confirmation_confirms_only_the_requested_share`,
+`focused_confirmation_ignores_malformed_unrelated_share`,
+`focused_confirmation_rejects_a_missing_share_without_network_io`,
+`focused_confirmation_returns_an_existing_confirmation_without_network_io`,
+`focused_confirmation_bypasses_the_tracker_status_grace`,
+`focused_confirmation_does_not_confirm_a_replacement_generation`,
+`focused_confirmation_reports_cancellation_without_mutation`,
 `stalled_status_poll_does_not_starve_a_later_share`,
 `expired_status_budget_does_not_start_or_penalize_helpers`,
 `cancellation_aborts_bounded_in_flight_status_polls`,
@@ -906,7 +1003,7 @@ configured helper set.
    helpers, and finally previously accepted helpers. Already-journaled retries
    rely on their durable history instead of adding a fresh attempt marker.
 4. The untried and previously accepted groups are independently randomized
-   from host-supplied CSPRNG bytes. Interrupted and ambiguous retry groups are
+   from SDK-owned operating-system CSPRNG bytes. Interrupted and ambiguous retry groups are
    deterministic last resorts whose membership is already persisted; health
    ordering is applied within every group.
 5. An ambiguous helper stays poll-only for early replenishment. Overdue
@@ -1030,8 +1127,10 @@ Regression tests: `missing_recovery_material_is_reported_not_retried`,
 The cancellation callback is checked between shares, POST targets, attempts,
 and retry backoffs. While concurrent status tasks are pending or an initial or
 tracking pass is waiting for another operation on the same share, it is also
-checked on a 50-millisecond interval. Cancellation prevents additional
-requests from starting, returns the effects already recorded, sets
+checked on a 50-millisecond interval. A prepared batch waiting for one of the
+process-wide initial-delivery permits observes cancellation on the same
+interval without waiting for a permit to be released. Cancellation prevents
+additional requests from starting, returns the effects already recorded, sets
 `ShareTrackingReport::cancelled` for tracking, and is not charged to helper
 health when it suppresses pending work. Once the final observed request has
 completed, its result takes precedence: cancellation observed afterward does
@@ -1062,6 +1161,7 @@ Regression tests: `cancellation_aborts_bounded_in_flight_status_polls`,
 `cancelled_pass_reports_cancellation_and_keeps_durable_effects`,
 `cancellation_aborts_initial_wait_for_live_share_operation`,
 `cancellation_aborts_wait_for_live_share_operation`,
+`global_ceiling_is_sixteen_and_queued_cancellation_returns_pending_shares`,
 `cancellation_before_request_is_not_scored`,
 `late_cancellation_does_not_replace_final_failed_poll`, and
 `late_cancellation_does_not_replace_final_failed_resubmission`.
@@ -1119,7 +1219,7 @@ Regression coverage: `test_share_delegation_lifecycle` in
 `confirmation_does_not_apply_to_a_replaced_share_generation`,
 `initial_delivery_stays_bound_to_its_starting_wallet`,
 `initial_delivery_rejects_a_replaced_share_generation`, and
-`initial_delivery_does_not_recreate_share_after_recovery_cleanup`,
+`initial_delivery_does_not_recreate_share_after_round_deletion`,
 `interrupted_retry_does_not_resolve_a_replaced_share_generation` in
 `share_tracking/tests`,
 `public_vote_writers_reserve_before_validation_and_wait_on_contention`
@@ -1130,10 +1230,18 @@ in `storage/operations.rs` for public submission and VC-position writes, and
 recovery-identity derivation under the same reservation,
 `record_rejects_recovery_for_a_different_proposal` in `share.rs` for binding
 the embedded recovery proposal to the durable key,
-`stale_helper_results_do_not_mutate_replacement_share` in `share.rs` for
-identity-bound confirmation and placement updates, and
+`wrong_nullifier_generation_cannot_apply_any_delivery_transition` in
+`share_tracking/tests/initial_delivery.rs` for identity-bound confirmation and
+placement updates, and
 `changed_choice_ignores_stale_share_confirmations` and
-`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`.
+`skipped_intent_clears_and_blocks_stale_share_rows` in `session.rs`. Active
+chain-generation preservation is covered by
+`active_singleton_generation_locks_intent_and_recovery_material` and
+`active_batch_generation_locks_every_member_intent`; both reject the intent
+change before vote recovery or helper-delivery rows can be cleared. A rejected
+atomic batch retains the same protection because its authoritative member
+roster still depends on those recovery rows; this is covered by
+`rejected_vote_batch_never_reschedules_its_members`.
 
 ### Configuration and migration
 
@@ -1156,6 +1264,24 @@ and `target_count` with default `0`. Databases from launch schema version 13
 onward migrate in place; the migration MUST preserve existing round and
 delivery rows. A schema newer than the crate supports is rejected.
 
+Schema version 17 adds `helper_share_plans`. Its composite key and foreign key
+match the owning vote, and deleting the vote cascades to its plan. The row
+stores the exact `commitment_bundle_json` generation, canonical configured
+fleet, complete plan vector, format version, placement guarantee, and creation
+time. Any true recovery-generation replacement, clearing, or unrelated
+recovery-material edit deletes the plan.
+
+Confirmation is the sole snapshot transition that preserves a plan. On the
+first `vc_tree_position: NULL -> non-NULL` vote update, the v17 trigger updates
+a plan only when it is bound to the exact OLD JSON and replacing only the
+JSON's `vc_tree_position` yields the exact NEW JSON. It then deletes any plan
+whose snapshot still differs. Singleton and atomic-batch confirmation perform
+this transition inside their existing transaction. Runtime loading requires
+the plan and submitting handle to match that exact new snapshot. The
+pre-confirmation handle becomes stale and must be recovered again. Every other
+handle snapshot is also stale, including a same-commitment recovery
+replacement.
+
 The internal record keeps `attempting_urls` distinct. The compatibility wire
 view has no separate attempting field, so it merges those helpers into
 `ambiguous_urls`. Older hosts therefore retain the required poll-only behavior
@@ -1174,30 +1300,39 @@ Enforcement:
 [`storage/queries/share_delegations.rs`](../zcash_voting/src/storage/queries/share_delegations.rs).
 
 Regression tests: `migrate_from_launch_version_preserves_delegation_state`,
+`migrate_v16_to_v17_installs_plan_lifecycle_invariants`,
+`fresh_schema_enforces_plan_lifecycle_invariants`,
+`migrate_from_launch_version_matches_a_fresh_schema`,
 `incremental_migrations_form_an_unbroken_chain_to_current`,
 `test_migrate_rejects_newer_database_version`,
 `persisted_desired_target_replenishes_when_the_fleet_expands`,
 `legacy_target_above_protocol_cap_is_effectively_clamped`,
 `share_delegation_view_treats_attempting_helpers_as_ambiguous`, and
-`test_share_delegation_lifecycle`.
+`test_share_delegation_lifecycle`. Confirmation synchronization is covered by
+`records_vote_confirmation_atomically`,
+`records_vote_batch_confirmation_replay_and_helper_positions`, and
+`preconfirmation_plan_survives_confirmation_restart_and_submission`.
 
 ### Recovery cleanup
 
-Explicit recovery cleanup removes share-delivery rows and retryable,
-unconfirmed vote recovery artifacts. It preserves ballot intent, confirmed
-vote positions, and imported delegation capabilities. Full round deletion is
-a separate operation.
+There is no standalone recovery-cleanup operation or
+`clear_recovery_state` primitive. Ordinary cleanup and reset preserve helper
+plans and delivery history required by unresolved or confirmed chain
+submissions.
+
+Explicit round and account deletion are destructive escape hatches. They delete
+the owning rows, and foreign-key cascades remove the round's helper plans and
+delivery history as part of that deletion. The records are not selectively
+cleared while their round remains live.
 
 Enforcement:
-[`recovery::clear`](../zcash_voting/src/recovery.rs) and
-`clear_recovery_state` in
-[`storage/queries/mod.rs`](../zcash_voting/src/storage/queries/mod.rs).
+[`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),
+[`VotingDb::clear_wallet_state`](../zcash_voting/src/storage/operations.rs),
+and the `rounds` foreign-key cascades.
 
-Regression tests:
-`clear_preserves_recorded_positions_and_resets_unconfirmed_votes` and
-`test_clear_recovery_state_resets_vote_recovery`, plus
-`initial_delivery_does_not_recreate_share_after_recovery_cleanup` for cleanup
-racing active helper delivery.
+Regression coverage must show that ordinary cleanup and reset preserve delivery
+rows, explicit round or account deletion removes their owning rows, and no
+standalone recovery-clear API or storage primitive remains.
 
 ## Helper identity and payload invariants
 
@@ -1211,15 +1346,17 @@ Configured helper bases:
 
 Every endpoint appends `/shielded-vote/v1` after any configured mount path.
 Round IDs accepted by the client are 64 hexadecimal characters or base64 that
-decodes to exactly 32 bytes. Share IDs in status paths are nonempty
-hexadecimal. Both are normalized to lowercase hexadecimal.
+decodes to exactly 32 bytes; the bytes must encode a canonical Pallas
+base-field element. Share IDs in status paths are exactly 64 hexadecimal
+characters. Both are normalized to lowercase hexadecimal.
 
-Direct POST APIs validate that a supplied body is JSON, but do not
-schema-validate arbitrary caller JSON. Crate-generated payloads additionally
-validate round identity, proposal and option fields, share lengths and indexes,
-tree position, `submit_at`, and the relationship to persisted recovery
-material. One helper request contains only the selected encrypted share, never
-the complete `all_enc_shares` collection.
+Direct POST APIs require the closed `VoteShareWire` schema. They reject unknown
+or duplicate fields, bodies larger than 4096 bytes, noncanonical encodings,
+unsafe integer values, and invalid round identity, proposal, option, share,
+tree-position, or `submit_at` fields, then canonically reserialize the body
+before dispatch. Crate-generated payloads additionally validate their
+relationship to persisted recovery material. One helper request contains only
+the selected encrypted share, never the complete `all_enc_shares` collection.
 
 Enforcement:
 [`helper/url.rs`](../zcash_voting/src/helper/url.rs),
@@ -1233,23 +1370,30 @@ The crate cannot enforce the following properties without cooperation from the
 host wallet:
 
 1. **Network route.** The host owns `HelperTransport`. A Tor or proxy transport
-   MUST fail closed and MUST NOT fall back to a direct connection.
+   MUST fail closed and MUST NOT fall back to a direct connection. A host can
+   inject route-aware I/O into `HyperTransport::with_http_connector`, but it
+   remains responsible for invalidating pooled connections when their route is
+   no longer allowed.
 2. **Transport contract.** A custom transport MUST preserve route policy,
    classify definitely pre-dispatch failures separately from ambiguous
    failures, and return response content-type metadata. The client enforces
    complete-request deadlines, the 256 KiB response limit, and JSON content
    type around every transport implementation.
-3. **Entropy.** Production hosts MUST supply fresh CSPRNG bytes for every
-   timing and ordering input. `os_random_bytes` is provided for Rust hosts.
+3. **Entropy.** The SDK owns production entropy for complete-plan timing and
+   helper ordering. Hosts do not supply randomness to the planning lifecycle.
 4. **Lifecycle.** The host owns the timer, app-lock and round-expiry behavior,
    invokes `track_pending_shares`, and supplies cancellation.
-5. **Initial identity.** The host MUST retain the `CommittedVote`, persist the
-   complete original plan set before the first helper POST, pass each exact
-   planner-produced plan with the complete current configured fleet, and call
-   its typed `submit_share_to_helpers` method. The host MUST reject a stored
-   plan whose target count or target membership is no longer valid for the
-   current fleet rather than replanning missing shares. The crate derives the
-   durable identity and wire payload and journals every POST before dispatch.
+5. **Initial delivery invocation.** The host obtains `HelperFleetPreflight`
+   from the SDK, calls
+   `prepare_share_delivery` with the complete proposal roster from the
+   authenticated round configuration, and waits for chain confirmation when
+   necessary. It then recovers a fresh `CommittedVote` and calls
+   `submit_prepared_shares`. It supplies the complete current configured fleet
+   and cancellation signal. The SDK validates the stored plan against its
+   original planning fleet while limiting delivery to that current fleet. The
+   host does not select the immediate share, serialize plans, select helpers,
+   derive targets, expose share payloads, filter missing shares, or replan
+   after restart.
 6. **Helper-operator trust.** The protocol assumes that the authority supplying
    the wallet's helper configuration is trusted to choose independent operators
    and govern changes. URLs are endpoint identities, not authenticated operator
@@ -1268,19 +1412,14 @@ host wallet:
 
 ### Exported policy values versus enforced behavior
 
-`share_server_selection_policy` exports a two-second preflight soft window, a
-30-second preflight hard deadline, and a maximum of 16 concurrent POSTs.
-`HelperClient::preflight` enforces both readiness windows and the caller-supplied
-target: it starts all probes concurrently, waits through the soft window, and
-keeps slower probes alive through the hard window only when the target remains
-unmet.
-
-The maximum concurrent POST count remains policy metadata:
-`submit_share_to_helpers` is sequential. A host that implements concurrent
-initial delivery MUST still preserve all target, timeout, ambiguity,
-distinct-helper, persistence, per-share serialization, and routing invariants
-in this document. The built-in initial and tracking entry points serialize live
-work for the same share even when a host invokes them concurrently.
+`share_server_selection_policy` describes a two-second preflight soft window,
+a 30-second hard deadline, and 16 concurrent POSTs.
+`HelperClient::preflight_fleet` enforces both windows and derives the readiness
+target internally. `CommittedVote::submit_prepared_shares` enforces the
+process-wide 16-POST ceiling with a shared semaphore. Complete-plan persistence
+lets the SDK validate commitment-wide quota, current-fleet compatibility, and
+restart reuse before network dispatch. These are enforced behavior, not host
+integration metadata.
 
 `SHARE_STATUS_MAX_CONCURRENT_POLLS` and
 `SHARE_STATUS_POLL_BUDGET_MILLISECONDS` are enforced tracker behavior, not
@@ -1288,16 +1427,11 @@ descriptive metadata. `poll_share_helpers` limits each share to four in-flight
 status requests and ten seconds of quorum search even when a configured
 per-request timeout or retry sequence would run longer.
 
-The initial planner checks only for empty and exactly duplicated URL strings;
-it does not parse or canonicalize helper endpoints. Hosts MUST canonicalize
-their helper configuration before computing targets and plans, using the
-exported `canonicalize_helper_base_url` / `canonical_helper_url_list`. The
-host MUST reject the configuration when canonicalization changes its length;
-silently planning against the deduplicated result changes helper counts. The
-delivery entry points independently construct `ConfiguredHelperFleet` and
-reject an empty fleet, any URL that fails canonicalization, or distinct
-spellings of one canonical identity with `InvalidInput` before storage or
-network effects.
+`HelperFleetPreflight`, complete-plan preparation, batch submission, and
+tracking reject an empty fleet, invalid URLs, and distinct spellings of one
+canonical identity with `InvalidInput` before storage or network effects.
+Hosts remain responsible only for supplying the configured list from an
+authenticated configuration source.
 
 ## Reviewer checklist
 
@@ -1308,6 +1442,9 @@ A change to helper submission or recovery should answer all of the following:
   minimum planning-pool capacity still calculated from `S`, `T`, and `M`?
 - Does every complete normal batch assign each helper no more than
   `floor(3S / 4)` shares, except for the documented one-helper case?
+- Is the complete plan persisted before every POST and reused unchanged after
+  restart?
+- Is `LegacyBestEffort` confined to metadata for preexisting delivery rows?
 - Does the change preserve independent CSPRNG timing and helper ordering?
 - Can `single_share = true` reach planning with any payload count other than
   exactly one?
@@ -1338,6 +1475,5 @@ A change to helper submission or recovery should answer all of the following:
 - Can cancellation interrupt a wait for the per-share operation lock?
 - Is the trust placed in a helper `confirmed` response still explicit?
 - Do schema and wire changes preserve legacy rows and safe helper identity?
-- Are exported policy values correctly distinguished between readiness and
-  status limits enforced by the crate and the concurrent-POST limit that
-  remains host integration metadata?
+- Are readiness, status, per-share timeout, and the process-wide 16-POST limit
+  still enforced by their SDK entry points?

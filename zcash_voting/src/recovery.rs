@@ -28,7 +28,8 @@ pub struct DelegationRecovery {
     pub bundle_index: u32,
     pub phase: DelegationPhase,
     pub tx_hash: Option<String>,
-    pub van_leaf_position: Option<u32>,
+    /// Confirmed VAN leaf position, preserving the lifecycle's full `u64` range.
+    pub van_leaf_position: Option<u64>,
 }
 
 impl DelegationRecovery {
@@ -184,7 +185,7 @@ pub fn round_snapshot(db: &VotingDb, round_id: &str) -> Result<RoundRecoverySnap
                 bundle_index,
                 phase,
                 tx_hash: db.get_delegation_tx_hash(round_id, bundle_index)?,
-                van_leaf_position: db.load_van_position(round_id, bundle_index).ok(),
+                van_leaf_position: db.load_optional_van_position_u64(round_id, bundle_index)?,
             })
         })
         .collect::<Result<Vec<_>, VotingError>>()?;
@@ -212,15 +213,6 @@ pub fn round_snapshot(db: &VotingDb, round_id: &str) -> Result<RoundRecoverySnap
         share_delegations: share::list(db, round_id)?,
         unconfirmed_share_delegations: share::unconfirmed(db, round_id)?,
     })
-}
-
-/// Clears unconfirmed recovery artifacts for one round.
-///
-/// Ballot intent, recorded vote confirmations, and imported delegation
-/// capabilities are preserved. Use [`VotingDb::clear_round`] to remove the
-/// entire round.
-pub fn clear(db: &VotingDb, round_id: &str) -> Result<(), VotingError> {
-    db.clear_recovery_state(round_id)
 }
 
 fn build_vote_recovery_rows(
@@ -334,6 +326,55 @@ mod tests {
     }
 
     #[test]
+    fn round_snapshot_reports_lifecycle_owned_recovery() {
+        let db = db_with_round(WALLET_ID);
+        db.store_delegation_tx_hash(ROUND_ID, 0, "delegation-tx")
+            .unwrap();
+        insert_vote(&db, 0, 1, 0, b"vote-0-1");
+        store_commitment_bundle(&db, 0, 1, r#"{"bundle":"pending"}"#, None);
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, ?4,
+                         'recovering', 0, 'ambiguous_dispatch',
+                         'vote response was lost after dispatch', 9, 9)",
+                rusqlite::params![vec![0x72_u8; 32], ROUND_ID, WALLET_ID, vec![0x62_u8; 32]],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', NULL,
+                         ?4, 'recovering', 0, 'ambiguous_dispatch',
+                         'delegation response was lost after dispatch', 9, 9)",
+                rusqlite::params![vec![0x74_u8; 32], ROUND_ID, WALLET_ID, vec![0x64_u8; 32]],
+            )
+            .unwrap();
+
+        let snapshot = round_snapshot(&db, ROUND_ID).unwrap();
+
+        assert_eq!(snapshot.votes.len(), 1);
+        assert_eq!(
+            snapshot.delegation[0].phase,
+            DelegationPhase::SubmissionManaged
+        );
+        assert_eq!(snapshot.votes[0].phase, VotePhase::SubmissionManaged);
+        assert_eq!(
+            snapshot.votes[0].workflow_phase(),
+            WorkflowPhase::SubmissionManaged
+        );
+        assert!(snapshot.votes[0].has_commitment_bundle);
+    }
+
+    #[test]
     fn round_snapshot_is_scoped_by_wallet_id() {
         let db = db_with_round(WALLET_ID);
         db.store_delegation_tx_hash(ROUND_ID, 0, "wallet-a-tx")
@@ -410,63 +451,6 @@ mod tests {
             vec!["https://helper-a.example".to_string()]
         );
         let _ = std::fs::remove_file(db_path);
-    }
-
-    #[test]
-    fn clear_preserves_recorded_positions_and_resets_unconfirmed_votes() {
-        let db = db_with_round(WALLET_ID);
-
-        // Canonical confirmed vote.
-        insert_vote(&db, 0, 1, 0, b"vote-0-1");
-        db.mark_vote_submitted(ROUND_ID, 0, 1, "vote-tx-0-1")
-            .unwrap();
-        store_commitment_bundle(&db, 0, 1, r#"{"bundle":"ok"}"#, Some(11));
-
-        // Submitted but unconfirmed vote.
-        insert_vote(&db, 0, 2, 1, b"vote-0-2");
-        db.mark_vote_submitted(ROUND_ID, 0, 2, "vote-tx-0-2")
-            .unwrap();
-        store_commitment_bundle(&db, 0, 2, r#"{"bundle":"pending"}"#, None);
-
-        // A recorded position is preserved conservatively even if a caller
-        // used the standalone position API without first recording a hash.
-        insert_vote(&db, 0, 3, 0, b"vote-0-3");
-        store_commitment_bundle(&db, 0, 3, r#"{"bundle":"position-only"}"#, Some(12));
-
-        db.record_share_delegation(
-            ROUND_ID,
-            0,
-            1,
-            0,
-            &["https://helper-a.example".to_string()],
-            &[0x44; 32],
-            0,
-        )
-        .unwrap();
-
-        clear(&db, ROUND_ID).unwrap();
-        let snapshot = round_snapshot(&db, ROUND_ID).unwrap();
-
-        assert_eq!(snapshot.votes.len(), 3);
-        assert_eq!(snapshot.commitment_bundles.len(), 2);
-        assert_eq!(snapshot.share_delegations.len(), 0);
-        assert_eq!(snapshot.unconfirmed_share_delegations.len(), 0);
-        assert!(snapshot.votes.iter().any(|vote| vote.bundle_index == 0
-            && vote.proposal_id == 1
-            && vote.phase == VotePhase::Confirmed
-            && vote.tx_hash.as_deref() == Some("vote-tx-0-1")
-            && vote.vc_tree_position == Some(11)
-            && vote.has_commitment_bundle));
-        assert!(snapshot.votes.iter().any(|vote| vote.bundle_index == 0
-            && vote.proposal_id == 2
-            && vote.tx_hash.is_none()
-            && vote.vc_tree_position.is_none()
-            && !vote.has_commitment_bundle));
-        assert!(snapshot.votes.iter().any(|vote| vote.bundle_index == 0
-            && vote.proposal_id == 3
-            && vote.tx_hash.is_none()
-            && vote.vc_tree_position == Some(12)
-            && vote.has_commitment_bundle));
     }
 
     #[test]

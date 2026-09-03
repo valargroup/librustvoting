@@ -1,6 +1,6 @@
 [package]
 name = "zcash_voting"
-version = "3.1.0-rc.13"
+version = "3.1.0"
 edition = "2021"
 rust-version = "1.91"
 description = "Client-side library for Zcash shielded voting: ZKP delegation and vote-commitment proofs (Halo 2), ElGamal encryption, governance PCZT construction, Merkle witness generation, and SQLite round-state persistence."
@@ -34,6 +34,7 @@ test-fixtures = []
 
 [dependencies]
 rand = "0.8"
+futures-util = "0.3"
 blake2b_simd = "1"
 voting-crypto-deps = { workspace = true }
 
@@ -96,6 +97,7 @@ serde_json = "1"
 sha2 = "0.10"
 secrecy = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tower-service = "0.3"
 zcash_note_encryption = "0.4.2"
 
 # Smoke-only CLI invoked by tests/pir-smoke.sh / `make pir-smoke`.

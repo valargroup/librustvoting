@@ -39,56 +39,6 @@ pub(super) fn delete_for_replaced_vote(
     Ok(())
 }
 
-pub fn clear_stale_share_delegations_for_intent(
-    conn: &Connection,
-    round_id: &str,
-    wallet_id: &str,
-    proposal_id: u32,
-    skipped: bool,
-    choice: Option<u32>,
-) -> Result<u64, VotingError> {
-    let deleted_row_count = if skipped {
-        conn.execute(
-            "DELETE FROM share_delegations
-             WHERE round_id = :round_id
-               AND wallet_id = :wallet_id
-               AND proposal_id = :proposal_id",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":proposal_id": proposal_id as i64,
-            },
-        )
-    } else if let Some(choice) = choice {
-        conn.execute(
-            "DELETE FROM share_delegations
-             WHERE round_id = :round_id
-               AND wallet_id = :wallet_id
-               AND proposal_id = :proposal_id
-               AND NOT EXISTS (
-                   SELECT 1 FROM votes
-                   WHERE votes.round_id = share_delegations.round_id
-                     AND votes.wallet_id = share_delegations.wallet_id
-                     AND votes.bundle_index = share_delegations.bundle_index
-                     AND votes.proposal_id = share_delegations.proposal_id
-                     AND votes.choice = :choice
-               )",
-            named_params! {
-                ":round_id": round_id,
-                ":wallet_id": wallet_id,
-                ":proposal_id": proposal_id as i64,
-                ":choice": choice as i64,
-            },
-        )
-    } else {
-        Ok(0)
-    }
-    .map_err(|e| VotingError::Internal {
-        message: format!("failed to clear stale share delegations: {}", e),
-    })?;
-    Ok(deleted_row_count as u64)
-}
-
 /// Splits persisted helper identities into canonical entries and legacy
 /// entries accepted by older schemas that no longer canonicalize. Legacy
 /// entries are never contacted or counted, but rewrites preserve them verbatim
@@ -434,13 +384,14 @@ pub(crate) fn remove_attempting_server_for_generation(
 ///
 /// This raw SQL helper is crate-internal because callers must provide a
 /// nullifier that matches the persisted vote recovery bundle. Wallet
-/// integrations should use `CommittedVote::submit_share_to_helpers`, which
+/// integrations should use `CommittedVote::submit_prepared_shares`, which
 /// derives that nullifier and owns journal-before-dispatch ordering.
 ///
 /// All reported helper URLs must canonicalize. Existing evidence is merged
 /// with definite acceptance taking precedence over outcome-unknown or
 /// in-flight state; a conflicting nullifier leaves the row unchanged.
 /// Returns the effective durable `submit_at`, which is write-once on conflict.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub(crate) fn record_share_delegation(
     conn: &Connection,
     round_id: &str,
@@ -764,9 +715,36 @@ pub fn get_share_delegations(
         "SELECT bundle_index, proposal_id, share_index, sent_to_urls, ambiguous_urls, attempting_urls, target_count, nullifier, confirmed, submit_at, created_at, round_id \
          FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id \
          ORDER BY proposal_id, share_index",
-        round_id,
-        wallet_id,
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
+}
+
+/// Load one share delegation by its complete durable key.
+#[allow(clippy::too_many_arguments)]
+pub fn get_share_delegation(
+    conn: &Connection,
+    round_id: &str,
+    wallet_id: &str,
+    bundle_index: u32,
+    proposal_id: u32,
+    share_index: u32,
+) -> Result<Option<ShareDelegationRecord>, VotingError> {
+    let mut shares = load_share_delegations(
+        conn,
+        "SELECT bundle_index, proposal_id, share_index, sent_to_urls, ambiguous_urls, attempting_urls, target_count, nullifier, confirmed, submit_at, created_at, round_id \
+         FROM share_delegations \
+         WHERE round_id = :round_id AND wallet_id = :wallet_id \
+           AND bundle_index = :bundle_index AND proposal_id = :proposal_id \
+           AND share_index = :share_index",
+        named_params! {
+            ":round_id": round_id,
+            ":wallet_id": wallet_id,
+            ":bundle_index": bundle_index,
+            ":proposal_id": proposal_id,
+            ":share_index": share_index,
+        },
+    )?;
+    Ok(shares.pop())
 }
 
 /// Load only unconfirmed share delegations for a round.
@@ -780,8 +758,7 @@ pub fn get_unconfirmed_delegations(
         "SELECT bundle_index, proposal_id, share_index, sent_to_urls, ambiguous_urls, attempting_urls, target_count, nullifier, confirmed, submit_at, created_at, round_id \
          FROM share_delegations WHERE round_id = :round_id AND wallet_id = :wallet_id AND confirmed = 0 \
          ORDER BY proposal_id, share_index",
-        round_id,
-        wallet_id,
+        named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
     )
 }
 
@@ -822,42 +799,38 @@ pub fn pending_share_rounds(
         })
 }
 
-fn load_share_delegations(
+fn load_share_delegations<P: rusqlite::Params>(
     conn: &Connection,
     sql: &str,
-    round_id: &str,
-    wallet_id: &str,
+    params: P,
 ) -> Result<Vec<ShareDelegationRecord>, VotingError> {
     let mut stmt = conn.prepare(sql).map_err(|e| VotingError::Internal {
         message: format!("failed to prepare share delegation query: {}", e),
     })?;
     let share_delegation_rows = stmt
-        .query_map(
-            named_params! { ":round_id": round_id, ":wallet_id": wallet_id },
-            |row| {
-                let definite_acceptance_json: String = row.get(3)?;
-                let outcome_unknown_json: String = row.get(4)?;
-                let in_flight_json: String = row.get(5)?;
-                let target_count: u32 = row.get(6)?;
-                let nullifier_blob: Vec<u8> = row.get(7)?;
-                let confirmed_int: i32 = row.get(8)?;
-                let persisted_round_id: String = row.get(11)?;
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, u32>(2)?,
-                    definite_acceptance_json,
-                    outcome_unknown_json,
-                    in_flight_json,
-                    target_count,
-                    nullifier_blob,
-                    confirmed_int != 0,
-                    row.get::<_, u64>(9)?,
-                    row.get::<_, u64>(10)?,
-                    persisted_round_id,
-                ))
-            },
-        )
+        .query_map(params, |row| {
+            let definite_acceptance_json: String = row.get(3)?;
+            let outcome_unknown_json: String = row.get(4)?;
+            let in_flight_json: String = row.get(5)?;
+            let target_count: u32 = row.get(6)?;
+            let nullifier_blob: Vec<u8> = row.get(7)?;
+            let confirmed_int: i32 = row.get(8)?;
+            let persisted_round_id: String = row.get(11)?;
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u32>(2)?,
+                definite_acceptance_json,
+                outcome_unknown_json,
+                in_flight_json,
+                target_count,
+                nullifier_blob,
+                confirmed_int != 0,
+                row.get::<_, u64>(9)?,
+                row.get::<_, u64>(10)?,
+                persisted_round_id,
+            ))
+        })
         .map_err(|e| VotingError::Internal {
             message: format!("failed to query share delegations: {}", e),
         })?;
