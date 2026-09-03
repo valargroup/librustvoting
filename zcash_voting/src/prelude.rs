@@ -121,6 +121,12 @@ pub use crate::vote::{
     VoteCommitStage, VoteRecoveryBundle, VoteSigner, VoteSubmission,
     DEFAULT_BATCH_PROOF_CONCURRENCY, MAX_VOTE_BATCH_ACTIONS,
 };
+pub use crate::vote_work::{
+    NoopVoteRecoveryProgressReporter, VoteRecoveryAdvance, VoteRecoveryDisposition,
+    VoteRecoveryExecutor, VoteRecoveryFailure, VoteRecoveryFailureKind, VoteRecoveryKey,
+    VoteRecoveryProgress, VoteRecoveryProgressBridge, VoteRecoveryProgressReporter,
+    VoteRecoveryRequest, VoteShareDeliveryReport,
+};
 pub use crate::wire::{
     DelegationSubmissionWire, SignedVoteBatchView, VoteCommitmentBatchWire, VoteCommitmentWire,
     VoteShareWire, VotingHotkeyTargetV1,
