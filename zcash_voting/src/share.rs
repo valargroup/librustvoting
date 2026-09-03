@@ -857,6 +857,26 @@ pub fn pending_rounds_for_accounts(
     Ok(rounds)
 }
 
+/// Seconds until this round's next helper-share tracking pass should run.
+///
+/// Returns `None` when the round has no unconfirmed shares left, which is also
+/// the signal to stop background tracking. Reading the rows here keeps durable
+/// share records inside the crate: a host that computed this itself would have
+/// to carry them across its boundary just to hand them back.
+pub fn next_tracking_delay_for_round(
+    db: &VotingDb,
+    round_id: &str,
+    now_seconds: u64,
+    policy: ShareTimingPolicy,
+) -> Result<Option<u64>, VotingError> {
+    let shares = db.get_unconfirmed_delegations(round_id)?;
+    Ok(policy::next_tracking_delay_seconds(
+        &shares,
+        now_seconds,
+        policy,
+    ))
+}
+
 /// Re-reads whether one helper-share record is durably confirmed.
 pub(crate) fn is_confirmed_for_generation(
     db: &VotingDb,

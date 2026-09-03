@@ -451,6 +451,9 @@ pub struct RoundPlanView {
     pub pending_recovery: bool,
     pub blocking_recovery: bool,
     pub blocking_share_work: bool,
+    /// True when any helper-share row is still unconfirmed. Schedule
+    /// background share tracking from this instead of holding share rows.
+    pub has_unconfirmed_shares: bool,
     pub hotkey_bound: bool,
     pub completed_vote_artifact: bool,
     pub completed_for_display: bool,

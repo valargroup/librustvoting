@@ -514,6 +514,13 @@ pub struct RoundPlan {
     pub blocking_recovery: bool,
     /// True when an unconfirmed helper-share row has no accepted helper URL yet.
     pub blocking_share_work: bool,
+    /// True when any helper-share row is still unconfirmed, whether or not a
+    /// helper has already accepted it.
+    ///
+    /// Hosts schedule background share tracking from this rather than holding
+    /// share rows themselves; `blocking_share_work` is the stricter subset
+    /// that must block the foreground vote flow.
+    pub has_unconfirmed_shares: bool,
     /// True once round artifacts require the same voting hotkey to be reused.
     pub hotkey_bound: bool,
     /// True once the local DB contains a vote or helper-share artifact for the round.
@@ -1475,6 +1482,8 @@ pub fn resume_plan(
 
     let work_summary = summarize_plan_work(&steps, blocking_share_work);
 
+    let has_unconfirmed_shares = share_delegations.iter().any(|share| !share.confirmed);
+
     let immediate_share_key =
         round_immediate_share_key(bundles.iter().copied().max(), &choice_proposals);
     let immediate_share_confirmed = immediate_share_key.as_ref().is_some_and(|key| {
@@ -1497,6 +1506,7 @@ pub fn resume_plan(
         delegation_statuses,
         blocking_recovery,
         blocking_share_work,
+        has_unconfirmed_shares,
         hotkey_bound,
         completed_vote_artifact,
         completed_for_display,
@@ -4163,6 +4173,49 @@ mod tests {
             "expected ConfirmShare in steps, got: {:?}",
             plan.next_steps
         );
+    }
+
+    #[test]
+    fn unconfirmed_shares_are_reported_and_schedule_a_tracking_pass() {
+        let db = db_with_bundle();
+        assert!(!resume_plan(&db, ROUND, &[1, 2, 3])
+            .unwrap()
+            .has_unconfirmed_shares);
+        assert_eq!(
+            crate::share::next_tracking_delay_for_round(
+                &db,
+                ROUND,
+                1_000,
+                crate::share::ShareTimingPolicy::default()
+            )
+            .unwrap(),
+            None
+        );
+
+        db.record_share_delegation(
+            ROUND,
+            0,
+            2,
+            0,
+            &["https://helper.example".to_string()],
+            &[0x44; 32],
+            0,
+        )
+        .unwrap();
+
+        // An accepted-but-unconfirmed share is not blocking, yet it still has
+        // to keep background tracking armed.
+        let plan = resume_plan(&db, ROUND, &[1, 2, 3]).unwrap();
+        assert!(plan.has_unconfirmed_shares);
+        assert!(!plan.blocking_share_work);
+        assert!(crate::share::next_tracking_delay_for_round(
+            &db,
+            ROUND,
+            1_000,
+            crate::share::ShareTimingPolicy::default()
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]

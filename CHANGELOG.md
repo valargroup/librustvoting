@@ -28,6 +28,10 @@ This release is `zcash_voting` 4.0.0.
   or a stored or provided Keystone signature, so seed material never enters
   the crate. `start_proving_cache_warmup` starts the process-lifetime key
   warm-up once.
+- `RoundPlan::has_unconfirmed_shares` and
+  `share::next_tracking_delay_for_round` let a host schedule background share
+  tracking without holding durable share rows: the plan says whether any share
+  is still unconfirmed, and the delay is computed from the round's own records.
 - `PirFleet`, `PirSession`, and `PirProofSource`: ordered PIR endpoints with
   failover on typed retryable failures, serviced from a dedicated thread so
   proving can run inside another runtime's blocking pool.

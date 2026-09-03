@@ -849,6 +849,7 @@ impl TryFrom<session::RoundPlan> for RoundPlanView {
             needs_vote_polling: plan.needs_vote_polling,
             has_remaining_vote_or_share_work: plan.has_remaining_vote_or_share_work,
             has_recoverable_vote_or_share_work: plan.has_recoverable_vote_or_share_work,
+            has_unconfirmed_shares: plan.has_unconfirmed_shares,
             primary_action: plan.primary_action.into(),
             next_steps: plan
                 .next_steps
@@ -2283,6 +2284,7 @@ mod tests {
             pending_recovery: true,
             blocking_recovery: true,
             blocking_share_work: false,
+            has_unconfirmed_shares: true,
             hotkey_bound: true,
             completed_vote_artifact: true,
             completed_for_display: false,
