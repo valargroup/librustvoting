@@ -28,15 +28,15 @@ mod state;
 mod store;
 mod transport;
 
+pub use client::{
+    AdvanceDelegation, AdvanceVote, ChainRecoveryMode, ChainSubmissionClient,
+    ChainSubmissionClientConfig, ChainSubmissionControl,
+};
 #[cfg(test)]
 pub(crate) use generation::generation_for_vote;
 pub(crate) use generation::generation_for_vote_batch;
 #[cfg(test)]
 pub(crate) use identity::submission_identity_key;
-pub use client::{
-    AdvanceDelegation, AdvanceVote, ChainRecoveryMode, ChainSubmissionClient,
-    ChainSubmissionClientConfig, ChainSubmissionControl,
-};
 pub use identity::{
     CandidateTransactionHash, CandidateTransactionHashError, ChainSubmissionGeneration,
     ChainSubmissionGenerationDigest, ChainSubmissionIdentity, ChainSubmissionIdentityError,

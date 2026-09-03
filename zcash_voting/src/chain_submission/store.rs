@@ -26,10 +26,8 @@ mod tests;
 
 #[cfg(test)]
 use super::{
-    confirmation::validate_hash_confirmation,
-    coordination::BundleOperationKey,
-    result::ValidatedChainSubmissionConfirmation,
-    state::apply_submission_observation,
+    confirmation::validate_hash_confirmation, coordination::BundleOperationKey,
+    result::ValidatedChainSubmissionConfirmation, state::apply_submission_observation,
 };
 
 /// Inputs from which storage reconstructs a closed semantic generation.
