@@ -9,8 +9,8 @@ use rusqlite::named_params;
 use crate::{
     chain_submission::{
         AdvanceImportedDelegation, ChainHttpRequest, ChainHttpResponse, ChainSubmissionClient,
-        ChainSubmissionClientConfig, ChainSubmissionControl, ChainSubmissionResult, ChainTransport,
-        ChainTransportError, ChainTransportFuture,
+        ChainSubmissionClientConfig, ChainSubmissionControl, ChainSubmissionFailureKind,
+        ChainSubmissionResult, ChainTransport, ChainTransportError, ChainTransportFuture,
     },
     session::{resume_plan, NextStep},
     storage::{queries, VotingDb},
@@ -266,8 +266,37 @@ async fn imported_advancement_rejects_a_locally_prepared_bundle_without_network_
         .await
         .unwrap_err();
 
+    assert_eq!(error.kind(), ChainSubmissionFailureKind::InvalidInput);
     assert!(
         error.message().contains("imported delegation"),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(*transport.get_count.lock().unwrap(), 0);
+    assert_eq!(*transport.post_count.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn malformed_imported_bundle_column_reports_a_storage_failure() {
+    let db = imported_db();
+    db.conn()
+        .execute(
+            "UPDATE bundles SET gov_comm = 7
+             WHERE round_id = :round AND wallet_id = :wallet AND bundle_index = 0",
+            named_params! { ":round": ROUND, ":wallet": WALLET },
+        )
+        .unwrap();
+    let transport = Arc::new(PollOnlyTransport::default());
+
+    let error = client(db, Arc::clone(&transport))
+        .advance_imported_delegation(request(), &ChainSubmissionControl::new(1))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ChainSubmissionFailureKind::Storage);
+    assert!(
+        error
+            .message()
+            .contains("failed to read imported delegation capability bundle"),
         "unexpected error: {error:?}"
     );
     assert_eq!(*transport.get_count.lock().unwrap(), 0);

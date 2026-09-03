@@ -642,7 +642,11 @@ pub(super) fn generation_for_imported_delegation(
         });
     }
     let round_id = validate_identity_context(conn, identity)?;
-    let (governance_commitment, transaction_hash, imported): (Vec<u8>, String, bool) = conn
+    let (governance_commitment, transaction_hash, imported): (
+        Option<Vec<u8>>,
+        Option<String>,
+        bool,
+    ) = conn
         .query_row(
             "SELECT b.gov_comm, b.delegation_tx_hash,
                     COALESCE(
@@ -662,10 +666,8 @@ pub(super) fn generation_for_imported_delegation(
                         AND b.pczt_sighash IS NULL
                         AND b.tx1_effects IS NULL
                         AND b.van_comm_rand IS NOT NULL
-                        AND b.gov_comm IS NOT NULL
                         AND b.total_note_value IS NOT NULL
                         AND b.address_index = 0
-                        AND b.delegation_tx_hash IS NOT NULL
                         AND NOT EXISTS (
                             SELECT 1 FROM proofs p
                             WHERE p.round_id = b.round_id
@@ -683,20 +685,30 @@ pub(super) fn generation_for_imported_delegation(
             },
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .map_err(|error| VotingError::InvalidInput {
-            message: format!(
-                "imported delegation capability bundle not found for round={round_id}, bundle={}: {error}",
-                identity.bundle_index()
-            ),
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => VotingError::InvalidInput {
+                message: format!(
+                    "imported delegation capability bundle not found for round={round_id}, bundle={}",
+                    identity.bundle_index()
+                ),
+            },
+            error => VotingError::Storage {
+                message: format!(
+                    "failed to read imported delegation capability bundle for round={round_id}, bundle={}: {error}",
+                    identity.bundle_index()
+                ),
+            },
         })?;
-    if !imported {
+    let (true, Some(governance_commitment), Some(transaction_hash)) =
+        (imported, governance_commitment, transaction_hash)
+    else {
         return Err(VotingError::InvalidInput {
             message: format!(
                 "round={round_id}, bundle={} is not an imported delegation capability bundle",
                 identity.bundle_index()
             ),
         });
-    }
+    };
 
     let governance_commitment = checked_blob32(governance_commitment, "imported gov_comm")?;
     let candidate_transaction_hash = transaction_hash
