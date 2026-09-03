@@ -1,8 +1,71 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use zcash_voting::prelude::{
-    recover_atomic_vote_batch, resume_plan, round_snapshot, CommittedVote, NextStep, RoundPlan,
-    RoundRecoverySnapshot, SignedVoteBatch, VotingDb,
+    recover_atomic_vote_batch, resume_plan, round_snapshot, ChainSubmissionClientConfig,
+    ChainSubmissionControl, CommittedVote, HelperClient, HelperHealth, Network, NextStep,
+    NoopRoundStepProgressReporter, ProposalRosterEntry, RoundBinding, RoundExecutor,
+    RoundHostContext, RoundPlan, RoundRecoverySnapshot, RoundStepDisposition, SignedVoteBatch,
+    VotingDb,
 };
+use zcash_voting::HyperTransport;
+
+/// Drives one round to its next idle point with the SDK-owned executor.
+///
+/// This is the recommended recovery loop: bind the round once, then call
+/// `advance_next` until the plan has nothing actionable, re-scheduling on
+/// `Pending`. The executor owns step interpretation, helper-plan persistence,
+/// chain advancement, confirmation, and share delivery; the host supplies
+/// transports, the fleet, timing, and cancellation.
+pub async fn advance_round_until_idle(
+    voting_db: Arc<VotingDb>,
+    network: Network,
+    chain_endpoints: Vec<String>,
+    binding: RoundBinding,
+    host: RoundHostContext,
+    control: &ChainSubmissionControl,
+) -> Result<RoundPlan> {
+    let helper_client = HelperClient::new(Arc::new(HyperTransport::new()), HelperHealth::default());
+    let executor = RoundExecutor::new(
+        voting_db,
+        ChainSubmissionClientConfig::for_network(network, chain_endpoints),
+        helper_client,
+    )
+    .map_err(|failure| anyhow::anyhow!(failure.message().to_string()))?
+    .with_binding(binding)
+    .context("bind round executor")?;
+    loop {
+        let outcome = executor
+            .advance_next(&host, control, &NoopRoundStepProgressReporter {})
+            .await
+            .map_err(|failure| anyhow::anyhow!(failure.message))?;
+        if outcome.disposition == RoundStepDisposition::Advanced {
+            continue;
+        }
+        return Ok(outcome.plan);
+    }
+}
+
+/// Builds the executor binding from the authenticated proposal roster.
+pub fn round_binding(
+    round_id: &str,
+    network: Network,
+    proposals: &[(u32, u32)],
+    hotkey_secret: Option<Vec<u8>>,
+) -> RoundBinding {
+    RoundBinding {
+        round_id: round_id.to_string(),
+        network,
+        proposals: proposals
+            .iter()
+            .map(|(proposal_id, num_options)| ProposalRosterEntry {
+                proposal_id: *proposal_id,
+                num_options: *num_options,
+            })
+            .collect(),
+        hotkey_secret: hotkey_secret.map(zeroize::Zeroizing::new),
+    }
+}
 
 /// One round-level recovery payload fetched in a single caller entrypoint.
 pub struct RoundRecoveryContext {

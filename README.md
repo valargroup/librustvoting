@@ -64,8 +64,21 @@ labels and the rules for what may ship on a maintenance line, and
 
 ## Wallet API Lifecycle
 
-New wallet integrations should import `zcash_voting::prelude::*` and use the
-stage-oriented API:
+New wallet integrations should import `zcash_voting::prelude::*` and drive a
+round through `RoundExecutor`: bind the round, its proposal roster, and the
+voting hotkey secret once, record decisions with `set_ballot_intents`, then
+call `advance_next` (or `advance_step`) in a loop until the plan has no
+actionable step, re-scheduling on a `Pending` disposition. The executor owns
+the ordering between helper-plan persistence, chain advancement, confirmation,
+and share delivery, proves off the async runtime, and reports typed progress.
+Supply transports once (`HyperTransport::with_route` over a host `RouteHttp`
+for Tor or proxies), a `DelegationPipeline` for delegation steps, and a
+`PirFleet` for PIR proofs. PIR and vote-tree traffic use whatever transports
+the host binds; a host that wants them on a privacy route binds routed
+transports for them too.
+
+The stage-oriented modules below remain available for integrations that need
+finer control:
 
 - `round::*` creates rounds and binds eligible notes into bundles. Planning
   trims the low-value bundle tail so a concentrated holder emits fewer
@@ -197,6 +210,24 @@ custody provider integrations.
 Pre-launch wallet databases with older schema versions are reset when opened by
 this branch; callers that need to preserve test data should export it before
 upgrading the crate.
+
+### Migrating 3.x to 4.0
+
+- Match `NextStepView.kind`, `RoundPlanView.primary_action`, recovery-work
+  kinds, and wire `phase` fields as enums; the string tables are gone.
+- `VotingDb::open_wallet_sidecar` returns `Arc<VotingDb>` and shares one
+  connection per path; drop host-side per-path write locks and
+  "database is locked" matching, and branch on `VotingError::kind` (`DbBusy`,
+  `PirUnavailable`, `InsufficientEligibility`, ...) or `retryable`.
+- Replace hand-rolled Tor transports with one `RouteHttp` implementation and
+  `HyperTransport::with_route`.
+- Replace per-stage delegation orchestration with `DelegationPipeline` and
+  `DelegationSigner`; keep only the seed-owning `SpendAuthSigner`.
+- Replace host sequencing of plan steps with `RoundExecutor::advance_next`;
+  replace `VoteRecoveryExecutor::advance` (still available, deprecated) with
+  the same. Helper shares are submitted through `ConfirmedVote`.
+- Start chain submissions with `ChainSubmissionClientConfig::for_network` and
+  drive them with `advance_until_terminal` instead of a host polling loop.
 
 The workspace uses the published `voting-circuits 0.12.0-rc.1` release.
 

@@ -6,6 +6,69 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## Unreleased
 
+This release is `zcash_voting` 4.0.0.
+
+### Added
+
+- `RoundExecutor` executes any planner `NextStep` for a bound round: it
+  proves and signs delegations through a `DelegationDriver`, re-signs and
+  advances in-flight delegations, casts every draft of a bundle (tree sync,
+  VAN witness, proofs off the async runtime, persistence, helper plans, chain
+  advancement, and share delivery once confirmed), resumes persisted vote
+  work, and runs focused share confirmation. Delegation steps lock per
+  bundle; chain and share steps lock per round. `RoundHostContext` carries
+  the per-call host inputs and derives last-moment timing from the shared
+  share policy; `set_ballot_intents` records decisions against the bound
+  roster. `VoteRecoveryExecutor` remains as a deprecated alias.
+- `DelegationPipeline` binds the sidecar, a `WalletDbOpener`, the round's
+  lightwalletd inputs, account, hotkey, and bundle policy once and runs bundle
+  setup, eligibility, PIR precompute, proof generation, Keystone requests, and
+  prove-and-sign. `DelegationSigner` carries a host `SpendAuthSigner` callback
+  or a stored or provided Keystone signature, so seed material never enters
+  the crate. `start_proving_cache_warmup` starts the process-lifetime key
+  warm-up once.
+- `PirFleet`, `PirSession`, and `PirProofSource`: ordered PIR endpoints with
+  failover on typed retryable failures, serviced from a dedicated thread so
+  proving can run inside another runtime's blocking pool.
+- `RouteHttp`: a request-level executor a host implements once to route every
+  SDK transport (PIR, tree sync, helper, vote chain) through Tor or a proxy.
+  `HyperTransport` is generic over it; `DirectRoute` is the SDK default.
+  Classification of definite versus ambiguous failures is derived from the
+  executor's dispatch hook in one place.
+- `ChainSubmissionClient::advance_until_terminal` runs bounded passes as one
+  episode under a `ChainAdvancePolicy`; `ChainSubmissionClientConfig::for_network`
+  and `Network::default_vote_chain_id` replace host-side literals.
+- `VotingError::kind`, `VotingError::retryable`, and the new variants
+  `InsufficientEligibility`, `NoSpendableNotes`, `SetupAlreadyPersisted`,
+  `DbBusy`, and `PirUnavailable`, with `wire::VotingErrorView` for hosts.
+- `VotingDb::open_wallet_sidecar` shares one connection per sidecar path and
+  returns `Arc<VotingDb>`; `VotingDb::scoped` reads another wallet through the
+  same connection; `share::pending_rounds_for_accounts` lists pending share
+  rounds for several wallets.
+- `vote::recover_vote_commitment`, `prepare_vote_work`, and
+  `persist_prepared_vote_work` choose the singleton or atomic shape
+  internally. `ConfirmedVote`, produced only by `CommittedVote::confirmed`,
+  owns helper-share submission.
+- Wire views for hosts: typed `NextStepKind`, `RoundPlanActionKind`,
+  recovery-work kinds, `WorkflowPhaseView`, chain outcome and failure views,
+  round step outcome, failure, and progress views, and `PendingShareRoundView`.
+
+### Changed
+
+- **Breaking:** `NextStepView.kind`, `RoundPlanView.primary_action`, the
+  recovery-work `kind` fields, and every wire `phase` field are enums instead
+  of strings. Serde labels are unchanged. The crate-side `as_str` and
+  `NextStep::kind` string tables are removed.
+- **Breaking:** `VotingDb::open_wallet_sidecar` returns `Arc<VotingDb>`.
+- **Breaking:** functions that took `&PirClientBlocking` take
+  `&dyn PirProofSource`; existing callers coerce.
+- **Breaking:** `HyperTransport` is `HyperTransport<R: RouteHttp = DirectRoute>`.
+  `new`, `with_http_connector`, and `with_connector` keep their shapes.
+- Transaction begin and commit failures classify SQLite busy and locked
+  errors as `VotingError::DbBusy`.
+- Eligibility, no-spendable-note, write-once setup, and PIR failures carry
+  structured fields. Their display text keeps the earlier wording.
+
 ### Removed
 
 - **Breaking:** removed `VotingDb::build_and_prove_delegation` so durable
@@ -16,6 +79,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   progress is delivered live from a delivery thread the producer never waits
   on, so reporters may reenter or dispatch proof work without deadlocking, and
   terminally rejected submissions retain their generation-bound proof.
+- **Breaking:** removed `CommittedVote::submit_prepared_shares`; submit
+  through `ConfirmedVote::submit_prepared_shares`.
 - **Breaking:** removed `delegate::DelegationSigner` and replaced
   `AdvanceDelegation::signer` with `spend_auth_signature`. Delegation chain
   submission now accepts only the external SpendAuth signature and loads the

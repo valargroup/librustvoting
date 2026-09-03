@@ -1383,13 +1383,15 @@ host wallet:
    helper ordering. Hosts do not supply randomness to the planning lifecycle.
 4. **Lifecycle.** The host owns the timer, app-lock and round-expiry behavior,
    invokes `track_pending_shares`, and supplies cancellation.
-5. **Initial delivery invocation.** Supported wallet integrations call
-   `VoteRecoveryExecutor::advance` with the complete proposal roster from the
-   authenticated round configuration, the complete current configured fleet,
-   timing, and cancellation. The executor obtains `HelperFleetPreflight`,
-   prepares every affected delivery plan, waits for durable chain confirmation,
-   recovers fresh `CommittedVote` handles, and submits the prepared shares.
-   Lower-level integrations may perform that exact sequence directly. The SDK
+5. **Initial delivery invocation.** Supported wallet integrations bind a
+   `RoundExecutor` to the complete proposal roster from the authenticated round
+   configuration and call `advance_next` or `advance_step` with the complete
+   current configured fleet, timing, and cancellation. The executor obtains
+   `HelperFleetPreflight`, prepares every affected delivery plan, advances the
+   chain until confirmation is durable, recovers fresh `CommittedVote` handles,
+   converts them to `ConfirmedVote`, and submits the prepared shares. Lower-level
+   integrations may perform that exact sequence directly; submission is only
+   offered on `ConfirmedVote`, which only the durable confirmation produces. The SDK
    validates the stored plan against its original planning fleet while limiting
    delivery to the current fleet. The host does not interpret recovery steps,
    select atomic-batch members, select the immediate share, serialize plans,

@@ -25,13 +25,19 @@ use crate::{
     },
     vote::{SignedVoteBatch, SignedVoteCommitment, SignedVoteCommitments, VoteSubmission},
     wire::{
-        CompletedVoteChoiceView, CompletedVoteDisplayView, DelegationPirPrecomputeResultView,
+        ChainConfirmationSourceView, ChainDiagnosticKindView, ChainDiagnosticView,
+        ChainSubmissionFailureStateView, ChainSubmissionOutcomeKind, ChainSubmissionOutcomeView,
+        ChainSubmissionStateEvidenceView, ChainSubmissionStateView, CompletedVoteChoiceView,
+        CompletedVoteDisplayView, DelegationPirPrecomputeResultView, DelegationProgressKind,
         DelegationRecoveryView, DelegationRecoveryWorkView, DelegationStatusView,
         DelegationSubmissionWire, NextStepView, PendingShareRoundView, RoundPlanView,
-        RoundRecoveryStateView, ShareDelegationRecordView, ShareWorkflowRecoveryView,
-        SignedDelegationPayloadView, SignedVoteBatchView, SignedVoteCommitmentView,
-        SignedVoteCommitmentsView, SubmissionDiagnosticView, VoteCommitmentBatchWire,
-        VoteCommitmentWire, VoteRecoveryView,
+        RoundRecoveryStateView, RoundStepDispositionView, RoundStepFailureKindView,
+        RoundStepFailureView, RoundStepOutcomeView, RoundStepProgressKind, RoundStepProgressView,
+        ShareBatchDeliveryReportView, ShareDelegationRecordView, ShareDeliveryOutcomeView,
+        ShareKeyView, ShareWorkflowRecoveryView, SignedDelegationPayloadView, SignedVoteBatchView,
+        SignedVoteCommitmentView, SignedVoteCommitmentsView, SubmissionDiagnosticView,
+        VoteCommitStageKind, VoteCommitmentBatchWire, VoteCommitmentWire, VoteKeyView,
+        VoteRecoveryView,
         VoteRecoveryWorkView, VoteShareWire, VotingErrorKindView, VotingErrorView,
         VotingHotkeyTargetV1, VotingNoteRefView, VotingNoteSelectionResultView, VotingRoundParams,
     },
@@ -858,6 +864,358 @@ fn helper_tree_position(value: u64) -> Result<u64, VotingError> {
         });
     }
     Ok(value)
+}
+
+impl From<crate::ChainSubmissionConfirmationSource> for ChainConfirmationSourceView {
+    fn from(source: crate::ChainSubmissionConfirmationSource) -> Self {
+        match source {
+            crate::ChainSubmissionConfirmationSource::Hash => Self::Hash,
+            crate::ChainSubmissionConfirmationSource::Tree => Self::Tree,
+        }
+    }
+}
+
+impl From<crate::ChainSubmissionDiagnosticKind> for ChainDiagnosticKindView {
+    fn from(kind: crate::ChainSubmissionDiagnosticKind) -> Self {
+        use crate::ChainSubmissionDiagnosticKind as Kind;
+        match kind {
+            Kind::AmbiguousDispatch => Self::AmbiguousDispatch,
+            Kind::AmbiguousAttemptsExhausted => Self::AmbiguousAttemptsExhausted,
+            Kind::NullifierAlreadySpent => Self::NullifierAlreadySpent,
+            Kind::TrackingWindowExpired => Self::TrackingWindowExpired,
+            Kind::ChainRejected => Self::ChainRejected,
+            Kind::ReconciliationPending => Self::ReconciliationPending,
+            Kind::InvalidProtocolResponse => Self::InvalidProtocolResponse,
+            Kind::StorageFailure => Self::StorageFailure,
+        }
+    }
+}
+
+impl From<&crate::ChainSubmissionDiagnostic> for ChainDiagnosticView {
+    fn from(diagnostic: &crate::ChainSubmissionDiagnostic) -> Self {
+        Self {
+            kind: diagnostic.kind().into(),
+            message: diagnostic.message().to_string(),
+        }
+    }
+}
+
+impl From<crate::ChainSubmissionResult> for ChainSubmissionOutcomeView {
+    fn from(result: crate::ChainSubmissionResult) -> Self {
+        use crate::{ChainSubmissionPending, ChainSubmissionResult};
+        let empty = |kind| Self {
+            kind,
+            confirmation_source: None,
+            transaction_hash: None,
+            candidate_transaction_hash: None,
+            final_van_position: None,
+            vote_commitment_positions: Vec::new(),
+            diagnostic: None,
+        };
+        match result {
+            ChainSubmissionResult::Confirmed(confirmation) => Self {
+                kind: ChainSubmissionOutcomeKind::Confirmed,
+                confirmation_source: Some(confirmation.source().into()),
+                transaction_hash: confirmation.transaction_hash().map(|hash| hash.to_hex()),
+                candidate_transaction_hash: None,
+                final_van_position: Some(confirmation.final_van_position()),
+                vote_commitment_positions: confirmation.vote_commitment_positions().to_vec(),
+                diagnostic: None,
+            },
+            ChainSubmissionResult::Pending(ChainSubmissionPending::Tracking {
+                candidate_transaction_hash,
+            }) => Self {
+                candidate_transaction_hash: Some(candidate_transaction_hash.to_hex()),
+                ..empty(ChainSubmissionOutcomeKind::Tracking)
+            },
+            ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+                candidate_transaction_hash,
+                diagnostic,
+            }) => Self {
+                candidate_transaction_hash: candidate_transaction_hash.map(|hash| hash.to_hex()),
+                diagnostic: Some(ChainDiagnosticView::from(&diagnostic)),
+                ..empty(ChainSubmissionOutcomeKind::Recovering)
+            },
+            ChainSubmissionResult::SubmittedWithoutHash(diagnostic) => Self {
+                diagnostic: Some(ChainDiagnosticView::from(&diagnostic)),
+                ..empty(ChainSubmissionOutcomeKind::SubmittedWithoutHash)
+            },
+            ChainSubmissionResult::Rejected(diagnostic) => Self {
+                diagnostic: Some(ChainDiagnosticView::from(&diagnostic)),
+                ..empty(ChainSubmissionOutcomeKind::Rejected)
+            },
+            ChainSubmissionResult::Cancelled => empty(ChainSubmissionOutcomeKind::Cancelled),
+        }
+    }
+}
+
+impl From<crate::ChainSubmissionState> for ChainSubmissionStateView {
+    fn from(state: crate::ChainSubmissionState) -> Self {
+        use crate::ChainSubmissionState as State;
+        match state {
+            State::Submitting => Self::Submitting,
+            State::Tracking => Self::Tracking,
+            State::Recovering => Self::Recovering,
+            State::SubmittedWithoutHash => Self::SubmittedWithoutHash,
+            State::Confirmed => Self::Confirmed,
+            State::Rejected => Self::Rejected,
+        }
+    }
+}
+
+impl From<crate::ChainSubmissionFailureState> for ChainSubmissionFailureStateView {
+    fn from(state: crate::ChainSubmissionFailureState) -> Self {
+        Self {
+            state: state.state().into(),
+            evidence: match state.evidence() {
+                crate::ChainSubmissionStateEvidence::Durable => {
+                    ChainSubmissionStateEvidenceView::Durable
+                }
+                crate::ChainSubmissionStateEvidence::KnownPossiblyDispatched => {
+                    ChainSubmissionStateEvidenceView::KnownPossiblyDispatched
+                }
+            },
+        }
+    }
+}
+
+impl From<crate::VoteRecoveryKey> for VoteKeyView {
+    fn from(key: crate::VoteRecoveryKey) -> Self {
+        Self {
+            bundle_index: key.bundle_index,
+            proposal_id: key.proposal_id,
+        }
+    }
+}
+
+impl From<crate::share_tracking::ShareKey> for ShareKeyView {
+    fn from(key: crate::share_tracking::ShareKey) -> Self {
+        Self {
+            bundle_index: key.bundle_index,
+            proposal_id: key.proposal_id,
+            share_index: key.share_index,
+        }
+    }
+}
+
+impl From<crate::VoteShareDeliveryReport> for ShareBatchDeliveryReportView {
+    fn from(report: crate::VoteShareDeliveryReport) -> Self {
+        let delivery = report.delivery;
+        Self {
+            vote: report.vote.into(),
+            deliveries: delivery
+                .deliveries
+                .into_iter()
+                .map(|outcome| ShareDeliveryOutcomeView {
+                    share_index: outcome.share_index,
+                    accepted_urls: outcome.submission.accepted_urls,
+                    ambiguous_urls: outcome.submission.ambiguous_urls,
+                    target_count: u32::try_from(outcome.submission.target_count)
+                        .unwrap_or(u32::MAX),
+                })
+                .collect(),
+            pending_share_indices: delivery.pending_share_indices,
+            cancelled: delivery.cancelled,
+            legacy_best_effort: matches!(
+                delivery.placement_guarantee,
+                crate::share_tracking::SharePlacementGuarantee::LegacyBestEffort
+            ),
+        }
+    }
+}
+
+impl From<crate::RoundStepDisposition> for RoundStepDispositionView {
+    fn from(disposition: crate::RoundStepDisposition) -> Self {
+        use crate::RoundStepDisposition as D;
+        match disposition {
+            D::NoWork => Self::NoWork,
+            D::Advanced => Self::Advanced,
+            D::Pending => Self::Pending,
+            D::Cancelled => Self::Cancelled,
+            D::ChainTerminal => Self::ChainTerminal,
+        }
+    }
+}
+
+impl From<crate::RoundStepFailureKind> for RoundStepFailureKindView {
+    fn from(kind: crate::RoundStepFailureKind) -> Self {
+        use crate::RoundStepFailureKind as K;
+        match kind {
+            K::InvalidInput => Self::InvalidInput,
+            K::Busy => Self::Busy,
+            K::Storage => Self::Storage,
+            K::InvariantViolation => Self::InvariantViolation,
+            K::Transport => Self::Transport,
+            K::Protocol => Self::Protocol,
+            K::ProofFailed => Self::ProofFailed,
+            K::Signing => Self::Signing,
+            K::HelperDeliveryIncomplete => Self::HelperDeliveryIncomplete,
+        }
+    }
+}
+
+impl TryFrom<crate::RoundStepOutcome> for RoundStepOutcomeView {
+    type Error = VotingError;
+
+    fn try_from(outcome: crate::RoundStepOutcome) -> Result<Self, Self::Error> {
+        Ok(Self {
+            step: outcome.step.map(NextStepView::try_from).transpose()?,
+            disposition: outcome.disposition.into(),
+            chain_outcome: outcome.chain_outcome.map(Into::into),
+            share_deliveries: outcome
+                .share_deliveries
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            delegation: outcome
+                .delegation
+                .map(SignedDelegationPayloadView::try_from)
+                .transpose()?,
+            plan: outcome.plan.try_into()?,
+        })
+    }
+}
+
+impl TryFrom<crate::RoundStepFailure> for RoundStepFailureView {
+    type Error = VotingError;
+
+    fn try_from(failure: crate::RoundStepFailure) -> Result<Self, Self::Error> {
+        Ok(Self {
+            kind: failure.kind.into(),
+            step: failure.step.map(NextStepView::try_from).transpose()?,
+            strongest_chain_state: failure.strongest_chain_state.map(Into::into),
+            chain_outcome: failure.chain_outcome.map(Into::into),
+            message: failure.message,
+            plan: failure
+                .plan
+                .map(|plan| RoundPlanView::try_from(*plan))
+                .transpose()?,
+        })
+    }
+}
+
+fn delegation_progress_kind(
+    progress: crate::delegate::DelegationProgress,
+) -> (DelegationProgressKind, Option<f64>) {
+    use crate::delegate::DelegationProgress as P;
+    match progress {
+        P::SelectingNotes => (DelegationProgressKind::SelectingNotes, None),
+        P::PcztBuilding => (DelegationProgressKind::PcztBuilding, None),
+        P::PcztBuilt => (DelegationProgressKind::PcztBuilt, None),
+        P::ProofStarting => (DelegationProgressKind::ProofStarting, None),
+        P::WaitingForExistingProof => (DelegationProgressKind::WaitingForExistingProof, None),
+        P::ProofProgress(fraction) => (DelegationProgressKind::ProofProgress, Some(fraction)),
+        P::ProofComplete => (DelegationProgressKind::ProofComplete, None),
+        P::SigningPayload => (DelegationProgressKind::SigningPayload, None),
+        P::PayloadReady => (DelegationProgressKind::PayloadReady, None),
+    }
+}
+
+impl TryFrom<crate::RoundStepProgress> for RoundStepProgressView {
+    type Error = VotingError;
+
+    fn try_from(progress: crate::RoundStepProgress) -> Result<Self, Self::Error> {
+        use crate::vote::VoteCommitStage as Stage;
+        use crate::RoundStepProgress as P;
+        let mut view = Self {
+            kind: RoundStepProgressKind::Selected,
+            step: None,
+            bundle_index: None,
+            proposal_id: None,
+            delegation_progress: None,
+            vote_commit_stage: None,
+            proof_progress: None,
+            tree_height: None,
+            vote_keys: Vec::new(),
+            chain_outcome: None,
+            share_delivery: None,
+            share: None,
+            share_confirmed: None,
+        };
+        match progress {
+            P::Selected(step) => {
+                view.step = Some(step.try_into()?);
+            }
+            P::Delegation {
+                bundle_index,
+                progress,
+            } => {
+                let (kind, fraction) = delegation_progress_kind(progress);
+                view.kind = RoundStepProgressKind::Delegation;
+                view.bundle_index = Some(bundle_index);
+                view.delegation_progress = Some(kind);
+                view.proof_progress = fraction;
+            }
+            P::TreeSynced { height } => {
+                view.kind = RoundStepProgressKind::TreeSynced;
+                view.tree_height = Some(height);
+            }
+            P::VoteCommit(stage) => {
+                view.kind = RoundStepProgressKind::VoteCommit;
+                let (kind, bundle_index, proposal_id, fraction) = match stage {
+                    Stage::ProofStarting {
+                        proposal_id,
+                        bundle_index,
+                    } => (
+                        VoteCommitStageKind::ProofStarting,
+                        bundle_index,
+                        proposal_id,
+                        None,
+                    ),
+                    Stage::ProofProgress {
+                        proposal_id,
+                        bundle_index,
+                        progress,
+                    } => (
+                        VoteCommitStageKind::ProofProgress,
+                        bundle_index,
+                        proposal_id,
+                        Some(progress),
+                    ),
+                    Stage::SharePayloadsBuilding {
+                        proposal_id,
+                        bundle_index,
+                    } => (
+                        VoteCommitStageKind::SharePayloadsBuilding,
+                        bundle_index,
+                        proposal_id,
+                        None,
+                    ),
+                    Stage::Signing {
+                        proposal_id,
+                        bundle_index,
+                    } => (
+                        VoteCommitStageKind::Signing,
+                        bundle_index,
+                        proposal_id,
+                        None,
+                    ),
+                };
+                view.vote_commit_stage = Some(kind);
+                view.bundle_index = Some(bundle_index);
+                view.proposal_id = Some(proposal_id);
+                view.proof_progress = fraction;
+            }
+            P::HelperPlansPrepared(keys) => {
+                view.kind = RoundStepProgressKind::HelperPlansPrepared;
+                view.vote_keys = keys.into_iter().map(Into::into).collect();
+            }
+            P::ChainOutcome(result) => {
+                view.kind = RoundStepProgressKind::ChainOutcome;
+                view.chain_outcome = Some(result.into());
+            }
+            P::ShareOutcome(report) => {
+                view.kind = RoundStepProgressKind::ShareOutcome;
+                view.share_delivery = Some(report.into());
+            }
+            P::ShareConfirmed { share, confirmed } => {
+                view.kind = RoundStepProgressKind::ShareConfirmed;
+                view.share = Some(share.into());
+                view.share_confirmed = Some(confirmed);
+            }
+        }
+        Ok(view)
+    }
 }
 
 impl From<crate::share::PendingShareRoundForAccount> for PendingShareRoundView {
