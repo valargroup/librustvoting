@@ -366,7 +366,7 @@ async fn atomic_vote_batch_uses_shared_lifecycle_and_confirms_ordered_positions(
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
     let transport = Arc::new(ScriptedTransport::default());
-    transport.queue(Ok(accepted()));
+    transport.queue(Ok(accepted_batch(&identity)));
     transport.queue(Ok(batch_confirmed(&identity, &proposals)));
 
     let result = coordinator(
@@ -402,7 +402,7 @@ async fn atomic_vote_batches_from_one_through_protocol_maximum_confirm() {
         let store = Arc::new(InMemoryChainSubmissionStore::default());
         store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
         let transport = Arc::new(ScriptedTransport::default());
-        transport.queue(Ok(accepted()));
+        transport.queue(Ok(accepted_batch(&identity)));
         transport.queue(Ok(batch_confirmed(&identity, &proposals)));
 
         let result = coordinator(transport, store, ManualClock::new(100), 10)
@@ -461,7 +461,7 @@ async fn reordered_batch_confirmation_leaves_tracking_authoritative() {
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
     let transport = Arc::new(ScriptedTransport::default());
-    transport.queue(Ok(accepted()));
+    transport.queue(Ok(accepted_batch(&identity)));
     transport.queue(Ok(batch_confirmed(&identity, &[1, 5, 2])));
 
     let failure = coordinator(transport, Arc::clone(&store), ManualClock::new(100), 10)
@@ -491,7 +491,7 @@ async fn partial_nonadjacent_batch_tree_members_authorize_retry_without_confirma
     for response in tree_responses(&[[3; 32], [4; 32], [8; 32], [4; 32], [4; 32]]) {
         transport.queue(Ok(response));
     }
-    transport.queue(Ok(accepted()));
+    transport.queue(Ok(accepted_batch(&identity)));
 
     let protocol = ChainProtocolClient::new(
         Arc::clone(&transport),
@@ -1037,6 +1037,23 @@ fn accepted() -> ChainHttpResponse {
     ChainHttpResponse::json(
         200,
         format!(r#"{{"tx_hash":"{HASH}","code":0,"log":""}}"#).into_bytes(),
+    )
+}
+
+fn accepted_batch(identity: &ChainSubmissionIdentity) -> ChainHttpResponse {
+    let ChainSubmissionTarget::VoteBatch {
+        ordered_batch_digest,
+    } = identity.target()
+    else {
+        panic!("batch response requires a vote-batch identity")
+    };
+    ChainHttpResponse::json(
+        200,
+        format!(
+            r#"{{"tx_hash":"{HASH}","code":0,"log":"","batch_digest":"{}"}}"#,
+            hex::encode(ordered_batch_digest)
+        )
+        .into_bytes(),
     )
 }
 
@@ -2363,7 +2380,7 @@ async fn same_batch_concurrency_releases_only_one_atomic_post() {
     let store = Arc::new(InMemoryChainSubmissionStore::default());
     store.seed_derivation(derived_batch(identity.clone(), proposals.clone()));
     let transport = Arc::new(ScriptedTransport::default());
-    transport.queue(Ok(accepted()));
+    transport.queue(Ok(accepted_batch(&identity)));
     transport.queue(Ok(pending()));
     transport.queue(Ok(pending()));
     let (entered, release) = transport.gate_first_post();

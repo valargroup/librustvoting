@@ -22,12 +22,7 @@ async fn constructs_exact_atomic_vote_batch_url_and_json() {
 
     assert!(matches!(
         client
-            .submit_vote_batch_with_dispatch(
-                0,
-                &wire,
-                batch_digest,
-                ChainPostDispatch::default(),
-            )
+            .submit_vote_batch_with_dispatch(0, &wire, batch_digest, ChainPostDispatch::default(),)
             .await,
         PostAttemptOutcome::Accepted(_)
     ));
@@ -57,12 +52,7 @@ async fn accepts_rejection_with_matching_server_digest() {
 
     assert!(matches!(
         client
-            .submit_vote_batch_with_dispatch(
-                0,
-                &wire,
-                batch_digest,
-                ChainPostDispatch::default(),
-            )
+            .submit_vote_batch_with_dispatch(0, &wire, batch_digest, ChainPostDispatch::default(),)
             .await,
         PostAttemptOutcome::Rejected {
             code: 7,
@@ -74,7 +64,7 @@ async fn accepts_rejection_with_matching_server_digest() {
 
 #[tokio::test]
 async fn rejects_missing_noncanonical_or_mismatched_server_digest() {
-    let expected_batch_digest = [9; 32];
+    let expected_batch_digest = [0xab; 32];
     let responses = [
         format!(r#"{{"tx_hash":"{HASH}","code":0}}"#),
         format!(
