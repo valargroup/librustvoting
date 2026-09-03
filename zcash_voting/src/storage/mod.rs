@@ -114,15 +114,14 @@ impl VotingDb {
     /// share lifecycle coordination.
     pub fn open_path(path: &Path) -> Result<Self, VotingError> {
         validate_database_path(path)?;
+        let canonical_path = canonical_database_path(path)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let connection =
-            Connection::open_with_flags(path, flags).map_err(|error| VotingError::Internal {
+        let connection = Connection::open_with_flags(&canonical_path, flags).map_err(|error| {
+            VotingError::Internal {
                 message: format!("failed to open database: {error}"),
-            })?;
-        let canonical_path = std::fs::canonicalize(path).map_err(|error| VotingError::Storage {
-            message: format!("failed to resolve SQLite database authority: {error}"),
+            }
         })?;
         let database_authority = DatabaseAuthority::for_file(canonical_path)?;
 
@@ -206,6 +205,34 @@ fn validate_database_path(path: &Path) -> Result<(), VotingError> {
         });
     }
     Ok(())
+}
+
+/// Resolves the exact filesystem path before SQLite opens it.
+///
+/// Existing symlinks resolve to their current target. For a new database, the
+/// parent is resolved first and the new filename is appended, so SQLite and the
+/// authority registry receive the same path.
+fn canonical_database_path(path: &Path) -> Result<std::path::PathBuf, VotingError> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical_path) => Ok(canonical_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file_name = path.file_name().ok_or_else(|| VotingError::InvalidInput {
+                message: "voting database path must name a file".to_string(),
+            })?;
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let canonical_parent =
+                std::fs::canonicalize(parent).map_err(|error| VotingError::Storage {
+                    message: format!("failed to resolve SQLite database parent: {error}"),
+                })?;
+            Ok(canonical_parent.join(file_name))
+        }
+        Err(error) => Err(VotingError::Storage {
+            message: format!("failed to resolve SQLite database path: {error}"),
+        }),
+    }
 }
 
 #[cfg(test)]

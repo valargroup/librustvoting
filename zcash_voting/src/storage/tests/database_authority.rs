@@ -6,6 +6,9 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
 use super::super::*;
 
 fn unique_label(label: &str) -> String {
@@ -186,6 +189,47 @@ fn legacy_string_open_accepts_only_filesystem_paths() {
             Err(VotingError::InvalidInput { .. })
         ));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn retargeted_symlink_opens_use_the_resolved_database_authority() {
+    let directory = temporary_path("symlink-parent");
+    std::fs::create_dir_all(&directory).unwrap();
+    let first_path = directory.join("first.sqlite");
+    let second_path = directory.join("second.sqlite");
+    let alias_path = directory.join("current.sqlite");
+
+    drop(VotingDb::open_path(&first_path).unwrap());
+    drop(VotingDb::open_path(&second_path).unwrap());
+    symlink(&first_path, &alias_path).unwrap();
+
+    let first_alias = VotingDb::open_path(&alias_path).unwrap();
+    let first_direct = VotingDb::open_path(&first_path).unwrap();
+    assert!(Arc::ptr_eq(
+        &first_alias.database_authority,
+        &first_direct.database_authority
+    ));
+
+    std::fs::remove_file(&alias_path).unwrap();
+    symlink(&second_path, &alias_path).unwrap();
+
+    let second_alias = VotingDb::open_path(&alias_path).unwrap();
+    let second_direct = VotingDb::open_path(&second_path).unwrap();
+    assert!(Arc::ptr_eq(
+        &second_alias.database_authority,
+        &second_direct.database_authority
+    ));
+    assert!(!Arc::ptr_eq(
+        &first_alias.database_authority,
+        &second_alias.database_authority
+    ));
+
+    drop((first_alias, first_direct, second_alias, second_direct));
+    std::fs::remove_file(alias_path).unwrap();
+    remove_sqlite_files(&first_path);
+    remove_sqlite_files(&second_path);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(target_os = "linux")]

@@ -82,7 +82,9 @@ One process exclusively owns a voting database. Every handle opened on the
 same canonical SQLite file in that process shares one database authority and
 therefore one lifecycle-coordination registry. `VotingDb::open_path` accepts
 native paths, including non-UTF-8 paths on platforms where SQLite supports
-them, and disables SQLite URI interpretation;
+them, and disables SQLite URI interpretation. It resolves the target before
+opening and passes that same canonical path to SQLite and the authority
+registry, so a symlink retarget cannot split one opened file from its authority;
 `VotingDb::open_in_memory` creates one private authority for one independent
 in-memory database. The legacy UTF-8 string constructor accepts only filesystem
 paths. Empty paths, SQLite's `:memory:` magic name, and `file:` URIs are

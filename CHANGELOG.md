@@ -71,7 +71,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - Independently opened SQLite handles now share chain-submission lifecycle
   coordination for one canonical filesystem path, including supported
   non-UTF-8 native paths, so a destructive operation cannot bypass an in-flight
-  submission lease. Explicit in-memory databases remain private to one handle.
+  submission lease. The canonical path is resolved before SQLite opens it, so
+  symlink retargeting cannot bind a connection to a different authority.
+  Explicit in-memory databases remain private to one handle.
 
 ### Removed
 
