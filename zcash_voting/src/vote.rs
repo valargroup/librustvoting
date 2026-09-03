@@ -3569,14 +3569,14 @@ fn array32_vec(label: &str, values: Vec<Vec<u8>>) -> Result<Vec<[u8; 32]>, Votin
 //
 // Chain submission is driven exclusively by the `chain_submission` lifecycle,
 // which is the sole authority for submission and confirmation. These helpers
-// write the same durable rows the lifecycle writes so tests can cover the
-// singleton/batch guards and the position-conflict rules directly. They are
-// compiled only for this crate's tests and for the `test-fixtures` feature;
-// production builds must not enable that feature.
+// write the same durable rows the lifecycle writes so this crate's tests can
+// cover the singleton/batch guards and the position-conflict rules directly.
+// They are compiled only for this crate's own tests and are never part of the
+// library surface, with or without the `test-fixtures` feature.
 
 /// Marks one singleton vote submitted with `tx_hash`.
-#[cfg(any(test, feature = "test-fixtures"))]
-pub fn record_submission(
+#[cfg(test)]
+pub(crate) fn record_submission(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
@@ -3587,8 +3587,8 @@ pub fn record_submission(
 }
 
 /// Records one transaction hash for every action in a persisted batch.
-#[cfg(any(test, feature = "test-fixtures"))]
-pub fn record_batch_submission(
+#[cfg(test)]
+pub(crate) fn record_batch_submission(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,
@@ -3636,8 +3636,8 @@ pub fn record_batch_submission(
 }
 
 /// Records the confirmed vote-commitment position for one singleton vote.
-#[cfg(any(test, feature = "test-fixtures"))]
-pub fn record_vc_position(
+#[cfg(test)]
+pub(crate) fn record_vc_position(
     db: &VotingDb,
     round_id: &str,
     bundle_index: u32,

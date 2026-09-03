@@ -5,7 +5,7 @@ use zcash_voting::{
     },
     round::{RoundParams, VotingDb},
     types::{EncryptedShare, Network, NoteInfo},
-    vote::{insert_recovery_fixture, record_vc_position, CommittedVote, VoteRecoveryBundle},
+    vote::{insert_recovery_fixture, CommittedVote, VoteRecoveryBundle},
     BALLOT_DIVISOR,
 };
 
@@ -54,7 +54,24 @@ fn db_with_confirmed_recovery(recovery: VoteRecoveryBundle) -> VotingDb {
     )
     .unwrap();
     insert_recovery_fixture(&db, &recovery).unwrap();
-    record_vc_position(&db, ROUND_ID, BUNDLE_INDEX, PROPOSAL_ID, VC_TREE_POSITION).unwrap();
+    // The fixture leaves confirmation columns unset and no public writer
+    // exists for them: the chain lifecycle is the only production author.
+    // These helper-share tests only need the confirmed VC leaf to be readable,
+    // so project it straight into the domain column.
+    db.conn()
+        .execute(
+            "UPDATE votes SET vc_tree_position = ?4
+             WHERE round_id = ?1 AND wallet_id = ?2
+               AND bundle_index = ?3 AND proposal_id = ?5",
+            rusqlite::params![
+                ROUND_ID,
+                WALLET_ID,
+                BUNDLE_INDEX,
+                VC_TREE_POSITION as i64,
+                PROPOSAL_ID
+            ],
+        )
+        .unwrap();
     db
 }
 
@@ -83,7 +100,7 @@ fn recovery_fixture() -> VoteRecoveryBundle {
         proposal_id: PROPOSAL_ID,
         vote_decision: 1,
         anchor_height: 123,
-        vc_tree_position: 456,
+        vc_tree_position: VC_TREE_POSITION,
         single_share: false,
         num_options: 3,
         van_nullifier: [0x10; 32],

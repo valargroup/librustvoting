@@ -385,6 +385,7 @@ fn validate_witnesses_for_round(
 /// SQLite's writer reservation. Lifecycle admission uses the same transaction
 /// behavior, so no native authority can appear between this check and the
 /// caller's projection write.
+#[cfg(test)]
 pub(crate) fn reject_legacy_chain_mutation_in_tx(
     tx: &rusqlite::Transaction<'_>,
     wallet_id: &str,
@@ -1607,8 +1608,8 @@ impl VotingDb {
     /// Test-only durable writer. Production callers reach chain state
     /// through the `chain_submission` lifecycle, which is the only
     /// authority for submission and confirmation.
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn store_van_position(
+    #[cfg(test)]
+    pub(crate) fn store_van_position(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -1790,8 +1791,8 @@ impl VotingDb {
     /// Test-only durable writer. Production callers reach chain state
     /// through the `chain_submission` lifecycle, which is the only
     /// authority for submission and confirmation.
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn store_delegation_tx_hash(
+    #[cfg(test)]
+    pub(crate) fn store_delegation_tx_hash(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -1839,8 +1840,8 @@ impl VotingDb {
     /// Test-only durable writer. Production callers reach chain state
     /// through the `chain_submission` lifecycle, which is the only
     /// authority for submission and confirmation.
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn record_vote_submission(
+    #[cfg(test)]
+    pub(crate) fn record_vote_submission(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -1879,8 +1880,8 @@ impl VotingDb {
     /// Test-only durable writer. Production callers reach chain state
     /// through the `chain_submission` lifecycle, which is the only
     /// authority for submission and confirmation.
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn mark_delegation_submitted(
+    #[cfg(test)]
+    pub(crate) fn mark_delegation_submitted(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -1909,8 +1910,8 @@ impl VotingDb {
     /// Test-only durable writer. Production callers reach chain state
     /// through the `chain_submission` lifecycle, which is the only
     /// authority for submission and confirmation.
-    #[cfg(any(test, feature = "test-fixtures"))]
-    pub fn mark_vote_submitted(
+    #[cfg(test)]
+    pub(crate) fn mark_vote_submitted(
         &self,
         round_id: &str,
         bundle_index: u32,
@@ -2680,7 +2681,7 @@ impl VotingDb {
 }
 
 /// Accepts missing or matching text fields and rejects conflicting values.
-#[cfg(any(test, feature = "test-fixtures"))]
+#[cfg(test)]
 fn check_text_conflict(
     existing: Option<&str>,
     requested: &str,

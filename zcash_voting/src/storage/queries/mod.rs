@@ -1715,7 +1715,7 @@ pub(crate) fn load_vote_row_state(
 ///
 /// Test-only writer; production confirmation is recorded atomically by the
 /// `chain_submission` lifecycle.
-#[cfg(any(test, feature = "test-fixtures"))]
+#[cfg(test)]
 pub(crate) fn store_van_position(
     conn: &Connection,
     round_id: &str,

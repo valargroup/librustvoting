@@ -58,24 +58,24 @@
 //! let _ = zcash_voting::delegate::record_van_position;
 //! ```
 //!
-//! The vote-side recorders survive only as `test-fixtures` seeding helpers,
-//! which production builds must not enable, so their surface check is scoped
-//! to a default build:
-#![cfg_attr(
-    not(feature = "test-fixtures"),
-    doc = "",
-    doc = "```compile_fail",
-    doc = "let _ = zcash_voting::vote::record_submission;",
-    doc = "```",
-    doc = "",
-    doc = "```compile_fail",
-    doc = "let _ = zcash_voting::vote::record_batch_submission;",
-    doc = "```",
-    doc = "",
-    doc = "```compile_fail",
-    doc = "let _ = zcash_voting::vote::record_vc_position;",
-    doc = "```"
-)]
+//! The vote-side recorders are crate-private test helpers and stay off the
+//! surface even when the `test-fixtures` feature is enabled:
+//!
+//! ```compile_fail
+//! let _ = zcash_voting::vote::record_submission;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = zcash_voting::vote::record_batch_submission;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = zcash_voting::vote::record_vc_position;
+//! ```
+//!
+//! ```compile_fail
+//! let _ = zcash_voting::round::VotingDb::mark_vote_submitted;
+//! ```
 //!
 //! The host chain-event vocabulary is private:
 //!
