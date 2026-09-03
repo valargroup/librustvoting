@@ -855,27 +855,7 @@ impl SqliteChainSubmissionStore {
                 .ok_or_else(|| {
                     transition_failure(previous, "transition unexpectedly removed durable row")
                 })?;
-            if let Some(value) = diagnostic {
-                record.diagnostic = Some(value);
-            }
-            record.diagnostic = match &record.state {
-                SubmissionRecordState::Recovering {
-                    ambiguity_diagnostic,
-                    ..
-                }
-                | SubmissionRecordState::SubmittedWithoutHash(ambiguity_diagnostic)
-                | SubmissionRecordState::Rejected(ambiguity_diagnostic) => {
-                    Some(ambiguity_diagnostic.clone())
-                }
-                _ => record.diagnostic,
-            };
-            let effective_now = now.max(record.updated_at);
-            if matches!(record.state(), SubmissionRecordState::Tracking { .. })
-                && record.tracking_started_at.is_none()
-            {
-                record.tracking_started_at = Some(effective_now);
-            }
-            record.updated_at = effective_now;
+            record.settle_after_transition(previous, diagnostic, now);
             persist_mutable(tx, &record)?;
             Ok(record)
         })

@@ -252,3 +252,64 @@ fn submitted_without_hash_survives_reopen_without_domain_confirmation() {
     }
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn usable_hash_after_dispatch_ambiguity_clears_the_stored_diagnostic() {
+    let path = temporary_path("ambiguity-cleared-by-usable-hash");
+    let generation = {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(db);
+        let StoreAdmission::Ready { derived, .. } = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 10)
+            .unwrap()
+        else {
+            panic!("fresh admission")
+        };
+        let generation = derived.generation().clone();
+        let ambiguous = store
+            .classify_post(
+                &generation,
+                SubmissionObservation::PossiblyDispatched(
+                    ChainSubmissionDiagnostic::from_redacted_message(
+                        ChainSubmissionDiagnosticKind::AmbiguousDispatch,
+                        "response lost",
+                    ),
+                ),
+                11,
+            )
+            .unwrap();
+        assert_eq!(
+            ambiguous.diagnostic().map(|d| d.kind()),
+            Some(ChainSubmissionDiagnosticKind::AmbiguousDispatch)
+        );
+        store.reserve_ambiguous_retry(&generation, 12).unwrap();
+        let tracking = store
+            .classify_post(
+                &generation,
+                SubmissionObservation::UsableCandidateHash(CandidateTransactionHash::from_bytes(
+                    [0x45; 32],
+                )),
+                13,
+            )
+            .unwrap();
+        assert_eq!(tracking.durable_state(), ChainSubmissionState::Tracking);
+        assert_eq!(tracking.diagnostic(), None);
+        assert_eq!(tracking.tracking_started_at(), Some(13));
+        generation
+    };
+    {
+        let db = open_prepared(&path);
+        let store = SqliteChainSubmissionStore::new(db);
+        let StoreAdmission::Ready { record, .. } = store
+            .admit(&StoreAdvancementRequest::vote(identity()), true, 1, 14)
+            .unwrap()
+        else {
+            panic!("tracking row remains reconcilable")
+        };
+        assert!(record.generation_digest() == generation.digest());
+        assert_eq!(record.durable_state(), ChainSubmissionState::Tracking);
+        assert_eq!(record.diagnostic(), None);
+        assert_eq!(record.tracking_started_at(), Some(13));
+    }
+    let _ = std::fs::remove_file(path);
+}

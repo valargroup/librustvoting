@@ -1266,8 +1266,12 @@ Tests cover:
   advancement, while another deterministic rejection preserves the ambiguity
   and errors;
 - version-18 rows migrate incrementally to version 19, fresh and migrated
-  schemas are equivalent, and current-schema fingerprint rejection covers
-  missing columns, indexes, and triggers;
+  schemas share one chain-submission fingerprint, a migrated database passes
+  the current-schema check on reopen, and current-schema fingerprint rejection
+  covers missing columns, indexes, and triggers;
+- a usable hash that follows durable dispatch ambiguity clears the stored
+  ambiguity diagnostic on entry to `Tracking`
+  (`usable_hash_after_dispatch_ambiguity_clears_the_stored_diagnostic`);
 - ordinary cleanup and reset preserve every unresolved generation, its
   retry/recovery data, helper plan, and complete delivery history;
 - round reset preserves a protected bundle while clearing an independent

@@ -242,6 +242,48 @@ pub(super) struct StoredChainSubmission {
 }
 
 impl StoredChainSubmission {
+    /// Applies the bookkeeping every state transition shares, so both stores
+    /// persist identical rows for identical observations.
+    ///
+    /// The stored diagnostic mirrors the typed state wherever the state
+    /// carries one (`Recovering`, `SubmittedWithoutHash`, `Rejected`); an
+    /// explicit lookup diagnostic is retained only for states that carry
+    /// none. Entering `Tracking` from another state with no explicit
+    /// diagnostic clears the previous ambiguity: the usable hash is the later
+    /// observation that replaced it. The tracking window starts once, on the
+    /// first entry into `Tracking`, and `updated_at` never moves backwards.
+    pub(super) fn settle_after_transition(
+        &mut self,
+        previous: ChainSubmissionState,
+        explicit_diagnostic: Option<ChainSubmissionDiagnostic>,
+        now: u64,
+    ) {
+        let entered_tracking = matches!(self.state, SubmissionRecordState::Tracking { .. })
+            && previous != ChainSubmissionState::Tracking;
+        self.diagnostic = match &self.state {
+            SubmissionRecordState::Recovering {
+                ambiguity_diagnostic,
+                ..
+            }
+            | SubmissionRecordState::SubmittedWithoutHash(ambiguity_diagnostic)
+            | SubmissionRecordState::Rejected(ambiguity_diagnostic) => {
+                Some(ambiguity_diagnostic.clone())
+            }
+            _ => match explicit_diagnostic {
+                Some(diagnostic) => Some(diagnostic),
+                None if entered_tracking => None,
+                None => self.diagnostic.take(),
+            },
+        };
+        let effective_now = now.max(self.updated_at);
+        if matches!(self.state, SubmissionRecordState::Tracking { .. })
+            && self.tracking_started_at.is_none()
+        {
+            self.tracking_started_at = Some(effective_now);
+        }
+        self.updated_at = effective_now;
+    }
+
     fn fresh(
         generation: &ChainSubmissionGeneration,
         committed_post_reservations: u64,
@@ -402,8 +444,11 @@ pub(super) trait ChainSubmissionStore: Send + Sync {
     /// possibly-dispatched path (`AmbiguousDispatch` or
     /// `InvalidProtocolResponse`) qualifies; see
     /// `SubmissionRecordState::permits_ambiguous_retry`. Any other row is an
-    /// invariant violation. The reservation count is monotonic and is
-    /// diagnostic only; invocation attempt budgets remain coordinator-local.
+    /// invariant violation. The coordinator takes this path directly only
+    /// under status-only advancement; exact-tree advancement scans first and
+    /// reaches a POST through `reserve_recovery_retry`. The reservation count
+    /// is monotonic and is diagnostic only; invocation attempt budgets remain
+    /// coordinator-local.
     fn reserve_ambiguous_retry(
         &self,
         generation: &ChainSubmissionGeneration,
@@ -1045,23 +1090,7 @@ pub(super) mod memory {
                             "classification unexpectedly removed row",
                         )
                     })?;
-                if matches!(record.state, SubmissionRecordState::Tracking { .. })
-                    && record.tracking_started_at.is_none()
-                {
-                    record.tracking_started_at = Some(now);
-                }
-                record.diagnostic = match &record.state {
-                    SubmissionRecordState::Recovering {
-                        ambiguity_diagnostic,
-                        ..
-                    }
-                    | SubmissionRecordState::SubmittedWithoutHash(ambiguity_diagnostic)
-                    | SubmissionRecordState::Rejected(ambiguity_diagnostic) => {
-                        Some(ambiguity_diagnostic.clone())
-                    }
-                    _ => record.diagnostic,
-                };
-                record.updated_at = now;
+                record.settle_after_transition(previous_state, None, now);
                 state
                     .records
                     .insert(generation.identity().clone(), record.clone());
@@ -1141,10 +1170,7 @@ pub(super) mod memory {
                 record.state = apply_submission_observation(Some(record.state), observation)
                     .map_err(|error| transition_failure(previous_state, error))?
                     .expect("reconciliation cannot remove a row");
-                if let Some(diagnostic) = diagnostic {
-                    record.diagnostic = Some(diagnostic);
-                }
-                record.updated_at = now;
+                record.settle_after_transition(previous_state, diagnostic, now);
                 state
                     .records
                     .insert(generation.identity().clone(), record.clone());

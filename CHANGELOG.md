@@ -146,6 +146,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - A non-final exact-tree recovery retry whose accepted hash collides with
   another generation now continues through the remaining bounded attempts.
 - `ExactTree` advancement of an imported delegation never scans the tree.
+- A usable hash that follows durable dispatch ambiguity clears the stored
+  ambiguity diagnostic when the row enters `Tracking`.
 - A vote-chain POST that hits the SDK's own deadline before the transport
   marks dispatch is now classified as definitely unsent, so the fresh
   reservation is removed and bounded failover continues instead of persisting

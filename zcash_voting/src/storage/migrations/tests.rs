@@ -424,6 +424,18 @@ fn v18_submission_rows_migrate_incrementally_to_v19() {
     conn.pragma_update(None, "user_version", 18).unwrap();
 
     migrate(&mut conn).unwrap();
+    // Reopening a migrated database runs the current-schema fingerprint
+    // check against it; a migration that drifted from the fresh DDL fails here.
+    migrate(&mut conn).unwrap();
+    assert_eq!(
+        chain_submission_schema_fingerprint(&conn).unwrap(),
+        chain_submission_schema_fingerprint(&{
+            let mut fresh = Connection::open_in_memory().unwrap();
+            migrate(&mut fresh).unwrap();
+            fresh
+        })
+        .unwrap()
+    );
 
     assert_eq!(
         conn.query_row(
@@ -864,6 +876,11 @@ fn migrate_from_launch_version_matches_a_fresh_schema() {
             "clear_helper_share_plan_on_vote_generation_change"
         ),
         "migrated and fresh schemas must install the same plan lifecycle trigger"
+    );
+    assert_eq!(
+        chain_submission_schema_fingerprint(&migrated).unwrap(),
+        chain_submission_schema_fingerprint(&fresh).unwrap(),
+        "migrated and fresh chain-submission schemas must share one fingerprint"
     );
 }
 
