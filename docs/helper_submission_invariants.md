@@ -1328,8 +1328,9 @@ same canonical SQLite file in the owning process shares one database authority,
 so an exclusive deletion requested through one handle cannot bypass a chain
 submission lifecycle lease held through another handle. Connections using the
 same shared-cache SQLite memory URI share an authority by decoded database
-name. Plain `:memory:`, explicitly private-cache memory, and SQLite temporary
-databases remain independent authorities.
+name and selected VFS. Equal names opened through distinct VFSes, plain
+`:memory:`, explicitly private-cache memory, and SQLite temporary databases
+remain independent authorities.
 
 Enforcement:
 [`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),

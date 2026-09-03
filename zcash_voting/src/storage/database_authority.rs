@@ -14,7 +14,10 @@ use crate::{chain_submission::coordination::SubmissionCoordination, types::Votin
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum DatabaseIdentity {
     File(PathBuf),
-    SharedMemory(Vec<u8>),
+    SharedMemory {
+        database_name: Vec<u8>,
+        vfs_identity: usize,
+    },
 }
 
 /// Process-local owner of coordination that must agree across database handles.
@@ -31,8 +34,8 @@ impl DatabaseAuthority {
     ///
     /// File-backed databases are interned by canonical path. SQLite URI memory
     /// databases with shared caching are interned by SQLite's decoded database
-    /// name. Plain `:memory:`, temporary, and explicitly private-cache memory
-    /// databases receive private authorities.
+    /// name and selected VFS. Plain `:memory:`, temporary, and explicitly
+    /// private-cache memory databases receive private authorities.
     pub(super) fn for_connection(
         connection: &Connection,
         opening_path: &str,
@@ -77,8 +80,35 @@ impl DatabaseIdentity {
             return Ok(Some(Self::File(canonical_path)));
         }
 
-        Ok(shared_memory_name(opening_path).map(Self::SharedMemory))
+        let Some(database_name) = shared_memory_name(opening_path) else {
+            return Ok(None);
+        };
+        Ok(Some(Self::SharedMemory {
+            database_name,
+            vfs_identity: connection_vfs_identity(connection)?,
+        }))
     }
+}
+
+/// Returns the process-local identity of the VFS selected for this connection.
+fn connection_vfs_identity(connection: &Connection) -> Result<usize, VotingError> {
+    let mut selected_vfs: *mut rusqlite::ffi::sqlite3_vfs = std::ptr::null_mut();
+    // SAFETY: the rusqlite connection remains borrowed for the call, `main` is
+    // NUL-terminated, and SQLite writes one VFS pointer into `selected_vfs`.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_VFS_POINTER,
+            std::ptr::from_mut(&mut selected_vfs).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK || selected_vfs.is_null() {
+        return Err(VotingError::Storage {
+            message: format!("failed to resolve SQLite VFS identity: result code {result}"),
+        });
+    }
+    Ok(selected_vfs.addr())
 }
 
 /// Returns SQLite's decoded database name for a shared-cache memory URI.

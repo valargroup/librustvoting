@@ -82,12 +82,14 @@ One process exclusively owns a voting database. Every handle opened on the
 same canonical SQLite file in that process shares one database authority and
 therefore one lifecycle-coordination registry. Connections using the same
 shared-cache SQLite memory URI share an authority by decoded database name.
-Plain `:memory:`, explicitly private-cache memory, and SQLite temporary
-databases remain independent database authorities. Operations capture wallet,
-round, submission identity, and host operation epoch once; an account switch
-cannot retarget in-flight work. Opening one physical SQLite database through
-distinct hard-link paths is unsupported because SQLite's WAL sidecars and this
-authority identity are pathname-based.
+The selected SQLite VFS is also part of that identity, so equal names opened
+through distinct VFSes remain independent. Plain `:memory:`, explicitly
+private-cache memory, and SQLite temporary databases remain independent
+database authorities. Operations capture wallet, round, submission identity,
+and host operation epoch once; an account switch cannot retarget in-flight
+work. Opening one physical SQLite database through distinct hard-link paths is
+unsupported because SQLite's WAL sidecars and this authority identity are
+pathname-based.
 
 ## Identity and semantic generation
 
@@ -745,13 +747,13 @@ was not locked. The request rejects rosters above the 15-action protocol
 maximum before allocating lock identities. No persisted roster is read before the operation
 and identity locks.
 The coordination authority is owned by the process-local database authority,
-which is interned by canonical SQLite file path or decoded shared-memory
-database name. Constructing multiple stores, coordinators, or `VotingDb`
-handles for one database cannot create disjoint lock registries. Cleanup and
-deletion acquire the same round gate exclusively and treat an active shared
-lifecycle lease from any handle as busy. Process death drops these ephemeral
-gates; the durable submission row determines restart behavior, including
-conservative recovery of an abandoned `Submitting` row.
+which is interned by canonical SQLite file path or by decoded shared-memory
+database name plus selected VFS. Constructing multiple stores, coordinators, or
+`VotingDb` handles for one database cannot create disjoint lock registries.
+Cleanup and deletion acquire the same round gate exclusively and treat an
+active shared lifecycle lease from any handle as busy. Process death drops
+these ephemeral gates; the durable submission row determines restart behavior,
+including conservative recovery of an abandoned `Submitting` row.
 
 Once a singleton request is possibly dispatched, its proposal and choice are
 locked. Once a batch is possibly dispatched, member proposals, choices, count,

@@ -1,4 +1,5 @@
 use std::{
+    ffi::CStr,
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
 };
@@ -22,6 +23,24 @@ fn temporary_path(label: &str) -> PathBuf {
 
 fn shared_memory_uri(label: &str) -> String {
     format!("file:{}?mode=memory&cache=shared", unique_label(label))
+}
+
+fn sqlite_vfs_names() -> Vec<String> {
+    let mut names = Vec::new();
+    // SAFETY: SQLite owns the process-global VFS list for the duration of the
+    // process. Each registered VFS supplies a NUL-terminated static name.
+    unsafe {
+        let mut vfs = rusqlite::ffi::sqlite3_vfs_find(std::ptr::null());
+        while let Some(registered_vfs) = vfs.as_ref() {
+            names.push(
+                CStr::from_ptr(registered_vfs.zName)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            vfs = registered_vfs.pNext;
+        }
+    }
+    names
 }
 
 fn remove_sqlite_files(path: &Path) {
@@ -77,6 +96,50 @@ fn equivalent_shared_memory_uris_share_one_database_authority() {
     .unwrap();
 
     assert!(Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}
+
+#[test]
+fn explicit_default_vfs_preserves_shared_memory_database_authority() {
+    let name = unique_label("shared-memory-default-vfs");
+    let default_vfs = sqlite_vfs_names()
+        .into_iter()
+        .next()
+        .expect("bundled SQLite must register a default VFS");
+    let implicit = VotingDb::open(&format!("file:{name}?mode=memory&cache=shared")).unwrap();
+    let explicit = VotingDb::open(&format!(
+        "file:{name}?mode=memory&cache=shared&vfs={default_vfs}"
+    ))
+    .unwrap();
+
+    assert!(Arc::ptr_eq(
+        &implicit.database_authority,
+        &explicit.database_authority
+    ));
+}
+
+#[test]
+fn different_vfses_have_independent_shared_memory_database_authorities() {
+    let name = unique_label("shared-memory-different-vfs");
+    let vfs_names = sqlite_vfs_names();
+    assert!(
+        vfs_names.len() >= 2,
+        "bundled SQLite must register two VFSes for this regression"
+    );
+    let first = VotingDb::open(&format!(
+        "file:{name}?mode=memory&cache=shared&vfs={}",
+        vfs_names[0]
+    ))
+    .unwrap();
+    let second = VotingDb::open(&format!(
+        "file:{name}?mode=memory&cache=shared&vfs={}",
+        vfs_names[1]
+    ))
+    .unwrap();
+
+    assert!(!Arc::ptr_eq(
         &first.database_authority,
         &second.database_authority
     ));
