@@ -1,0 +1,17 @@
+defaults:
+  actions:
+    backport:
+      assignees:
+        - "{{ author }}"
+      ignore_conflicts: true
+      label_conflicts: A:backport/conflict
+
+pull_request_rules:
+  - name: backport marked changes to release/v3.x
+    conditions:
+      - base=main
+      - label=A:backport/v3.x
+    actions:
+      backport:
+        branches:
+          - release/v3.x
