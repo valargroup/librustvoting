@@ -114,8 +114,12 @@ impl VotingDb {
     /// share lifecycle coordination.
     pub fn open_path(path: &Path) -> Result<Self, VotingError> {
         validate_database_path(path)?;
-        let canonical_path = canonical_database_path(path)?;
-        let connection = open_canonical_database_file(&canonical_path)?;
+        let opening_path = canonical_database_path(path)?;
+        let connection = open_canonical_database_file(&opening_path)?;
+        // A first open creates the final path. Resolve it again so concurrent
+        // casing aliases on a case-insensitive filesystem converge before
+        // authority interning.
+        let canonical_path = canonical_opened_database_path(&opening_path)?;
         let database_authority = DatabaseAuthority::for_file(canonical_path)?;
 
         Self::initialize(connection, database_authority)
@@ -279,6 +283,13 @@ fn canonical_new_database_path(path: &Path) -> Result<std::path::PathBuf, Voting
         message: format!("failed to resolve SQLite database parent: {error}"),
     })?;
     Ok(canonical_parent.join(file_name))
+}
+
+/// Resolves the filesystem identity of a path SQLite has created or opened.
+fn canonical_opened_database_path(path: &Path) -> Result<std::path::PathBuf, VotingError> {
+    std::fs::canonicalize(path).map_err(|error| VotingError::Storage {
+        message: format!("failed to resolve opened SQLite database path: {error}"),
+    })
 }
 
 #[cfg(test)]

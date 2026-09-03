@@ -74,7 +74,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   submission lease. The canonical path is resolved before SQLite opens it, so
   symlink retargeting and dangling targets cannot bind a connection to a
   different authority; the final open refuses symlinks introduced after
-  resolution. Explicit in-memory databases remain private to one handle.
+  resolution, and the opened path is canonicalized again so concurrent first
+  opens through case variants share authority on case-insensitive filesystems.
+  Explicit in-memory databases remain private to one handle.
 
 ### Removed
 

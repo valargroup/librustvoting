@@ -275,6 +275,42 @@ fn final_database_open_rejects_a_symlink_added_after_resolution() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn new_database_casing_aliases_converge_when_the_filesystem_is_case_insensitive() {
+    let directory = temporary_path("case-insensitive-parent");
+    std::fs::create_dir_all(&directory).unwrap();
+    let uppercase_path = directory.join("Voting.sqlite");
+    let lowercase_path = directory.join("voting.sqlite");
+    let uppercase_opening_path = canonical_database_path(&uppercase_path).unwrap();
+    let lowercase_opening_path = canonical_database_path(&lowercase_path).unwrap();
+
+    let lowercase_connection = open_canonical_database_file(&lowercase_opening_path).unwrap();
+    if !uppercase_opening_path.exists() {
+        drop(lowercase_connection);
+        remove_sqlite_files(&lowercase_path);
+        std::fs::remove_dir_all(directory).unwrap();
+        return;
+    }
+
+    let uppercase_connection = open_canonical_database_file(&uppercase_opening_path).unwrap();
+    let uppercase_identity = canonical_opened_database_path(&uppercase_opening_path).unwrap();
+    let lowercase_identity = canonical_opened_database_path(&lowercase_opening_path).unwrap();
+    assert_eq!(uppercase_identity, lowercase_identity);
+
+    let uppercase_authority = DatabaseAuthority::for_file(uppercase_identity).unwrap();
+    let lowercase_authority = DatabaseAuthority::for_file(lowercase_identity).unwrap();
+    assert!(Arc::ptr_eq(&uppercase_authority, &lowercase_authority));
+
+    drop((
+        uppercase_authority,
+        lowercase_authority,
+        uppercase_connection,
+        lowercase_connection,
+    ));
+    remove_sqlite_files(&lowercase_path);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_file_paths_share_one_database_authority() {
