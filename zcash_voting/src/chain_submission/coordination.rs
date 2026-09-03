@@ -57,7 +57,7 @@ impl BundleOperationKey {
     }
 }
 
-/// Canonical process-local key for native and migration-only identities.
+/// Canonical process-local key for one submission identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct SubmissionOperationKey {
     bundle: BundleOperationKey,

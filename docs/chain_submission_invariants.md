@@ -461,7 +461,7 @@ Reconciliation is state-driven:
 - `Tracking` polls its candidate hash and never scans the tree. If a configured
   finite tracking window expires without a definitive result, it atomically
   becomes `Recovering` while retaining the candidate hash.
-- a bound `Recovering` row polls its candidate hash first. If hash polling does
+- a `Recovering` row polls its candidate hash first. If hash polling does
   not confirm, the lifecycle may perform one bounded tree recovery pass.
 - `Confirmed` and compatibility `Rejected` rows perform no network mutation,
   whatever the confirmation source.
@@ -480,7 +480,7 @@ receives one private process-local authorization for the captured identity,
 generation, host operation epoch, and continuously held round, bundle, and
 identity locks. The authorization is not persisted, cloned, returned, or
 reconstructed from a hashless row. It is consumed only by one immediate
-transaction that validates the same bound `Recovering` row, atomically clears
+transaction that validates the same `Recovering` row, atomically clears
 any remaining inconclusive candidate, and increments the attempt count to
 reserve one same-generation retry. The transaction consumes the no-match
 authorization. The authorization expires on cancellation, error, return, lock
@@ -509,7 +509,7 @@ timestamp maintenance cannot reset or extend the window.
 Restart plans are derived from the authoritative row:
 
 - `Tracking` schedules hash polling;
-- bound `Recovering` schedules candidate-first reconciliation and tree
+- `Recovering` schedules candidate-first reconciliation and tree
   recovery, then same-generation retry when permitted;
 - `Confirmed` enables dependent domain and helper work;
 - a compatibility `Rejected` row schedules no reconciliation; and
@@ -522,7 +522,7 @@ successor VAN. Independent bundles remain schedulable.
 
 Tree recovery is authorized only by a durable `Recovering` row. It never runs
 for ordinary `Tracking` even when its hash is pending, or for fresh unsubmitted
-work. A pending candidate carried by a bound `Recovering`
+work. A pending candidate carried by a `Recovering`
 row is polled first and does not prevent the subsequent tree pass.
 
 Before scanning, the lifecycle re-derives the generation digest and complete
@@ -892,7 +892,7 @@ Tests cover:
 - hash polling produces atomic `Confirmed`;
 - a chain rejection code produces bound hashless `Recovering` with a redacted
   diagnostic;
-- committed failure clears the tracked candidate into bound `Recovering`;
+- committed failure clears the tracked candidate into `Recovering`;
 - definite pre-dispatch failure does not create ambiguity;
 - every possibly-dispatched class produces `Recovering`;
 - restart from `Submitting` produces `Recovering`;
@@ -934,7 +934,7 @@ Tests cover:
   limits even though later invocations may reconcile and retry;
 - restart after the combined transaction conservatively requires a new
   completed valid no-match pass before retry;
-- an originally hashless bound `Recovering` row likewise cannot POST before a
+- an originally hashless `Recovering` row likewise cannot POST before a
   completed valid no-match pass, so retry permission never depends on
   non-durable scan history;
 - a retired transaction that later commits is confirmed by its exact tree
@@ -1009,7 +1009,7 @@ Tests cover:
   row and remains fresh delegate work;
 - a version-17 round id that cannot form a canonical identity creates no
   submission row and leaves its domain evidence untouched;
-- a hashless bound `Recovering` row remains `Recovering` after a retry receives
+- a hashless `Recovering` row remains `Recovering` after a retry receives
   a definite rejection, leaving exact tree recovery available;
 - fresh and migrated v18 schema equivalence and stale-v18 fingerprint
   rejection, including missing columns, indexes, and triggers;

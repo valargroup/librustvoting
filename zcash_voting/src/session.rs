@@ -1194,7 +1194,7 @@ pub fn resume_plan(
                     }
                 }
                 // The chain-submission lifecycle owns every network action for
-                // this persisted generation, including migration-only guards.
+                // this persisted generation.
                 Some(VotePhase::SubmissionManaged) => {}
                 // Prepared or no row yet -> still needs casting.
                 _ => {
