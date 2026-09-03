@@ -305,12 +305,17 @@ pub async fn track_committed_vote_shares(
 ///
 /// - [`ChainSubmissionResult::Confirmed`] once confirmation is durable,
 /// - [`ChainSubmissionResult::Pending`] to schedule another call,
+/// - [`ChainSubmissionResult::SubmittedWithoutHash`] when bounded dispatch is
+///   durably complete without a usable transaction hash,
 /// - [`ChainSubmissionResult::Rejected`] for a deterministic chain rejection, or
 /// - [`ChainSubmissionResult::Cancelled`] when cancellation preceded dispatch.
 ///
-/// Call this in a loop that re-invokes on `Pending`. Exact-tree recovery is
-/// harmless before the lifecycle reaches `Recovering` and lets the same loop
-/// resolve a hashless recovery instead of returning it unchanged forever.
+/// Call this in a loop that re-invokes only on `Pending`. A
+/// `SubmittedWithoutHash` result is terminal but unconfirmed: surface its
+/// diagnostic for manual handling and do not retry it automatically. Exact-tree
+/// recovery is harmless before the lifecycle reaches `Recovering` and lets the
+/// same loop resolve a hashless recovery instead of returning it unchanged
+/// forever.
 /// Helper-share delivery is separate: plan with
 /// [`prepare_committed_vote_shares`] and send through
 /// [`submit_committed_vote_shares`] after the vote confirms.
