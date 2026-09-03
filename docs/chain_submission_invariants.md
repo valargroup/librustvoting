@@ -124,7 +124,9 @@ accepted for reuse. Validation reproduces the target-bound VAN commitment, so
 a same-network, same-round hotkey substitution cannot reuse another target's
 proof. A progress callback that reenters proof generation for the same identity
 on the same thread fails with `VotingError::Busy` rather than waiting on its own
-lock.
+lock, including when reentry occurs from the waiting notification. Terminal
+submission rejection preserves and reuses the proof bound to the rejected
+generation; proof preparation cannot replace it with new randomized bytes.
 
 ## Identity and semantic generation
 
@@ -1255,6 +1257,8 @@ Tests cover:
   account switch cannot retarget a waiting proof operation or its PIR cache;
 - a same-round hotkey substitution cannot reuse a persisted proof, and
   same-thread progress callback reentry fails without deadlocking;
+- waiting-callback reentry fails without recursion, and a terminally rejected
+  delegation continues to reuse its generation-bound proof;
 - bundle locking prevents two successors from consuming the same VAN;
 - a confirmed vote or batch refuses a later delegation reservation for its
   bundle before derivation or dispatch;
@@ -1344,6 +1348,8 @@ Delegation proof coordination is anchored by
 are anchored by `reused_proof_rejects_mismatched_notes`,
 `reused_proof_rejects_mismatched_keys`,
 `reentrant_progress_reporter_returns_busy`,
+`wait_callback_reentry_returns_busy`,
+`rejected_delegation_reuses_persisted_proof`,
 `wallet_switch_does_not_retarget_waiting_proof`, and
 `pir_fetch_persists_under_captured_wallet`.
 

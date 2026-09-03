@@ -32,6 +32,10 @@ pub(super) fn run_exclusively<T>(
         });
     }
 
+    // Cover both the wait callback and the admitted operation. A callback may
+    // synchronously enter the public proof facade before this thread owns the
+    // process-local lock.
+    let active_identity = ActiveProofIdentity::enter(identity.clone());
     let proof_lock = proof_lock_for(&identity);
     let proof_guard = match proof_lock.try_lock() {
         Ok(guard) => guard,
@@ -43,7 +47,6 @@ pub(super) fn run_exclusively<T>(
         }
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
     };
-    let active_identity = ActiveProofIdentity::enter(identity.clone());
 
     let output = operation(&identity);
     drop(active_identity);

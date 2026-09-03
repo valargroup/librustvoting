@@ -1274,6 +1274,7 @@ fn load_persisted_proof(
             | DelegationPhase::Submitted
             | DelegationPhase::SubmissionManaged
             | DelegationPhase::SubmittedWithoutHash
+            | DelegationPhase::SubmissionRejected
             | DelegationPhase::Confirmed
     ) {
         return Ok(None);

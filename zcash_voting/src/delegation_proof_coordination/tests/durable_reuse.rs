@@ -123,6 +123,34 @@ fn reentrant_progress_reporter_returns_busy() {
 }
 
 #[test]
+fn rejected_delegation_reuses_persisted_proof() {
+    let db = db_with_persisted_proofs();
+    db.conn()
+        .execute(
+            "INSERT INTO chain_submissions
+             (identity_key, round_id, wallet_id, network, bundle_index, kind,
+              generation_digest, state, committed_post_reservations, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'testnet', 0, 'delegation', ?4, 'rejected', 1, 10, 10)",
+            rusqlite::params![vec![0x51u8; 32], ROUND_ID, WALLET_A, vec![0x52u8; 32]],
+        )
+        .unwrap();
+
+    let completion = ensure_proof(
+        &db,
+        ROUND_ID,
+        0,
+        &[note()],
+        &keys(Network::Testnet, 1),
+        &pir_client(),
+        &crate::types::NoopProgressReporter,
+    )
+    .unwrap();
+
+    assert_eq!(completion.status, DelegationProofStatus::Reused);
+    assert_eq!(completion.proof.bytes, vec![WALLET_A_PROOF_BYTE; 96]);
+}
+
+#[test]
 fn wallet_switch_does_not_retarget_waiting_proof() {
     let db = Arc::new(db_with_persisted_proofs());
     let leader_started = Arc::new(Barrier::new(2));

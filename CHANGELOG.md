@@ -13,7 +13,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   Use `delegate::ensure_proof` or
   `PreparedDelegationBundle::ensure_proof`; both validate the supplied notes
   and target-bound keys before returning a generated or reused proof. Same-
-  bundle reentry from a progress callback now returns `VotingError::Busy`.
+  bundle reentry from any progress callback now returns `VotingError::Busy`,
+  and terminally rejected submissions retain their generation-bound proof.
 - **Breaking:** removed `delegate::DelegationSigner` and replaced
   `AdvanceDelegation::signer` with `spend_auth_signature`. Delegation chain
   submission now accepts only the external SpendAuth signature and loads the

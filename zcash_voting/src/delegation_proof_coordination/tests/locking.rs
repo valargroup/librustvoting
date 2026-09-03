@@ -164,3 +164,61 @@ fn failed_leader_releases_the_waiting_retry() {
     ));
     assert_eq!(follower.join().unwrap().unwrap(), "generated after retry");
 }
+
+#[test]
+fn wait_callback_reentry_returns_busy() {
+    let leader_started = Arc::new(Barrier::new(2));
+    let release_leader = Arc::new((Mutex::new(false), Condvar::new()));
+    let leader = {
+        let leader_started = Arc::clone(&leader_started);
+        let release_leader = Arc::clone(&release_leader);
+        thread::spawn(move || {
+            coordinate(
+                identity("wait-reentry-wallet", 0),
+                || {},
+                |_| {
+                    leader_started.wait();
+                    let (released, wake) = &*release_leader;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    Ok(())
+                },
+            )
+        })
+    };
+    leader_started.wait();
+
+    let wait_callback_started = Arc::new(AtomicBool::new(false));
+    let nested_call_was_busy = Arc::new(AtomicBool::new(false));
+    let follower = {
+        let wait_callback_started = Arc::clone(&wait_callback_started);
+        let nested_call_was_busy = Arc::clone(&nested_call_was_busy);
+        thread::spawn(move || {
+            coordinate(
+                identity("wait-reentry-wallet", 0),
+                || {
+                    wait_callback_started.store(true, Ordering::SeqCst);
+                    let nested = coordinate(identity("wait-reentry-wallet", 0), || {}, |_| Ok(()));
+                    nested_call_was_busy.store(
+                        matches!(nested, Err(VotingError::Busy { .. })),
+                        Ordering::SeqCst,
+                    );
+                },
+                |_| Ok(()),
+            )
+        })
+    };
+
+    while !wait_callback_started.load(Ordering::SeqCst) {
+        thread::yield_now();
+    }
+    let (released, wake) = &*release_leader;
+    *released.lock().unwrap() = true;
+    wake.notify_all();
+
+    leader.join().unwrap().unwrap();
+    follower.join().unwrap().unwrap();
+    assert!(nested_call_was_busy.load(Ordering::SeqCst));
+}
