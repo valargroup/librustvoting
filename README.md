@@ -52,6 +52,16 @@ Halo2 dependency graph each time. Contributors who switch backends often can use
 the `make` targets, which give each feature permutation its own
 `CARGO_TARGET_DIR`; run `make help` for the list.
 
+## Releases and Branching
+
+`main` is the development line for the next release. Each shipped major series
+is maintained on a `release/vMAJOR.x` branch, and semver-compatible fixes reach
+those branches through reviewed automated backports rather than direct pushes.
+
+See [Release branches and backports](docs/release-branches.md) for the backport
+labels and the rules for what may ship on a maintenance line, and
+[CONTRIBUTING.md](CONTRIBUTING.md) for the build, test, and code standards.
+
 ## Wallet API Lifecycle
 
 New wallet integrations should import `zcash_voting::prelude::*` and use the
