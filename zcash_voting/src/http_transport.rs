@@ -13,7 +13,6 @@ use bytes::Bytes;
 use http::{Method, Request};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, Response};
-use hyper_rustls::HttpsConnector;
 use hyper_util::{
     client::legacy::{
         connect::{Connect, HttpConnector},
@@ -236,7 +235,71 @@ pub trait RouteHttp: Send + Sync + 'static {
     ) -> RouteFuture<'a>;
 }
 
+tokio::task_local! {
+    /// Absolute deadline of the request in flight, read by
+    /// [`ConnectDeadlineConnector`] so connection setup (TCP and TLS) times
+    /// out as a connect error, which Hyper reports distinctly and the route
+    /// classifies as pre-dispatch.
+    static DIRECT_CONNECT_DEADLINE: Option<tokio::time::Instant>;
+}
+
+/// Applies the in-flight request deadline to connection setup.
+///
+/// Wrapping the complete TCP+TLS connector matters: a stalled TLS handshake
+/// has still not dispatched an HTTP request, so it must surface as a connect
+/// failure rather than race the whole-request deadline into an ambiguous
+/// outcome.
+#[derive(Clone)]
+struct ConnectDeadlineConnector<C> {
+    inner: C,
+}
+
+impl<C, T, E> tower_service::Service<http::Uri> for ConnectDeadlineConnector<C>
+where
+    C: tower_service::Service<http::Uri, Response = T, Error = E> + Send,
+    C::Future: Send + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Response = T;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<T, Self::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        self.inner
+            .poll_ready(cx)
+            .map(|result| result.map_err(Into::into))
+    }
+
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let future = self.inner.call(uri);
+        let deadline = DIRECT_CONNECT_DEADLINE
+            .try_with(|deadline| *deadline)
+            .ok()
+            .flatten();
+        Box::pin(async move {
+            match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, future)
+                    .await
+                    .map_err(|_| {
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "connection setup timed out before request dispatch",
+                        )) as Self::Error
+                    })?
+                    .map_err(Into::into),
+                None => future.await.map_err(Into::into),
+            }
+        })
+    }
+}
+
 /// SDK-owned direct HTTP/HTTPS executor with a pooled Hyper client.
+///
+/// Connection setup runs under the request deadline, so a TCP or TLS stall
+/// is reported as a connect failure and classified as pre-dispatch.
 pub struct DirectRoute {
     client: Box<dyn HyperRequestClient>,
 }
@@ -254,12 +317,22 @@ impl DirectRoute {
     ///
     /// This preserves WebPKI roots, HTTP/1 and HTTP/2 support, and cleartext
     /// HTTP compatibility while letting the host control how sockets are
-    /// opened. Hyper pools connections: a host whose route can change must
-    /// close or invalidate already-open I/O when the old route is no longer
-    /// permitted, or route every request through its own [`RouteHttp`].
+    /// opened. Connection setup, TLS included, runs under the request
+    /// deadline so a stall there is a connect failure. Hyper pools
+    /// connections: a host whose route can change must close or invalidate
+    /// already-open I/O when the old route is no longer permitted, or route
+    /// every request through its own [`RouteHttp`].
     pub fn with_http_connector<C>(connector: C) -> Self
     where
-        HttpsConnector<C>: Connect + Clone + Send + Sync + 'static,
+        C: tower_service::Service<http::Uri> + Clone + Send + Sync + 'static,
+        C::Response: hyper_util::client::legacy::connect::Connection
+            + hyper::rt::Read
+            + hyper::rt::Write
+            + Unpin
+            + Send
+            + 'static,
+        C::Future: Send + 'static,
+        C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         ensure_rustls_provider();
         let https = hyper_rustls::HttpsConnectorBuilder::new()
@@ -268,10 +341,13 @@ impl DirectRoute {
             .enable_http1()
             .enable_http2()
             .wrap_connector(connector);
-        Self::with_connector(https)
+        Self::with_connector(ConnectDeadlineConnector { inner: https })
     }
 
     /// Uses a fully configured Hyper connector without adding TLS.
+    ///
+    /// The connector is used as given; only [`Self::with_http_connector`]
+    /// and [`Self::new`] bound connection setup by the request deadline.
     pub fn with_connector<C>(connector: C) -> Self
     where
         C: Connect + Clone + Send + Sync + 'static,
@@ -307,51 +383,54 @@ impl RouteHttp for DirectRoute {
                         RouteError::before_dispatch(format!("build HTTP request: {error}"))
                     })?;
             let max_response_bytes = request.max_response_bytes;
+            let deadline = tokio::time::Instant::now().checked_add(request.timeout);
             // The SDK enforces `request.timeout` around this future, and a
-            // deadline it observes is classified by the dispatch hook, so no
-            // second deadline is applied here.
-            async move {
-                // Hyper offers no hook between connection setup and the first
-                // request byte, so dispatch is marked before the request is
-                // handed over. A connect failure is reported distinctly and
-                // reclassified as pre-dispatch below.
-                on_dispatch();
-                let response = self.client.request(hyper_request).await.map_err(|error| {
-                    let message = format!("send HTTP request: {error}");
-                    if error.is_connect() {
-                        RouteError::before_dispatch(message)
-                    } else {
-                        RouteError::after_dispatch(message)
-                    }
-                })?;
-                let status = response.status().as_u16();
-                let headers = response
-                    .headers()
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        value
-                            .to_str()
-                            .ok()
-                            .map(|value| (name.as_str().to_string(), value.to_string()))
-                    })
-                    .collect();
-                let body = Limited::new(response.into_body(), max_response_bytes)
-                    .collect()
-                    .await
-                    .map_err(|error| {
-                        RouteError::response_read(format!(
+            // deadline it observes is classified by the dispatch hook. The
+            // connector reads the same deadline so connection setup fails as
+            // a connect error instead.
+            DIRECT_CONNECT_DEADLINE
+                .scope(deadline, async move {
+                    // Hyper offers no hook between connection setup and the first
+                    // request byte, so dispatch is marked before the request is
+                    // handed over. A connect failure is reported distinctly and
+                    // reclassified as pre-dispatch below.
+                    on_dispatch();
+                    let response = self.client.request(hyper_request).await.map_err(|error| {
+                        let message = format!("send HTTP request: {error}");
+                        if error.is_connect() {
+                            RouteError::before_dispatch(message)
+                        } else {
+                            RouteError::after_dispatch(message)
+                        }
+                    })?;
+                    let status = response.status().as_u16();
+                    let headers = response
+                        .headers()
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            value
+                                .to_str()
+                                .ok()
+                                .map(|value| (name.as_str().to_string(), value.to_string()))
+                        })
+                        .collect();
+                    let body = Limited::new(response.into_body(), max_response_bytes)
+                        .collect()
+                        .await
+                        .map_err(|error| {
+                            RouteError::response_read(format!(
                             "read HTTP response body (limit {max_response_bytes} bytes): {error}"
                         ))
-                    })?
-                    .to_bytes()
-                    .to_vec();
-                Ok(RouteResponse {
-                    status,
-                    headers,
-                    body,
+                        })?
+                        .to_bytes()
+                        .to_vec();
+                    Ok(RouteResponse {
+                        status,
+                        headers,
+                        body,
+                    })
                 })
-            }
-            .await
+                .await
         })
     }
 }
@@ -390,7 +469,15 @@ impl HyperTransport<DirectRoute> {
     /// See [`DirectRoute::with_http_connector`].
     pub fn with_http_connector<C>(connector: C) -> Self
     where
-        HttpsConnector<C>: Connect + Clone + Send + Sync + 'static,
+        C: tower_service::Service<http::Uri> + Clone + Send + Sync + 'static,
+        C::Response: hyper_util::client::legacy::connect::Connection
+            + hyper::rt::Read
+            + hyper::rt::Write
+            + Unpin
+            + Send
+            + 'static,
+        C::Future: Send + 'static,
+        C::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         Self::with_route(DirectRoute::with_http_connector(connector))
     }
@@ -909,6 +996,30 @@ mod route_tests {
                 .await,
             Err(HelperTransportError::Timeout)
         ));
+    }
+
+    #[tokio::test]
+    async fn direct_tls_stall_is_a_definite_pre_dispatch_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            // Accept TCP but never complete TLS.
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        let transport = HyperTransport::new();
+        let result = transport
+            .post_json(
+                &format!("https://{address}/shielded-vote/v1/shares"),
+                b"{}".to_vec(),
+                Duration::from_millis(40),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(HelperTransportError::Transport(_))),
+            "{result:?}"
+        );
+        server.join().unwrap();
     }
 
     #[tokio::test]
