@@ -1303,11 +1303,30 @@ mod tests {
         VotingHotkey,
         crate::vote::VanWitness,
     ) {
+        confirmed_capability_fixture_for_db(test_db(path))
+    }
+
+    fn confirmed_capability_fixture_in_memory() -> (
+        VotingDb,
+        VotingRoundParams,
+        VotingHotkey,
+        crate::vote::VanWitness,
+    ) {
+        confirmed_capability_fixture_for_db(memory_test_db())
+    }
+
+    fn confirmed_capability_fixture_for_db(
+        customer: VotingDb,
+    ) -> (
+        VotingDb,
+        VotingRoundParams,
+        VotingHotkey,
+        crate::vote::VanWitness,
+    ) {
         use crate::confirmation::{confirm_delegation_submission, TxEvent, TxEventAttribute};
         use vote_commitment_tree::MemoryTreeServer;
 
         let (_, params, hotkey, capability) = exported_fixture();
-        let customer = test_db(path);
         import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
 
         for bundle_index in 0..2 {
@@ -1360,7 +1379,7 @@ mod tests {
             types::NoopProgressReporter,
             vote::{DraftVote, VoteSigner},
         };
-        let (customer, params, hotkey, witness) = confirmed_capability_fixture(":memory:");
+        let (customer, params, hotkey, witness) = confirmed_capability_fixture_in_memory();
         let committed = crate::vote::commit(
             &customer,
             &params.vote_round_id,
