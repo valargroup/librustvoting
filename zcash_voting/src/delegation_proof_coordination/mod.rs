@@ -41,9 +41,9 @@ impl DelegationProofIdentity {
 ///
 /// `on_wait` runs before blocking behind an existing operation. The operation
 /// must re-read durable proof state after admission; coordination itself does
-/// not treat an earlier caller's success as authoritative. Reentry for the
-/// same identity on the current thread returns [`VotingError::Busy`] instead
-/// of waiting on the thread's own lock.
+/// not treat an earlier caller's success as authoritative. Any nested proof
+/// coordination on the current thread returns [`VotingError::Busy`], including
+/// a different identity, to prevent callback-driven lock-order deadlocks.
 pub(super) fn coordinate<T>(
     identity: DelegationProofIdentity,
     on_wait: impl FnOnce(),

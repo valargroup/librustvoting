@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex, OnceLock, TryLockError, Weak},
 };
 
@@ -13,8 +13,8 @@ type ProofLockRegistry = Mutex<HashMap<DelegationProofIdentity, Weak<Mutex<()>>>
 static DELEGATION_PROOF_LOCKS: OnceLock<ProofLockRegistry> = OnceLock::new();
 
 thread_local! {
-    static ACTIVE_PROOF_IDENTITIES: RefCell<HashSet<DelegationProofIdentity>> =
-        RefCell::new(HashSet::new());
+    static ACTIVE_PROOF_IDENTITY: RefCell<Option<DelegationProofIdentity>> =
+        RefCell::new(None);
 }
 
 pub(super) fn run_exclusively<T>(
@@ -22,10 +22,12 @@ pub(super) fn run_exclusively<T>(
     on_wait: impl FnOnce(),
     operation: impl FnOnce(&DelegationProofIdentity) -> Result<T, VotingError>,
 ) -> Result<T, VotingError> {
-    if proof_is_active_on_current_thread(&identity) {
+    if let Some(active_identity) = active_proof_identity_on_current_thread() {
         return Err(VotingError::Busy {
             message: format!(
-                "delegation proof generation is already active on this thread for round {} bundle {}",
+                "delegation proof generation is already active on this thread for round {} bundle {}; cannot enter round {} bundle {}",
+                active_identity.round_id(),
+                active_identity.bundle_index(),
                 identity.round_id(),
                 identity.bundle_index(),
             ),
@@ -55,8 +57,8 @@ pub(super) fn run_exclusively<T>(
     output
 }
 
-fn proof_is_active_on_current_thread(identity: &DelegationProofIdentity) -> bool {
-    ACTIVE_PROOF_IDENTITIES.with(|active| active.borrow().contains(identity))
+fn active_proof_identity_on_current_thread() -> Option<DelegationProofIdentity> {
+    ACTIVE_PROOF_IDENTITY.with(|active| active.borrow().clone())
 }
 
 struct ActiveProofIdentity {
@@ -65,11 +67,11 @@ struct ActiveProofIdentity {
 
 impl ActiveProofIdentity {
     fn enter(identity: DelegationProofIdentity) -> Self {
-        ACTIVE_PROOF_IDENTITIES.with(|active| {
-            let inserted = active.borrow_mut().insert(identity.clone());
+        ACTIVE_PROOF_IDENTITY.with(|active| {
+            let previous = active.borrow_mut().replace(identity.clone());
             debug_assert!(
-                inserted,
-                "reentrant proof identity passed the preflight check"
+                previous.is_none(),
+                "nested proof passed the preflight check"
             );
         });
         Self { identity }
@@ -78,8 +80,9 @@ impl ActiveProofIdentity {
 
 impl Drop for ActiveProofIdentity {
     fn drop(&mut self) {
-        ACTIVE_PROOF_IDENTITIES.with(|active| {
-            active.borrow_mut().remove(&self.identity);
+        ACTIVE_PROOF_IDENTITY.with(|active| {
+            let removed = active.borrow_mut().take();
+            debug_assert_eq!(removed.as_ref(), Some(&self.identity));
         });
     }
 }

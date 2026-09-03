@@ -123,6 +123,48 @@ fn reentrant_progress_reporter_returns_busy() {
 }
 
 #[test]
+fn cross_bundle_reentrant_progress_reporter_returns_busy() {
+    let db = Arc::new(db_with_persisted_proofs());
+    let reentrant_error = Arc::new(Mutex::new(None));
+    let callback_error = Arc::clone(&reentrant_error);
+    let callback_db = Arc::clone(&db);
+    let progress = DelegationProgressBridge::new(move |event| {
+        if event == DelegationProgress::ProofComplete {
+            let error = ensure_proof(
+                &callback_db,
+                ROUND_ID,
+                1,
+                &[note()],
+                &keys(Network::Testnet, 1),
+                &pir_client(),
+                &crate::types::NoopProgressReporter,
+            )
+            .expect_err("cross-bundle proof reentry must not acquire another proof lock");
+            *callback_error.lock().unwrap() = Some(error);
+        }
+    });
+
+    let completion = ensure_proof(
+        &db,
+        ROUND_ID,
+        0,
+        &[note()],
+        &keys(Network::Testnet, 1),
+        &pir_client(),
+        &progress,
+    )
+    .unwrap();
+
+    assert_eq!(completion.status, DelegationProofStatus::Reused);
+    assert!(matches!(
+        reentrant_error.lock().unwrap().take(),
+        Some(VotingError::Busy { message })
+            if message.contains("cannot enter round")
+                && message.contains("bundle 1")
+    ));
+}
+
+#[test]
 fn rejected_delegation_reuses_persisted_proof() {
     let db = db_with_persisted_proofs();
     db.conn()

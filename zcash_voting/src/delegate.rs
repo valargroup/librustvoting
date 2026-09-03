@@ -1176,7 +1176,8 @@ pub fn signing_request(
 ///
 /// Witnesses and PIR proof precompute data must already be present. The proof
 /// result is checked against PCZT-derived public fields before persistence.
-/// Calls made reentrantly from a progress reporter for the same bundle return
+/// Calls made reentrantly from a progress reporter while any proof operation is
+/// active on the current thread return
 /// [`VotingError::Busy`].
 pub fn prove(
     db: &VotingDb,
@@ -1201,7 +1202,8 @@ pub fn prove(
 ///
 /// Returns [`VotingError`] when durable state cannot be read or validated, or
 /// when proof generation or persistence fails. A call made reentrantly from a
-/// progress reporter for the same bundle returns [`VotingError::Busy`].
+/// progress reporter while any proof operation is active on the current thread
+/// returns [`VotingError::Busy`].
 pub fn ensure_proof(
     db: &VotingDb,
     round_id: &str,
