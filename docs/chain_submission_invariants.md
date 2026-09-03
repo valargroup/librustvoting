@@ -734,9 +734,9 @@ recovery-independent identity lock set. Under those locks, admission loads the
 persisted roster and requires an exact ordered match before inserting a batch
 row. A missing, truncated, reordered,
 duplicated, or otherwise changed roster fails without touching an identity that
-was not locked. The request rejects rosters above the 15-action protocol
-maximum before allocating lock identities. No persisted roster is read before the operation
-and identity locks.
+was not locked. The request rejects rosters above the 50-action protocol
+maximum before allocating lock identities. No persisted roster is read before
+the operation and identity locks.
 The coordination authority is owned by the database authority, so constructing
 multiple coordinators for one store cannot create disjoint lock registries.
 Cleanup and deletion acquire the same round gate exclusively and treat an

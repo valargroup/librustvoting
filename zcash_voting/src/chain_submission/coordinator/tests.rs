@@ -1749,6 +1749,8 @@ fn batch_request_supplies_its_complete_recovery_independent_lock_set() {
 
 #[test]
 fn batch_request_enforces_protocol_action_bounds() {
+    assert_eq!(crate::vote::MAX_VOTE_BATCH_ACTIONS, 50);
+
     let batch = batch_identity(0);
     let one = StoreAdvancementRequest::vote_batch(batch.clone(), vec![1]).unwrap();
     assert_eq!(one.applicable_identities().len(), 2);
