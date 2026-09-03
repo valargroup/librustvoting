@@ -122,14 +122,13 @@ while the operation is waiting or running. Supplied bundle notes and delegation
 keys are validated against that captured wallet before any persisted proof is
 accepted for reuse. Validation reproduces the target-bound VAN commitment, so
 a same-network, same-round hotkey substitution cannot reuse another target's
-proof. Progress emitted while a proof operation owns its process-local lock is
-accumulated and delivered in order after the lock is released. A reporter may
-therefore enter proof generation directly or dispatch it to another thread
-without waiting on the operation that invoked the reporter. The
-`WaitingForExistingProof` notification remains immediate because its caller
-does not yet own the proof lock; direct same-thread reentry from that
-notification fails with `VotingError::Busy`, even for a different bundle
-identity. Different bundle identities remain independent throughout.
+proof. Progress, including the waiting notification, is delivered live and in
+emission order from a dedicated delivery thread that the proof operation never
+waits on. A reporter may therefore enter proof generation directly or dispatch
+it to another thread; that work waits at most until the operation releases its
+lock, which it does without waiting on the reporter. `ensure_proof` returns
+only after every emitted event has been delivered. Different bundle identities
+remain independent throughout.
 Terminal submission rejection preserves and reuses the proof bound to the
 rejected generation; proof preparation cannot replace it with new randomized
 bytes.
@@ -1354,7 +1353,12 @@ Delegation proof coordination is anchored by
 `failed_leader_releases_the_waiting_retry`. Durable reuse and wallet capture
 are anchored by `reused_proof_rejects_mismatched_notes`,
 `reused_proof_rejects_mismatched_keys`,
-`reentrant_progress_reporter_returns_busy`,
+`reentrant_progress_reporter_reuses_after_lock_release`,
+`cross_thread_reentrant_progress_reporter_reuses_after_lock_release`,
+`progress_reaches_the_host_while_the_operation_is_still_running`,
+`blocked_host_callback_does_not_stall_the_producer`,
+`hammered_identities_never_overlap_and_every_caller_returns`,
+`panicking_producer_releases_waiters_and_its_own_thread`,
 `wait_callback_reentry_returns_busy`,
 `rejected_delegation_reuses_persisted_proof`,
 `wallet_switch_does_not_retarget_waiting_proof`, and

@@ -6,7 +6,10 @@
 
 mod proof_lock;
 
-use std::sync::Mutex;
+use std::{
+    sync::{mpsc, Mutex},
+    thread,
+};
 
 use crate::{delegate::DelegationProgress, types::DelegationProgressReporter, VotingError};
 
@@ -39,31 +42,53 @@ impl DelegationProofIdentity {
     }
 }
 
-/// Collects proof progress while coordination is locked for delivery after
-/// the durable proof operation has released its lock.
-#[derive(Default)]
-pub(super) struct DeferredProgressReporter {
-    events: Mutex<Vec<DelegationProgress>>,
+/// Runs `operation` while a dedicated delivery thread forwards its progress to
+/// `host` as it happens.
+///
+/// The operation only enqueues events, so it never blocks on the host. A host
+/// callback may therefore enter proof coordination directly or hand it to
+/// another thread: at worst that work waits for the operation to release its
+/// proof lock, which the operation does without waiting on the callback.
+/// Delivery preserves emission order, and this function returns only after
+/// every emitted event has been delivered.
+///
+/// A panic inside a host callback surfaces here after the operation finishes.
+pub(super) fn with_live_progress<T>(
+    host: &dyn DelegationProgressReporter,
+    operation: impl FnOnce(&dyn DelegationProgressReporter) -> T,
+) -> T {
+    thread::scope(|scope| {
+        let (sender, receiver) = mpsc::channel::<DelegationProgress>();
+        scope.spawn(move || {
+            for event in receiver {
+                host.on_progress(event);
+            }
+        });
+        let relay = LiveProgressRelay {
+            sender: Mutex::new(sender),
+        };
+        let output = operation(&relay);
+        // Closing the channel lets the delivery thread drain and exit; the
+        // scope then joins it before returning.
+        drop(relay);
+        output
+    })
 }
 
-impl DeferredProgressReporter {
-    pub(super) fn replay(&self, reporter: &dyn DelegationProgressReporter) {
-        let events = self
-            .events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for event in events.iter().copied() {
-            reporter.on_progress(event);
-        }
-    }
+/// Enqueues proof progress for the delivery thread in [`with_live_progress`].
+struct LiveProgressRelay {
+    sender: Mutex<mpsc::Sender<DelegationProgress>>,
 }
 
-impl DelegationProgressReporter for DeferredProgressReporter {
+impl DelegationProgressReporter for LiveProgressRelay {
     fn on_progress(&self, progress: DelegationProgress) {
-        self.events
+        // A closed receiver only happens if delivery already stopped; there is
+        // nobody left to notify, so dropping the event is the correct outcome.
+        let _ = self
+            .sender
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(progress);
+            .send(progress);
     }
 }
 
@@ -74,6 +99,8 @@ impl DelegationProgressReporter for DeferredProgressReporter {
 /// not treat an earlier caller's success as authoritative. Any nested proof
 /// coordination on the current thread returns [`VotingError::Busy`], including
 /// a different identity, to prevent callback-driven lock-order deadlocks.
+/// Host progress callbacks never run on the operation's thread; see
+/// [`with_live_progress`].
 pub(super) fn coordinate<T>(
     identity: DelegationProofIdentity,
     on_wait: impl FnOnce(),

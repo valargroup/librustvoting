@@ -13,9 +13,9 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
   Use `delegate::ensure_proof` or
   `PreparedDelegationBundle::ensure_proof`; both validate the supplied notes
   and target-bound keys before returning a generated or reused proof. Proof
-  progress callbacks run after the single-flight lock is released, preventing
-  callback-dispatched proof work from deadlocking, and terminally rejected
-  submissions retain their generation-bound proof.
+  progress is delivered live from a delivery thread the producer never waits
+  on, so reporters may reenter or dispatch proof work without deadlocking, and
+  terminally rejected submissions retain their generation-bound proof.
 - **Breaking:** removed `delegate::DelegationSigner` and replaced
   `AdvanceDelegation::signer` with `spend_auth_signature`. Delegation chain
   submission now accepts only the external SpendAuth signature and loads the
