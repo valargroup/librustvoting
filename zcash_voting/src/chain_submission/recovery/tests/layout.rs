@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn exact_vote_layout_recovers_adjacent_ordered_positions() {
+async fn first_block_accepts_omitted_zero_start_index_and_recovers_layout() {
     let (outcome, urls) = scan(&[[8; 32], [3; 32], [4; 32], [7; 32]], None)
         .await
         .unwrap();
@@ -31,7 +31,7 @@ async fn complete_no_match_authorizes_only_the_captured_generation_and_candidate
 }
 
 #[tokio::test]
-async fn empty_snapshot_is_a_complete_no_match_without_a_leaves_request() {
+async fn empty_snapshot_accepts_omitted_zero_metadata_without_a_leaves_request() {
     let (outcome, urls) = scan(&[], None).await.unwrap();
     assert!(matches!(outcome, RecoveryScanOutcome::NoMatch(_)));
     assert_eq!(urls.len(), 1);

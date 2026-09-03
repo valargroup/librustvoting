@@ -221,19 +221,42 @@ async fn incomplete_pagination_produces_no_authorization() {
     assert!(matches!(failure, RecoveryScanFailure::Invalid(_)));
 }
 
+#[tokio::test]
+async fn oversized_atomic_block_is_accepted_above_the_page_target() {
+    let leaves = vec![[8; 32]; VOTE_SDK_PAGE_LEAF_TARGET as usize + 1];
+
+    let (outcome, urls) = scan(&leaves, None).await.unwrap();
+
+    assert!(matches!(outcome, RecoveryScanOutcome::NoMatch(_)));
+    assert_eq!(urls.len(), 2);
+}
+
 #[test]
 fn full_tree_capacity_fits_the_fixed_request_and_byte_ceilings() {
     assert_eq!(MAX_RECOVERY_LEAVES, 16_777_216);
+    assert_eq!(VOTE_SDK_PAGE_LEAF_TARGET, 5_000);
+    assert_eq!(MAX_RECOVERY_LEAF_REQUESTS, 6_709);
+
+    let requests_for_four_thousand_leaf_blocks = MAX_RECOVERY_LEAVES.div_ceil(4_000);
+    assert_eq!(requests_for_four_thousand_leaf_blocks, 4_195);
+    assert!(requests_for_four_thousand_leaf_blocks <= MAX_RECOVERY_LEAF_REQUESTS as u64);
+
+    let paired_leaf_count = VOTE_SDK_PAGE_LEAF_TARGET + 1;
+    assert_eq!(MAX_RECOVERY_LEAVES / paired_leaf_count, 3_354);
+    assert_eq!(MAX_RECOVERY_LEAVES % paired_leaf_count, 3_862);
     assert_eq!(
-        MAX_RECOVERY_LEAVES.div_ceil(MAX_LEAVES_PER_PAGE as u64),
-        MAX_RECOVERY_REQUESTS as u64
+        maximum_whole_block_page_count(MAX_RECOVERY_LEAVES, VOTE_SDK_PAGE_LEAF_TARGET),
+        MAX_RECOVERY_LEAF_REQUESTS as u64
     );
+
+    let maximum_http_responses = MAX_RECOVERY_LEAF_REQUESTS as u64 + 1;
     assert_eq!(
-        MAX_RECOVERY_REQUESTS as u64 * MAX_RECOVERY_RESPONSE_BYTES as u64,
+        maximum_http_responses * MAX_RECOVERY_RESPONSE_BYTES as u64,
         MAX_RECOVERY_TOTAL_BYTES
     );
+    assert_eq!(MAX_RECOVERY_TOTAL_BYTES, 56_287_559_680);
     assert!(
-        MAX_RECOVERY_REQUESTS as u64 * RECOVERY_REQUEST_TIMEOUT.as_secs()
+        maximum_http_responses * RECOVERY_REQUEST_TIMEOUT.as_secs()
             <= RECOVERY_PASS_TIMEOUT.as_secs()
     );
 }

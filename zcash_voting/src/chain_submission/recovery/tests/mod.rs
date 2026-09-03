@@ -84,10 +84,7 @@ fn derived() -> DerivedChainSubmission {
 
 fn tree_responses(leaves: &[[u8; 32]]) -> Vec<ChainHttpResponse> {
     if leaves.is_empty() {
-        return vec![ChainHttpResponse::json(
-            200,
-            br#"{"tree":{"next_index":0,"height":0}}"#.to_vec(),
-        )];
+        return vec![ChainHttpResponse::json(200, br#"{"tree":{}}"#.to_vec())];
     }
     let mut frontier: Frontier<MerkleHashVote, { TREE_DEPTH as u8 }> = Frontier::empty();
     for leaf in leaves {
@@ -110,7 +107,7 @@ fn tree_responses(leaves: &[[u8; 32]]) -> Vec<ChainHttpResponse> {
             200,
             serde_json::to_vec(&serde_json::json!({
                 "blocks": [{
-                    "height": 1, "start_index": 0, "leaves": encoded, "root": root
+                    "height": 1, "leaves": encoded, "root": root
                 }],
                 "next_from_height": 0
             }))

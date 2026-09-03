@@ -24,7 +24,7 @@ const MAX_POST_ATTEMPTS_PER_PASS: usize = 8;
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(10 * 60);
 const CONTROL_CHECK_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Finite policy for one private coordinator instance.
+/// Finite policy for one bounded coordinator instance.
 #[derive(Clone)]
 pub(super) struct CoordinatorPolicy {
     tracking_window_seconds: u64,
@@ -88,7 +88,7 @@ pub(super) trait SubmissionControl: Send + Sync {
     fn operation_epoch(&self) -> u64;
 }
 
-/// Private lifecycle engine shared by Phase 5's future public entry points.
+/// Internal lifecycle engine backing the public chain-submission client.
 pub(super) struct ChainSubmissionCoordinator<T, S, C> {
     protocol: ChainProtocolClient<T>,
     store: Arc<S>,
@@ -847,17 +847,10 @@ where
                     SubmissionObservation::UsableCandidateHash(candidate),
                 )?
                 .public_result(),
-            PostAttemptOutcome::Rejected {
-                diagnostic,
-                candidate_transaction_hash,
-                ..
-            } => self
+            PostAttemptOutcome::Rejected { diagnostic, .. } => self
                 .classify_dispatched_post(
                     derived.generation(),
-                    candidate_transaction_hash.map_or(
-                        SubmissionObservation::DefiniteRejection(diagnostic),
-                        SubmissionObservation::UsableCandidateHash,
-                    ),
+                    SubmissionObservation::DefiniteRejection(diagnostic),
                 )?
                 .public_result(),
             PostAttemptOutcome::PossiblyDispatched(diagnostic) => self

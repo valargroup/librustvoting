@@ -16,12 +16,30 @@ use super::{
 };
 
 const MAX_RECOVERY_LEAVES: u64 = 1 << TREE_DEPTH;
-const MAX_RECOVERY_REQUESTS: usize = 4_096;
-const MAX_LEAVES_PER_PAGE: usize = 4_096;
+const VOTE_SDK_PAGE_LEAF_TARGET: u64 = 5_000;
+const MAX_RECOVERY_LEAF_REQUESTS: usize =
+    maximum_whole_block_page_count(MAX_RECOVERY_LEAVES, VOTE_SDK_PAGE_LEAF_TARGET) as usize;
 const MAX_RECOVERY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_RECOVERY_TOTAL_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_RECOVERY_TOTAL_BYTES: u64 =
+    (MAX_RECOVERY_LEAF_REQUESTS as u64 + 1) * MAX_RECOVERY_RESPONSE_BYTES as u64;
 const RECOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const RECOVERY_PASS_TIMEOUT: Duration = Duration::from_secs(72 * 60 * 60);
+const RECOVERY_PASS_TIMEOUT: Duration = Duration::from_secs(120 * 60 * 60);
+
+/// Maximum pages produced by vote-sdk's greedy, whole-block pagination.
+///
+/// Two consecutive non-final pages contain at least `target + 1` leaves:
+/// otherwise the second page's first indivisible block would have fit on the
+/// first page.
+const fn maximum_whole_block_page_count(leaves: u64, target: u64) -> u64 {
+    let paired_leaf_count = target + 1;
+    let complete_page_pairs = leaves / paired_leaf_count;
+    let trailing_page = if leaves.is_multiple_of(paired_leaf_count) {
+        0
+    } else {
+        1
+    };
+    complete_page_pairs * 2 + trailing_page
+}
 
 #[derive(Debug)]
 pub(super) enum RecoveryScanFailure {
@@ -68,8 +86,10 @@ struct LatestResponse {
 
 #[derive(Deserialize)]
 struct TreeState {
+    #[serde(default)]
     next_index: u64,
     root: Option<String>,
+    #[serde(default)]
     height: u64,
 }
 
@@ -83,7 +103,9 @@ struct LeavesResponse {
 
 #[derive(Deserialize)]
 struct LeafBlock {
+    #[serde(default)]
     height: u64,
+    #[serde(default)]
     start_index: u64,
     #[serde(default)]
     leaves: Vec<String>,
@@ -138,7 +160,8 @@ pub(super) async fn scan_exact_layout<'a, T: ChainTransport>(
         if interrupted() {
             return Err(RecoveryScanFailure::Interrupted);
         }
-        if leaf_request_count >= MAX_RECOVERY_REQUESTS || started.elapsed() > RECOVERY_PASS_TIMEOUT
+        if leaf_request_count >= MAX_RECOVERY_LEAF_REQUESTS
+            || started.elapsed() > RECOVERY_PASS_TIMEOUT
         {
             return Err(RecoveryScanFailure::Invalid(invalid(
                 "tree recovery exhausted its bounded pass",
@@ -158,9 +181,9 @@ pub(super) async fn scan_exact_layout<'a, T: ChainTransport>(
             )));
         }
         let page_leaf_count: usize = page.blocks.iter().map(|block| block.leaves.len()).sum();
-        if page_leaf_count > MAX_LEAVES_PER_PAGE {
+        if page_leaf_count as u64 > snapshot.next_index.saturating_sub(next_index) {
             return Err(RecoveryScanFailure::Invalid(invalid(
-                "tree recovery page exceeds the leaf limit",
+                "tree recovery page exceeds the fixed snapshot",
             )));
         }
         for block in page.blocks {

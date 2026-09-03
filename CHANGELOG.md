@@ -8,13 +8,14 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 
 ### Added
 
-- Added the inactive private chain-submission lifecycle coordinator and store
-  contract, including durable pre-POST reservation, bounded failover,
-  candidate reconciliation, restart-stable tracking deadlines, sticky
-  recovery, atomic confirmation, canonical lifecycle serialization,
-  store-owned lock authority, causal bundle admission, strict batch-roster and
-  confirmation-event validation, unique candidate ownership, and exact
-  committed-reservation accounting.
+- Added the public bounded `ChainSubmissionClient` for delegation and
+  singleton-vote submission, status advancement, and opt-in exact
+  commitment-tree recovery. Its internal coordinator and store provide durable
+  pre-POST reservation, bounded failover, candidate-first reconciliation,
+  restart-stable tracking deadlines, sticky recovery, atomic confirmation,
+  canonical lifecycle serialization, store-owned lock authority, causal bundle
+  admission, strict confirmation-event validation, unique candidate ownership,
+  and exact committed-reservation accounting.
 
 ### Changed
 

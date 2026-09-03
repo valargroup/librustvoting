@@ -292,6 +292,74 @@ async fn no_match_recovery_waits_for_backoff_and_clamps_reservation_timestamp() 
 }
 
 #[tokio::test]
+async fn recovery_retry_rejection_hash_is_not_candidate_evidence() {
+    let identity = identity(1, 0);
+    let store = Arc::new(InMemoryChainSubmissionStore::default());
+    store.seed_derivation(derived(identity.clone(), 1));
+    let transport = Arc::new(ScriptedTransport::default());
+    transport.queue(Err(ChainTransportError::possibly_dispatched("timeout")));
+    let coordinator = coordinator(
+        Arc::clone(&transport),
+        Arc::clone(&store),
+        ManualClock::new(100),
+        10,
+    );
+    coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity.clone()),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    for response in tree_responses(&[[8; 32]]) {
+        transport.queue(Ok(response));
+    }
+    transport.queue(Ok(rejected_with_hash()));
+    let result = coordinator
+        .advance_with_recovery(
+            StoreAdvancementRequest::vote(identity.clone()),
+            ChainRecoveryMode::ExactTree,
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ref diagnostic,
+        }) if diagnostic.kind() == ChainSubmissionDiagnosticKind::AmbiguousDispatch
+    ));
+    let record = store.record(&identity).unwrap();
+    assert_eq!(record.committed_post_reservations(), 2);
+    assert!(matches!(
+        record.state(),
+        SubmissionRecordState::Recovering {
+            candidate_transaction_hash: None,
+            ..
+        }
+    ));
+
+    let replay = coordinator
+        .advance(
+            StoreAdvancementRequest::vote(identity),
+            &ManualControl::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay,
+        ChainSubmissionResult::Pending(ChainSubmissionPending::Recovering {
+            candidate_transaction_hash: None,
+            ..
+        })
+    ));
+    assert_eq!(transport.methods(), vec!["POST", "GET", "GET", "POST"]);
+}
+
+#[tokio::test]
 async fn recovering_candidate_is_polled_before_no_match_retry_reservation() {
     let identity = identity(1, 0);
     let store = Arc::new(InMemoryChainSubmissionStore::default());
@@ -840,6 +908,13 @@ fn rejected() -> ChainHttpResponse {
     ChainHttpResponse::json(
         422,
         br#"{"tx_hash":null,"code":17,"log":"sensitive server log"}"#.to_vec(),
+    )
+}
+
+fn rejected_with_hash() -> ChainHttpResponse {
+    ChainHttpResponse::json(
+        422,
+        format!(r#"{{"tx_hash":"{HASH}","code":17,"log":"sensitive server log"}}"#).into_bytes(),
     )
 }
 

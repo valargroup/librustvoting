@@ -1,4 +1,4 @@
-//! Private transactional storage contract for the submission coordinator.
+//! Internal transactional storage contract for the public submission lifecycle.
 
 use crate::{delegate::DelegationSigner, types::VotingError};
 
@@ -15,10 +15,6 @@ use super::{
 };
 
 mod sqlite;
-#[allow(
-    unused_imports,
-    reason = "SQLite lifecycle authority is activated by a later public phase"
-)]
 pub(super) use sqlite::SqliteChainSubmissionStore;
 
 #[cfg(test)]
@@ -202,7 +198,7 @@ impl StoreAdvancementRequest {
     }
 }
 
-/// Complete durable record used by the coordinator and future SQLite adapter.
+/// Complete durable record used by the coordinator and SQLite adapter.
 #[derive(Clone)]
 pub(super) struct StoredChainSubmission {
     identity: ChainSubmissionIdentity,

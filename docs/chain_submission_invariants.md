@@ -567,25 +567,29 @@ The scanner validates snapshot identity, heights, roots, ranges, pagination
 progress, final size, canonical field encodings, and response bounds. A
 nonempty block's absolute start index must identify its first leaf. An empty
 checkpoint has no first leaf, so its start index is ignored while its ordered
-height and unchanged tree root remain mandatory. Recovery uses the following
-fixed ceilings:
+height and unchanged tree root remain mandatory. The vote-sdk REST encoder may
+omit zero-valued protobuf scalars; omitted indexes and heights are interpreted
+as zero before those validations. Recovery uses the following fixed ceilings:
 
 - `16,777,216` leaves, the full `2^24` vote-commitment-tree capacity;
-- `4,096` leaf-range requests of at most `4,096` leaves each;
-- `8 MiB` per response and `32 GiB` across the complete pass;
-- `60 seconds` per request and `72 hours` across the complete pass; and
+- `6,709` leaf-range requests under vote-sdk's `5,000`-leaf page target, with
+  each block returned atomically even when the block exceeds that target;
+- `8 MiB` per response and `53,680 MiB` across the complete pass, including
+  the initial snapshot-metadata response;
+- `60 seconds` per request and `120 hours` across the complete pass; and
 - `16 MiB` working memory beyond the expected layout and transport buffers.
 
 The tree's documented month-scale design point is approximately one million
 leaves, so the leaf ceiling retains more than sixteen-fold headroom and also
-covers every structurally valid tree. Responses are processed as a stream; the
-complete tree is never retained in memory. Configuration may lower a
-per-request range, byte, or timeout only when the derived request count, total
-bytes, and worst-case elapsed time still fit the complete-pass ceilings. An
-invalid combination is rejected before chain submission or recovery is
-enabled. Before reading leaves, validated snapshot metadata must show that a
+covers every structurally valid tree size. Responses are processed as a stream;
+the complete tree is never retained in memory. The request ceiling follows the
+deployed greedy whole-block pagination contract: two consecutive non-final
+pages contain at least `5,001` leaves, so a full tree requires at most `6,709`
+leaf requests. A server that advances through empty pages or otherwise departs
+from that contract remains bounded and fails closed if it exhausts the request
+ceiling. Before reading leaves, validated snapshot metadata must show that a
 complete traversal fits. There is no smaller whole-pass work budget that can
-repeatedly truncate a valid snapshot. Metadata claiming more than `2^24`
+repeatedly truncate a supported snapshot. Metadata claiming more than `2^24`
 leaves is malformed and no leaf scan starts. Cancellation is checked between
 requests and before the confirmation commit point.
 
@@ -967,10 +971,13 @@ Tests cover:
 - delegation, singleton, and batch exact layouts recover positions;
 - partial, reordered, nonadjacent, and duplicate layouts do not confirm;
 - scans use one validated fixed complete snapshot;
-- a full `2^24`-leaf snapshot fits the `4,096`-request, `32 GiB`, `72`-hour,
-  and streaming-memory ceilings without a smaller restart budget;
-- invalid lower per-request configuration is rejected before submission or
-  recovery is enabled;
+- omitted zero-valued tree metadata and first-block indexes match the live REST
+  encoding without weakening continuity validation;
+- an indivisible block above the `5,000`-leaf target remains recoverable within
+  the fixed response and snapshot bounds;
+- a full `2^24`-leaf snapshot under deployed whole-block pagination fits the
+  `6,709` leaf-request, `53,680 MiB`, `120`-hour, and streaming-memory
+  ceilings without a smaller restart budget;
 - interrupted scans restart without durable cursors or partial evidence; and
 - tree confirmation never invents a hash.
 
@@ -1053,13 +1060,15 @@ Phase 6 recovery coverage is anchored by
 `recovering_candidate_is_polled_before_no_match_retry_reservation`,
 `definitely_unsent_recovery_retry_keeps_reservation_and_requires_a_new_scan`,
 `malformed_tree_after_candidate_first_poll_retains_candidate_and_never_retries`,
-`exact_vote_layout_recovers_adjacent_ordered_positions`,
+`first_block_accepts_omitted_zero_start_index_and_recovers_layout`,
 `complete_no_match_authorizes_only_the_captured_generation_and_candidate`,
 `duplicate_complete_layout_is_ambiguous_not_confirmation`,
+`empty_snapshot_accepts_omitted_zero_metadata_without_a_leaves_request`,
 `empty_checkpoint_ignores_start_index_after_earlier_leaves`,
 `nonempty_block_with_discontinuous_start_index_is_rejected`,
 `empty_checkpoint_with_contradictory_root_is_rejected`,
 `incomplete_pagination_produces_no_authorization`,
+`oversized_atomic_block_is_accepted_above_the_page_target`,
 `full_tree_capacity_fits_the_fixed_request_and_byte_ceilings`, and
 `tree_confirmation_is_atomic_clamps_timestamp_and_survives_reopen_without_a_hash`.
 
@@ -1076,7 +1085,7 @@ Generation and confirmation coverage is anchored by
 `records_vote_confirmation_atomically`, and
 `records_vote_batch_confirmation_replay_and_helper_positions`.
 
-Private-coordinator lifecycle coverage is anchored by
+Public-lifecycle engine coverage is anchored by
 `reservation_commits_before_post_and_accepted_hash_is_tracking`,
 `delegation_uses_the_same_lifecycle_and_atomic_confirmation_path`,
 `reservation_failure_dispatches_nothing_and_writes_nothing`,
@@ -1086,6 +1095,7 @@ Private-coordinator lifecycle coverage is anchored by
 `failed_tracking_reconciliation_reports_the_durable_state`,
 `tracking_deadline_survives_polling_and_coordinator_restart`,
 `chain_rejection_preserves_bound_recovery_and_redacts_diagnostics`,
+`recovery_retry_rejection_hash_is_not_candidate_evidence`,
 `committed_failure_moves_tracking_to_recovery_and_clears_recovery_candidate`,
 `hash_confirmation_updates_submission_and_projection_atomically`,
 `failed_confirmation_rolls_back_submission_and_projection`,
