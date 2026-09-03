@@ -1325,18 +1325,15 @@ the owning rows, and foreign-key cascades remove the round's helper plans and
 delivery history as part of that deletion. The records are not selectively
 cleared while their round remains live. Every `VotingDb` handle opened on the
 same canonical SQLite file in the owning process shares one database authority,
-including files whose native path is not valid UTF-8, so an exclusive deletion
-requested through one handle cannot bypass a chain submission lifecycle lease
-held through another handle. Named `mode=memory` URIs, the special
-`file::memory:` URI, and named `memdb` databases conservatively share an
-authority unless URI memory mode explicitly selects `cache=private`. Rooted
-`memdb` names that do not select URI memory mode remain shared even under that
-cache option because the VFS itself shares their backing store. This covers
-SQLite's process-wide shared-cache default and explicit shared caching for
-unrooted `memdb` names. The decoded database name and selected VFS form the
-authority identity. Equal names opened through distinct VFSes, anonymous
-memory databases, plain `:memory:`, URI memory-mode databases with an explicit
-private cache, and SQLite temporary databases remain independent authorities.
+so an exclusive deletion requested through one handle cannot bypass a chain
+submission lifecycle lease held through another handle. `VotingDb::open_path`
+opens only filesystem databases, accepts non-UTF-8 native paths on platforms
+where SQLite supports them, and disables SQLite URI interpretation;
+`VotingDb::open_in_memory` creates an independent database with a private
+authority. The legacy UTF-8 string constructor accepts only filesystem paths.
+Empty paths, SQLite's `:memory:` magic name, and `file:` URIs are rejected
+before opening a database, and replacing SQLite's process-default filesystem
+VFS is unsupported.
 
 Enforcement:
 [`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),
@@ -1347,14 +1344,10 @@ Regression coverage must show that ordinary cleanup and reset preserve delivery
 rows, explicit round or account deletion removes their owning rows, and no
 standalone recovery-clear API or storage primitive remains.
 `second_handle_cannot_delete_state_reserved_by_an_active_submission` covers the
-file-backed cross-handle deletion boundary while recovery material is reserved;
-`shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission`
-covers the same lifecycle boundary for URI-backed shared memory, while
-`special_memory_uri_without_explicit_cache_conservatively_shares_authority`
-covers authority identity for the special `file::memory:` form. The
-`memdb_handle_cannot_delete_state_reserved_by_an_active_submission` and
-`shared_cache_memdb_handle_cannot_delete_an_active_submission` cover rooted and
-explicitly shared-cache forms of SQLite's `memdb` VFS.
+file-backed cross-handle deletion boundary while recovery material is reserved.
+`file_handles_share_physical_state_and_database_authority` and
+`in_memory_handles_have_independent_database_authorities` cover the supported
+filesystem and private-memory identity boundaries.
 
 ## Helper identity and payload invariants
 

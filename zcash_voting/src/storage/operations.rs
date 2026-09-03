@@ -2721,7 +2721,7 @@ mod tests {
     }
 
     fn test_db() -> VotingDb {
-        let db = VotingDb::open(":memory:").unwrap();
+        let db = VotingDb::open_in_memory().unwrap();
         db.set_wallet_id(W);
         db
     }

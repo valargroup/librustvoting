@@ -80,21 +80,18 @@ ledgers.
 
 One process exclusively owns a voting database. Every handle opened on the
 same canonical SQLite file in that process shares one database authority and
-therefore one lifecycle-coordination registry, including files whose native
-path is not valid UTF-8. Named `mode=memory` URIs and the special
-`file::memory:` URI without an explicit `cache=private` option conservatively
-share an authority because SQLite's process-wide shared-cache default can make
-them share one database. Named `memdb` databases likewise conservatively share;
-rooted `memdb` names that do not select URI memory mode remain shared even with
-`cache=private`, while `cache=shared` also shares unrooted names. The selected
-SQLite VFS is part of that identity, so equal names opened through distinct
-VFSes remain independent. Anonymous memory databases, plain `:memory:`,
-URI memory-mode databases with an explicit private cache, and SQLite temporary
-databases remain independent database authorities. Operations capture wallet,
-round, submission identity, and host operation epoch once; an account switch
-cannot retarget in-flight work. Opening one physical SQLite database through
-distinct hard-link paths is unsupported because SQLite's WAL sidecars and this
-authority identity are pathname-based.
+therefore one lifecycle-coordination registry. `VotingDb::open_path` accepts
+native paths, including non-UTF-8 paths on platforms where SQLite supports
+them, and disables SQLite URI interpretation;
+`VotingDb::open_in_memory` creates one private authority for one independent
+in-memory database. The legacy UTF-8 string constructor accepts only filesystem
+paths. Empty paths, SQLite's `:memory:` magic name, and `file:` URIs are
+rejected before opening a database. Replacing SQLite's process-default
+filesystem VFS is outside this contract. Operations capture wallet, round,
+submission identity, and host operation epoch once; an account switch cannot
+retarget in-flight work. Opening one physical SQLite database through distinct
+hard-link paths is unsupported because SQLite's WAL sidecars and this authority
+identity are pathname-based.
 
 ## Identity and semantic generation
 
@@ -752,13 +749,14 @@ was not locked. The request rejects rosters above the 15-action protocol
 maximum before allocating lock identities. No persisted roster is read before the operation
 and identity locks.
 The coordination authority is owned by the process-local database authority,
-which is interned by canonical SQLite file path or by decoded shared-memory
-database name plus selected VFS. Constructing multiple stores, coordinators, or
-`VotingDb` handles for one database cannot create disjoint lock registries.
-Cleanup and deletion acquire the same round gate exclusively and treat an
-active shared lifecycle lease from any handle as busy. Process death drops
-these ephemeral gates; the durable submission row determines restart behavior,
-including conservative recovery of an abandoned `Submitting` row.
+which is interned by canonical SQLite filesystem path. Constructing multiple
+stores, coordinators, or `VotingDb` handles for one supported file database
+cannot create disjoint lock registries. Private in-memory databases are never
+interned. Cleanup and deletion acquire the same round gate exclusively and
+treat an active shared lifecycle lease from any file handle as busy. Process
+death drops these ephemeral gates; the durable submission row determines
+restart behavior, including conservative recovery of an abandoned `Submitting`
+row.
 
 Once a singleton request is possibly dispatched, its proposal and choice are
 locked. Once a batch is possibly dispatched, member proposals, choices, count,
@@ -1130,10 +1128,6 @@ Public-lifecycle engine coverage is anchored by
 `independent_bundles_progress_while_another_post_is_blocked`,
 `coordinators_for_one_store_share_the_same_lock_authority`,
 `second_handle_cannot_delete_state_reserved_by_an_active_submission`,
-`shared_memory_handle_cannot_delete_state_reserved_by_an_active_submission`,
-`special_memory_uri_without_explicit_cache_conservatively_shares_authority`,
-`memdb_handle_cannot_delete_state_reserved_by_an_active_submission`,
-`shared_cache_memdb_handle_cannot_delete_an_active_submission`,
 `exclusive_round_access_is_busy_until_lifecycle_work_finishes`,
 `batch_roster_mismatch_never_creates_a_reservation`,
 `batch_request_supplies_its_complete_recovery_independent_lock_set`,

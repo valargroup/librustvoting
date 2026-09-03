@@ -710,6 +710,12 @@ mod tests {
         db
     }
 
+    fn memory_test_db() -> VotingDb {
+        let db = VotingDb::open_in_memory().unwrap();
+        db.set_wallet_id(WALLET);
+        db
+    }
+
     fn seed_provider(
         db: &VotingDb,
         params: &VotingRoundParams,
@@ -760,7 +766,7 @@ mod tests {
         let params = round_params();
         let hotkey = hotkey(0x21);
         let target = bound_target(&hotkey, &params);
-        let db = test_db(":memory:");
+        let db = memory_test_db();
         seed_provider(&db, &params, &[&target, &target]);
         let exported =
             export_delegation_capability(&db, &target, &[b"tx-zero".to_vec(), b"tx-one".to_vec()])
@@ -873,7 +879,7 @@ mod tests {
 
         let noncanonical = [json.as_slice(), b" "].concat();
         assert!(DelegationCapabilityV1::from_json(&noncanonical).is_err());
-        let customer = test_db(":memory:");
+        let customer = memory_test_db();
         assert!(import_delegation_capability(
             &customer,
             &noncanonical,
@@ -1001,7 +1007,7 @@ mod tests {
     fn imported_capability_survives_session_reset() {
         let (_, params, hotkey, capability) = exported_fixture();
         let capability_json = capability.to_json().unwrap();
-        let customer = test_db(":memory:");
+        let customer = memory_test_db();
         let digest = import_delegation_capability(
             &customer,
             &capability_json,
@@ -1036,7 +1042,7 @@ mod tests {
     fn import_rejects_context_and_local_state_without_writes() {
         let (_, params, customer_hotkey, capability) = exported_fixture();
         let wrong_hotkey = hotkey(0x44);
-        let customer = test_db(":memory:");
+        let customer = memory_test_db();
         assert!(import_capability(
             &customer,
             &capability,
@@ -1062,7 +1068,7 @@ mod tests {
             vec![9]
         );
 
-        let conflicting_round = test_db(":memory:");
+        let conflicting_round = memory_test_db();
         let mut stored_params = params.clone();
         stored_params.nc_root[0] ^= 1;
         conflicting_round
@@ -1085,7 +1091,7 @@ mod tests {
     #[test]
     fn late_bundle_insert_failure_rolls_back_the_round_and_batch() {
         let (_, params, hotkey, capability) = exported_fixture();
-        let customer = test_db(":memory:");
+        let customer = memory_test_db();
         customer
             .conn()
             .execute_batch(
@@ -1106,7 +1112,7 @@ mod tests {
         use crate::confirmation::{confirm_delegation_submission, TxEvent, TxEventAttribute};
 
         let (_, params, hotkey, capability) = exported_fixture();
-        let customer = test_db(":memory:");
+        let customer = memory_test_db();
         import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
         let events = [TxEvent {
             event_type: "delegate_vote".to_string(),
@@ -1151,7 +1157,7 @@ mod tests {
             .require_capability_delegations_confirmed(&params.vote_round_id)
             .expect("locally prepared rounds retain per-bundle voting");
 
-        let customer = test_db(":memory:");
+        let customer = memory_test_db();
         import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
         queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0, 42)
             .unwrap();
@@ -1202,7 +1208,7 @@ mod tests {
 
     fn assert_imported_capability_rejects_bundle_trim(keep_count: u32) {
         let (_, params, hotkey, capability) = exported_fixture();
-        let customer = test_db(":memory:");
+        let customer = memory_test_db();
         let digest =
             import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
         queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0, 42)
@@ -1251,7 +1257,7 @@ mod tests {
     #[test]
     fn terminal_capability_reset_accepts_a_corrected_complete_package() {
         let (_, params, hotkey, capability) = exported_fixture();
-        let customer = test_db(":memory:");
+        let customer = memory_test_db();
         import_capability(&customer, &capability, import_context(&hotkey, &params)).unwrap();
         queries::store_van_position(&customer.conn(), &params.vote_round_id, WALLET, 0, 42)
             .unwrap();

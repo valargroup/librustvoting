@@ -58,6 +58,14 @@ pub(super) fn recovery() -> VoteRecoveryBundle {
 
 pub(super) fn open_prepared(path: &str) -> Arc<VotingDb> {
     let db = Arc::new(VotingDb::open(path).unwrap());
+    prepare(db)
+}
+
+pub(super) fn open_prepared_in_memory() -> Arc<VotingDb> {
+    prepare(Arc::new(VotingDb::open_in_memory().unwrap()))
+}
+
+fn prepare(db: Arc<VotingDb>) -> Arc<VotingDb> {
     db.set_wallet_id("wallet");
     if !db.has_round(ROUND).unwrap() {
         db.create_round(

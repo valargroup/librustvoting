@@ -4,11 +4,12 @@ pub mod operations;
 pub mod queries;
 
 use std::{
+    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::types::{Network, VotingError};
 
@@ -97,37 +98,66 @@ pub struct VotingDb {
 }
 
 impl VotingDb {
-    /// Open (or create) the voting database at the given path.
-    /// An empty path opens an independent SQLite temporary database.
-    /// Plain `:memory:` databases are independent, while handles using the
-    /// same named memory URI may conservatively share lifecycle coordination.
-    /// Runs migrations automatically.
-    /// Call `set_wallet_id` before performing any round operations.
+    /// Opens or creates a voting database at a UTF-8 filesystem path.
+    ///
+    /// Empty paths, SQLite's `:memory:` magic name, and `file:` URIs are
+    /// rejected. Use [`VotingDb::open_path`] for native filesystem paths and
+    /// [`VotingDb::open_in_memory`] for an independent in-memory database.
     pub fn open(path: &str) -> Result<Self, VotingError> {
-        let mut conn = if path == ":memory:" {
-            Connection::open_in_memory()
-        } else {
-            Connection::open(path)
-        }
-        .map_err(|e| VotingError::Internal {
-            message: format!("failed to open database: {}", e),
+        Self::open_path(Path::new(path))
+    }
+
+    /// Opens or creates a voting database at a native filesystem path.
+    ///
+    /// URI interpretation is disabled so database identity is determined only
+    /// by the filesystem path. Handles resolving to the same canonical path
+    /// share lifecycle coordination.
+    pub fn open_path(path: &Path) -> Result<Self, VotingError> {
+        validate_database_path(path)?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let connection =
+            Connection::open_with_flags(path, flags).map_err(|error| VotingError::Internal {
+                message: format!("failed to open database: {error}"),
+            })?;
+        let canonical_path = std::fs::canonicalize(path).map_err(|error| VotingError::Storage {
+            message: format!("failed to resolve SQLite database authority: {error}"),
         })?;
+        let database_authority = DatabaseAuthority::for_file(canonical_path)?;
 
-        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to configure database busy timeout: {}", e),
+        Self::initialize(connection, database_authority)
+    }
+
+    /// Opens a fresh private in-memory voting database.
+    pub fn open_in_memory() -> Result<Self, VotingError> {
+        let connection = Connection::open_in_memory().map_err(|error| VotingError::Internal {
+            message: format!("failed to open in-memory database: {error}"),
+        })?;
+        Self::initialize(connection, DatabaseAuthority::private())
+    }
+
+    /// Configures and migrates one newly opened voting database.
+    fn initialize(
+        mut connection: Connection,
+        database_authority: Arc<DatabaseAuthority>,
+    ) -> Result<Self, VotingError> {
+        connection
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to configure database busy timeout: {error}"),
             })?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| VotingError::Internal {
-                message: format!("failed to set pragmas: {}", e),
+
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .map_err(|error| VotingError::Internal {
+                message: format!("failed to set pragmas: {error}"),
             })?;
 
-        migrations::migrate(&mut conn)?;
-
-        let database_authority = DatabaseAuthority::for_connection(&conn, path)?;
+        migrations::migrate(&mut connection)?;
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(connection),
             wallet_id: Mutex::new(String::new()),
             database_authority,
         })
@@ -165,6 +195,19 @@ impl VotingDb {
     }
 }
 
+/// Rejects SQLite's non-filesystem magic names before any database is opened.
+fn validate_database_path(path: &Path) -> Result<(), VotingError> {
+    let invalid_path = path.as_os_str().is_empty()
+        || path == Path::new(":memory:")
+        || path.to_str().is_some_and(|path| path.starts_with("file:"));
+    if invalid_path {
+        return Err(VotingError::InvalidInput {
+            message: "voting database must be a filesystem path; use open_in_memory for an independent in-memory database".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     mod database_authority;
@@ -175,7 +218,7 @@ mod tests {
     const W: &str = "test-wallet";
 
     fn test_db() -> VotingDb {
-        VotingDb::open(":memory:").unwrap()
+        VotingDb::open_in_memory().unwrap()
     }
 
     fn test_params() -> VotingRoundParams {

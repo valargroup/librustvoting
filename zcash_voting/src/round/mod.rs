@@ -227,22 +227,6 @@ impl VotingDb {
         Ok(db)
     }
 
-    /// Opens or creates a voting database at `path` and runs migrations.
-    ///
-    /// Call [`VotingDb::set_wallet_id`] before performing wallet-scoped round
-    /// operations. Passing `:memory:` is supported through the legacy string
-    /// API; prefer [`VotingDb::open_in_memory`] for in-memory tests.
-    pub fn open_path(path: &Path) -> Result<Self, VotingError> {
-        Self::open(path.to_str().ok_or_else(|| VotingError::InvalidInput {
-            message: "voting database path is not valid UTF-8".to_string(),
-        })?)
-    }
-
-    /// Opens a fresh in-memory voting database for tests and examples.
-    pub fn open_in_memory() -> Result<Self, VotingError> {
-        Self::open(":memory:")
-    }
-
     /// Creates a voting round for the current wallet.
     ///
     /// The round id comes from `params.vote_round_id`. This call persists the
