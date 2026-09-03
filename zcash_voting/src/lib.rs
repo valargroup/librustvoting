@@ -60,6 +60,7 @@ pub mod types;
 mod van_blinding;
 pub mod vote;
 pub mod vote_commitment;
+pub mod vote_work;
 pub mod wire;
 mod wire_codec;
 pub mod witness;
@@ -91,6 +92,12 @@ pub use http_transport::HyperTransport;
 pub use pir::{
     connect_pir, connect_pir_blocking, negotiated_pir_layout, ImtProofData, NegotiatedPirLayout,
     PirClient, PirClientBlocking, Transport, TransportFuture, TransportResponse,
+};
+pub use vote_work::{
+    NoopVoteRecoveryProgressReporter, VoteRecoveryAdvance, VoteRecoveryDisposition,
+    VoteRecoveryExecutor, VoteRecoveryFailure, VoteRecoveryFailureKind, VoteRecoveryKey,
+    VoteRecoveryProgress, VoteRecoveryProgressBridge, VoteRecoveryProgressReporter,
+    VoteRecoveryRequest, VoteShareDeliveryReport,
 };
 
 pub use delegation_capability::{

@@ -1383,17 +1383,18 @@ host wallet:
    helper ordering. Hosts do not supply randomness to the planning lifecycle.
 4. **Lifecycle.** The host owns the timer, app-lock and round-expiry behavior,
    invokes `track_pending_shares`, and supplies cancellation.
-5. **Initial delivery invocation.** The host obtains `HelperFleetPreflight`
-   from the SDK, calls
-   `prepare_share_delivery` with the complete proposal roster from the
-   authenticated round configuration, and waits for chain confirmation when
-   necessary. It then recovers a fresh `CommittedVote` and calls
-   `submit_prepared_shares`. It supplies the complete current configured fleet
-   and cancellation signal. The SDK validates the stored plan against its
-   original planning fleet while limiting delivery to that current fleet. The
-   host does not select the immediate share, serialize plans, select helpers,
-   derive targets, expose share payloads, filter missing shares, or replan
-   after restart.
+5. **Initial delivery invocation.** Supported wallet integrations call
+   `VoteRecoveryExecutor::advance` with the complete proposal roster from the
+   authenticated round configuration, the complete current configured fleet,
+   timing, and cancellation. The executor obtains `HelperFleetPreflight`,
+   prepares every affected delivery plan, waits for durable chain confirmation,
+   recovers fresh `CommittedVote` handles, and submits the prepared shares.
+   Lower-level integrations may perform that exact sequence directly. The SDK
+   validates the stored plan against its original planning fleet while limiting
+   delivery to the current fleet. The host does not interpret recovery steps,
+   select atomic-batch members, select the immediate share, serialize plans,
+   select helpers, derive targets, expose share payloads, filter missing shares,
+   or replan after restart.
 6. **Helper-operator trust.** The protocol assumes that the authority supplying
    the wallet's helper configuration is trusted to choose independent operators
    and govern changes. URLs are endpoint identities, not authenticated operator
