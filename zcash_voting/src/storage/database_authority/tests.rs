@@ -118,3 +118,14 @@ fn in_memory_handles_have_independent_database_authorities() {
         &second.database_authority
     ));
 }
+
+#[test]
+fn temporary_database_handles_have_independent_database_authorities() {
+    let first = VotingDb::open("").unwrap();
+    let second = VotingDb::open("").unwrap();
+
+    assert!(!Arc::ptr_eq(
+        &first.database_authority,
+        &second.database_authority
+    ));
+}

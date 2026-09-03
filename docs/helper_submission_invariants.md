@@ -1326,7 +1326,8 @@ delivery history as part of that deletion. The records are not selectively
 cleared while their round remains live. Every `VotingDb` handle opened on the
 same canonical SQLite file in the owning process shares one database authority,
 so an exclusive deletion requested through one handle cannot bypass a chain
-submission lifecycle lease held through another handle.
+submission lifecycle lease held through another handle. In-memory connections
+and SQLite temporary databases remain independent authorities.
 
 Enforcement:
 [`RoundApi::delete_round`](../zcash_voting/src/round/mod.rs),

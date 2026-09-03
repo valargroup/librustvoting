@@ -80,12 +80,12 @@ ledgers.
 
 One process exclusively owns a voting database. Every handle opened on the
 same canonical SQLite file in that process shares one database authority and
-therefore one lifecycle-coordination registry. In-memory connections remain
-independent database authorities. Operations capture wallet, round, submission
-identity, and host operation epoch once; an account switch cannot retarget
-in-flight work. Opening one physical SQLite database through distinct hard-link
-paths is unsupported because SQLite's WAL sidecars and this authority identity
-are pathname-based.
+therefore one lifecycle-coordination registry. In-memory connections and
+SQLite temporary databases remain independent database authorities. Operations
+capture wallet, round, submission identity, and host operation epoch once; an
+account switch cannot retarget in-flight work. Opening one physical SQLite
+database through distinct hard-link paths is unsupported because SQLite's WAL
+sidecars and this authority identity are pathname-based.
 
 ## Identity and semantic generation
 
