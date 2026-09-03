@@ -146,6 +146,8 @@ and this workspace adheres to [Semantic Versioning](https://semver.org/spec/v2.0
 - A non-final exact-tree recovery retry whose accepted hash collides with
   another generation now continues through the remaining bounded attempts.
 - `ExactTree` advancement of an imported delegation never scans the tree.
+- `VoteRecovery::tx_hash` in the round snapshot now reports the batch row's
+  candidate hash for in-flight batch members, matching `VoteRecoveryWork`.
 - A usable hash that follows durable dispatch ambiguity clears the stored
   ambiguity diagnostic when the row enters `Tracking`.
 - A vote-chain POST that hits the SDK's own deadline before the transport

@@ -25,6 +25,9 @@ use crate::{
 pub(super) struct AuthoritativeBatchMember {
     pub(super) phase: VotePhase,
     pub(super) diagnostic: Option<ChainSubmissionDiagnostic>,
+    /// Digest of the batch row that owns this member, so callers can read
+    /// that row's hash: members own no lifecycle row of their own.
+    pub(super) ordered_batch_digest: [u8; 32],
 }
 
 /// Loads every member phase claimed by an authoritative batch row.
@@ -105,10 +108,6 @@ pub(super) fn load_authoritative_batch_phases(
         let Some(phase) = authoritative_submission_phase(Some(&state)) else {
             continue;
         };
-        let member = AuthoritativeBatchMember {
-            phase,
-            diagnostic: stored_submission_diagnostic(diagnostic_kind, diagnostic)?,
-        };
         let stored_bundle_index =
             u32::try_from(stored_bundle_index).map_err(|_| VotingError::Internal {
                 message: format!(
@@ -124,6 +123,11 @@ pub(super) fn load_authoritative_batch_phases(
                         digest.len()
                     ),
                 })?;
+        let member = AuthoritativeBatchMember {
+            phase,
+            diagnostic: stored_submission_diagnostic(diagnostic_kind, diagnostic)?,
+            ordered_batch_digest,
+        };
         let identity = ChainSubmissionIdentity::new(
             wallet_id,
             network,

@@ -38,6 +38,10 @@ pub(crate) struct VoteSubmissionStatus {
     pub(crate) proposal_id: u32,
     pub(crate) phase: VotePhase,
     pub(crate) diagnostic: Option<ChainSubmissionDiagnostic>,
+    /// Digest of the authoritative batch row that owns this vote, when the
+    /// phase comes from a batch rather than a singleton row or the domain
+    /// columns. The batch row, not the member, holds the candidate hash.
+    pub(crate) ordered_batch_digest: Option<[u8; 32]>,
 }
 
 /// Rebuilds the stored lifecycle diagnostic from its two projection columns.
@@ -599,21 +603,28 @@ fn load_vote_submission_statuses(
                     ),
                 });
             }
-            let (phase, diagnostic) = match (singleton_phase, batch_member) {
+            let (phase, diagnostic, ordered_batch_digest) = match (singleton_phase, batch_member)
+            {
                 (Some(phase), _) => (
                     phase,
                     stored_submission_diagnostic(
                         evidence.singleton_diagnostic_kind,
                         evidence.singleton_diagnostic,
                     )?,
+                    None,
                 ),
-                (None, Some(member)) => (member.phase, member.diagnostic.clone()),
+                (None, Some(member)) => (
+                    member.phase,
+                    member.diagnostic.clone(),
+                    Some(member.ordered_batch_digest),
+                ),
                 (None, None) => (
                     vote_phase_from_columns(
                         evidence.has_tx_hash,
                         evidence.has_vc_position,
                         evidence.has_recovery_bundle,
                     ),
+                    None,
                     None,
                 ),
             };
@@ -622,6 +633,7 @@ fn load_vote_submission_statuses(
                 proposal_id: evidence.proposal_id,
                 phase,
                 diagnostic,
+                ordered_batch_digest,
             })
         })
         .collect()

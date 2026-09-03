@@ -5,7 +5,9 @@
 
 use crate::{
     chain_submission::{
-        planning::{delegation_transaction_hash, vote_transaction_hash},
+        planning::{
+            delegation_transaction_hash, vote_batch_transaction_hash, vote_transaction_hash,
+        },
         ChainSubmissionDiagnostic,
     },
     phases::{DelegationPhase, SharePhase, VotePhase, WorkflowPhase},
@@ -58,6 +60,11 @@ pub struct VoteRecovery {
     pub proposal_id: u32,
     pub choice: u32,
     pub phase: VotePhase,
+    /// Transaction hash the lifecycle already knows for this vote: the
+    /// confirmed hash, else the candidate hash of the in-flight generation.
+    /// For a batch member this is the batch row's hash, since members own no
+    /// lifecycle row of their own. Absent before the first accepted POST and
+    /// after a hashless recovery.
     pub tx_hash: Option<String>,
     pub vc_tree_position: Option<u64>,
     pub has_commitment_bundle: bool,
@@ -249,7 +256,16 @@ fn build_vote_recovery_rows(
         .map(|status| {
             let (bundle_index, proposal_id, phase) =
                 (status.bundle_index, status.proposal_id, status.phase);
-            let tx_hash = vote_transaction_hash(db, round_id, bundle_index, proposal_id)?;
+            let tx_hash = match status.ordered_batch_digest {
+                Some(ordered_batch_digest) => vote_batch_transaction_hash(
+                    db,
+                    round_id,
+                    bundle_index,
+                    ordered_batch_digest,
+                    proposal_id,
+                )?,
+                None => vote_transaction_hash(db, round_id, bundle_index, proposal_id)?,
+            };
             let fields =
                 db.get_commitment_bundle_recovery_fields(round_id, bundle_index, proposal_id)?;
             let (has_commitment_bundle, vc_tree_position) = match fields {

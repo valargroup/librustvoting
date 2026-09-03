@@ -2077,7 +2077,7 @@ mod tests {
     }
 
     #[test]
-    fn submitted_but_unconfirmed_vote_yields_poll() {
+    fn submitted_legacy_vote_without_a_lifecycle_row_yields_an_advance_step() {
         let db = db_with_bundle();
         db.set_ballot_intent(ROUND, 2, Decision::Choice(1), 3)
             .unwrap();
@@ -2827,6 +2827,174 @@ mod tests {
                 vc_tree_position: None,
                 share_indexes: Vec::new(),
             }]
+        );
+        // The per-vote recovery snapshot reports the same batch hash for
+        // every member.
+        let snapshot = crate::recovery::round_snapshot(&db, ROUND).unwrap();
+        assert_eq!(snapshot.votes.len(), 2);
+        for vote in &snapshot.votes {
+            assert_eq!(vote.phase, VotePhase::SubmissionManaged);
+            assert_eq!(
+                vote.tx_hash.as_deref(),
+                Some(hex::encode(candidate).as_str())
+            );
+        }
+    }
+
+    fn insert_batch_row_fixture(
+        db: &VotingDb,
+        identity_key: &[u8],
+        network: &str,
+        ordered_batch_digest: [u8; 32],
+        generation_digest: [u8; 32],
+    ) {
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network, bundle_index,
+                  kind, ordered_batch_digest, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, 'vote_batch', ?5, ?6,
+                         'recovering', 1, 'ambiguous_dispatch',
+                         'batch response was lost after dispatch', 9, 9)",
+                rusqlite::params![
+                    identity_key,
+                    ROUND,
+                    W,
+                    network,
+                    ordered_batch_digest.as_slice(),
+                    generation_digest.to_vec(),
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn batch_row_with_mismatched_generation_digest_is_an_invariant_error() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
+        align_stored_commitments_with_recovery(&db, &[1, 2]);
+        let identity = submission_identity_fixture(ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        });
+        insert_batch_row_fixture(
+            &db,
+            &submission_identity_key(&identity),
+            "testnet",
+            ordered_batch_digest,
+            [0x99; 32],
+        );
+
+        let error = db.vote_phases(ROUND).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generation digest does not match persisted members"),
+            "{error}"
+        );
+        assert!(resume_plan(&db, ROUND, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn vote_claimed_by_two_batch_rows_is_an_invariant_error() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
+        align_stored_commitments_with_recovery(&db, &[1, 2]);
+        let identity = submission_identity_fixture(ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        });
+        let generation_digest = {
+            let conn = db.conn();
+            *generation_for_vote_batch(&conn, &identity)
+                .unwrap()
+                .generation()
+                .digest()
+                .as_bytes()
+        };
+        insert_batch_row_fixture(
+            &db,
+            &submission_identity_key(&identity),
+            "testnet",
+            ordered_batch_digest,
+            generation_digest,
+        );
+        // The identity index is per network, so a second row on another
+        // network is the only way a second batch can claim the same signed
+        // members; the projection reads the whole round and must refuse it.
+        insert_batch_row_fixture(
+            &db,
+            &[0x5A; 32],
+            "mainnet",
+            ordered_batch_digest,
+            generation_digest,
+        );
+
+        let error = db.vote_phases(ROUND).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("belongs to multiple authoritative batches"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn overlapping_singleton_and_batch_rows_are_an_invariant_error() {
+        let db = db_with_bundle();
+        db.store_delegation_tx_hash(ROUND, 0, "dtx").unwrap();
+        db.store_van_position(ROUND, 0, 7).unwrap();
+        let ordered_batch_digest = store_two_action_batch_recovery_fixture(&db);
+        align_stored_commitments_with_recovery(&db, &[1, 2]);
+        let batch_identity = submission_identity_fixture(ChainSubmissionTarget::VoteBatch {
+            ordered_batch_digest,
+        });
+        let generation_digest = {
+            let conn = db.conn();
+            *generation_for_vote_batch(&conn, &batch_identity)
+                .unwrap()
+                .generation()
+                .digest()
+                .as_bytes()
+        };
+        insert_batch_row_fixture(
+            &db,
+            &submission_identity_key(&batch_identity),
+            "testnet",
+            ordered_batch_digest,
+            generation_digest,
+        );
+        let singleton_identity =
+            submission_identity_fixture(ChainSubmissionTarget::Vote { proposal_id: 1 });
+        db.conn()
+            .execute(
+                "INSERT INTO chain_submissions
+                 (identity_key, round_id, wallet_id, network,
+                  bundle_index, kind, proposal_id, generation_digest, state,
+                  committed_post_reservations, diagnostic_kind, diagnostic,
+                  created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'testnet', 0, 'vote', 1, ?4,
+                         'recovering', 1, 'ambiguous_dispatch',
+                         'vote response was lost after dispatch', 9, 9)",
+                rusqlite::params![
+                    submission_identity_key(&singleton_identity),
+                    ROUND,
+                    W,
+                    vec![0x77_u8; 32],
+                ],
+            )
+            .unwrap();
+
+        let error = db.vote_phases(ROUND).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("overlapping authoritative singleton and batch submissions"),
+            "{error}"
         );
     }
 

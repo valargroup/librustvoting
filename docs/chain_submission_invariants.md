@@ -641,9 +641,10 @@ conflict for a singleton or a batch member; only a differing or skipped intent
 conflicts, and that conflict is rejected before any step is planned
 (`lifecycle_owned_vote_without_ballot_intent_still_yields_an_advance_step`,
 `lifecycle_owned_batch_without_ballot_intent_still_yields_an_advance_step`).
-Recovery work for an in-flight batch reports the hash held by the batch's own
-authoritative row, looked up by ordered batch digest, because batch members own
-no lifecycle row and their projection columns stay empty until confirmation
+Recovery work and the per-vote recovery snapshot report, for an in-flight
+batch, the hash held by the batch's own authoritative row, looked up by ordered
+batch digest, because batch members own no lifecycle row and their projection
+columns stay empty until confirmation
 (`in_flight_batch_reports_the_batch_row_candidate_hash`).
 
 Hosts must execute local delegation, singleton-vote, and vote-batch advance
@@ -998,11 +999,16 @@ authoritative row exists it wins: any unresolved row reports
 
 Upgrading a database that holds an in-flight version-17 submission is
 unsupported. Such a vote still projects as `Submitted` and, when its recovery
-material is present, the session plan still emits the host-driven legacy poll
-step, exactly as version 17 did, but
-the specification makes no guarantee about its outcome and the lifecycle
-neither owns nor reconciles it. Version-17 hash values remain byte for byte in
-their domain columns; runtime lookup never treats them as candidates.
+material is present, the session plan emits `AdvanceVote` for it (and
+`AdvanceDelegation` for a delegation with a domain hash and no row), exactly as
+for any other submitted vote
+(`submitted_legacy_vote_without_a_lifecycle_row_yields_an_advance_step`).
+Executing that step reserves a fresh generation and redispatches the same
+transaction bytes; the nullifier argument keeps this safe, since a rejection
+lands in `Recovering` and exact-tree recovery then confirms the earlier
+transaction by layout. The specification makes no further guarantee about its
+outcome. Version-17 hash values remain byte for byte in their domain columns;
+runtime lookup never treats them as candidates.
 
 Version-17 round ids that cannot form a canonical lifecycle identity remain
 domain data that is prunable and explicitly deletable.
@@ -1272,6 +1278,12 @@ Tests cover:
 - a usable hash that follows durable dispatch ambiguity clears the stored
   ambiguity diagnostic on entry to `Tracking`
   (`usable_hash_after_dispatch_ambiguity_clears_the_stored_diagnostic`);
+- a batch row whose generation digest does not re-derive, a vote claimed by
+  two batch rows, and a vote with both a singleton and a batch row are
+  projection invariant errors rather than silently different phases
+  (`batch_row_with_mismatched_generation_digest_is_an_invariant_error`,
+  `vote_claimed_by_two_batch_rows_is_an_invariant_error`,
+  `overlapping_singleton_and_batch_rows_are_an_invariant_error`);
 - ordinary cleanup and reset preserve every unresolved generation, its
   retry/recovery data, helper plan, and complete delivery history;
 - round reset preserves a protected bundle while clearing an independent
